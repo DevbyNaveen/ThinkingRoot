@@ -510,9 +510,17 @@ impl QueryEngine {
 
         // 1) Try vector search first.
         let vector_results = storage.vector.search(query, top_k * 2)?;
+
+        // Hoist lookups outside the loop to avoid O(n) graph queries per result.
+        let all_entities = storage.graph.get_all_entities()?;
+        let all_claims = storage.graph.get_all_claims_with_sources()?;
+
         for (id, _metadata, score) in &vector_results {
+            if *score < 0.1 {
+                continue;
+            }
+
             // Try to find this id as an entity.
-            let all_entities = storage.graph.get_all_entities()?;
             if let Some((eid, ename, etype)) =
                 all_entities.iter().find(|(eid, _, _)| eid == id)
             {
@@ -530,7 +538,6 @@ impl QueryEngine {
             }
 
             // Try to find this id as a claim.
-            let all_claims = storage.graph.get_all_claims_with_sources()?;
             if let Some((cid, stmt, ctype, conf, uri)) =
                 all_claims.iter().find(|(cid, _, _, _, _)| cid == id)
             {
@@ -547,32 +554,34 @@ impl QueryEngine {
             }
         }
 
-        // 2) Keyword fallback — always run to supplement vector results.
-        let kw_entities = storage.graph.search_entities(query)?;
-        for (eid, ename, etype) in kw_entities {
-            if seen_entity_ids.insert(eid.clone()) {
-                let claims = storage.graph.get_claims_for_entity(&eid)?;
-                entity_hits.push(EntitySearchHit {
-                    id: eid,
-                    name: ename,
-                    entity_type: etype,
-                    claim_count: claims.len(),
-                    relevance: 0.5, // default relevance for keyword matches
-                });
+        // 2) Keyword fallback if vector didn't return enough.
+        if entity_hits.len() + claim_hits.len() < top_k {
+            let kw_entities = storage.graph.search_entities(query)?;
+            for (eid, ename, etype) in kw_entities {
+                if seen_entity_ids.insert(eid.clone()) {
+                    let claims = storage.graph.get_claims_for_entity(&eid)?;
+                    entity_hits.push(EntitySearchHit {
+                        id: eid,
+                        name: ename,
+                        entity_type: etype,
+                        claim_count: claims.len(),
+                        relevance: 0.5, // default relevance for keyword matches
+                    });
+                }
             }
-        }
 
-        let kw_claims = storage.graph.search_claims(query)?;
-        for (cid, stmt, ctype, conf, uri) in kw_claims {
-            if seen_claim_ids.insert(cid.clone()) {
-                claim_hits.push(ClaimSearchHit {
-                    id: cid,
-                    statement: stmt,
-                    claim_type: ctype,
-                    confidence: conf,
-                    source_uri: uri,
-                    relevance: 0.5,
-                });
+            let kw_claims = storage.graph.search_claims(query)?;
+            for (cid, stmt, ctype, conf, uri) in kw_claims {
+                if seen_claim_ids.insert(cid.clone()) {
+                    claim_hits.push(ClaimSearchHit {
+                        id: cid,
+                        statement: stmt,
+                        claim_type: ctype,
+                        confidence: conf,
+                        source_uri: uri,
+                        relevance: 0.5,
+                    });
+                }
             }
         }
 
