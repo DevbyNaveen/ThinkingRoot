@@ -94,8 +94,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let mcp_routes = crate::mcp::sse::build_router(state.clone());
+
     Router::new()
         .nest("/api/v1", api_routes)
+        .nest("/mcp", mcp_routes)
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),

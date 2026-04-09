@@ -1,4 +1,5 @@
 pub mod resources;
+pub mod sse;
 pub mod stdio;
 pub mod tools;
 
