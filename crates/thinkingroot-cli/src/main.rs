@@ -7,6 +7,7 @@ use console::style;
 use tracing_subscriber::EnvFilter;
 
 mod pipeline;
+mod serve;
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +59,30 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "10")]
         top_k: usize,
     },
+    /// Start the REST API and MCP server
+    Serve {
+        /// Port to bind
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Host to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Optional API key for authentication
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Workspace paths (repeatable)
+        #[arg(long = "path", default_value = ".")]
+        paths: Vec<PathBuf>,
+        /// Run as MCP stdio server (single workspace, no HTTP)
+        #[arg(long)]
+        mcp_stdio: bool,
+        /// Disable REST API (MCP only)
+        #[arg(long)]
+        no_rest: bool,
+        /// Disable MCP endpoints (REST only)
+        #[arg(long)]
+        no_mcp: bool,
+    },
 }
 
 #[tokio::main]
@@ -88,6 +113,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Query { query, path, top_k }) => {
             run_query(&path, &query, top_k).await?;
+        }
+        Some(Commands::Serve {
+            port,
+            host,
+            api_key,
+            paths,
+            mcp_stdio,
+            no_rest,
+            no_mcp,
+        }) => {
+            serve::run_serve(port, host, api_key, paths, mcp_stdio, no_rest, no_mcp).await?;
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.

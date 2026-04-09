@@ -30,6 +30,7 @@ indicatif = { workspace = true }
 console = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+axum = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
