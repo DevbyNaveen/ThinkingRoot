@@ -11,6 +11,7 @@ members = [
     "crates/thinkingroot-serve",
     "crates/thinkingroot-safety",
     "crates/thinkingroot-cli",
+    "thinkingroot-python",
 ]
 
 [workspace.package]

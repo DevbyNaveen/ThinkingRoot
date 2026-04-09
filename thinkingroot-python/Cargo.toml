@@ -1,0 +1,22 @@
+[package]
+name = "thinkingroot-python"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_thinkingroot"
+crate-type = ["cdylib"]
+
+[dependencies]
+thinkingroot-core = { path = "../crates/thinkingroot-core" }
+thinkingroot-graph = { path = "../crates/thinkingroot-graph" }
+thinkingroot-parse = { path = "../crates/thinkingroot-parse" }
+thinkingroot-extract = { path = "../crates/thinkingroot-extract" }
+thinkingroot-link = { path = "../crates/thinkingroot-link" }
+thinkingroot-compile = { path = "../crates/thinkingroot-compile" }
+thinkingroot-verify = { path = "../crates/thinkingroot-verify" }
+thinkingroot-serve = { path = "../crates/thinkingroot-serve" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
