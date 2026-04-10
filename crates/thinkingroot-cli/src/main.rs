@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use console::style;
 use tracing_subscriber::EnvFilter;
 
+mod mcp_config;
 mod pipeline;
 mod serve;
 mod workspace;
@@ -98,6 +99,21 @@ enum Commands {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Write MCP configuration to detected AI tools
+    Connect {
+        /// Only connect this specific tool (e.g. "claude", "cursor")
+        #[arg(long)]
+        tool: Option<String>,
+        /// Port the ThinkingRoot server is running on
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Show what would be written without changing any files
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove ThinkingRoot entry from all tool configs
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,6 +192,9 @@ async fn main() -> anyhow::Result<()> {
                 workspace::run_workspace_remove(&name)?;
             }
         },
+        Some(Commands::Connect { tool, port, dry_run, remove }) => {
+            mcp_config::run_connect(tool.as_deref(), port, dry_run, remove)?;
+        }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
