@@ -134,3 +134,34 @@ fn semantic_hash_different_facts_differ() {
     let h2 = semantic_hash("AuthService uses OAuth2");
     assert_ne!(h1, h2);
 }
+
+use thinkingroot_branch::{create_branch, list_branches, read_head_branch};
+
+#[tokio::test]
+async fn create_branch_creates_layout_and_registry() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    // Create minimal main .thinkingroot/graph/ dir with a fake db file
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch(root, "feature/test", "main", None).await.unwrap();
+
+    // Branch dir should exist with db copy
+    assert!(root.join(".thinkingroot-feature-test/graph/graph.db").exists());
+
+    // Registry should have one active branch
+    let branches = list_branches(root).unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "feature/test");
+    assert_eq!(branches[0].parent, "main");
+}
+
+#[tokio::test]
+async fn read_head_defaults_to_main() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let head = read_head_branch(root).unwrap();
+    assert_eq!(head, "main");
+}
