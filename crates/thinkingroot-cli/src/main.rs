@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 mod mcp_config;
 mod pipeline;
 mod serve;
+mod setup;
 mod workspace;
 
 #[derive(Parser)]
@@ -100,6 +101,8 @@ enum Commands {
         #[arg(long)]
         install_service: bool,
     },
+    /// First-time guided setup wizard
+    Setup,
     /// Manage registered workspaces
     Workspace {
         #[command(subcommand)]
@@ -192,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             serve::run_serve(port, host, api_key, paths, name, mcp_stdio, no_rest, no_mcp).await?;
+        }
+        Some(Commands::Setup) => {
+            setup::run_setup().await?;
         }
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Add { path, name, port } => {
