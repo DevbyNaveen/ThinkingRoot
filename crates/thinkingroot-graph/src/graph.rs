@@ -467,7 +467,14 @@ impl GraphStore {
     /// Incrementally update entity_relations for specific (from, to, rel_type) triples.
     /// Removes the stale aggregated edge, then re-aggregates from source_entity_relations.
     /// If no source still contributes a triple, the aggregated edge stays deleted.
-    /// This is O(affected_triples) instead of O(all_edges).
+    ///
+    /// Note: the re-aggregation query scans source_entity_relations per triple because
+    /// (from_id, to_id, relation_type) is not a key prefix (source_id leads the key).
+    /// For graphs with many source-relation rows, callers should batch affected triples.
+    ///
+    /// If the same triple appears multiple times in `triples`, each occurrence is
+    /// processed independently (idempotent result, redundant work). Callers that
+    /// accumulate triples from multiple sources should deduplicate before calling.
     pub fn update_entity_relations_for_triples(
         &self,
         triples: &[(String, String, String)],
@@ -501,7 +508,12 @@ impl GraphStore {
                 let strength = match &row[0] {
                     DataValue::Num(Num::Float(f)) => *f,
                     DataValue::Num(Num::Int(i)) => *i as f64,
-                    _ => continue,
+                    _ => {
+                        tracing::warn!(
+                            "unexpected strength type for triple ({from_id}, {to_id}, {relation_type}), skipping re-insert"
+                        );
+                        continue;
+                    }
                 };
                 self.link_entities(from_id, to_id, relation_type, strength)?;
             }
@@ -1671,7 +1683,8 @@ mod tests {
 
         store.rebuild_entity_relations().unwrap();
         let before = store.get_all_relations().unwrap();
-        assert_eq!(before[0].5, 1.0, "max should be 1.0 initially");
+        let (_, _, _, _, _, initial_strength) = before[0];
+        assert_eq!(initial_strength, 1.0, "max should be 1.0 initially");
 
         // Capture triples, remove source A, re-add at lower strength.
         let affected = store.get_source_relation_triples(&sid_a).unwrap();
@@ -1686,6 +1699,7 @@ mod tests {
 
         let after = store.get_all_relations().unwrap();
         assert_eq!(after.len(), 1);
-        assert_eq!(after[0].5, 0.5, "max should now be 0.5 (src_b's contribution)");
+        let (_, _, _, _, _, final_strength) = after[0];
+        assert_eq!(final_strength, 0.5, "max should now be 0.5 (src_b's contribution)");
     }
 }
