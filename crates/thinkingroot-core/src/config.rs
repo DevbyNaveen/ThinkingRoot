@@ -40,6 +40,63 @@ impl Config {
         }
     }
 
+    /// Merge a parsed workspace config with the global config.
+    /// If the raw workspace TOML contains no `[llm]` section, the global LLM config wins.
+    /// If the workspace has an `[llm]` section, it wins — but individual provider credentials
+    /// from the global are inherited for any provider slot left as `None`.
+    pub fn merge_with_global(
+        mut workspace: Config,
+        raw_toml: &str,
+        global: &crate::global_config::GlobalConfig,
+    ) -> Config {
+        let has_llm_section = toml::from_str::<toml::Value>(raw_toml)
+            .ok()
+            .and_then(|v| v.as_table().map(|t| t.contains_key("llm")))
+            .unwrap_or(false);
+
+        if !has_llm_section {
+            workspace.llm = global.llm.clone();
+        } else {
+            // Workspace set its own LLM section — inherit individual provider creds from global
+            macro_rules! inherit {
+                ($field:ident) => {
+                    if workspace.llm.providers.$field.is_none() {
+                        workspace.llm.providers.$field = global.llm.providers.$field.clone();
+                    }
+                };
+            }
+            inherit!(openai);
+            inherit!(anthropic);
+            inherit!(ollama);
+            inherit!(groq);
+            inherit!(deepseek);
+            inherit!(openrouter);
+            inherit!(together);
+            inherit!(perplexity);
+            inherit!(litellm);
+            inherit!(custom);
+        }
+        workspace
+    }
+
+    /// Load workspace config merged with global config.
+    /// Priority: per-workspace `.thinkingroot/config.toml` > global `~/.config/thinkingroot/config.toml` > defaults.
+    pub fn load_merged(workspace_path: &std::path::Path) -> Result<Self> {
+        let global = crate::global_config::GlobalConfig::load().unwrap_or_default();
+        let config_path = workspace_path.join(".thinkingroot").join("config.toml");
+
+        if !config_path.exists() {
+            let mut config = Self::default();
+            config.llm = global.llm;
+            return Ok(config);
+        }
+
+        let raw = std::fs::read_to_string(&config_path)
+            .map_err(|e| Error::io_path(&config_path, e))?;
+        let workspace: Config = toml::from_str(&raw)?;
+        Ok(Self::merge_with_global(workspace, &raw, &global))
+    }
+
     /// Save config to the `.thinkingroot/config.toml` file.
     pub fn save(&self, root_path: &Path) -> Result<()> {
         let dir = root_path.join(".thinkingroot");
@@ -64,10 +121,15 @@ impl Default for Config {
     }
 }
 
+fn default_data_dir() -> String {
+    ".thinkingroot".to_string()
+}
+
 /// Workspace-level settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub name: Option<String>,
+    #[serde(default = "default_data_dir")]
     pub data_dir: String,
 }
 
@@ -253,6 +315,74 @@ pub struct SourceConfig {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn load_merged_uses_global_llm_when_workspace_has_no_llm_section() {
+        use crate::global_config::{GlobalConfig, ServeConfig};
+
+        let global = GlobalConfig {
+            llm: LlmConfig {
+                default_provider: "openrouter".to_string(),
+                extraction_model: "anthropic/claude-3-haiku".to_string(),
+                compilation_model: "anthropic/claude-3-haiku".to_string(),
+                max_concurrent_requests: 5,
+                request_timeout_secs: 120,
+                providers: ProvidersConfig::default(),
+            },
+            serve: ServeConfig::default(),
+        };
+
+        // Workspace config has NO llm section — raw TOML has only [workspace]
+        let workspace_toml = r#"
+[workspace]
+name = "myproject"
+"#;
+
+        let merged = Config::merge_with_global(
+            toml::from_str(workspace_toml).unwrap(),
+            workspace_toml,
+            &global,
+        );
+        assert_eq!(merged.llm.default_provider, "openrouter");
+        assert_eq!(merged.workspace.name, Some("myproject".to_string()));
+    }
+
+    #[test]
+    fn load_merged_workspace_llm_overrides_global() {
+        use crate::global_config::{GlobalConfig, ServeConfig};
+
+        let global = GlobalConfig {
+            llm: LlmConfig {
+                default_provider: "openrouter".to_string(),
+                extraction_model: "anthropic/claude-3-haiku".to_string(),
+                compilation_model: "anthropic/claude-3-haiku".to_string(),
+                max_concurrent_requests: 5,
+                request_timeout_secs: 120,
+                providers: ProvidersConfig::default(),
+            },
+            serve: ServeConfig::default(),
+        };
+
+        let workspace_toml = r#"
+[workspace]
+name = "myproject"
+
+[llm]
+default_provider = "ollama"
+extraction_model = "llama3"
+compilation_model = "llama3"
+max_concurrent_requests = 2
+request_timeout_secs = 60
+"#;
+
+        let merged = Config::merge_with_global(
+            toml::from_str(workspace_toml).unwrap(),
+            workspace_toml,
+            &global,
+        );
+        assert_eq!(merged.llm.default_provider, "ollama");
+        assert_eq!(merged.llm.extraction_model, "llama3");
+    }
 
     #[test]
     fn default_config_is_valid() {
