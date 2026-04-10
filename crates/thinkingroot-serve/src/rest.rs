@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::graph::serve_graph;
@@ -6,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -19,15 +20,28 @@ pub struct AppState {
     pub engine: RwLock<QueryEngine>,
     pub api_key: Option<String>,
     pub mcp_sessions: crate::mcp::sse::SseSessionMap,
+    /// Workspace root path for branch operations (None when multiple workspaces are mounted).
+    pub workspace_root: Option<PathBuf>,
 }
 
 impl AppState {
     /// Create a new `AppState` wrapped in `Arc`, initialising a fresh session map.
+    /// Backward-compatible — workspace_root defaults to None.
     pub fn new(engine: QueryEngine, api_key: Option<String>) -> Arc<Self> {
+        Self::new_with_root(engine, api_key, None)
+    }
+
+    /// Create a new `AppState` with an explicit workspace root path for branch operations.
+    pub fn new_with_root(
+        engine: QueryEngine,
+        api_key: Option<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             engine: RwLock::new(engine),
             api_key,
             mcp_sessions: crate::mcp::sse::new_session_map(),
+            workspace_root,
         })
     }
 }
@@ -117,7 +131,14 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/health", get(get_health))
             .route("/ws/{ws}/search", get(search))
             .route("/ws/{ws}/compile", post(compile))
-            .route("/ws/{ws}/verify", post(verify_ws));
+            .route("/ws/{ws}/verify", post(verify_ws))
+            // Branch endpoints
+            .route("/branches", get(list_branches_handler).post(create_branch_handler))
+            .route("/branches/{branch}/diff", get(diff_branch_handler))
+            .route("/branches/{branch}/merge", post(merge_branch_handler))
+            .route("/branches/{branch}/checkout", post(checkout_branch_handler))
+            .route("/branches/{branch}", delete(delete_branch_handler))
+            .route("/head", get(get_head_handler));
         router = router.nest("/api/v1", api_routes);
     }
 
@@ -318,6 +339,324 @@ async fn verify_ws(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -
     match engine.verify(&ws).await {
         Ok(result) => ok_response(result).into_response(),
         Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Branch Handlers ─────────────────────────────────────────
+
+async fn list_branches_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            // No workspace root set — return empty list (server started without --path)
+            let empty: Vec<serde_json::Value> = vec![];
+            return ok_response(serde_json::json!({ "branches": empty })).into_response();
+        }
+    };
+    match thinkingroot_branch::list_branches(&root) {
+        Ok(branches) => ok_response(serde_json::json!({ "branches": branches })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BRANCH_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn get_head_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return ok_response(serde_json::json!({ "head": "main" })).into_response();
+        }
+    };
+    match thinkingroot_branch::read_head_branch(&root) {
+        Ok(head) => ok_response(serde_json::json!({ "head": head })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BRANCH_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateBranchRequest {
+    name: String,
+    parent: Option<String>,
+    description: Option<String>,
+}
+
+async fn create_branch_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateBranchRequest>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            )
+        }
+    };
+    let parent = body.parent.as_deref().unwrap_or("main");
+    match thinkingroot_branch::create_branch(&root, &body.name, parent, body.description).await {
+        Ok(branch) => ok_response(serde_json::json!({ "branch": branch })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BRANCH_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn delete_branch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            )
+        }
+    };
+    match thinkingroot_branch::delete_branch(&root, &branch) {
+        Ok(_) => ok_response(serde_json::json!({ "deleted": branch })).into_response(),
+        Err(e) => err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &e.to_string()),
+    }
+}
+
+async fn checkout_branch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            )
+        }
+    };
+    match thinkingroot_branch::write_head_branch(&root, &branch) {
+        Ok(_) => ok_response(serde_json::json!({ "head": branch })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BRANCH_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn diff_branch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            )
+        }
+    };
+    use thinkingroot_branch::diff::compute_diff;
+    use thinkingroot_branch::snapshot::resolve_data_dir;
+    use thinkingroot_core::config::Config;
+    use thinkingroot_graph::graph::GraphStore;
+
+    let config = match Config::load_merged(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CONFIG_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    let mc = &config.merge;
+    let main_data_dir = resolve_data_dir(&root, None);
+    let branch_data_dir = resolve_data_dir(&root, Some(&branch));
+
+    if !branch_data_dir.exists() {
+        return err_response(
+            StatusCode::NOT_FOUND,
+            "BRANCH_NOT_FOUND",
+            &format!("branch '{}' not found", branch),
+        );
+    }
+
+    let main_graph = match GraphStore::init(&main_data_dir.join("graph")) {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    match compute_diff(
+        &main_graph,
+        &branch_graph,
+        &branch,
+        mc.auto_resolve_threshold,
+        mc.max_health_drop,
+        mc.block_on_contradictions,
+    ) {
+        Ok(diff) => ok_response(diff).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DIFF_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct MergeBranchRequest {
+    force: Option<bool>,
+    propagate_deletions: Option<bool>,
+}
+
+async fn merge_branch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+    body: Option<Json<MergeBranchRequest>>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            )
+        }
+    };
+    use thinkingroot_branch::diff::compute_diff;
+    use thinkingroot_branch::merge::execute_merge;
+    use thinkingroot_branch::snapshot::resolve_data_dir;
+    use thinkingroot_core::{config::Config, MergedBy};
+    use thinkingroot_graph::graph::GraphStore;
+
+    let force = body.as_ref().and_then(|b| b.force).unwrap_or(false);
+    let propagate_deletions = body
+        .as_ref()
+        .and_then(|b| b.propagate_deletions)
+        .unwrap_or(false);
+
+    let config = match Config::load_merged(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CONFIG_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    let mc = &config.merge;
+    let main_data_dir = resolve_data_dir(&root, None);
+    let branch_data_dir = resolve_data_dir(&root, Some(&branch));
+
+    if !branch_data_dir.exists() {
+        return err_response(
+            StatusCode::NOT_FOUND,
+            "BRANCH_NOT_FOUND",
+            &format!("branch '{}' not found", branch),
+        );
+    }
+
+    let main_graph = match GraphStore::init(&main_data_dir.join("graph")) {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+    let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let mut diff = match compute_diff(
+        &main_graph,
+        &branch_graph,
+        &branch,
+        mc.auto_resolve_threshold,
+        mc.max_health_drop,
+        mc.block_on_contradictions,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DIFF_ERROR",
+                &e.to_string(),
+            )
+        }
+    };
+
+    if force {
+        diff.merge_allowed = true;
+        diff.blocking_reasons.clear();
+    }
+
+    match execute_merge(
+        &root,
+        &branch,
+        &diff,
+        MergedBy::Human {
+            user: "api".to_string(),
+        },
+        propagate_deletions,
+    )
+    .await
+    {
+        Ok(_) => ok_response(serde_json::json!({
+            "merged": branch,
+            "new_claims": diff.new_claims.len(),
+            "new_entities": diff.new_entities.len(),
+            "auto_resolved": diff.auto_resolved.len(),
+        }))
+        .into_response(),
+        Err(e) => err_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "MERGE_BLOCKED",
+            &e.to_string(),
+        ),
     }
 }
 

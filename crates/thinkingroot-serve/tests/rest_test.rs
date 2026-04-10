@@ -104,3 +104,51 @@ async fn auth_accepts_with_correct_key() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ─── Branch Endpoints ────────────────────────────────────────
+
+#[tokio::test]
+async fn branch_list_endpoint_returns_ok() {
+    let app = empty_app(None).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/branches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert!(json["data"]["branches"].is_array(), "branches should be an array");
+}
+
+#[tokio::test]
+async fn head_endpoint_returns_ok() {
+    let app = empty_app(None).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/head")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+}
