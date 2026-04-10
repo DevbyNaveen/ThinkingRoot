@@ -72,18 +72,21 @@ enum Commands {
     },
     /// Start the REST API and MCP server
     Serve {
-        /// Port to bind
+        /// Port to bind (ignored when loading from registry — each workspace has its own port)
         #[arg(long, default_value = "3000")]
         port: u16,
         /// Host to bind
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// Optional API key for authentication
+        /// Optional API key for bearer authentication
         #[arg(long)]
         api_key: Option<String>,
-        /// Workspace paths (repeatable)
-        #[arg(long = "path", default_value = ".")]
+        /// Workspace paths to mount (repeatable; if omitted, reads from registry)
+        #[arg(long = "path")]
         paths: Vec<PathBuf>,
+        /// Mount a single workspace by registry name
+        #[arg(long)]
+        name: Option<String>,
         /// Run as MCP stdio server (single workspace, no HTTP)
         #[arg(long)]
         mcp_stdio: bool,
@@ -93,6 +96,9 @@ enum Commands {
         /// Disable MCP endpoints (REST only)
         #[arg(long)]
         no_mcp: bool,
+        /// Generate and install an OS-native service file (launchd/systemd/Windows)
+        #[arg(long)]
+        install_service: bool,
     },
     /// Manage registered workspaces
     Workspace {
@@ -175,11 +181,17 @@ async fn main() -> anyhow::Result<()> {
             host,
             api_key,
             paths,
+            name,
             mcp_stdio,
             no_rest,
             no_mcp,
+            install_service,
         }) => {
-            serve::run_serve(port, host, api_key, paths, mcp_stdio, no_rest, no_mcp).await?;
+            if install_service {
+                serve::install_service()?;
+                return Ok(());
+            }
+            serve::run_serve(port, host, api_key, paths, name, mcp_stdio, no_rest, no_mcp).await?;
         }
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Add { path, name, port } => {
