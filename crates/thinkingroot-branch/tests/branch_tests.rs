@@ -118,3 +118,19 @@ fn head_defaults_to_main() {
     // No HEAD file written yet
     assert_eq!(read_head(&refs_dir).unwrap(), "main");
 }
+
+use thinkingroot_branch::diff::semantic_hash;
+
+#[test]
+fn semantic_hash_normalises_whitespace_and_case() {
+    let h1 = semantic_hash("AuthService  uses  JWT");
+    let h2 = semantic_hash("authservice uses jwt");
+    assert_eq!(h1, h2, "same fact with different spacing/casing should hash identically");
+}
+
+#[test]
+fn semantic_hash_different_facts_differ() {
+    let h1 = semantic_hash("AuthService uses JWT");
+    let h2 = semantic_hash("AuthService uses OAuth2");
+    assert_ne!(h1, h2);
+}
