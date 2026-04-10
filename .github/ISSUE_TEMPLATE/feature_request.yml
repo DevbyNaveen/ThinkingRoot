@@ -1,0 +1,56 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Check [Discussions](https://github.com/thinkingroot/thinkingroot/discussions) first to see if it's already being talked about.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the pain point. What are you trying to do that's currently hard or impossible?
+      placeholder: I'm trying to... but ThinkingRoot doesn't...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it work? Include API sketches, CLI examples, or config snippets if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Any workarounds you're using today?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of ThinkingRoot?
+      options:
+        - Parser (new file type or format)
+        - Extraction (LLM / new claim types)
+        - Link (entity resolution / contradiction)
+        - Compile (new artifact type)
+        - Verify (new health check)
+        - REST API
+        - MCP Server
+        - Python SDK
+        - CLI
+        - Configuration
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context

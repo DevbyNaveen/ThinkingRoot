@@ -1,0 +1,92 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill this out as completely as possible.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: When I run `root compile ./my-repo`, it...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected it to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the behavior.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Error output
+      description: Paste any error messages or stack traces.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: ThinkingRoot version
+      description: "`root --version` output"
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux (x86_64)
+        - Linux (ARM64)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version (if built from source)
+      description: "`rustc --version` output"
+      placeholder: "rustc 1.85.0"
+
+  - type: dropdown
+    id: llm-provider
+    attributes:
+      label: LLM provider (if extraction-related)
+      options:
+        - AWS Bedrock
+        - OpenAI
+        - Anthropic
+        - Ollama
+        - Groq
+        - DeepSeek
+        - Not applicable
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that might help.

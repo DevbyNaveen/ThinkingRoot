@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/thinkingroot/thinkingroot/discussions
+    about: Use Discussions for questions and ideas
+  - name: Security vulnerability
+    url: https://github.com/thinkingroot/thinkingroot/security/advisories/new
+    about: Please report security issues privately
