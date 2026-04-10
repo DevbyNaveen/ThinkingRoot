@@ -33,6 +33,15 @@ pub enum Error {
     #[error("claim not found: {0}")]
     ClaimNotFound(String),
 
+    #[error("branch not found: {0}")]
+    BranchNotFound(String),
+
+    #[error("branch already exists: {0}")]
+    BranchAlreadyExists(String),
+
+    #[error("merge blocked: {0}")]
+    MergeBlocked(String),
+
     // --- LLM / Extraction ---
     #[error("llm provider error: {provider}: {message}")]
     LlmProvider { provider: String, message: String },

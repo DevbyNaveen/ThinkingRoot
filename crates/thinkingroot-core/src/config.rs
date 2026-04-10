@@ -24,6 +24,9 @@ pub struct Config {
 
     #[serde(default)]
     pub parsers: ParserConfig,
+
+    #[serde(default)]
+    pub merge: MergeConfig,
 }
 
 impl Config {
@@ -286,6 +289,46 @@ impl Default for ParserConfig {
             ],
             respect_gitignore: true,
             max_file_size: 1_048_576, // 1 MB
+        }
+    }
+}
+
+/// Configuration for knowledge branch merge behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConfig {
+    /// Maximum allowed health score drop during merge (default: 0.05 = 5%).
+    #[serde(default = "MergeConfig::default_max_health_drop")]
+    pub max_health_drop: f64,
+    /// Block merge if unresolved contradictions remain (default: true).
+    #[serde(default = "MergeConfig::default_block_on_contradictions")]
+    pub block_on_contradictions: bool,
+    /// Auto-resolve contradictions when confidence delta exceeds this threshold (default: 0.15).
+    #[serde(default = "MergeConfig::default_auto_resolve_threshold")]
+    pub auto_resolve_threshold: f64,
+    /// Require human approval before merge (default: false).
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+impl MergeConfig {
+    fn default_max_health_drop() -> f64 {
+        0.05
+    }
+    fn default_block_on_contradictions() -> bool {
+        true
+    }
+    fn default_auto_resolve_threshold() -> f64 {
+        0.15
+    }
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            max_health_drop: Self::default_max_health_drop(),
+            block_on_contradictions: Self::default_block_on_contradictions(),
+            auto_resolve_threshold: Self::default_auto_resolve_threshold(),
+            require_approval: false,
         }
     }
 }

@@ -1,14 +1,18 @@
 mod artifact;
+mod branch;
 mod claim;
 mod contradiction;
+mod diff;
 mod entity;
 mod relation;
 mod source;
 mod workspace;
 
 pub use artifact::*;
+pub use branch::*;
 pub use claim::*;
 pub use contradiction::*;
+pub use diff::*;
 pub use entity::*;
 pub use relation::*;
 pub use source::*;
