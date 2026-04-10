@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 
 /// Top-level configuration for a ThinkingRoot workspace.
 /// Stored at `.thinkingroot/config.toml` inside the target directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -86,8 +86,10 @@ impl Config {
         let config_path = workspace_path.join(".thinkingroot").join("config.toml");
 
         if !config_path.exists() {
-            let mut config = Self::default();
-            config.llm = global.llm;
+            let config = Self {
+                llm: global.llm,
+                ..Default::default()
+            };
             return Ok(config);
         }
 
@@ -105,19 +107,6 @@ impl Config {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(&config_path, content).map_err(|e| Error::io_path(&config_path, e))?;
         Ok(())
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            workspace: WorkspaceConfig::default(),
-            llm: LlmConfig::default(),
-            extraction: ExtractionConfig::default(),
-            compilation: CompilationConfig::default(),
-            verification: VerificationConfig::default(),
-            parsers: ParserConfig::default(),
-        }
     }
 }
 
