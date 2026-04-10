@@ -1,20 +1,22 @@
 use std::collections::HashMap;
-use tokio::sync::Semaphore;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
+use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
 use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_core::types::*;
-use thinkingroot_core::Result;
 
 use crate::llm::LlmClient;
 use crate::prompts;
 use crate::schema::ExtractionResult;
 
+type SharedLlm = Arc<LlmClient>;
+
 /// The main extraction engine. Takes DocumentIRs and produces
 /// Claims, Entities, and Relations via LLM extraction.
 pub struct Extractor {
-    llm: LlmClient,
+    llm: SharedLlm,
     concurrency: usize,
     min_confidence: f64,
 }
@@ -24,12 +26,18 @@ pub struct Extractor {
 pub struct ExtractionOutput {
     pub claims: Vec<Claim>,
     pub entities: Vec<Entity>,
-    pub relations: Vec<Relation>,
+    pub relations: Vec<SourcedRelation>,
     /// Maps ClaimId → entity names that the claim references.
     /// Used by the Linker to create claim→entity edges.
     pub claim_entity_names: HashMap<ClaimId, Vec<String>>,
     pub sources_processed: usize,
     pub chunks_processed: usize,
+}
+
+#[derive(Debug)]
+pub struct SourcedRelation {
+    pub source: SourceId,
+    pub relation: Relation,
 }
 
 impl Extractor {
@@ -39,85 +47,83 @@ impl Extractor {
             .with_max_retries(config.extraction.max_retries);
 
         Ok(Self {
-            llm,
+            llm: Arc::new(llm),
             concurrency: config.llm.max_concurrent_requests,
             min_confidence: config.extraction.min_confidence,
         })
     }
 
-    /// Extract knowledge from a batch of documents.
+    /// Extract knowledge from a batch of documents — all chunks run concurrently.
     pub async fn extract_all(
         &self,
         documents: &[DocumentIR],
         workspace_id: WorkspaceId,
     ) -> Result<ExtractionOutput> {
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
-        let mut output = ExtractionOutput::default();
+        let min_confidence = self.min_confidence;
+
+        // Collect all (doc, chunk) pairs upfront, spawn one task per chunk.
+        let mut handles = Vec::new();
 
         for doc in documents {
-            let result = self.extract_document(doc, workspace_id, &semaphore).await?;
-            output.merge(result);
-            output.sources_processed += 1;
+            for chunk in &doc.chunks {
+                let llm = Arc::clone(&self.llm);
+                let sem = Arc::clone(&semaphore);
+                let uri = doc.uri.clone();
+                let source_id = doc.source_id;
+                let content = chunk.content.clone();
+                let context = prompts::build_context(
+                    &doc.uri,
+                    chunk.language.as_deref(),
+                    chunk.heading.as_deref(),
+                );
+
+                let handle = tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok()?;
+                    match llm.extract(&content, &context).await {
+                        Ok(result) => Some((source_id, uri, result)),
+                        Err(e) => {
+                            tracing::warn!("extraction failed for chunk in {uri}: {e}");
+                            None
+                        }
+                    }
+                });
+
+                handles.push(handle);
+            }
         }
 
+        let mut output = ExtractionOutput::default();
+        let sources_processed = documents.len();
+
+        for handle in handles {
+            if let Ok(Some((source_id, _uri, result))) = handle.await {
+                let converted = Self::convert_result_static(result, source_id, workspace_id, min_confidence);
+                output.merge(converted);
+                output.chunks_processed += 1;
+            }
+        }
+
+        output.sources_processed = sources_processed;
+
         tracing::info!(
-            "extraction complete: {} claims, {} entities, {} relations from {} sources",
+            "extraction complete: {} claims, {} entities, {} relations from {} sources ({} chunks)",
             output.claims.len(),
             output.entities.len(),
             output.relations.len(),
             output.sources_processed,
+            output.chunks_processed,
         );
 
         Ok(output)
     }
 
-    /// Extract knowledge from a single document.
-    async fn extract_document(
-        &self,
-        doc: &DocumentIR,
-        workspace_id: WorkspaceId,
-        semaphore: &Arc<Semaphore>,
-    ) -> Result<ExtractionOutput> {
-        let mut output = ExtractionOutput::default();
-
-        for chunk in &doc.chunks {
-            let _permit = semaphore.acquire().await.map_err(|e| {
-                thinkingroot_core::Error::Extraction {
-                    source_id: doc.source_id.to_string(),
-                    message: format!("semaphore error: {e}"),
-                }
-            })?;
-
-            let context = prompts::build_context(
-                &doc.uri,
-                chunk.language.as_deref(),
-                chunk.heading.as_deref(),
-            );
-
-            match self.llm.extract(&chunk.content, &context).await {
-                Ok(result) => {
-                    let converted = self.convert_result(result, doc.source_id, workspace_id);
-                    output.merge(converted);
-                    output.chunks_processed += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "extraction failed for chunk in {}: {e}",
-                        doc.uri
-                    );
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    /// Convert LLM extraction results into core types.
-    fn convert_result(
-        &self,
+    /// Convert LLM extraction results into core types (static so spawned tasks can call it).
+    fn convert_result_static(
         result: ExtractionResult,
         source_id: SourceId,
         workspace_id: WorkspaceId,
+        min_confidence: f64,
     ) -> ExtractionOutput {
         let mut output = ExtractionOutput::default();
 
@@ -136,7 +142,7 @@ impl Extractor {
 
         // Convert claims and track their entity references.
         for ext_claim in &result.claims {
-            if ext_claim.confidence < self.min_confidence {
+            if ext_claim.confidence < min_confidence {
                 continue;
             }
             let claim_type = parse_claim_type(&ext_claim.claim_type);
@@ -159,7 +165,10 @@ impl Extractor {
                 let rel_type = parse_relation_type(&ext_rel.relation_type);
                 let rel = Relation::new(from, to, rel_type)
                     .with_description(ext_rel.description.clone().unwrap_or_default());
-                output.relations.push(rel);
+                output.relations.push(SourcedRelation {
+                    source: source_id,
+                    relation: rel,
+                });
             }
         }
 

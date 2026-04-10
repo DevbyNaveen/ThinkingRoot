@@ -73,7 +73,7 @@ enum Commands {
     },
     /// Start the REST API and MCP server
     Serve {
-        /// Port to bind (ignored when loading from registry — each workspace has its own port)
+        /// Port to bind [default: 3000]
         #[arg(long, default_value = "3000")]
         port: u16,
         /// Host to bind

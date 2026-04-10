@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::graph::serve_graph;
+use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -17,6 +18,18 @@ use crate::engine::{ClaimFilter, QueryEngine};
 pub struct AppState {
     pub engine: RwLock<QueryEngine>,
     pub api_key: Option<String>,
+    pub mcp_sessions: crate::mcp::sse::SseSessionMap,
+}
+
+impl AppState {
+    /// Create a new `AppState` wrapped in `Arc`, initialising a fresh session map.
+    pub fn new(engine: QueryEngine, api_key: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            engine: RwLock::new(engine),
+            api_key,
+            mcp_sessions: crate::mcp::sse::new_session_map(),
+        })
+    }
 }
 
 // ─── Response Envelope ───────────────────────────────────────
@@ -86,6 +99,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
 
     let mut router = Router::new();
 
+    // Graph explorer — always available when REST is on
+    if enable_rest {
+        router = router.route("/graph", get(serve_graph));
+    }
+
     if enable_rest {
         let api_routes = Router::new()
             .route("/workspaces", get(list_workspaces))
@@ -151,14 +169,15 @@ async fn list_workspaces(State(state): State<Arc<AppState>>) -> Response {
     let engine = state.engine.read().await;
     match engine.list_workspaces().await {
         Ok(ws) => ok_response(ws).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", &e.to_string()),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            &e.to_string(),
+        ),
     }
 }
 
-async fn list_entities(
-    State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
-) -> Response {
+async fn list_entities(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
     match engine.list_entities(&ws).await {
         Ok(entities) => ok_response(entities).into_response(),
@@ -196,10 +215,7 @@ async fn list_claims(
     }
 }
 
-async fn get_all_relations(
-    State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
-) -> Response {
+async fn get_all_relations(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
     match engine.get_all_relations(&ws).await {
         Ok(rels) => {
@@ -231,10 +247,7 @@ async fn get_entity_relations(
     }
 }
 
-async fn list_artifacts(
-    State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
-) -> Response {
+async fn list_artifacts(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
     match engine.list_artifacts(&ws).await {
         Ok(artifacts) => ok_response(artifacts).into_response(),
@@ -257,7 +270,11 @@ async fn get_artifact(
                 .unwrap_or(false);
 
             if wants_markdown {
-                (StatusCode::OK, [("content-type", "text/markdown")], artifact.content)
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/markdown")],
+                    artifact.content,
+                )
                     .into_response()
             } else {
                 ok_response(artifact).into_response()
@@ -267,10 +284,7 @@ async fn get_artifact(
     }
 }
 
-async fn get_health(
-    State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
-) -> Response {
+async fn get_health(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
     match engine.health(&ws).await {
         Ok(result) => ok_response(result).into_response(),
@@ -291,21 +305,15 @@ async fn search(
     }
 }
 
-async fn compile(
-    State(_state): State<Arc<AppState>>,
-    Path(_ws): Path<String>,
-) -> Response {
-    err_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "NOT_IMPLEMENTED",
-        "Compile endpoint will be implemented in Task 4 via serve.rs"
-    )
+async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    let engine = state.engine.read().await;
+    match engine.compile(&ws).await {
+        Ok(result) => ok_response(result).into_response(),
+        Err(e) => match_engine_error(e),
+    }
 }
 
-async fn verify_ws(
-    State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
-) -> Response {
+async fn verify_ws(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
     match engine.verify(&ws).await {
         Ok(result) => ok_response(result).into_response(),

@@ -1,3 +1,5 @@
 pub mod engine;
-pub mod rest;
+pub mod graph;
 pub mod mcp;
+pub mod pipeline;
+pub mod rest;

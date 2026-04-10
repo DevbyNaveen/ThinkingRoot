@@ -194,7 +194,7 @@ impl QueryEngine {
             )));
         }
 
-        let config = Config::load(&root_path)?;
+        let config = Config::load_merged(&root_path)?;
         let storage = StorageEngine::init(&data_dir).await?;
 
         self.workspaces.insert(

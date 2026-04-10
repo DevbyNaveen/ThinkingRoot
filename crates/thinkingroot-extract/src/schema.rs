@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 /// This is what we parse from the LLM response for each chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
+    #[serde(default)]
     pub claims: Vec<ExtractedClaim>,
+    #[serde(default)]
     pub entities: Vec<ExtractedEntity>,
+    #[serde(default)]
     pub relations: Vec<ExtractedRelation>,
 }
 

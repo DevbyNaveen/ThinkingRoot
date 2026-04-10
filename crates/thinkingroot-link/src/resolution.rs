@@ -28,11 +28,11 @@ pub fn resolve_entity(new_entity: &Entity, existing: &[Entity]) -> Option<Entity
         }
 
         // Fuzzy match on canonical names.
-        let similarity = normalized_levenshtein(
-            &existing_entity.canonical_name.to_lowercase(),
-            &new_name,
-        );
-        if similarity >= SIMILARITY_THRESHOLD && existing_entity.entity_type == new_entity.entity_type {
+        let similarity =
+            normalized_levenshtein(&existing_entity.canonical_name.to_lowercase(), &new_name);
+        if similarity >= SIMILARITY_THRESHOLD
+            && existing_entity.entity_type == new_entity.entity_type
+        {
             return Some(existing_entity.id);
         }
     }
@@ -75,9 +75,7 @@ mod tests {
 
     #[test]
     fn alias_match() {
-        let existing = vec![
-            Entity::new("PostgreSQL", EntityType::Database).with_alias("postgres")
-        ];
+        let existing = vec![Entity::new("PostgreSQL", EntityType::Database).with_alias("postgres")];
         let new = Entity::new("postgres", EntityType::Database);
         assert!(resolve_entity(&new, &existing).is_some());
     }

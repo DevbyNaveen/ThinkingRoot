@@ -1,6 +1,6 @@
-use serde_json::Value;
 use super::JsonRpcResponse;
 use crate::engine::{ClaimFilter, QueryEngine};
+use serde_json::Value;
 
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     let tools = serde_json::json!({
@@ -25,28 +25,53 @@ pub async fn handle_call(
         Some(n) => n,
         None => return JsonRpcResponse::error(id, -32602, "Missing 'name' parameter".to_string()),
     };
-    let arguments = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
-    let ws = arguments.get("workspace").and_then(|v| v.as_str()).or(default_ws).unwrap_or("default");
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+    let ws = arguments
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .or(default_ws)
+        .unwrap_or("default");
 
     match tool_name {
         "search" => {
             let query = match arguments.get("query").and_then(|v| v.as_str()) {
                 Some(q) => q,
-                None => return JsonRpcResponse::error(id, -32602, "Missing 'query' argument".to_string()),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'query' argument".to_string(),
+                    );
+                }
             };
-            let top_k = arguments.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let top_k = arguments
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
             match engine.search(ws, query, top_k).await {
                 Ok(results) => {
                     let content = serde_json::to_string_pretty(&results).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "content": [{ "type": "text", "text": content }] }))
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                    )
                 }
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
         "query_claims" => {
             let filter = ClaimFilter {
-                claim_type: arguments.get("type").and_then(|v| v.as_str()).map(String::from),
-                entity_name: arguments.get("entity").and_then(|v| v.as_str()).map(String::from),
+                claim_type: arguments
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                entity_name: arguments
+                    .get("entity")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 min_confidence: arguments.get("min_confidence").and_then(|v| v.as_f64()),
                 limit: Some(100),
                 offset: None,
@@ -54,7 +79,10 @@ pub async fn handle_call(
             match engine.list_claims(ws, filter).await {
                 Ok(claims) => {
                     let content = serde_json::to_string_pretty(&claims).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "content": [{ "type": "text", "text": content }] }))
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                    )
                 }
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
@@ -62,28 +90,45 @@ pub async fn handle_call(
         "get_relations" => {
             let entity = match arguments.get("entity").and_then(|v| v.as_str()) {
                 Some(e) => e,
-                None => return JsonRpcResponse::error(id, -32602, "Missing 'entity' argument".to_string()),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'entity' argument".to_string(),
+                    );
+                }
             };
             match engine.get_relations(ws, entity).await {
                 Ok(rels) => {
                     let content = serde_json::to_string_pretty(&rels).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "content": [{ "type": "text", "text": content }] }))
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                    )
                 }
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
-        "compile" => {
-            JsonRpcResponse::error(id, -32603, "Compile not yet implemented in MCP tools".to_string())
-        }
-        "health_check" => {
-            match engine.health(ws).await {
-                Ok(result) => {
-                    let content = serde_json::to_string_pretty(&result).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "content": [{ "type": "text", "text": content }] }))
-                }
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        "compile" => match engine.compile(ws).await {
+            Ok(result) => {
+                let content = serde_json::to_string_pretty(&result).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                )
             }
-        }
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        "health_check" => match engine.health(ws).await {
+            Ok(result) => {
+                let content = serde_json::to_string_pretty(&result).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                )
+            }
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
     }
 }

@@ -1,6 +1,6 @@
-use serde_json::Value;
 use super::JsonRpcResponse;
 use crate::engine::QueryEngine;
+use serde_json::Value;
 
 pub async fn handle_list(
     id: Option<Value>,
@@ -18,7 +18,15 @@ pub async fn handle_list(
         resources.push(serde_json::json!({ "uri": format!("thinkingroot://{}/entities", name), "name": format!("{} — Entities", name), "mimeType": "application/json" }));
         resources.push(serde_json::json!({ "uri": format!("thinkingroot://{}/health", name), "name": format!("{} — Health", name), "mimeType": "application/json" }));
         resources.push(serde_json::json!({ "uri": format!("thinkingroot://{}/contradictions", name), "name": format!("{} — Contradictions", name), "mimeType": "application/json" }));
-        for atype in &["architecture-map", "contradiction-report", "decision-log", "task-pack", "agent-brief", "runbook", "health-report"] {
+        for atype in &[
+            "architecture-map",
+            "contradiction-report",
+            "decision-log",
+            "task-pack",
+            "agent-brief",
+            "runbook",
+            "health-report",
+        ] {
             resources.push(serde_json::json!({ "uri": format!("thinkingroot://{}/artifacts/{}", name, atype), "name": format!("{} — {}", name, atype), "mimeType": "text/markdown" }));
         }
     }
@@ -45,7 +53,9 @@ pub async fn handle_read(
     let ws = if parts.is_empty() || parts[0].is_empty() {
         match default_ws {
             Some(w) => w,
-            None => return JsonRpcResponse::error(id, -32602, "No workspace specified".to_string()),
+            None => {
+                return JsonRpcResponse::error(id, -32602, "No workspace specified".to_string());
+            }
         }
     } else {
         parts[0]
@@ -55,48 +65,57 @@ pub async fn handle_read(
     let resource_name = parts.get(2).copied().unwrap_or("");
 
     match resource_type {
-        "entities" if resource_name.is_empty() => {
-            match engine.list_entities(ws).await {
-                Ok(entities) => {
-                    let content = serde_json::to_string_pretty(&entities).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }))
-                }
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        "entities" if resource_name.is_empty() => match engine.list_entities(ws).await {
+            Ok(entities) => {
+                let content = serde_json::to_string_pretty(&entities).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }),
+                )
             }
-        }
-        "entities" => {
-            match engine.get_entity(ws, resource_name).await {
-                Ok(entity) => {
-                    let content = serde_json::to_string_pretty(&entity).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }))
-                }
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        "entities" => match engine.get_entity(ws, resource_name).await {
+            Ok(entity) => {
+                let content = serde_json::to_string_pretty(&entity).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }),
+                )
             }
-        }
-        "health" => {
-            match engine.health(ws).await {
-                Ok(result) => {
-                    let content = serde_json::to_string_pretty(&result).unwrap_or_default();
-                    JsonRpcResponse::success(id, serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }))
-                }
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        "health" => match engine.health(ws).await {
+            Ok(result) => {
+                let content = serde_json::to_string_pretty(&result).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": content }] }),
+                )
             }
-        }
-        "contradictions" => {
-            match engine.health(ws).await {
-                Ok(result) => {
-                    let content = serde_json::json!({ "contradictions": result.contradictions, "warnings": result.warnings });
-                    JsonRpcResponse::success(id, serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&content).unwrap_or_default() }] }))
-                }
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        "contradictions" => match engine.health(ws).await {
+            Ok(result) => {
+                let content = serde_json::json!({ "contradictions": result.contradictions, "warnings": result.warnings });
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": serde_json::to_string_pretty(&content).unwrap_or_default() }] }),
+                )
             }
-        }
-        "artifacts" => {
-            match engine.get_artifact(ws, resource_name).await {
-                Ok(artifact) => JsonRpcResponse::success(id, serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": artifact.content }] })),
-                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
-            }
-        }
-        _ => JsonRpcResponse::error(id, -32602, format!("Unknown resource type: {}", resource_type)),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        "artifacts" => match engine.get_artifact(ws, resource_name).await {
+            Ok(artifact) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": artifact.content }] }),
+            ),
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+        _ => JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("Unknown resource type: {}", resource_type),
+        ),
     }
 }

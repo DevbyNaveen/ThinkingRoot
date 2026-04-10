@@ -36,7 +36,12 @@ pub struct JsonRpcError {
 
 impl JsonRpcResponse {
     pub fn success(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn error(id: Option<Value>, code: i32, message: String) -> Self {
@@ -44,7 +49,11 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message, data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: None,
+            }),
         }
     }
 }
@@ -67,7 +76,9 @@ pub async fn dispatch(
         "initialize" => JsonRpcResponse::success(id, server_info()),
         "notifications/initialized" => JsonRpcResponse::success(id, Value::Null),
         "resources/list" => resources::handle_list(id, engine, default_workspace).await,
-        "resources/read" => resources::handle_read(id, &request.params, engine, default_workspace).await,
+        "resources/read" => {
+            resources::handle_read(id, &request.params, engine, default_workspace).await
+        }
         "tools/list" => tools::handle_list(id).await,
         "tools/call" => tools::handle_call(id, &request.params, engine, default_workspace).await,
         "ping" => JsonRpcResponse::success(id, serde_json::json!({})),

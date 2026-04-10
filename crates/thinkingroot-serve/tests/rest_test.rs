@@ -3,22 +3,16 @@
 //! Spins up an in-memory QueryEngine and verifies all REST endpoints
 //! return correct status codes and envelope shapes.
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use thinkingroot_serve::engine::QueryEngine;
-use thinkingroot_serve::rest::{build_router, AppState};
+use thinkingroot_serve::rest::{AppState, build_router};
 
 async fn empty_app(api_key: Option<String>) -> axum::Router {
     let engine = QueryEngine::new();
-    let state = Arc::new(AppState {
-        engine: RwLock::new(engine),
-        api_key,
-    });
+    let state = AppState::new(engine, api_key);
     build_router(state)
 }
 

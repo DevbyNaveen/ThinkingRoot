@@ -7,15 +7,21 @@ edition = "2024"
 name = "_thinkingroot"
 crate-type = ["cdylib"]
 
+[features]
+## Enable vector/semantic search. On by default (matches production maturin builds).
+## Disable with --no-default-features for lighter workspace test builds.
+default = ["vector"]
+vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector"]
+
 [dependencies]
 thinkingroot-core = { path = "../crates/thinkingroot-core" }
-thinkingroot-graph = { path = "../crates/thinkingroot-graph" }
+thinkingroot-graph = { path = "../crates/thinkingroot-graph", default-features = false }
 thinkingroot-parse = { path = "../crates/thinkingroot-parse" }
 thinkingroot-extract = { path = "../crates/thinkingroot-extract" }
 thinkingroot-link = { path = "../crates/thinkingroot-link" }
 thinkingroot-compile = { path = "../crates/thinkingroot-compile" }
 thinkingroot-verify = { path = "../crates/thinkingroot-verify" }
-thinkingroot-serve = { path = "../crates/thinkingroot-serve" }
+thinkingroot-serve = { path = "../crates/thinkingroot-serve", default-features = false }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

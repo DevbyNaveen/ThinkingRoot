@@ -1,7 +1,7 @@
 use chrono::Utc;
+use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
 use thinkingroot_core::types::HealthScore;
-use thinkingroot_core::Result;
 use thinkingroot_graph::graph::GraphStore;
 
 /// The Verifier runs health checks on the knowledge base.
@@ -32,8 +32,7 @@ impl Verifier {
         let mut warnings = Vec::new();
 
         // Staleness: count claims older than staleness_days.
-        let cutoff = Utc::now().timestamp() as f64
-            - (self.staleness_days as f64 * 86400.0);
+        let cutoff = Utc::now().timestamp() as f64 - (self.staleness_days as f64 * 86400.0);
         let stale_claims = graph.count_stale_claims(cutoff)?;
 
         let freshness = if claims > 0 {
@@ -64,11 +63,7 @@ impl Verifier {
         };
 
         // Provenance: all claims should have valid source links.
-        let provenance = if claims > 0 && sources > 0 {
-            1.0
-        } else {
-            0.0
-        };
+        let provenance = if claims > 0 && sources > 0 { 1.0 } else { 0.0 };
 
         if sources == 0 {
             warnings.push("No sources ingested yet.".to_string());
@@ -92,13 +87,17 @@ impl Verifier {
         // Orphan detection: claims whose source no longer exists.
         let orphaned_claims = graph.count_orphaned_claims()?;
         if orphaned_claims > 0 {
-            warnings.push(format!("{orphaned_claims} orphaned claims (source deleted or missing)."));
+            warnings.push(format!(
+                "{orphaned_claims} orphaned claims (source deleted or missing)."
+            ));
         }
 
         // Confidence decay: count superseded claims still referenced.
         let superseded = graph.count_superseded_claims()?;
         if superseded > 0 {
-            warnings.push(format!("{superseded} claims have been superseded by newer information."));
+            warnings.push(format!(
+                "{superseded} claims have been superseded by newer information."
+            ));
         }
 
         let health_score = HealthScore::compute(freshness, consistency, coverage, provenance);

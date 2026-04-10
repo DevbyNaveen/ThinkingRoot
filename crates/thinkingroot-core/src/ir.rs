@@ -60,7 +60,12 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn new(content: impl Into<String>, chunk_type: ChunkType, start_line: u32, end_line: u32) -> Self {
+    pub fn new(
+        content: impl Into<String>,
+        chunk_type: ChunkType,
+        start_line: u32,
+        end_line: u32,
+    ) -> Self {
         Self {
             content: content.into(),
             chunk_type,

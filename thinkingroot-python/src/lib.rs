@@ -1,6 +1,12 @@
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::path::PathBuf;
+
+// Custom exception exported to Python as `thinkingroot.ThinkingRootError`.
+pyo3::create_exception!(
+    _thinkingroot,
+    ThinkingRootError,
+    pyo3::exceptions::PyException
+);
 
 /// Build a single-threaded tokio runtime for blocking PyO3 calls.
 fn runtime() -> tokio::runtime::Runtime {
@@ -18,56 +24,9 @@ fn runtime() -> tokio::runtime::Runtime {
 fn compile(path: &str) -> PyResult<PyObject> {
     let root = PathBuf::from(path);
     let rt = runtime();
-    let result = rt.block_on(async {
-        let config = thinkingroot_core::config::Config::load(&root)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let documents = thinkingroot_parse::parse_directory(&root, &config.parsers)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let data_dir = root.join(".thinkingroot");
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let storage = thinkingroot_graph::StorageEngine::init(&data_dir)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let ws_id = thinkingroot_core::types::WorkspaceId::new();
-        // Extractor::new is async — initialises the embedding model.
-        let extractor = thinkingroot_extract::Extractor::new(&config)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let extraction = extractor
-            .extract_all(&documents, ws_id)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let linker = thinkingroot_link::Linker::new(&storage.graph);
-        let link_result = linker
-            .link(extraction)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let compiler = thinkingroot_compile::Compiler::new(&config)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let artifacts = compiler
-            .compile_all(&storage.graph, &data_dir)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let verifier = thinkingroot_verify::Verifier::new(&config);
-        let verification = verifier
-            .verify(&storage.graph)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        Ok::<_, PyErr>(serde_json::json!({
-            "files_parsed": documents.len(),
-            "claims_count": link_result.claims_linked,
-            "entities_count": link_result.entities_created + link_result.entities_merged,
-            "relations_count": link_result.relations_linked,
-            "contradictions_count": link_result.contradictions_detected,
-            "artifacts_count": artifacts.len(),
-            "health_score": verification.health_score.as_percentage(),
-        }))
-    })?;
+    let result = rt
+        .block_on(thinkingroot_serve::pipeline::run_pipeline(&root))
+        .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
 
     to_py_json(&result)
 }
@@ -80,7 +39,7 @@ fn parse_directory(path: &str) -> PyResult<PyObject> {
     let root = PathBuf::from(path);
     let config = thinkingroot_core::config::ParserConfig::default();
     let docs = thinkingroot_parse::parse_directory(&root, &config)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
 
     let result: Vec<serde_json::Value> = docs
         .iter()
@@ -102,7 +61,7 @@ fn parse_directory(path: &str) -> PyResult<PyObject> {
 fn parse_file(path: &str) -> PyResult<PyObject> {
     let file_path = PathBuf::from(path);
     let doc = thinkingroot_parse::parse_file(&file_path)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
 
     let result = serde_json::json!({
         "uri": doc.uri,
@@ -139,7 +98,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.list_entities(&self.ws_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
@@ -147,16 +106,12 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.get_entity(&self.ws_name, name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
     #[pyo3(signature = (r#type=None, min_confidence=None))]
-    fn get_claims(
-        &self,
-        r#type: Option<&str>,
-        min_confidence: Option<f64>,
-    ) -> PyResult<PyObject> {
+    fn get_claims(&self, r#type: Option<&str>, min_confidence: Option<f64>) -> PyResult<PyObject> {
         let filter = thinkingroot_serve::engine::ClaimFilter {
             claim_type: r#type.map(String::from),
             min_confidence,
@@ -165,7 +120,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.list_claims(&self.ws_name, filter))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
@@ -173,7 +128,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.get_relations(&self.ws_name, entity))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
@@ -181,7 +136,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.get_all_relations(&self.ws_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         // Convert raw tuples to named-field objects matching the REST API shape.
         let data: Vec<serde_json::Value> = result
             .into_iter()
@@ -203,7 +158,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.search(&self.ws_name, query, k))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
@@ -211,7 +166,7 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.health(&self.ws_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
@@ -219,25 +174,24 @@ impl Engine {
         let result = self
             .rt
             .block_on(self.inner.verify(&self.ws_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         to_py_json(&result)
     }
 
     fn get_sources(&self) -> PyResult<PyObject> {
-        Err(PyRuntimeError::new_err(
-            "get_sources not yet implemented — use health() for source count",
-        ))
+        let result = self
+            .rt
+            .block_on(self.inner.list_sources(&self.ws_name))
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
+        to_py_json(&result)
     }
 
     fn get_contradictions(&self) -> PyResult<PyObject> {
         let result = self
             .rt
-            .block_on(self.inner.health(&self.ws_name))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        to_py_json(&serde_json::json!({
-            "count": result.contradictions,
-            "warnings": result.warnings,
-        }))
+            .block_on(self.inner.list_contradictions(&self.ws_name))
+            .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
+        to_py_json(&result)
     }
 }
 
@@ -249,7 +203,7 @@ impl Engine {
 fn open(path: &str) -> PyResult<Engine> {
     let root = PathBuf::from(path);
     let abs_path = std::fs::canonicalize(&root)
-        .map_err(|e| PyRuntimeError::new_err(format!("Invalid path: {}", e)))?;
+        .map_err(|e| ThinkingRootError::new_err(format!("Invalid path: {}", e)))?;
     let name = abs_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -258,7 +212,7 @@ fn open(path: &str) -> PyResult<Engine> {
     let rt = runtime();
     let mut engine = thinkingroot_serve::engine::QueryEngine::new();
     rt.block_on(engine.mount(name.clone(), abs_path))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
 
     Ok(Engine {
         inner: engine,
@@ -272,8 +226,8 @@ fn open(path: &str) -> PyResult<Engine> {
 /// Convert a Serialize value to a Python object via JSON round-trip.
 fn to_py_json<T: serde::Serialize>(value: &T) -> PyResult<PyObject> {
     Python::with_gil(|py| {
-        let json_str = serde_json::to_string(value)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let json_str =
+            serde_json::to_string(value).map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
         let json_module = py.import("json")?;
         json_module
             .call_method1("loads", (json_str,))
@@ -285,6 +239,7 @@ fn to_py_json<T: serde::Serialize>(value: &T) -> PyResult<PyObject> {
 
 #[pymodule]
 fn _thinkingroot(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("ThinkingRootError", m.py().get_type::<ThinkingRootError>())?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(parse_directory, m)?)?;
     m.add_function(wrap_pyfunction!(parse_file, m)?)?;

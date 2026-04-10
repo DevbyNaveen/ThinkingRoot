@@ -25,22 +25,16 @@ impl Compiler {
     }
 
     /// Compile all artifacts and write them to disk.
-    pub fn compile_all(
-        &self,
-        graph: &GraphStore,
-        data_dir: &Path,
-    ) -> Result<Vec<Artifact>> {
+    pub fn compile_all(&self, graph: &GraphStore, data_dir: &Path) -> Result<Vec<Artifact>> {
         let output_path = data_dir.join(&self.output_dir);
-        std::fs::create_dir_all(&output_path)
-            .map_err(|e| Error::io_path(&output_path, e))?;
+        std::fs::create_dir_all(&output_path).map_err(|e| Error::io_path(&output_path, e))?;
 
         let mut artifacts = Vec::new();
 
         // 1. Compile entity pages.
         let entities = graph.get_all_entities()?;
         let entities_dir = output_path.join("entities");
-        std::fs::create_dir_all(&entities_dir)
-            .map_err(|e| Error::io_path(&entities_dir, e))?;
+        std::fs::create_dir_all(&entities_dir).map_err(|e| Error::io_path(&entities_dir, e))?;
 
         for (entity_id, entity_name, entity_type) in &entities {
             match self.compile_entity_page(graph, entity_id, entity_name, entity_type) {
@@ -380,9 +374,7 @@ impl Compiler {
 
         let contradictions: Vec<serde_json::Value> = contradictions_raw
             .iter()
-            .map(|(_, _, _, explanation, _)| {
-                serde_json::json!({ "explanation": explanation })
-            })
+            .map(|(_, _, _, explanation, _)| serde_json::json!({ "explanation": explanation }))
             .collect();
 
         let mut context = Context::new();
@@ -400,11 +392,7 @@ impl Compiler {
             .render("task_pack.md", &context)
             .map_err(|e| Error::Template(e.to_string()))?;
 
-        Ok(Artifact::new(
-            ArtifactType::TaskPack,
-            "Task Pack",
-            content,
-        ))
+        Ok(Artifact::new(ArtifactType::TaskPack, "Task Pack", content))
     }
 
     fn compile_agent_brief(&self, graph: &GraphStore) -> Result<Artifact> {
@@ -534,9 +522,7 @@ impl Compiler {
 
         let contradictions: Vec<serde_json::Value> = contradictions_raw
             .iter()
-            .map(|(_, _, _, explanation, _)| {
-                serde_json::json!({ "explanation": explanation })
-            })
+            .map(|(_, _, _, explanation, _)| serde_json::json!({ "explanation": explanation }))
             .collect();
 
         let mut context = Context::new();
@@ -559,7 +545,11 @@ impl Compiler {
     }
 
     /// Helper: query claims by type and return as JSON array for templates.
-    fn claims_by_type_to_json(&self, graph: &GraphStore, claim_type: &str) -> Result<Vec<serde_json::Value>> {
+    fn claims_by_type_to_json(
+        &self,
+        graph: &GraphStore,
+        claim_type: &str,
+    ) -> Result<Vec<serde_json::Value>> {
         Ok(graph
             .get_claims_by_type(claim_type)?
             .iter()

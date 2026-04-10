@@ -83,12 +83,7 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
             if diff_output.status.success() {
                 let diff_stat = String::from_utf8_lossy(&diff_output.stdout);
                 if !diff_stat.trim().is_empty() {
-                    doc.add_chunk(Chunk::new(
-                        diff_stat.trim(),
-                        ChunkType::Code,
-                        2,
-                        2,
-                    ));
+                    doc.add_chunk(Chunk::new(diff_stat.trim(), ChunkType::Code, 2, 2));
                 }
             }
         }
@@ -96,7 +91,11 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
         documents.push(doc);
     }
 
-    tracing::info!("parsed {} git commits from {}", documents.len(), repo_path.display());
+    tracing::info!(
+        "parsed {} git commits from {}",
+        documents.len(),
+        repo_path.display()
+    );
     Ok(documents)
 }
 

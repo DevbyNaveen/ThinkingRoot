@@ -7,6 +7,13 @@ authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+## Enable neural embedding via fastembed + ONNX Runtime. Disable for faster
+## test builds or environments where the ~300MB ONNX runtime is undesirable.
+## When disabled, VectorStore is a no-op that returns empty search results.
+default = ["vector"]
+vector = ["dep:fastembed"]
+
 [dependencies]
 thinkingroot-core = { workspace = true }
 serde = { workspace = true }
@@ -17,7 +24,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 cozo = { workspace = true }
 
-fastembed = "5"
+fastembed = { version = "5", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

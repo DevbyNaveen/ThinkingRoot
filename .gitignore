@@ -1,7 +1,8 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed for binary crates (reproducible CLI builds)
+# Library crates would exclude it, but we ship a CLI binary.
 
 # IDE
 .idea/
@@ -33,5 +34,9 @@ dist/
 # Node
 node_modules/
 
-# Claude
+# Internal AI tooling — not for public repo
 .claude/
+CLAUDE.md
+
+# Internal design docs, specs, planning (business strategy, pricing, roadmap details)
+docs/

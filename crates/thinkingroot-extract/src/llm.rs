@@ -340,33 +340,43 @@ impl LlmClient {
             }
             "groq" => {
                 let key = resolve_key(config.providers.groq.as_ref(), "GROQ_API_KEY")?;
-                Provider::OpenAi(OpenAiProvider::new(
-                    &key, &config.extraction_model, "https://api.groq.com/openai",
-                ))
+                let base_url = resolve_base_url(
+                    config.providers.groq.as_ref(),
+                    "https://api.groq.com/openai",
+                );
+                Provider::OpenAi(OpenAiProvider::new(&key, &config.extraction_model, &base_url))
             }
             "deepseek" => {
                 let key = resolve_key(config.providers.deepseek.as_ref(), "DEEPSEEK_API_KEY")?;
-                Provider::OpenAi(OpenAiProvider::new(
-                    &key, &config.extraction_model, "https://api.deepseek.com",
-                ))
+                let base_url = resolve_base_url(
+                    config.providers.deepseek.as_ref(),
+                    "https://api.deepseek.com",
+                );
+                Provider::OpenAi(OpenAiProvider::new(&key, &config.extraction_model, &base_url))
             }
             "openrouter" => {
                 let key = resolve_key(config.providers.openrouter.as_ref(), "OPENROUTER_API_KEY")?;
-                Provider::OpenAi(OpenAiProvider::new(
-                    &key, &config.extraction_model, "https://openrouter.ai/api/v1",
-                ))
+                let base_url = resolve_base_url(
+                    config.providers.openrouter.as_ref(),
+                    "https://openrouter.ai/api/v1",
+                );
+                Provider::OpenAi(OpenAiProvider::new(&key, &config.extraction_model, &base_url))
             }
             "together" => {
                 let key = resolve_key(config.providers.together.as_ref(), "TOGETHER_API_KEY")?;
-                Provider::OpenAi(OpenAiProvider::new(
-                    &key, &config.extraction_model, "https://api.together.xyz/v1",
-                ))
+                let base_url = resolve_base_url(
+                    config.providers.together.as_ref(),
+                    "https://api.together.xyz/v1",
+                );
+                Provider::OpenAi(OpenAiProvider::new(&key, &config.extraction_model, &base_url))
             }
             "perplexity" => {
                 let key = resolve_key(config.providers.perplexity.as_ref(), "PERPLEXITY_API_KEY")?;
-                Provider::OpenAi(OpenAiProvider::new(
-                    &key, &config.extraction_model, "https://api.perplexity.ai",
-                ))
+                let base_url = resolve_base_url(
+                    config.providers.perplexity.as_ref(),
+                    "https://api.perplexity.ai",
+                );
+                Provider::OpenAi(OpenAiProvider::new(&key, &config.extraction_model, &base_url))
             }
             "litellm" => {
                 let key = resolve_key_optional(config.providers.litellm.as_ref());

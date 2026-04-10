@@ -45,10 +45,7 @@ fn parse_markdown_produces_chunks() {
         "expected multiple chunks from markdown, got {}",
         doc.chunks.len()
     );
-    assert!(
-        !doc.content_hash.0.is_empty(),
-        "content hash should be set"
-    );
+    assert!(!doc.content_hash.0.is_empty(), "content hash should be set");
 }
 
 #[test]
@@ -105,9 +102,7 @@ fn graph_store_roundtrip() {
         .unwrap();
 
     // Query claims for entity.
-    let claims = store
-        .get_claims_for_entity(&entity.id.to_string())
-        .unwrap();
+    let claims = store.get_claims_for_entity(&entity.id.to_string()).unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].1, "TestService uses PostgreSQL");
 
@@ -204,10 +199,8 @@ fn compiler_produces_all_artifact_types() {
     let (_tmp, store) = temp_graph_store();
 
     // Insert minimal data for compilation.
-    let entity = thinkingroot_core::Entity::new(
-        "TestAPI",
-        thinkingroot_core::types::EntityType::Api,
-    );
+    let entity =
+        thinkingroot_core::Entity::new("TestAPI", thinkingroot_core::types::EntityType::Api);
     store.insert_entity(&entity).unwrap();
 
     let source = thinkingroot_core::Source::new(

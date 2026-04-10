@@ -65,10 +65,13 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
 
         match child.kind() {
             // Rust
-            "function_item" | "function_definition" | "method_definition"
-            | "function_declaration" | "method_declaration" => {
-                let name = find_child_by_field(&child, "name")
-                    .map(|n| source[n.byte_range()].to_string());
+            "function_item"
+            | "function_definition"
+            | "method_definition"
+            | "function_declaration"
+            | "method_declaration" => {
+                let name =
+                    find_child_by_field(&child, "name").map(|n| source[n.byte_range()].to_string());
                 let params = find_child_by_field(&child, "parameters")
                     .map(|n| source[n.byte_range()].to_string());
                 let ret = find_child_by_field(&child, "return_type")
@@ -87,11 +90,18 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             }
 
             // Struct / class / interface / type definitions
-            "struct_item" | "enum_item" | "type_item" | "trait_item" | "impl_item"
-            | "class_definition" | "class_declaration" | "interface_declaration"
-            | "type_alias_declaration" | "type_spec" => {
-                let name = find_child_by_field(&child, "name")
-                    .map(|n| source[n.byte_range()].to_string());
+            "struct_item"
+            | "enum_item"
+            | "type_item"
+            | "trait_item"
+            | "impl_item"
+            | "class_definition"
+            | "class_declaration"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "type_spec" => {
+                let name =
+                    find_child_by_field(&child, "name").map(|n| source[n.byte_range()].to_string());
 
                 let mut chunk = Chunk::new(text, ChunkType::TypeDef, start_line, end_line)
                     .with_language(language);
@@ -137,7 +147,10 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
     }
 }
 
-fn find_child_by_field<'a>(node: &'a tree_sitter::Node<'a>, field: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_field<'a>(
+    node: &'a tree_sitter::Node<'a>,
+    field: &str,
+) -> Option<tree_sitter::Node<'a>> {
     node.child_by_field_name(field)
 }
 
@@ -167,11 +180,7 @@ struct Config {
     value: i32,
 }
 "#;
-        let mut doc = DocumentIR::new(
-            SourceId::new(),
-            "test.rs".to_string(),
-            SourceType::File,
-        );
+        let mut doc = DocumentIR::new(SourceId::new(), "test.rs".to_string(), SourceType::File);
 
         let ts_lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let mut parser = tree_sitter::Parser::new();
@@ -180,7 +189,15 @@ struct Config {
 
         extract_chunks(source, tree.root_node(), "rust", &mut doc);
 
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef));
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::TypeDef));
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef)
+        );
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::TypeDef)
+        );
     }
 }

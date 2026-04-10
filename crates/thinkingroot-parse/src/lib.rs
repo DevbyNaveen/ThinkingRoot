@@ -40,7 +40,10 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
 
 /// Parse all supported files in a directory tree.
 /// Also ingests recent git history if the directory is a git repo.
-pub fn parse_directory(root: &Path, config: &thinkingroot_core::config::ParserConfig) -> Result<Vec<DocumentIR>> {
+pub fn parse_directory(
+    root: &Path,
+    config: &thinkingroot_core::config::ParserConfig,
+) -> Result<Vec<DocumentIR>> {
     let files = walker::walk(root, config)?;
     let mut documents = Vec::new();
 

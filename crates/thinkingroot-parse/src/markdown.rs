@@ -69,7 +69,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
         match event {
             Event::Start(Tag::Heading { level: _, .. }) => {
                 // Flush any accumulated prose.
-                flush_prose(&mut doc, &mut current_text, current_start_line, line_counter, &current_heading);
+                flush_prose(
+                    &mut doc,
+                    &mut current_text,
+                    current_start_line,
+                    line_counter,
+                    &current_heading,
+                );
                 in_heading = true;
                 heading_text.clear();
             }
@@ -86,7 +92,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 current_start_line = line_counter + 1;
             }
             Event::Start(Tag::CodeBlock(kind)) => {
-                flush_prose(&mut doc, &mut current_text, current_start_line, line_counter, &current_heading);
+                flush_prose(
+                    &mut doc,
+                    &mut current_text,
+                    current_start_line,
+                    line_counter,
+                    &current_heading,
+                );
                 in_code_block = true;
                 code_content.clear();
                 code_lang = match kind {
@@ -119,7 +131,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 current_start_line = line_counter + 1;
             }
             Event::Start(Tag::List(_)) => {
-                flush_prose(&mut doc, &mut current_text, current_start_line, line_counter, &current_heading);
+                flush_prose(
+                    &mut doc,
+                    &mut current_text,
+                    current_start_line,
+                    line_counter,
+                    &current_heading,
+                );
                 in_list = true;
                 list_content.clear();
             }
@@ -178,7 +196,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     }
 
     // Flush remaining text.
-    flush_prose(&mut doc, &mut current_text, current_start_line, line_counter, &current_heading);
+    flush_prose(
+        &mut doc,
+        &mut current_text,
+        current_start_line,
+        line_counter,
+        &current_heading,
+    );
 
     Ok(doc)
 }
@@ -211,7 +235,11 @@ mod tests {
         let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
 
         assert!(doc.chunk_count() >= 4); // 2 headings + 2 prose
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Heading));
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::Heading)
+        );
         assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Prose));
     }
 
@@ -220,7 +248,11 @@ mod tests {
         let content = "# Code Example\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n";
         let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
 
-        let code_chunks: Vec<_> = doc.chunks.iter().filter(|c| c.chunk_type == ChunkType::Code).collect();
+        let code_chunks: Vec<_> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Code)
+            .collect();
         assert!(!code_chunks.is_empty());
         assert_eq!(code_chunks[0].language.as_deref(), Some("rust"));
     }

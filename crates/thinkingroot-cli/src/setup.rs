@@ -60,7 +60,7 @@ static PROVIDERS: &[ProviderDef] = &[
         label: "Groq        (ultra-fast inference)",
         id: "groq",
         default_env: "GROQ_API_KEY",
-        base_url: Some("https://api.groq.com/openai/v1"),
+        base_url: Some("https://api.groq.com/openai"),
         default_models: &["llama-3.1-8b-instant", "mixtral-8x7b-32768"],
         validate_url: Some("https://api.groq.com/openai/v1/models"),
     },
@@ -244,10 +244,6 @@ pub async fn run_setup() -> anyhow::Result<()> {
     global.save()?;
     registry.save()?;
 
-    // Initialize workspace .thinkingroot/config.toml
-    let ws_config = thinkingroot_core::Config::default();
-    ws_config.save(&abs_ws_path)?;
-
     // Connect tools
     if connect {
         for tool in &detected {
@@ -382,7 +378,11 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
             crate::workspace::run_workspace_add(path, None, None)?;
         }
         2 => {
-            crate::mcp_config::run_connect(None, 3000, false, false)?;
+            let port = WorkspaceRegistry::load()
+                .ok()
+                .and_then(|r| r.workspaces.first().map(|w| w.port))
+                .unwrap_or(3000);
+            crate::mcp_config::run_connect(None, port, false, false)?;
         }
         3 => {
             if let Some(p) = GlobalConfig::path() {

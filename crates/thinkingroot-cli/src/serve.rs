@@ -139,7 +139,6 @@ pub async fn run_serve(
     }
 
     // Print banner.
-    let workspaces = engine.list_workspaces().await?;
     let auth_status = if api_key.is_some() {
         "API key required"
     } else {
@@ -154,15 +153,10 @@ pub async fn run_serve(
     if !no_mcp {
         println!("  MCP SSE:   http://{}:{}/mcp/sse", host, port);
     }
-    for ws in &workspaces {
-        let ws_port = resolved_paths
-            .iter()
-            .find(|(n, _, _)| n == &ws.name)
-            .map(|(_, _, p)| *p)
-            .unwrap_or(port);
+    for (ws_name, _path, _ws_port) in &resolved_paths {
         println!(
             "  Workspace: {} → http://{}:{}/api/v1/ws/{}/",
-            ws.name, host, ws_port, ws.name
+            ws_name, host, port, ws_name
         );
     }
     println!("  Auth:      {}", auth_status);
