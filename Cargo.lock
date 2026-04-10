@@ -4821,6 +4821,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-branch"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thinkingroot-core",
+ "thinkingroot-graph",
+ "thinkingroot-verify",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "thinkingroot-cli"
 version = "0.1.0"
 dependencies = [
