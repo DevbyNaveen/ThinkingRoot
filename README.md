@@ -98,11 +98,20 @@ ThinkingRoot treats it as a **compilation problem** — transform, verify, and s
 - **Trust levels** — Quarantined / Untrusted / Unknown / Trusted / Verified per source
 - **Sensitivity labels** — Public / Internal / Confidential / Restricted per claim
 
+### Knowledge Version Control (KVC)
+
+- **Branches** — `root branch <name>` snapshots `graph.db`; each branch is an isolated `.thinkingroot-{slug}/` directory
+- **Semantic diff** — `root diff <branch>` shows a Knowledge PR: new claims, entities, relations, contradictions, health score delta
+- **Contradiction-as-conflict** — negation-pair detection + Jaccard token similarity; auto-resolved above confidence threshold, flagged for review below it
+- **Health CI gate** — `root merge` blocks if health drop exceeds `max_health_drop`; `--force` to bypass
+- **Merge safety** — advisory file lock (no concurrent merge races), pre-merge `graph.db` snapshot, `--rollback` to restore
+- **Agent sandboxing** — agents write to a branch; a human or CI job reviews the diff before merging to main
+
 ### Interfaces
 
-- **CLI** — `root compile ./repo` | `root health` | `root serve`
-- **REST API** — Axum-based, bearer auth, multi-workspace, JSON envelope
-- **MCP Server** — Model Context Protocol 2024-11-05, SSE + stdio transports
+- **CLI** — `root compile ./repo` | `root health` | `root serve` | `root branch/diff/merge`
+- **REST API** — Axum-based, bearer auth, multi-workspace, JSON envelope; full branch CRUD + diff/merge endpoints
+- **MCP Server** — Model Context Protocol 2024-11-05, SSE + stdio; tools include `create_branch`, `diff_branch`, `merge_branch`
 - **Python SDK** — native bindings (PyO3) + async HTTP client
 
 ---
@@ -413,8 +422,6 @@ except ThinkingRootError as e:
 | **Config** | TOML, YAML, JSON |
 | **Version control** | Git commits, PR descriptions |
 
-More parsers coming in Phase 3.
-
 ---
 
 ## CLI Reference
@@ -422,24 +429,49 @@ More parsers coming in Phase 3.
 ```
 root <command> [options]
 
-Commands:
-  compile <path>    Run full 6-stage pipeline
-  health            Show knowledge health score
-  init              Initialize .thinkingroot/config.toml
-  query <text>      Semantic search over compiled knowledge
-  serve             Start REST API + MCP server
+── Core ────────────────────────────────────────────────────────────
+  compile <path>          Run full 6-stage pipeline
+  health                  Show knowledge health score
+  init                    Initialize .thinkingroot/config.toml
+  query <text>            Semantic search over compiled knowledge
 
-Options (compile):
-  --path            Path to compile (default: current dir)
+── Server ──────────────────────────────────────────────────────────
+  serve                   Start REST API + MCP server
+    --port                HTTP port (default: 3000)
+    --host                Bind address (default: 127.0.0.1)
+    --api-key             Bearer auth token
+    --path                Workspace path (repeatable for multi-workspace)
+    --name                Serve a named registered workspace
+    --branch              Serve a specific knowledge branch
+    --mcp-stdio           Use stdio MCP transport instead of HTTP
+    --no-rest             Disable REST API routes
+    --no-mcp              Disable MCP routes
+    --install-service     Install OS-native autostart service
 
-Options (serve):
-  --port            HTTP port (default: 3000)
-  --host            Bind address (default: 127.0.0.1)
-  --api-key         Bearer auth token
-  --path            Workspace path (repeatable for multi-workspace)
-  --mcp-stdio       Use stdio MCP transport instead of HTTP
-  --no-rest         Disable REST API routes
-  --no-mcp          Disable MCP routes
+── Onboarding ──────────────────────────────────────────────────────
+  setup                   Interactive first-time setup wizard
+  connect                 Auto-wire MCP to Claude Desktop, Cursor, VS Code, Zed
+    --tool <name>         Target specific tool only
+    --dry-run             Preview without writing
+    --remove              Remove wiring
+  workspace add <path>    Register a workspace
+  workspace list          List registered workspaces
+  workspace remove <name> Remove a workspace
+
+── Knowledge Version Control (KVC) ────────────────────────────────
+  branch <name>           Create an isolated knowledge branch
+    --list                List all active branches
+    --delete <name>       Soft-delete a branch (data dir kept)
+    --purge <name>        Hard-delete branch and remove data directory
+    --gc                  Remove all abandoned branch data directories
+  checkout <name>         Set active branch (update HEAD)
+  diff <branch>           Show semantic Knowledge PR vs main
+  merge <branch>          Merge branch into main (runs health CI gate)
+    --force               Bypass health gate
+    --propagate-deletions Apply deletions from branch to main
+    --rollback            Restore main to state before this branch was merged
+  status                  Show current branch and active branches
+  snapshot <name>         Create an immutable named snapshot
 
 Global:
   -v, --verbose     Debug logging
@@ -482,11 +514,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for crate architecture, feature flags, an
 |---|---|---|
 | **Phase 1** — Core engine | ✅ Complete | 6-stage pipeline, CozoDB graph, fastembed vectors, CLI |
 | **Phase 2** — Serve + SDK | ✅ Complete | REST API, MCP server (SSE + stdio), Python SDK |
-| **Phase 3** — Ecosystem | 🔨 Building | TypeScript SDK, GitHub Action, VS Code extension, safety engine |
+| **Phase 3** — Onboarding | ✅ Complete | 11 LLM providers, global config hierarchy, `root setup` wizard, `root connect` MCP auto-wiring, `root workspace` registry, OS service install |
+| **Phase 3.5** — KVC | ✅ Complete | Knowledge Version Control: `root branch/checkout/diff/merge/status/snapshot`, semantic diff, health CI gate, merge lock + rollback, REST + MCP branch APIs |
 | **Phase 4** — Cloud | 🔒 Planned | Dashboard, source connectors, multi-tenant (separate repo) |
 | **Phase 5** — Enterprise | 🔒 Planned | SSO, compliance, air-gapped deploy (separate repo) |
 
-Phases 1–3 are fully open source (this repo). Star to follow progress.
+Phases 1–3.5 are fully open source (this repo). Phases 4–5 are in a separate private repo. Star to follow progress.
 
 ---
 
