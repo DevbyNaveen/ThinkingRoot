@@ -279,6 +279,20 @@ async fn run_compile(path: &PathBuf) -> anyhow::Result<()> {
         style("  └──").dim(),
         style(result.artifacts_count).cyan()
     );
+    if result.cache_hits > 0 {
+        println!(
+            "  {} {} extraction cache hits",
+            style("  ├──").dim(),
+            style(result.cache_hits).green()
+        );
+    }
+    if result.early_cutoffs > 0 {
+        println!(
+            "  {} {} sources unchanged (early cutoff)",
+            style("  └──").dim(),
+            style(result.early_cutoffs).green()
+        );
+    }
     println!();
 
     Ok(())
