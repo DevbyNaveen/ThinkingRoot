@@ -33,6 +33,8 @@ pub struct ExtractionOutput {
     pub claim_entity_names: HashMap<ClaimId, Vec<String>>,
     pub sources_processed: usize,
     pub chunks_processed: usize,
+    /// Chunks served from the content-addressable extraction cache (no LLM call made).
+    pub cache_hits: usize,
 }
 
 #[derive(Debug)]
@@ -102,6 +104,7 @@ impl Extractor {
                         );
                         output.merge(converted);
                         output.chunks_processed += 1;
+                        output.cache_hits += 1;
                         continue;
                     }
                 }
@@ -229,6 +232,7 @@ impl ExtractionOutput {
         self.claim_entity_names.extend(other.claim_entity_names);
         self.sources_processed += other.sources_processed;
         self.chunks_processed += other.chunks_processed;
+        self.cache_hits += other.cache_hits;
     }
 }
 

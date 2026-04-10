@@ -135,6 +135,7 @@ pub async fn run_pipeline(root_path: &Path) -> Result<PipelineResult> {
     let claims_count = extraction.claims.len();
     let entities_count = extraction.entities.len();
     let relations_count = extraction.relations.len();
+    let cache_hits = extraction.cache_hits;
 
     // ─── Phase 4: Insert sources ───────────────────────────────────────
     for doc in &new_documents {
@@ -197,7 +198,7 @@ pub async fn run_pipeline(root_path: &Path) -> Result<PipelineResult> {
         contradictions_count: verification.contradictions,
         artifacts_count: artifacts.len(),
         health_score: verification.health_score.as_percentage(),
-        cache_hits: 0,        // TODO: plumb from extractor
+        cache_hits,
         early_cutoffs: skipped,
     })
 }
