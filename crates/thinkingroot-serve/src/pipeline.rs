@@ -104,11 +104,7 @@ pub async fn run_pipeline(root_path: &Path) -> Result<PipelineResult> {
         update_vector_index_full(&mut storage)?;
 
         let compiler = thinkingroot_compile::Compiler::new(&config)?;
-        let artifacts = if has_any_changes {
-            compiler.compile_affected(&storage.graph, &data_dir, &[], true)?
-        } else {
-            compiler.compile_all(&storage.graph, &data_dir)?
-        };
+        let artifacts = compiler.compile_affected(&storage.graph, &data_dir, &[], true)?;
 
         let verifier = thinkingroot_verify::Verifier::new(&config);
         let verification = verifier.verify(&storage.graph)?;
