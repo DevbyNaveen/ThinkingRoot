@@ -13,6 +13,21 @@ members = [
     "crates/thinkingroot-cli",
     "thinkingroot-python",
 ]
+# thinkingroot-python is a PyO3 cdylib that must be built via maturin.
+# Excluded from default-members so `cargo build` / `cargo test` don't try to
+# link it without Python headers.  `cargo check --workspace` still validates it.
+default-members = [
+    "crates/thinkingroot-core",
+    "crates/thinkingroot-graph",
+    "crates/thinkingroot-parse",
+    "crates/thinkingroot-extract",
+    "crates/thinkingroot-link",
+    "crates/thinkingroot-compile",
+    "crates/thinkingroot-verify",
+    "crates/thinkingroot-serve",
+    "crates/thinkingroot-safety",
+    "crates/thinkingroot-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,13 +40,13 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates
 thinkingroot-core = { path = "crates/thinkingroot-core" }
-thinkingroot-graph = { path = "crates/thinkingroot-graph" }
+thinkingroot-graph = { path = "crates/thinkingroot-graph", default-features = false }
 thinkingroot-parse = { path = "crates/thinkingroot-parse" }
 thinkingroot-extract = { path = "crates/thinkingroot-extract" }
 thinkingroot-link = { path = "crates/thinkingroot-link" }
 thinkingroot-compile = { path = "crates/thinkingroot-compile" }
 thinkingroot-verify = { path = "crates/thinkingroot-verify" }
-thinkingroot-serve = { path = "crates/thinkingroot-serve" }
+thinkingroot-serve = { path = "crates/thinkingroot-serve", default-features = false }
 thinkingroot-safety = { path = "crates/thinkingroot-safety" }
 
 # Serialization
@@ -66,6 +81,8 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.17"
 console = "0.15"
+dirs = "5"
+dialoguer = "0.11"
 
 # Graph DB (Datalog-based, embedded, community edition)
 cozo = { package = "cozo-ce", version = "0.7.13-alpha.3", default-features = false, features = ["minimal", "rayon"] }

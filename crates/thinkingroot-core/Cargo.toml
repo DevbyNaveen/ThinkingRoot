@@ -19,6 +19,7 @@ toml = { workspace = true }
 url = { workspace = true }
 ordered-float = { workspace = true }
 tracing = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
