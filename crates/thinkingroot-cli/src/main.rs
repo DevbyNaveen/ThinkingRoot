@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 mod pipeline;
 mod serve;
+mod workspace;
 
 #[derive(Parser)]
 #[command(
@@ -59,6 +60,15 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "10")]
         top_k: usize,
     },
+    /// Open the interactive knowledge graph in your browser
+    Graph {
+        /// Path to the compiled knowledge base
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Port to bind
+        #[arg(long, default_value = "3001")]
+        port: u16,
+    },
     /// Start the REST API and MCP server
     Serve {
         /// Port to bind
@@ -82,6 +92,33 @@ enum Commands {
         /// Disable MCP endpoints (REST only)
         #[arg(long)]
         no_mcp: bool,
+    },
+    /// Manage registered workspaces
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Register a directory as a workspace
+    Add {
+        /// Path to the directory
+        path: PathBuf,
+        /// Workspace name (defaults to directory name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Port for this workspace's server (defaults to next available)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// List all registered workspaces
+    List,
+    /// Remove a workspace from the registry
+    Remove {
+        /// Workspace name to remove
+        name: String,
     },
 }
 
@@ -114,6 +151,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Query { query, path, top_k }) => {
             run_query(&path, &query, top_k).await?;
         }
+        Some(Commands::Graph { path, port }) => {
+            serve::run_graph(port, path).await?;
+        }
         Some(Commands::Serve {
             port,
             host,
@@ -125,6 +165,17 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             serve::run_serve(port, host, api_key, paths, mcp_stdio, no_rest, no_mcp).await?;
         }
+        Some(Commands::Workspace { action }) => match action {
+            WorkspaceAction::Add { path, name, port } => {
+                workspace::run_workspace_add(path, name, port)?;
+            }
+            WorkspaceAction::List => {
+                workspace::run_workspace_list()?;
+            }
+            WorkspaceAction::Remove { name } => {
+                workspace::run_workspace_remove(&name)?;
+            }
+        },
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
@@ -210,7 +261,8 @@ async fn run_health(path: &PathBuf) -> anyhow::Result<()> {
     }
 
     let config = thinkingroot_core::Config::load(&path)?;
-    let storage = thinkingroot_graph::StorageEngine::init(&data_dir).await
+    let storage = thinkingroot_graph::StorageEngine::init(&data_dir)
+        .await
         .context("failed to open storage")?;
     let verifier = thinkingroot_verify::Verifier::new(&config);
     let result = verifier.verify(&storage.graph)?;
@@ -244,7 +296,8 @@ async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<
         );
     }
 
-    let mut storage = thinkingroot_graph::StorageEngine::init(&data_dir).await
+    let mut storage = thinkingroot_graph::StorageEngine::init(&data_dir)
+        .await
         .context("failed to open storage")?;
 
     if storage.vector.is_empty() {
@@ -296,11 +349,7 @@ async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<
                         );
                     }
                 }
-                println!(
-                    "      {} {:.0}%",
-                    style("relevance:").dim(),
-                    score * 100.0
-                );
+                println!("      {} {:.0}%", style("relevance:").dim(), score * 100.0);
                 println!();
             }
             Some(&"claim") if parts.len() >= 5 => {
@@ -359,7 +408,10 @@ fn run_init(path: &PathBuf) -> anyhow::Result<()> {
         style("ThinkingRoot").green().bold(),
         data_dir.display()
     );
-    println!("  Run `root compile {}` to compile your knowledge.", path.display());
+    println!(
+        "  Run `root compile {}` to compile your knowledge.",
+        path.display()
+    );
 
     Ok(())
 }
