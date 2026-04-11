@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build CLI binaries for all platforms ────────────────────────────────────
+  # ── Build CLI binaries for all platforms ──────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -46,11 +46,11 @@ jobs:
 
       - name: Build (native)
         if: '!matrix.cross'
-        run: cargo build --release --target ${{ matrix.target }} -p thinkingroot-cli
+        run: cargo build --release --no-default-features --target ${{ matrix.target }} -p thinkingroot-cli
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} -p thinkingroot-cli
+        run: cross build --release --no-default-features --target ${{ matrix.target }} -p thinkingroot-cli
 
       - name: Rename binary
         shell: bash
@@ -64,7 +64,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  # ── Create GitHub Release ────────────────────────────────────────────────────
+  # ── Generate checksums and create GitHub Release ───────────────────────────
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
@@ -73,14 +73,48 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts/
           merge-multiple: true
 
+      - name: Generate checksums.txt
+        run: |
+          cd artifacts
+          sha256sum root-linux-amd64 \
+                    root-linux-arm64 \
+                    root-macos-amd64 \
+                    root-macos-arm64 \
+                    root-windows-amd64.exe \
+            > checksums.txt
+          cat checksums.txt
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            artifacts/root-linux-amd64
+            artifacts/root-linux-arm64
+            artifacts/root-macos-amd64
+            artifacts/root-macos-arm64
+            artifacts/root-windows-amd64.exe
+            artifacts/checksums.txt
           generate_release_notes: true
-          draft: true
+          draft: false
+          fail_on_unmatched_files: true
+
+  # ── Trigger Homebrew formula bump ─────────────────────────────────────────
+  homebrew-bump:
+    name: Bump Homebrew formula
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: root
+          homebrew-tap: thinkingroot/homebrew-thinkingroot
+          tag-name: ${{ github.ref_name }}
+          download-url: https://github.com/thinkingroot/thinkingroot/releases/download/${{ github.ref_name }}/root-macos-arm64
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_PR_PAT }}
