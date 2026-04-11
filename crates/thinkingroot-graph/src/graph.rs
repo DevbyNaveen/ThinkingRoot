@@ -508,9 +508,13 @@ impl GraphStore {
                 let strength = match &row[0] {
                     DataValue::Num(Num::Float(f)) => *f,
                     DataValue::Num(Num::Int(i)) => *i as f64,
-                    _ => {
+                    DataValue::Null => {
+                        // No source contributes this triple anymore — edge stays deleted.
+                        continue;
+                    }
+                    other => {
                         tracing::warn!(
-                            "unexpected strength type for triple ({from_id}, {to_id}, {relation_type}), skipping re-insert"
+                            "unexpected strength type for triple ({from_id}, {to_id}, {relation_type}): {other:?}, skipping re-insert"
                         );
                         continue;
                     }
