@@ -25,7 +25,7 @@ fn compile(path: &str) -> PyResult<PyObject> {
     let root = PathBuf::from(path);
     let rt = runtime();
     let result = rt
-        .block_on(thinkingroot_serve::pipeline::run_pipeline(&root, None))
+        .block_on(thinkingroot_serve::pipeline::run_pipeline(&root, None, None))
         .map_err(|e| ThinkingRootError::new_err(e.to_string()))?;
 
     to_py_json(&result)

@@ -19,7 +19,7 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
     // Initial compile.
     println!("  {} initial compile...", style(">>").cyan().bold());
     let start = Instant::now();
-    match pipeline::run_pipeline(root_path, None).await {
+    match pipeline::run_pipeline(root_path, None, None).await {
         Ok(result) => {
             println!(
                 "  {} compiled {} files in {:.1}s (health: {}%)\n",
@@ -78,7 +78,7 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
                 );
 
                 let start = Instant::now();
-                match pipeline::run_pipeline(root_path, None).await {
+                match pipeline::run_pipeline(root_path, None, None).await {
                     Ok(result) => {
                         println!(
                             "  {} {:.1}s | {} claims, {} entities, health {}%\n",
