@@ -240,10 +240,19 @@ enum WorkspaceAction {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing.
+    // Detect TTY *before* initialising the subscriber — the filter depends on it.
+    // Progress bars and tracing INFO both write to stderr; in TTY mode we suppress
+    // INFO to avoid garbling the bars (same approach as `cargo build`).
+    use std::io::IsTerminal as _;
+    let use_progress = !cli.verbose && std::io::stderr().is_terminal();
+
     let filter = if cli.verbose {
         EnvFilter::new("thinkingroot=debug,root=debug")
+    } else if use_progress {
+        // TTY + no --verbose: suppress INFO so bars own stderr.
+        EnvFilter::new("thinkingroot=warn,root=warn")
     } else {
+        // Pipe / CI: full INFO for clean log output.
         EnvFilter::new("thinkingroot=info,root=info")
     };
     tracing_subscriber::fmt()
@@ -254,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Compile { path, branch }) => {
-            run_compile(&path, branch.as_deref()).await?;
+            run_compile(&path, branch.as_deref(), use_progress).await?;
         }
         Some(Commands::Health { path }) => {
             run_health(&path).await?;
@@ -333,10 +342,10 @@ async fn main() -> anyhow::Result<()> {
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
-                run_compile(&path, None).await?;
+                run_compile(&path, None, use_progress).await?;
             } else {
                 // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None).await?;
+                run_compile(&PathBuf::from("."), None, use_progress).await?;
             }
         }
     }
@@ -344,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_compile(path: &PathBuf, branch: Option<&str>) -> anyhow::Result<()> {
+async fn run_compile(path: &PathBuf, branch: Option<&str>, use_progress: bool) -> anyhow::Result<()> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("path not found: {}", path.display()))?;
 
@@ -356,7 +365,12 @@ async fn run_compile(path: &PathBuf, branch: Option<&str>) -> anyhow::Result<()>
     );
 
     let start = Instant::now();
-    let result = pipeline::run_pipeline(&path, branch).await?;
+
+    let result = if use_progress {
+        progress::run_compile_progress(&path, branch).await?
+    } else {
+        pipeline::run_pipeline(&path, branch, None).await?
+    };
 
     let elapsed = start.elapsed();
     println!();
