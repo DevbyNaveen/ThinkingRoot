@@ -134,6 +134,7 @@ impl BedrockProvider {
             .inference_config(
                 InferenceConfiguration::builder()
                     .max_tokens(self.max_output_tokens)
+                    .temperature(0.1_f32)
                     .build(),
             )
             .messages(
@@ -293,6 +294,7 @@ impl AnthropicProvider {
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_output_tokens,
+            "temperature": 0.1,
             "system": system,
             "messages": [
                 {"role": "user", "content": user},
