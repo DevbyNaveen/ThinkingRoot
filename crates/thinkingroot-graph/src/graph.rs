@@ -49,7 +49,9 @@ impl GraphStore {
                 confidence: Float default 0.8,
                 sensitivity: String default 'Public',
                 workspace_id: String default '',
-                created_at: Float default 0.0
+                created_at: Float default 0.0,
+                grounding_score: Float default -1.0,
+                grounding_method: String default ''
             }",
             ":create entities {
                 id: String
@@ -233,12 +235,25 @@ impl GraphStore {
             "created_at".into(),
             DataValue::Num(Num::Float(claim.created_at.timestamp() as f64)),
         );
+        params.insert(
+            "grounding_score".into(),
+            DataValue::Num(Num::Float(claim.grounding_score.unwrap_or(-1.0))),
+        );
+        params.insert(
+            "grounding_method".into(),
+            DataValue::Str(
+                claim.grounding_method
+                    .map(|m| format!("{m:?}"))
+                    .unwrap_or_default()
+                    .into(),
+            ),
+        );
 
         self.query(
-            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at] <- [[
-                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at
+            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method] <- [[
+                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method
             ]]
-            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at}"#,
+            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method}"#,
             params,
         )?;
         Ok(())
@@ -734,6 +749,18 @@ impl GraphStore {
         }
     }
 
+    /// Count claims with grounding_score below a threshold.
+    /// Ignores ungrounded claims (score = -1.0).
+    pub fn count_low_grounding_claims(&self, threshold: f64) -> Result<usize> {
+        let mut params = BTreeMap::new();
+        params.insert("threshold".into(), DataValue::Num(Num::Float(threshold)));
+        let result = self.query(
+            "?[count(id)] := *claims{id, grounding_score: gs}, gs >= 0.0, gs < $threshold",
+            params,
+        )?;
+        Ok(count_from_rows(&result.rows))
+    }
+
     /// Check if a source with this content_hash already exists.
     pub fn source_hash_exists(&self, content_hash: &str) -> Result<bool> {
         let mut params = BTreeMap::new();
@@ -1038,6 +1065,8 @@ impl GraphStore {
             extracted_by: PipelineVersion::current(),
             superseded_by: None,
             created_at,
+            grounding_score: None,
+            grounding_method: None,
         }))
     }
 
