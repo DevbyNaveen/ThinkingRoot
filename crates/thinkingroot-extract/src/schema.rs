@@ -18,6 +18,8 @@ pub struct ExtractedClaim {
     pub claim_type: String,
     pub confidence: f64,
     pub entities: Vec<String>,
+    #[serde(default)]
+    pub source_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

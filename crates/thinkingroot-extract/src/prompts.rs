@@ -10,7 +10,8 @@ You MUST return valid JSON matching this exact schema:
       "statement": "A clear, atomic statement of fact or decision",
       "claim_type": "fact|decision|opinion|plan|requirement|metric|definition|dependency|api_signature|architecture",
       "confidence": 0.0-1.0,
-      "entities": ["entity names mentioned in this claim"]
+      "entities": ["entity names mentioned in this claim"],
+      "source_quote": "The exact phrase or sentence from the source that supports this claim"
     }
   ],
   "entities": [
@@ -39,7 +40,8 @@ Rules:
 5. Do NOT fabricate information. Extract only what is explicitly stated or clearly implied.
 6. For code: extract function signatures, type definitions, dependencies, and architectural patterns.
 7. For docs: extract decisions, requirements, facts, and relationships between concepts.
-8. Return ONLY the JSON object. No markdown, no explanation, no preamble."#;
+8. source_quote MUST be a verbatim substring copied from the source. Do NOT paraphrase.
+9. Return ONLY the JSON object. No markdown, no explanation, no preamble."#;
 
 /// Build the user prompt for a given chunk of content.
 pub fn build_extraction_prompt(content: &str, context: &str) -> String {
