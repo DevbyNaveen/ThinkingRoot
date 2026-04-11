@@ -1,10 +1,37 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
 use thinkingroot_core::types::WorkspaceId;
 use thinkingroot_graph::StorageEngine;
+
+/// Events emitted by the pipeline to drive CLI progress bars.
+/// Sent via `tokio::sync::mpsc::UnboundedSender<ProgressEvent>`.
+/// The CLI bar-driver task consumes these and renders indicatif bars.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Parsing finished. `files` = number of documents parsed.
+    ParseComplete { files: usize },
+    /// Extraction is starting. Fired inside the `ChunkProgressFn` on the
+    /// first chunk completion; `total_chunks` is the definitive denominator.
+    ExtractionStart { total_chunks: usize },
+    /// One original chunk processed (cache hit or LLM result).
+    ChunkDone { done: usize, total: usize, source_uri: String },
+    /// All chunks extracted. Summary data for solidifying the bar.
+    ExtractionComplete { claims: usize, entities: usize, cache_hits: usize },
+    /// Entity resolution is starting.
+    LinkingStart { total_entities: usize },
+    /// One entity resolved (created or merged).
+    EntityResolved { done: usize, total: usize },
+    /// Linking finished.
+    LinkComplete { entities: usize, relations: usize, contradictions: usize },
+    /// Artifact compilation finished.
+    CompilationDone { artifacts: usize },
+    /// Verification finished.
+    VerificationDone { health: u8 },
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PipelineResult {
@@ -19,13 +46,26 @@ pub struct PipelineResult {
     pub early_cutoffs: usize,
 }
 
-pub async fn run_pipeline(root_path: &Path, branch: Option<&str>) -> Result<PipelineResult> {
+pub async fn run_pipeline(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<PipelineResult> {
+    macro_rules! emit {
+        ($event:expr) => {
+            if let Some(ref tx) = progress {
+                let _ = tx.send($event);
+            }
+        };
+    }
+
     let config = Config::load_merged(root_path)?;
     let data_dir = thinkingroot_branch::snapshot::resolve_data_dir(root_path, branch);
     std::fs::create_dir_all(&data_dir)?;
 
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
+    emit!(ProgressEvent::ParseComplete { files: files_parsed });
 
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
@@ -82,15 +122,39 @@ pub async fn run_pipeline(root_path: &Path, branch: Option<&str>) -> Result<Pipe
         cache_hits = 0;
         extraction = thinkingroot_extract::ExtractionOutput::default();
     } else {
-        let extractor = thinkingroot_extract::Extractor::new(&config)
-            .await?
-            .with_cache_dir(&data_dir);
+        let extractor = {
+            let e = thinkingroot_extract::Extractor::new(&config)
+                .await?
+                .with_cache_dir(&data_dir);
+            if let Some(ref tx) = progress {
+                let tx_chunk = tx.clone();
+                let pf = Arc::new(move |done: usize, total: usize, uri: &str| {
+                    if done == 1 {
+                        let _ = tx_chunk
+                            .send(ProgressEvent::ExtractionStart { total_chunks: total });
+                    }
+                    let _ = tx_chunk.send(ProgressEvent::ChunkDone {
+                        done,
+                        total,
+                        source_uri: uri.to_string(),
+                    });
+                }) as thinkingroot_extract::ChunkProgressFn;
+                e.with_progress(pf)
+            } else {
+                e
+            }
+        };
         let raw = extractor
             .extract_all(
                 &potentially_changed.iter().map(|d| (*d).clone()).collect::<Vec<_>>(),
                 workspace_id,
             )
             .await?;
+        emit!(ProgressEvent::ExtractionComplete {
+            claims: raw.claims.len(),
+            entities: raw.entities.len(),
+            cache_hits: raw.cache_hits,
+        });
         cache_hits = raw.cache_hits;
         extraction = raw;
     }
@@ -179,9 +243,13 @@ pub async fn run_pipeline(root_path: &Path, branch: Option<&str>) -> Result<Pipe
 
         let compiler = thinkingroot_compile::Compiler::new(&config)?;
         let artifacts = compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
+        emit!(ProgressEvent::CompilationDone { artifacts: artifacts.len() });
 
         let verifier = thinkingroot_verify::Verifier::new(&config);
         let verification = verifier.verify(&storage.graph)?;
+        emit!(ProgressEvent::VerificationDone {
+            health: verification.health_score.as_percentage(),
+        });
 
         fingerprints.save()?;
         config.save(root_path)?;
@@ -234,8 +302,26 @@ pub async fn run_pipeline(root_path: &Path, branch: Option<&str>) -> Result<Pipe
     let relations_count = filtered_extraction.relations.len();
 
     // ─── Phase 7: Link ─────────────────────────────────────────────────
-    let linker = thinkingroot_link::Linker::new(&storage.graph);
+    let linker = {
+        let l = thinkingroot_link::Linker::new(&storage.graph);
+        if let Some(ref tx) = progress {
+            let tx_link = tx.clone();
+            let total_entities = filtered_extraction.entities.len();
+            emit!(ProgressEvent::LinkingStart { total_entities });
+            let pf = Arc::new(move |done: usize, total: usize| {
+                let _ = tx_link.send(ProgressEvent::EntityResolved { done, total });
+            }) as thinkingroot_link::EntityProgressFn;
+            l.with_progress(pf)
+        } else {
+            l
+        }
+    };
     let link_output = linker.link(filtered_extraction)?;
+    emit!(ProgressEvent::LinkComplete {
+        entities: link_output.entities_created + link_output.entities_merged,
+        relations: link_output.relations_linked,
+        contradictions: link_output.contradictions_detected,
+    });
 
     // ─── Phase 8: Incremental entity relation update for new sources ───
     let mut new_triples: Vec<(String, String, String)> = Vec::new();
@@ -340,10 +426,14 @@ pub async fn run_pipeline(root_path: &Path, branch: Option<&str>) -> Result<Pipe
         &link_output.affected_entity_ids,
         true,
     )?;
+    emit!(ProgressEvent::CompilationDone { artifacts: artifacts.len() });
 
     // ─── Phase 11: Verify + persist ─────────────────────────────────────
     let verifier = thinkingroot_verify::Verifier::new(&config);
     let verification = verifier.verify(&storage.graph)?;
+    emit!(ProgressEvent::VerificationDone {
+        health: verification.health_score.as_percentage(),
+    });
 
     fingerprints.save()?;
     config.save(root_path)?;
