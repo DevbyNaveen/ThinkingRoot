@@ -239,6 +239,14 @@ impl Extractor {
             }
         }
 
+        // Guard: if some tasks returned None (all sub-chunks failed), fire a
+        // synthetic catch-up event so the bar always reaches 100%.
+        if done < total_chunks {
+            if let Some(ref pf) = self.progress {
+                pf(total_chunks, total_chunks, "");
+            }
+        }
+
         tracing::info!(
             "extraction complete: {} claims, {} entities, {} relations \
              from {} sources ({} chunks, {} cache hits)",
