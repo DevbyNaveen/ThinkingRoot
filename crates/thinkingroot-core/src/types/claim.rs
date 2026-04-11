@@ -21,6 +21,8 @@ pub struct Claim {
     pub extracted_by: PipelineVersion,
     pub superseded_by: Option<ClaimId>,
     pub created_at: DateTime<Utc>,
+    pub grounding_score: Option<f64>,
+    pub grounding_method: Option<GroundingMethod>,
 }
 
 impl Claim {
@@ -45,6 +47,8 @@ impl Claim {
             extracted_by: PipelineVersion::current(),
             superseded_by: None,
             created_at: now,
+            grounding_score: None,
+            grounding_method: None,
         }
     }
 
@@ -60,6 +64,12 @@ impl Claim {
 
     pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
         self.sensitivity = sensitivity;
+        self
+    }
+
+    pub fn with_grounding(mut self, score: f64, method: GroundingMethod) -> Self {
+        self.grounding_score = Some(score.clamp(0.0, 1.0));
+        self.grounding_method = Some(method);
         self
     }
 
@@ -157,6 +167,22 @@ impl PipelineVersion {
     }
 }
 
+/// How a claim's grounding score was determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingMethod {
+    /// Judge 1: keyword/n-gram overlap with source text.
+    Lexical,
+    /// Judge 2: LLM-cited source quote verified in source text.
+    Span,
+    /// Judge 3: embedding cosine similarity with source text.
+    Semantic,
+    /// Combined score from multiple judges.
+    Combined,
+    /// Not grounded (legacy claims or grounding disabled).
+    Unverified,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +207,24 @@ mod tests {
 
         assert!(!claim.is_active());
         assert_eq!(claim.superseded_by, Some(new_claim_id));
+    }
+
+    #[test]
+    fn claim_grounding_defaults_to_none() {
+        let ws = WorkspaceId::new();
+        let src = SourceId::new();
+        let claim = Claim::new("Rust is fast", ClaimType::Fact, src, ws);
+        assert!(claim.grounding_score.is_none());
+        assert!(claim.grounding_method.is_none());
+    }
+
+    #[test]
+    fn claim_with_grounding() {
+        let ws = WorkspaceId::new();
+        let src = SourceId::new();
+        let claim = Claim::new("Rust is fast", ClaimType::Fact, src, ws)
+            .with_grounding(0.92, GroundingMethod::Lexical);
+        assert_eq!(claim.grounding_score, Some(0.92));
+        assert_eq!(claim.grounding_method, Some(GroundingMethod::Lexical));
     }
 }
