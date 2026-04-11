@@ -58,7 +58,7 @@ impl ExtractionCache {
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
                     .count()
             })
             .unwrap_or(0)

@@ -105,8 +105,10 @@ impl Extractor {
         let max_chunk_tokens = self.max_chunk_tokens;
         let documents_len = documents.len();
 
-        let mut output = ExtractionOutput::default();
-        output.sources_processed = documents_len;
+        let mut output = ExtractionOutput {
+            sources_processed: documents_len,
+            ..Default::default()
+        };
 
         // Build source text map from all documents (for grounding).
         for doc in documents {

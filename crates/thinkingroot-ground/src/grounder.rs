@@ -239,4 +239,110 @@ mod tests {
         let (score, _) = combine_scores(0.1, Some(0.1), None);
         assert!(score < config.reject_threshold);
     }
+
+    // ── Integration tests ────────────────────────────────────────────
+
+    use thinkingroot_core::types::{Claim, ClaimType, WorkspaceId, SourceId};
+
+    fn make_extraction(
+        claims: Vec<(&str, SourceId)>,
+        source_texts: Vec<(SourceId, &str)>,
+        quotes: Vec<(ClaimId, &str)>,
+    ) -> ExtractionOutput {
+        let mut output = ExtractionOutput::default();
+        for (stmt, src) in &claims {
+            let c = Claim::new(*stmt, ClaimType::Fact, *src, WorkspaceId::new());
+            output.claims.push(c);
+        }
+        for (sid, text) in source_texts {
+            output.source_texts.insert(sid, text.to_string());
+        }
+        for (cid, quote) in quotes {
+            output.claim_source_quotes.insert(cid, quote.to_string());
+        }
+        output
+    }
+
+    #[test]
+    fn grounded_claim_survives_and_gets_score() {
+        let src = SourceId::new();
+        let extraction = make_extraction(
+            vec![("PostgreSQL stores user data in tables", src)],
+            vec![(src, "PostgreSQL stores user data in tables and handles transactions")],
+            vec![],
+        );
+        let grounder = Grounder::new(GroundingConfig::default());
+        let result = grounder.ground(extraction);
+
+        assert_eq!(result.claims.len(), 1);
+        let claim = &result.claims[0];
+        assert!(claim.grounding_score.is_some());
+        let score = claim.grounding_score.unwrap();
+        assert!(score > 0.5, "well-grounded claim should score > 0.5, got {score}");
+    }
+
+    #[test]
+    fn hallucinated_claim_rejected() {
+        let src = SourceId::new();
+        let extraction = make_extraction(
+            vec![("Redis caches session tokens in memory", src)],
+            vec![(src, "PostgreSQL stores user data in tables and handles transactions")],
+            vec![],
+        );
+        let grounder = Grounder::new(GroundingConfig::default());
+        let result = grounder.ground(extraction);
+
+        // With zero word overlap, lexical score ≈ 0.0, which is below reject threshold (0.25)
+        assert_eq!(result.claims.len(), 0, "hallucinated claim should be rejected");
+    }
+
+    #[test]
+    fn source_quote_boosts_grounding_score() {
+        let src = SourceId::new();
+        let mut extraction = make_extraction(
+            vec![("PostgreSQL stores user data", src)],
+            vec![(src, "PostgreSQL stores user data in normalized tables")],
+            vec![],
+        );
+        // Add source quote for the claim
+        let claim_id = extraction.claims[0].id;
+        extraction.claim_source_quotes.insert(
+            claim_id,
+            "PostgreSQL stores user data".to_string(),
+        );
+
+        let grounder = Grounder::new(GroundingConfig::default());
+        let result = grounder.ground(extraction);
+
+        assert_eq!(result.claims.len(), 1);
+        let score = result.claims[0].grounding_score.unwrap();
+        // With both lexical + exact span match, should be very high
+        assert!(score > 0.8, "claim with exact quote match should score high, got {score}");
+    }
+
+    #[test]
+    fn low_grounding_reduces_confidence() {
+        let src = SourceId::new();
+        // Partial overlap: some words match, some don't
+        let extraction = make_extraction(
+            vec![("PostgreSQL handles authentication and sessions", src)],
+            vec![(src, "PostgreSQL stores user data and handles transactions for the application")],
+            vec![],
+        );
+        let grounder = Grounder::new(GroundingConfig {
+            reject_threshold: 0.1, // low threshold so it doesn't get rejected
+            reduce_threshold: 0.9, // high threshold so confidence gets reduced
+        });
+        let result = grounder.ground(extraction);
+
+        assert_eq!(result.claims.len(), 1);
+        let claim = &result.claims[0];
+        // Original confidence is 0.8 (default from Claim::new)
+        // With partial overlap, confidence should be reduced
+        assert!(
+            claim.confidence.value() < 0.8,
+            "low-grounding claim should have reduced confidence, got {}",
+            claim.confidence.value()
+        );
+    }
 }
