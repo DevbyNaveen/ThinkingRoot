@@ -39,13 +39,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Install cross (Linux ARM64)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (native)
-        if: '!matrix.cross'
+        if: ${{ !matrix.cross }}
         run: cargo build --release --no-default-features --target ${{ matrix.target }} -p thinkingroot-cli
 
       - name: Build (cross)
@@ -82,6 +84,9 @@ jobs:
       - name: Generate checksums.txt
         run: |
           cd artifacts
+          for f in root-linux-amd64 root-linux-arm64 root-macos-amd64 root-macos-arm64 root-windows-amd64.exe; do
+            [ -f "$f" ] || { echo "Missing artifact: $f"; exit 1; }
+          done
           sha256sum root-linux-amd64 \
                     root-linux-arm64 \
                     root-macos-amd64 \
