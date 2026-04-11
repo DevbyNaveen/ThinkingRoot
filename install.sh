@@ -84,8 +84,8 @@ select_install_dir() {
   elif [ -d "$HOME/.local/bin" ] && [ -w "$HOME/.local/bin" ]; then
     echo "$HOME/.local/bin"
   else
+    mkdir -p "$HOME/.local/bin" || err "Cannot create $HOME/.local/bin — check filesystem permissions."
     echo "$HOME/.local/bin"
-    mkdir -p "$HOME/.local/bin"
   fi
 }
 
@@ -138,10 +138,14 @@ main() {
   download "$CHECKSUM_URL"  "$CHECKSUMS_PATH"
 
   say "Verifying SHA256 checksum..."
-  EXPECTED="$(grep "$ASSET" "$CHECKSUMS_PATH" | cut -d' ' -f1)"
+  EXPECTED="$(grep " ${ASSET}$" "$CHECKSUMS_PATH" | awk '{print $1}')"
   [ -z "$EXPECTED" ] && err "Checksum not found for ${ASSET} in checksums.txt"
   ACTUAL="$(sha256 "$ASSET_PATH")"
-  [ "$EXPECTED" != "$ACTUAL" ] && err "Checksum mismatch!\n  Expected: $EXPECTED\n  Got:      $ACTUAL"
+  if [ "$EXPECTED" != "$ACTUAL" ]; then
+    printf '\033[1;31mError: Checksum mismatch!\n  Expected: %s\n  Got:      %s\033[0m\n' \
+      "$EXPECTED" "$ACTUAL" >&2
+    exit 1
+  fi
   say "Checksum OK"
 
   chmod +x "$ASSET_PATH"
