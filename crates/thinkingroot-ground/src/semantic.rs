@@ -19,7 +19,7 @@ impl SemanticJudge {
     /// - > 0.7: claim is semantically close to source content
     /// - 0.4-0.7: partially related
     /// - < 0.4: likely off-topic / hallucinated
-    pub fn score(claim: &str, source_text: &str, vector_store: &VectorStore) -> f64 {
+    pub fn score(claim: &str, source_text: &str, vector_store: &mut VectorStore) -> f64 {
         // Embed both texts using the existing model.
         let texts = vec![claim, source_text];
         match vector_store.embed_texts(&texts) {

@@ -161,7 +161,7 @@ mod inner {
 
         /// Embed texts and return raw embedding vectors.
         /// Used by the grounding system's semantic judge.
-        pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.model
                 .embed(texts.to_vec(), None)
                 .map_err(|e| Error::GraphStorage(format!("embedding failed: {e}")))
@@ -248,7 +248,7 @@ mod inner {
             true
         }
 
-        pub fn embed_texts(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        pub fn embed_texts(&mut self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             Ok(vec![])
         }
     }
