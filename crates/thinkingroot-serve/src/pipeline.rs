@@ -295,6 +295,8 @@ pub async fn run_pipeline(
         sources_processed: truly_changed.len(),
         chunks_processed: extraction.chunks_processed,
         cache_hits: extraction.cache_hits,
+        source_texts: extraction.source_texts,
+        claim_source_quotes: extraction.claim_source_quotes,
     };
 
     let claims_count = filtered_extraction.claims.len();

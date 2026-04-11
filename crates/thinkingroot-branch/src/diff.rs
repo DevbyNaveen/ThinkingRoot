@@ -193,6 +193,8 @@ pub fn compute_diff(
                 extracted_by: PipelineVersion::current(),
                 superseded_by: None,
                 created_at: now,
+                grounding_score: None,
+                grounding_method: None,
             };
             new_claims.push(DiffClaim {
                 claim,
