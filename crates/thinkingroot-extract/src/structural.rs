@@ -15,6 +15,12 @@ use crate::schema::{ExtractedClaim, ExtractedEntity, ExtractedRelation, Extracti
 
 /// Returns `true` if this chunk can be handled by the structural extractor
 /// without any LLM calls.
+///
+/// **Note on `Prose`:** `Prose` chunks with `commit_author` or non-empty `links`
+/// are routed Structural by `router::classify()` and handled by `extract_structural`,
+/// but are NOT included here. Use `router::classify()` as the authoritative gate in
+/// production code; this predicate covers only the pure-structural types where
+/// metadata presence alone determines extractability.
 pub fn is_structurally_extractable(chunk: &Chunk) -> bool {
     matches!(
         chunk.chunk_type,
@@ -507,9 +513,10 @@ fn extract_prose_links(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         // Absolute URL (has '://') → 0.7
         let confidence = if url.contains("://") { 0.7 } else { 0.99 };
 
+        let link_type = if url.contains("://") { "service" } else { "file" };
         let link_entity = ExtractedEntity {
             name: url.clone(),
-            entity_type: "file".to_string(),
+            entity_type: link_type.to_string(),
             aliases: Vec::new(),
             description: None,
         };

@@ -31,8 +31,8 @@ pub enum Tier {
 /// - Everything else → [`Tier::Llm`]
 ///
 /// Note: `ManifestDependency`, `Heading`, and git/link `Prose` chunks are routed
-/// Structural here. Until Task 7 adds their extractors, they fall through to LLM
-/// in the extractor when `extract_structural` returns an empty result.
+/// Structural here. Their extractors are implemented in `structural.rs` and fall
+/// through to LLM only when metadata is absent (e.g., a Heading chunk with no content).
 pub fn classify(chunk: &Chunk) -> Tier {
     match chunk.chunk_type {
         ChunkType::FunctionDef => {
