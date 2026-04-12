@@ -64,10 +64,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     let mut heading_text = String::new();
     let mut in_list = false;
     let mut list_content = String::new();
+    let mut heading_stack: Vec<(u8, String)> = Vec::new(); // (level, text) for parent tracking
+    let mut current_heading_level: u8 = 1;
+    let mut current_links: Vec<String> = Vec::new();
 
     for event in parser {
         match event {
-            Event::Start(Tag::Heading { level: _, .. }) => {
+            Event::Start(Tag::Heading { level, .. }) => {
                 // Flush any accumulated prose.
                 flush_prose(
                     &mut doc,
@@ -75,18 +78,40 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                     current_start_line,
                     line_counter,
                     &current_heading,
+                    &mut current_links,
                 );
                 in_heading = true;
                 heading_text.clear();
+                current_heading_level = match level {
+                    pulldown_cmark::HeadingLevel::H1 => 1,
+                    pulldown_cmark::HeadingLevel::H2 => 2,
+                    pulldown_cmark::HeadingLevel::H3 => 3,
+                    pulldown_cmark::HeadingLevel::H4 => 4,
+                    pulldown_cmark::HeadingLevel::H5 => 5,
+                    pulldown_cmark::HeadingLevel::H6 => 6,
+                };
             }
             Event::End(TagEnd::Heading(_)) => {
                 in_heading = false;
                 let heading = heading_text.trim().to_string();
                 if !heading.is_empty() {
-                    doc.add_chunk(
+                    // Pop stack entries at same or deeper level than current heading.
+                    while heading_stack
+                        .last()
+                        .is_some_and(|(l, _)| *l >= current_heading_level)
+                    {
+                        heading_stack.pop();
+                    }
+                    let parent = heading_stack.last().map(|(_, t)| t.clone());
+
+                    let mut heading_chunk =
                         Chunk::new(&heading, ChunkType::Heading, line_counter, line_counter)
-                            .with_heading(heading.clone()),
-                    );
+                            .with_heading(heading.clone());
+                    heading_chunk.metadata.heading_level = Some(current_heading_level);
+                    heading_chunk.metadata.parent = parent;
+                    doc.add_chunk(heading_chunk);
+
+                    heading_stack.push((current_heading_level, heading.clone()));
                     current_heading = Some(heading);
                 }
                 current_start_line = line_counter + 1;
@@ -98,6 +123,7 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                     current_start_line,
                     line_counter,
                     &current_heading,
+                    &mut current_links,
                 );
                 in_code_block = true;
                 code_content.clear();
@@ -137,6 +163,7 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                     current_start_line,
                     line_counter,
                     &current_heading,
+                    &mut current_links,
                 );
                 in_list = true;
                 list_content.clear();
@@ -158,6 +185,12 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 in_list = false;
                 list_content.clear();
                 current_start_line = line_counter + 1;
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let url = dest_url.to_string();
+                if !url.is_empty() && !url.starts_with('#') {
+                    current_links.push(url);
+                }
             }
             Event::Text(text) => {
                 let text_str = text.to_string();
@@ -202,6 +235,7 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
         current_start_line,
         line_counter,
         &current_heading,
+        &mut current_links,
     );
 
     Ok(doc)
@@ -213,6 +247,7 @@ fn flush_prose(
     start_line: u32,
     end_line: u32,
     heading: &Option<String>,
+    links: &mut Vec<String>,
 ) {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -220,9 +255,11 @@ fn flush_prose(
         if let Some(h) = heading {
             chunk = chunk.with_heading(h.clone());
         }
+        chunk.metadata.links = std::mem::take(links);
         doc.add_chunk(chunk);
     }
     text.clear();
+    links.clear(); // ensure cleared even if text was empty
 }
 
 #[cfg(test)]
@@ -255,5 +292,72 @@ mod tests {
             .collect();
         assert!(!code_chunks.is_empty());
         assert_eq!(code_chunks[0].language.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn heading_level_is_captured() {
+        let content = "# H1 Title\n\n## H2 Section\n\n### H3 Sub\n";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let headings: Vec<_> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Heading)
+            .collect();
+        assert_eq!(headings.len(), 3);
+        assert_eq!(headings[0].metadata.heading_level, Some(1));
+        assert_eq!(headings[1].metadata.heading_level, Some(2));
+        assert_eq!(headings[2].metadata.heading_level, Some(3));
+    }
+
+    #[test]
+    fn heading_parent_is_set_from_stack() {
+        let content = "# Top\n\n## Child\n\n### Grandchild\n\n## Sibling\n";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let headings: Vec<_> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Heading)
+            .collect();
+        assert_eq!(headings.len(), 4);
+        assert!(headings[0].metadata.parent.is_none(), "H1 has no parent");
+        assert_eq!(headings[1].metadata.parent.as_deref(), Some("Top"));
+        assert_eq!(headings[2].metadata.parent.as_deref(), Some("Child"));
+        assert_eq!(
+            headings[3].metadata.parent.as_deref(),
+            Some("Top"),
+            "Sibling H2 parent is Top"
+        );
+    }
+
+    #[test]
+    fn prose_links_are_collected() {
+        let content =
+            "# Sec\n\nSee [OAuth docs](./oauth.md) and [external](https://example.com/docs).\n";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let prose = doc
+            .chunks
+            .iter()
+            .find(|c| c.chunk_type == ChunkType::Prose)
+            .unwrap();
+        assert!(prose.metadata.links.contains(&"./oauth.md".to_string()));
+        assert!(prose
+            .metadata
+            .links
+            .contains(&"https://example.com/docs".to_string()));
+    }
+
+    #[test]
+    fn fragment_only_links_are_skipped() {
+        let content = "See [section](#intro) for details.\n";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let prose = doc
+            .chunks
+            .iter()
+            .find(|c| c.chunk_type == ChunkType::Prose)
+            .unwrap();
+        assert!(
+            prose.metadata.links.iter().all(|l| !l.starts_with('#')),
+            "fragment-only links must not be collected"
+        );
     }
 }
