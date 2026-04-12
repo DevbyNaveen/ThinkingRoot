@@ -8,6 +8,7 @@ use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_core::types::*;
 
 use crate::llm::LlmClient;
+use crate::scheduler::ThroughputScheduler;
 use crate::prompts;
 use crate::schema::ExtractionResult;
 
@@ -58,9 +59,11 @@ pub struct SourcedRelation {
 
 impl Extractor {
     pub async fn new(config: &Config) -> Result<Self> {
+        let scheduler = ThroughputScheduler::new();
         let llm = LlmClient::new(&config.llm)
             .await?
-            .with_max_retries(config.extraction.max_retries);
+            .with_max_retries(config.extraction.max_retries)
+            .with_scheduler(Arc::clone(&scheduler));
 
         Ok(Self {
             llm: Arc::new(llm),
@@ -125,6 +128,10 @@ impl Extractor {
         struct ChunkWork {
             source_id: SourceId,
             source_uri: String,
+            /// The original full chunk content — used as the cache key after
+            /// all sub-chunks are processed, so split chunks are cached under
+            /// their original key and hit on subsequent runs.
+            original_content: String,
             sub_chunks: Vec<String>,
             context: String,
         }
@@ -155,6 +162,7 @@ impl Extractor {
                 llm_work.push(ChunkWork {
                     source_id: doc.source_id,
                     source_uri: doc.uri.clone(),
+                    original_content: chunk.content.clone(),
                     sub_chunks,
                     context: prompts::build_context(
                         &doc.uri,
@@ -197,6 +205,7 @@ impl Extractor {
             join_set.spawn(async move {
                 let source_id = work.source_id;
                 let source_uri = work.source_uri;
+                let original_content = work.original_content;
                 let mut sub_results: Vec<(String, ExtractionResult)> = Vec::new();
 
                 for sub_content in work.sub_chunks {
@@ -221,7 +230,7 @@ impl Extractor {
                 if sub_results.is_empty() {
                     return None;
                 }
-                Some((source_id, source_uri, sub_results))
+                Some((source_id, source_uri, original_content, sub_results))
             });
         }
 
@@ -229,12 +238,25 @@ impl Extractor {
         // JoinSet yields results as each task finishes, giving smooth
         // progress updates rather than awaiting in spawn order.
         while let Some(join_result) = join_set.join_next().await {
-            if let Ok(Some((source_id, source_uri, sub_results))) = join_result {
-                // Write each sub-chunk result to cache.
+            if let Ok(Some((source_id, source_uri, original_content, sub_results))) = join_result {
                 if let Some(ref cache) = self.cache {
+                    // Write each sub-chunk result under its own key.
                     for (sub_content, extraction_result) in &sub_results {
                         if let Err(e) = cache.put(sub_content, extraction_result) {
                             tracing::warn!("failed to write extraction cache entry: {e}");
+                        }
+                    }
+                    // Also write the merged result under the original chunk key so that
+                    // split chunks hit the cache on subsequent runs (the lookup key is
+                    // always the original full chunk content, not the sub-chunk content).
+                    if sub_results.len() > 1 || sub_results.first().map(|(c, _)| c != &original_content).unwrap_or(false) {
+                        let merged = ExtractionResult {
+                            claims: sub_results.iter().flat_map(|(_, r)| r.claims.clone()).collect(),
+                            entities: sub_results.iter().flat_map(|(_, r)| r.entities.clone()).collect(),
+                            relations: sub_results.iter().flat_map(|(_, r)| r.relations.clone()).collect(),
+                        };
+                        if let Err(e) = cache.put(&original_content, &merged) {
+                            tracing::warn!("failed to write merged cache entry: {e}");
                         }
                     }
                 }
