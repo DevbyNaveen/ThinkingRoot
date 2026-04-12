@@ -1,19 +1,13 @@
-```
-╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║   ████████╗██╗  ██╗██╗███╗   ██╗██╗  ██╗██╗███╗   ██╗ ██████╗  ║
-║      ██╔══╝██║  ██║██║████╗  ██║██║ ██╔╝██║████╗  ██║██╔════╝  ║
-║      ██║   ███████║██║██╔██╗ ██║█████╔╝ ██║██╔██╗ ██║██║  ███╗ ║
-║      ██║   ██╔══██║██║██║╚██╗██║██╔═██╗ ██║██║╚██╗██║██║   ██║ |
-║      ██║   ██║  ██║██║██║ ╚████║██║  ██╗██║██║ ╚████║╚██████╔╝ ║
-║      ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝ ╚═════╝  ║
-║                                                                ║
-║          R  O  O  T                                            ║
-║          The open-source knowledge compiler for AI agents      ║
-╚════════════════════════════════════════════════════════════════╝
-```
-
 <div align="center">
+
+<img src="assets/branding/logo.png" alt="ThinkingRoot Logo" width="300" />
+
+<br/>
+
+**The open-source knowledge compiler for AI agents**
+
+<br/>
+
 
 [![CI](https://github.com/thinkingroot/thinkingroot/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkingroot/thinkingroot/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](LICENSE-MIT)
