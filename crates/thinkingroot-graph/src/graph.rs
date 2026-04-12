@@ -2139,4 +2139,36 @@ mod tests {
         let not_found = store.find_entity_id_by_name("NonExistent").unwrap();
         assert!(not_found.is_none());
     }
+
+    #[test]
+    fn insert_and_get_claim_preserves_extraction_tier() {
+        use thinkingroot_core::types::ExtractionTier;
+
+        let store = mem_store();
+
+        let source = thinkingroot_core::Source::new(
+            "test://tier-roundtrip.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&source).unwrap();
+
+        let mut claim = thinkingroot_core::Claim::new(
+            "compile is defined in example.rs",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        claim.extraction_tier = ExtractionTier::Structural;
+        store.insert_claim(&claim).unwrap();
+
+        let retrieved = store
+            .get_claim_by_id(&claim.id.to_string())
+            .unwrap()
+            .expect("claim should be present after insert");
+        assert_eq!(
+            retrieved.extraction_tier,
+            ExtractionTier::Structural,
+            "extraction_tier must survive insert+get round-trip"
+        );
+    }
 }

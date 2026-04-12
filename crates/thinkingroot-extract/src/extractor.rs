@@ -620,3 +620,82 @@ mod tests {
         assert_eq!(chunks[0], big_line);
     }
 }
+
+#[cfg(test)]
+mod tiered_tests {
+    #[test]
+    fn structural_chunks_produce_results_without_llm() {
+        use thinkingroot_core::ir::{Chunk, ChunkMetadata, ChunkType};
+        use thinkingroot_core::types::ExtractionTier;
+
+        let chunk = Chunk {
+            content: "pub fn compile(path: &Path) -> Result<()> { }".to_string(),
+            chunk_type: ChunkType::FunctionDef,
+            start_line: 1,
+            end_line: 1,
+            heading: None,
+            language: Some("rust".to_string()),
+            metadata: ChunkMetadata {
+                function_name: Some("compile".to_string()),
+                parameters: Some(vec!["path: &Path".to_string()]),
+                return_type: Some("Result<()>".to_string()),
+                visibility: Some("pub".to_string()),
+                ..Default::default()
+            },
+        };
+
+        let result = crate::structural::extract_structural(&chunk, "test/example.rs");
+        assert!(!result.entities.is_empty(), "structural should produce entities");
+        assert!(!result.claims.is_empty(), "structural should produce claims");
+        assert_eq!(
+            result.claims[0].extraction_tier,
+            ExtractionTier::Structural,
+            "structural extractor must tag claims with ExtractionTier::Structural"
+        );
+    }
+
+    #[test]
+    fn router_correctly_splits_mixed_document() {
+        use thinkingroot_core::ir::{Chunk, ChunkMetadata, ChunkType};
+
+        let chunks = vec![
+            Chunk {
+                content: "pub fn foo() {}".to_string(),
+                chunk_type: ChunkType::FunctionDef,
+                start_line: 1,
+                end_line: 1,
+                heading: None,
+                language: Some("rust".to_string()),
+                metadata: ChunkMetadata {
+                    function_name: Some("foo".to_string()),
+                    ..Default::default()
+                },
+            },
+            Chunk {
+                content: "This module handles authentication.".to_string(),
+                chunk_type: ChunkType::Prose,
+                start_line: 5,
+                end_line: 5,
+                heading: None,
+                language: None,
+                metadata: ChunkMetadata::default(),
+            },
+            Chunk {
+                content: "use std::path::Path;".to_string(),
+                chunk_type: ChunkType::Import,
+                start_line: 1,
+                end_line: 1,
+                heading: None,
+                language: Some("rust".to_string()),
+                metadata: ChunkMetadata {
+                    import_path: Some("std::path::Path".to_string()),
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let (structural, llm) = crate::router::route_chunks(&chunks);
+        assert_eq!(structural.len(), 2, "FunctionDef + Import = 2 structural");
+        assert_eq!(llm.len(), 1, "Prose = 1 LLM");
+    }
+}
