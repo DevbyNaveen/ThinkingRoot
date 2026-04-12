@@ -108,14 +108,35 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
 /// Each file line looks like: " path/to/file.rs | 12 +++---"
 /// The summary line ("N files changed, ...") has no " | " and is skipped.
 fn parse_changed_files(diff_stat: &str) -> Vec<String> {
-    diff_stat
-        .lines()
-        .filter_map(|line| {
-            let pipe_pos = line.find(" |")?;
-            let path = line[..pipe_pos].trim().to_string();
-            if path.is_empty() { None } else { Some(path) }
-        })
-        .collect()
+    let mut result = Vec::new();
+    for line in diff_stat.lines() {
+        let Some(pipe_pos) = line.find(" |") else { continue };
+        let path = line[..pipe_pos].trim();
+        if path.is_empty() {
+            continue;
+        }
+        // Handle git rename notation: "prefix{old => new}suffix"
+        if let (Some(brace_start), Some(brace_end)) = (path.find('{'), path.find('}')) {
+            if brace_start < brace_end {
+                let prefix = &path[..brace_start];
+                let suffix = &path[brace_end + 1..];
+                let inner = &path[brace_start + 1..brace_end];
+                if let Some((old_part, new_part)) = inner.split_once(" => ") {
+                    let old_path = format!("{}{}{}", prefix, old_part.trim(), suffix);
+                    let new_path = format!("{}{}{}", prefix, new_part.trim(), suffix);
+                    if !old_path.is_empty() {
+                        result.push(old_path);
+                    }
+                    if !new_path.is_empty() {
+                        result.push(new_path);
+                    }
+                    continue;
+                }
+            }
+        }
+        result.push(path.to_string());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -146,5 +167,20 @@ mod tests {
         let files = parse_changed_files(stat);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], "foo.rs");
+    }
+
+    #[test]
+    fn parse_changed_files_empty_input() {
+        assert!(parse_changed_files("").is_empty());
+        assert!(parse_changed_files("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_changed_files_handles_rename() {
+        let stat = " src/{old.rs => new.rs} | 3 ++-\n 1 file changed, 3 insertions(+), 0 deletions(-)\n";
+        let files = parse_changed_files(stat);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"src/old.rs".to_string()));
+        assert!(files.contains(&"src/new.rs".to_string()));
     }
 }
