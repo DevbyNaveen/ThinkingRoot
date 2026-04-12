@@ -46,6 +46,12 @@ pub enum Error {
     #[error("llm provider error: {provider}: {message}")]
     LlmProvider { provider: String, message: String },
 
+    #[error("rate limited by {provider} (retry after {retry_after_ms}ms)")]
+    RateLimited {
+        provider: String,
+        retry_after_ms: u64,
+    },
+
     #[error("extraction failed for source {source_id}: {message}")]
     Extraction { source_id: String, message: String },
 
@@ -101,6 +107,26 @@ impl Error {
         Self::Io {
             path: Some(path.into()),
             source,
+        }
+    }
+
+    /// True when the error is a rate-limit / throttle from any LLM provider.
+    /// Also catches generic provider errors whose message mentions throttling.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::LlmProvider { message, .. } => {
+                let m = message.to_lowercase();
+                m.contains("throttl")
+                    || m.contains("rate")
+                    || m.contains("too many requests")
+                    || m.contains("429")
+                    || m.contains("quota")
+                    || m.contains("capacity")
+                    || m.contains("overloaded")
+                    || m.contains("service error")
+            }
+            _ => false,
         }
     }
 }

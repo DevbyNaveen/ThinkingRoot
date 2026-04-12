@@ -68,6 +68,7 @@ impl Config {
                     }
                 };
             }
+            inherit!(azure);
             inherit!(openai);
             inherit!(anthropic);
             inherit!(ollama);
@@ -156,8 +157,8 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             default_provider: "bedrock".to_string(),
-            extraction_model: "amazon.nova-micro-v1:0".to_string(),
-            compilation_model: "amazon.nova-micro-v1:0".to_string(),
+            extraction_model: "us.amazon.nova-pro-v1:0".to_string(),
+            compilation_model: "us.amazon.nova-pro-v1:0".to_string(),
             max_concurrent_requests: 5,
             request_timeout_secs: 120,
             providers: ProvidersConfig::default(),
@@ -168,6 +169,7 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
     pub bedrock: Option<BedrockConfig>,
+    pub azure: Option<AzureConfig>,
     pub openai: Option<ProviderConfig>,
     pub anthropic: Option<ProviderConfig>,
     pub ollama: Option<ProviderConfig>,
@@ -191,6 +193,27 @@ pub struct ProviderConfig {
 pub struct BedrockConfig {
     pub region: Option<String>,
     pub profile: Option<String>,
+}
+
+/// Azure OpenAI provider configuration.
+/// Uses deployment-based URLs and `api-key` header auth (not Bearer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AzureConfig {
+    /// Azure OpenAI resource name (e.g., "my-company-openai").
+    /// Used to construct `https://{resource_name}.openai.azure.com` when
+    /// `endpoint_base` is not set.
+    pub resource_name: Option<String>,
+    /// Full base URL override (e.g., "https://myresource.cognitiveservices.azure.com").
+    /// Use this for AIServices/Foundry resources that use `.cognitiveservices.azure.com`
+    /// instead of `.openai.azure.com`. When set, `resource_name` is ignored for URL
+    /// construction but still stored for display purposes.
+    pub endpoint_base: Option<String>,
+    /// Deployment name (e.g., "gpt-4o-mini-prod").
+    pub deployment: Option<String>,
+    /// API version string (e.g., "2024-12-01-preview").
+    pub api_version: Option<String>,
+    /// Environment variable holding the api-key.
+    pub api_key_env: Option<String>,
 }
 
 /// Extraction pipeline settings.
@@ -284,8 +307,13 @@ impl Default for ParserConfig {
                 ".git/**".to_string(),
                 ".thinkingroot/**".to_string(),
                 "*.lock".to_string(),
+                "package-lock.json".to_string(),
                 "*.min.js".to_string(),
                 "*.min.css".to_string(),
+                "*.map".to_string(),
+                "dist/**".to_string(),
+                ".next/**".to_string(),
+                "build/**".to_string(),
             ],
             respect_gitignore: true,
             max_file_size: 1_048_576, // 1 MB
@@ -430,6 +458,38 @@ request_timeout_secs = 60
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.llm.default_provider, config.llm.default_provider);
+    }
+
+    #[test]
+    fn azure_config_roundtrip_toml() {
+        let toml = r#"
+[llm]
+default_provider = "azure"
+extraction_model = "gpt-4o-mini-deploy"
+compilation_model = "gpt-4o-mini-deploy"
+max_concurrent_requests = 5
+request_timeout_secs = 120
+
+[llm.providers.azure]
+resource_name = "my-company-openai"
+deployment = "gpt-4o-mini-deploy"
+api_version = "2024-02-01"
+api_key_env = "AZURE_OPENAI_API_KEY"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let azure = config.llm.providers.azure.as_ref().unwrap();
+        assert_eq!(azure.resource_name.as_deref(), Some("my-company-openai"));
+        assert_eq!(azure.deployment.as_deref(), Some("gpt-4o-mini-deploy"));
+        assert_eq!(azure.api_version.as_deref(), Some("2024-02-01"));
+        assert_eq!(azure.api_key_env.as_deref(), Some("AZURE_OPENAI_API_KEY"));
+
+        // Roundtrip
+        let out = toml::to_string_pretty(&config).unwrap();
+        let reparsed: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            reparsed.llm.providers.azure.as_ref().unwrap().resource_name.as_deref(),
+            Some("my-company-openai")
+        );
     }
 
     #[test]
