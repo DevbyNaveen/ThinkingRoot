@@ -580,7 +580,7 @@ impl GraphStore {
                 .db
                 .run_script(
                     "?[f, t, rel_type] := \
-                     *entity_relations{from_id: f, to_id: t, relation_type: rel_type}, \
+                     *entity_relations{from_id: $eid, to_id: t, relation_type: rel_type}, \
                      f = $eid",
                     params.clone(),
                     ScriptMutability::Immutable,
@@ -592,7 +592,7 @@ impl GraphStore {
                 .db
                 .run_script(
                     "?[f, t, rel_type] := \
-                     *entity_relations{from_id: f, to_id: t, relation_type: rel_type}, \
+                     *entity_relations{from_id: f, to_id: $eid, relation_type: rel_type}, \
                      t = $eid",
                     params,
                     ScriptMutability::Immutable,

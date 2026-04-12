@@ -333,16 +333,18 @@ pub async fn run_pipeline(
             for (source_id, _, _) in &existing_sources {
                 affected_triples
                     .extend(storage.graph.get_source_relation_triples(source_id)?);
-                // Cross-file staleness: also re-evaluate triples involving entities from this source.
+                // Fetch entity IDs once, reuse for both cross-file triples and vector stale IDs.
                 let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
                 if !entity_ids_from_source.is_empty() {
                     let cross_file_triples = storage
                         .graph
                         .get_all_triples_involving_entities(&entity_ids_from_source)?;
+                    let cross_file_count = cross_file_triples.len();
                     affected_triples.extend(cross_file_triples);
                     tracing::debug!(
-                        "cross-file staleness: {} entity ids, cross-file triples added for source {}",
+                        "cross-file staleness: {} entity ids, {} cross-file triples added for source {}",
                         entity_ids_from_source.len(),
+                        cross_file_count,
                         source_id
                     );
                 }
@@ -350,7 +352,7 @@ pub async fn run_pipeline(
                 for cid in storage.graph.get_claim_ids_for_source(source_id)? {
                     stale_claim_vector_ids.push(format!("claim:{cid}"));
                 }
-                for eid in storage.graph.get_entity_ids_for_source(source_id)? {
+                for eid in &entity_ids_from_source {
                     stale_entity_candidate_ids.push(format!("entity:{eid}"));
                 }
             }
@@ -361,16 +363,18 @@ pub async fn run_pipeline(
 
     for (source_id, uri) in &deleted_sources {
         affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
-        // Cross-file staleness: also re-evaluate triples involving entities from this source.
+        // Fetch entity IDs once, reuse for both cross-file triples and vector stale IDs.
         let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
         if !entity_ids_from_source.is_empty() {
             let cross_file_triples = storage
                 .graph
                 .get_all_triples_involving_entities(&entity_ids_from_source)?;
+            let cross_file_count = cross_file_triples.len();
             affected_triples.extend(cross_file_triples);
             tracing::debug!(
-                "cross-file staleness: {} entity ids, cross-file triples added for source {}",
+                "cross-file staleness: {} entity ids, {} cross-file triples added for source {}",
                 entity_ids_from_source.len(),
+                cross_file_count,
                 source_id
             );
         }
@@ -378,7 +382,7 @@ pub async fn run_pipeline(
         for cid in storage.graph.get_claim_ids_for_source(source_id)? {
             stale_claim_vector_ids.push(format!("claim:{cid}"));
         }
-        for eid in storage.graph.get_entity_ids_for_source(source_id)? {
+        for eid in &entity_ids_from_source {
             stale_entity_candidate_ids.push(format!("entity:{eid}"));
         }
         storage.graph.remove_source_by_uri(uri)?;
