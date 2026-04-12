@@ -90,7 +90,9 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             | "local_function"
             | "singleton_method"
             // Ruby: `def method_name` → node kind is literally "method"
-            | "method" => {
+            | "method"
+            // Haskell function definition
+            | "function" => {
                 let name =
                     find_child_by_field(&child, "name").map(|n| source[n.byte_range()].to_string());
                 let params = find_child_by_field(&child, "parameters")
@@ -222,8 +224,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             | "preproc_include"
             // C# (using System;)
             | "using_directive"
-            // Kotlin
-            | "import_header"
+            // Kotlin (kotlin-ng uses "import", not "import_header")
+            | "import"
             // PHP
             | "namespace_use_declaration" => {
                 let chunk = Chunk::new(text, ChunkType::Import, start_line, end_line)
@@ -246,6 +248,47 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 let chunk = Chunk::new(text, ChunkType::ModuleDoc, start_line, end_line)
                     .with_language(language);
                 doc.add_chunk(chunk);
+            }
+
+            // Elixir: def/defp/defmacro are represented as `call` nodes in tree-sitter-elixir.
+            // Detect them by checking if the first child's text is "def", "defp", or "defmacro".
+            "call" if language == "elixir" => {
+                // The call node's first named child is the function identifier ("def", "defp", etc.)
+                // The second child (arguments) contains the function name and body.
+                let mut call_cursor = child.walk();
+                let call_children: Vec<_> = child.named_children(&mut call_cursor).collect();
+                if let Some(head) = call_children.first() {
+                    let head_text = &source[head.byte_range()];
+                    if matches!(head_text, "def" | "defp" | "defmacro" | "defmacrop") {
+                        // Function name is the first argument to the def call
+                        if let Some(args) = call_children.get(1) {
+                            // args is typically an "arguments" node; first child is the function name or call
+                            let mut args_cursor = args.walk();
+                            let arg_children: Vec<_> = args.named_children(&mut args_cursor).collect();
+                            let name = arg_children.first().map(|n| {
+                                // Could be an identifier (simple fn) or a call (fn with params)
+                                let text = &source[n.byte_range()];
+                                // Take just the identifier part before any '('
+                                last_identifier(text).unwrap_or_else(|| text.to_string())
+                            });
+                            let start_line = child.start_position().row as u32 + 1;
+                            let end_line = child.end_position().row as u32 + 1;
+                            let text = &source[child.byte_range()];
+                            let mut chunk = Chunk::new(text, ChunkType::FunctionDef, start_line, end_line)
+                                .with_language(language);
+                            chunk.metadata = ChunkMetadata {
+                                function_name: name,
+                                visibility: Some(if head_text.ends_with('p') { "private".to_string() } else { "public".to_string() }),
+                                ..Default::default()
+                            };
+                            doc.add_chunk(chunk);
+                        }
+                    }
+                }
+                // Always recurse into call children for nested definitions
+                if child.child_count() > 0 {
+                    extract_chunks(source, child, language, doc);
+                }
             }
 
             _ => {
@@ -671,5 +714,65 @@ def process(data):
         let calls = &process_chunk.unwrap().metadata.calls_functions;
         assert!(calls.contains(&"transform".to_string()), "must detect transform call");
         assert!(calls.contains(&"method".to_string()), "must detect obj.method call");
+    }
+
+    #[test]
+    fn kotlin_import_is_parsed() {
+        let source = r#"
+import com.example.Foo
+import kotlin.collections.List
+
+fun hello(): String = "hi"
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "Main.kt".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "kotlin", &mut doc);
+        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
+            "kotlin import must produce Import chunk");
+    }
+
+    #[test]
+    fn haskell_function_is_parsed() {
+        let source = r#"
+module Main where
+
+greet :: String -> String
+greet name = "Hello " ++ name
+
+main :: IO ()
+main = putStrLn (greet "world")
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "Main.hs".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_haskell::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "haskell", &mut doc);
+        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "haskell function node must produce FunctionDef");
+    }
+
+    #[test]
+    fn elixir_def_is_parsed() {
+        let source = r#"
+defmodule Greeter do
+  def greet(name) do
+    "Hello #{name}"
+  end
+
+  defp helper(x), do: x
+end
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "greeter.ex".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_elixir::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "elixir", &mut doc);
+        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "elixir def must produce FunctionDef");
     }
 }
