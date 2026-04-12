@@ -226,6 +226,7 @@ fn extract_field_types(source: &str, node: &tree_sitter::Node) -> Vec<String> {
                             .trim_start_matches("Vec<")
                             .trim_start_matches("Arc<")
                             .trim_start_matches("Box<")
+                            .trim_start_matches("dyn ")
                             .split('<')
                             .next()
                             .unwrap_or(&raw)
@@ -240,6 +241,8 @@ fn extract_field_types(source: &str, node: &tree_sitter::Node) -> Vec<String> {
             }
         }
     }
+    types.sort();
+    types.dedup();
     types
 }
 
@@ -276,6 +279,18 @@ fn is_primitive_type(s: &str) -> bool {
             | "Rc"
             | "Cell"
             | "RefCell"
+            | "Result"
+            | "Mutex"
+            | "RwLock"
+            | "Cow"
+            | "PhantomData"
+            | "Pin"
+            | "Weak"
+            | "OnceCell"
+            | "LazyLock"
+            | "MaybeUninit"
+            | "UnsafeCell"
+            | "ManuallyDrop"
     )
 }
 
