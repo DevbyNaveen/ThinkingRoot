@@ -146,6 +146,9 @@ impl Extractor {
             original_content: String,
             sub_chunks: Vec<String>,
             context: String,
+            /// AST-extracted anchor section injected into the LLM prompt.
+            /// Empty string when the chunk has no AST metadata (prose, headings, etc.).
+            ast_anchor: String,
         }
 
         let mut cache_hits_data: Vec<(SourceId, String, ExtractionResult)> = Vec::new();
@@ -193,6 +196,7 @@ impl Extractor {
                         chunk.language.as_deref(),
                         chunk.heading.as_deref(),
                     ),
+                    ast_anchor: prompts::build_ast_anchor_section(&chunk.metadata),
                 });
             }
         }
@@ -255,13 +259,22 @@ impl Extractor {
                 let original_content = work.original_content;
                 let mut sub_results: Vec<(String, ExtractionResult)> = Vec::new();
 
+                // Prepend AST anchor (if any) to the graph-primed context so the LLM
+                // is anchored to the exact entity names AST already extracted — one
+                // coherent pipeline instead of two blind parallel lanes.
+                let combined_ctx = if work.ast_anchor.is_empty() {
+                    graph_ctx
+                } else {
+                    format!("{}\n\n{}", work.ast_anchor, graph_ctx)
+                };
+
                 for sub_content in work.sub_chunks {
                     let _permit = sem.acquire().await.ok()?;
                     match extract_with_split(
                         Arc::clone(&llm),
                         sub_content.clone(),
                         work.context.clone(),
-                        graph_ctx.clone(),
+                        combined_ctx.clone(),
                         0,
                     )
                     .await

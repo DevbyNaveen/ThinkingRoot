@@ -97,3 +97,116 @@ pub fn build_context(uri: &str, language: Option<&str>, heading: Option<&str>) -
     }
     parts.join(", ")
 }
+
+/// Build an AST anchor section from chunk metadata to inject into the LLM prompt.
+///
+/// When a chunk has AST-extracted metadata (function name, call list, type name, etc.),
+/// this section is prepended to the LLM prompt so LLM describes the EXACT entities
+/// AST already found — guaranteeing that structural topology (0.99 confidence) and
+/// LLM semantics (0.7-0.9 confidence) land on the same graph node after Linker merge.
+pub fn build_ast_anchor_section(metadata: &thinkingroot_core::ir::ChunkMetadata) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut entity_names: Vec<String> = Vec::new();
+
+    if let Some(ref name) = metadata.function_name {
+        lines.push(format!("Function: {name}"));
+        entity_names.push(format!("\"{name}\""));
+        if let Some(ref vis) = metadata.visibility {
+            lines.push(format!("Visibility: {vis}"));
+        }
+        if let Some(ref ret) = metadata.return_type {
+            lines.push(format!("Returns: {ret}"));
+        }
+        if !metadata.calls_functions.is_empty() {
+            lines.push(format!("Calls: [{}]", metadata.calls_functions.join(", ")));
+            for callee in &metadata.calls_functions {
+                entity_names.push(format!("\"{callee}\""));
+            }
+        }
+    } else if let Some(ref name) = metadata.type_name {
+        lines.push(format!("Type: {name}"));
+        entity_names.push(format!("\"{name}\""));
+        if let Some(ref vis) = metadata.visibility {
+            lines.push(format!("Visibility: {vis}"));
+        }
+        if let Some(ref trait_name) = metadata.trait_name {
+            lines.push(format!("Implements: {trait_name}"));
+            entity_names.push(format!("\"{trait_name}\""));
+        }
+        if !metadata.field_types.is_empty() {
+            lines.push(format!("Field types: [{}]", metadata.field_types.join(", ")));
+        }
+    } else if let Some(ref path) = metadata.import_path {
+        lines.push(format!("Import: {path}"));
+        entity_names.push(format!("\"{path}\""));
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "## AST Analysis (deterministic, tree-sitter)\n\
+         {}\n\
+         IMPORTANT: Your entity names MUST match exactly: {}\n",
+        lines.join("\n"),
+        entity_names.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thinkingroot_core::ir::ChunkMetadata;
+
+    #[test]
+    fn ast_anchor_empty_for_empty_metadata() {
+        let meta = ChunkMetadata::default();
+        assert!(build_ast_anchor_section(&meta).is_empty(),
+            "empty metadata must produce empty anchor");
+    }
+
+    #[test]
+    fn ast_anchor_includes_function_name_and_calls() {
+        let meta = ChunkMetadata {
+            function_name: Some("validate_token".to_string()),
+            calls_functions: vec!["decode".to_string(), "verify_sig".to_string()],
+            return_type: Some("Result<Claims>".to_string()),
+            visibility: Some("pub".to_string()),
+            ..Default::default()
+        };
+        let section = build_ast_anchor_section(&meta);
+        assert!(section.contains("validate_token"));
+        assert!(section.contains("decode"));
+        assert!(section.contains("verify_sig"));
+        assert!(section.contains("Result<Claims>"));
+        assert!(section.contains("pub"));
+    }
+
+    #[test]
+    fn ast_anchor_includes_type_name_and_trait() {
+        let meta = ChunkMetadata {
+            type_name: Some("AuthService".to_string()),
+            trait_name: Some("Service".to_string()),
+            ..Default::default()
+        };
+        let section = build_ast_anchor_section(&meta);
+        assert!(section.contains("AuthService"));
+        assert!(section.contains("Service"));
+    }
+
+    #[test]
+    fn ast_anchor_exact_names_instruction_present() {
+        let meta = ChunkMetadata {
+            function_name: Some("do_thing".to_string()),
+            calls_functions: vec!["helper".to_string()],
+            ..Default::default()
+        };
+        let section = build_ast_anchor_section(&meta);
+        assert!(section.contains("do_thing"));
+        assert!(section.contains("helper"));
+        // Must instruct LLM to use exact names
+        assert!(section.to_lowercase().contains("exact") || section.contains("MUST") || section.contains("must"),
+            "anchor must instruct LLM to use exact entity names");
+    }
+}
