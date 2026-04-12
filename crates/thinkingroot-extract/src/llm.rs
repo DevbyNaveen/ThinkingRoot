@@ -1011,7 +1011,13 @@ fn parse_extraction_result(text: &str) -> Result<ExtractionResult> {
     // Some models (Nova, older Claude) emit trailing commas which are invalid JSON.
     // Strip them and retry before giving up.
     let cleaned = strip_trailing_commas(json_str);
-    serde_json::from_str::<ExtractionResult>(&cleaned).map_err(|e| Error::StructuredOutput {
+    if let Ok(result) = serde_json::from_str::<ExtractionResult>(&cleaned) {
+        return Ok(result);
+    }
+
+    // Attempt 4: repair bare array items (LLM forgot {} around objects)
+    let repaired = repair_bare_array_items(&cleaned);
+    serde_json::from_str::<ExtractionResult>(&repaired).map_err(|e| Error::StructuredOutput {
         message: format!(
             "failed to parse extraction result: {e}\nRaw response: {}",
             &text[..text.len().min(200)]
@@ -1043,6 +1049,157 @@ fn strip_trailing_commas(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Repair the specific malformation where LLMs omit `{}` around array items.
+///
+/// Handles:
+/// ```text
+/// "claims": ["statement": "...", "claim_type": "fact"]
+/// ```
+/// Repairs to:
+/// ```text
+/// "claims": [{"statement": "...", "claim_type": "fact"}]
+/// ```
+///
+/// Uses the known first-field names of our schema to detect object boundaries.
+fn repair_bare_array_items(s: &str) -> String {
+    // First-field of each array item type in ExtractionResult.
+    // A new object starts whenever one of these appears after a comma at depth 0.
+    const BOUNDARY_KEYS: &[&str] = &[
+        r#""statement":"#,
+        r#""name":"#,
+        r#""from_entity":"#,
+    ];
+
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 128);
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            // Check if the first non-whitespace content after '[' is a bare key (not '{')
+            let after = skip_whitespace(bytes, i + 1);
+            let remaining = s.get(after..).unwrap_or("");
+            let is_bare = BOUNDARY_KEYS.iter().any(|k| remaining.starts_with(k));
+
+            if is_bare {
+                // Find the matching ']'
+                if let Some(close_rel) = find_close_bracket(&bytes[i..]) {
+                    let inner_start = i + 1;
+                    let inner_end = i + close_rel - 1; // content between '[' and ']'
+                    let inner = s.get(inner_start..inner_end).unwrap_or("");
+
+                    // Split inner content into individual object strings
+                    let objects = split_bare_objects(inner, BOUNDARY_KEYS);
+
+                    out.push('[');
+                    for (idx, obj) in objects.iter().enumerate() {
+                        if idx > 0 {
+                            out.push_str(", ");
+                        }
+                        let trimmed = obj.trim().trim_end_matches(',');
+                        out.push('{');
+                        out.push_str(trimmed);
+                        out.push('}');
+                    }
+                    out.push(']');
+
+                    i = i + close_rel; // advance past ']'
+                    continue;
+                }
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
+}
+
+fn skip_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// Returns the length from the opening `[` up to and including the matching `]`.
+fn find_close_bracket(bytes: &[u8]) -> Option<usize> {
+    debug_assert_eq!(bytes.first(), Some(&b'['));
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => {
+                i += 2;
+                continue;
+            }
+            b'"' => {
+                in_string = !in_string;
+            }
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'}' if !in_string => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split the flat content of a bare array into individual object string slices.
+/// Objects are delimited by a comma followed by one of the known boundary keys at depth 0.
+fn split_bare_objects<'a>(inner: &'a str, boundary_keys: &[&str]) -> Vec<&'a str> {
+    let bytes = inner.as_bytes();
+    let mut objects: Vec<&str> = Vec::new();
+    let mut current_start = 0usize;
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut depth = 0i32;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => {
+                i += 2;
+                continue;
+            }
+            b'"' => {
+                in_string = !in_string;
+            }
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => depth -= 1,
+            b',' if !in_string && depth == 0 => {
+                // Check if what follows (after whitespace) is a boundary key
+                let after = skip_whitespace(bytes, i + 1);
+                let remaining = inner.get(after..).unwrap_or("");
+                if boundary_keys.iter().any(|k| remaining.starts_with(k)) {
+                    objects.push(inner[current_start..i].trim());
+                    current_start = after; // new object starts after the whitespace
+                    i = after;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Last object
+    let last = inner[current_start..].trim();
+    if !last.is_empty() {
+        objects.push(last);
+    }
+
+    objects
 }
 
 fn extract_json_from_text(text: &str) -> &str {
@@ -1183,5 +1340,85 @@ mod tests {
             "Sure! Here is the extraction:\n\n{\"claims\":[],\"entities\":[],\"relations\":[]}";
         let result = parse_extraction_result(text).unwrap();
         assert!(result.claims.is_empty());
+    }
+
+    #[test]
+    fn repair_bare_array_single_claim() {
+        // LLM forgot {} around the claim object
+        let malformed = r#"{
+  "claims": [
+      "statement": "X is a function",
+      "claim_type": "fact",
+      "confidence": 0.9,
+      "entities": ["X"],
+      "source_quote": "fn x()"
+  ],
+  "entities": [],
+  "relations": []
+}"#;
+        let repaired = repair_bare_array_items(malformed);
+        let result: ExtractionResult = serde_json::from_str(&repaired)
+            .expect("repaired JSON should parse");
+        assert_eq!(result.claims.len(), 1);
+        assert_eq!(result.claims[0].statement, "X is a function");
+    }
+
+    #[test]
+    fn repair_bare_array_multiple_claims() {
+        // Two claims without {}, split at "statement":
+        let malformed = r#"{
+  "claims": [
+      "statement": "A is a type",
+      "claim_type": "definition",
+      "confidence": 0.99,
+      "entities": ["A"],
+      "source_quote": "struct A {}",
+      "statement": "B depends on A",
+      "claim_type": "dependency",
+      "confidence": 0.8,
+      "entities": ["B", "A"],
+      "source_quote": "use A;"
+  ],
+  "entities": [],
+  "relations": []
+}"#;
+        let repaired = repair_bare_array_items(malformed);
+        let result: ExtractionResult = serde_json::from_str(&repaired)
+            .expect("repaired JSON should parse");
+        assert_eq!(result.claims.len(), 2);
+    }
+
+    #[test]
+    fn repair_well_formed_json_unchanged() {
+        // Properly formed JSON should pass through unchanged
+        let good = r#"{"claims": [{"statement": "X", "claim_type": "fact", "confidence": 0.9, "entities": [], "source_quote": null}], "entities": [], "relations": []}"#;
+        let repaired = repair_bare_array_items(good);
+        assert_eq!(repaired, good);
+    }
+
+    #[test]
+    fn parse_extraction_result_recovers_from_bare_array() {
+        // Full parse_extraction_result pipeline handles the bare-array failure
+        let malformed = r#"{
+  "claims": [
+      "statement": "The engine compiles code",
+      "claim_type": "fact",
+      "confidence": 0.85,
+      "entities": ["engine"],
+      "source_quote": "fn compile()"
+  ],
+  "entities": [
+      "name": "engine",
+      "entity_type": "system",
+      "aliases": [],
+      "description": "The extraction engine"
+  ],
+  "relations": []
+}"#;
+        let result = parse_extraction_result(malformed)
+            .expect("parse_extraction_result should recover");
+        assert_eq!(result.claims.len(), 1);
+        assert_eq!(result.entities.len(), 1);
+        assert_eq!(result.entities[0].name, "engine");
     }
 }
