@@ -561,6 +561,23 @@ impl GraphStore {
             .collect())
     }
 
+    /// Returns (canonical_name, entity_type) pairs for all entities.
+    /// Used by graph-primed extraction to inject KNOWN_ENTITIES into LLM prompts.
+    pub fn get_known_entities(&self) -> Result<Vec<(String, String)>> {
+        let result = self.query_read(
+            "?[name, entity_type] := *entities{canonical_name: name, entity_type}",
+        )?;
+        Ok(result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = row.first()?.get_str()?.to_string();
+                let entity_type = row.get(1)?.get_str()?.to_string();
+                Some((name, entity_type))
+            })
+            .collect())
+    }
+
     /// Remove all graph state derived from a source URI.
     pub fn remove_source_by_uri(&self, uri: &str) -> Result<usize> {
         let sources = self.find_sources_by_uri(uri)?;
