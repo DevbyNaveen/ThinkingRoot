@@ -1,9 +1,10 @@
 //! Tier 0 structural extractor — zero LLM, zero hallucination.
 //!
-//! Converts AST-rich chunks (FunctionDef, TypeDef, Import)
-//! into `ExtractionResult` deterministically using only the metadata that the
-//! parse crate already computed via tree-sitter.  Every claim produced here
-//! carries `extraction_tier: ExtractionTier::Structural` and `confidence: 0.99`.
+//! Converts AST-rich chunks (FunctionDef, TypeDef, Import, ManifestDependency,
+//! Heading, Prose) into `ExtractionResult` deterministically using only the
+//! metadata that the parse crate already computed via tree-sitter.  Every claim
+//! produced here carries `extraction_tier: ExtractionTier::Structural` and a
+//! confidence value appropriate to the evidence certainty.
 
 use thinkingroot_core::ir::{Chunk, ChunkType};
 use thinkingroot_core::types::ExtractionTier;
@@ -14,14 +15,14 @@ use crate::schema::{ExtractedClaim, ExtractedEntity, ExtractedRelation, Extracti
 
 /// Returns `true` if this chunk can be handled by the structural extractor
 /// without any LLM calls.
-///
-/// Note: `ManifestDependency` and `Heading` are routed Structural by the router
-/// but not yet handled here — they will be added in the structural extractor
-/// expansion (Task 7). Until then, they fall through to LLM.
 pub fn is_structurally_extractable(chunk: &Chunk) -> bool {
     matches!(
         chunk.chunk_type,
-        ChunkType::FunctionDef | ChunkType::TypeDef | ChunkType::Import
+        ChunkType::FunctionDef
+            | ChunkType::TypeDef
+            | ChunkType::Import
+            | ChunkType::ManifestDependency
+            | ChunkType::Heading
     )
 }
 
@@ -34,16 +35,66 @@ pub fn extract_structural(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         ChunkType::FunctionDef => extract_function_def(chunk, source_uri),
         ChunkType::TypeDef => extract_type_def(chunk, source_uri),
         ChunkType::Import => extract_import(chunk, source_uri),
+        ChunkType::ManifestDependency => extract_manifest_dep(chunk, source_uri),
+        ChunkType::Heading => extract_heading(chunk, source_uri),
+        ChunkType::Prose => extract_prose(chunk, source_uri),
         ChunkType::Comment | ChunkType::ModuleDoc => extract_doc_comment(chunk, source_uri),
-        // Prose, Code, Heading, List, Table — not structurally extractable.
         _ => ExtractionResult::empty(),
     }
 }
 
 // ── Internal extractors ───────────────────────────────────────────────────────
 
+/// ManifestDependency → Entity(project) + Entity(library) + Relation(depends_on) + Claim(dependency)
+fn extract_manifest_dep(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    let project = match &chunk.metadata.type_name {
+        Some(n) if !n.is_empty() => n.clone(),
+        _ => return ExtractionResult::empty(),
+    };
+    let library = match &chunk.metadata.import_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return ExtractionResult::empty(),
+    };
+    let file_name = file_name_from_uri(source_uri);
+
+    let project_entity = ExtractedEntity {
+        name: project.clone(),
+        entity_type: "system".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("{project} is a project defined in {file_name}")),
+    };
+    let library_entity = ExtractedEntity {
+        name: library.clone(),
+        entity_type: "library".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("{library} is a dependency of {project}")),
+    };
+    let dep_relation = ExtractedRelation {
+        from_entity: project.clone(),
+        to_entity: library.clone(),
+        relation_type: "depends_on".to_string(),
+        description: Some(format!("{project} depends on {library}")),
+        confidence: 0.99,
+    };
+    let dep_claim = ExtractedClaim {
+        statement: format!("{project} depends on {library}"),
+        claim_type: "dependency".to_string(),
+        confidence: 0.99,
+        entities: vec![project.clone(), library.clone()],
+        source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
+        extraction_tier: ExtractionTier::Structural,
+    };
+
+    ExtractionResult {
+        claims: vec![dep_claim],
+        entities: vec![project_entity, library_entity],
+        relations: vec![dep_relation],
+    }
+}
+
 /// FunctionDef → Entity(function) + Claim(api_signature) + Claim(definition)
 ///             + Relation(file contains func) + optional Relation(parent contains method)
+///             + optional Relation(calls) for each callee in calls_functions
 fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
     let name = match &chunk.metadata.function_name {
         Some(n) if !n.is_empty() => n.clone(),
@@ -122,6 +173,28 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
             result.entities.push(parent_entity);
             result.relations.push(parent_contains);
         }
+    }
+
+    // Gap 2: emit calls relations for each function this function calls.
+    for callee in &chunk.metadata.calls_functions {
+        if callee.is_empty() {
+            continue;
+        }
+        let callee_entity = ExtractedEntity {
+            name: callee.clone(),
+            entity_type: "function".to_string(),
+            aliases: Vec::new(),
+            description: Some(format!("Function called by {name}")),
+        };
+        let calls_rel = ExtractedRelation {
+            from_entity: name.clone(),
+            to_entity: callee.clone(),
+            relation_type: "calls".to_string(),
+            description: Some(format!("{name} calls {callee}")),
+            confidence: 0.99,
+        };
+        result.entities.push(callee_entity);
+        result.relations.push(calls_rel);
     }
 
     result
@@ -285,6 +358,173 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![file_entity, module_entity],
         relations: vec![uses_relation],
     }
+}
+
+/// Heading → Entity(heading) + Relation(container contains heading) + Claim(definition)
+fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    let heading_text = match chunk.heading.as_deref() {
+        Some(h) if !h.is_empty() => h.to_string(),
+        _ => {
+            let t = chunk.content.trim().to_string();
+            if t.is_empty() {
+                return ExtractionResult::empty();
+            }
+            t
+        }
+    };
+
+    let file_name = file_name_from_uri(source_uri);
+    let container_name = chunk.metadata.parent.clone().unwrap_or_else(|| file_name.clone());
+    let container_type = if chunk.metadata.parent.is_some() { "concept" } else { "file" };
+
+    let heading_entity = ExtractedEntity {
+        name: heading_text.clone(),
+        entity_type: "concept".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("Section in {file_name}")),
+    };
+    let container_entity = ExtractedEntity {
+        name: container_name.clone(),
+        entity_type: container_type.to_string(),
+        aliases: Vec::new(),
+        description: None,
+    };
+    let contains_rel = ExtractedRelation {
+        from_entity: container_name.clone(),
+        to_entity: heading_text.clone(),
+        relation_type: "contains".to_string(),
+        description: Some(format!("{container_name} contains section {heading_text}")),
+        confidence: 0.99,
+    };
+    let def_claim = ExtractedClaim {
+        statement: format!("{heading_text} is a section in {file_name}"),
+        claim_type: "definition".to_string(),
+        confidence: 0.99,
+        entities: vec![heading_text.clone(), file_name.clone()],
+        source_quote: None,
+        extraction_tier: ExtractionTier::Structural,
+    };
+
+    ExtractionResult {
+        claims: vec![def_claim],
+        entities: vec![heading_entity, container_entity],
+        relations: vec![contains_rel],
+    }
+}
+
+/// Prose → dispatches to extract_git_commit (if git:// URI) and/or extract_prose_links (if links present)
+fn extract_prose(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    let mut result = ExtractionResult::empty();
+
+    // Git authorship: source_uri starts with git:// AND commit_author is set.
+    if source_uri.starts_with("git://") {
+        if let Some(author) = &chunk.metadata.commit_author {
+            if !author.is_empty() {
+                result.merge(extract_git_commit(chunk, source_uri, author));
+            }
+        }
+    }
+
+    // Link extraction: any Prose with non-empty links.
+    if !chunk.metadata.links.is_empty() {
+        result.merge(extract_prose_links(chunk, source_uri));
+    }
+
+    result
+}
+
+/// Git commit Prose → Entity(author) + Relation(created_by file→author at 0.7) + Claim(fact)
+fn extract_git_commit(chunk: &Chunk, source_uri: &str, author: &str) -> ExtractionResult {
+    if chunk.metadata.changed_files.is_empty() {
+        return ExtractionResult::empty();
+    }
+
+    // The SHA is the last path segment of the git:// URI.
+    let sha = file_name_from_uri(source_uri);
+
+    let author_entity = ExtractedEntity {
+        name: author.to_string(),
+        entity_type: "person".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("{author} is a contributor")),
+    };
+
+    let mut result = ExtractionResult {
+        claims: Vec::new(),
+        entities: vec![author_entity],
+        relations: Vec::new(),
+    };
+
+    for file_path in &chunk.metadata.changed_files {
+        let file_entity = ExtractedEntity {
+            name: file_path.clone(),
+            entity_type: "file".to_string(),
+            aliases: Vec::new(),
+            description: None,
+        };
+        let created_by = ExtractedRelation {
+            from_entity: file_path.clone(),
+            to_entity: author.to_string(),
+            relation_type: "created_by".to_string(),
+            description: Some(format!("{author} modified {file_path}")),
+            confidence: 0.7,
+        };
+        let fact_claim = ExtractedClaim {
+            statement: format!("{author} modified {file_path} in commit {sha}"),
+            claim_type: "fact".to_string(),
+            confidence: 0.7,
+            entities: vec![author.to_string(), file_path.clone()],
+            source_quote: None,
+            extraction_tier: ExtractionTier::Structural,
+        };
+        result.entities.push(file_entity);
+        result.relations.push(created_by);
+        result.claims.push(fact_claim);
+    }
+
+    result
+}
+
+/// Prose links → Relation(related_to doc→link): relative at 0.99, absolute at 0.7
+fn extract_prose_links(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    let doc_name = file_name_from_uri(source_uri);
+
+    let doc_entity = ExtractedEntity {
+        name: doc_name.clone(),
+        entity_type: "file".to_string(),
+        aliases: Vec::new(),
+        description: None,
+    };
+
+    let mut result = ExtractionResult {
+        claims: Vec::new(),
+        entities: vec![doc_entity],
+        relations: Vec::new(),
+    };
+
+    for url in &chunk.metadata.links {
+        // Relative path (starts with '.' or has no scheme '://') → 0.99
+        // Absolute URL (has '://') → 0.7
+        let confidence = if url.contains("://") { 0.7 } else { 0.99 };
+
+        let link_entity = ExtractedEntity {
+            name: url.clone(),
+            entity_type: "file".to_string(),
+            aliases: Vec::new(),
+            description: None,
+        };
+        let rel = ExtractedRelation {
+            from_entity: doc_name.clone(),
+            to_entity: url.clone(),
+            relation_type: "related_to".to_string(),
+            description: Some(format!("{doc_name} references {url}")),
+            confidence,
+        };
+        result.entities.push(link_entity);
+        result.relations.push(rel);
+    }
+
+    result
 }
 
 /// Comment/ModuleDoc → Claim(definition) if a parent is present, empty otherwise.
@@ -474,7 +714,7 @@ mod tests {
         assert_eq!(uses_rel.to_entity, "DocumentIR");
     }
 
-    // ── 4. Prose → empty ─────────────────────────────────────────────────────
+    // ── 4. Prose → empty (default metadata, no git:// URI, no links) ─────────
 
     #[test]
     fn prose_chunk_returns_empty() {
@@ -525,6 +765,8 @@ mod tests {
             ChunkType::FunctionDef,
             ChunkType::TypeDef,
             ChunkType::Import,
+            ChunkType::ManifestDependency,
+            ChunkType::Heading,
         ] {
             let chunk = make_chunk(ct, "", ChunkMetadata::default());
             assert!(
@@ -539,7 +781,6 @@ mod tests {
         for ct in [
             ChunkType::Prose,
             ChunkType::Code,
-            ChunkType::Heading,
             ChunkType::List,
             ChunkType::Table,
             ChunkType::Comment,
@@ -681,5 +922,146 @@ mod tests {
         assert_eq!(deps.len(), 2, "two field types → two depends_on relations");
         assert!(deps.iter().any(|r| r.to_entity == "StorageBackend"));
         assert!(deps.iter().any(|r| r.to_entity == "EngineConfig"));
+    }
+
+    // ── Gap 1: ManifestDependency ─────────────────────────────────────────────
+
+    #[test]
+    fn manifest_dep_produces_depends_on_relation() {
+        let mut chunk = Chunk::new("serde = \"1\"", ChunkType::ManifestDependency, 1, 1);
+        chunk.metadata = ChunkMetadata {
+            type_name: Some("my-crate".to_string()),
+            import_path: Some("serde".to_string()),
+            ..Default::default()
+        };
+        let result = extract_structural(&chunk, "Cargo.toml");
+        let dep = result.relations.iter().find(|r| r.relation_type == "depends_on");
+        assert!(dep.is_some(), "must emit depends_on relation");
+        let dep = dep.unwrap();
+        assert_eq!(dep.from_entity, "my-crate");
+        assert_eq!(dep.to_entity, "serde");
+        assert_eq!(dep.confidence, 0.99);
+        let claim = result.claims.iter().find(|c| c.claim_type == "dependency");
+        assert!(claim.is_some(), "must emit dependency claim");
+        assert!(claim.unwrap().statement.contains("my-crate"));
+        assert!(claim.unwrap().statement.contains("serde"));
+    }
+
+    #[test]
+    fn manifest_dep_missing_fields_returns_empty() {
+        let chunk = make_chunk(ChunkType::ManifestDependency, "", ChunkMetadata::default());
+        let result = extract_structural(&chunk, "Cargo.toml");
+        assert!(result.claims.is_empty());
+        assert!(result.relations.is_empty());
+    }
+
+    // ── Gap 2: FunctionDef call graph ─────────────────────────────────────────
+
+    #[test]
+    fn function_def_with_calls_produces_calls_relations() {
+        let meta = ChunkMetadata {
+            function_name: Some("process".to_string()),
+            calls_functions: vec!["validate".to_string(), "persist".to_string()],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::FunctionDef, "fn process() {}", meta);
+        let result = extract_structural(&chunk, "src/handler.rs");
+        let calls: Vec<_> = result.relations.iter().filter(|r| r.relation_type == "calls").collect();
+        assert_eq!(calls.len(), 2, "one calls relation per callee");
+        assert!(calls.iter().any(|r| r.to_entity == "validate"));
+        assert!(calls.iter().any(|r| r.to_entity == "persist"));
+        assert!(calls.iter().all(|r| r.from_entity == "process"));
+        assert!(calls.iter().all(|r| r.confidence == 0.99));
+    }
+
+    // ── Gap 3: Heading hierarchy ──────────────────────────────────────────────
+
+    #[test]
+    fn heading_with_no_parent_uses_file_as_container() {
+        let mut chunk = Chunk::new("Introduction", ChunkType::Heading, 1, 1);
+        chunk.heading = Some("Introduction".to_string());
+        chunk.metadata.heading_level = Some(1);
+        // No parent set
+        let result = extract_structural(&chunk, "docs/guide.md");
+        let contains = result.relations.iter().find(|r| r.relation_type == "contains");
+        assert!(contains.is_some(), "must emit contains relation");
+        assert_eq!(contains.unwrap().from_entity, "guide.md");
+        assert_eq!(contains.unwrap().to_entity, "Introduction");
+    }
+
+    #[test]
+    fn heading_with_parent_uses_parent_as_container() {
+        let mut chunk = Chunk::new("Sub-section", ChunkType::Heading, 5, 5);
+        chunk.heading = Some("Sub-section".to_string());
+        chunk.metadata.heading_level = Some(2);
+        chunk.metadata.parent = Some("Overview".to_string());
+        let result = extract_structural(&chunk, "docs/guide.md");
+        let contains = result.relations.iter().find(|r| r.relation_type == "contains");
+        assert!(contains.is_some());
+        assert_eq!(contains.unwrap().from_entity, "Overview");
+        assert_eq!(contains.unwrap().to_entity, "Sub-section");
+    }
+
+    // ── Gap 3b: Prose links ───────────────────────────────────────────────────
+
+    #[test]
+    fn prose_links_produce_related_to_relations() {
+        let meta = ChunkMetadata {
+            links: vec!["./oauth.md".to_string(), "https://example.com".to_string()],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::Prose, "See oauth.md and example.com.", meta);
+        let result = extract_structural(&chunk, "docs/guide.md");
+        let refs: Vec<_> = result.relations.iter().filter(|r| r.relation_type == "related_to").collect();
+        assert_eq!(refs.len(), 2);
+        let rel = refs.iter().find(|r| r.to_entity == "./oauth.md").unwrap();
+        assert_eq!(rel.confidence, 0.99);
+        let abs = refs.iter().find(|r| r.to_entity == "https://example.com").unwrap();
+        assert_eq!(abs.confidence, 0.7);
+    }
+
+    // ── Gap 4: Git authorship ────────────────────────────────────────────────
+
+    #[test]
+    fn git_commit_produces_created_by_relations() {
+        let meta = ChunkMetadata {
+            commit_author: Some("Alice".to_string()),
+            changed_files: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::Prose, "fix: correct off-by-one error", meta);
+        let result = extract_structural(&chunk, "git://abc123def456");
+        let created: Vec<_> = result.relations.iter()
+            .filter(|r| r.relation_type == "created_by")
+            .collect();
+        assert_eq!(created.len(), 2, "one created_by per changed file");
+        assert!(created.iter().all(|r| r.to_entity == "Alice"));
+        assert!(created.iter().all(|r| r.confidence == 0.7));
+        assert!(result.claims.iter().any(|c| c.statement.contains("abc123def456")));
+    }
+
+    #[test]
+    fn git_commit_missing_author_returns_empty() {
+        let meta = ChunkMetadata {
+            changed_files: vec!["src/lib.rs".to_string()],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::Prose, "commit msg", meta);
+        let result = extract_structural(&chunk, "git://abc123");
+        assert!(result.claims.is_empty());
+        assert!(result.relations.is_empty());
+    }
+
+    // ── Predicate ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_structurally_extractable_includes_new_types() {
+        for ct in [ChunkType::ManifestDependency, ChunkType::Heading] {
+            let chunk = make_chunk(ct, "", ChunkMetadata::default());
+            assert!(
+                is_structurally_extractable(&chunk),
+                "{ct:?} should be structurally extractable"
+            );
+        }
     }
 }
