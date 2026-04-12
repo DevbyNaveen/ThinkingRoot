@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use console::style;
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 use thinkingroot_core::global_config::{GlobalConfig, ServeConfig};
-use thinkingroot_core::config::{LlmConfig, ProviderConfig, ProvidersConfig};
+use thinkingroot_core::config::{AzureConfig, BedrockConfig, LlmConfig, ProviderConfig, ProvidersConfig};
 
 // ── Provider catalogue ───────────────────────────────────────────
 
@@ -40,12 +41,32 @@ static PROVIDERS: &[ProviderDef] = &[
         validate_url: Some("https://api.openai.com/v1/models"),
     },
     ProviderDef {
+        label: "Azure OpenAI  (enterprise, Microsoft Azure)",
+        id: "azure",
+        default_env: "AZURE_OPENAI_API_KEY",
+        base_url: None,
+        default_models: &["gpt-4o-mini", "gpt-4o", "gpt-35-turbo"],
+        validate_url: None,
+    },
+    ProviderDef {
         label: "Anthropic",
         id: "anthropic",
         default_env: "ANTHROPIC_API_KEY",
         base_url: None,
         default_models: &["claude-3-haiku-20240307", "claude-3-5-sonnet-20241022"],
         validate_url: Some("https://api.anthropic.com/v1/models"),
+    },
+    ProviderDef {
+        label: "AWS Bedrock  (enterprise, no data leaves AWS)",
+        id: "bedrock",
+        default_env: "",
+        base_url: None,
+        default_models: &[
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "amazon.nova-micro-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        ],
+        validate_url: None,
     },
     ProviderDef {
         label: "Ollama      (local, free)",
@@ -64,19 +85,14 @@ static PROVIDERS: &[ProviderDef] = &[
         validate_url: Some("https://api.groq.com/openai/v1/models"),
     },
     ProviderDef {
-        label: "AWS Bedrock  (enterprise, no data leaves AWS)",
-        id: "bedrock",
-        default_env: "",
-        base_url: None,
-        default_models: &["amazon.nova-micro-v1:0", "anthropic.claude-3-haiku-20240307-v1:0"],
-        validate_url: None,
-    },
-    ProviderDef {
         label: "Together AI",
         id: "together",
         default_env: "TOGETHER_API_KEY",
         base_url: Some("https://api.together.xyz/v1"),
-        default_models: &["meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo", "mistralai/Mixtral-8x7B-Instruct-v0.1"],
+        default_models: &[
+            "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        ],
         validate_url: Some("https://api.together.xyz/v1/models"),
     },
     ProviderDef {
@@ -92,7 +108,10 @@ static PROVIDERS: &[ProviderDef] = &[
         id: "perplexity",
         default_env: "PERPLEXITY_API_KEY",
         base_url: Some("https://api.perplexity.ai"),
-        default_models: &["llama-3.1-sonar-small-128k-online", "llama-3.1-sonar-large-128k-online"],
+        default_models: &[
+            "llama-3.1-sonar-small-128k-online",
+            "llama-3.1-sonar-large-128k-online",
+        ],
         validate_url: Some("https://api.perplexity.ai/models"),
     },
     ProviderDef {
@@ -112,6 +131,19 @@ static PROVIDERS: &[ProviderDef] = &[
         validate_url: None,
     },
 ];
+
+// ── Provider setup result (carries all collected data) ───────────
+
+struct ProviderSetup {
+    api_key: String,
+    model: String,
+    // Azure-specific (set only for provider id = "azure")
+    azure_resource: Option<String>,
+    azure_deployment: Option<String>,
+    azure_api_version: Option<String>,
+    // Bedrock-specific (set only for provider id = "bedrock")
+    bedrock_region: Option<String>,
+}
 
 // ── Main entry point ─────────────────────────────────────────────
 
@@ -153,19 +185,18 @@ pub async fn run_setup() -> anyhow::Result<()> {
         .interact()?;
 
     let provider = &PROVIDERS[provider_idx];
-
-    let (api_key, model) = configure_provider(&theme, provider).await?;
+    let setup = configure_provider(&theme, provider).await?;
 
     // Build global config
     let mut llm = LlmConfig {
         default_provider: provider.id.to_string(),
-        extraction_model: model.clone(),
-        compilation_model: model.clone(),
+        extraction_model: setup.model.clone(),
+        compilation_model: setup.model.clone(),
         max_concurrent_requests: 5,
         request_timeout_secs: 120,
         providers: ProvidersConfig::default(),
     };
-    set_provider_config(&mut llm, provider, &api_key);
+    set_provider_config(&mut llm, provider, &setup);
 
     let global = GlobalConfig {
         llm,
@@ -354,12 +385,12 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
                 .default(0)
                 .interact()?;
             let provider = &PROVIDERS[idx];
-            let (api_key, model) = configure_provider(theme, provider).await?;
+            let setup = configure_provider(theme, provider).await?;
             let mut new_global = global.clone();
             new_global.llm.default_provider = provider.id.to_string();
-            new_global.llm.extraction_model = model.clone();
-            new_global.llm.compilation_model = model;
-            set_provider_config(&mut new_global.llm, provider, &api_key);
+            new_global.llm.extraction_model = setup.model.clone();
+            new_global.llm.compilation_model = setup.model.clone();
+            set_provider_config(&mut new_global.llm, provider, &setup);
             new_global.save()?;
             println!("  {} Provider updated.", style("✓").green().bold());
         }
@@ -392,27 +423,257 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Provider helpers ─────────────────────────────────────────────
+// ── Provider dispatch ─────────────────────────────────────────────
 
 async fn configure_provider(
     theme: &ColorfulTheme,
     provider: &ProviderDef,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<ProviderSetup> {
+    match provider.id {
+        "bedrock" => configure_bedrock(theme, provider).await,
+        "azure"   => configure_azure(theme).await,
+        _         => configure_generic(theme, provider).await,
+    }
+}
+
+// ── Bedrock configure flow ────────────────────────────────────────
+
+async fn configure_bedrock(
+    theme: &ColorfulTheme,
+    provider: &ProviderDef,
+) -> anyhow::Result<ProviderSetup> {
+    println!();
+    println!("  {}", style("AWS Bedrock").bold());
+    println!("  Runs inference inside your AWS account — no data leaves AWS.\n");
+
+    // 1. Check for existing credentials
+    if !bedrock_credentials_found() {
+        println!("  {} AWS credentials not found.", style("!").yellow().bold());
+        println!();
+        println!("  Bedrock uses your AWS credentials. Configure them with:");
+        println!();
+        println!("    Option A — AWS CLI (recommended):");
+        println!("      {}", style("aws configure").cyan());
+        println!("      (install: https://aws.amazon.com/cli/)");
+        println!();
+        println!("    Option B — environment variables:");
+        println!(
+            "      {} = <your access key>",
+            style("AWS_ACCESS_KEY_ID").cyan()
+        );
+        println!(
+            "      {} = <your secret>",
+            style("AWS_SECRET_ACCESS_KEY").cyan()
+        );
+        println!();
+
+        // Wait for the user to set up credentials, then re-check.
+        Input::<String>::with_theme(theme)
+            .with_prompt("Press Enter after configuring AWS credentials")
+            .default(String::new())
+            .allow_empty(true)
+            .interact_text()?;
+
+        if !bedrock_credentials_found() {
+            anyhow::bail!(
+                "AWS credentials not found.\n  \
+                 Run `aws configure` or set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY, \
+                 then re-run `root setup`."
+            );
+        }
+    }
+    println!("  {} AWS credentials found.", style("✓").green());
+
+    // 2. Region
+    println!();
+    println!("  {} Use cross-region inference IDs (e.g. {}) for ~4x higher quota.", style("Tip:").dim(), style("us.anthropic.claude-haiku-4-5-20251001-v1:0").cyan());
+    let region: String = Input::with_theme(theme)
+        .with_prompt("AWS region")
+        .default("us-east-1".to_string())
+        .interact_text()?;
+
+    // 3. Model
+    let model = select_model_from_list(theme, provider.default_models)?;
+
+    Ok(ProviderSetup {
+        api_key: String::new(),
+        model,
+        azure_resource: None,
+        azure_deployment: None,
+        azure_api_version: None,
+        bedrock_region: Some(region),
+    })
+}
+
+/// Returns true if AWS credentials are available (file or env).
+fn bedrock_credentials_found() -> bool {
+    // Env var credentials
+    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() {
+        return true;
+    }
+    // Named profile
+    if std::env::var("AWS_PROFILE").is_ok() {
+        return true;
+    }
+    // Credentials file (~/.aws/credentials or ~/.aws/config)
+    if let Some(home) = dirs::home_dir() {
+        if home.join(".aws").join("credentials").exists() {
+            return true;
+        }
+        if home.join(".aws").join("config").exists() {
+            return true;
+        }
+    }
+    false
+}
+
+// ── Azure configure flow ──────────────────────────────────────────
+
+async fn configure_azure(theme: &ColorfulTheme) -> anyhow::Result<ProviderSetup> {
+    println!();
+    println!("  {}", style("Azure OpenAI").bold());
+    println!("  Requires an Azure OpenAI resource with a deployed model.\n");
+    println!(
+        "  Find these in Azure Portal → {} → your resource.",
+        style("Azure OpenAI").cyan()
+    );
+    println!();
+
+    // Resource name
+    let resource: String = Input::with_theme(theme)
+        .with_prompt("Azure resource name  (e.g., my-company-openai)")
+        .interact_text()?;
+
+    // Deployment name
+    let deployment: String = Input::with_theme(theme)
+        .with_prompt("Deployment name      (e.g., gpt-4o-mini-deploy)")
+        .interact_text()?;
+
+    // API version
+    let api_version: String = Input::with_theme(theme)
+        .with_prompt("API version")
+        .default("2024-02-01".to_string())
+        .interact_text()?;
+
+    // API key
+    let key: String = Password::with_theme(theme)
+        .with_prompt("Azure API key")
+        .interact()?;
+
+    // Validate endpoint
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.set_message("Validating Azure endpoint...");
+    pb.enable_steady_tick(Duration::from_millis(80));
+
+    match validate_azure(&resource, &deployment, &api_version, &key).await {
+        Ok(()) => pb.finish_with_message(format!("{} Azure endpoint valid", style("✓").green())),
+        Err(e) => {
+            pb.finish_with_message(format!("{} Validation failed", style("✗").red()));
+            anyhow::bail!(
+                "Azure validation failed: {e}\n\n  \
+                 Check:\n  \
+                 • Resource name: {resource}\n  \
+                 • Deployment name: {deployment}\n  \
+                 • API version: {api_version}\n  \
+                 Re-run `root setup` to try again."
+            );
+        }
+    }
+
+    // The deployment name IS the model identifier for Azure.
+    // Offer the deployment name as default so the user can override the display name.
+    let model: String = Input::with_theme(theme)
+        .with_prompt("Model name for display (usually your deployment name)")
+        .default(deployment.clone())
+        .interact_text()?;
+
+    Ok(ProviderSetup {
+        api_key: key,
+        model,
+        azure_resource: Some(resource),
+        azure_deployment: Some(deployment),
+        azure_api_version: Some(api_version),
+        bedrock_region: None,
+    })
+}
+
+/// Validate Azure AOAI credentials by sending a minimal 1-token inference request.
+/// Returns Ok if the credentials are accepted (HTTP 2xx or 5xx); Err on 401/403/404.
+async fn validate_azure(
+    resource: &str,
+    deployment: &str,
+    api_version: &str,
+    key: &str,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+
+    let url = format!(
+        "https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    );
+
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "temperature": 0,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("api-key", key)
+        .json(&body)
+        .send()
+        .await
+        .context("network error reaching Azure endpoint")?;
+
+    match resp.status().as_u16() {
+        401 | 403 => anyhow::bail!("invalid API key (HTTP {})", resp.status().as_u16()),
+        404 => anyhow::bail!(
+            "resource or deployment not found (HTTP 404). \
+             Check resource name '{}' and deployment '{}'.",
+            resource,
+            deployment
+        ),
+        _ => Ok(()),
+    }
+}
+
+// ── Generic (OpenAI-compatible) configure flow ────────────────────
+
+async fn configure_generic(
+    theme: &ColorfulTheme,
+    provider: &ProviderDef,
+) -> anyhow::Result<ProviderSetup> {
     let api_key = if !provider.default_env.is_empty() {
         let key: String = Password::with_theme(theme)
-            .with_prompt(format!("{} API key", provider.label.split_whitespace().next().unwrap_or(provider.id)))
+            .with_prompt(format!(
+                "{} API key",
+                provider.label.split_whitespace().next().unwrap_or(provider.id)
+            ))
             .interact()?;
 
         if let Some(validate_url) = provider.validate_url {
             let pb = indicatif::ProgressBar::new_spinner();
+            pb.set_style(
+                indicatif::ProgressStyle::default_spinner()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            );
             pb.set_message("Validating key...");
-            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            pb.enable_steady_tick(Duration::from_millis(80));
 
             match validate_key_http(validate_url, provider.id, &key).await {
                 Ok(()) => pb.finish_with_message(format!("{} Key valid", style("✓").green())),
                 Err(e) => {
                     pb.finish_with_message(format!("{} Validation failed", style("✗").red()));
-                    anyhow::bail!("Key validation failed: {}\nRe-run `root setup` to try again.", e);
+                    anyhow::bail!(
+                        "Key validation failed: {}\nRe-run `root setup` to try again.",
+                        e
+                    );
                 }
             }
         }
@@ -421,68 +682,117 @@ async fn configure_provider(
         String::new()
     };
 
-    let model = if !provider.default_models.is_empty() {
-        let mut model_items: Vec<&str> = provider.default_models.to_vec();
-        model_items.push("Enter model ID manually");
-        let midx = Select::with_theme(theme)
+    let model = select_model_from_list(theme, provider.default_models)?;
+
+    Ok(ProviderSetup {
+        api_key,
+        model,
+        azure_resource: None,
+        azure_deployment: None,
+        azure_api_version: None,
+        bedrock_region: None,
+    })
+}
+
+// ── Config writer ─────────────────────────────────────────────────
+
+fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &ProviderSetup) {
+    match provider.id {
+        "bedrock" => {
+            llm.providers.bedrock = Some(BedrockConfig {
+                region: setup.bedrock_region.clone(),
+                profile: None,
+            });
+        }
+        "azure" => {
+            // Store the key in env immediately so it's usable in this process.
+            // SAFETY: single-threaded at this point in setup.
+            unsafe { std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key); }
+            llm.providers.azure = Some(AzureConfig {
+                resource_name: setup.azure_resource.clone(),
+                endpoint_base: None, // set manually for AIServices/cognitiveservices resources
+                deployment: setup.azure_deployment.clone(),
+                api_version: setup.azure_api_version.clone(),
+                api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
+            });
+        }
+        _ => {
+            if provider.default_env.is_empty() {
+                // Ollama: no key, but may have base_url.
+                if let Some(base) = provider.base_url {
+                    let cfg = ProviderConfig {
+                        api_key_env: None,
+                        base_url: Some(base.to_string()),
+                        default_model: None,
+                    };
+                    if provider.id == "ollama" {
+                        llm.providers.ollama = Some(cfg);
+                    }
+                }
+                return;
+            }
+            // Standard API-key providers.
+            let env_var = provider.default_env;
+            // SAFETY: single-threaded at this point in setup.
+            unsafe { std::env::set_var(env_var, &setup.api_key); }
+            let cfg = ProviderConfig {
+                api_key_env: Some(env_var.to_string()),
+                base_url: provider.base_url.map(str::to_string),
+                default_model: None,
+            };
+            match provider.id {
+                "openrouter" => llm.providers.openrouter = Some(cfg),
+                "openai"     => llm.providers.openai     = Some(cfg),
+                "anthropic"  => llm.providers.anthropic  = Some(cfg),
+                "groq"       => llm.providers.groq        = Some(cfg),
+                "together"   => llm.providers.together    = Some(cfg),
+                "deepseek"   => llm.providers.deepseek    = Some(cfg),
+                "perplexity" => llm.providers.perplexity  = Some(cfg),
+                "litellm"    => llm.providers.litellm     = Some(cfg),
+                "custom"     => llm.providers.custom      = Some(cfg),
+                _            => {}
+            }
+        }
+    }
+}
+
+// ── Model selection helper ────────────────────────────────────────
+
+fn select_model_from_list(
+    theme: &ColorfulTheme,
+    default_models: &[&str],
+) -> anyhow::Result<String> {
+    if !default_models.is_empty() {
+        let mut items: Vec<&str> = default_models.to_vec();
+        items.push("Enter model ID manually");
+        let idx = Select::with_theme(theme)
             .with_prompt("Extraction model")
-            .items(&model_items)
+            .items(&items)
             .default(0)
             .interact()?;
-        if midx == model_items.len() - 1 {
-            Input::with_theme(theme)
+        if idx == items.len() - 1 {
+            return Ok(Input::with_theme(theme)
                 .with_prompt("Model ID")
-                .interact_text()?
-        } else {
-            model_items[midx].to_string()
+                .interact_text()?);
         }
-    } else {
-        Input::with_theme(theme)
-            .with_prompt("Model ID")
-            .interact_text()?
-    };
-
-    Ok((api_key, model))
+        return Ok(items[idx].to_string());
+    }
+    Ok(Input::with_theme(theme)
+        .with_prompt("Model ID")
+        .interact_text()?)
 }
 
-fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, api_key: &str) {
-    if provider.default_env.is_empty() {
-        return;
-    }
-    let env_var = provider.default_env;
-    // Set the key as an env var for this process so it's usable immediately
-    // SAFETY: single-threaded at this point in setup; no other threads reading env
-    unsafe { std::env::set_var(env_var, api_key); }
-
-    let cfg = ProviderConfig {
-        api_key_env: Some(env_var.to_string()),
-        base_url: provider.base_url.map(str::to_string),
-        default_model: None,
-    };
-    match provider.id {
-        "openrouter" => llm.providers.openrouter = Some(cfg),
-        "openai"     => llm.providers.openai     = Some(cfg),
-        "anthropic"  => llm.providers.anthropic  = Some(cfg),
-        "groq"       => llm.providers.groq        = Some(cfg),
-        "together"   => llm.providers.together    = Some(cfg),
-        "deepseek"   => llm.providers.deepseek    = Some(cfg),
-        "perplexity" => llm.providers.perplexity  = Some(cfg),
-        "litellm"    => llm.providers.litellm     = Some(cfg),
-        "custom"     => llm.providers.custom      = Some(cfg),
-        _            => {}
-    }
-}
+// ── Key validation (generic providers) ───────────────────────────
 
 /// Validate an API key by GETting the provider's /models endpoint.
 /// Returns Ok(()) if the key is accepted (HTTP 2xx, 404, or 405 — key valid, endpoint may differ).
 /// Returns Err if HTTP 401/403 (bad key) or network error.
 async fn validate_key_http(url: &str, provider_id: &str, key: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(Duration::from_secs(10))
         .build()?;
 
     let mut req = client.get(url);
-
     req = if provider_id == "anthropic" {
         req.header("x-api-key", key)
            .header("anthropic-version", "2023-06-01")

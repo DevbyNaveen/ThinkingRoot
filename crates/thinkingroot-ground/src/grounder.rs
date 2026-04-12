@@ -6,6 +6,9 @@ use thinkingroot_extract::extractor::ExtractionOutput;
 use crate::lexical::LexicalJudge;
 use crate::span::SpanJudge;
 
+#[cfg(feature = "vector")]
+use crate::nli::NliJudge;
+
 /// The result of grounding a single claim.
 #[derive(Debug, Clone)]
 pub struct GroundingVerdict {
@@ -15,6 +18,7 @@ pub struct GroundingVerdict {
     pub lexical_score: f64,
     pub span_score: Option<f64>,
     pub semantic_score: Option<f64>,
+    pub nli_score: Option<f64>,
     /// If true, this claim should be rejected (not stored).
     pub rejected: bool,
 }
@@ -39,27 +43,11 @@ impl Default for GroundingConfig {
 /// The Grounding Tribunal: chains 3 judges to verify extraction output.
 pub struct Grounder {
     config: GroundingConfig,
-    #[cfg(feature = "vector")]
-    vector_store: Option<std::sync::Arc<std::sync::Mutex<thinkingroot_graph::vector::VectorStore>>>,
 }
 
 impl Grounder {
     pub fn new(config: GroundingConfig) -> Self {
-        Self {
-            config,
-            #[cfg(feature = "vector")]
-            vector_store: None,
-        }
-    }
-
-    /// Attach a vector store for Judge 3 (semantic similarity).
-    #[cfg(feature = "vector")]
-    pub fn with_vector_store(
-        mut self,
-        store: std::sync::Arc<std::sync::Mutex<thinkingroot_graph::vector::VectorStore>>,
-    ) -> Self {
-        self.vector_store = Some(store);
-        self
+        Self { config }
     }
 
     /// Ground all claims in an extraction output.
@@ -68,7 +56,18 @@ impl Grounder {
     /// - Rejected claims removed
     /// - Surviving claims annotated with grounding_score and grounding_method
     /// - Confidence reduced for low-grounding claims
-    pub fn ground(&self, mut extraction: ExtractionOutput) -> ExtractionOutput {
+    ///
+    /// Pass `vector_store` for Judge 3 (semantic similarity) and `nli_judge`
+    /// for Judge 4 (NLI entailment). Pass `None` to skip either/both and use
+    /// only the available judges.
+    pub fn ground(
+        &self,
+        mut extraction: ExtractionOutput,
+        #[cfg(feature = "vector")]
+        mut vector_store: Option<&mut thinkingroot_graph::vector::VectorStore>,
+        #[cfg(feature = "vector")]
+        mut nli_judge: Option<&mut NliJudge>,
+    ) -> ExtractionOutput {
         let source_texts = &extraction.source_texts;
         let source_quotes = &extraction.claim_source_quotes;
 
@@ -91,23 +90,30 @@ impl Grounder {
 
             // Judge 3: Semantic similarity (if vector feature enabled).
             #[cfg(feature = "vector")]
-            let semantic = self.vector_store.as_ref().and_then(|vs| {
-                vs.lock().ok().map(|mut guard| {
-                    crate::semantic::SemanticJudge::score(&claim.statement, source_text, &mut guard)
-                })
-            });
+            let semantic = match vector_store {
+                Some(ref mut vs) => Some(
+                    crate::semantic::SemanticJudge::score(&claim.statement, source_text, vs),
+                ),
+                None => None,
+            };
             #[cfg(not(feature = "vector"))]
             let semantic: Option<f64> = None;
 
+            // Judge 4: NLI entailment (if vector feature enabled and model loaded).
+            #[cfg(feature = "vector")]
+            let nli = nli_judge.as_mut().map(|judge| judge.score(&claim.statement, source_text));
+            #[cfg(not(feature = "vector"))]
+            let nli: Option<f64> = None;
+
             // Combine scores: weighted average of available judges.
-            let (combined, method) = combine_scores(lexical, span, semantic);
+            let (combined, method) = combine_scores(lexical, span, semantic, nli);
 
             let rejected = combined < self.config.reject_threshold;
 
             if rejected {
                 tracing::debug!(
                     "grounding REJECTED claim {:?}: score={combined:.2} lexical={lexical:.2} \
-                     span={span:?} semantic={semantic:?} — \"{}\"",
+                     span={span:?} semantic={semantic:?} nli={nli:?} — \"{}\"",
                     claim.id,
                     truncate(&claim.statement, 60),
                 );
@@ -122,6 +128,7 @@ impl Grounder {
                     lexical_score: lexical,
                     span_score: span,
                     semantic_score: semantic,
+                    nli_score: nli,
                     rejected,
                 },
             );
@@ -168,29 +175,57 @@ impl Grounder {
 }
 
 /// Combine scores from available judges into a single grounding score.
+///
+/// Weight strategy:
+/// - NLI (Judge 4) is the strongest signal — gets the highest weight when available.
+/// - Semantic (Judge 3) and Span (Judge 2) are medium signals.
+/// - Lexical (Judge 1) is the weakest but always available.
+///
+/// The weights dynamically redistribute based on which judges are present.
 fn combine_scores(
     lexical: f64,
     span: Option<f64>,
     semantic: Option<f64>,
+    nli: Option<f64>,
 ) -> (f64, GroundingMethod) {
-    match (span, semantic) {
-        // All 3 judges available.
-        (Some(s), Some(sem)) => {
+    match (span, semantic, nli) {
+        // All 4 judges.
+        (Some(s), Some(sem), Some(n)) => {
+            let combined = lexical * 0.15 + s * 0.20 + sem * 0.25 + n * 0.40;
+            (combined, GroundingMethod::Combined)
+        }
+        // Judges 1 + 2 + 4 (no embeddings, but NLI available).
+        (Some(s), None, Some(n)) => {
+            let combined = lexical * 0.15 + s * 0.25 + n * 0.60;
+            (combined, GroundingMethod::Combined)
+        }
+        // Judges 1 + 3 + 4 (no source quote, but embeddings + NLI).
+        (None, Some(sem), Some(n)) => {
+            let combined = lexical * 0.15 + sem * 0.30 + n * 0.55;
+            (combined, GroundingMethod::Combined)
+        }
+        // Judges 1 + 4 only (NLI but no span or embeddings).
+        (None, None, Some(n)) => {
+            let combined = lexical * 0.25 + n * 0.75;
+            (combined, GroundingMethod::Combined)
+        }
+        // Judges 1 + 2 + 3 (no NLI — original 3-judge mode).
+        (Some(s), Some(sem), None) => {
             let combined = lexical * 0.35 + s * 0.35 + sem * 0.30;
             (combined, GroundingMethod::Combined)
         }
         // Judges 1 + 2 only.
-        (Some(s), None) => {
+        (Some(s), None, None) => {
             let combined = lexical * 0.5 + s * 0.5;
             (combined, GroundingMethod::Combined)
         }
         // Judges 1 + 3 only (no source_quote from LLM).
-        (None, Some(sem)) => {
+        (None, Some(sem), None) => {
             let combined = lexical * 0.55 + sem * 0.45;
             (combined, GroundingMethod::Combined)
         }
         // Judge 1 only.
-        (None, None) => (lexical, GroundingMethod::Lexical),
+        (None, None, None) => (lexical, GroundingMethod::Lexical),
     }
 }
 
@@ -207,8 +242,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn combine_all_three() {
-        let (score, method) = combine_scores(0.8, Some(1.0), Some(0.9));
+    fn combine_all_four() {
+        let (score, method) = combine_scores(0.8, Some(1.0), Some(0.9), Some(0.95));
+        // 0.8*0.15 + 1.0*0.20 + 0.9*0.25 + 0.95*0.40
+        // = 0.12 + 0.20 + 0.225 + 0.38 = 0.925
+        assert!((score - 0.925).abs() < 0.01);
+        assert!(matches!(method, GroundingMethod::Combined));
+    }
+
+    #[test]
+    fn combine_judges_1_2_3_no_nli() {
+        let (score, method) = combine_scores(0.8, Some(1.0), Some(0.9), None);
         // 0.8*0.35 + 1.0*0.35 + 0.9*0.30 = 0.28 + 0.35 + 0.27 = 0.90
         assert!((score - 0.9).abs() < 0.01);
         assert!(matches!(method, GroundingMethod::Combined));
@@ -216,15 +260,23 @@ mod tests {
 
     #[test]
     fn combine_judges_1_and_2() {
-        let (score, method) = combine_scores(0.8, Some(1.0), None);
+        let (score, method) = combine_scores(0.8, Some(1.0), None, None);
         // 0.8*0.5 + 1.0*0.5 = 0.4 + 0.5 = 0.9
         assert!((score - 0.9).abs() < 0.01);
         assert!(matches!(method, GroundingMethod::Combined));
     }
 
     #[test]
+    fn combine_judges_1_and_4_nli_only() {
+        let (score, method) = combine_scores(0.6, None, None, Some(0.9));
+        // 0.6*0.25 + 0.9*0.75 = 0.15 + 0.675 = 0.825
+        assert!((score - 0.825).abs() < 0.01);
+        assert!(matches!(method, GroundingMethod::Combined));
+    }
+
+    #[test]
     fn combine_judge_1_only() {
-        let (score, method) = combine_scores(0.6, None, None);
+        let (score, method) = combine_scores(0.6, None, None, None);
         assert!((score - 0.6).abs() < 0.01);
         assert!(matches!(method, GroundingMethod::Lexical));
     }
@@ -236,7 +288,7 @@ mod tests {
             reduce_threshold: 0.5,
         };
         // Score = 0.1 (below 0.25) → rejected
-        let (score, _) = combine_scores(0.1, Some(0.1), None);
+        let (score, _) = combine_scores(0.1, Some(0.1), None, None);
         assert!(score < config.reject_threshold);
     }
 
@@ -272,7 +324,13 @@ mod tests {
             vec![],
         );
         let grounder = Grounder::new(GroundingConfig::default());
-        let result = grounder.ground(extraction);
+        let result = grounder.ground(
+            extraction,
+            #[cfg(feature = "vector")]
+            None,
+            #[cfg(feature = "vector")]
+            None,
+        );
 
         assert_eq!(result.claims.len(), 1);
         let claim = &result.claims[0];
@@ -290,7 +348,13 @@ mod tests {
             vec![],
         );
         let grounder = Grounder::new(GroundingConfig::default());
-        let result = grounder.ground(extraction);
+        let result = grounder.ground(
+            extraction,
+            #[cfg(feature = "vector")]
+            None,
+            #[cfg(feature = "vector")]
+            None,
+        );
 
         // With zero word overlap, lexical score ≈ 0.0, which is below reject threshold (0.25)
         assert_eq!(result.claims.len(), 0, "hallucinated claim should be rejected");
@@ -312,7 +376,13 @@ mod tests {
         );
 
         let grounder = Grounder::new(GroundingConfig::default());
-        let result = grounder.ground(extraction);
+        let result = grounder.ground(
+            extraction,
+            #[cfg(feature = "vector")]
+            None,
+            #[cfg(feature = "vector")]
+            None,
+        );
 
         assert_eq!(result.claims.len(), 1);
         let score = result.claims[0].grounding_score.unwrap();
@@ -333,7 +403,13 @@ mod tests {
             reject_threshold: 0.1, // low threshold so it doesn't get rejected
             reduce_threshold: 0.9, // high threshold so confidence gets reduced
         });
-        let result = grounder.ground(extraction);
+        let result = grounder.ground(
+            extraction,
+            #[cfg(feature = "vector")]
+            None,
+            #[cfg(feature = "vector")]
+            None,
+        );
 
         assert_eq!(result.claims.len(), 1);
         let claim = &result.claims[0];

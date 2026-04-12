@@ -249,8 +249,9 @@ async fn main() -> anyhow::Result<()> {
     let filter = if cli.verbose {
         EnvFilter::new("thinkingroot=debug,root=debug")
     } else if use_progress {
-        // TTY + no --verbose: suppress INFO so bars own stderr.
-        EnvFilter::new("thinkingroot=warn,root=warn")
+        // TTY + no --verbose: suppress everything below ERROR so progress bars
+        // own stderr cleanly. WARN/INFO mixed with indicatif garbles the display.
+        EnvFilter::new("thinkingroot=error,root=error")
     } else {
         // Pipe / CI: full INFO for clean log output.
         EnvFilter::new("thinkingroot=info,root=info")

@@ -80,15 +80,19 @@ pub async fn run_compile_progress(
                 // ── Extraction ──────────────────────────────────────────
                 ProgressEvent::ExtractionStart { total_chunks } => {
                     if total_chunks > 0 {
-                        eb.set_style(active_bar_style());
+                        // Length MUST be set before style — the 80ms redraw timer
+                        // can fire between the two calls, and {bar:30} panics on len=0.
                         eb.set_length(total_chunks as u64);
                         eb.set_position(0);
+                        eb.set_style(active_bar_style());
                         eb.enable_steady_tick(std::time::Duration::from_millis(80));
                     }
                 }
 
                 ProgressEvent::ChunkDone { done, total, source_uri } => {
-                    eb.set_length(total as u64);
+                    if total > 0 {
+                        eb.set_length(total as u64);
+                    }
                     eb.set_position(done as u64);
                     eb.set_message(format!("↳ {}", uri_basename(&source_uri)));
                 }
@@ -238,7 +242,7 @@ fn waiting_style() -> ProgressStyle {
     ProgressStyle::default_spinner()
         .template("  {spinner:.dim} {prefix} {msg}")
         .expect("static template is valid")
-        .tick_strings(&["○"])
+        .tick_strings(&["○", "○"]) // indicatif uses last entry as "done" state; need ≥2
 }
 
 fn active_spinner_style() -> ProgressStyle {
@@ -262,14 +266,14 @@ fn done_style() -> ProgressStyle {
     ProgressStyle::default_spinner()
         .template("  {spinner:.green} {prefix} {msg}")
         .expect("static template is valid")
-        .tick_strings(&["✓"])
+        .tick_strings(&["✓", "✓"]) // last entry = done state; need ≥2
 }
 
 fn skipped_style() -> ProgressStyle {
     ProgressStyle::default_spinner()
         .template("  {spinner:.dim} {prefix} {msg}")
         .expect("static template is valid")
-        .tick_strings(&["─"])
+        .tick_strings(&["─", "─"]) // last entry = done state; need ≥2
 }
 
 // ── Utility ──────────────────────────────────────────────────────────────────

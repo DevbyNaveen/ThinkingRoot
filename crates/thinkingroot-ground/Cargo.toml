@@ -14,9 +14,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-## Enable Judge 3 (embedding cosine similarity) via fastembed.
-## Without this, only Judges 1+2 (pure string ops) are active.
-vector = ["dep:thinkingroot-graph"]
+## Enable Judge 3 (embedding cosine similarity) + Judge 4 (NLI entailment)
+## via fastembed/ort/tokenizers. Without this, only Judges 1+2 (pure string
+## ops) are active.
+vector = ["dep:thinkingroot-graph", "dep:ort", "dep:tokenizers", "dep:hf-hub"]
 
 [dependencies]
 thinkingroot-core = { workspace = true }
@@ -24,8 +25,11 @@ thinkingroot-extract = { workspace = true }
 unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
 
-# Optional: Judge 3 needs fastembed via graph crate for embeddings.
+# Optional: Judges 3+4 need fastembed/ort for ML inference.
 thinkingroot-graph = { workspace = true, optional = true }
+ort = { version = "2.0.0-rc.11", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
