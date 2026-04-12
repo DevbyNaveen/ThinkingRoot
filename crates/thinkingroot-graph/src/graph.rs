@@ -654,6 +654,28 @@ impl GraphStore {
             .collect())
     }
 
+    /// Returns `(from_name, to_name, relation_type)` triples for all relations in the graph.
+    /// Used by graph-primed extraction to inject KNOWN_RELATIONS into LLM prompts.
+    pub fn get_known_relations(&self) -> Result<Vec<(String, String, String)>> {
+        let result = self.query_read(
+            r#"?[from_name, to_name, rel_type] :=
+                *entity_relations{from_id, to_id, relation_type: rel_type},
+                *entities{id: from_id, canonical_name: from_name},
+                *entities{id: to_id, canonical_name: to_name}"#,
+        )?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                )
+            })
+            .collect())
+    }
+
     /// Remove all graph state derived from a source URI.
     pub fn remove_source_by_uri(&self, uri: &str) -> Result<usize> {
         let sources = self.find_sources_by_uri(uri)?;

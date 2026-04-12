@@ -10,4 +10,4 @@ pub mod schema;
 pub mod structural;
 
 pub use extractor::{ChunkProgressFn, ExtractionOutput, Extractor};
-pub use graph_context::{GraphPrimedContext, KnownEntity};
+pub use graph_context::{GraphPrimedContext, KnownEntity, KnownRelation};

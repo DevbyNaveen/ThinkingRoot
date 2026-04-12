@@ -132,6 +132,27 @@ pub async fn run_pipeline(
         }
     };
 
+    // ── Graph-Primed Context: also inject known relations ──
+    let ctx_with_relations = match storage.graph.get_known_relations() {
+        Ok(relations) if !relations.is_empty() => {
+            tracing::info!("graph-primed context: {} known relations loaded", relations.len());
+            let known_rels: Vec<thinkingroot_extract::KnownRelation> = relations
+                .into_iter()
+                .map(|(from, to, rel_type)| thinkingroot_extract::KnownRelation {
+                    from,
+                    to,
+                    relation_type: rel_type,
+                })
+                .collect();
+            known_entities.with_relations(known_rels)
+        }
+        Ok(_) => known_entities,
+        Err(e) => {
+            tracing::warn!("failed to load known relations for graph-priming: {e}");
+            known_entities
+        }
+    };
+
     if potentially_changed.is_empty() {
         // Only deletions — no extraction needed.
         cache_hits = 0;
@@ -141,7 +162,7 @@ pub async fn run_pipeline(
             let e = thinkingroot_extract::Extractor::new(&config)
                 .await?
                 .with_cache_dir(&data_dir)
-                .with_known_entities(known_entities);
+                .with_known_entities(ctx_with_relations);
             if let Some(ref tx) = progress {
                 let tx_chunk = tx.clone();
                 let pf = Arc::new(move |done: usize, total: usize, uri: &str| {
