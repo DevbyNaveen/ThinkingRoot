@@ -77,12 +77,13 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 let ret = find_child_by_field(&child, "return_type")
                     .map(|n| source[n.byte_range()].to_string());
 
-                // Walk the function body for call expressions (depth-limited to 5).
+                // Walk the function body for call expressions (depth=6 captures up to 5
+                // levels of nesting below the body node).
                 let body = find_child_by_field(&child, "body")
                     .or_else(|| find_child_by_field(&child, "block"))
                     .or_else(|| find_child_by_field(&child, "statement_block"));
                 let mut calls = body
-                    .map(|b| collect_calls(source, b, 5))
+                    .map(|b| collect_calls(source, b, 6))
                     .unwrap_or_default();
                 calls.sort();
                 calls.dedup();
@@ -214,8 +215,8 @@ fn extract_visibility(source: &str, node: &tree_sitter::Node) -> Option<String> 
     None
 }
 
-/// Walk a function body subtree up to `depth` levels and collect all called
-/// function/method names (final identifier only).
+/// Walk a function body subtree. The caller passes depth=6 to capture up to 5
+/// levels of nesting below the body node; each recursion step decrements depth.
 fn collect_calls(source: &str, node: tree_sitter::Node, depth: u8) -> Vec<String> {
     if depth == 0 {
         return Vec::new();
@@ -237,6 +238,15 @@ fn collect_calls(source: &str, node: tree_sitter::Node, depth: u8) -> Vec<String
                     let raw = source[method.byte_range()].to_string();
                     if !raw.is_empty() {
                         calls.push(raw);
+                    }
+                }
+            }
+            "call" => {
+                // Python: both function calls and method calls
+                if let Some(func) = child.child_by_field_name("function") {
+                    let raw = &source[func.byte_range()];
+                    if let Some(name) = last_identifier(raw) {
+                        calls.push(name);
                     }
                 }
             }
@@ -445,5 +455,30 @@ struct Config {
                 .iter()
                 .any(|c| c.chunk_type == ChunkType::TypeDef)
         );
+    }
+
+    #[test]
+    fn python_function_calls_are_collected() {
+        let source = r#"
+def process(data):
+    result = transform(data)
+    obj.method(result)
+    return result
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "test.py".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "python", &mut doc);
+
+        let process_chunk = doc.chunks.iter().find(|c| {
+            c.chunk_type == ChunkType::FunctionDef
+                && c.metadata.function_name.as_deref() == Some("process")
+        });
+        assert!(process_chunk.is_some(), "process function chunk must exist");
+        let calls = &process_chunk.unwrap().metadata.calls_functions;
+        assert!(calls.contains(&"transform".to_string()), "must detect transform call");
+        assert!(calls.contains(&"method".to_string()), "must detect obj.method call");
     }
 }
