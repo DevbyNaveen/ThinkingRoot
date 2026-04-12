@@ -77,6 +77,18 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 let ret = find_child_by_field(&child, "return_type")
                     .map(|n| source[n.byte_range()].to_string());
 
+                // Walk the function body for call expressions (depth-limited to 5).
+                let body = find_child_by_field(&child, "body")
+                    .or_else(|| find_child_by_field(&child, "block"))
+                    .or_else(|| find_child_by_field(&child, "statement_block"));
+                let mut calls = body
+                    .map(|b| collect_calls(source, b, 5))
+                    .unwrap_or_default();
+                calls.sort();
+                calls.dedup();
+                let func_name_str = name.as_deref().unwrap_or("").to_string();
+                calls.retain(|c| !c.is_empty() && *c != func_name_str);
+
                 let mut chunk = Chunk::new(text, ChunkType::FunctionDef, start_line, end_line)
                     .with_language(language);
                 chunk.metadata = ChunkMetadata {
@@ -84,6 +96,7 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                     parameters: params.map(|p| vec![p]),
                     return_type: ret,
                     visibility: extract_visibility(source, &child),
+                    calls_functions: calls,
                     ..Default::default()
                 };
                 doc.add_chunk(chunk);
@@ -201,6 +214,53 @@ fn extract_visibility(source: &str, node: &tree_sitter::Node) -> Option<String> 
     None
 }
 
+/// Walk a function body subtree up to `depth` levels and collect all called
+/// function/method names (final identifier only).
+fn collect_calls(source: &str, node: tree_sitter::Node, depth: u8) -> Vec<String> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    let mut calls = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "call_expression" => {
+                if let Some(func) = child.child_by_field_name("function") {
+                    let raw = &source[func.byte_range()];
+                    if let Some(name) = last_identifier(raw) {
+                        calls.push(name);
+                    }
+                }
+            }
+            "method_call_expression" => {
+                if let Some(method) = child.child_by_field_name("method") {
+                    let raw = source[method.byte_range()].to_string();
+                    if !raw.is_empty() {
+                        calls.push(raw);
+                    }
+                }
+            }
+            _ => {}
+        }
+        calls.extend(collect_calls(source, child, depth - 1));
+    }
+    calls
+}
+
+/// Extract the last identifier from a dotted or scoped name.
+/// "user_service.find_by_email" → "find_by_email"
+/// "AuthService::validate"      → "validate"
+/// "foo"                        → "foo"
+fn last_identifier(text: &str) -> Option<String> {
+    let last = text
+        .split(['.', ':']).rfind(|s| !s.is_empty())?;
+    if !last.is_empty() && last.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(last.to_string())
+    } else {
+        None
+    }
+}
+
 /// Walk struct/class body and collect non-primitive field type names.
 /// Returns base type names with generics stripped (e.g., `Vec<String>` → `Vec`).
 fn extract_field_types(source: &str, node: &tree_sitter::Node) -> Vec<String> {
@@ -297,6 +357,62 @@ fn is_primitive_type(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_body_calls_are_collected() {
+        let source = r#"
+fn outer(x: i32) -> i32 {
+    let a = helper_one(x);
+    let b = self.helper_two(a);
+    a + b
+}
+
+fn helper_one(x: i32) -> i32 { x + 1 }
+fn helper_two(&self, x: i32) -> i32 { x * 2 }
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "test.rs".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "rust", &mut doc);
+
+        let outer = doc.chunks.iter().find(|c| {
+            c.chunk_type == ChunkType::FunctionDef
+                && c.metadata.function_name.as_deref() == Some("outer")
+        });
+        assert!(outer.is_some(), "outer function chunk must exist");
+        let calls = &outer.unwrap().metadata.calls_functions;
+        assert!(calls.contains(&"helper_one".to_string()), "must detect call to helper_one");
+        assert!(calls.contains(&"helper_two".to_string()), "must detect method call to helper_two");
+        assert!(!calls.contains(&"outer".to_string()), "must not list self-recursion");
+    }
+
+    #[test]
+    fn calls_functions_deduplicated() {
+        let source = r#"
+fn process(items: Vec<i32>) -> i32 {
+    let a = transform(items[0]);
+    let b = transform(items[1]);
+    a + b
+}
+fn transform(x: i32) -> i32 { x }
+"#;
+        let mut doc = DocumentIR::new(SourceId::new(), "test.rs".to_string(), SourceType::File);
+        let ts_lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_chunks(source, tree.root_node(), "rust", &mut doc);
+
+        let process = doc.chunks.iter().find(|c| {
+            c.metadata.function_name.as_deref() == Some("process")
+        }).unwrap();
+        let transform_count = process.metadata.calls_functions.iter()
+            .filter(|n| n.as_str() == "transform")
+            .count();
+        assert_eq!(transform_count, 1, "same callee must appear only once");
+    }
 
     #[test]
     fn parse_rust_functions() {
