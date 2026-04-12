@@ -195,6 +195,7 @@ pub fn compute_diff(
                 created_at: now,
                 grounding_score: None,
                 grounding_method: None,
+                extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
             };
             new_claims.push(DiffClaim {
                 claim,

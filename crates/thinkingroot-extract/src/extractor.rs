@@ -329,7 +329,8 @@ impl Extractor {
             }
             let claim_type = parse_claim_type(&ext_claim.claim_type);
             let claim = Claim::new(&ext_claim.statement, claim_type, source_id, workspace_id)
-                .with_confidence(ext_claim.confidence);
+                .with_confidence(ext_claim.confidence)
+                .with_extraction_tier(ext_claim.extraction_tier);
             if !ext_claim.entities.is_empty() {
                 output
                     .claim_entity_names

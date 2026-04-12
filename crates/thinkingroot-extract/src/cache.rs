@@ -82,6 +82,7 @@ mod tests {
                 confidence: 0.9,
                 entities: vec!["Rust".into()],
                 source_quote: None,
+                extraction_tier: crate::schema::ExtractionTier::default(),
             }],
             entities: vec![ExtractedEntity {
                 name: "Rust".into(),

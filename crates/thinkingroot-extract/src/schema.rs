@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+pub use thinkingroot_core::types::ExtractionTier;
 
 /// The structured output schema that the LLM must return.
 /// This is what we parse from the LLM response for each chunk.
@@ -20,6 +21,8 @@ pub struct ExtractedClaim {
     pub entities: Vec<String>,
     #[serde(default)]
     pub source_quote: Option<String>,
+    #[serde(default)]
+    pub extraction_tier: ExtractionTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,6 +23,7 @@ pub struct Claim {
     pub created_at: DateTime<Utc>,
     pub grounding_score: Option<f64>,
     pub grounding_method: Option<GroundingMethod>,
+    pub extraction_tier: ExtractionTier,
 }
 
 impl Claim {
@@ -49,6 +50,7 @@ impl Claim {
             created_at: now,
             grounding_score: None,
             grounding_method: None,
+            extraction_tier: ExtractionTier::default(),
         }
     }
 
@@ -64,6 +66,11 @@ impl Claim {
 
     pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
         self.sensitivity = sensitivity;
+        self
+    }
+
+    pub fn with_extraction_tier(mut self, tier: ExtractionTier) -> Self {
+        self.extraction_tier = tier;
         self
     }
 
@@ -181,6 +188,19 @@ pub enum GroundingMethod {
     Combined,
     /// Not grounded (legacy claims or grounding disabled).
     Unverified,
+    /// Structurally extracted from AST — deterministic, no LLM involved.
+    Structural,
+}
+
+/// Which extraction tier produced this claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionTier {
+    /// Deterministically extracted from document structure (AST/headings/metadata).
+    Structural,
+    /// Extracted by an LLM from chunk content.
+    #[default]
+    Llm,
 }
 
 #[cfg(test)]

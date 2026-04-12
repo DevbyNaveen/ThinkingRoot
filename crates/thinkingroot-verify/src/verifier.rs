@@ -269,6 +269,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             grounding_score: None,
             grounding_method: None,
+            extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
         };
         graph.insert_claim(&claim).unwrap();
 
