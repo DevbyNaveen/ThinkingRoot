@@ -90,6 +90,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         to_entity: name.clone(),
         relation_type: "contains".to_string(),
         description: Some(format!("{file_name} contains function {name}")),
+        confidence: 0.99,
     };
 
     let mut result = ExtractionResult {
@@ -112,6 +113,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
                 to_entity: name.clone(),
                 relation_type: "contains".to_string(),
                 description: Some(format!("{parent} contains method {name}")),
+                confidence: 0.99,
             };
             result.entities.push(parent_entity);
             result.relations.push(parent_contains);
@@ -159,6 +161,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         to_entity: name.clone(),
         relation_type: "contains".to_string(),
         description: Some(format!("{file_name} contains type {name}")),
+        confidence: 0.99,
     };
 
     ExtractionResult {
@@ -216,6 +219,7 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         to_entity: module_name.clone(),
         relation_type: "uses".to_string(),
         description: Some(format!("{file_name} imports {import_path}")),
+        confidence: 0.99,
     };
 
     ExtractionResult {

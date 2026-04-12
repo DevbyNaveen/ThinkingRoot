@@ -39,6 +39,14 @@ pub struct ExtractedRelation {
     pub to_entity: String,
     pub relation_type: String,
     pub description: Option<String>,
+    /// LLM-assigned confidence for this relation [0.0, 1.0].
+    /// Relations below 0.3 are discarded during conversion.
+    #[serde(default = "default_relation_confidence")]
+    pub confidence: f64,
+}
+
+fn default_relation_confidence() -> f64 {
+    0.8
 }
 
 impl ExtractionResult {

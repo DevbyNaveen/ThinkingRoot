@@ -393,14 +393,33 @@ impl Extractor {
             output.claims.push(claim);
         }
 
-        // Convert relations.
+        // Convert relations — filter unknown types and low-confidence ones.
         for ext_rel in &result.relations {
             let from_id = entity_map.get(&ext_rel.from_entity.to_lowercase());
             let to_id = entity_map.get(&ext_rel.to_entity.to_lowercase());
 
             if let (Some(&from), Some(&to)) = (from_id, to_id) {
-                let rel_type = parse_relation_type(&ext_rel.relation_type);
+                // Reject unknown relation types (returns None) and explicit SKIP.
+                let Some(rel_type) = parse_relation_type(&ext_rel.relation_type) else {
+                    tracing::debug!(
+                        "discarded relation '{}' → '{}' with unknown type '{}'",
+                        ext_rel.from_entity, ext_rel.to_entity, ext_rel.relation_type
+                    );
+                    continue;
+                };
+
+                // Reject low-confidence relations (LLM was too uncertain).
+                let confidence = ext_rel.confidence.clamp(0.0, 1.0);
+                if confidence < 0.3 {
+                    tracing::debug!(
+                        "discarded low-confidence relation '{}' → '{}' ({:.2})",
+                        ext_rel.from_entity, ext_rel.to_entity, confidence
+                    );
+                    continue;
+                }
+
                 let rel = Relation::new(from, to, rel_type)
+                    .with_strength(confidence)
                     .with_description(ext_rel.description.clone().unwrap_or_default());
                 output.relations.push(SourcedRelation {
                     source: source_id,
@@ -573,22 +592,23 @@ fn parse_entity_type(s: &str) -> EntityType {
     }
 }
 
-fn parse_relation_type(s: &str) -> RelationType {
-    match s.to_lowercase().as_str() {
-        "depends_on" => RelationType::DependsOn,
-        "owned_by" => RelationType::OwnedBy,
-        "replaces" => RelationType::Replaces,
-        "contradicts" => RelationType::Contradicts,
-        "implements" => RelationType::Implements,
-        "uses" => RelationType::Uses,
-        "contains" => RelationType::Contains,
-        "created_by" => RelationType::CreatedBy,
-        "part_of" => RelationType::PartOf,
-        "related_to" => RelationType::RelatedTo,
-        "calls" => RelationType::Calls,
-        "configured_by" => RelationType::ConfiguredBy,
-        "tested_by" => RelationType::TestedBy,
-        _ => RelationType::RelatedTo,
+fn parse_relation_type(s: &str) -> Option<RelationType> {
+    match s.to_lowercase().trim() {
+        "depends_on"    => Some(RelationType::DependsOn),
+        "owned_by"      => Some(RelationType::OwnedBy),
+        "replaces"      => Some(RelationType::Replaces),
+        "contradicts"   => Some(RelationType::Contradicts),
+        "implements"    => Some(RelationType::Implements),
+        "uses"          => Some(RelationType::Uses),
+        "contains"      => Some(RelationType::Contains),
+        "created_by"    => Some(RelationType::CreatedBy),
+        "part_of"       => Some(RelationType::PartOf),
+        "related_to"    => Some(RelationType::RelatedTo),
+        "calls"         => Some(RelationType::Calls),
+        "configured_by" => Some(RelationType::ConfiguredBy),
+        "tested_by"     => Some(RelationType::TestedBy),
+        "skip_relation" | "" => None,
+        _               => None,
     }
 }
 
@@ -628,6 +648,27 @@ mod tests {
         let chunks = split_to_token_budget(&big_line, 10); // 40 chars budget
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], big_line);
+    }
+
+    #[test]
+    fn unknown_relation_type_is_rejected_not_mapped_to_related_to() {
+        let result = parse_relation_type("blah_relation");
+        assert!(result.is_none(), "unknown types must be rejected, not silently mapped");
+    }
+
+    #[test]
+    fn skip_relation_is_rejected() {
+        assert!(parse_relation_type("skip_relation").is_none());
+        assert!(parse_relation_type("SKIP_RELATION").is_none());
+        assert!(parse_relation_type("").is_none());
+    }
+
+    #[test]
+    fn known_types_still_parse() {
+        assert_eq!(parse_relation_type("depends_on"), Some(RelationType::DependsOn));
+        assert_eq!(parse_relation_type("calls"), Some(RelationType::Calls));
+        assert_eq!(parse_relation_type("implements"), Some(RelationType::Implements));
+        assert_eq!(parse_relation_type("related_to"), Some(RelationType::RelatedTo));
     }
 }
 

@@ -26,22 +26,38 @@ You MUST return valid JSON matching this exact schema:
     {
       "from_entity": "Entity A",
       "to_entity": "Entity B",
-      "relation_type": "depends_on|owned_by|replaces|contradicts|implements|uses|contains|created_by|part_of|related_to|calls|configured_by|tested_by",
-      "description": "Brief description of the relationship"
+      "relation_type": "<see allowed types below>",
+      "confidence": 0.0-1.0,
+      "description": "One sentence describing why this relation exists"
     }
   ]
 }
 
-Rules:
-1. Claims must be ATOMIC — one fact per claim. Do not combine multiple facts.
-2. Claims must be SELF-CONTAINED — understandable without reading the source.
-3. Every entity mentioned in a claim MUST appear in the entities list.
-4. Confidence reflects how certain the source is (0.5=implied, 0.8=stated, 0.95=definitive).
-5. Do NOT fabricate information. Extract only what is explicitly stated or clearly implied.
-6. For code: extract function signatures, type definitions, dependencies, and architectural patterns.
-7. For docs: extract decisions, requirements, facts, and relationships between concepts.
-8. source_quote MUST be a verbatim substring copied from the source. Do NOT paraphrase.
-9. Return ONLY the JSON object. No markdown, no explanation, no preamble."#;
+## Allowed relation_type values (use EXACTLY one, no other values):
+
+- depends_on    — A cannot function without B (hard runtime dependency)
+- calls         — A invokes B as a function or API at runtime
+- implements    — A implements interface/trait/protocol B
+- uses          — A uses B as a tool or library (soft dependency)
+- contains      — A is a container that includes B as a sub-component
+- part_of       — A is a sub-component of B (inverse of contains)
+- owned_by      — A is maintained or owned by person/team B
+- created_by    — A was originally authored by B
+- configured_by — A's behaviour is controlled by configuration B
+- tested_by     — A has test coverage provided by test suite B
+- replaces      — A supersedes or replaces B
+- contradicts   — A and B make conflicting assertions
+- related_to    — use ONLY when none of the above apply AND you are confident a relationship exists
+
+## Critical rules:
+1. NEVER output related_to as a lazy default. If you are uncertain what the relation is, output "skip_relation" instead.
+2. If you output "skip_relation" for relation_type, the relation will be discarded — this is correct behaviour for uncertain relations.
+3. confidence for relations: 0.9=directly stated in code/text, 0.7=strongly implied, 0.5=inferred, below 0.3=output skip_relation instead.
+4. Claims must be ATOMIC — one fact per claim.
+5. Claims must be SELF-CONTAINED — understandable without the source.
+6. Every entity in a claim MUST appear in the entities list.
+7. source_quote MUST be a verbatim substring copied from the source. Do NOT paraphrase.
+8. Return ONLY the JSON object. No markdown, no explanation, no preamble."#;
 
 /// Build the user prompt for a given chunk of content.
 pub fn build_extraction_prompt(content: &str, context: &str) -> String {
