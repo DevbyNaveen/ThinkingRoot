@@ -66,27 +66,32 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
         doc.author = Some(author.to_string());
         doc.content_hash = ContentHash::from_bytes(sha.as_bytes());
 
-        // Commit message as a chunk.
-        let message = if body.is_empty() {
-            subject.to_string()
-        } else {
-            format!("{subject}\n\n{body}")
-        };
-        doc.add_chunk(Chunk::new(&message, ChunkType::Prose, 1, 1));
-
-        // Get the diff for this commit (abbreviated for extraction).
-        if let Ok(diff_output) = Command::new("git")
+        // Run diff stat first so we can embed it in the Prose chunk metadata.
+        let changed_files = if let Ok(diff_output) = Command::new("git")
             .args(["diff", &format!("{sha}^..{sha}"), "--stat"])
             .current_dir(repo_path)
             .output()
         {
             if diff_output.status.success() {
                 let diff_stat = String::from_utf8_lossy(&diff_output.stdout);
-                if !diff_stat.trim().is_empty() {
-                    doc.add_chunk(Chunk::new(diff_stat.trim(), ChunkType::Code, 2, 2));
-                }
+                parse_changed_files(&diff_stat)
+            } else {
+                Vec::new()
             }
-        }
+        } else {
+            Vec::new()
+        };
+
+        // Commit message as a Prose chunk, carrying author + changed files metadata.
+        let message = if body.is_empty() {
+            subject.to_string()
+        } else {
+            format!("{subject}\n\n{body}")
+        };
+        let mut prose_chunk = Chunk::new(&message, ChunkType::Prose, 1, 1);
+        prose_chunk.metadata.commit_author = Some(author.to_string());
+        prose_chunk.metadata.changed_files = changed_files;
+        doc.add_chunk(prose_chunk);
 
         documents.push(doc);
     }
@@ -99,6 +104,20 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
     Ok(documents)
 }
 
+/// Extract file paths from `git diff --stat` output.
+/// Each file line looks like: " path/to/file.rs | 12 +++---"
+/// The summary line ("N files changed, ...") has no " | " and is skipped.
+fn parse_changed_files(diff_stat: &str) -> Vec<String> {
+    diff_stat
+        .lines()
+        .filter_map(|line| {
+            let pipe_pos = line.find(" |")?;
+            let path = line[..pipe_pos].trim().to_string();
+            if path.is_empty() { None } else { Some(path) }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +128,23 @@ mod tests {
         std::fs::create_dir_all(&tmp).ok();
         let docs = parse_git_log(&tmp, 10).unwrap();
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn parse_changed_files_extracts_paths() {
+        let stat = " src/main.rs | 12 +++---\n crates/core/src/lib.rs |  4 ++\n 2 files changed, 16 insertions(+), 2 deletions(-)\n";
+        let files = parse_changed_files(stat);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"src/main.rs".to_string()));
+        assert!(files.contains(&"crates/core/src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_changed_files_ignores_summary_line() {
+        // The last line "N files changed..." has no pipe → must not be included
+        let stat = "foo.rs | 1 +\n1 file changed, 1 insertion(+)\n";
+        let files = parse_changed_files(stat);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], "foo.rs");
     }
 }
