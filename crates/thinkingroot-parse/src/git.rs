@@ -106,6 +106,10 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
 
 /// Extract file paths from `git diff --stat` output.
 /// Each file line looks like: " path/to/file.rs | 12 +++---"
+/// Rename lines are expanded into two paths:
+///   - Brace form:  "prefix{old => new}suffix" → "prefixoldsuffix", "prefixnewsuffix"
+///   - Bare form:   "old.rs => new.rs"          → "old.rs", "new.rs"
+///
 /// The summary line ("N files changed, ...") has no " | " and is skipped.
 fn parse_changed_files(diff_stat: &str) -> Vec<String> {
     let mut result = Vec::new();
@@ -133,6 +137,18 @@ fn parse_changed_files(diff_stat: &str) -> Vec<String> {
                     continue;
                 }
             }
+        }
+        // Handle bare-form rename: "old.rs => new.rs" or "src/a.rs => dst/b.rs"
+        if let Some((old_part, new_part)) = path.split_once(" => ") {
+            let old_path = old_part.trim().to_string();
+            let new_path = new_part.trim().to_string();
+            if !old_path.is_empty() {
+                result.push(old_path);
+            }
+            if !new_path.is_empty() {
+                result.push(new_path);
+            }
+            continue;
         }
         result.push(path.to_string());
     }
@@ -182,5 +198,25 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"src/old.rs".to_string()));
         assert!(files.contains(&"src/new.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_changed_files_handles_bare_rename() {
+        // Pure rename — no common prefix, no braces
+        let stat = " old.rs => new.rs | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n";
+        let files = parse_changed_files(stat);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"old.rs".to_string()));
+        assert!(files.contains(&"new.rs".to_string()));
+    }
+
+    #[test]
+    fn parse_changed_files_handles_cross_dir_rename() {
+        // Cross-directory rename — no braces
+        let stat = " src/beta.rs => dst/gamma.rs | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n";
+        let files = parse_changed_files(stat);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&"src/beta.rs".to_string()));
+        assert!(files.contains(&"dst/gamma.rs".to_string()));
     }
 }
