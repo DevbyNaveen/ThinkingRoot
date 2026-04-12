@@ -25,6 +25,9 @@ pub fn specificity_rank(r: RelationType) -> u8 {
 /// same semantic concept but `specific` is more precise.
 /// Only true within the same subtree (Uses→DependsOn, not Uses→PartOf).
 pub fn subsumes(general: RelationType, specific: RelationType) -> bool {
+    if general == specific {
+        return false;
+    }
     matches!(
         (general, specific),
         (RelationType::RelatedTo, _)
@@ -145,5 +148,31 @@ mod tests {
         ];
         dedup_relations(&mut relations);
         assert_eq!(relations.len(), 2, "different pairs must not affect each other");
+    }
+
+    #[test]
+    fn dedup_does_not_remove_same_type_duplicates() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let mut relations = vec![
+            make_relation(e1, e2, RelationType::RelatedTo, 0.5),
+            make_relation(e1, e2, RelationType::RelatedTo, 0.7),
+        ];
+        dedup_relations(&mut relations);
+        assert_eq!(relations.len(), 2, "same-type duplicates should not be removed by subsumption");
+    }
+
+    #[test]
+    fn dedup_transitive_three_types_keeps_only_most_specific() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let mut relations = vec![
+            make_relation(e1, e2, RelationType::RelatedTo, 0.3),
+            make_relation(e1, e2, RelationType::Uses, 0.6),
+            make_relation(e1, e2, RelationType::DependsOn, 0.9),
+        ];
+        dedup_relations(&mut relations);
+        assert_eq!(relations.len(), 1, "should collapse to DependsOn only");
+        assert_eq!(relations[0].relation.relation_type, RelationType::DependsOn);
     }
 }
