@@ -481,18 +481,23 @@ impl GraphStore {
     }
 
     /// Rebuild the aggregated entity relation view from source-scoped relations.
+    /// Uses noisy-OR aggregation: strength = 1 − ∏(1 − s_i).
     pub fn rebuild_entity_relations(&self) -> Result<()> {
         self.clear_entity_relations()?;
 
+        // Fetch all (from, to, relation_type, strength) rows from source-scoped table.
         let result = self
             .db
             .run_script(
-                "?[from_id, to_id, relation_type, max(strength)] := *source_entity_relations{source_id, from_id, to_id, relation_type, strength}",
+                "?[from_id, to_id, relation_type, strength] := *source_entity_relations{source_id, from_id, to_id, relation_type, strength}",
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )
             .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
 
+        // Group by (from_id, to_id, relation_type) and compute noisy-OR.
+        let mut grouped: std::collections::BTreeMap<(String, String, String), Vec<f64>> =
+            std::collections::BTreeMap::new();
         for row in &result.rows {
             let from_id = dv_to_string(&row[0]);
             let to_id = dv_to_string(&row[1]);
@@ -502,7 +507,18 @@ impl GraphStore {
                 DataValue::Num(Num::Int(i)) => *i as f64,
                 _ => 1.0,
             };
-            self.link_entities(&from_id, &to_id, &relation_type, strength)?;
+            grouped
+                .entry((from_id, to_id, relation_type))
+                .or_default()
+                .push(strength);
+        }
+
+        for ((from_id, to_id, relation_type), strengths) in &grouped {
+            let complement_product = strengths.iter().fold(1.0_f64, |acc, &s| {
+                acc * (1.0 - s.clamp(0.0, 1.0))
+            });
+            let noisy_or_strength = (1.0 - complement_product).clamp(0.0, 1.0);
+            self.link_entities(from_id, to_id, relation_type, noisy_or_strength)?;
         }
 
         Ok(())
@@ -569,33 +585,35 @@ impl GraphStore {
                 params.clone(),
             )?;
 
-            // Re-aggregate: if any source still contributes this triple, re-insert.
+            // Re-aggregate using noisy-OR: 1 − ∏(1 − s_i)
+            // Include source_id in the projection so CozoDB does not deduplicate
+            // rows that share the same strength value (e.g., three sources all at 0.5).
             let result = self
                 .db
                 .run_script(
-                    "?[max(strength)] := *source_entity_relations{from_id: $fid, to_id: $tid, relation_type: $rtype, strength}",
+                    "?[source_id, strength] := *source_entity_relations{source_id, from_id: $fid, to_id: $tid, relation_type: $rtype, strength}",
                     params,
                     ScriptMutability::Immutable,
                 )
                 .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
 
-            if let Some(row) = result.rows.first() {
-                let strength = match &row[0] {
-                    DataValue::Num(Num::Float(f)) => *f,
-                    DataValue::Num(Num::Int(i)) => *i as f64,
-                    DataValue::Null => {
-                        // No source contributes this triple anymore — edge stays deleted.
-                        continue;
-                    }
-                    other => {
-                        tracing::warn!(
-                            "unexpected strength type for triple ({from_id}, {to_id}, {relation_type}): {other:?}, skipping re-insert"
-                        );
-                        continue;
-                    }
-                };
-                self.link_entities(from_id, to_id, relation_type, strength)?;
+            if result.rows.is_empty() {
+                // No sources remain — edge stays deleted.
+                continue;
             }
+
+            // Compute noisy-OR across all source strengths.
+            let complement_product = result.rows.iter().fold(1.0_f64, |acc, row| {
+                let s = match &row[1] {
+                    DataValue::Num(Num::Float(f)) => f.clamp(0.0, 1.0),
+                    DataValue::Num(Num::Int(i)) => (*i as f64).clamp(0.0, 1.0),
+                    _ => 0.0,
+                };
+                acc * (1.0 - s)
+            });
+            let noisy_or_strength = (1.0 - complement_product).clamp(0.0, 1.0);
+
+            self.link_entities(from_id, to_id, relation_type, noisy_or_strength)?;
         }
         Ok(())
     }
@@ -2010,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_update_recomputes_max_strength() {
+    fn incremental_update_recomputes_strength_noisy_or() {
         let store = mem_store();
 
         let e1 = thinkingroot_core::Entity::new("Svc1", thinkingroot_core::types::EntityType::Service);
@@ -2036,13 +2054,14 @@ mod tests {
         let sid_b = src_b.id.to_string();
 
         // Source A: strength 1.0 (highest). Source B: strength 0.5.
+        // noisy-OR(1.0, 0.5) = 1 - (1-1.0)*(1-0.5) = 1 - 0 = 1.0
         store.link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 1.0).unwrap();
         store.link_entities_for_source(&sid_b, &eid1, &eid2, "Uses", 0.5).unwrap();
 
         store.rebuild_entity_relations().unwrap();
         let before = store.get_all_relations().unwrap();
         let (_, _, _, _, _, initial_strength) = before[0];
-        assert_eq!(initial_strength, 1.0, "max should be 1.0 initially");
+        assert_eq!(initial_strength, 1.0, "noisy-OR with a 1.0 source should give 1.0 initially");
 
         // Capture triples, remove source A, re-add at lower strength.
         let affected = store.get_source_relation_triples(&sid_a).unwrap();
@@ -2052,13 +2071,16 @@ mod tests {
         store.insert_source(&src_a).unwrap();
         store.link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 0.3).unwrap();
 
-        // Incremental update should recompute to max(0.3, 0.5) = 0.5.
+        // Incremental update should recompute noisy-OR(0.3, 0.5) = 1 - (1-0.3)*(1-0.5) = 1 - 0.35 = 0.65.
         store.update_entity_relations_for_triples(&affected).unwrap();
 
         let after = store.get_all_relations().unwrap();
         assert_eq!(after.len(), 1);
         let (_, _, _, _, _, final_strength) = after[0];
-        assert_eq!(final_strength, 0.5, "max should now be 0.5 (src_b's contribution)");
+        assert!(
+            (final_strength - 0.65).abs() < 0.01,
+            "noisy-OR(0.3, 0.5) should give ~0.65, got {final_strength}"
+        );
     }
 
     #[test]
@@ -2156,6 +2178,52 @@ mod tests {
 
         let not_found = store.find_entity_id_by_name("NonExistent").unwrap();
         assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn noisy_or_combines_multiple_sources_stronger_than_max() {
+        let store = mem_store();
+
+        let e1 = thinkingroot_core::Entity::new("A", thinkingroot_core::types::EntityType::Service);
+        let e2 = thinkingroot_core::Entity::new("B", thinkingroot_core::types::EntityType::Service);
+        store.insert_entity(&e1).unwrap();
+        store.insert_entity(&e2).unwrap();
+
+        let eid1 = e1.id.to_string();
+        let eid2 = e2.id.to_string();
+
+        let src_a = thinkingroot_core::Source::new("test://a.rs".into(), thinkingroot_core::types::SourceType::File);
+        let src_b = thinkingroot_core::Source::new("test://b.rs".into(), thinkingroot_core::types::SourceType::File);
+        let src_c = thinkingroot_core::Source::new("test://c.rs".into(), thinkingroot_core::types::SourceType::File);
+        store.insert_source(&src_a).unwrap();
+        store.insert_source(&src_b).unwrap();
+        store.insert_source(&src_c).unwrap();
+
+        // Three sources each with strength 0.5.
+        // MAX would give 0.5.
+        // Noisy-OR gives 1 - (1-0.5)^3 = 1 - 0.125 = 0.875.
+        store.link_entities_for_source(&src_a.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
+        store.link_entities_for_source(&src_b.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
+        store.link_entities_for_source(&src_c.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
+
+        // Trigger aggregation.
+        let triples = vec![
+            (eid1.clone(), eid2.clone(), "Uses".to_string()),
+        ];
+        store.update_entity_relations_for_triples(&triples).unwrap();
+
+        let relations = store.get_all_relations().unwrap();
+        assert_eq!(relations.len(), 1);
+        let (_, _, _, _, _, strength) = &relations[0];
+        // Must be greater than 0.5 (the max) — noisy-OR gives ~0.875
+        assert!(
+            *strength > 0.5,
+            "noisy-OR with 3 sources of 0.5 should produce strength > 0.5, got {strength}"
+        );
+        assert!(
+            (*strength - 0.875).abs() < 0.01,
+            "expected ~0.875 from noisy-OR, got {strength}"
+        );
     }
 
     #[test]
