@@ -647,8 +647,10 @@ mod tiered_tests {
         let result = crate::structural::extract_structural(&chunk, "test/example.rs");
         assert!(!result.entities.is_empty(), "structural should produce entities");
         assert!(!result.claims.is_empty(), "structural should produce claims");
+        let first_claim = result.claims.first()
+            .expect("structural extractor must produce at least one claim");
         assert_eq!(
-            result.claims[0].extraction_tier,
+            first_claim.extraction_tier,
             ExtractionTier::Structural,
             "structural extractor must tag claims with ExtractionTier::Structural"
         );
@@ -697,5 +699,8 @@ mod tiered_tests {
         let (structural, llm) = crate::router::route_chunks(&chunks);
         assert_eq!(structural.len(), 2, "FunctionDef + Import = 2 structural");
         assert_eq!(llm.len(), 1, "Prose = 1 LLM");
+        assert!(structural.contains(&0), "FunctionDef (index 0) should be structural");
+        assert!(structural.contains(&2), "Import (index 2) should be structural");
+        assert!(llm.contains(&1), "Prose (index 1) should be LLM");
     }
 }

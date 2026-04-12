@@ -2170,5 +2170,24 @@ mod tests {
             ExtractionTier::Structural,
             "extraction_tier must survive insert+get round-trip"
         );
+
+        // Also verify ExtractionTier::Llm round-trips correctly
+        let mut llm_claim = thinkingroot_core::Claim::new(
+            "another fact",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        llm_claim.extraction_tier = ExtractionTier::Llm;
+        store.insert_claim(&llm_claim).unwrap();
+        let retrieved_llm = store
+            .get_claim_by_id(&llm_claim.id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retrieved_llm.extraction_tier,
+            ExtractionTier::Llm,
+            "ExtractionTier::Llm must survive insert+get round-trip"
+        );
     }
 }
