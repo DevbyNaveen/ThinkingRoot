@@ -503,9 +503,9 @@ impl GraphStore {
             let to_id = dv_to_string(&row[1]);
             let relation_type = dv_to_string(&row[2]);
             let strength = match &row[3] {
-                DataValue::Num(Num::Float(f)) => *f,
-                DataValue::Num(Num::Int(i)) => *i as f64,
-                _ => 1.0,
+                DataValue::Num(Num::Float(f)) => f.clamp(0.0, 1.0),
+                DataValue::Num(Num::Int(i)) => (*i as f64).clamp(0.0, 1.0),
+                _ => 0.0,
             };
             grouped
                 .entry((from_id, to_id, relation_type))
