@@ -1075,8 +1075,8 @@ impl GraphStore {
         params.insert("id".into(), DataValue::Str(id.into()));
 
         let result = self.db.run_script(
-            r#"?[statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, extraction_tier] :=
-                *claims{id: $id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, extraction_tier}"#,
+            r#"?[statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier] :=
+                *claims{id: $id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier}"#,
             params,
             ScriptMutability::Immutable,
         ).map_err(|e| Error::GraphStorage(format!("get_claim_by_id query failed: {e}")))?;
@@ -1101,6 +1101,13 @@ impl GraphStore {
             DataValue::Num(Num::Int(n))   => *n as f64,
             _ => 0.0,
         };
+
+        let grounding_score_val = match &row[7] {
+            DataValue::Num(Num::Float(f)) if *f >= 0.0 => Some(*f),
+            DataValue::Num(Num::Int(n)) if *n >= 0 => Some(*n as f64),
+            _ => None,  // -1.0 is stored when unset
+        };
+        let grounding_method_s = dv_to_string(&row[8]);
 
         let claim_type = match claim_type_s.as_str() {
             "Decision"     => ClaimType::Decision,
@@ -1128,6 +1135,17 @@ impl GraphStore {
         let created_at = chrono::DateTime::from_timestamp(created_ts as i64, 0)
             .unwrap_or_else(chrono::Utc::now);
 
+        use thinkingroot_core::types::GroundingMethod;
+        let grounding_method = match grounding_method_s.as_str() {
+            "Lexical"    => Some(GroundingMethod::Lexical),
+            "Span"       => Some(GroundingMethod::Span),
+            "Semantic"   => Some(GroundingMethod::Semantic),
+            "Combined"   => Some(GroundingMethod::Combined),
+            "Unverified" => Some(GroundingMethod::Unverified),
+            "Structural" => Some(GroundingMethod::Structural),
+            _            => None,
+        };
+
         Ok(Some(Claim {
             id: claim_id,
             statement,
@@ -1142,9 +1160,9 @@ impl GraphStore {
             extracted_by: PipelineVersion::current(),
             superseded_by: None,
             created_at,
-            grounding_score: None,
-            grounding_method: None,
-            extraction_tier: match dv_to_string(&row[7]).as_str() {
+            grounding_score: grounding_score_val,
+            grounding_method,
+            extraction_tier: match dv_to_string(&row[9]).as_str() {
                 "structural" => thinkingroot_core::types::ExtractionTier::Structural,
                 "llm" | _ => thinkingroot_core::types::ExtractionTier::Llm,
             },
