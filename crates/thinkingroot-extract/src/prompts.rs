@@ -50,6 +50,26 @@ pub fn build_extraction_prompt(content: &str, context: &str) -> String {
     )
 }
 
+/// Build an extraction prompt with a graph-primed KNOWN_ENTITIES section.
+///
+/// The entities section helps the LLM ground new extractions in existing
+/// knowledge and reduces hallucination of entity names. Falls back to
+/// `build_extraction_prompt` when `known_entities_section` is empty so that
+/// callers never have to branch on emptiness themselves.
+pub fn build_extraction_prompt_with_context(
+    content: &str,
+    context: &str,
+    known_entities_section: &str,
+) -> String {
+    if known_entities_section.is_empty() {
+        build_extraction_prompt(content, context)
+    } else {
+        format!(
+            "Extract knowledge from the following content.\n\nContext: {context}\n\n{known_entities_section}\n\n---\n\n{content}\n\n---\n\nReturn the JSON extraction result."
+        )
+    }
+}
+
 /// Build context string from document metadata.
 pub fn build_context(uri: &str, language: Option<&str>, heading: Option<&str>) -> String {
     let mut parts = vec![format!("Source: {uri}")];

@@ -832,6 +832,33 @@ impl LlmClient {
     /// attached, the effective concurrency is also halved.
     pub async fn extract(&self, content: &str, context: &str) -> Result<ExtractionResult> {
         let user_prompt = prompts::build_extraction_prompt(content, context);
+        self.extract_prompt(user_prompt).await
+    }
+
+    /// Extract knowledge with graph-primed context injected into the prompt.
+    ///
+    /// When `known_entities_section` is non-empty it is embedded in the prompt
+    /// before the source content so the LLM can ground new extractions against
+    /// existing entities rather than inventing names.  Falls back to the plain
+    /// prompt when the section is empty (i.e. first-run, empty graph).
+    pub async fn extract_with_graph_context(
+        &self,
+        content: &str,
+        context: &str,
+        known_entities_section: &str,
+    ) -> Result<ExtractionResult> {
+        let user_prompt = prompts::build_extraction_prompt_with_context(
+            content,
+            context,
+            known_entities_section,
+        );
+        self.extract_prompt(user_prompt).await
+    }
+
+    /// Core retry/rate-limit loop shared by `extract` and
+    /// `extract_with_graph_context`.  Accepts a fully-built user prompt string
+    /// so callers can vary the prompt without duplicating retry logic.
+    async fn extract_prompt(&self, user_prompt: String) -> Result<ExtractionResult> {
         let mut last_error = None;
 
         // Rate-limit errors get double the retries.

@@ -241,9 +241,13 @@ impl Extractor {
         // sub-chunk LLM call, released after each call completes).
         let mut join_set = tokio::task::JoinSet::new();
 
+        // Compute the graph-primed context section once; cloned into each task.
+        let known_entities_section = self.known_entities.prompt_section();
+
         for work in llm_work {
             let llm = Arc::clone(&self.llm);
             let sem = Arc::clone(&semaphore);
+            let graph_ctx = known_entities_section.clone();
 
             join_set.spawn(async move {
                 let source_id = work.source_id;
@@ -257,6 +261,7 @@ impl Extractor {
                         Arc::clone(&llm),
                         sub_content.clone(),
                         work.context.clone(),
+                        graph_ctx.clone(),
                         0,
                     )
                     .await
@@ -447,14 +452,17 @@ fn split_to_token_budget(content: &str, max_tokens: usize) -> Vec<String> {
 
 /// Recursively extract from content, splitting at line boundaries if truncated.
 /// Depth limit of 3 prevents infinite recursion on pathological inputs.
+/// `known_entities_section` is passed unchanged through all recursive splits so
+/// every sub-chunk benefits from the same graph context.
 fn extract_with_split(
     llm: SharedLlm,
     content: String,
     context: String,
+    known_entities_section: String,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send>> {
     Box::pin(async move {
-        match llm.extract(&content, &context).await {
+        match llm.extract_with_graph_context(&content, &context, &known_entities_section).await {
             Ok(result) => Ok(result),
 
             Err(thinkingroot_core::Error::TruncatedOutput { ref provider, ref model })
@@ -484,10 +492,12 @@ fn extract_with_split(
                 let llm2 = Arc::clone(&llm);
                 let ctx1 = context.clone();
                 let ctx2 = context.clone();
+                let gctx1 = known_entities_section.clone();
+                let gctx2 = known_entities_section.clone();
 
                 let (r1, r2) = tokio::try_join!(
-                    extract_with_split(llm1, first_half, ctx1, depth + 1),
-                    extract_with_split(llm2, second_half, ctx2, depth + 1),
+                    extract_with_split(llm1, first_half, ctx1, gctx1, depth + 1),
+                    extract_with_split(llm2, second_half, ctx2, gctx2, depth + 1),
                 )?;
 
                 Ok(ExtractionResult {
