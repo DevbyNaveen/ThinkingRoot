@@ -1,6 +1,6 @@
 //! Tier 0 structural extractor — zero LLM, zero hallucination.
 //!
-//! Converts AST-rich chunks (FunctionDef, TypeDef, Import, Comment/ModuleDoc)
+//! Converts AST-rich chunks (FunctionDef, TypeDef, Import)
 //! into `ExtractionResult` deterministically using only the metadata that the
 //! parse crate already computed via tree-sitter.  Every claim produced here
 //! carries `extraction_tier: ExtractionTier::Structural` and `confidence: 0.99`.
@@ -17,7 +17,7 @@ use crate::schema::{ExtractedClaim, ExtractedEntity, ExtractedRelation, Extracti
 pub fn is_structurally_extractable(chunk: &Chunk) -> bool {
     matches!(
         chunk.chunk_type,
-        ChunkType::FunctionDef | ChunkType::TypeDef | ChunkType::Import | ChunkType::Comment | ChunkType::ModuleDoc
+        ChunkType::FunctionDef | ChunkType::TypeDef | ChunkType::Import
     )
 }
 
@@ -103,7 +103,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         if !parent.is_empty() {
             let parent_entity = ExtractedEntity {
                 name: parent.clone(),
-                entity_type: "system".to_string(), // refined by infer_entity_type_from_content below
+                entity_type: "concept".to_string(), // conservative default for parent scope
                 aliases: Vec::new(),
                 description: Some(format!("Type defined in {file_name}")),
             };
@@ -178,9 +178,12 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
     let file_name = file_name_from_uri(source_uri);
 
     // Use the last segment of the import path as the canonical module name.
+    // Supports Rust (::), path-style (/), and Python-style (.) imports.
     let module_name = import_path
         .rsplit("::")
         .next()
+        .or_else(|| import_path.rsplit('/').next())
+        .or_else(|| import_path.rsplit('.').next())
         .unwrap_or(&import_path)
         .trim_matches('"')
         .to_string();
@@ -462,8 +465,6 @@ mod tests {
             ChunkType::FunctionDef,
             ChunkType::TypeDef,
             ChunkType::Import,
-            ChunkType::Comment,
-            ChunkType::ModuleDoc,
         ] {
             let chunk = make_chunk(ct, "", ChunkMetadata::default());
             assert!(
@@ -475,7 +476,15 @@ mod tests {
 
     #[test]
     fn is_structurally_extractable_rejects_prose_code_etc() {
-        for ct in [ChunkType::Prose, ChunkType::Code, ChunkType::Heading, ChunkType::List, ChunkType::Table] {
+        for ct in [
+            ChunkType::Prose,
+            ChunkType::Code,
+            ChunkType::Heading,
+            ChunkType::List,
+            ChunkType::Table,
+            ChunkType::Comment,
+            ChunkType::ModuleDoc,
+        ] {
             let chunk = make_chunk(ct, "", ChunkMetadata::default());
             assert!(
                 !is_structurally_extractable(&chunk),
