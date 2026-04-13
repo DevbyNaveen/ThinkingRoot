@@ -21,12 +21,20 @@ pub enum ProgressEvent {
     ChunkDone { done: usize, total: usize, source_uri: String },
     /// All chunks extracted. Summary data for solidifying the bar.
     ExtractionComplete { claims: usize, entities: usize, cache_hits: usize },
+    /// Grounding tribunal is starting (runs between extraction and linking).
+    GroundingStart { llm_claims: usize, structural_claims: usize },
+    /// Grounding tribunal finished. `accepted` = claims that survived.
+    GroundingDone { accepted: usize, rejected: usize },
+    /// Fingerprint check finished. `cutoffs` = sources skipped by fingerprint match.
+    FingerprintDone { truly_changed: usize, cutoffs: usize },
     /// Entity resolution is starting.
     LinkingStart { total_entities: usize },
     /// One entity resolved (created or merged).
     EntityResolved { done: usize, total: usize },
     /// Linking finished.
     LinkComplete { entities: usize, relations: usize, contradictions: usize },
+    /// Vector index update finished.
+    VectorUpdateDone { entities_indexed: usize, claims_indexed: usize },
     /// Artifact compilation finished.
     CompilationDone { artifacts: usize },
     /// Verification finished.
@@ -224,6 +232,11 @@ pub async fn run_pipeline(
         .into_iter()
         .partition(|c| c.extraction_tier == thinkingroot_core::types::ExtractionTier::Llm);
 
+    emit!(ProgressEvent::GroundingStart {
+        llm_claims: llm_claims.len(),
+        structural_claims: structural_claims.len(),
+    });
+
     // Auto-ground structural claims.
     let structural_count = structural_claims.len();
     for claim in &mut structural_claims {
@@ -289,9 +302,16 @@ pub async fn run_pipeline(
     };
 
     // Merge: structural claims (0.99 grounding) + surviving LLM claims.
+    let pre_grounding_total = grounded_llm_claims.claims.len() + structural_claims.len();
     extraction = grounded_llm_claims;
     extraction.claims.extend(structural_claims);
     thinkingroot_ground::dedup::dedup_claims(&mut extraction.claims);
+    let post_grounding_total = extraction.claims.len();
+
+    emit!(ProgressEvent::GroundingDone {
+        accepted: post_grounding_total,
+        rejected: pre_grounding_total.saturating_sub(post_grounding_total),
+    });
 
     // ─── Phase 3: Fingerprint check ────────────────────────────────────
     // For each potentially-changed doc, compute a fingerprint of its extracted
@@ -318,6 +338,11 @@ pub async fn run_pipeline(
             truly_changed.push(*doc);
         }
     }
+
+    emit!(ProgressEvent::FingerprintDone {
+        truly_changed: truly_changed.len(),
+        cutoffs: fingerprint_cutoffs,
+    });
 
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
@@ -403,7 +428,13 @@ pub async fn run_pipeline(
 
     // If only deletions or all fingerprint hits — no new content to link.
     if truly_changed.is_empty() {
-        update_vector_index_full(&mut storage)?;
+        emit!(ProgressEvent::LinkComplete { entities: 0, relations: 0, contradictions: 0 });
+
+        let (ent_count, clm_count) = update_vector_index_full(&mut storage)?;
+        emit!(ProgressEvent::VectorUpdateDone {
+            entities_indexed: ent_count,
+            claims_indexed: clm_count,
+        });
 
         let compiler = thinkingroot_compile::Compiler::new(&config)?;
         let artifacts = compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
@@ -577,15 +608,25 @@ pub async fn run_pipeline(
         storage.vector.upsert_batch(&new_claim_items)?;
         storage.vector.save()?;
 
+        let ent_count = new_entity_items.len();
+        let clm_count = new_claim_items.len();
         tracing::info!(
             "vector index updated surgically: removed {}, added {} entities + {} claims",
             stale_ids.len(),
-            new_entity_items.len(),
-            new_claim_items.len(),
+            ent_count,
+            clm_count,
         );
+        emit!(ProgressEvent::VectorUpdateDone {
+            entities_indexed: ent_count,
+            claims_indexed: clm_count,
+        });
     } else {
         // Deletions occurred — full rebuild to correctly handle orphaned entries.
-        update_vector_index_full(&mut storage)?;
+        let (ent_count, clm_count) = update_vector_index_full(&mut storage)?;
+        emit!(ProgressEvent::VectorUpdateDone {
+            entities_indexed: ent_count,
+            claims_indexed: clm_count,
+        });
     }
 
     // ─── Phase 10: Selective compilation ────────────────────────────────

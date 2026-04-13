@@ -43,6 +43,8 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-mini = { workspace = true }
+toml = { workspace = true }
+ignore = { workspace = true }
 
 [features]
 ## Enable neural embedding for semantic search. On by default; disable with

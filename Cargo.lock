@@ -4901,6 +4901,7 @@ dependencies = [
  "console",
  "dialoguer",
  "dirs 5.0.1",
+ "ignore",
  "indicatif",
  "notify",
  "notify-debouncer-mini",
@@ -4919,6 +4920,7 @@ dependencies = [
  "thinkingroot-serve",
  "thinkingroot-verify",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

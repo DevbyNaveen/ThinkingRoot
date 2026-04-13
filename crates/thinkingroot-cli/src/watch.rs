@@ -5,11 +5,74 @@ use std::time::{Duration, Instant};
 use console::style;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
 
+use thinkingroot_core::config::Config;
+
 use crate::pipeline;
 
+/// Build a gitignore-aware matcher from the workspace's `exclude_patterns`
+/// and `.gitignore` rules. Returns a closure that returns `true` for paths
+/// the watcher should **ignore** (i.e. noise).
+fn build_ignore_matcher(root: &Path, config: &Config) -> impl Fn(&Path) -> bool {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+
+    // Load .gitignore if respect_gitignore is enabled.
+    if config.parsers.respect_gitignore {
+        let gitignore_path = root.join(".gitignore");
+        if gitignore_path.exists() {
+            let _ = builder.add(&gitignore_path);
+        }
+    }
+
+    // Add the config's exclude_patterns as additional ignore rules.
+    for pattern in &config.parsers.exclude_patterns {
+        let _ = builder.add_line(None, pattern);
+    }
+
+    let gitignore = builder.build().unwrap_or_else(|_| {
+        ignore::gitignore::GitignoreBuilder::new(root)
+            .build()
+            .expect("empty gitignore builder must succeed")
+    });
+
+    // Built-in noise directories that should always be ignored, regardless of
+    // config — these never contain user-authored source files.
+    const ALWAYS_IGNORE: &[&str] = &[
+        ".thinkingroot",
+        ".git",
+        "target",
+        "node_modules",
+        ".next",
+        "dist",
+        "build",
+        "__pycache__",
+        ".tox",
+        ".venv",
+    ];
+
+    move |path: &Path| {
+        // Fast path: check path components against the built-in blocklist.
+        for component in path.components() {
+            let name = component.as_os_str();
+            if ALWAYS_IGNORE.iter().any(|&blocked| name == blocked) {
+                return true;
+            }
+        }
+
+        // Check against gitignore + config exclude_patterns.
+        gitignore
+            .matched_path_or_any_parents(path, path.is_dir())
+            .is_ignore()
+    }
+}
+
 /// Watch a directory for changes and run incremental compilation.
-/// Debounces file events with a 300ms window before triggering a compile.
+/// Debounces file events with a 500ms window before triggering a compile.
+/// Respects `.gitignore` and `exclude_patterns` from config — only reacts
+/// to files the parser would actually process.
 pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
+    let config = Config::load_merged(root_path)?;
+    let should_ignore = build_ignore_matcher(root_path, &config);
+
     println!(
         "\n  {} watching {} for changes (Ctrl+C to stop)\n",
         style("ThinkingRoot").green().bold(),
@@ -34,10 +97,10 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Set up file watcher with 300ms debounce.
+    // Set up file watcher with 500ms debounce (up from 300ms to reduce noise).
     let (tx, rx) = mpsc::channel();
     let rx = Arc::new(Mutex::new(rx));
-    let mut debouncer = new_debouncer(Duration::from_millis(300), tx)?;
+    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
 
     debouncer
         .watcher()
@@ -49,20 +112,16 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
     );
 
     loop {
-        // Move the blocking recv off the async executor's worker threads.
         let rx_clone = Arc::clone(&rx);
         let recv_result = tokio::task::spawn_blocking(move || rx_clone.lock().unwrap().recv())
             .await?;
 
         match recv_result {
             Ok(Ok(events)) => {
-                // Filter out events inside .thinkingroot/ using exact component matching
-                // to avoid false-positives when a parent dir contains ".thinkingroot".
                 let relevant: Vec<_> = events
                     .iter()
                     .filter(|e| {
-                        e.kind == DebouncedEventKind::Any
-                            && !e.path.components().any(|c| c.as_os_str() == ".thinkingroot")
+                        e.kind == DebouncedEventKind::Any && !should_ignore(&e.path)
                     })
                     .collect();
 
@@ -71,10 +130,28 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
                 }
 
                 let changed_count = relevant.len();
+                let sample = relevant
+                    .first()
+                    .map(|e| {
+                        e.path
+                            .strip_prefix(root_path)
+                            .unwrap_or(&e.path)
+                            .display()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+
+                let extra = if changed_count > 1 {
+                    format!(" (+{} more)", changed_count - 1)
+                } else {
+                    String::new()
+                };
+
                 println!(
-                    "  {} {} file(s) changed, recompiling...",
+                    "  {} {}{}",
                     style(">>").cyan().bold(),
-                    changed_count,
+                    style(&sample).white(),
+                    style(&extra).dim(),
                 );
 
                 let start = Instant::now();

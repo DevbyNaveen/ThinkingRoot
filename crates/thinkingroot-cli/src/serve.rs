@@ -11,6 +11,10 @@ use thinkingroot_serve::engine::QueryEngine;
 use thinkingroot_serve::rest::{AppState, build_router_opts};
 
 /// Launch the interactive knowledge graph explorer in the browser.
+///
+/// Tries the requested port first, then scans up to 9 consecutive ports if it
+/// is already taken. The browser is opened only after the port binds
+/// successfully — never before.
 pub async fn run_graph(port: u16, path: std::path::PathBuf) -> anyhow::Result<()> {
     let abs_path = std::fs::canonicalize(&path)
         .with_context(|| format!("path not found: {}", path.display()))?;
@@ -24,7 +28,45 @@ pub async fn run_graph(port: u16, path: std::path::PathBuf) -> anyhow::Result<()
         );
     }
 
-    let url = format!("http://127.0.0.1:{}/graph", port);
+    // ── Port probe: try the requested port, then up to 9 more ──────────
+    const MAX_ATTEMPTS: u16 = 10;
+    let mut listener = None;
+    let mut actual_port = port;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let candidate = port.saturating_add(attempt);
+        let addr = format!("127.0.0.1:{}", candidate);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                actual_port = candidate;
+                listener = Some(l);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if attempt == 0 {
+                    eprintln!(
+                        "  {} port {} in use, scanning for an available port...",
+                        console::style("!").yellow().bold(),
+                        candidate
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to bind port {}: {}", candidate, e));
+            }
+        }
+    }
+
+    let listener = listener.ok_or_else(|| {
+        anyhow::anyhow!(
+            "all ports {}-{} are in use. Free a port or specify one with --port",
+            port,
+            port.saturating_add(MAX_ATTEMPTS - 1)
+        )
+    })?;
+
+    // ── Banner (shows the ACTUAL port, not the requested one) ──────────
+    let url = format!("http://127.0.0.1:{}/graph", actual_port);
 
     println!();
     println!(
@@ -32,25 +74,22 @@ pub async fn run_graph(port: u16, path: std::path::PathBuf) -> anyhow::Result<()
         console::style("ThinkingRoot").green().bold()
     );
     println!("  {}", console::style(&url).cyan().underlined());
+    if actual_port != port {
+        println!(
+            "  {} default port {} was busy — using {} instead",
+            console::style("note:").dim(),
+            port,
+            actual_port
+        );
+    }
     println!();
     println!("  Press Ctrl+C to stop.");
     println!();
 
-    // Open browser (best-effort, don't fail if it doesn't work)
+    // Browser opens AFTER successful bind — never to a dead port.
     let _ = open_browser(&url);
 
-    run_serve(
-        port,
-        "127.0.0.1".into(),
-        None,
-        vec![path],
-        None,   // name
-        false,
-        false,
-        false, // enable MCP
-        None,  // branch
-    )
-    .await
+    run_serve_with_listener(listener, None, vec![path], None, false, false, false, None).await
 }
 
 fn open_browser(url: &str) -> std::io::Result<()> {
@@ -201,6 +240,110 @@ pub async fn run_serve(
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("server listening on {}", addr);
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    Ok(())
+}
+
+/// Variant of [`run_serve`] that accepts a pre-bound [`tokio::net::TcpListener`].
+///
+/// Used by `run_graph` which probes for an available port before calling this.
+#[allow(clippy::too_many_arguments)]
+async fn run_serve_with_listener(
+    listener: tokio::net::TcpListener,
+    api_key: Option<String>,
+    paths: Vec<PathBuf>,
+    name: Option<String>,
+    no_rest: bool,
+    no_mcp: bool,
+    mcp_stdio: bool,
+    branch: Option<String>,
+) -> anyhow::Result<()> {
+    if no_rest && no_mcp {
+        anyhow::bail!("--no-rest and --no-mcp cannot be used together: nothing to serve");
+    }
+
+    // Resolve workspace paths: explicit --path > --name > registry
+    let resolved_paths: Vec<(String, PathBuf)> = if !paths.is_empty() {
+        paths
+            .iter()
+            .map(|p| {
+                let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                let ws_name = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                (ws_name, abs)
+            })
+            .collect()
+    } else {
+        let registry = WorkspaceRegistry::load()?;
+        let workspaces = if let Some(ref ws_name) = name {
+            let entry = registry
+                .workspaces
+                .iter()
+                .find(|w| w.name == *ws_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workspace \"{}\" not found. Run `root workspace list`.",
+                        ws_name
+                    )
+                })?;
+            vec![(entry.name.clone(), entry.path.clone())]
+        } else {
+            registry
+                .workspaces
+                .iter()
+                .map(|w| (w.name.clone(), w.path.clone()))
+                .collect()
+        };
+        if workspaces.is_empty() {
+            anyhow::bail!("No workspaces registered. Run `root setup` or `root workspace add <path>`.");
+        }
+        workspaces
+    };
+
+    let mut engine = QueryEngine::new();
+    for (ws_name, abs_path) in &resolved_paths {
+        if let Some(ref branch_name) = branch {
+            let data_dir = resolve_data_dir(abs_path, Some(branch_name));
+            if !data_dir.exists() {
+                anyhow::bail!(
+                    "branch '{}' not found for workspace '{}' — expected data dir at {}. \
+                     Run `root branch {}` first.",
+                    branch_name,
+                    ws_name,
+                    data_dir.display(),
+                    branch_name,
+                );
+            }
+            engine
+                .mount_with_data_dir(ws_name.clone(), abs_path.clone(), data_dir.clone())
+                .await?;
+        } else {
+            engine.mount(ws_name.clone(), abs_path.clone()).await?;
+        }
+    }
+
+    if mcp_stdio {
+        let default_ws = resolved_paths.first().map(|(ws_name, _)| ws_name.clone());
+        let engine = Arc::new(RwLock::new(engine));
+        thinkingroot_serve::mcp::stdio::run(engine, default_ws).await;
+        return Ok(());
+    }
+
+    let workspace_root = if resolved_paths.len() == 1 {
+        Some(resolved_paths[0].1.clone())
+    } else {
+        None
+    };
+    let state = AppState::new_with_root(engine, api_key, workspace_root);
+    let router = build_router_opts(state, !no_rest, !no_mcp);
+
+    tracing::info!("server listening on {:?}", listener.local_addr());
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())

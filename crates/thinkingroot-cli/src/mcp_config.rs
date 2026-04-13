@@ -15,6 +15,10 @@ pub enum ConfigFormat {
     ContextServers,
     /// Individual file, same JSON as McpServers
     ContinueDev,
+    /// Claude Code CLI: `~/.claude.json` with per-project `mcpServers` nesting
+    ClaudeCode,
+    /// OpenAI Codex CLI: `~/.codex/config.toml` (TOML format)
+    CodexToml,
 }
 
 /// A detected AI tool with its resolved config file path.
@@ -121,6 +125,24 @@ fn tool_defs() -> Vec<(&'static str, Box<dyn Fn() -> Option<PathBuf>>, ConfigFor
             }),
             ConfigFormat::ContinueDev,
         ),
+        (
+            "Antigravity",
+            Box::new(|| {
+                dirs::home_dir()
+                    .map(|d| d.join(".gemini").join("antigravity").join("mcp_config.json"))
+            }),
+            ConfigFormat::McpServers,
+        ),
+        (
+            "Claude Code",
+            Box::new(|| dirs::home_dir().map(|d| d.join(".claude.json"))),
+            ConfigFormat::ClaudeCode,
+        ),
+        (
+            "Codex",
+            Box::new(|| dirs::home_dir().map(|d| d.join(".codex").join("config.toml"))),
+            ConfigFormat::CodexToml,
+        ),
     ]
 }
 
@@ -131,6 +153,8 @@ pub fn apply_entry(existing: &mut Value, format: ConfigFormat, port: u16) {
         ConfigFormat::McpServers | ConfigFormat::ContinueDev => "mcpServers",
         ConfigFormat::Servers => "servers",
         ConfigFormat::ContextServers => "context_servers",
+        // These formats use dedicated write functions — not apply_entry.
+        ConfigFormat::ClaudeCode | ConfigFormat::CodexToml => return,
     };
 
     let entry = match format {
@@ -154,6 +178,7 @@ pub fn remove_entry(existing: &mut Value, format: ConfigFormat) {
         ConfigFormat::McpServers | ConfigFormat::ContinueDev => "mcpServers",
         ConfigFormat::Servers => "servers",
         ConfigFormat::ContextServers => "context_servers",
+        ConfigFormat::ClaudeCode | ConfigFormat::CodexToml => return,
     };
     if let Some(obj) = existing[servers_key].as_object_mut() {
         obj.remove("thinkingroot");
@@ -163,6 +188,12 @@ pub fn remove_entry(existing: &mut Value, format: ConfigFormat) {
 // ── File I/O ─────────────────────────────────────────────────────
 
 pub fn write_tool_config(tool: &DetectedTool, port: u16, dry_run: bool) -> anyhow::Result<WriteResult> {
+    match tool.format {
+        ConfigFormat::ClaudeCode => return write_claude_code_config(tool, port, dry_run),
+        ConfigFormat::CodexToml => return write_codex_config(tool, port, dry_run),
+        _ => {}
+    }
+
     let path = &tool.config_path;
 
     let mut existing: Value = if path.exists() {
@@ -195,6 +226,12 @@ pub fn write_tool_config(tool: &DetectedTool, port: u16, dry_run: bool) -> anyho
 }
 
 pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<WriteResult> {
+    match tool.format {
+        ConfigFormat::ClaudeCode => return remove_claude_code_config(tool, dry_run),
+        ConfigFormat::CodexToml => return remove_codex_config(tool, dry_run),
+        _ => {}
+    }
+
     let path = &tool.config_path;
     if !path.exists() {
         return Ok(WriteResult {
@@ -224,6 +261,239 @@ pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<
     Ok(WriteResult { tool: tool.name, path: path.clone(), action: WriteAction::Removed })
 }
 
+// ── Claude Code: per-project config in ~/.claude.json ────────────
+
+pub fn apply_claude_code_entry(existing: &mut Value, port: u16, project_dir: &str) {
+    if !existing["projects"].is_object() {
+        existing["projects"] = json!({});
+    }
+    if !existing["projects"][project_dir].is_object() {
+        existing["projects"][project_dir] = json!({});
+    }
+    if !existing["projects"][project_dir]["mcpServers"].is_object() {
+        existing["projects"][project_dir]["mcpServers"] = json!({});
+    }
+    existing["projects"][project_dir]["mcpServers"]["thinkingroot"] = json!({
+        "type": "sse",
+        "url": format!("http://localhost:{}/mcp/sse", port)
+    });
+}
+
+pub fn remove_claude_code_entry(existing: &mut Value, project_dir: &str) {
+    if let Some(proj) = existing
+        .get_mut("projects")
+        .and_then(|p| p.get_mut(project_dir))
+        .and_then(|p| p.get_mut("mcpServers"))
+        .and_then(|s| s.as_object_mut())
+    {
+        proj.remove("thinkingroot");
+    }
+}
+
+fn write_claude_code_config(
+    tool: &DetectedTool,
+    port: u16,
+    dry_run: bool,
+) -> anyhow::Result<WriteResult> {
+    let path = &tool.config_path;
+
+    let mut existing: Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str(&raw).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+
+    let cwd = std::env::current_dir()
+        .context("failed to resolve current directory")?
+        .display()
+        .to_string();
+
+    apply_claude_code_entry(&mut existing, port, &cwd);
+    let json_out = serde_json::to_string_pretty(&existing)?;
+
+    if dry_run {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::DryRun(json_out),
+        });
+    }
+
+    std::fs::write(path, &json_out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Written,
+    })
+}
+
+fn remove_claude_code_config(
+    tool: &DetectedTool,
+    dry_run: bool,
+) -> anyhow::Result<WriteResult> {
+    let path = &tool.config_path;
+    if !path.exists() {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::Skipped("config file not found"),
+        });
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut existing: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+
+    let cwd = std::env::current_dir()
+        .context("failed to resolve current directory")?
+        .display()
+        .to_string();
+
+    remove_claude_code_entry(&mut existing, &cwd);
+    let json_out = serde_json::to_string_pretty(&existing)?;
+
+    if dry_run {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::DryRun(json_out),
+        });
+    }
+
+    std::fs::write(path, &json_out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Removed,
+    })
+}
+
+// ── Codex CLI: TOML config at ~/.codex/config.toml ──────────────
+
+fn write_codex_config(
+    tool: &DetectedTool,
+    port: u16,
+    dry_run: bool,
+) -> anyhow::Result<WriteResult> {
+    let path = &tool.config_path;
+
+    let mut doc: toml::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        raw.parse::<toml::Value>()
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    apply_codex_entry(&mut doc, port);
+    let toml_out = toml::to_string_pretty(&doc)
+        .with_context(|| "failed to serialize TOML")?;
+
+    if dry_run {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::DryRun(toml_out),
+        });
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(path, &toml_out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Written,
+    })
+}
+
+pub fn apply_codex_entry(doc: &mut toml::Value, port: u16) {
+    let root = doc
+        .as_table_mut()
+        .expect("TOML root must be a table");
+
+    if !root.contains_key("mcp_servers") {
+        root.insert(
+            "mcp_servers".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+
+    let mcp_servers = root
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_table_mut())
+        .expect("mcp_servers must be a table");
+
+    let mut entry = toml::map::Map::new();
+    entry.insert(
+        "url".to_string(),
+        toml::Value::String(format!("http://localhost:{}/mcp/sse", port)),
+    );
+    mcp_servers.insert("thinkingroot".to_string(), toml::Value::Table(entry));
+}
+
+pub fn remove_codex_entry(doc: &mut toml::Value) {
+    if let Some(mcp) = doc
+        .as_table_mut()
+        .and_then(|root| root.get_mut("mcp_servers"))
+        .and_then(|v| v.as_table_mut())
+    {
+        mcp.remove("thinkingroot");
+    }
+}
+
+fn remove_codex_config(
+    tool: &DetectedTool,
+    dry_run: bool,
+) -> anyhow::Result<WriteResult> {
+    let path = &tool.config_path;
+    if !path.exists() {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::Skipped("config file not found"),
+        });
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut doc: toml::Value = raw
+        .parse()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+
+    remove_codex_entry(&mut doc);
+    let toml_out = toml::to_string_pretty(&doc)
+        .with_context(|| "failed to serialize TOML")?;
+
+    if dry_run {
+        return Ok(WriteResult {
+            tool: tool.name,
+            path: path.clone(),
+            action: WriteAction::DryRun(toml_out),
+        });
+    }
+
+    std::fs::write(path, &toml_out)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Removed,
+    })
+}
+
 // ── run_connect entry point ───────────────────────────────────────
 
 pub fn run_connect(
@@ -239,7 +509,7 @@ pub fn run_connect(
     let all_tools = detect_tools();
     if all_tools.is_empty() {
         println!("  No supported AI tools detected.");
-        println!("  Supported: Claude Desktop, Cursor, VS Code, Windsurf, Zed, Cline, Continue.dev");
+        println!("  Supported: Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Zed, Cline, Continue.dev, Antigravity, Codex");
         return Ok(());
     }
 
@@ -372,5 +642,83 @@ mod tests {
         let mut existing = json!({});
         apply_entry(&mut existing, ConfigFormat::McpServers, 3000);
         assert!(existing["mcpServers"]["thinkingroot"].is_object());
+    }
+
+    #[test]
+    fn claude_code_inserts_project_scoped_entry() {
+        let mut existing = json!({
+            "numStartups": 10,
+            "projects": {
+                "/other/project": { "mcpServers": { "github": {} } }
+            }
+        });
+        apply_claude_code_entry(&mut existing, 3000, "/my/workspace");
+        assert_eq!(
+            existing["projects"]["/my/workspace"]["mcpServers"]["thinkingroot"]["url"],
+            "http://localhost:3000/mcp/sse"
+        );
+        assert_eq!(
+            existing["projects"]["/my/workspace"]["mcpServers"]["thinkingroot"]["type"],
+            "sse"
+        );
+        // Other project and top-level keys preserved.
+        assert!(existing["projects"]["/other/project"]["mcpServers"]["github"].is_object());
+        assert_eq!(existing["numStartups"], 10);
+    }
+
+    #[test]
+    fn claude_code_remove_leaves_other_servers() {
+        let mut existing = json!({
+            "projects": {
+                "/my/ws": {
+                    "mcpServers": {
+                        "github": {},
+                        "thinkingroot": { "type": "sse", "url": "http://localhost:3000/mcp/sse" }
+                    }
+                }
+            }
+        });
+        remove_claude_code_entry(&mut existing, "/my/ws");
+        assert!(existing["projects"]["/my/ws"]["mcpServers"]["github"].is_object());
+        assert!(existing["projects"]["/my/ws"]["mcpServers"]["thinkingroot"].is_null());
+    }
+
+    #[test]
+    fn codex_toml_inserts_mcp_server_entry() {
+        let input = r#"
+model = "gpt-4o"
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+"#;
+        let mut doc: toml::Value = input.parse().unwrap();
+        apply_codex_entry(&mut doc, 3000);
+        let root = doc.as_table().unwrap();
+        let mcp = root["mcp_servers"].as_table().unwrap();
+        assert_eq!(
+            mcp["thinkingroot"]["url"].as_str().unwrap(),
+            "http://localhost:3000/mcp/sse"
+        );
+        // Existing server preserved.
+        assert!(mcp["playwright"].is_table());
+        // Top-level key preserved.
+        assert_eq!(root["model"].as_str().unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn codex_toml_remove_leaves_other_servers() {
+        let input = r#"
+[mcp_servers.playwright]
+command = "npx"
+
+[mcp_servers.thinkingroot]
+url = "http://localhost:3000/mcp/sse"
+"#;
+        let mut doc: toml::Value = input.parse().unwrap();
+        remove_codex_entry(&mut doc);
+        let mcp = doc["mcp_servers"].as_table().unwrap();
+        assert!(mcp.contains_key("playwright"));
+        assert!(!mcp.contains_key("thinkingroot"));
     }
 }
