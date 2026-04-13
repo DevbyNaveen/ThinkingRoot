@@ -27,35 +27,33 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
         "py" | "pyi" => code::parse(path, "python"),
         "js" | "jsx" | "mjs" | "cjs" => code::parse(path, "javascript"),
         "ts" | "tsx" => code::parse(path, "typescript"),
-        "go"                                    => code::parse(path, "go"),
-        "java"                                  => code::parse(path, "java"),
-        "c" | "h"                               => code::parse(path, "c"),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx"   => code::parse(path, "cpp"),
-        "cs"                                    => code::parse(path, "csharp"),
-        "rb"                                    => code::parse(path, "ruby"),
-        "kt" | "kts"                            => code::parse(path, "kotlin"),
-        "swift"                                 => code::parse(path, "swift"),
-        "php"                                   => code::parse(path, "php"),
-        "sh" | "bash"                           => code::parse(path, "bash"),
-        "lua"                                   => code::parse(path, "lua"),
-        "scala"                                 => code::parse(path, "scala"),
-        "ex" | "exs"                            => code::parse(path, "elixir"),
-        "hs"                                    => code::parse(path, "haskell"),
-        "r"                                     => code::parse(path, "r"),
+        "go" => code::parse(path, "go"),
+        "java" => code::parse(path, "java"),
+        "c" | "h" => code::parse(path, "c"),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => code::parse(path, "cpp"),
+        "cs" => code::parse(path, "csharp"),
+        "rb" => code::parse(path, "ruby"),
+        "kt" | "kts" => code::parse(path, "kotlin"),
+        "swift" => code::parse(path, "swift"),
+        "php" => code::parse(path, "php"),
+        "sh" | "bash" => code::parse(path, "bash"),
+        "lua" => code::parse(path, "lua"),
+        "scala" => code::parse(path, "scala"),
+        "ex" | "exs" => code::parse(path, "elixir"),
+        "hs" => code::parse(path, "haskell"),
+        "r" => code::parse(path, "r"),
         "pdf" => pdf::parse(path),
         // Manifest files get structured dependency parsing.
-        "toml" if path.file_name().is_some_and(|n| n == "Cargo.toml" || n == "pyproject.toml") => {
+        "toml"
+            if path
+                .file_name()
+                .is_some_and(|n| n == "Cargo.toml" || n == "pyproject.toml") =>
+        {
             manifest::parse(path)
         }
-        "json" if path.file_name().is_some_and(|n| n == "package.json") => {
-            manifest::parse(path)
-        }
-        "mod" if path.file_name().is_some_and(|n| n == "go.mod") => {
-            manifest::parse(path)
-        }
-        "txt" if path.file_name().is_some_and(|n| n == "requirements.txt") => {
-            manifest::parse(path)
-        }
+        "json" if path.file_name().is_some_and(|n| n == "package.json") => manifest::parse(path),
+        "mod" if path.file_name().is_some_and(|n| n == "go.mod") => manifest::parse(path),
+        "txt" if path.file_name().is_some_and(|n| n == "requirements.txt") => manifest::parse(path),
         // Treat unknown text files as plain markdown for basic extraction.
         "txt" | "toml" | "yaml" | "yml" | "json" | "cfg" | "ini" | "env" => {
             markdown::parse_as_text(path)

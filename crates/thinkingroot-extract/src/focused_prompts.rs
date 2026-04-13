@@ -169,8 +169,14 @@ mod tests {
             entity_type: "system".to_string(),
         }]);
         let (_sys, user) = build_entity_extraction_prompt("some content", "Source: test.rs", &ctx);
-        assert!(user.contains("KNOWN_ENTITIES"), "user prompt should contain KNOWN_ENTITIES tag");
-        assert!(user.contains("GraphStore"), "user prompt should contain known entity name");
+        assert!(
+            user.contains("KNOWN_ENTITIES"),
+            "user prompt should contain KNOWN_ENTITIES tag"
+        );
+        assert!(
+            user.contains("GraphStore"),
+            "user prompt should contain known entity name"
+        );
     }
 
     #[test]
@@ -178,26 +184,42 @@ mod tests {
         let names = vec!["GraphStore".to_string(), "Claim".to_string()];
         let (_sys, user) =
             build_relation_extraction_prompt("some content", "Source: test.rs", &names);
-        assert!(user.contains("GraphStore"), "user prompt should contain entity name GraphStore");
-        assert!(user.contains("Claim"), "user prompt should contain entity name Claim");
-        assert!(user.contains("<ENTITIES>"), "user prompt should contain ENTITIES section");
+        assert!(
+            user.contains("GraphStore"),
+            "user prompt should contain entity name GraphStore"
+        );
+        assert!(
+            user.contains("Claim"),
+            "user prompt should contain entity name Claim"
+        );
+        assert!(
+            user.contains("<ENTITIES>"),
+            "user prompt should contain ENTITIES section"
+        );
     }
 
     #[test]
     fn claim_prompt_includes_entity_list() {
         let names = vec!["AuthService".to_string(), "UserDB".to_string()];
-        let (_sys, user) =
-            build_claim_extraction_prompt("some content", "Source: auth.rs", &names);
-        assert!(user.contains("AuthService"), "user prompt should contain entity AuthService");
-        assert!(user.contains("UserDB"), "user prompt should contain entity UserDB");
-        assert!(user.contains("<ENTITIES>"), "user prompt should contain ENTITIES section");
+        let (_sys, user) = build_claim_extraction_prompt("some content", "Source: auth.rs", &names);
+        assert!(
+            user.contains("AuthService"),
+            "user prompt should contain entity AuthService"
+        );
+        assert!(
+            user.contains("UserDB"),
+            "user prompt should contain entity UserDB"
+        );
+        assert!(
+            user.contains("<ENTITIES>"),
+            "user prompt should contain ENTITIES section"
+        );
     }
 
     #[test]
     fn empty_graph_context_omits_known_entities_section() {
         let ctx = GraphPrimedContext::new(vec![]);
-        let (_sys, user) =
-            build_entity_extraction_prompt("some content", "Source: test.rs", &ctx);
+        let (_sys, user) = build_entity_extraction_prompt("some content", "Source: test.rs", &ctx);
         assert!(
             !user.contains("KNOWN_ENTITIES"),
             "user prompt should NOT contain KNOWN_ENTITIES when context is empty"

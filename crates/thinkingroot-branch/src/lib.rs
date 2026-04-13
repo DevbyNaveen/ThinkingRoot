@@ -13,6 +13,7 @@ use thinkingroot_core::{BranchRef, Result};
 /// - Copies `{parent_data_dir}/graph/graph.db` to the new branch dir
 /// - Symlinks `models/` and `cache/` from parent (avoids duplicating ~300MB)
 /// - Registers the branch in `.thinkingroot-refs/branches.toml`
+/// - Branch data dir lives at `.thinkingroot/branches/{slug}/`
 pub async fn create_branch(
     root_path: &Path,
     name: &str,
@@ -60,7 +61,7 @@ pub fn delete_branch(root_path: &Path, name: &str) -> Result<()> {
     registry.abandon_branch(name)
 }
 
-/// Hard-delete a branch: mark as Abandoned AND remove its `.thinkingroot-{slug}/` directory.
+/// Hard-delete a branch: mark as Abandoned AND remove its `.thinkingroot/branches/{slug}/` directory.
 ///
 /// Use `delete_branch` for soft delete (keeps data dir). Use this when you want
 /// to reclaim disk space and are sure you no longer need the branch data.
@@ -103,4 +104,15 @@ pub fn gc_branches(root_path: &Path) -> Result<usize> {
 /// Roll back a previously executed merge by restoring the pre-merge graph snapshot.
 pub fn rollback_merge(root_path: &Path, branch_name: &str) -> Result<()> {
     merge::rollback_merge(root_path, branch_name)
+}
+
+/// Migrate legacy branch directories from the old sibling layout to the new nested layout.
+///
+/// Old: `{root}/.thinkingroot-{slug}/`
+/// New: `{root}/.thinkingroot/branches/{slug}/`
+///
+/// Safe to call on every startup — idempotent, skips already-migrated branches.
+/// Returns the number of directories migrated.
+pub fn migrate_legacy_layout(root_path: &Path) -> Result<usize> {
+    snapshot::migrate_legacy_layout(root_path)
 }

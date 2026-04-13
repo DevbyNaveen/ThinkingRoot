@@ -23,8 +23,8 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use fs2::FileExt;
-use thinkingroot_core::error::Error;
 use thinkingroot_core::Result;
+use thinkingroot_core::error::Error;
 
 /// RAII guard for the merge advisory lock.
 ///
@@ -66,6 +66,8 @@ impl Drop for MergeLock {
     fn drop(&mut self) {
         // `fs2::FileExt::unlock` is best-effort; if it fails the OS will
         // release the lock when the file handle is closed anyway.
+        // allow: clippy confuses fs2::FileExt::unlock with std::fs::File::unlock (stable 1.89)
+        #[allow(clippy::incompatible_msrv)]
         let _ = self._file.unlock();
     }
 }

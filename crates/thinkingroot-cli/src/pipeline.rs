@@ -1,1 +1,1 @@
-pub use thinkingroot_serve::pipeline::{run_pipeline, ProgressEvent, PipelineResult};
+pub use thinkingroot_serve::pipeline::{PipelineResult, ProgressEvent, run_pipeline};

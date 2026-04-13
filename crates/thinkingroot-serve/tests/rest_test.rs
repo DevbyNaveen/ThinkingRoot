@@ -128,7 +128,10 @@ async fn branch_list_endpoint_returns_ok() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["ok"], true);
-    assert!(json["data"]["branches"].is_array(), "branches should be an array");
+    assert!(
+        json["data"]["branches"].is_array(),
+        "branches should be an array"
+    );
 }
 
 #[tokio::test]

@@ -114,7 +114,9 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
 fn parse_changed_files(diff_stat: &str) -> Vec<String> {
     let mut result = Vec::new();
     for line in diff_stat.lines() {
-        let Some(pipe_pos) = line.find(" |") else { continue };
+        let Some(pipe_pos) = line.find(" |") else {
+            continue;
+        };
         let path = line[..pipe_pos].trim();
         if path.is_empty() {
             continue;
@@ -193,7 +195,8 @@ mod tests {
 
     #[test]
     fn parse_changed_files_handles_rename() {
-        let stat = " src/{old.rs => new.rs} | 3 ++-\n 1 file changed, 3 insertions(+), 0 deletions(-)\n";
+        let stat =
+            " src/{old.rs => new.rs} | 3 ++-\n 1 file changed, 3 insertions(+), 0 deletions(-)\n";
         let files = parse_changed_files(stat);
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"src/old.rs".to_string()));
@@ -213,7 +216,8 @@ mod tests {
     #[test]
     fn parse_changed_files_handles_cross_dir_rename() {
         // Cross-directory rename — no braces
-        let stat = " src/beta.rs => dst/gamma.rs | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n";
+        let stat =
+            " src/beta.rs => dst/gamma.rs | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n";
         let files = parse_changed_files(stat);
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"src/beta.rs".to_string()));

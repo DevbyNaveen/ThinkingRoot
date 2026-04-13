@@ -24,9 +24,9 @@ ehthumbs.db
 .Trashes
 
 # ThinkingRoot local data
+# Branches now live inside .thinkingroot/branches/ — covered by the line above.
 .thinkingroot/
-.thinkingroot-baseline*
-.thinkingroot-refs*
+.thinkingroot-refs/
 test-repo*
 tmp-*
 *.db-shm

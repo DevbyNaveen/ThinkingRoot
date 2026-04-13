@@ -1,12 +1,12 @@
 // crates/thinkingroot-branch/src/branch.rs
-use std::path::{Path, PathBuf};
-use std::fs;
+use crate::snapshot::slugify;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use thinkingroot_core::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
 use thinkingroot_core::Result;
+use thinkingroot_core::error::Error;
 use thinkingroot_core::{BranchRef, BranchStatus, MergedBy};
-use crate::snapshot::slugify;
 
 const REGISTRY_FILE: &str = "branches.toml";
 const HEAD_FILE: &str = "HEAD";
@@ -33,14 +33,17 @@ impl BranchRegistry {
         } else {
             RegistryFile::default()
         };
-        Ok(Self { refs_dir: refs_dir.to_path_buf(), data })
+        Ok(Self {
+            refs_dir: refs_dir.to_path_buf(),
+            data,
+        })
     }
 
     /// Save registry to disk.
     pub fn save(&self) -> Result<()> {
         let path = self.refs_dir.join(REGISTRY_FILE);
-        let content = toml::to_string_pretty(&self.data)
-            .map_err(|e| Error::Serialization(e.to_string()))?;
+        let content =
+            toml::to_string_pretty(&self.data).map_err(|e| Error::Serialization(e.to_string()))?;
         fs::write(path, content)?;
         Ok(())
     }
@@ -52,9 +55,12 @@ impl BranchRegistry {
         parent: &str,
         description: Option<String>,
     ) -> Result<BranchRef> {
-        if self.data.branches.iter().any(|b| {
-            b.name == name && matches!(b.status, BranchStatus::Active)
-        }) {
+        if self
+            .data
+            .branches
+            .iter()
+            .any(|b| b.name == name && matches!(b.status, BranchStatus::Active))
+        {
             return Err(Error::BranchAlreadyExists(name.to_string()));
         }
         let branch = BranchRef {
@@ -72,7 +78,10 @@ impl BranchRegistry {
 
     /// Mark a branch as merged.
     pub fn mark_merged(&mut self, name: &str, merged_by: MergedBy) -> Result<()> {
-        let branch = self.data.branches.iter_mut()
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
             .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
         branch.status = BranchStatus::Merged {
@@ -84,29 +93,40 @@ impl BranchRegistry {
 
     /// Mark a branch as abandoned (soft delete — data dir kept).
     pub fn abandon_branch(&mut self, name: &str) -> Result<()> {
-        let branch = self.data.branches.iter_mut()
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
             .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
-        branch.status = BranchStatus::Abandoned { abandoned_at: Utc::now() };
+        branch.status = BranchStatus::Abandoned {
+            abandoned_at: Utc::now(),
+        };
         self.save()
     }
 
     /// Get all active branches.
     pub fn list_active(&self) -> Vec<&BranchRef> {
-        self.data.branches.iter()
+        self.data
+            .branches
+            .iter()
             .filter(|b| matches!(b.status, BranchStatus::Active))
             .collect()
     }
 
     /// Get a branch by name (active only).
     pub fn get(&self, name: &str) -> Option<&BranchRef> {
-        self.data.branches.iter()
+        self.data
+            .branches
+            .iter()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
     }
 
     /// Get all abandoned branches.
     pub fn list_abandoned(&self) -> Vec<&BranchRef> {
-        self.data.branches.iter()
+        self.data
+            .branches
+            .iter()
             .filter(|b| matches!(b.status, BranchStatus::Abandoned { .. }))
             .collect()
     }

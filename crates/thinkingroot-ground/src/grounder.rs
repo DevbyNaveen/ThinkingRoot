@@ -63,10 +63,10 @@ impl Grounder {
     pub fn ground(
         &self,
         mut extraction: ExtractionOutput,
-        #[cfg(feature = "vector")]
-        mut vector_store: Option<&mut thinkingroot_graph::vector::VectorStore>,
-        #[cfg(feature = "vector")]
-        mut nli_judge: Option<&mut NliJudge>,
+        #[cfg(feature = "vector")] mut vector_store: Option<
+            &mut thinkingroot_graph::vector::VectorStore,
+        >,
+        #[cfg(feature = "vector")] mut nli_judge: Option<&mut NliJudge>,
     ) -> ExtractionOutput {
         let source_texts = &extraction.source_texts;
         let source_quotes = &extraction.claim_source_quotes;
@@ -91,9 +91,11 @@ impl Grounder {
             // Judge 3: Semantic similarity (if vector feature enabled).
             #[cfg(feature = "vector")]
             let semantic = match vector_store {
-                Some(ref mut vs) => Some(
-                    crate::semantic::SemanticJudge::score(&claim.statement, source_text, vs),
-                ),
+                Some(ref mut vs) => Some(crate::semantic::SemanticJudge::score(
+                    &claim.statement,
+                    source_text,
+                    vs,
+                )),
                 None => None,
             };
             #[cfg(not(feature = "vector"))]
@@ -101,7 +103,9 @@ impl Grounder {
 
             // Judge 4: NLI entailment (if vector feature enabled and model loaded).
             #[cfg(feature = "vector")]
-            let nli = nli_judge.as_mut().map(|judge| judge.score(&claim.statement, source_text));
+            let nli = nli_judge
+                .as_mut()
+                .map(|judge| judge.score(&claim.statement, source_text));
             #[cfg(not(feature = "vector"))]
             let nli: Option<f64> = None;
 
@@ -143,12 +147,9 @@ impl Grounder {
             .count();
 
         // Remove rejected claims.
-        extraction.claims.retain(|c| {
-            verdicts
-                .get(&c.id)
-                .map(|v| !v.rejected)
-                .unwrap_or(true)
-        });
+        extraction
+            .claims
+            .retain(|c| verdicts.get(&c.id).map(|v| !v.rejected).unwrap_or(true));
 
         // Annotate surviving claims with grounding scores.
         for claim in &mut extraction.claims {
@@ -230,11 +231,7 @@ fn combine_scores(
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    if s.len() <= max { s } else { &s[..max] }
 }
 
 #[cfg(test)]
@@ -294,7 +291,7 @@ mod tests {
 
     // ── Integration tests ────────────────────────────────────────────
 
-    use thinkingroot_core::types::{Claim, ClaimType, WorkspaceId, SourceId};
+    use thinkingroot_core::types::{Claim, ClaimType, SourceId, WorkspaceId};
 
     fn make_extraction(
         claims: Vec<(&str, SourceId)>,
@@ -320,7 +317,10 @@ mod tests {
         let src = SourceId::new();
         let extraction = make_extraction(
             vec![("PostgreSQL stores user data in tables", src)],
-            vec![(src, "PostgreSQL stores user data in tables and handles transactions")],
+            vec![(
+                src,
+                "PostgreSQL stores user data in tables and handles transactions",
+            )],
             vec![],
         );
         let grounder = Grounder::new(GroundingConfig::default());
@@ -336,7 +336,10 @@ mod tests {
         let claim = &result.claims[0];
         assert!(claim.grounding_score.is_some());
         let score = claim.grounding_score.unwrap();
-        assert!(score > 0.5, "well-grounded claim should score > 0.5, got {score}");
+        assert!(
+            score > 0.5,
+            "well-grounded claim should score > 0.5, got {score}"
+        );
     }
 
     #[test]
@@ -344,7 +347,10 @@ mod tests {
         let src = SourceId::new();
         let extraction = make_extraction(
             vec![("Redis caches session tokens in memory", src)],
-            vec![(src, "PostgreSQL stores user data in tables and handles transactions")],
+            vec![(
+                src,
+                "PostgreSQL stores user data in tables and handles transactions",
+            )],
             vec![],
         );
         let grounder = Grounder::new(GroundingConfig::default());
@@ -357,7 +363,11 @@ mod tests {
         );
 
         // With zero word overlap, lexical score ≈ 0.0, which is below reject threshold (0.25)
-        assert_eq!(result.claims.len(), 0, "hallucinated claim should be rejected");
+        assert_eq!(
+            result.claims.len(),
+            0,
+            "hallucinated claim should be rejected"
+        );
     }
 
     #[test]
@@ -370,10 +380,9 @@ mod tests {
         );
         // Add source quote for the claim
         let claim_id = extraction.claims[0].id;
-        extraction.claim_source_quotes.insert(
-            claim_id,
-            "PostgreSQL stores user data".to_string(),
-        );
+        extraction
+            .claim_source_quotes
+            .insert(claim_id, "PostgreSQL stores user data".to_string());
 
         let grounder = Grounder::new(GroundingConfig::default());
         let result = grounder.ground(
@@ -387,7 +396,10 @@ mod tests {
         assert_eq!(result.claims.len(), 1);
         let score = result.claims[0].grounding_score.unwrap();
         // With both lexical + exact span match, should be very high
-        assert!(score > 0.8, "claim with exact quote match should score high, got {score}");
+        assert!(
+            score > 0.8,
+            "claim with exact quote match should score high, got {score}"
+        );
     }
 
     #[test]
@@ -396,7 +408,10 @@ mod tests {
         // Partial overlap: some words match, some don't
         let extraction = make_extraction(
             vec![("PostgreSQL handles authentication and sessions", src)],
-            vec![(src, "PostgreSQL stores user data and handles transactions for the application")],
+            vec![(
+                src,
+                "PostgreSQL stores user data and handles transactions for the application",
+            )],
             vec![],
         );
         let grounder = Grounder::new(GroundingConfig {

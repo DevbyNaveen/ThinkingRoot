@@ -48,9 +48,7 @@ pub async fn run_update() -> anyhow::Result<()> {
     );
 
     let artifact = current_artifact()?;
-    let url = format!(
-        "https://github.com/{RELEASES_REPO}/releases/download/v{latest}/{artifact}"
-    );
+    let url = format!("https://github.com/{RELEASES_REPO}/releases/download/v{latest}/{artifact}");
 
     println!("  {} Downloading {}...", style("→").cyan(), artifact);
 
@@ -83,10 +81,8 @@ pub async fn run_update() -> anyhow::Result<()> {
     {
         let old_exe = current_exe.with_extension("old");
         // Windows won't let you write to a running .exe, but rename is allowed.
-        std::fs::rename(&current_exe, &old_exe)
-            .context("failed to rename current binary")?;
-        std::fs::rename(&tmp_exe, &current_exe)
-            .context("failed to install new binary")?;
+        std::fs::rename(&current_exe, &old_exe).context("failed to rename current binary")?;
+        std::fs::rename(&tmp_exe, &current_exe).context("failed to install new binary")?;
     }
 
     println!(
@@ -100,10 +96,10 @@ pub async fn run_update() -> anyhow::Result<()> {
 
 fn current_artifact() -> anyhow::Result<String> {
     let name = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64")   => "root-linux-amd64",
-        ("linux", "aarch64")  => "root-linux-arm64",
-        ("macos", "x86_64")   => "root-macos-amd64",
-        ("macos", "aarch64")  => "root-macos-arm64",
+        ("linux", "x86_64") => "root-linux-amd64",
+        ("linux", "aarch64") => "root-linux-arm64",
+        ("macos", "x86_64") => "root-macos-amd64",
+        ("macos", "aarch64") => "root-macos-arm64",
         ("windows", "x86_64") => "root-windows-amd64.exe",
         (os, arch) => anyhow::bail!("unsupported platform: {os}/{arch}"),
     };

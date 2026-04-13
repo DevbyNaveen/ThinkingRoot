@@ -342,10 +342,12 @@ mod tests {
             .find(|c| c.chunk_type == ChunkType::Prose)
             .unwrap();
         assert!(prose.metadata.links.contains(&"./oauth.md".to_string()));
-        assert!(prose
-            .metadata
-            .links
-            .contains(&"https://example.com/docs".to_string()));
+        assert!(
+            prose
+                .metadata
+                .links
+                .contains(&"https://example.com/docs".to_string())
+        );
     }
 
     #[test]
@@ -367,7 +369,9 @@ mod tests {
     fn links_in_list_do_not_leak_to_next_prose() {
         let content = "- Item with [link](https://list-link.com)\n\nProse after list.\n";
         let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
-        let prose = doc.chunks.iter()
+        let prose = doc
+            .chunks
+            .iter()
             .find(|c| c.chunk_type == ChunkType::Prose && c.content.contains("Prose after"))
             .expect("prose chunk must exist");
         assert!(
@@ -381,7 +385,9 @@ mod tests {
     fn links_in_heading_do_not_leak_to_next_prose() {
         let content = "# [Title](https://heading-link.com)\n\nProse after heading.\n";
         let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
-        let prose = doc.chunks.iter()
+        let prose = doc
+            .chunks
+            .iter()
             .find(|c| c.chunk_type == ChunkType::Prose && c.content.contains("Prose after"))
             .expect("prose chunk must exist");
         assert!(

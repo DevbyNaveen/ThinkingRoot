@@ -5,36 +5,46 @@ use console::style;
 use dialoguer::{Input, Password, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use thinkingroot_core::config::{AzureConfig, BedrockConfig, Config, LlmConfig, ProviderConfig, ProvidersConfig};
+use thinkingroot_core::config::{
+    AzureConfig, BedrockConfig, Config, LlmConfig, ProviderConfig, ProvidersConfig,
+};
 use thinkingroot_core::global_config::GlobalConfig;
 
 use crate::setup::{
-    PROVIDERS, ProviderDef, bedrock_credentials_found, select_model_from_list,
-    validate_azure, validate_key_http,
+    PROVIDERS, ProviderDef, bedrock_credentials_found, fetch_provider_models,
+    select_model_from_list, validate_azure, validate_key_http,
 };
 
 // ── root provider list ────────────────────────────────────────────
 
 pub async fn run_provider_list(workspace_path: &Path) -> anyhow::Result<()> {
-    let global = GlobalConfig::load().unwrap_or_default();
+    let global = GlobalConfig::load().unwrap_or_else(|e| {
+        eprintln!("  Warning: could not load global config, using defaults: {e}");
+        GlobalConfig::default()
+    });
 
     // Check for workspace override.
     let ws_config_path = workspace_path.join(".thinkingroot").join("config.toml");
     let local_config = if ws_config_path.exists() {
-        Config::load(workspace_path).ok()
+        Config::load_merged(workspace_path).ok()
     } else {
         None
     };
 
     // Effective = workspace override if present and different from global.
     let global_provider = global.llm.default_provider.as_str();
-    let global_model    = global.llm.extraction_model.as_str();
+    let global_model = global.llm.extraction_model.as_str();
 
     let (effective_provider, effective_model, ws_override) = match &local_config {
-        Some(lc) if lc.llm.default_provider != global_provider
-                 || lc.llm.extraction_model  != global_model =>
+        Some(lc)
+            if lc.llm.default_provider != global_provider
+                || lc.llm.extraction_model != global_model =>
         {
-            (lc.llm.default_provider.as_str(), lc.llm.extraction_model.as_str(), true)
+            (
+                lc.llm.default_provider.as_str(),
+                lc.llm.extraction_model.as_str(),
+                true,
+            )
         }
         _ => (global_provider, global_model, false),
     };
@@ -45,14 +55,18 @@ pub async fn run_provider_list(workspace_path: &Path) -> anyhow::Result<()> {
 
     for p in PROVIDERS {
         let is_active = p.id == effective_provider;
-        let marker = if is_active { style("▶").green().bold().to_string() }
-                     else         { style(" ").dim().to_string() };
-        let id_col  = if is_active { style(p.id).green().bold().to_string() }
-                      else         { style(p.id).white().to_string() };
+        let marker = if is_active {
+            style("▶").green().bold().to_string()
+        } else {
+            style(" ").dim().to_string()
+        };
+        let id_col = if is_active {
+            style(p.id).green().bold().to_string()
+        } else {
+            style(p.id).white().to_string()
+        };
         let model_hint = if is_active {
             format!("  {}", style(effective_model).dim())
-        } else if !p.default_models.is_empty() {
-            format!("  {}", style(p.default_models[0]).dim())
         } else {
             String::new()
         };
@@ -61,7 +75,11 @@ pub async fn run_provider_list(workspace_path: &Path) -> anyhow::Result<()> {
 
     println!();
     if let Some(path) = GlobalConfig::path() {
-        println!("  {}: {}", style("Config").dim(), style(path.display()).dim());
+        println!(
+            "  {}: {}",
+            style("Config").dim(),
+            style(path.display()).dim()
+        );
     }
     if ws_override {
         println!(
@@ -83,20 +101,25 @@ pub async fn run_provider_list(workspace_path: &Path) -> anyhow::Result<()> {
 // ── root provider status ──────────────────────────────────────────
 
 pub async fn run_provider_status(workspace_path: &Path) -> anyhow::Result<()> {
-    let global = GlobalConfig::load().unwrap_or_default();
+    let global = GlobalConfig::load().unwrap_or_else(|e| {
+        eprintln!("  Warning: could not load global config, using defaults: {e}");
+        GlobalConfig::default()
+    });
 
     // Check if there's a local workspace override
     let ws_config_path = workspace_path.join(".thinkingroot").join("config.toml");
     let local_config = if ws_config_path.exists() {
-        Config::load(workspace_path).ok()
+        Config::load_merged(workspace_path).ok()
     } else {
         None
     };
 
     let has_local_llm = local_config
         .as_ref()
-        .map(|c| c.llm.default_provider != global.llm.default_provider
-            || c.llm.extraction_model != global.llm.extraction_model)
+        .map(|c| {
+            c.llm.default_provider != global.llm.default_provider
+                || c.llm.extraction_model != global.llm.extraction_model
+        })
         .unwrap_or(false);
 
     let (effective_provider, effective_model, source) = if has_local_llm {
@@ -144,15 +167,25 @@ pub async fn run_provider_status(workspace_path: &Path) -> anyhow::Result<()> {
             } else {
                 style("✗ not found — run `aws configure`").red().to_string()
             };
-            println!("  {:<16} AWS credentials  {}", style("Credentials:").dim(), status);
+            println!(
+                "  {:<16} AWS credentials  {}",
+                style("Credentials:").dim(),
+                status
+            );
         } else if p.id == "ollama" {
             let reachable = ping_ollama().await;
             let status = if reachable {
                 style("✓ running").green().to_string()
             } else {
-                style("✗ not running — start with `ollama serve`").yellow().to_string()
+                style("✗ not running — start with `ollama serve`")
+                    .yellow()
+                    .to_string()
             };
-            println!("  {:<16} localhost:11434  {}", style("Ollama:").dim(), status);
+            println!(
+                "  {:<16} localhost:11434  {}",
+                style("Ollama:").dim(),
+                status
+            );
         } else if !p.default_env.is_empty() {
             let env_var = p.default_env;
             let is_set = std::env::var(env_var).is_ok();
@@ -165,7 +198,12 @@ pub async fn run_provider_status(workspace_path: &Path) -> anyhow::Result<()> {
                     style(env_var).cyan()
                 )
             };
-            println!("  {:<16} {}  {}", style("Key env:").dim(), style(env_var).cyan(), status);
+            println!(
+                "  {:<16} {}  {}",
+                style("Key env:").dim(),
+                style(env_var).cyan(),
+                status
+            );
         }
     }
 
@@ -208,6 +246,7 @@ async fn ping_ollama() -> bool {
 
 // ── root provider use ─────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_provider_use(
     name: &str,
     model: Option<&str>,
@@ -227,19 +266,30 @@ pub async fn run_provider_use(
     if pdef.is_none() {
         let known: Vec<&str> = PROVIDERS.iter().map(|p| p.id).collect();
         eprintln!();
-        eprintln!("  {} Unknown provider '{}'.", style("✗").red(), style(name).yellow());
+        eprintln!(
+            "  {} Unknown provider '{}'.",
+            style("✗").red(),
+            style(name).yellow()
+        );
         eprintln!();
         eprintln!("  Known providers: {}", known.join(", "));
         eprintln!();
         eprintln!("  For any OpenAI-compatible endpoint, use:");
-        eprintln!("    {}", style("root provider use custom --base-url <url> --model <model>").cyan());
+        eprintln!(
+            "    {}",
+            style("root provider use custom --base-url <url> --model <model>").cyan()
+        );
         eprintln!();
         anyhow::bail!("unknown provider '{name}'");
     }
     let pdef = pdef.unwrap();
 
     println!();
-    println!("  {} {}", style("Switching to:").white(), style(name).green().bold());
+    println!(
+        "  {} {}",
+        style("Switching to:").white(),
+        style(name).green().bold()
+    );
     println!();
 
     // ── 2. Collect credentials & build updated LlmConfig ─────────
@@ -250,16 +300,26 @@ pub async fn run_provider_use(
     //
     // GLOBAL mode: full credential collection as usual.
     let new_llm = if local {
-        let model_str = resolve_model(&theme, model, pdef.default_models)?;
+        let model_str = resolve_model(&theme, model, &[])?;
         base_llm_config(name, &model_str)
         // providers block is intentionally empty — write_to_workspace never writes it
     } else {
         match name {
             "bedrock" => collect_bedrock(&theme, model).await?,
-            "azure"   => collect_azure(&theme, model, key, no_validate,
-                                       azure_resource, azure_deployment, azure_api_version).await?,
-            "ollama"  => collect_ollama(&theme, model, base_url)?,
-            _         => collect_generic(&theme, pdef, model, key, base_url, no_validate).await?,
+            "azure" => {
+                collect_azure(
+                    &theme,
+                    model,
+                    key,
+                    no_validate,
+                    azure_resource,
+                    azure_deployment,
+                    azure_api_version,
+                )
+                .await?
+            }
+            "ollama" => collect_ollama(&theme, model, base_url).await?,
+            _ => collect_generic(&theme, pdef, model, key, base_url, no_validate).await?,
         }
     };
 
@@ -289,17 +349,34 @@ pub async fn run_provider_use(
 
     // ── 4. Summary ────────────────────────────────────────────────
     println!();
-    println!("  {:<14} {}", style("Provider:").dim(), style(name).green().bold());
-    println!("  {:<14} {}", style("Model:").dim(), style(&new_llm.extraction_model).white());
+    println!(
+        "  {:<14} {}",
+        style("Provider:").dim(),
+        style(name).green().bold()
+    );
+    println!(
+        "  {:<14} {}",
+        style("Model:").dim(),
+        style(&new_llm.extraction_model).white()
+    );
 
     // For global switches on env-var providers: remind user to export the key.
     if !local && !pdef.default_env.is_empty() && name != "bedrock" && name != "ollama" {
         let env_var = pdef.default_env;
         if std::env::var(env_var).is_err() {
             println!();
-            println!("  {} Set your API key:", style("Action needed:").yellow().bold());
-            println!("    {}", style(format!("export {env_var}=<your-key>")).cyan());
-            println!("  Add this to your {} to persist it.", style("~/.zshrc or ~/.bashrc").dim());
+            println!(
+                "  {} Set your API key:",
+                style("Action needed:").yellow().bold()
+            );
+            println!(
+                "    {}",
+                style(format!("export {env_var}=<your-key>")).cyan()
+            );
+            println!(
+                "  Add this to your {} to persist it.",
+                style("~/.zshrc or ~/.bashrc").dim()
+            );
         }
     }
 
@@ -312,18 +389,20 @@ pub async fn run_provider_use(
 
 // ── Bedrock collection ────────────────────────────────────────────
 
-async fn collect_bedrock(
-    theme: &ColorfulTheme,
-    model: Option<&str>,
-) -> anyhow::Result<LlmConfig> {
-    let pdef = PROVIDERS.iter().find(|p| p.id == "bedrock").unwrap();
-
+async fn collect_bedrock(theme: &ColorfulTheme, model: Option<&str>) -> anyhow::Result<LlmConfig> {
     if !bedrock_credentials_found() {
-        println!("  {} AWS credentials not found.", style("!").yellow().bold());
+        println!(
+            "  {} AWS credentials not found.",
+            style("!").yellow().bold()
+        );
         println!();
         println!("  Configure them with:");
         println!("    Option A — AWS CLI:  {}", style("aws configure").cyan());
-        println!("    Option B — env vars: {} + {}", style("AWS_ACCESS_KEY_ID").cyan(), style("AWS_SECRET_ACCESS_KEY").cyan());
+        println!(
+            "    Option B — env vars: {} + {}",
+            style("AWS_ACCESS_KEY_ID").cyan(),
+            style("AWS_SECRET_ACCESS_KEY").cyan()
+        );
         println!();
 
         Input::<String>::with_theme(theme)
@@ -333,9 +412,7 @@ async fn collect_bedrock(
             .interact_text()?;
 
         if !bedrock_credentials_found() {
-            anyhow::bail!(
-                "AWS credentials not found. Run `aws configure` then retry."
-            );
+            anyhow::bail!("AWS credentials not found. Run `aws configure` then retry.");
         }
     }
     println!("  {} AWS credentials found.", style("✓").green());
@@ -346,7 +423,26 @@ async fn collect_bedrock(
         .default("us-east-1".to_string())
         .interact_text()?;
 
-    let model_str = resolve_model(theme, model, pdef.default_models)?;
+    let model_str = if let Some(m) = model {
+        m.to_string()
+    } else {
+        println!(
+            "  {} Use cross-region inference IDs for ~4x higher quota.",
+            style("Tip:").dim()
+        );
+        println!(
+            "  {}  claude  →  us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            style("  e.g.").dim()
+        );
+        println!(
+            "  {}  nova    →  us.amazon.nova-micro-v1:0",
+            style("      ").dim()
+        );
+        println!();
+        Input::<String>::with_theme(theme)
+            .with_prompt("Model ID")
+            .interact_text()?
+    };
 
     let mut llm = base_llm_config("bedrock", &model_str);
     llm.providers.bedrock = Some(BedrockConfig {
@@ -411,7 +507,9 @@ async fn collect_azure(
     if !no_validate {
         let pb = spinner("Validating Azure endpoint...");
         match validate_azure(&resource, &deployment, &api_version, &api_key).await {
-            Ok(()) => pb.finish_with_message(format!("{} Azure endpoint valid", style("✓").green())),
+            Ok(()) => {
+                pb.finish_with_message(format!("{} Azure endpoint valid", style("✓").green()))
+            }
             Err(e) => {
                 pb.finish_with_message(format!("{} Validation failed", style("✗").red()));
                 anyhow::bail!("Azure validation failed: {e}");
@@ -420,7 +518,9 @@ async fn collect_azure(
     }
 
     // Set the env var in this process so it's usable immediately.
-    unsafe { std::env::set_var(pdef.default_env, &api_key); }
+    unsafe {
+        std::env::set_var(pdef.default_env, &api_key);
+    }
 
     let model_str = resolve_model(theme, model, &[&deployment])?;
 
@@ -437,7 +537,7 @@ async fn collect_azure(
 
 // ── Ollama collection ─────────────────────────────────────────────
 
-fn collect_ollama(
+async fn collect_ollama(
     theme: &ColorfulTheme,
     model: Option<&str>,
     base_url: Option<&str>,
@@ -445,7 +545,19 @@ fn collect_ollama(
     let pdef = PROVIDERS.iter().find(|p| p.id == "ollama").unwrap();
     let effective_base = base_url.unwrap_or("http://localhost:11434");
 
-    let model_str = resolve_model(theme, model, pdef.default_models)?;
+    let live_models = if model.is_none() {
+        let pb = spinner("Fetching installed Ollama models...");
+        let result = fetch_provider_models(pdef, "").await;
+        pb.finish_and_clear();
+        result
+    } else {
+        None
+    };
+    let effective: Vec<&str> = live_models
+        .as_deref()
+        .map(|v| v.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let model_str = resolve_model(theme, model, &effective)?;
 
     let mut llm = base_llm_config("ollama", &model_str);
     llm.providers.ollama = Some(ProviderConfig {
@@ -472,7 +584,9 @@ async fn collect_generic(
         String::new()
     } else if let Some(k) = key {
         // Key passed via --key flag
-        unsafe { std::env::set_var(pdef.default_env, k); }
+        unsafe {
+            std::env::set_var(pdef.default_env, k);
+        }
         k.to_string()
     } else if let Ok(k) = std::env::var(pdef.default_env) {
         // Already set in environment
@@ -495,7 +609,9 @@ async fn collect_generic(
                 pdef.label.split_whitespace().next().unwrap_or(pdef.id)
             ))
             .interact()?;
-        unsafe { std::env::set_var(pdef.default_env, &k); }
+        unsafe {
+            std::env::set_var(pdef.default_env, &k);
+        }
         k
     };
 
@@ -517,9 +633,7 @@ async fn collect_generic(
 
     // ── Base URL ──────────────────────────────────────────────────
     // --base-url flag overrides catalogue default (useful for custom/litellm/self-hosted)
-    let effective_base = base_url
-        .or(pdef.base_url)
-        .map(str::to_string);
+    let effective_base = base_url.or(pdef.base_url).map(str::to_string);
 
     // For custom provider, base_url is required
     if pdef.id == "custom" && effective_base.is_none() {
@@ -529,7 +643,20 @@ async fn collect_generic(
     }
 
     // ── Model ─────────────────────────────────────────────────────
-    let model_str = resolve_model(theme, model, pdef.default_models)?;
+    // If --model was passed, use it directly. Otherwise fetch the live list.
+    let live_models = if model.is_none() {
+        let pb = spinner("Fetching available models...");
+        let result = fetch_provider_models(pdef, &api_key).await;
+        pb.finish_and_clear();
+        result
+    } else {
+        None
+    };
+    let effective: Vec<&str> = live_models
+        .as_deref()
+        .map(|v| v.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let model_str = resolve_model(theme, model, &effective)?;
 
     // ── Build LlmConfig ───────────────────────────────────────────
     let provider_cfg = ProviderConfig {
@@ -545,15 +672,15 @@ async fn collect_generic(
     let mut llm = base_llm_config(pdef.id, &model_str);
     match pdef.id {
         "openrouter" => llm.providers.openrouter = Some(provider_cfg),
-        "openai"     => llm.providers.openai     = Some(provider_cfg),
-        "anthropic"  => llm.providers.anthropic  = Some(provider_cfg),
-        "groq"       => llm.providers.groq        = Some(provider_cfg),
-        "together"   => llm.providers.together    = Some(provider_cfg),
-        "deepseek"   => llm.providers.deepseek    = Some(provider_cfg),
-        "perplexity" => llm.providers.perplexity  = Some(provider_cfg),
-        "litellm"    => llm.providers.litellm     = Some(provider_cfg),
-        "custom"     => llm.providers.custom      = Some(provider_cfg),
-        _            => {}
+        "openai" => llm.providers.openai = Some(provider_cfg),
+        "anthropic" => llm.providers.anthropic = Some(provider_cfg),
+        "groq" => llm.providers.groq = Some(provider_cfg),
+        "together" => llm.providers.together = Some(provider_cfg),
+        "deepseek" => llm.providers.deepseek = Some(provider_cfg),
+        "perplexity" => llm.providers.perplexity = Some(provider_cfg),
+        "litellm" => llm.providers.litellm = Some(provider_cfg),
+        "custom" => llm.providers.custom = Some(provider_cfg),
+        _ => {}
     }
     Ok(llm)
 }
@@ -564,17 +691,21 @@ async fn collect_generic(
 /// and the new provider's credential slot. All other provider entries are
 /// preserved so switching between providers doesn't require re-configuring them.
 fn write_to_global(new_llm: LlmConfig) -> anyhow::Result<()> {
-    let mut global = GlobalConfig::load().unwrap_or_default();
+    let mut global = GlobalConfig::load()?;
 
-    global.llm.default_provider  = new_llm.default_provider.clone();
-    global.llm.extraction_model  = new_llm.extraction_model;
+    global.llm.default_provider = new_llm.default_provider.clone();
+    global.llm.extraction_model = new_llm.extraction_model;
     global.llm.compilation_model = new_llm.compilation_model;
     // Apply provider-specific timeout; leave max_concurrent_requests untouched
     // so users who have tuned their concurrency don't get it reset on every switch.
     global.llm.request_timeout_secs = new_llm.request_timeout_secs;
 
     // Merge only the new provider's credentials — leave all others intact.
-    merge_provider_slot(&mut global.llm.providers, &new_llm.providers, &new_llm.default_provider);
+    merge_provider_slot(
+        &mut global.llm.providers,
+        &new_llm.providers,
+        &new_llm.default_provider,
+    );
 
     global.save()?;
     Ok(())
@@ -584,10 +715,10 @@ fn write_to_global(new_llm: LlmConfig) -> anyhow::Result<()> {
 /// NEVER writes credentials — those always live in global config.
 /// At runtime, the merged config picks up global credentials automatically.
 fn write_to_workspace(workspace_path: &Path, new_llm: LlmConfig) -> anyhow::Result<()> {
-    let mut config = Config::load(workspace_path).unwrap_or_default();
+    let mut config = Config::load(workspace_path)?;
 
-    config.llm.default_provider  = new_llm.default_provider;
-    config.llm.extraction_model  = new_llm.extraction_model;
+    config.llm.default_provider = new_llm.default_provider;
+    config.llm.extraction_model = new_llm.extraction_model;
     config.llm.compilation_model = new_llm.compilation_model;
     config.llm.request_timeout_secs = new_llm.request_timeout_secs;
     // Intentionally NO merge_provider_slot — credentials stay in global only.
@@ -604,18 +735,66 @@ fn merge_provider_slot(
     provider_id: &str,
 ) {
     match provider_id {
-        "bedrock"    => { if incoming.bedrock.is_some()    { existing.bedrock    = incoming.bedrock.clone(); } }
-        "azure"      => { if incoming.azure.is_some()      { existing.azure      = incoming.azure.clone(); } }
-        "openai"     => { if incoming.openai.is_some()     { existing.openai     = incoming.openai.clone(); } }
-        "anthropic"  => { if incoming.anthropic.is_some()  { existing.anthropic  = incoming.anthropic.clone(); } }
-        "ollama"     => { if incoming.ollama.is_some()     { existing.ollama     = incoming.ollama.clone(); } }
-        "groq"       => { if incoming.groq.is_some()       { existing.groq       = incoming.groq.clone(); } }
-        "together"   => { if incoming.together.is_some()   { existing.together   = incoming.together.clone(); } }
-        "deepseek"   => { if incoming.deepseek.is_some()   { existing.deepseek   = incoming.deepseek.clone(); } }
-        "openrouter" => { if incoming.openrouter.is_some() { existing.openrouter = incoming.openrouter.clone(); } }
-        "perplexity" => { if incoming.perplexity.is_some() { existing.perplexity = incoming.perplexity.clone(); } }
-        "litellm"    => { if incoming.litellm.is_some()    { existing.litellm   = incoming.litellm.clone(); } }
-        "custom"     => { if incoming.custom.is_some()     { existing.custom     = incoming.custom.clone(); } }
+        "bedrock" => {
+            if incoming.bedrock.is_some() {
+                existing.bedrock = incoming.bedrock.clone();
+            }
+        }
+        "azure" => {
+            if incoming.azure.is_some() {
+                existing.azure = incoming.azure.clone();
+            }
+        }
+        "openai" => {
+            if incoming.openai.is_some() {
+                existing.openai = incoming.openai.clone();
+            }
+        }
+        "anthropic" => {
+            if incoming.anthropic.is_some() {
+                existing.anthropic = incoming.anthropic.clone();
+            }
+        }
+        "ollama" => {
+            if incoming.ollama.is_some() {
+                existing.ollama = incoming.ollama.clone();
+            }
+        }
+        "groq" => {
+            if incoming.groq.is_some() {
+                existing.groq = incoming.groq.clone();
+            }
+        }
+        "together" => {
+            if incoming.together.is_some() {
+                existing.together = incoming.together.clone();
+            }
+        }
+        "deepseek" => {
+            if incoming.deepseek.is_some() {
+                existing.deepseek = incoming.deepseek.clone();
+            }
+        }
+        "openrouter" => {
+            if incoming.openrouter.is_some() {
+                existing.openrouter = incoming.openrouter.clone();
+            }
+        }
+        "perplexity" => {
+            if incoming.perplexity.is_some() {
+                existing.perplexity = incoming.perplexity.clone();
+            }
+        }
+        "litellm" => {
+            if incoming.litellm.is_some() {
+                existing.litellm = incoming.litellm.clone();
+            }
+        }
+        "custom" => {
+            if incoming.custom.is_some() {
+                existing.custom = incoming.custom.clone();
+            }
+        }
         _ => {}
     }
 }
@@ -628,7 +807,7 @@ pub fn run_provider_set_model(
     workspace_path: &Path,
 ) -> anyhow::Result<()> {
     if local {
-        let mut config = Config::load(workspace_path).unwrap_or_default();
+        let mut config = Config::load(workspace_path)?;
         config.llm.extraction_model = model.to_string();
         config.llm.compilation_model = model.to_string();
         config.save(workspace_path)?;
@@ -638,7 +817,7 @@ pub fn run_provider_set_model(
         println!("  {} Model updated (workspace)", style("✓").green().bold());
         println!("  {}", style(cfg_path.display()).dim());
     } else {
-        let mut global = GlobalConfig::load().unwrap_or_default();
+        let mut global = GlobalConfig::load()?;
         global.llm.extraction_model = model.to_string();
         global.llm.compilation_model = model.to_string();
         global.save()?;
@@ -683,12 +862,12 @@ fn base_llm_config(provider: &str, model: &str) -> LlmConfig {
 /// Everything else: 120s covers Azure, OpenRouter, Together, etc.
 fn provider_timeout_secs(provider: &str) -> u64 {
     match provider {
-        "groq"      => 30,
+        "groq" => 30,
         "anthropic" => 60,
-        "openai"    => 60,
-        "ollama"    => 300,
-        "bedrock"   => 180,
-        _           => 120,
+        "openai" => 60,
+        "ollama" => 300,
+        "bedrock" => 180,
+        _ => 120,
     }
 }
 

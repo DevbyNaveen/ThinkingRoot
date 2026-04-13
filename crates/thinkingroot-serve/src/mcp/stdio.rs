@@ -1,10 +1,18 @@
 use super::JsonRpcRequest;
 use crate::engine::QueryEngine;
+use crate::intelligence::session::{SessionStore, new_session_store};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
-pub async fn run(engine: Arc<RwLock<QueryEngine>>, default_workspace: Option<String>) {
+/// Fixed session ID for the stdio transport (single-client protocol).
+const STDIO_SESSION_ID: &str = "stdio";
+
+pub async fn run(
+    engine: Arc<RwLock<QueryEngine>>,
+    default_workspace: Option<String>,
+    sessions: SessionStore,
+) {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
@@ -46,7 +54,14 @@ pub async fn run(engine: Arc<RwLock<QueryEngine>>, default_workspace: Option<Str
         }
 
         let engine_guard = engine.read().await;
-        let response = super::dispatch(&request, &engine_guard, default_workspace.as_deref()).await;
+        let response = super::dispatch(
+            &request,
+            &engine_guard,
+            default_workspace.as_deref(),
+            STDIO_SESSION_ID,
+            &sessions,
+        )
+        .await;
         drop(engine_guard);
 
         let json = serde_json::to_string(&response).unwrap_or_default();
@@ -54,4 +69,10 @@ pub async fn run(engine: Arc<RwLock<QueryEngine>>, default_workspace: Option<Str
         let _ = stdout.write_all(b"\n").await;
         let _ = stdout.flush().await;
     }
+}
+
+/// Create a fresh session store — convenience for callers that create stdio servers
+/// without an `AppState` (e.g., CLI `root serve --mcp-stdio`).
+pub fn new_stdio_sessions() -> SessionStore {
+    new_session_store()
 }

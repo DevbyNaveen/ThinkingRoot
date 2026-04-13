@@ -1,6 +1,10 @@
 <div align="center">
 
-<img src="assets/branding/logo.png" alt="ThinkingRoot Logo" width="300" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/branding/logo_white.png">
+  <img alt="ThinkingRoot Logo" src="assets/branding/logo_black.png" width="300" />
+</picture>
+
 
 <br/>
 

@@ -31,9 +31,7 @@ pub enum BranchStatus {
         merged_by: MergedBy,
     },
     /// Branch was abandoned without merging.
-    Abandoned {
-        abandoned_at: DateTime<Utc>,
-    },
+    Abandoned { abandoned_at: DateTime<Utc> },
 }
 
 /// Records who or what performed a branch merge.
@@ -67,7 +65,9 @@ mod tests {
 
     #[test]
     fn merged_by_agent() {
-        let mb = MergedBy::Agent { agent_id: "claude".to_string() };
+        let mb = MergedBy::Agent {
+            agent_id: "claude".to_string(),
+        };
         assert!(matches!(mb, MergedBy::Agent { .. }));
     }
 }

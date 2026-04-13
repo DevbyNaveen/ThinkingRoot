@@ -203,6 +203,10 @@ pub enum ExtractionTier {
     /// Uses API calls. Subject to grounding tribunal.
     #[default]
     Llm,
+    /// Tier 3: agent-contributed knowledge written back via the `contribute` MCP tool.
+    /// Bypasses the parse→extract pipeline entirely. Trust level is always Untrusted
+    /// until a subsequent `root compile` cross-validates against source code.
+    AgentInferred,
 }
 
 #[cfg(test)]

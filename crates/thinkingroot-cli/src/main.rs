@@ -367,7 +367,10 @@ async fn main() -> anyhow::Result<()> {
                 serve::install_service()?;
                 return Ok(());
             }
-            serve::run_serve(port, host, api_key, paths, name, mcp_stdio, no_rest, no_mcp, branch).await?;
+            serve::run_serve(
+                port, host, api_key, paths, name, mcp_stdio, no_rest, no_mcp, branch,
+            )
+            .await?;
         }
         Some(Commands::Setup) => {
             setup::run_setup().await?;
@@ -383,7 +386,12 @@ async fn main() -> anyhow::Result<()> {
                 workspace::run_workspace_remove(&name)?;
             }
         },
-        Some(Commands::Connect { tool, port, dry_run, remove }) => {
+        Some(Commands::Connect {
+            tool,
+            port,
+            dry_run,
+            remove,
+        }) => {
             mcp_config::run_connect(tool.as_deref(), port, dry_run, remove)?;
         }
         Some(Commands::Watch { path }) => {
@@ -391,8 +399,25 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("path not found: {}", path.display()))?;
             watch::run_watch(&path).await?;
         }
-        Some(Commands::Branch { name, list, delete, purge, gc, description, path }) => {
-            branch_cmd::handle_branch(&path, name.as_deref(), list, delete.as_deref(), purge.as_deref(), gc, description).await?;
+        Some(Commands::Branch {
+            name,
+            list,
+            delete,
+            purge,
+            gc,
+            description,
+            path,
+        }) => {
+            branch_cmd::handle_branch(
+                &path,
+                name.as_deref(),
+                list,
+                delete.as_deref(),
+                purge.as_deref(),
+                gc,
+                description,
+            )
+            .await?;
         }
         Some(Commands::Checkout { name, path }) => {
             branch_cmd::handle_checkout(&path, &name).await?;
@@ -400,11 +425,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Diff { branch, path }) => {
             branch_cmd::handle_diff(&path, &branch).await?;
         }
-        Some(Commands::Merge { branch, path, force, propagate_deletions, rollback, resolutions }) => {
+        Some(Commands::Merge {
+            branch,
+            path,
+            force,
+            propagate_deletions,
+            rollback,
+            resolutions,
+        }) => {
             if rollback {
                 branch_cmd::handle_rollback(&path, &branch)?;
             } else {
-                branch_cmd::handle_merge(&path, &branch, force, propagate_deletions, &resolutions).await?;
+                branch_cmd::handle_merge(&path, &branch, force, propagate_deletions, &resolutions)
+                    .await?;
             }
         }
         Some(Commands::Status { path }) => {
@@ -470,7 +503,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_compile(path: &PathBuf, branch: Option<&str>, use_progress: bool) -> anyhow::Result<()> {
+async fn run_compile(
+    path: &PathBuf,
+    branch: Option<&str>,
+    use_progress: bool,
+) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
         anyhow::bail!(

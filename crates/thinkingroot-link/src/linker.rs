@@ -38,7 +38,10 @@ pub struct LinkOutput {
 
 impl<'a> Linker<'a> {
     pub fn new(graph: &'a GraphStore) -> Self {
-        Self { graph, progress: None }
+        Self {
+            graph,
+            progress: None,
+        }
     }
 
     /// Attach a progress callback. Called once per entity resolved.
@@ -125,9 +128,15 @@ impl<'a> Linker<'a> {
         // Deduplicate first: keep most-specific type per (from, to) pair.
         let mut deduped_relations = extraction.relations.clone();
         crate::relation_dedup::dedup_relations(&mut deduped_relations);
-        let removed = extraction.relations.len().saturating_sub(deduped_relations.len());
+        let removed = extraction
+            .relations
+            .len()
+            .saturating_sub(deduped_relations.len());
         if removed > 0 {
-            tracing::debug!("relation subsumption dedup: removed {} redundant relations", removed);
+            tracing::debug!(
+                "relation subsumption dedup: removed {} redundant relations",
+                removed
+            );
         }
         for sourced_relation in &deduped_relations {
             let relation = &sourced_relation.relation;

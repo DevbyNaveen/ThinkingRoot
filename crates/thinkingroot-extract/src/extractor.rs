@@ -8,8 +8,8 @@ use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_core::types::*;
 
 use crate::llm::LlmClient;
-use crate::scheduler::ThroughputScheduler;
 use crate::prompts;
+use crate::scheduler::ThroughputScheduler;
 use crate::schema::ExtractionResult;
 
 type SharedLlm = Arc<LlmClient>;
@@ -104,7 +104,10 @@ impl Extractor {
 
     /// Inject known entities from the existing knowledge graph into LLM prompts.
     pub fn with_known_entities(mut self, ctx: crate::graph_context::GraphPrimedContext) -> Self {
-        tracing::info!("graph-primed context: {} known entities", ctx.entities.len());
+        tracing::info!(
+            "graph-primed context: {} known entities",
+            ctx.entities.len()
+        );
         self.known_entities = ctx;
         self
     }
@@ -127,7 +130,9 @@ impl Extractor {
 
         // Build source text map from all documents (for grounding).
         for doc in documents {
-            let text: String = doc.chunks.iter()
+            let text: String = doc
+                .chunks
+                .iter()
                 .map(|c| c.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -160,7 +165,10 @@ impl Extractor {
                 // ── Tier Router: structural or LLM? ──
                 if crate::router::classify(chunk) == crate::router::Tier::Structural {
                     let result = crate::structural::extract_structural(chunk, &doc.uri);
-                    if !result.claims.is_empty() || !result.entities.is_empty() || !result.relations.is_empty() {
+                    if !result.claims.is_empty()
+                        || !result.entities.is_empty()
+                        || !result.relations.is_empty()
+                    {
                         structural_results.push((doc.source_id, doc.uri.clone(), result));
                         // No `continue` — chunk also queued for LLM below so both run additively.
                         // Structural provides graph topology at 0.99 confidence;
@@ -227,7 +235,8 @@ impl Extractor {
         let structural_count = structural_results.len();
         for (source_id, _source_uri, struct_result) in structural_results {
             // Use min_confidence=0.0 for structural — they're always 0.99, never filtered
-            let converted = Self::convert_result_static(struct_result, source_id, workspace_id, 0.0);
+            let converted =
+                Self::convert_result_static(struct_result, source_id, workspace_id, 0.0);
             output.merge(converted);
             output.structural_extractions += 1;
         }
@@ -281,9 +290,7 @@ impl Extractor {
                     {
                         Ok(r) => sub_results.push((sub_content, r)),
                         Err(e) => {
-                            tracing::warn!(
-                                "extraction failed for chunk in {source_uri}: {e}"
-                            );
+                            tracing::warn!("extraction failed for chunk in {source_uri}: {e}");
                         }
                     }
                 }
@@ -310,11 +317,25 @@ impl Extractor {
                     // Also write the merged result under the original chunk key so that
                     // split chunks hit the cache on subsequent runs (the lookup key is
                     // always the original full chunk content, not the sub-chunk content).
-                    if sub_results.len() > 1 || sub_results.first().map(|(c, _)| c != &original_content).unwrap_or(false) {
+                    if sub_results.len() > 1
+                        || sub_results
+                            .first()
+                            .map(|(c, _)| c != &original_content)
+                            .unwrap_or(false)
+                    {
                         let merged = ExtractionResult {
-                            claims: sub_results.iter().flat_map(|(_, r)| r.claims.clone()).collect(),
-                            entities: sub_results.iter().flat_map(|(_, r)| r.entities.clone()).collect(),
-                            relations: sub_results.iter().flat_map(|(_, r)| r.relations.clone()).collect(),
+                            claims: sub_results
+                                .iter()
+                                .flat_map(|(_, r)| r.claims.clone())
+                                .collect(),
+                            entities: sub_results
+                                .iter()
+                                .flat_map(|(_, r)| r.entities.clone())
+                                .collect(),
+                            relations: sub_results
+                                .iter()
+                                .flat_map(|(_, r)| r.relations.clone())
+                                .collect(),
                         };
                         if let Err(e) = cache.put(&original_content, &merged) {
                             tracing::warn!("failed to write merged cache entry: {e}");
@@ -416,7 +437,9 @@ impl Extractor {
                 let Some(rel_type) = parse_relation_type(&ext_rel.relation_type) else {
                     tracing::debug!(
                         "discarded relation '{}' → '{}' with unknown type '{}'",
-                        ext_rel.from_entity, ext_rel.to_entity, ext_rel.relation_type
+                        ext_rel.from_entity,
+                        ext_rel.to_entity,
+                        ext_rel.relation_type
                     );
                     continue;
                 };
@@ -426,7 +449,9 @@ impl Extractor {
                 if confidence < 0.3 {
                     tracing::debug!(
                         "discarded low-confidence relation '{}' → '{}' ({:.2})",
-                        ext_rel.from_entity, ext_rel.to_entity, confidence
+                        ext_rel.from_entity,
+                        ext_rel.to_entity,
+                        confidence
                     );
                     continue;
                 }
@@ -494,12 +519,16 @@ fn extract_with_split(
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExtractionResult>> + Send>> {
     Box::pin(async move {
-        match llm.extract_with_graph_context(&content, &context, &known_entities_section).await {
+        match llm
+            .extract_with_graph_context(&content, &context, &known_entities_section)
+            .await
+        {
             Ok(result) => Ok(result),
 
-            Err(thinkingroot_core::Error::TruncatedOutput { ref provider, ref model })
-                if depth < 3 =>
-            {
+            Err(thinkingroot_core::Error::TruncatedOutput {
+                ref provider,
+                ref model,
+            }) if depth < 3 => {
                 let lines: Vec<&str> = content.lines().collect();
                 if lines.len() < 2 {
                     tracing::warn!(
@@ -607,21 +636,21 @@ fn parse_entity_type(s: &str) -> EntityType {
 
 fn parse_relation_type(s: &str) -> Option<RelationType> {
     match s.to_lowercase().trim() {
-        "depends_on"    => Some(RelationType::DependsOn),
-        "owned_by"      => Some(RelationType::OwnedBy),
-        "replaces"      => Some(RelationType::Replaces),
-        "contradicts"   => Some(RelationType::Contradicts),
-        "implements"    => Some(RelationType::Implements),
-        "uses"          => Some(RelationType::Uses),
-        "contains"      => Some(RelationType::Contains),
-        "created_by"    => Some(RelationType::CreatedBy),
-        "part_of"       => Some(RelationType::PartOf),
-        "related_to"    => Some(RelationType::RelatedTo),
-        "calls"         => Some(RelationType::Calls),
+        "depends_on" => Some(RelationType::DependsOn),
+        "owned_by" => Some(RelationType::OwnedBy),
+        "replaces" => Some(RelationType::Replaces),
+        "contradicts" => Some(RelationType::Contradicts),
+        "implements" => Some(RelationType::Implements),
+        "uses" => Some(RelationType::Uses),
+        "contains" => Some(RelationType::Contains),
+        "created_by" => Some(RelationType::CreatedBy),
+        "part_of" => Some(RelationType::PartOf),
+        "related_to" => Some(RelationType::RelatedTo),
+        "calls" => Some(RelationType::Calls),
         "configured_by" => Some(RelationType::ConfiguredBy),
-        "tested_by"     => Some(RelationType::TestedBy),
+        "tested_by" => Some(RelationType::TestedBy),
         "skip_relation" | "" => None,
-        _               => None,
+        _ => None,
     }
 }
 
@@ -666,7 +695,10 @@ mod tests {
     #[test]
     fn unknown_relation_type_is_rejected_not_mapped_to_related_to() {
         let result = parse_relation_type("blah_relation");
-        assert!(result.is_none(), "unknown types must be rejected, not silently mapped");
+        assert!(
+            result.is_none(),
+            "unknown types must be rejected, not silently mapped"
+        );
     }
 
     #[test]
@@ -678,10 +710,19 @@ mod tests {
 
     #[test]
     fn known_types_still_parse() {
-        assert_eq!(parse_relation_type("depends_on"), Some(RelationType::DependsOn));
+        assert_eq!(
+            parse_relation_type("depends_on"),
+            Some(RelationType::DependsOn)
+        );
         assert_eq!(parse_relation_type("calls"), Some(RelationType::Calls));
-        assert_eq!(parse_relation_type("implements"), Some(RelationType::Implements));
-        assert_eq!(parse_relation_type("related_to"), Some(RelationType::RelatedTo));
+        assert_eq!(
+            parse_relation_type("implements"),
+            Some(RelationType::Implements)
+        );
+        assert_eq!(
+            parse_relation_type("related_to"),
+            Some(RelationType::RelatedTo)
+        );
     }
 }
 
@@ -709,9 +750,17 @@ mod tiered_tests {
         };
 
         let result = crate::structural::extract_structural(&chunk, "test/example.rs");
-        assert!(!result.entities.is_empty(), "structural should produce entities");
-        assert!(!result.claims.is_empty(), "structural should produce claims");
-        let first_claim = result.claims.first()
+        assert!(
+            !result.entities.is_empty(),
+            "structural should produce entities"
+        );
+        assert!(
+            !result.claims.is_empty(),
+            "structural should produce claims"
+        );
+        let first_claim = result
+            .claims
+            .first()
             .expect("structural extractor must produce at least one claim");
         assert_eq!(
             first_claim.extraction_tier,
@@ -763,8 +812,14 @@ mod tiered_tests {
         let (structural, llm) = crate::router::route_chunks(&chunks);
         assert_eq!(structural.len(), 2, "FunctionDef + Import = 2 structural");
         assert_eq!(llm.len(), 1, "Prose = 1 LLM");
-        assert!(structural.contains(&0), "FunctionDef (index 0) should be structural");
-        assert!(structural.contains(&2), "Import (index 2) should be structural");
+        assert!(
+            structural.contains(&0),
+            "FunctionDef (index 0) should be structural"
+        );
+        assert!(
+            structural.contains(&2),
+            "Import (index 2) should be structural"
+        );
         assert!(llm.contains(&1), "Prose (index 1) should be LLM");
     }
 }

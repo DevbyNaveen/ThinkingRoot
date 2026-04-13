@@ -1,11 +1,11 @@
 // crates/thinkingroot-branch/src/merge.rs
+use crate::branch::BranchRegistry;
+use crate::lock::MergeLock;
+use crate::snapshot::{resolve_data_dir, slugify};
 use std::path::Path;
 use thinkingroot_core::error::Error;
 use thinkingroot_core::{KnowledgeDiff, MergedBy, Result};
 use thinkingroot_graph::graph::GraphStore;
-use crate::branch::BranchRegistry;
-use crate::lock::MergeLock;
-use crate::snapshot::{resolve_data_dir, slugify};
 
 /// Execute a merge of `branch_name` into main.
 ///
@@ -45,10 +45,7 @@ pub async fn execute_merge(
             .join("graph")
             .join(format!("graph.db.pre-merge-{slug}-{ts}"));
         std::fs::copy(&db_path, &backup_path)?;
-        tracing::debug!(
-            "pre-merge snapshot written to {}",
-            backup_path.display()
-        );
+        tracing::debug!("pre-merge snapshot written to {}", backup_path.display());
     }
 
     let main_graph = GraphStore::init(&main_data_dir.join("graph"))?;
@@ -75,10 +72,17 @@ pub async fn execute_merge(
                 copied_source_ids.insert(source_id);
             }
             Ok(None) => {
-                tracing::warn!("merge: source '{}' not found in branch graph — claim will be orphaned", source_id);
+                tracing::warn!(
+                    "merge: source '{}' not found in branch graph — claim will be orphaned",
+                    source_id
+                );
             }
             Err(e) => {
-                tracing::warn!("merge: failed to look up source '{}' in branch graph: {}", source_id, e);
+                tracing::warn!(
+                    "merge: failed to look up source '{}' in branch graph: {}",
+                    source_id,
+                    e
+                );
             }
         }
     }
@@ -100,10 +104,7 @@ pub async fn execute_merge(
     for resolution in &diff.auto_resolved {
         if resolution.winner == resolution.branch_claim_id {
             // Branch won — supersede main claim
-            main_graph.supersede_claim(
-                &resolution.main_claim_id,
-                &resolution.branch_claim_id,
-            )?;
+            main_graph.supersede_claim(&resolution.main_claim_id, &resolution.branch_claim_id)?;
         }
         // If main won — branch claim is simply not inserted
     }
@@ -118,7 +119,12 @@ pub async fn execute_merge(
         let from_id = main_graph.find_entity_id_by_name(&diff_relation.from_name)?;
         let to_id = main_graph.find_entity_id_by_name(&diff_relation.to_name)?;
         if let (Some(from), Some(to)) = (from_id, to_id) {
-            main_graph.link_entities(&from, &to, &diff_relation.relation_type, diff_relation.strength)?;
+            main_graph.link_entities(
+                &from,
+                &to,
+                &diff_relation.relation_type,
+                diff_relation.strength,
+            )?;
         }
     }
 

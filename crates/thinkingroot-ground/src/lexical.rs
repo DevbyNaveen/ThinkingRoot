@@ -8,16 +8,13 @@ pub struct LexicalJudge;
 
 /// Words to ignore when computing overlap (too common to be meaningful).
 const STOP_WORDS: &[&str] = &[
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "must",
-    "and", "or", "but", "if", "then", "else", "when", "where", "how",
-    "what", "which", "who", "whom", "this", "that", "these", "those",
-    "it", "its", "of", "in", "to", "for", "with", "on", "at", "by",
-    "from", "as", "into", "about", "not", "no", "so", "up", "out",
-    "than", "too", "very", "just", "also", "all", "each", "every",
-    "any", "some", "such", "only", "own", "same", "other", "new",
-    "used", "using", "uses", "use",
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+    "need", "must", "and", "or", "but", "if", "then", "else", "when", "where", "how", "what",
+    "which", "who", "whom", "this", "that", "these", "those", "it", "its", "of", "in", "to", "for",
+    "with", "on", "at", "by", "from", "as", "into", "about", "not", "no", "so", "up", "out",
+    "than", "too", "very", "just", "also", "all", "each", "every", "any", "some", "such", "only",
+    "own", "same", "other", "new", "used", "using", "uses", "use",
 ];
 
 impl LexicalJudge {

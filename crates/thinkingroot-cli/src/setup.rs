@@ -4,9 +4,11 @@ use std::time::Duration;
 use anyhow::Context as _;
 use console::style;
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
-use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
+use thinkingroot_core::config::{
+    AzureConfig, BedrockConfig, LlmConfig, ProviderConfig, ProvidersConfig,
+};
 use thinkingroot_core::global_config::{GlobalConfig, ServeConfig};
-use thinkingroot_core::config::{AzureConfig, BedrockConfig, LlmConfig, ProviderConfig, ProvidersConfig};
+use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 
 // ── Provider catalogue ───────────────────────────────────────────
 
@@ -15,7 +17,6 @@ pub(crate) struct ProviderDef {
     pub(crate) id: &'static str,
     pub(crate) default_env: &'static str,
     pub(crate) base_url: Option<&'static str>,
-    pub(crate) default_models: &'static [&'static str],
     pub(crate) validate_url: Option<&'static str>,
 }
 
@@ -25,11 +26,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "openrouter",
         default_env: "OPENROUTER_API_KEY",
         base_url: Some("https://openrouter.ai/api/v1"),
-        default_models: &[
-            "anthropic/claude-3-haiku",
-            "openai/gpt-4o-mini",
-            "meta-llama/llama-3.1-8b-instruct:free",
-        ],
         validate_url: Some("https://openrouter.ai/api/v1/models"),
     },
     ProviderDef {
@@ -37,7 +33,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "openai",
         default_env: "OPENAI_API_KEY",
         base_url: Some("https://api.openai.com"),
-        default_models: &["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
         validate_url: Some("https://api.openai.com/v1/models"),
     },
     ProviderDef {
@@ -45,7 +40,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "azure",
         default_env: "AZURE_OPENAI_API_KEY",
         base_url: None,
-        default_models: &["gpt-4o-mini", "gpt-4o", "gpt-35-turbo"],
         validate_url: None,
     },
     ProviderDef {
@@ -53,7 +47,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "anthropic",
         default_env: "ANTHROPIC_API_KEY",
         base_url: None,
-        default_models: &["claude-3-haiku-20240307", "claude-3-5-sonnet-20241022"],
         validate_url: Some("https://api.anthropic.com/v1/models"),
     },
     ProviderDef {
@@ -61,11 +54,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "bedrock",
         default_env: "",
         base_url: None,
-        default_models: &[
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            "amazon.nova-micro-v1:0",
-            "anthropic.claude-3-haiku-20240307-v1:0",
-        ],
         validate_url: None,
     },
     ProviderDef {
@@ -73,7 +61,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "ollama",
         default_env: "",
         base_url: Some("http://localhost:11434"),
-        default_models: &["llama3", "mistral", "phi3"],
         validate_url: None,
     },
     ProviderDef {
@@ -81,7 +68,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "groq",
         default_env: "GROQ_API_KEY",
         base_url: Some("https://api.groq.com/openai"),
-        default_models: &["llama-3.1-8b-instant", "mixtral-8x7b-32768"],
         validate_url: Some("https://api.groq.com/openai/v1/models"),
     },
     ProviderDef {
@@ -89,10 +75,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "together",
         default_env: "TOGETHER_API_KEY",
         base_url: Some("https://api.together.xyz/v1"),
-        default_models: &[
-            "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        ],
         validate_url: Some("https://api.together.xyz/v1/models"),
     },
     ProviderDef {
@@ -100,7 +82,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "deepseek",
         default_env: "DEEPSEEK_API_KEY",
         base_url: Some("https://api.deepseek.com"),
-        default_models: &["deepseek-chat", "deepseek-coder"],
         validate_url: Some("https://api.deepseek.com/models"),
     },
     ProviderDef {
@@ -108,10 +89,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "perplexity",
         default_env: "PERPLEXITY_API_KEY",
         base_url: Some("https://api.perplexity.ai"),
-        default_models: &[
-            "llama-3.1-sonar-small-128k-online",
-            "llama-3.1-sonar-large-128k-online",
-        ],
         validate_url: Some("https://api.perplexity.ai/models"),
     },
     ProviderDef {
@@ -119,7 +96,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "litellm",
         default_env: "LITELLM_API_KEY",
         base_url: Some("http://localhost:4000"),
-        default_models: &["gpt-4o-mini", "claude-3-haiku"],
         validate_url: None,
     },
     ProviderDef {
@@ -127,7 +103,6 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         id: "custom",
         default_env: "CUSTOM_LLM_API_KEY",
         base_url: None,
-        default_models: &[],
         validate_url: None,
     },
 ];
@@ -137,6 +112,8 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
 struct ProviderSetup {
     api_key: String,
     model: String,
+    // Used by providers with no fixed base_url (e.g. "custom")
+    base_url: Option<String>,
     // Azure-specific (set only for provider id = "azure")
     azure_resource: Option<String>,
     azure_deployment: Option<String>,
@@ -158,11 +135,17 @@ pub async fn run_setup() -> anyhow::Result<()> {
     }
 
     // ── Step 1: Confirm config location ──────────────────────────
-    let config_path = GlobalConfig::path()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
+    let config_path =
+        GlobalConfig::path().ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
 
-    println!("\n  {}", style("[1/5] Global config location").cyan().bold());
-    println!("  Settings will be saved to: {}", style(config_path.display()).white());
+    println!(
+        "\n  {}",
+        style("[1/5] Global config location").cyan().bold()
+    );
+    println!(
+        "  Settings will be saved to: {}",
+        style(config_path.display()).white()
+    );
     println!();
 
     if !Confirm::with_theme(&theme)
@@ -260,14 +243,18 @@ pub async fn run_setup() -> anyhow::Result<()> {
     };
 
     // ── Step 5: Compile ───────────────────────────────────────────
-    println!("\n  {}", style("[5/5] Compile knowledge base").cyan().bold());
+    println!(
+        "\n  {}",
+        style("[5/5] Compile knowledge base").cyan().bold()
+    );
 
     let compile_choices = &["Yes, compile now", "Skip — I'll run `root compile` later"];
     let compile_now = Select::with_theme(&theme)
         .with_prompt("Compile now?")
         .items(compile_choices)
         .default(0)
-        .interact()? == 0;
+        .interact()?
+        == 0;
 
     // ── Apply all changes ─────────────────────────────────────────
     println!();
@@ -314,12 +301,10 @@ pub async fn run_setup() -> anyhow::Result<()> {
                 .unwrap_or_else(|| std::path::PathBuf::from("~/.config/thinkingroot/config.toml"))
                 .display()
                 .to_string()
-        ).dim()
+        )
+        .dim()
     );
-    println!(
-        "  Workspace       {}/.thinkingroot/",
-        abs_ws_path.display()
-    );
+    println!("  Workspace       {}/.thinkingroot/", abs_ws_path.display());
     println!(
         "  MCP endpoint    {}",
         style(format!("http://localhost:{}/mcp/sse", ws_port)).cyan()
@@ -335,15 +320,36 @@ pub async fn run_setup() -> anyhow::Result<()> {
 
     println!();
     println!("  Next steps:");
-    println!("    {}  start the knowledge server", style("root serve").cyan());
+    println!(
+        "    {}  start the knowledge server",
+        style("root serve").cyan()
+    );
     println!(
         "    {}  add more folders",
         style("root workspace add <path>").cyan()
     );
-    println!(
-        "    {}  wire more AI tools",
-        style("root connect").cyan()
-    );
+    println!("    {}  wire more AI tools", style("root connect").cyan());
+
+    // Remind the user to persist the API key across shell sessions.
+    // set_provider_config() only sets the env var for this process; it is not
+    // written to any file, so it will be gone after this terminal session ends.
+    if !provider.default_env.is_empty() && provider.id != "bedrock" && provider.id != "ollama" {
+        println!();
+        println!(
+            "  {} API key persistence",
+            style("Action required —").yellow().bold()
+        );
+        println!(
+            "  Your {} key was used for this session but is not saved on disk.",
+            style(provider.label).white()
+        );
+        println!("  Add the following line to your shell profile (~/.zshrc, ~/.bashrc, etc.):");
+        println!(
+            "    {}",
+            style(format!("export {}=\"<your-key>\"", provider.default_env)).cyan()
+        );
+    }
+
     println!();
 
     Ok(())
@@ -355,12 +361,15 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
     let global = GlobalConfig::load()?;
     let registry = WorkspaceRegistry::load()?;
 
-    println!("\n  {} ThinkingRoot is already configured.\n", style("✓").green().bold());
-    println!("  Provider:   {} / {}", global.llm.default_provider, global.llm.extraction_model);
     println!(
-        "  Workspaces: {} total\n",
-        registry.workspaces.len()
+        "\n  {} ThinkingRoot is already configured.\n",
+        style("✓").green().bold()
     );
+    println!(
+        "  Provider:   {} / {}",
+        global.llm.default_provider, global.llm.extraction_model
+    );
+    println!("  Workspaces: {} total\n", registry.workspaces.len());
 
     let choices = &[
         "Change LLM provider",
@@ -393,6 +402,21 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
             set_provider_config(&mut new_global.llm, provider, &setup);
             new_global.save()?;
             println!("  {} Provider updated.", style("✓").green().bold());
+            if !provider.default_env.is_empty()
+                && provider.id != "bedrock"
+                && provider.id != "ollama"
+            {
+                println!();
+                println!(
+                    "  {} API key persistence",
+                    style("Action required —").yellow().bold()
+                );
+                println!("  Add to your shell profile (~/.zshrc, ~/.bashrc, etc.):");
+                println!(
+                    "    {}",
+                    style(format!("export {}=\"<your-key>\"", provider.default_env)).cyan()
+                );
+            }
         }
         1 => {
             let path_str: String = Input::with_theme(theme)
@@ -410,10 +434,14 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
         }
         3 => {
             if let Some(p) = GlobalConfig::path() {
-                if p.exists() { std::fs::remove_file(&p)?; }
+                if p.exists() {
+                    std::fs::remove_file(&p)?;
+                }
             }
             if let Some(p) = WorkspaceRegistry::path() {
-                if p.exists() { std::fs::remove_file(&p)?; }
+                if p.exists() {
+                    std::fs::remove_file(&p)?;
+                }
             }
             Box::pin(run_setup()).await?;
         }
@@ -430,25 +458,25 @@ async fn configure_provider(
     provider: &ProviderDef,
 ) -> anyhow::Result<ProviderSetup> {
     match provider.id {
-        "bedrock" => configure_bedrock(theme, provider).await,
-        "azure"   => configure_azure(theme).await,
-        _         => configure_generic(theme, provider).await,
+        "bedrock" => configure_bedrock(theme).await,
+        "azure" => configure_azure(theme).await,
+        _ => configure_generic(theme, provider).await,
     }
 }
 
 // ── Bedrock configure flow ────────────────────────────────────────
 
-async fn configure_bedrock(
-    theme: &ColorfulTheme,
-    provider: &ProviderDef,
-) -> anyhow::Result<ProviderSetup> {
+async fn configure_bedrock(theme: &ColorfulTheme) -> anyhow::Result<ProviderSetup> {
     println!();
     println!("  {}", style("AWS Bedrock").bold());
     println!("  Runs inference inside your AWS account — no data leaves AWS.\n");
 
     // 1. Check for existing credentials
     if !bedrock_credentials_found() {
-        println!("  {} AWS credentials not found.", style("!").yellow().bold());
+        println!(
+            "  {} AWS credentials not found.",
+            style("!").yellow().bold()
+        );
         println!();
         println!("  Bedrock uses your AWS credentials. Configure them with:");
         println!();
@@ -486,18 +514,38 @@ async fn configure_bedrock(
 
     // 2. Region
     println!();
-    println!("  {} Use cross-region inference IDs (e.g. {}) for ~4x higher quota.", style("Tip:").dim(), style("us.anthropic.claude-haiku-4-5-20251001-v1:0").cyan());
+    println!(
+        "  {} Use cross-region inference IDs (e.g. {}) for ~4x higher quota.",
+        style("Tip:").dim(),
+        style("us.anthropic.claude-haiku-4-5-20251001-v1:0").cyan()
+    );
     let region: String = Input::with_theme(theme)
         .with_prompt("AWS region")
         .default("us-east-1".to_string())
         .interact_text()?;
 
-    // 3. Model
-    let model = select_model_from_list(theme, provider.default_models)?;
+    // 3. Model — Bedrock has no public model-list API; user enters the ID directly.
+    println!(
+        "  {} Use cross-region inference IDs for ~4x higher quota.",
+        style("Tip:").dim()
+    );
+    println!(
+        "  {}  claude  →  us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        style("  e.g.").dim()
+    );
+    println!(
+        "  {}  nova    →  us.amazon.nova-micro-v1:0",
+        style("      ").dim()
+    );
+    println!();
+    let model: String = Input::with_theme(theme)
+        .with_prompt("Model ID")
+        .interact_text()?;
 
     Ok(ProviderSetup {
         api_key: String::new(),
         model,
+        base_url: None,
         azure_resource: None,
         azure_deployment: None,
         azure_api_version: None,
@@ -594,6 +642,7 @@ async fn configure_azure(theme: &ColorfulTheme) -> anyhow::Result<ProviderSetup>
     Ok(ProviderSetup {
         api_key: key,
         model,
+        base_url: None,
         azure_resource: Some(resource),
         azure_deployment: Some(deployment),
         azure_api_version: Some(api_version),
@@ -653,7 +702,11 @@ async fn configure_generic(
         let key: String = Password::with_theme(theme)
             .with_prompt(format!(
                 "{} API key",
-                provider.label.split_whitespace().next().unwrap_or(provider.id)
+                provider
+                    .label
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(provider.id)
             ))
             .interact()?;
 
@@ -682,11 +735,46 @@ async fn configure_generic(
         String::new()
     };
 
-    let model = select_model_from_list(theme, provider.default_models)?;
+    // Custom provider has no default base_url — must be collected from the user.
+    let base_url = if provider.id == "custom" {
+        println!();
+        println!("  Enter the base URL of your OpenAI-compatible endpoint.");
+        println!(
+            "  {}",
+            style("Example: https://my-api.example.com/v1").dim()
+        );
+        let url: String = dialoguer::Input::with_theme(theme)
+            .with_prompt("Base URL")
+            .interact_text()?;
+        Some(url)
+    } else {
+        None
+    };
+
+    // Fetch live model list — show a spinner, fall back silently to catalogue on any error
+    let pb = {
+        let pb = indicatif::ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_message("Fetching available models...");
+        pb.enable_steady_tick(Duration::from_millis(80));
+        pb
+    };
+    let live_models = fetch_provider_models(provider, &api_key).await;
+    pb.finish_and_clear();
+
+    let effective: Vec<&str> = live_models
+        .as_deref()
+        .map(|v| v.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let model = select_model_from_list(theme, &effective)?;
 
     Ok(ProviderSetup {
         api_key,
         model,
+        base_url,
         azure_resource: None,
         azure_deployment: None,
         azure_api_version: None,
@@ -707,7 +795,9 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
         "azure" => {
             // Store the key in env immediately so it's usable in this process.
             // SAFETY: single-threaded at this point in setup.
-            unsafe { std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key); }
+            unsafe {
+                std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key);
+            }
             llm.providers.azure = Some(AzureConfig {
                 resource_name: setup.azure_resource.clone(),
                 endpoint_base: None, // set manually for AIServices/cognitiveservices resources
@@ -734,25 +824,150 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
             // Standard API-key providers.
             let env_var = provider.default_env;
             // SAFETY: single-threaded at this point in setup.
-            unsafe { std::env::set_var(env_var, &setup.api_key); }
+            unsafe {
+                std::env::set_var(env_var, &setup.api_key);
+            }
+            // setup.base_url takes precedence (collected interactively for custom);
+            // fall back to the catalogue's default base_url for all other providers.
+            let resolved_base_url = setup
+                .base_url
+                .clone()
+                .or_else(|| provider.base_url.map(str::to_string));
             let cfg = ProviderConfig {
                 api_key_env: Some(env_var.to_string()),
-                base_url: provider.base_url.map(str::to_string),
+                base_url: resolved_base_url,
                 default_model: None,
             };
             match provider.id {
                 "openrouter" => llm.providers.openrouter = Some(cfg),
-                "openai"     => llm.providers.openai     = Some(cfg),
-                "anthropic"  => llm.providers.anthropic  = Some(cfg),
-                "groq"       => llm.providers.groq        = Some(cfg),
-                "together"   => llm.providers.together    = Some(cfg),
-                "deepseek"   => llm.providers.deepseek    = Some(cfg),
-                "perplexity" => llm.providers.perplexity  = Some(cfg),
-                "litellm"    => llm.providers.litellm     = Some(cfg),
-                "custom"     => llm.providers.custom      = Some(cfg),
-                _            => {}
+                "openai" => llm.providers.openai = Some(cfg),
+                "anthropic" => llm.providers.anthropic = Some(cfg),
+                "groq" => llm.providers.groq = Some(cfg),
+                "together" => llm.providers.together = Some(cfg),
+                "deepseek" => llm.providers.deepseek = Some(cfg),
+                "perplexity" => llm.providers.perplexity = Some(cfg),
+                "litellm" => llm.providers.litellm = Some(cfg),
+                "custom" => llm.providers.custom = Some(cfg),
+                _ => {}
             }
         }
+    }
+}
+
+// ── Live model fetching ───────────────────────────────────────────
+
+/// Maximum number of models shown in the interactive picker.
+/// Keeps the terminal list manageable even for providers with 200+ models.
+const MODEL_LIST_LIMIT: usize = 30;
+
+/// Fetch the live model list for a provider.
+/// Returns `None` on any error (network, auth, parse, timeout) — callers fall back to catalogue.
+pub(crate) async fn fetch_provider_models(
+    pdef: &ProviderDef,
+    api_key: &str,
+) -> Option<Vec<String>> {
+    // Ollama is local — uses a tag-listing endpoint, no API key
+    if pdef.id == "ollama" {
+        let base = pdef.base_url.unwrap_or("http://localhost:11434");
+        return fetch_ollama_models(base).await;
+    }
+
+    // All other fetchable providers expose their list at validate_url
+    let url = pdef.validate_url?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let req = if pdef.id == "anthropic" {
+        client
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        client
+            .get(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+    };
+
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+
+    // Together AI returns a bare array; every other provider wraps in {"data": [...]}
+    let items = if let Some(arr) = json.as_array() {
+        arr.clone()
+    } else {
+        json["data"].as_array()?.clone()
+    };
+
+    let mut models: Vec<String> = items
+        .iter()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_string();
+            // OpenAI: drop non-chat models (embeddings, whisper, tts, dall-e, etc.)
+            if pdef.id == "openai" && is_non_chat_openai(&id) {
+                return None;
+            }
+            // Together AI: only include chat-type models
+            if pdef.id == "together" && m["type"].as_str() != Some("chat") {
+                return None;
+            }
+            Some(id)
+        })
+        .collect();
+
+    models.sort();
+    models.dedup();
+    models.truncate(MODEL_LIST_LIMIT);
+
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
+}
+
+fn is_non_chat_openai(id: &str) -> bool {
+    let id = id.to_lowercase();
+    id.contains("embed")
+        || id.contains("whisper")
+        || id.contains("tts")
+        || id.contains("dall-e")
+        || id.contains("moderation")
+        || id.contains("realtime")
+        || id.starts_with("babbage")
+        || id.starts_with("davinci")
+        || id.starts_with("text-ada")
+}
+
+async fn fetch_ollama_models(base_url: &str) -> Option<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let models: Vec<String> = json["models"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(str::to_string))
+        .collect();
+
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
     }
 }
 
@@ -787,7 +1002,11 @@ pub(crate) fn select_model_from_list(
 /// Validate an API key by GETting the provider's /models endpoint.
 /// Returns Ok(()) if the key is accepted (HTTP 2xx, 404, or 405 — key valid, endpoint may differ).
 /// Returns Err if HTTP 401/403 (bad key) or network error.
-pub(crate) async fn validate_key_http(url: &str, provider_id: &str, key: &str) -> anyhow::Result<()> {
+pub(crate) async fn validate_key_http(
+    url: &str,
+    provider_id: &str,
+    key: &str,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -795,12 +1014,15 @@ pub(crate) async fn validate_key_http(url: &str, provider_id: &str, key: &str) -
     let mut req = client.get(url);
     req = if provider_id == "anthropic" {
         req.header("x-api-key", key)
-           .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", "2023-06-01")
     } else {
         req.header("Authorization", format!("Bearer {}", key))
     };
 
-    let resp = req.send().await.context("network error during key validation")?;
+    let resp = req
+        .send()
+        .await
+        .context("network error during key validation")?;
 
     match resp.status().as_u16() {
         401 | 403 => anyhow::bail!("Invalid API key (HTTP {})", resp.status().as_u16()),

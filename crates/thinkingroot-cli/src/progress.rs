@@ -26,7 +26,7 @@ use anyhow::Context as _;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::pipeline::{run_pipeline, ProgressEvent, PipelineResult};
+use crate::pipeline::{PipelineResult, ProgressEvent, run_pipeline};
 
 /// Run the pipeline with a live progress display.
 ///
@@ -51,20 +51,20 @@ pub async fn run_compile_progress(
     let bar_driver = {
         let mp = mp.clone();
         async move {
-            let mut extract_bar:     Option<ProgressBar> = None;
-            let mut grounding_bar:   Option<ProgressBar> = None;
+            let mut extract_bar: Option<ProgressBar> = None;
+            let mut grounding_bar: Option<ProgressBar> = None;
             let mut fingerprint_bar: Option<ProgressBar> = None;
-            let mut link_bar:        Option<ProgressBar> = None;
-            let mut index_bar:       Option<ProgressBar> = None;
-            let mut compile_bar:     Option<ProgressBar> = None;
-            let mut verify_bar:      Option<ProgressBar> = None;
+            let mut link_bar: Option<ProgressBar> = None;
+            let mut index_bar: Option<ProgressBar> = None;
+            let mut compile_bar: Option<ProgressBar> = None;
+            let mut verify_bar: Option<ProgressBar> = None;
 
-            let mut extract_start:  Option<Instant> = None;
-            let mut ground_start:   Option<Instant> = None;
-            let mut link_start:     Option<Instant> = None;
-            let mut index_start:    Option<Instant> = None;
-            let mut compile_start:  Option<Instant> = None;
-            let mut verify_start:   Option<Instant> = None;
+            let mut extract_start: Option<Instant> = None;
+            let mut ground_start: Option<Instant> = None;
+            let mut link_start: Option<Instant> = None;
+            let mut index_start: Option<Instant> = None;
+            let mut compile_start: Option<Instant> = None;
+            let mut verify_start: Option<Instant> = None;
 
             while let Some(event) = rx.recv().await {
                 match event {
@@ -98,7 +98,11 @@ pub async fn run_compile_progress(
                         }
                     }
 
-                    ProgressEvent::ChunkDone { done, total, source_uri } => {
+                    ProgressEvent::ChunkDone {
+                        done,
+                        total,
+                        source_uri,
+                    } => {
                         if let Some(ref eb) = extract_bar {
                             if total > 0 {
                                 eb.set_length(total as u64);
@@ -108,13 +112,22 @@ pub async fn run_compile_progress(
                         }
                     }
 
-                    ProgressEvent::ExtractionComplete { claims, entities, cache_hits } => {
+                    ProgressEvent::ExtractionComplete {
+                        claims,
+                        entities,
+                        cache_hits,
+                    } => {
                         if let Some(ref eb) = extract_bar {
-                            let elapsed = extract_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                            let elapsed = extract_start
+                                .as_ref()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64());
                             let total = eb.length().unwrap_or(0) as usize;
                             let cache_note = if cache_hits > 0 && total > 0 {
                                 let pct = cache_hits * 100 / total;
-                                format!("  {}", style(format!("({cache_hits} cached, {pct}% saved)")).dim())
+                                format!(
+                                    "  {}",
+                                    style(format!("({cache_hits} cached, {pct}% saved)")).dim()
+                                )
                             } else {
                                 String::new()
                             };
@@ -133,7 +146,10 @@ pub async fn run_compile_progress(
                     }
 
                     // ── Grounding ───────────────────────────────────────
-                    ProgressEvent::GroundingStart { llm_claims, structural_claims } => {
+                    ProgressEvent::GroundingStart {
+                        llm_claims,
+                        structural_claims,
+                    } => {
                         let gb = mp.add(new_bar("Grounding"));
                         if llm_claims > 0 {
                             activate_spinner(
@@ -155,7 +171,9 @@ pub async fn run_compile_progress(
 
                     ProgressEvent::GroundingDone { accepted, rejected } => {
                         if let Some(ref gb) = grounding_bar {
-                            let elapsed = ground_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                            let elapsed = ground_start
+                                .as_ref()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64());
                             let reject_note = if rejected > 0 {
                                 format!("  {}", style(format!("({rejected} rejected)")).yellow())
                             } else {
@@ -174,7 +192,10 @@ pub async fn run_compile_progress(
                     }
 
                     // ── Fingerprint ─────────────────────────────────────
-                    ProgressEvent::FingerprintDone { truly_changed, cutoffs } => {
+                    ProgressEvent::FingerprintDone {
+                        truly_changed,
+                        cutoffs,
+                    } => {
                         // Only show bar if fingerprint actually skipped something.
                         if cutoffs > 0 {
                             let fb = mp.add(new_bar("Fingerprint"));
@@ -212,9 +233,15 @@ pub async fn run_compile_progress(
                         }
                     }
 
-                    ProgressEvent::LinkComplete { entities, relations, contradictions } => {
+                    ProgressEvent::LinkComplete {
+                        entities,
+                        relations,
+                        contradictions,
+                    } => {
                         if let Some(ref lb) = link_bar {
-                            let elapsed = link_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                            let elapsed = link_start
+                                .as_ref()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64());
                             let contra_note = if contradictions > 0 {
                                 format!(
                                     "  {}",
@@ -239,9 +266,14 @@ pub async fn run_compile_progress(
                     }
 
                     // ── Vector indexing ─────────────────────────────────
-                    ProgressEvent::VectorUpdateDone { entities_indexed, claims_indexed } => {
+                    ProgressEvent::VectorUpdateDone {
+                        entities_indexed,
+                        claims_indexed,
+                    } => {
                         let ib = mp.add(new_bar("Indexing"));
-                        let elapsed = index_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                        let elapsed = index_start
+                            .as_ref()
+                            .map_or(0.0, |t| t.elapsed().as_secs_f64());
                         finish_bar(
                             &ib,
                             &format!(
@@ -270,7 +302,9 @@ pub async fn run_compile_progress(
                             compile_bar = Some(cb);
                         }
                         if let Some(ref cb) = compile_bar {
-                            let elapsed = compile_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                            let elapsed = compile_start
+                                .as_ref()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64());
                             finish_bar(
                                 cb,
                                 &format!(
@@ -291,7 +325,9 @@ pub async fn run_compile_progress(
                     // ── Verification ────────────────────────────────────
                     ProgressEvent::VerificationDone { health } => {
                         if let Some(ref vb) = verify_bar {
-                            let elapsed = verify_start.as_ref().map_or(0.0, |t| t.elapsed().as_secs_f64());
+                            let elapsed = verify_start
+                                .as_ref()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64());
                             let health_str = if health >= 80 {
                                 style(format!("Health {health}%")).green().to_string()
                             } else if health >= 60 {
@@ -338,10 +374,8 @@ pub async fn run_compile_progress(
     };
 
     // ── Run pipeline and driver concurrently ───────────────────────────────
-    let (pipeline_result, ()) = tokio::join!(
-        run_pipeline(root_path, branch, Some(tx)),
-        bar_driver,
-    );
+    let (pipeline_result, ()) =
+        tokio::join!(run_pipeline(root_path, branch, Some(tx)), bar_driver,);
 
     // Blank line after the bars for visual breathing room.
     eprintln!();
@@ -388,9 +422,7 @@ fn active_spinner_style() -> ProgressStyle {
 
 fn active_bar_style() -> ProgressStyle {
     ProgressStyle::default_bar()
-        .template(
-            "  {spinner:.cyan} {prefix} [{bar:30.cyan/white.dim}] {pos}/{len}  {msg}",
-        )
+        .template("  {spinner:.cyan} {prefix} [{bar:30.cyan/white.dim}] {pos}/{len}  {msg}")
         .expect("static template is valid")
         .progress_chars("█░")
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])

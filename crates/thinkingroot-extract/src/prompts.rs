@@ -134,7 +134,10 @@ pub fn build_ast_anchor_section(metadata: &thinkingroot_core::ir::ChunkMetadata)
             entity_names.push(format!("\"{trait_name}\""));
         }
         if !metadata.field_types.is_empty() {
-            lines.push(format!("Field types: [{}]", metadata.field_types.join(", ")));
+            lines.push(format!(
+                "Field types: [{}]",
+                metadata.field_types.join(", ")
+            ));
         }
     } else if let Some(ref path) = metadata.import_path {
         lines.push(format!("Import: {path}"));
@@ -162,8 +165,10 @@ mod tests {
     #[test]
     fn ast_anchor_empty_for_empty_metadata() {
         let meta = ChunkMetadata::default();
-        assert!(build_ast_anchor_section(&meta).is_empty(),
-            "empty metadata must produce empty anchor");
+        assert!(
+            build_ast_anchor_section(&meta).is_empty(),
+            "empty metadata must produce empty anchor"
+        );
     }
 
     #[test]
@@ -206,7 +211,11 @@ mod tests {
         assert!(section.contains("do_thing"));
         assert!(section.contains("helper"));
         // Must instruct LLM to use exact names
-        assert!(section.to_lowercase().contains("exact") || section.contains("MUST") || section.contains("must"),
-            "anchor must instruct LLM to use exact entity names");
+        assert!(
+            section.to_lowercase().contains("exact")
+                || section.contains("MUST")
+                || section.contains("must"),
+            "anchor must instruct LLM to use exact entity names"
+        );
     }
 }

@@ -63,9 +63,7 @@ mod inner {
                         .with_cache_dir(self.cache_dir.clone())
                         .with_show_download_progress(false),
                 )
-                .map_err(|e| {
-                    Error::GraphStorage(format!("failed to init embedding model: {e}"))
-                })?;
+                .map_err(|e| Error::GraphStorage(format!("failed to init embedding model: {e}")))?;
                 self.model = Some(model);
                 tracing::info!("embedding model loaded");
             }
@@ -312,9 +310,21 @@ mod tests {
         let mut store = VectorStore::init(dir.path()).await.unwrap();
 
         let items = vec![
-            ("id-1".to_string(), "hello world".to_string(), "meta1".to_string()),
-            ("id-2".to_string(), "foo bar".to_string(), "meta2".to_string()),
-            ("id-3".to_string(), "baz qux".to_string(), "meta3".to_string()),
+            (
+                "id-1".to_string(),
+                "hello world".to_string(),
+                "meta1".to_string(),
+            ),
+            (
+                "id-2".to_string(),
+                "foo bar".to_string(),
+                "meta2".to_string(),
+            ),
+            (
+                "id-3".to_string(),
+                "baz qux".to_string(),
+                "meta3".to_string(),
+            ),
         ];
         store.upsert_batch(&items).unwrap();
         assert_eq!(store.len(), 3);

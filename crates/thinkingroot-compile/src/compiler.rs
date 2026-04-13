@@ -170,8 +170,7 @@ impl Compiler {
         // 1. Compile entity pages only for affected entities.
         if !affected_entity_ids.is_empty() {
             let entities_dir = output_path.join("entities");
-            std::fs::create_dir_all(&entities_dir)
-                .map_err(|e| Error::io_path(&entities_dir, e))?;
+            std::fs::create_dir_all(&entities_dir).map_err(|e| Error::io_path(&entities_dir, e))?;
 
             let all_entities = graph.get_all_entities()?;
             let affected_set: std::collections::HashSet<&str> =
@@ -751,17 +750,27 @@ mod tests {
         // init_templates must succeed — any Tera parse error in a template constant
         // will surface here before it reaches production.
         let tera = init_templates().expect("all templates should parse");
-        let names: Vec<&str> = tera
-            .get_template_names()
-            .collect();
-        assert!(names.contains(&"entity_page.md"),       "entity_page.md missing");
-        assert!(names.contains(&"architecture_map.md"),  "architecture_map.md missing");
-        assert!(names.contains(&"contradiction_report.md"), "contradiction_report.md missing");
-        assert!(names.contains(&"health_report.md"),     "health_report.md missing");
-        assert!(names.contains(&"decision_log.md"),      "decision_log.md missing");
-        assert!(names.contains(&"task_pack.md"),         "task_pack.md missing");
-        assert!(names.contains(&"agent_brief.md"),       "agent_brief.md missing");
-        assert!(names.contains(&"runbook.md"),           "runbook.md missing");
+        let names: Vec<&str> = tera.get_template_names().collect();
+        assert!(names.contains(&"entity_page.md"), "entity_page.md missing");
+        assert!(
+            names.contains(&"architecture_map.md"),
+            "architecture_map.md missing"
+        );
+        assert!(
+            names.contains(&"contradiction_report.md"),
+            "contradiction_report.md missing"
+        );
+        assert!(
+            names.contains(&"health_report.md"),
+            "health_report.md missing"
+        );
+        assert!(
+            names.contains(&"decision_log.md"),
+            "decision_log.md missing"
+        );
+        assert!(names.contains(&"task_pack.md"), "task_pack.md missing");
+        assert!(names.contains(&"agent_brief.md"), "agent_brief.md missing");
+        assert!(names.contains(&"runbook.md"), "runbook.md missing");
     }
 
     // ── Template rendering ───────────────────────────────────────────────
@@ -799,7 +808,10 @@ mod tests {
         ctx.insert("compiled_at", "2026-01-01T00:00:00Z");
 
         let out = tera.render("entity_page.md", &ctx).unwrap();
-        assert!(out.contains("Uses PostgreSQL 15."), "claim statement missing");
+        assert!(
+            out.contains("Uses PostgreSQL 15."),
+            "claim statement missing"
+        );
         assert!(out.contains("docs/db.md"), "source URI missing");
     }
 
@@ -822,21 +834,27 @@ mod tests {
     fn health_report_renders_score_dimensions() {
         let tera = init_templates().unwrap();
         let mut ctx = Context::new();
-        ctx.insert("score", &serde_json::json!({
-            "overall": 87, "freshness": 100,
-            "consistency": 95, "coverage": 60, "provenance": 100
-        }));
-        ctx.insert("stats", &serde_json::json!({
-            "sources": 5, "claims": 120, "entities": 30,
-            "relations": 18, "contradictions": 2, "unresolved": 1, "stale_claims": 3
-        }));
+        ctx.insert(
+            "score",
+            &serde_json::json!({
+                "overall": 87, "freshness": 100,
+                "consistency": 95, "coverage": 60, "provenance": 100
+            }),
+        );
+        ctx.insert(
+            "stats",
+            &serde_json::json!({
+                "sources": 5, "claims": 120, "entities": 30,
+                "relations": 18, "contradictions": 2, "unresolved": 1, "stale_claims": 3
+            }),
+        );
         ctx.insert("warnings", &Vec::<String>::new());
         ctx.insert("compiled_at", "2026-01-01T00:00:00Z");
 
         let out = tera.render("health_report.md", &ctx).unwrap();
-        assert!(out.contains("87%"),  "overall score missing");
+        assert!(out.contains("87%"), "overall score missing");
         assert!(out.contains("100%"), "freshness missing");
-        assert!(out.contains("120"),  "claim count missing");
+        assert!(out.contains("120"), "claim count missing");
     }
 
     #[test]
@@ -852,7 +870,10 @@ mod tests {
         ctx.insert("compiled_at", "2026-01-01T00:00:00Z");
 
         let out = tera.render("decision_log.md", &ctx).unwrap();
-        assert!(out.contains("Use Rust for the core engine."), "decision text missing");
+        assert!(
+            out.contains("Use Rust for the core engine."),
+            "decision text missing"
+        );
         assert!(out.contains("adr/001.md"), "source URI missing");
     }
 

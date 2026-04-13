@@ -1,5 +1,5 @@
 use std::path::Path;
-use thinkingroot_branch::snapshot::{slugify, resolve_data_dir};
+use thinkingroot_branch::snapshot::{resolve_data_dir, slugify};
 
 #[test]
 fn slugify_feature_slash() {
@@ -33,12 +33,14 @@ fn resolve_data_dir_branch() {
     let p = Path::new("/repo");
     assert_eq!(
         resolve_data_dir(p, Some("feature/graphql")),
-        p.join(".thinkingroot-feature-graphql")
+        p.join(".thinkingroot")
+            .join("branches")
+            .join("feature-graphql")
     );
 }
 
-use thinkingroot_branch::branch::{BranchRegistry, read_head, write_head};
 use tempfile::tempdir;
+use thinkingroot_branch::branch::{BranchRegistry, read_head, write_head};
 
 #[test]
 fn registry_create_and_list() {
@@ -90,7 +92,8 @@ fn registry_persists_across_loads() {
 
     {
         let mut reg = BranchRegistry::load_or_create(&refs_dir).unwrap();
-        reg.create_branch("feature/y", "main", Some("test desc".to_string())).unwrap();
+        reg.create_branch("feature/y", "main", Some("test desc".to_string()))
+            .unwrap();
     }
 
     let reg2 = BranchRegistry::load_or_create(&refs_dir).unwrap();
@@ -125,7 +128,10 @@ use thinkingroot_branch::diff::semantic_hash;
 fn semantic_hash_normalises_whitespace_and_case() {
     let h1 = semantic_hash("AuthService  uses  JWT");
     let h2 = semantic_hash("authservice uses jwt");
-    assert_eq!(h1, h2, "same fact with different spacing/casing should hash identically");
+    assert_eq!(
+        h1, h2,
+        "same fact with different spacing/casing should hash identically"
+    );
 }
 
 #[test]
@@ -146,10 +152,15 @@ async fn create_branch_creates_layout_and_registry() {
     std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
     std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
 
-    create_branch(root, "feature/test", "main", None).await.unwrap();
+    create_branch(root, "feature/test", "main", None)
+        .await
+        .unwrap();
 
     // Branch dir should exist with db copy
-    assert!(root.join(".thinkingroot-feature-test/graph/graph.db").exists());
+    assert!(
+        root.join(".thinkingroot/branches/feature-test/graph/graph.db")
+            .exists()
+    );
 
     // Registry should have one active branch
     let branches = list_branches(root).unwrap();

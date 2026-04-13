@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use thinkingroot_core::{
-    config::Config, AutoResolution, Claim, ClaimId, ClaimType, Confidence, ContradictionPair,
-    DiffClaim, DiffEntity, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion, Result,
-    Sensitivity, SourceId, WorkspaceId,
+    AutoResolution, Claim, ClaimId, ClaimType, Confidence, ContradictionPair, DiffClaim,
+    DiffEntity, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion, Result, Sensitivity,
+    SourceId, WorkspaceId, config::Config,
 };
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_verify::Verifier;
@@ -41,9 +41,7 @@ fn is_contradiction_pair(a: &str, b: &str) -> bool {
     let a_l = a.to_lowercase();
     let b_l = b.to_lowercase();
     for (pos, neg) in NEGATION_PAIRS {
-        if (a_l.contains(pos) && b_l.contains(neg))
-            || (a_l.contains(neg) && b_l.contains(pos))
-        {
+        if (a_l.contains(pos) && b_l.contains(neg)) || (a_l.contains(neg) && b_l.contains(pos)) {
             return true;
         }
     }
@@ -226,7 +224,10 @@ pub fn compute_diff(
                 continue;
             }
             // Only compare claims with overlapping entity context.
-            let main_entities = entity_map.get(main_id.as_str()).cloned().unwrap_or_default();
+            let main_entities = entity_map
+                .get(main_id.as_str())
+                .cloned()
+                .unwrap_or_default();
             let shared_entities = entity_context
                 .iter()
                 .filter(|e| main_entities.contains(e))
@@ -234,10 +235,7 @@ pub fn compute_diff(
             if shared_entities == 0 {
                 continue;
             }
-            let sim = jaccard_similarity(
-                &statement.to_lowercase(),
-                &main_stmt.to_lowercase(),
-            );
+            let sim = jaccard_similarity(&statement.to_lowercase(), &main_stmt.to_lowercase());
             // High overlap but different hashes → potential conflict.
             if sim > 0.6 && semantic_hash(statement) != semantic_hash(main_stmt) {
                 let delta = (confidence - main_conf).abs();
@@ -303,13 +301,15 @@ pub fn compute_diff(
         .filter(|(from, to, rel, _, _, _)| {
             !main_relation_keys.contains(&(from.clone(), to.clone(), rel.clone()))
         })
-        .map(|(from_name, to_name, relation_type, _, _, strength)| DiffRelation {
-            from_name,
-            to_name,
-            relation_type,
-            strength,
-            diff_status: DiffStatus::Added,
-        })
+        .map(
+            |(from_name, to_name, relation_type, _, _, strength)| DiffRelation {
+                from_name,
+                to_name,
+                relation_type,
+                strength,
+                diff_status: DiffStatus::Added,
+            },
+        )
         .collect();
 
     // Determine merge_allowed

@@ -70,6 +70,8 @@ pub async fn dispatch(
     request: &JsonRpcRequest,
     engine: &crate::engine::QueryEngine,
     default_workspace: Option<&str>,
+    session_id: &str,
+    sessions: &crate::intelligence::session::SessionStore,
 ) -> JsonRpcResponse {
     let id = request.id.clone();
     match request.method.as_str() {
@@ -80,7 +82,17 @@ pub async fn dispatch(
             resources::handle_read(id, &request.params, engine, default_workspace).await
         }
         "tools/list" => tools::handle_list(id).await,
-        "tools/call" => tools::handle_call(id, &request.params, engine, default_workspace).await,
+        "tools/call" => {
+            tools::handle_call(
+                id,
+                &request.params,
+                engine,
+                default_workspace,
+                session_id,
+                sessions,
+            )
+            .await
+        }
         "ping" => JsonRpcResponse::success(id, serde_json::json!({})),
         other => JsonRpcResponse::error(id, -32601, format!("Method not found: {}", other)),
     }

@@ -133,8 +133,8 @@ impl Verifier {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use thinkingroot_core::types::{SourceType, ClaimType, Sensitivity, PipelineVersion};
-    use thinkingroot_core::{Source, Claim, ClaimId, SourceId, WorkspaceId};
+    use thinkingroot_core::types::{ClaimType, PipelineVersion, Sensitivity, SourceType};
+    use thinkingroot_core::{Claim, ClaimId, Source, SourceId, WorkspaceId};
     use thinkingroot_graph::graph::GraphStore;
 
     fn make_graph() -> (TempDir, GraphStore) {

@@ -64,10 +64,7 @@ fn find_in_local_cache(filename: &str) -> Option<std::path::PathBuf> {
     // Locate the HuggingFace cache root ($HF_HOME/hub, $HF_HUB_CACHE, or ~/.cache/huggingface/hub)
     let cache_root = std::env::var("HF_HUB_CACHE")
         .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HF_HOME")
-                .map(|h| std::path::PathBuf::from(h).join("hub"))
-        })
+        .or_else(|_| std::env::var("HF_HOME").map(|h| std::path::PathBuf::from(h).join("hub")))
         .or_else(|_| {
             std::env::var("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".cache/huggingface/hub"))
@@ -81,10 +78,7 @@ fn find_in_local_cache(filename: &str) -> Option<std::path::PathBuf> {
         .trim()
         .to_string();
 
-    let snapshot_path = cache_root
-        .join("snapshots")
-        .join(&commit)
-        .join(filename);
+    let snapshot_path = cache_root.join("snapshots").join(&commit).join(filename);
 
     // Resolve the symlink that hf_hub places here pointing to the actual blob
     snapshot_path.canonicalize().ok().filter(|p| p.exists())
@@ -140,9 +134,7 @@ impl NliJudge {
         // DeBERTa v3 uses disentangled attention — no token_type_ids in its ONNX export.
         let session = Session::builder()
             .map_err(|e| {
-                thinkingroot_core::Error::VectorStorage(format!(
-                    "ort session builder failed: {e}"
-                ))
+                thinkingroot_core::Error::VectorStorage(format!("ort session builder failed: {e}"))
             })?
             .commit_from_file(&onnx_path)
             .map_err(|e| {
@@ -186,9 +178,8 @@ impl NliJudge {
 
         // Build input tensors (batch_size=1, seq_len) using ort 2.0 API.
         // DeBERTa v3 uses disentangled attention — no token_type_ids input in its ONNX export.
-        let ids_tensor = match Tensor::from_array(
-            ([1usize, seq_len], input_ids.into_boxed_slice()),
-        ) {
+        let ids_tensor = match Tensor::from_array(([1usize, seq_len], input_ids.into_boxed_slice()))
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("NLI: failed to create input_ids tensor: {e}");
@@ -196,15 +187,14 @@ impl NliJudge {
             }
         };
 
-        let mask_tensor = match Tensor::from_array(
-            ([1usize, seq_len], attention_mask.into_boxed_slice()),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("NLI: failed to create attention_mask tensor: {e}");
-                return NliResult::neutral_fallback();
-            }
-        };
+        let mask_tensor =
+            match Tensor::from_array(([1usize, seq_len], attention_mask.into_boxed_slice())) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("NLI: failed to create attention_mask tensor: {e}");
+                    return NliResult::neutral_fallback();
+                }
+            };
 
         // Run inference.
         let outputs = match self.session.run(ort::inputs![

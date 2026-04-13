@@ -3,6 +3,7 @@ use std::path::Path;
 
 use chrono;
 use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
+use serde::Serialize;
 use thinkingroot_core::types::{Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
@@ -297,7 +298,8 @@ impl GraphStore {
         params.insert(
             "grounding_method".into(),
             DataValue::Str(
-                claim.grounding_method
+                claim
+                    .grounding_method
                     .map(|m| format!("{m:?}"))
                     .unwrap_or_default()
                     .into(),
@@ -306,6 +308,7 @@ impl GraphStore {
         let tier_str = match claim.extraction_tier {
             thinkingroot_core::types::ExtractionTier::Structural => "structural",
             thinkingroot_core::types::ExtractionTier::Llm => "llm",
+            thinkingroot_core::types::ExtractionTier::AgentInferred => "agent_inferred",
         };
         params.insert("extraction_tier".into(), DataValue::Str(tier_str.into()));
 
@@ -514,9 +517,9 @@ impl GraphStore {
         }
 
         for ((from_id, to_id, relation_type), strengths) in &grouped {
-            let complement_product = strengths.iter().fold(1.0_f64, |acc, &s| {
-                acc * (1.0 - s.clamp(0.0, 1.0))
-            });
+            let complement_product = strengths
+                .iter()
+                .fold(1.0_f64, |acc, &s| acc * (1.0 - s.clamp(0.0, 1.0)));
             let noisy_or_strength = (1.0 - complement_product).clamp(0.0, 1.0);
             self.link_entities(from_id, to_id, relation_type, noisy_or_strength)?;
         }
@@ -631,10 +634,7 @@ impl GraphStore {
             let mut params = BTreeMap::new();
             params.insert("fid".into(), DataValue::Str(from_id.clone().into()));
             params.insert("tid".into(), DataValue::Str(to_id.clone().into()));
-            params.insert(
-                "rtype".into(),
-                DataValue::Str(relation_type.clone().into()),
-            );
+            params.insert("rtype".into(), DataValue::Str(relation_type.clone().into()));
             self.query(
                 r#"?[from_id, to_id, relation_type] <- [[$fid, $tid, $rtype]]
                 :rm entity_relations {from_id, to_id, relation_type}"#,
@@ -696,9 +696,8 @@ impl GraphStore {
     /// Returns (canonical_name, entity_type) pairs for all entities.
     /// Used by graph-primed extraction to inject KNOWN_ENTITIES into LLM prompts.
     pub fn get_known_entities(&self) -> Result<Vec<(String, String)>> {
-        let result = self.query_read(
-            "?[name, entity_type] := *entities{canonical_name: name, entity_type}",
-        )?;
+        let result = self
+            .query_read("?[name, entity_type] := *entities{canonical_name: name, entity_type}")?;
         Ok(result
             .rows
             .into_iter()
@@ -1072,9 +1071,7 @@ impl GraphStore {
     /// field in the claims table.  Used by the diff algorithm to carry real SourceIds
     /// into `DiffClaim` objects rather than synthetic placeholder IDs.
     pub fn get_claim_source_id_map(&self) -> Result<std::collections::HashMap<String, String>> {
-        let result = self.query_read(
-            "?[id, source_id] := *claims{id, source_id}",
-        )?;
+        let result = self.query_read("?[id, source_id] := *claims{id, source_id}")?;
         Ok(result
             .rows
             .iter()
@@ -1098,10 +1095,24 @@ impl GraphStore {
             .collect())
     }
 
+    /// Return all sources as `(uri, content_hash)` pairs.
+    ///
+    /// Used by `root status` to compare stored hashes against current on-disk
+    /// file contents, identifying modified, untracked, and deleted sources
+    /// without running a full compile.
+    pub fn get_sources_with_hashes(&self) -> Result<Vec<(String, String)>> {
+        let result = self.query_read("?[uri, content_hash] := *sources{uri, content_hash}")?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| (dv_to_string(&row[0]), dv_to_string(&row[1])))
+            .collect())
+    }
+
     /// Look up a source by its ID and return a reconstructed `Source` struct.
     /// Returns `None` if no source with that ID exists.
     pub fn get_source_by_id(&self, id: &str) -> Result<Option<thinkingroot_core::Source>> {
-        use thinkingroot_core::types::{SourceId, SourceType, ContentHash, TrustLevel};
+        use thinkingroot_core::types::{ContentHash, SourceId, SourceType, TrustLevel};
 
         let mut params = BTreeMap::new();
         params.insert("id".into(), DataValue::Str(id.into()));
@@ -1130,21 +1141,21 @@ impl GraphStore {
 
         let source_type = match source_type_str.as_str() {
             "GitCommit" => SourceType::GitCommit,
-            "GitDiff"   => SourceType::GitDiff,
-            "Document"  => SourceType::Document,
+            "GitDiff" => SourceType::GitDiff,
+            "Document" => SourceType::Document,
             "ChatMessage" => SourceType::ChatMessage,
-            "WebPage"   => SourceType::WebPage,
-            "Api"       => SourceType::Api,
-            "Manual"    => SourceType::Manual,
-            _           => SourceType::File,
+            "WebPage" => SourceType::WebPage,
+            "Api" => SourceType::Api,
+            "Manual" => SourceType::Manual,
+            _ => SourceType::File,
         };
 
         let trust_level = match trust_level_str.as_str() {
             "Quarantined" => TrustLevel::Quarantined,
-            "Untrusted"   => TrustLevel::Untrusted,
-            "Trusted"     => TrustLevel::Trusted,
-            "Verified"    => TrustLevel::Verified,
-            _             => TrustLevel::Unknown,
+            "Untrusted" => TrustLevel::Untrusted,
+            "Trusted" => TrustLevel::Trusted,
+            "Verified" => TrustLevel::Verified,
+            _ => TrustLevel::Unknown,
         };
 
         let source_id: SourceId = id.parse().unwrap_or_else(|_| SourceId::new());
@@ -1163,8 +1174,8 @@ impl GraphStore {
     /// Joins `claims` with `claim_temporal` for full temporal metadata.
     /// Returns `None` if no claim with that ID exists.
     pub fn get_claim_by_id(&self, id: &str) -> Result<Option<thinkingroot_core::Claim>> {
-        use thinkingroot_core::{Claim, ClaimId, SourceId, WorkspaceId};
         use thinkingroot_core::types::{ClaimType, Confidence, PipelineVersion, Sensitivity};
+        use thinkingroot_core::{Claim, ClaimId, SourceId, WorkspaceId};
 
         let mut params = BTreeMap::new();
         params.insert("id".into(), DataValue::Str(id.into()));
@@ -1181,64 +1192,68 @@ impl GraphStore {
             None => return Ok(None),
         };
 
-        let statement    = dv_to_string(&row[0]);
+        let statement = dv_to_string(&row[0]);
         let claim_type_s = dv_to_string(&row[1]);
-        let source_id_s  = dv_to_string(&row[2]);
-        let confidence   = match &row[3] {
+        let source_id_s = dv_to_string(&row[2]);
+        let confidence = match &row[3] {
             DataValue::Num(Num::Float(f)) => *f,
-            DataValue::Num(Num::Int(n))   => *n as f64,
+            DataValue::Num(Num::Int(n)) => *n as f64,
             _ => 0.8,
         };
-        let sensitivity_s  = dv_to_string(&row[4]);
+        let sensitivity_s = dv_to_string(&row[4]);
         let workspace_id_s = dv_to_string(&row[5]);
-        let created_ts     = match &row[6] {
+        let created_ts = match &row[6] {
             DataValue::Num(Num::Float(f)) => *f,
-            DataValue::Num(Num::Int(n))   => *n as f64,
+            DataValue::Num(Num::Int(n)) => *n as f64,
             _ => 0.0,
         };
 
         let grounding_score_val = match &row[7] {
             DataValue::Num(Num::Float(f)) if *f >= 0.0 => Some(*f),
             DataValue::Num(Num::Int(n)) if *n >= 0 => Some(*n as f64),
-            _ => None,  // -1.0 is stored when unset
+            _ => None, // -1.0 is stored when unset
         };
         let grounding_method_s = dv_to_string(&row[8]);
 
         let claim_type = match claim_type_s.as_str() {
-            "Decision"     => ClaimType::Decision,
-            "Opinion"      => ClaimType::Opinion,
-            "Plan"         => ClaimType::Plan,
-            "Requirement"  => ClaimType::Requirement,
-            "Metric"       => ClaimType::Metric,
-            "Definition"   => ClaimType::Definition,
-            "Dependency"   => ClaimType::Dependency,
+            "Decision" => ClaimType::Decision,
+            "Opinion" => ClaimType::Opinion,
+            "Plan" => ClaimType::Plan,
+            "Requirement" => ClaimType::Requirement,
+            "Metric" => ClaimType::Metric,
+            "Definition" => ClaimType::Definition,
+            "Dependency" => ClaimType::Dependency,
             "ApiSignature" => ClaimType::ApiSignature,
             "Architecture" => ClaimType::Architecture,
-            _              => ClaimType::Fact,
+            _ => ClaimType::Fact,
         };
 
         let sensitivity = match sensitivity_s.as_str() {
-            "Internal"     => Sensitivity::Internal,
+            "Internal" => Sensitivity::Internal,
             "Confidential" => Sensitivity::Confidential,
-            "Restricted"   => Sensitivity::Restricted,
-            _              => Sensitivity::Public,
+            "Restricted" => Sensitivity::Restricted,
+            _ => Sensitivity::Public,
         };
 
-        let claim_id   = id.parse::<ClaimId>().unwrap_or_else(|_| ClaimId::new());
-        let source_id  = source_id_s.parse::<SourceId>().unwrap_or_else(|_| SourceId::new());
-        let workspace  = workspace_id_s.parse::<WorkspaceId>().unwrap_or_else(|_| WorkspaceId::new());
-        let created_at = chrono::DateTime::from_timestamp(created_ts as i64, 0)
-            .unwrap_or_else(chrono::Utc::now);
+        let claim_id = id.parse::<ClaimId>().unwrap_or_else(|_| ClaimId::new());
+        let source_id = source_id_s
+            .parse::<SourceId>()
+            .unwrap_or_else(|_| SourceId::new());
+        let workspace = workspace_id_s
+            .parse::<WorkspaceId>()
+            .unwrap_or_else(|_| WorkspaceId::new());
+        let created_at =
+            chrono::DateTime::from_timestamp(created_ts as i64, 0).unwrap_or_else(chrono::Utc::now);
 
         use thinkingroot_core::types::GroundingMethod;
         let grounding_method = match grounding_method_s.as_str() {
-            "Lexical"    => Some(GroundingMethod::Lexical),
-            "Span"       => Some(GroundingMethod::Span),
-            "Semantic"   => Some(GroundingMethod::Semantic),
-            "Combined"   => Some(GroundingMethod::Combined),
+            "Lexical" => Some(GroundingMethod::Lexical),
+            "Span" => Some(GroundingMethod::Span),
+            "Semantic" => Some(GroundingMethod::Semantic),
+            "Combined" => Some(GroundingMethod::Combined),
             "Unverified" => Some(GroundingMethod::Unverified),
             "Structural" => Some(GroundingMethod::Structural),
-            _            => None,
+            _ => None,
         };
 
         Ok(Some(Claim {
@@ -1259,7 +1274,8 @@ impl GraphStore {
             grounding_method,
             extraction_tier: match dv_to_string(&row[9]).as_str() {
                 "structural" => thinkingroot_core::types::ExtractionTier::Structural,
-                "llm" | _ => thinkingroot_core::types::ExtractionTier::Llm,
+                "agent_inferred" => thinkingroot_core::types::ExtractionTier::AgentInferred,
+                _ => thinkingroot_core::types::ExtractionTier::Llm,
             },
         }))
     }
@@ -1833,6 +1849,404 @@ impl GraphStore {
     }
 }
 
+// ─── Intelligent Serve Layer: graph traversal types ──────────────────────────
+
+/// A single claim with its source provenance — used in entity context queries.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextClaim {
+    pub id: String,
+    pub statement: String,
+    pub claim_type: String,
+    pub confidence: f64,
+    pub source_uri: String,
+    pub extraction_tier: String,
+}
+
+/// A contradiction involving one of an entity's claims.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextContradiction {
+    pub explanation: String,
+    pub status: String,
+}
+
+/// Full context for one entity: its metadata, relations (both directions),
+/// claims with provenance, and any active contradictions.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityContext {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub description: String,
+    pub aliases: Vec<String>,
+    /// Relations FROM this entity to others: (target_name, rel_type, strength).
+    pub outgoing_relations: Vec<(String, String, f64)>,
+    /// Relations TO this entity from others: (source_name, rel_type, strength).
+    pub incoming_relations: Vec<(String, String, f64)>,
+    pub claims: Vec<ContextClaim>,
+    pub contradictions: Vec<ContextContradiction>,
+}
+
+/// A direct neighbour of the focal entity in the graph.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborhoodEntity {
+    pub name: String,
+    pub entity_type: String,
+    pub relation_type: String,
+    /// "outgoing" (focal → neighbour) or "incoming" (neighbour → focal).
+    pub direction: String,
+    pub claim_count: usize,
+}
+
+/// Top entity by claim count — used for workspace overview.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopEntity {
+    pub name: String,
+    pub entity_type: String,
+    pub claim_count: usize,
+}
+
+// ─── GraphStore: intelligent serve methods ───────────────────────────────────
+
+impl GraphStore {
+    /// Return complete context for the entity with the given canonical name.
+    /// Executes 6 Datalog queries covering entity metadata, outgoing relations,
+    /// incoming relations, claims with sources, and contradictions (both sides).
+    /// Returns `None` when no entity with that name exists.
+    pub fn get_entity_context(&self, entity_name: &str) -> Result<Option<EntityContext>> {
+        let mut name_params = BTreeMap::new();
+        name_params.insert("name".into(), DataValue::Str(entity_name.into()));
+
+        // 1. Resolve entity id, type, description.
+        let entity_rows = self
+            .db
+            .run_script(
+                "?[id, entity_type, description] := *entities{id, canonical_name: $name, entity_type, description}",
+                name_params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("entity_context query failed: {e}")))?;
+
+        let (eid, entity_type, description) = match entity_rows.rows.first() {
+            None => return Ok(None),
+            Some(row) => (
+                dv_to_string(&row[0]),
+                dv_to_string(&row[1]),
+                dv_to_string(&row[2]),
+            ),
+        };
+
+        let mut eid_params = BTreeMap::new();
+        eid_params.insert("eid".into(), DataValue::Str(eid.clone().into()));
+
+        // 2. Aliases.
+        let aliases = self.get_aliases_for_entity(&eid)?;
+
+        // 3. Outgoing relations: focal → neighbour.
+        let out_rows = self
+            .db
+            .run_script(
+                r#"?[to_name, rel_type, strength] :=
+                    *entity_relations{from_id: $eid, to_id, relation_type: rel_type, strength},
+                    *entities{id: to_id, canonical_name: to_name}"#,
+                eid_params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("outgoing_relations query failed: {e}")))?;
+
+        let outgoing_relations = out_rows
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_float(&row[2]),
+                )
+            })
+            .collect();
+
+        // 4. Incoming relations: neighbour → focal (reverse deps).
+        let in_rows = self
+            .db
+            .run_script(
+                r#"?[from_name, rel_type, strength] :=
+                    *entity_relations{from_id, to_id: $eid, relation_type: rel_type, strength},
+                    *entities{id: from_id, canonical_name: from_name}"#,
+                eid_params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("incoming_relations query failed: {e}")))?;
+
+        let incoming_relations = in_rows
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_float(&row[2]),
+                )
+            })
+            .collect();
+
+        // 5. Claims with source URIs (3-way join).
+        let claims_rows = self
+            .db
+            .run_script(
+                r#"?[id, statement, claim_type, confidence, uri, extraction_tier] :=
+                    *claim_entity_edges{claim_id: id, entity_id: $eid},
+                    *claims{id, statement, claim_type, confidence, extraction_tier},
+                    *claim_source_edges{claim_id: id, source_id: sid},
+                    *sources{id: sid, uri}"#,
+                eid_params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("claims_context query failed: {e}")))?;
+
+        let claims = claims_rows
+            .rows
+            .iter()
+            .map(|row| ContextClaim {
+                id: dv_to_string(&row[0]),
+                statement: dv_to_string(&row[1]),
+                claim_type: dv_to_string(&row[2]),
+                confidence: dv_to_float(&row[3]),
+                source_uri: dv_to_string(&row[4]),
+                extraction_tier: dv_to_string(&row[5]),
+            })
+            .collect();
+
+        // 6a. Contradictions where this entity's claim is claim_a.
+        let contra_a = self
+            .db
+            .run_script(
+                r#"?[explanation, status] :=
+                    *claim_entity_edges{claim_id, entity_id: $eid},
+                    *contradictions{claim_a: claim_id, explanation, status}"#,
+                eid_params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("contradictions_a query failed: {e}")))?;
+
+        // 6b. Contradictions where this entity's claim is claim_b.
+        let contra_b = self
+            .db
+            .run_script(
+                r#"?[explanation, status] :=
+                    *claim_entity_edges{claim_id, entity_id: $eid},
+                    *contradictions{claim_b: claim_id, explanation, status}"#,
+                eid_params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("contradictions_b query failed: {e}")))?;
+
+        let mut contradictions: Vec<ContextContradiction> = contra_a
+            .rows
+            .iter()
+            .chain(contra_b.rows.iter())
+            .map(|row| ContextContradiction {
+                explanation: dv_to_string(&row[0]),
+                status: dv_to_string(&row[1]),
+            })
+            .collect();
+
+        // Deduplicate by explanation text (both sides may yield same contradiction).
+        contradictions.sort_by(|a, b| a.explanation.cmp(&b.explanation));
+        contradictions.dedup_by(|a, b| a.explanation == b.explanation);
+
+        Ok(Some(EntityContext {
+            id: eid,
+            name: entity_name.to_string(),
+            entity_type,
+            description,
+            aliases,
+            outgoing_relations,
+            incoming_relations,
+            claims,
+            contradictions,
+        }))
+    }
+
+    /// Return all entities that have a relation pointing TO `entity_name`.
+    /// Result: (caller_name, relation_type, strength).
+    pub fn find_reverse_deps(&self, entity_name: &str) -> Result<Vec<(String, String, f64)>> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(entity_name.into()));
+
+        let result = self
+            .db
+            .run_script(
+                r#"?[from_name, rel_type, strength] :=
+                    *entities{id: to_id, canonical_name: $name},
+                    *entity_relations{from_id, to_id, relation_type: rel_type, strength},
+                    *entities{id: from_id, canonical_name: from_name}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("reverse_deps query failed: {e}")))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_float(&row[2]),
+                )
+            })
+            .collect())
+    }
+
+    /// Return all direct neighbours (radius = 1) of `entity_name`, in both
+    /// directions, with their entity type and claim count.
+    pub fn get_neighborhood(&self, entity_name: &str) -> Result<Vec<NeighborhoodEntity>> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(entity_name.into()));
+
+        // Outgoing: focal → neighbour.
+        let out_rows = self
+            .db
+            .run_script(
+                r#"?[neighbor_name, neighbor_type, rel_type] :=
+                    *entities{id: eid, canonical_name: $name},
+                    *entity_relations{from_id: eid, to_id, relation_type: rel_type},
+                    *entities{id: to_id, canonical_name: neighbor_name, entity_type: neighbor_type}"#,
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("neighborhood_out query failed: {e}")))?;
+
+        // Incoming: neighbour → focal.
+        let in_rows = self
+            .db
+            .run_script(
+                r#"?[neighbor_name, neighbor_type, rel_type] :=
+                    *entities{id: eid, canonical_name: $name},
+                    *entity_relations{from_id, to_id: eid, relation_type: rel_type},
+                    *entities{id: from_id, canonical_name: neighbor_name, entity_type: neighbor_type}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("neighborhood_in query failed: {e}")))?;
+
+        let mut neighbors: Vec<NeighborhoodEntity> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (rows, direction) in [(&out_rows.rows, "outgoing"), (&in_rows.rows, "incoming")] {
+            for row in rows {
+                let name = dv_to_string(&row[0]);
+                if seen.insert(name.clone()) {
+                    let claim_count = self.get_claim_count_for_entity_name(&name).unwrap_or(0);
+                    neighbors.push(NeighborhoodEntity {
+                        name,
+                        entity_type: dv_to_string(&row[1]),
+                        relation_type: dv_to_string(&row[2]),
+                        direction: direction.to_string(),
+                        claim_count,
+                    });
+                }
+            }
+        }
+
+        Ok(neighbors)
+    }
+
+    /// Return the top `limit` entities ranked by claim count.
+    pub fn get_top_entities_by_claim_count(&self, limit: usize) -> Result<Vec<TopEntity>> {
+        let result = self
+            .db
+            .run_script(
+                r#"entity_cnts[eid, count(cid)] :=
+                    *claim_entity_edges{entity_id: eid, claim_id: cid}
+                ?[name, entity_type, cnt] :=
+                    entity_cnts[eid, cnt],
+                    *entities{id: eid, canonical_name: name, entity_type}
+                :order -cnt
+                :limit 20"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("top_entities query failed: {e}")))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .take(limit)
+            .map(|row| TopEntity {
+                name: dv_to_string(&row[0]),
+                entity_type: dv_to_string(&row[1]),
+                claim_count: match &row[2] {
+                    DataValue::Num(Num::Int(n)) => *n as usize,
+                    DataValue::Num(Num::Float(f)) => *f as usize,
+                    _ => 0,
+                },
+            })
+            .collect())
+    }
+
+    /// Count claims linked to an entity looked up by canonical name.
+    fn get_claim_count_for_entity_name(&self, entity_name: &str) -> Result<usize> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(entity_name.into()));
+
+        let result = self
+            .db
+            .run_script(
+                r#"?[count(cid)] :=
+                    *entities{id: eid, canonical_name: $name},
+                    *claim_entity_edges{claim_id: cid, entity_id: eid}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("claim_count query failed: {e}")))?;
+
+        Ok(count_from_rows(&result.rows))
+    }
+
+    /// Find an entity by exact canonical name (case-insensitive) or by alias.
+    /// Returns `(id, canonical_name)` if found.
+    pub fn find_entity_by_name(&self, name: &str) -> Result<Option<(String, String)>> {
+        let lower = name.to_lowercase();
+        let mut params = BTreeMap::new();
+        params.insert("lower".into(), DataValue::Str(lower.clone().into()));
+
+        // Exact case-insensitive match on canonical name.
+        let result = self
+            .db
+            .run_script(
+                r#"?[id, canonical_name] :=
+                    *entities{id, canonical_name},
+                    lowercase(canonical_name) = $lower"#,
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("find_entity query failed: {e}")))?;
+
+        if let Some(row) = result.rows.first() {
+            return Ok(Some((dv_to_string(&row[0]), dv_to_string(&row[1]))));
+        }
+
+        // Alias match.
+        let alias_result = self
+            .db
+            .run_script(
+                r#"?[id, canonical_name] :=
+                    *entity_aliases{entity_id: id, alias},
+                    lowercase(alias) = $lower,
+                    *entities{id, canonical_name}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("find_entity_alias query failed: {e}")))?;
+
+        Ok(alias_result
+            .rows
+            .first()
+            .map(|row| (dv_to_string(&row[0]), dv_to_string(&row[1]))))
+    }
+}
+
 /// Extract a String from a DataValue.
 fn dv_to_string(val: &DataValue) -> String {
     match val {
@@ -1841,6 +2255,15 @@ fn dv_to_string(val: &DataValue) -> String {
         DataValue::Num(Num::Float(f)) => f.to_string(),
         DataValue::Null => String::new(),
         other => format!("{other:?}"),
+    }
+}
+
+/// Extract an f64 from a DataValue — handles both Float and Int variants.
+fn dv_to_float(val: &DataValue) -> f64 {
+    match val {
+        DataValue::Num(Num::Float(f)) => *f,
+        DataValue::Num(Num::Int(i)) => *i as f64,
+        _ => 0.0,
     }
 }
 
@@ -2052,9 +2475,12 @@ mod tests {
         let store = mem_store();
 
         // Create real entities so get_all_relations() JOIN works.
-        let e1 = thinkingroot_core::Entity::new("Alpha", thinkingroot_core::types::EntityType::System);
-        let e2 = thinkingroot_core::Entity::new("Beta", thinkingroot_core::types::EntityType::Service);
-        let e3 = thinkingroot_core::Entity::new("Gamma", thinkingroot_core::types::EntityType::Database);
+        let e1 =
+            thinkingroot_core::Entity::new("Alpha", thinkingroot_core::types::EntityType::System);
+        let e2 =
+            thinkingroot_core::Entity::new("Beta", thinkingroot_core::types::EntityType::Service);
+        let e3 =
+            thinkingroot_core::Entity::new("Gamma", thinkingroot_core::types::EntityType::Database);
         store.insert_entity(&e1).unwrap();
         store.insert_entity(&e2).unwrap();
         store.insert_entity(&e3).unwrap();
@@ -2079,9 +2505,15 @@ mod tests {
 
         // Source A: e1→Uses→e2 (0.8) and e1→DependsOn→e3 (0.7).
         // Source B: e1→Uses→e2 (0.9) — also contributes to first triple.
-        store.link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 0.8).unwrap();
-        store.link_entities_for_source(&sid_a, &eid1, &eid3, "DependsOn", 0.7).unwrap();
-        store.link_entities_for_source(&sid_b, &eid1, &eid2, "Uses", 0.9).unwrap();
+        store
+            .link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 0.8)
+            .unwrap();
+        store
+            .link_entities_for_source(&sid_a, &eid1, &eid3, "DependsOn", 0.7)
+            .unwrap();
+        store
+            .link_entities_for_source(&sid_b, &eid1, &eid2, "Uses", 0.9)
+            .unwrap();
 
         // Full rebuild to set initial entity_relations state.
         store.rebuild_entity_relations().unwrap();
@@ -2096,20 +2528,28 @@ mod tests {
         store.remove_source_by_uri("test://a.md").unwrap();
 
         // Incremental update — only re-aggregate affected triples.
-        store.update_entity_relations_for_triples(&affected).unwrap();
+        store
+            .update_entity_relations_for_triples(&affected)
+            .unwrap();
 
         let after = store.get_all_relations().unwrap();
         // e1→Uses→e2 should remain (src_b still has it at 0.9).
         // e1→DependsOn→e3 should be gone (src_a was the only contributor).
-        assert_eq!(after.len(), 1, "only the triple still supported by src-b should remain");
+        assert_eq!(
+            after.len(),
+            1,
+            "only the triple still supported by src-b should remain"
+        );
     }
 
     #[test]
     fn incremental_update_recomputes_strength_noisy_or() {
         let store = mem_store();
 
-        let e1 = thinkingroot_core::Entity::new("Svc1", thinkingroot_core::types::EntityType::Service);
-        let e2 = thinkingroot_core::Entity::new("Svc2", thinkingroot_core::types::EntityType::Service);
+        let e1 =
+            thinkingroot_core::Entity::new("Svc1", thinkingroot_core::types::EntityType::Service);
+        let e2 =
+            thinkingroot_core::Entity::new("Svc2", thinkingroot_core::types::EntityType::Service);
         store.insert_entity(&e1).unwrap();
         store.insert_entity(&e2).unwrap();
 
@@ -2132,13 +2572,20 @@ mod tests {
 
         // Source A: strength 1.0 (highest). Source B: strength 0.5.
         // noisy-OR(1.0, 0.5) = 1 - (1-1.0)*(1-0.5) = 1 - 0 = 1.0
-        store.link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 1.0).unwrap();
-        store.link_entities_for_source(&sid_b, &eid1, &eid2, "Uses", 0.5).unwrap();
+        store
+            .link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 1.0)
+            .unwrap();
+        store
+            .link_entities_for_source(&sid_b, &eid1, &eid2, "Uses", 0.5)
+            .unwrap();
 
         store.rebuild_entity_relations().unwrap();
         let before = store.get_all_relations().unwrap();
         let (_, _, _, _, _, initial_strength) = before[0];
-        assert_eq!(initial_strength, 1.0, "noisy-OR with a 1.0 source should give 1.0 initially");
+        assert_eq!(
+            initial_strength, 1.0,
+            "noisy-OR with a 1.0 source should give 1.0 initially"
+        );
 
         // Capture triples, remove source A, re-add at lower strength.
         let affected = store.get_source_relation_triples(&sid_a).unwrap();
@@ -2146,10 +2593,14 @@ mod tests {
 
         // Re-insert source A with lower strength (simulates file content change).
         store.insert_source(&src_a).unwrap();
-        store.link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 0.3).unwrap();
+        store
+            .link_entities_for_source(&sid_a, &eid1, &eid2, "Uses", 0.3)
+            .unwrap();
 
         // Incremental update should recompute noisy-OR(0.3, 0.5) = 1 - (1-0.3)*(1-0.5) = 1 - 0.35 = 0.65.
-        store.update_entity_relations_for_triples(&affected).unwrap();
+        store
+            .update_entity_relations_for_triples(&affected)
+            .unwrap();
 
         let after = store.get_all_relations().unwrap();
         assert_eq!(after.len(), 1);
@@ -2164,7 +2615,10 @@ mod tests {
     fn get_entity_ids_for_source_returns_linked_entities() {
         let store = mem_store();
 
-        let entity = thinkingroot_core::types::Entity::new("Alpha", thinkingroot_core::types::EntityType::System);
+        let entity = thinkingroot_core::types::Entity::new(
+            "Alpha",
+            thinkingroot_core::types::EntityType::System,
+        );
         store.insert_entity(&entity).unwrap();
 
         let source = thinkingroot_core::Source::new(
@@ -2181,10 +2635,16 @@ mod tests {
             workspace,
         );
         store.insert_claim(&claim).unwrap();
-        store.link_claim_to_source(&claim.id.to_string(), &source.id.to_string()).unwrap();
-        store.link_claim_to_entity(&claim.id.to_string(), &entity.id.to_string()).unwrap();
+        store
+            .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())
+            .unwrap();
+        store
+            .link_claim_to_entity(&claim.id.to_string(), &entity.id.to_string())
+            .unwrap();
 
-        let entity_ids = store.get_entity_ids_for_source(&source.id.to_string()).unwrap();
+        let entity_ids = store
+            .get_entity_ids_for_source(&source.id.to_string())
+            .unwrap();
         assert_eq!(entity_ids.len(), 1);
         assert_eq!(entity_ids[0], entity.id.to_string());
 
@@ -2194,7 +2654,9 @@ mod tests {
             thinkingroot_core::types::SourceType::File,
         );
         store.insert_source(&source2).unwrap();
-        let entity_ids2 = store.get_entity_ids_for_source(&source2.id.to_string()).unwrap();
+        let entity_ids2 = store
+            .get_entity_ids_for_source(&source2.id.to_string())
+            .unwrap();
         assert!(entity_ids2.is_empty());
     }
 
@@ -2269,9 +2731,18 @@ mod tests {
         let eid1 = e1.id.to_string();
         let eid2 = e2.id.to_string();
 
-        let src_a = thinkingroot_core::Source::new("test://a.rs".into(), thinkingroot_core::types::SourceType::File);
-        let src_b = thinkingroot_core::Source::new("test://b.rs".into(), thinkingroot_core::types::SourceType::File);
-        let src_c = thinkingroot_core::Source::new("test://c.rs".into(), thinkingroot_core::types::SourceType::File);
+        let src_a = thinkingroot_core::Source::new(
+            "test://a.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        let src_b = thinkingroot_core::Source::new(
+            "test://b.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        let src_c = thinkingroot_core::Source::new(
+            "test://c.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
         store.insert_source(&src_a).unwrap();
         store.insert_source(&src_b).unwrap();
         store.insert_source(&src_c).unwrap();
@@ -2279,14 +2750,18 @@ mod tests {
         // Three sources each with strength 0.5.
         // MAX would give 0.5.
         // Noisy-OR gives 1 - (1-0.5)^3 = 1 - 0.125 = 0.875.
-        store.link_entities_for_source(&src_a.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
-        store.link_entities_for_source(&src_b.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
-        store.link_entities_for_source(&src_c.id.to_string(), &eid1, &eid2, "Uses", 0.5).unwrap();
+        store
+            .link_entities_for_source(&src_a.id.to_string(), &eid1, &eid2, "Uses", 0.5)
+            .unwrap();
+        store
+            .link_entities_for_source(&src_b.id.to_string(), &eid1, &eid2, "Uses", 0.5)
+            .unwrap();
+        store
+            .link_entities_for_source(&src_c.id.to_string(), &eid1, &eid2, "Uses", 0.5)
+            .unwrap();
 
         // Trigger aggregation.
-        let triples = vec![
-            (eid1.clone(), eid2.clone(), "Uses".to_string()),
-        ];
+        let triples = vec![(eid1.clone(), eid2.clone(), "Uses".to_string())];
         store.update_entity_relations_for_triples(&triples).unwrap();
 
         let relations = store.get_all_relations().unwrap();
@@ -2307,9 +2782,12 @@ mod tests {
     fn get_all_triples_involving_entities_returns_cross_file_edges() {
         let store = mem_store();
 
-        let e1 = thinkingroot_core::Entity::new("Alpha", thinkingroot_core::types::EntityType::Service);
-        let e2 = thinkingroot_core::Entity::new("Beta", thinkingroot_core::types::EntityType::Service);
-        let e3 = thinkingroot_core::Entity::new("Gamma", thinkingroot_core::types::EntityType::Database);
+        let e1 =
+            thinkingroot_core::Entity::new("Alpha", thinkingroot_core::types::EntityType::Service);
+        let e2 =
+            thinkingroot_core::Entity::new("Beta", thinkingroot_core::types::EntityType::Service);
+        let e3 =
+            thinkingroot_core::Entity::new("Gamma", thinkingroot_core::types::EntityType::Database);
         store.insert_entity(&e1).unwrap();
         store.insert_entity(&e2).unwrap();
         store.insert_entity(&e3).unwrap();
@@ -2318,23 +2796,41 @@ mod tests {
         let eid2 = e2.id.to_string();
         let eid3 = e3.id.to_string();
 
-        let src_a = thinkingroot_core::Source::new("a.rs".into(), thinkingroot_core::types::SourceType::File);
-        let src_b = thinkingroot_core::Source::new("b.rs".into(), thinkingroot_core::types::SourceType::File);
+        let src_a = thinkingroot_core::Source::new(
+            "a.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        let src_b = thinkingroot_core::Source::new(
+            "b.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
         store.insert_source(&src_a).unwrap();
         store.insert_source(&src_b).unwrap();
 
-        store.link_entities_for_source(&src_a.id.to_string(), &eid1, &eid2, "Uses", 0.9).unwrap();
-        store.link_entities_for_source(&src_b.id.to_string(), &eid2, &eid3, "DependsOn", 0.8).unwrap();
+        store
+            .link_entities_for_source(&src_a.id.to_string(), &eid1, &eid2, "Uses", 0.9)
+            .unwrap();
+        store
+            .link_entities_for_source(&src_b.id.to_string(), &eid2, &eid3, "DependsOn", 0.8)
+            .unwrap();
         store.rebuild_entity_relations().unwrap();
 
         // Query triples involving e1.
-        let triples = store.get_all_triples_involving_entities(&[eid1.clone()]).unwrap();
+        let triples = store
+            .get_all_triples_involving_entities(&[eid1.clone()])
+            .unwrap();
         assert_eq!(triples.len(), 1);
         assert!(triples.iter().any(|(f, t, _)| f == &eid1 && t == &eid2));
 
         // Query triples involving e2 (appears in BOTH triples).
-        let triples2 = store.get_all_triples_involving_entities(&[eid2.clone()]).unwrap();
-        assert_eq!(triples2.len(), 2, "e2 is in both triples (as target of first, source of second)");
+        let triples2 = store
+            .get_all_triples_involving_entities(&[eid2.clone()])
+            .unwrap();
+        assert_eq!(
+            triples2.len(),
+            2,
+            "e2 is in both triples (as target of first, source of second)"
+        );
 
         // Empty input returns empty.
         let empty = store.get_all_triples_involving_entities(&[]).unwrap();

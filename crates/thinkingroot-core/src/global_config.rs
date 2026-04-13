@@ -30,8 +30,7 @@ impl GlobalConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| Error::io_path(&path, e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| Error::io_path(&path, e))?;
         let config: GlobalConfig = toml::from_str(&content)?;
         Ok(config)
     }
@@ -42,12 +41,10 @@ impl GlobalConfig {
         let path = Self::path()
             .ok_or_else(|| Error::MissingConfig("cannot resolve config directory".into()))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::io_path(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content)
-            .map_err(|e| Error::io_path(&path, e))?;
+        std::fs::write(&path, content).map_err(|e| Error::io_path(&path, e))?;
         Ok(())
     }
 }
@@ -97,8 +94,7 @@ impl WorkspaceRegistry {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| Error::io_path(&path, e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| Error::io_path(&path, e))?;
         let registry: WorkspaceRegistry = toml::from_str(&content)?;
         Ok(registry)
     }
@@ -108,12 +104,10 @@ impl WorkspaceRegistry {
         let path = Self::path()
             .ok_or_else(|| Error::MissingConfig("cannot resolve config directory".into()))?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::io_path(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content)
-            .map_err(|e| Error::io_path(&path, e))?;
+        std::fs::write(&path, content).map_err(|e| Error::io_path(&path, e))?;
         Ok(())
     }
 
@@ -132,8 +126,7 @@ impl WorkspaceRegistry {
 
     /// Next port not already used by any registered workspace, starting at 3000.
     pub fn next_available_port(&self) -> u16 {
-        let used: std::collections::HashSet<u16> =
-            self.workspaces.iter().map(|w| w.port).collect();
+        let used: std::collections::HashSet<u16> = self.workspaces.iter().map(|w| w.port).collect();
         let mut port = 3000u16;
         while used.contains(&port) {
             port += 1;
@@ -170,7 +163,10 @@ mod tests {
             port: 3000,
         });
         assert_eq!(reg.workspaces.len(), 2);
-        assert_eq!(reg.workspaces[1].path, std::path::PathBuf::from("/tmp/notes2"));
+        assert_eq!(
+            reg.workspaces[1].path,
+            std::path::PathBuf::from("/tmp/notes2")
+        );
 
         assert!(reg.remove("notes"));
         assert_eq!(reg.workspaces.len(), 1);
@@ -186,8 +182,16 @@ mod tests {
     #[test]
     fn next_available_port_skips_used() {
         let mut reg = WorkspaceRegistry::default();
-        reg.add(WorkspaceEntry { name: "a".to_string(), path: PathBuf::from("/a"), port: 3000 });
-        reg.add(WorkspaceEntry { name: "b".to_string(), path: PathBuf::from("/b"), port: 3001 });
+        reg.add(WorkspaceEntry {
+            name: "a".to_string(),
+            path: PathBuf::from("/a"),
+            port: 3000,
+        });
+        reg.add(WorkspaceEntry {
+            name: "b".to_string(),
+            path: PathBuf::from("/b"),
+            port: 3001,
+        });
         assert_eq!(reg.next_available_port(), 3002);
     }
 

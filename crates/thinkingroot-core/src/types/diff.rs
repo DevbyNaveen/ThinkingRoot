@@ -2,8 +2,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Claim, Entity};
 use crate::HealthScore;
+use crate::types::{Claim, Entity};
 
 /// A computed semantic diff between two knowledge branches.
 ///

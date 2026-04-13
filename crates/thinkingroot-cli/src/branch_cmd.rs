@@ -2,6 +2,7 @@
 //! CLI handlers for the Knowledge Version Control (KVC) subcommands:
 //! branch, checkout, diff, merge, status, snapshot.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -11,10 +12,12 @@ use thinkingroot_branch::{
     merge::execute_merge, purge_branch, read_head_branch, rollback_merge,
     snapshot::resolve_data_dir, write_head_branch,
 };
-use thinkingroot_core::{Config, MergedBy};
+use thinkingroot_core::{Config, MergedBy, types::ContentHash};
 use thinkingroot_graph::graph::GraphStore;
 
 /// Handle `root branch [<name>] [--list] [--delete <name>] [--purge <name>] [--gc]`
+///
+/// With no arguments, defaults to `--list`.
 pub async fn handle_branch(
     root: &Path,
     name: Option<&str>,
@@ -24,6 +27,8 @@ pub async fn handle_branch(
     gc: bool,
     description: Option<String>,
 ) -> anyhow::Result<()> {
+    // Default to list when no action is specified.
+    let list = list || (name.is_none() && delete.is_none() && purge.is_none() && !gc);
     if list {
         let branches = list_branches(root)?;
         if branches.is_empty() {
@@ -55,8 +60,7 @@ pub async fn handle_branch(
     }
 
     if let Some(to_purge) = purge {
-        purge_branch(root, to_purge)
-            .with_context(|| format!("branch '{}' not found", to_purge))?;
+        purge_branch(root, to_purge).with_context(|| format!("branch '{}' not found", to_purge))?;
         println!(
             "  {} Branch '{}' purged (data directory removed)",
             style("✓").green(),
@@ -92,17 +96,13 @@ pub async fn handle_branch(
             style(&branch.parent).white()
         );
         println!("  Hint: root checkout {}", branch.name);
-    } else {
-        eprintln!("Usage: root branch <name> | --list | --delete <name> | --purge <name> | --gc");
-        std::process::exit(1);
     }
     Ok(())
 }
 
 /// Handle `root merge <branch> --rollback`
 pub fn handle_rollback(root: &Path, branch: &str) -> anyhow::Result<()> {
-    rollback_merge(root, branch)
-        .with_context(|| format!("rollback of '{}' failed", branch))?;
+    rollback_merge(root, branch).with_context(|| format!("rollback of '{}' failed", branch))?;
     println!(
         "  {} Main rolled back to state before '{}' was merged",
         style("✓").green().bold(),
@@ -304,28 +304,37 @@ pub async fn handle_merge(
     if !resolutions.is_empty() {
         use thinkingroot_core::{AutoResolution, DiffClaim, DiffStatus};
         // Collect resolutions, validating format first to fail fast before mutating diff.
-        let parsed: Vec<(usize, &str)> = resolutions.iter().map(|spec| {
-            let (idx_s, resolution) = spec.split_once('=')
-                .ok_or_else(|| anyhow::anyhow!(
-                    "invalid --resolve format '{}': expected <index>=keep-main|keep-branch", spec
-                ))?;
-            let idx: usize = idx_s.trim().parse()
-                .map_err(|_| anyhow::anyhow!(
-                    "--resolve index must be a non-negative integer, got '{}'", idx_s
-                ))?;
-            if idx >= diff.needs_review.len() {
-                anyhow::bail!(
-                    "--resolve index {} out of range: only {} contradiction(s) need review",
-                    idx, diff.needs_review.len()
-                );
-            }
-            if resolution.trim() != "keep-main" && resolution.trim() != "keep-branch" {
-                anyhow::bail!(
-                    "invalid --resolve value '{}': expected keep-main or keep-branch", resolution
-                );
-            }
-            Ok((idx, resolution.trim()))
-        }).collect::<anyhow::Result<_>>()?;
+        let parsed: Vec<(usize, &str)> = resolutions
+            .iter()
+            .map(|spec| {
+                let (idx_s, resolution) = spec.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid --resolve format '{}': expected <index>=keep-main|keep-branch",
+                        spec
+                    )
+                })?;
+                let idx: usize = idx_s.trim().parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "--resolve index must be a non-negative integer, got '{}'",
+                        idx_s
+                    )
+                })?;
+                if idx >= diff.needs_review.len() {
+                    anyhow::bail!(
+                        "--resolve index {} out of range: only {} contradiction(s) need review",
+                        idx,
+                        diff.needs_review.len()
+                    );
+                }
+                if resolution.trim() != "keep-main" && resolution.trim() != "keep-branch" {
+                    anyhow::bail!(
+                        "invalid --resolve value '{}': expected keep-main or keep-branch",
+                        resolution
+                    );
+                }
+                Ok((idx, resolution.trim()))
+            })
+            .collect::<anyhow::Result<_>>()?;
 
         // Track which needs_review indices to remove after applying all resolutions.
         let mut remove_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -340,12 +349,11 @@ pub async fn handle_merge(
                 "keep-branch" => {
                     // Reconstruct the full Claim from the branch graph and promote to new_claims.
                     let branch_claim_id = pair.branch_claim_id.clone();
-                    let main_claim_id   = pair.main_claim_id.clone();
+                    let main_claim_id = pair.main_claim_id.clone();
                     match branch_graph.get_claim_by_id(&branch_claim_id)? {
                         Some(claim) => {
-                            let entity_map = branch_graph.get_entity_names_for_claims(
-                                &[branch_claim_id.as_str()]
-                            )?;
+                            let entity_map = branch_graph
+                                .get_entity_names_for_claims(&[branch_claim_id.as_str()])?;
                             let entity_context = entity_map
                                 .get(branch_claim_id.as_str())
                                 .cloned()
@@ -366,7 +374,8 @@ pub async fn handle_merge(
                         None => {
                             anyhow::bail!(
                                 "branch claim '{}' not found in branch graph — cannot apply --resolve {}=keep-branch",
-                                branch_claim_id, idx
+                                branch_claim_id,
+                                idx
                             );
                         }
                     }
@@ -377,12 +386,14 @@ pub async fn handle_merge(
         }
 
         // Remove resolved items from needs_review.
-        diff.needs_review.retain(|p| !remove_ids.contains(&p.branch_claim_id));
+        diff.needs_review
+            .retain(|p| !remove_ids.contains(&p.branch_claim_id));
 
         // Re-evaluate merge_allowed now that some contradictions may have been resolved.
         // Drop any blocking reason that referenced contradictions if needs_review is now empty.
         if diff.needs_review.is_empty() {
-            diff.blocking_reasons.retain(|r| !r.contains("contradiction"));
+            diff.blocking_reasons
+                .retain(|r| !r.contains("contradiction"));
         }
         if !force {
             diff.merge_allowed = diff.blocking_reasons.is_empty();
@@ -408,7 +419,10 @@ pub async fn handle_merge(
     );
     println!("    {} new claims", diff.new_claims.len());
     println!("    {} new entities", diff.new_entities.len());
-    println!("    {} auto-resolved contradictions", diff.auto_resolved.len());
+    println!(
+        "    {} auto-resolved contradictions",
+        diff.auto_resolved.len()
+    );
     if !diff.needs_review.is_empty() {
         println!(
             "    {} contradiction(s) remain unresolved (use --resolve to address)",
@@ -420,29 +434,133 @@ pub async fn handle_merge(
 
 /// Handle `root status`
 pub async fn handle_status(root: &Path) -> anyhow::Result<()> {
-    let head = read_head_branch(root).unwrap_or_else(|_| "main".to_string());
-    let branches = list_branches(root).unwrap_or_default();
+    // Canonicalize so that path comparisons against stored URIs are consistent.
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+
+    let head = read_head_branch(&root).unwrap_or_else(|_| "main".to_string());
 
     println!(
         "\n  {} {}",
         style("On branch:").white().bold(),
         style(&head).cyan().bold()
     );
-    if branches.is_empty() {
-        println!("  No active branches");
+
+    // Resolve the graph.db for the active branch (main lives under .thinkingroot/,
+    // feature branches under .thinkingroot-refs/branches/<name>/).
+    let data_dir = if head == "main" {
+        resolve_data_dir(&root, None)
     } else {
-        println!("  Active branches: {}", branches.len());
-        for b in &branches {
-            let marker = if b.name == head {
-                style("*").green()
-            } else {
-                style(" ").dim()
-            };
-            println!("  {}  {}", marker, b.name);
+        resolve_data_dir(&root, Some(&head))
+    };
+    let graph_path = data_dir.join("graph");
+
+    if !graph_path.exists() {
+        println!(
+            "  {}\n",
+            style("Graph not compiled yet — run `root compile .` first").dim()
+        );
+        return Ok(());
+    }
+
+    let graph = GraphStore::init(&graph_path).context("failed to open graph")?;
+
+    // Use parser config for gitignore / exclude-pattern rules so the file list
+    // here matches exactly what the compiler would process.
+    let config = Config::load_merged(&root).unwrap_or_default();
+
+    let files_on_disk =
+        thinkingroot_parse::walker::walk(&root, &config.parsers).unwrap_or_default();
+
+    // (uri → stored_content_hash) from the graph.
+    let graph_sources: HashMap<String, String> = graph
+        .get_sources_with_hashes()
+        .context("failed to read sources from graph")?
+        .into_iter()
+        .collect();
+
+    let mut modified: Vec<String> = Vec::new();
+    let mut untracked: Vec<String> = Vec::new();
+
+    for file_path in &files_on_disk {
+        let uri = file_path.to_string_lossy().to_string();
+        match graph_sources.get(&uri) {
+            Some(stored_hash) => {
+                // Known file — check whether content has changed.
+                match std::fs::read(file_path) {
+                    Ok(bytes) => {
+                        if ContentHash::from_bytes(&bytes).0 != *stored_hash {
+                            modified.push(uri);
+                        }
+                    }
+                    Err(_) => modified.push(uri), // unreadable → treat as modified
+                }
+            }
+            None => untracked.push(uri),
         }
     }
+
+    // Deleted: graph sources whose URI no longer exists on disk.
+    let disk_uris: HashSet<String> = files_on_disk
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let mut deleted: Vec<String> = graph_sources
+        .keys()
+        .filter(|uri| !disk_uris.contains(*uri))
+        .cloned()
+        .collect();
+
+    modified.sort();
+    untracked.sort();
+    deleted.sort();
+
+    println!();
+    println!("  {}", style("Sync Status").white().bold());
+    println!("  {}", style("──────────────────────────────").dim());
+
+    if modified.is_empty() && untracked.is_empty() && deleted.is_empty() {
+        println!("  {} Graph is up to date", style("✓").green().bold());
+    } else {
+        for uri in &modified {
+            println!(
+                "  {}  {}",
+                style("modified ").yellow().bold(),
+                strip_root(&root, uri)
+            );
+        }
+        for uri in &untracked {
+            println!("  {}  {}", style("untracked").dim(), strip_root(&root, uri));
+        }
+        for uri in &deleted {
+            println!(
+                "  {}  {}",
+                style("deleted  ").red().bold(),
+                strip_root(&root, uri)
+            );
+        }
+
+        let total = modified.len() + untracked.len() + deleted.len();
+        println!();
+        println!(
+            "  {} {} file{} out of sync — run {} to update",
+            style("!").yellow(),
+            style(total).white().bold(),
+            if total == 1 { "" } else { "s" },
+            style("root compile").cyan()
+        );
+    }
+
     println!();
     Ok(())
+}
+
+/// Strip the workspace root prefix from a URI for compact display.
+fn strip_root(root: &Path, uri: &str) -> String {
+    let prefix = root.to_string_lossy();
+    uri.strip_prefix(prefix.as_ref())
+        .map(|s| s.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| uri.to_string())
 }
 
 /// Handle `root snapshot <name>`

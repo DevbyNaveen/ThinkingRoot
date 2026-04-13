@@ -43,26 +43,26 @@ pub fn parse(path: &Path, language: &str) -> Result<DocumentIR> {
 
 fn get_language(name: &str) -> Result<tree_sitter::Language> {
     match name {
-        "rust"       => Ok(tree_sitter_rust::LANGUAGE.into()),
-        "python"     => Ok(tree_sitter_python::LANGUAGE.into()),
+        "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        "python" => Ok(tree_sitter_python::LANGUAGE.into()),
         "javascript" => Ok(tree_sitter_javascript::LANGUAGE.into()),
         "typescript" => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx"        => Ok(tree_sitter_typescript::LANGUAGE_TSX.into()),
-        "go"         => Ok(tree_sitter_go::LANGUAGE.into()),
-        "java"       => Ok(tree_sitter_java::LANGUAGE.into()),
-        "c"          => Ok(tree_sitter_c::LANGUAGE.into()),
-        "cpp"        => Ok(tree_sitter_cpp::LANGUAGE.into()),
-        "csharp"     => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
-        "ruby"       => Ok(tree_sitter_ruby::LANGUAGE.into()),
-        "kotlin"     => Ok(tree_sitter_kotlin_ng::LANGUAGE.into()),
-        "swift"      => Ok(tree_sitter_swift::LANGUAGE.into()),
-        "php"        => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
-        "bash"       => Ok(tree_sitter_bash::LANGUAGE.into()),
-        "lua"        => Ok(tree_sitter_lua::LANGUAGE.into()),
-        "scala"      => Ok(tree_sitter_scala::LANGUAGE.into()),
-        "elixir"     => Ok(tree_sitter_elixir::LANGUAGE.into()),
-        "haskell"    => Ok(tree_sitter_haskell::LANGUAGE.into()),
-        "r"          => Ok(tree_sitter_r::LANGUAGE.into()),
+        "tsx" => Ok(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "go" => Ok(tree_sitter_go::LANGUAGE.into()),
+        "java" => Ok(tree_sitter_java::LANGUAGE.into()),
+        "c" => Ok(tree_sitter_c::LANGUAGE.into()),
+        "cpp" => Ok(tree_sitter_cpp::LANGUAGE.into()),
+        "csharp" => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
+        "ruby" => Ok(tree_sitter_ruby::LANGUAGE.into()),
+        "kotlin" => Ok(tree_sitter_kotlin_ng::LANGUAGE.into()),
+        "swift" => Ok(tree_sitter_swift::LANGUAGE.into()),
+        "php" => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
+        "bash" => Ok(tree_sitter_bash::LANGUAGE.into()),
+        "lua" => Ok(tree_sitter_lua::LANGUAGE.into()),
+        "scala" => Ok(tree_sitter_scala::LANGUAGE.into()),
+        "elixir" => Ok(tree_sitter_elixir::LANGUAGE.into()),
+        "haskell" => Ok(tree_sitter_haskell::LANGUAGE.into()),
+        "r" => Ok(tree_sitter_r::LANGUAGE.into()),
         other => Err(Error::UnsupportedFileType {
             extension: other.to_string(),
         }),
@@ -410,8 +410,7 @@ fn collect_calls(source: &str, node: tree_sitter::Node, depth: u8) -> Vec<String
 /// "AuthService::validate"      → "validate"
 /// "foo"                        → "foo"
 fn last_identifier(text: &str) -> Option<String> {
-    let last = text
-        .split(['.', ':']).rfind(|s| !s.is_empty())?;
+    let last = text.split(['.', ':']).rfind(|s| !s.is_empty())?;
     if !last.is_empty() && last.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Some(last.to_string())
     } else {
@@ -541,9 +540,18 @@ fn helper_two(&self, x: i32) -> i32 { x * 2 }
         });
         assert!(outer.is_some(), "outer function chunk must exist");
         let calls = &outer.unwrap().metadata.calls_functions;
-        assert!(calls.contains(&"helper_one".to_string()), "must detect call to helper_one");
-        assert!(calls.contains(&"helper_two".to_string()), "must detect method call to helper_two");
-        assert!(!calls.contains(&"outer".to_string()), "must not list self-recursion");
+        assert!(
+            calls.contains(&"helper_one".to_string()),
+            "must detect call to helper_one"
+        );
+        assert!(
+            calls.contains(&"helper_two".to_string()),
+            "must detect method call to helper_two"
+        );
+        assert!(
+            !calls.contains(&"outer".to_string()),
+            "must not list self-recursion"
+        );
     }
 
     #[test]
@@ -563,10 +571,15 @@ fn transform(x: i32) -> i32 { x }
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "rust", &mut doc);
 
-        let process = doc.chunks.iter().find(|c| {
-            c.metadata.function_name.as_deref() == Some("process")
-        }).unwrap();
-        let transform_count = process.metadata.calls_functions.iter()
+        let process = doc
+            .chunks
+            .iter()
+            .find(|c| c.metadata.function_name.as_deref() == Some("process"))
+            .unwrap();
+        let transform_count = process
+            .metadata
+            .calls_functions
+            .iter()
             .filter(|n| n.as_str() == "transform")
             .count();
         assert_eq!(transform_count, 1, "same callee must appear only once");
@@ -620,9 +633,16 @@ public class Main {
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "java", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "java method_declaration must produce FunctionDef");
-        let greet = doc.chunks.iter().find(|c| c.metadata.function_name.as_deref() == Some("greet"));
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "java method_declaration must produce FunctionDef"
+        );
+        let greet = doc
+            .chunks
+            .iter()
+            .find(|c| c.metadata.function_name.as_deref() == Some("greet"));
         assert!(greet.is_some(), "greet method must be named");
     }
 
@@ -641,10 +661,16 @@ int add(int a, int b) {
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "c", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "c function_definition must produce FunctionDef");
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
-            "preproc_include must produce Import");
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "c function_definition must produce FunctionDef"
+        );
+        assert!(
+            doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
+            "preproc_include must produce Import"
+        );
     }
 
     #[test]
@@ -664,10 +690,16 @@ public class MyClass {
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "csharp", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "csharp method_declaration must produce FunctionDef");
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
-            "using_directive must produce Import");
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "csharp method_declaration must produce FunctionDef"
+        );
+        assert!(
+            doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
+            "using_directive must produce Import"
+        );
     }
 
     #[test]
@@ -685,9 +717,16 @@ end
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "ruby", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "ruby method must produce FunctionDef");
-        let greet = doc.chunks.iter().find(|c| c.metadata.function_name.as_deref() == Some("greet"));
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "ruby method must produce FunctionDef"
+        );
+        let greet = doc
+            .chunks
+            .iter()
+            .find(|c| c.metadata.function_name.as_deref() == Some("greet"));
         assert!(greet.is_some(), "greet method must be named");
     }
 
@@ -712,8 +751,14 @@ def process(data):
         });
         assert!(process_chunk.is_some(), "process function chunk must exist");
         let calls = &process_chunk.unwrap().metadata.calls_functions;
-        assert!(calls.contains(&"transform".to_string()), "must detect transform call");
-        assert!(calls.contains(&"method".to_string()), "must detect obj.method call");
+        assert!(
+            calls.contains(&"transform".to_string()),
+            "must detect transform call"
+        );
+        assert!(
+            calls.contains(&"method".to_string()),
+            "must detect obj.method call"
+        );
     }
 
     #[test]
@@ -730,8 +775,10 @@ fun hello(): String = "hi"
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "kotlin", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
-            "kotlin import must produce Import chunk");
+        assert!(
+            doc.chunks.iter().any(|c| c.chunk_type == ChunkType::Import),
+            "kotlin import must produce Import chunk"
+        );
     }
 
     #[test]
@@ -751,8 +798,12 @@ main = putStrLn (greet "world")
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "haskell", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "haskell function node must produce FunctionDef");
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "haskell function node must produce FunctionDef"
+        );
     }
 
     #[test]
@@ -772,7 +823,11 @@ end
         parser.set_language(&ts_lang).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_chunks(source, tree.root_node(), "elixir", &mut doc);
-        assert!(doc.chunks.iter().any(|c| c.chunk_type == ChunkType::FunctionDef),
-            "elixir def must produce FunctionDef");
+        assert!(
+            doc.chunks
+                .iter()
+                .any(|c| c.chunk_type == ChunkType::FunctionDef),
+            "elixir def must produce FunctionDef"
+        );
     }
 }

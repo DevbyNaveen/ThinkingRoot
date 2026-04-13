@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use console::style;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The JSON key / format that each tool uses for MCP server configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,7 +48,11 @@ pub fn detect_tools() -> Vec<DetectedTool> {
     tool_defs()
         .into_iter()
         .filter_map(|(name, path_fn, format)| {
-            path_fn().map(|path| DetectedTool { name, config_path: path, format })
+            path_fn().map(|path| DetectedTool {
+                name,
+                config_path: path,
+                format,
+            })
         })
         .filter(|t| {
             // Detect by parent directory existing (file itself may not exist yet)
@@ -74,9 +78,7 @@ fn tool_defs() -> Vec<(&'static str, Box<dyn Fn() -> Option<PathBuf>>, ConfigFor
         ),
         (
             "VS Code",
-            Box::new(|| {
-                dirs::config_dir().map(|d| d.join("Code").join("User").join("mcp.json"))
-            }),
+            Box::new(|| dirs::config_dir().map(|d| d.join("Code").join("User").join("mcp.json"))),
             ConfigFormat::Servers,
         ),
         (
@@ -120,16 +122,22 @@ fn tool_defs() -> Vec<(&'static str, Box<dyn Fn() -> Option<PathBuf>>, ConfigFor
         (
             "Continue.dev",
             Box::new(|| {
-                dirs::home_dir()
-                    .map(|d| d.join(".continue").join("mcpServers").join("thinkingroot.json"))
+                dirs::home_dir().map(|d| {
+                    d.join(".continue")
+                        .join("mcpServers")
+                        .join("thinkingroot.json")
+                })
             }),
             ConfigFormat::ContinueDev,
         ),
         (
             "Antigravity",
             Box::new(|| {
-                dirs::home_dir()
-                    .map(|d| d.join(".gemini").join("antigravity").join("mcp_config.json"))
+                dirs::home_dir().map(|d| {
+                    d.join(".gemini")
+                        .join("antigravity")
+                        .join("mcp_config.json")
+                })
             }),
             ConfigFormat::McpServers,
         ),
@@ -187,7 +195,11 @@ pub fn remove_entry(existing: &mut Value, format: ConfigFormat) {
 
 // ── File I/O ─────────────────────────────────────────────────────
 
-pub fn write_tool_config(tool: &DetectedTool, port: u16, dry_run: bool) -> anyhow::Result<WriteResult> {
+pub fn write_tool_config(
+    tool: &DetectedTool,
+    port: u16,
+    dry_run: bool,
+) -> anyhow::Result<WriteResult> {
     match tool.format {
         ConfigFormat::ClaudeCode => return write_claude_code_config(tool, port, dry_run),
         ConfigFormat::CodexToml => return write_codex_config(tool, port, dry_run),
@@ -222,7 +234,11 @@ pub fn write_tool_config(tool: &DetectedTool, port: u16, dry_run: bool) -> anyho
     std::fs::write(path, &json_out)
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    Ok(WriteResult { tool: tool.name, path: path.clone(), action: WriteAction::Written })
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Written,
+    })
 }
 
 pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<WriteResult> {
@@ -258,7 +274,11 @@ pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<
     std::fs::write(path, &json_out)
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    Ok(WriteResult { tool: tool.name, path: path.clone(), action: WriteAction::Removed })
+    Ok(WriteResult {
+        tool: tool.name,
+        path: path.clone(),
+        action: WriteAction::Removed,
+    })
 }
 
 // ── Claude Code: per-project config in ~/.claude.json ────────────
@@ -331,10 +351,7 @@ fn write_claude_code_config(
     })
 }
 
-fn remove_claude_code_config(
-    tool: &DetectedTool,
-    dry_run: bool,
-) -> anyhow::Result<WriteResult> {
+fn remove_claude_code_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<WriteResult> {
     let path = &tool.config_path;
     if !path.exists() {
         return Ok(WriteResult {
@@ -402,8 +419,7 @@ fn write_codex_config(
         .into_owned();
 
     apply_codex_entry(&mut doc, &bin_path, &workspace_path);
-    let toml_out = toml::to_string_pretty(&doc)
-        .with_context(|| "failed to serialize TOML")?;
+    let toml_out = toml::to_string_pretty(&doc).with_context(|| "failed to serialize TOML")?;
 
     if dry_run {
         return Ok(WriteResult {
@@ -428,9 +444,7 @@ fn write_codex_config(
 }
 
 pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: &str) {
-    let root = doc
-        .as_table_mut()
-        .expect("TOML root must be a table");
+    let root = doc.as_table_mut().expect("TOML root must be a table");
 
     if !root.contains_key("mcp_servers") {
         root.insert(
@@ -445,7 +459,10 @@ pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: 
         .expect("mcp_servers must be a table");
 
     let mut entry = toml::map::Map::new();
-    entry.insert("command".to_string(), toml::Value::String(bin_path.to_string()));
+    entry.insert(
+        "command".to_string(),
+        toml::Value::String(bin_path.to_string()),
+    );
     entry.insert(
         "args".to_string(),
         toml::Value::Array(vec![
@@ -468,10 +485,7 @@ pub fn remove_codex_entry(doc: &mut toml::Value) {
     }
 }
 
-fn remove_codex_config(
-    tool: &DetectedTool,
-    dry_run: bool,
-) -> anyhow::Result<WriteResult> {
+fn remove_codex_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<WriteResult> {
     let path = &tool.config_path;
     if !path.exists() {
         return Ok(WriteResult {
@@ -488,8 +502,7 @@ fn remove_codex_config(
         .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
 
     remove_codex_entry(&mut doc);
-    let toml_out = toml::to_string_pretty(&doc)
-        .with_context(|| "failed to serialize TOML")?;
+    let toml_out = toml::to_string_pretty(&doc).with_context(|| "failed to serialize TOML")?;
 
     if dry_run {
         return Ok(WriteResult {
@@ -541,7 +554,9 @@ pub fn run_connect(
     let all_tools = detect_tools();
     if all_tools.is_empty() {
         println!("  No supported AI tools detected.");
-        println!("  Supported: Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Zed, Cline, Continue.dev, Antigravity, Codex");
+        println!(
+            "  Supported: Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, Zed, Cline, Continue.dev, Antigravity, Codex"
+        );
         return Ok(());
     }
 
@@ -578,7 +593,10 @@ pub fn run_connect(
     };
 
     if dry_run {
-        println!("  {} (no files will be changed)\n", style("Dry run").yellow().bold());
+        println!(
+            "  {} (no files will be changed)\n",
+            style("Dry run").yellow().bold()
+        );
     }
 
     let mut sse_connected = false;
@@ -599,7 +617,11 @@ pub fn run_connect(
                     result.tool,
                     style(result.path.display()).dim()
                 );
-                if is_stdio_tool(tool.format) { stdio_connected = true; } else { sse_connected = true; }
+                if is_stdio_tool(tool.format) {
+                    stdio_connected = true;
+                } else {
+                    sse_connected = true;
+                }
             }
             WriteAction::DryRun(content) => {
                 println!(

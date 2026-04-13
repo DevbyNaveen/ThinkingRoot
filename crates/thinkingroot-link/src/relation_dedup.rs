@@ -5,19 +5,19 @@ use thinkingroot_extract::extractor::SourcedRelation;
 /// Two relations with the same rank in different subtrees are orthogonal (both kept).
 pub fn specificity_rank(r: RelationType) -> u8 {
     match r {
-        RelationType::RelatedTo    => 0,
-        RelationType::Uses         => 1,
-        RelationType::Contains     => 1,
-        RelationType::CreatedBy    => 1,
-        RelationType::OwnedBy      => 2,
-        RelationType::DependsOn    => 2,
-        RelationType::Calls        => 2,
-        RelationType::PartOf       => 2,
-        RelationType::Implements   => 2,
-        RelationType::TestedBy     => 2,
+        RelationType::RelatedTo => 0,
+        RelationType::Uses => 1,
+        RelationType::Contains => 1,
+        RelationType::CreatedBy => 1,
+        RelationType::OwnedBy => 2,
+        RelationType::DependsOn => 2,
+        RelationType::Calls => 2,
+        RelationType::PartOf => 2,
+        RelationType::Implements => 2,
+        RelationType::TestedBy => 2,
         RelationType::ConfiguredBy => 2,
-        RelationType::Replaces     => 2,
-        RelationType::Contradicts  => 2,
+        RelationType::Replaces => 2,
+        RelationType::Contradicts => 2,
     }
 }
 
@@ -89,10 +89,15 @@ pub fn dedup_relations(relations: &mut Vec<SourcedRelation>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thinkingroot_core::types::{Relation, RelationType, EntityId, SourceId};
+    use thinkingroot_core::types::{EntityId, Relation, RelationType, SourceId};
     use thinkingroot_extract::extractor::SourcedRelation;
 
-    fn make_relation(from: EntityId, to: EntityId, rel: RelationType, strength: f64) -> SourcedRelation {
+    fn make_relation(
+        from: EntityId,
+        to: EntityId,
+        rel: RelationType,
+        strength: f64,
+    ) -> SourcedRelation {
         SourcedRelation {
             source: SourceId::new(),
             relation: Relation::new(from, to, rel).with_strength(strength),
@@ -121,7 +126,11 @@ mod tests {
             make_relation(e1, e2, RelationType::TestedBy, 0.8),
         ];
         dedup_relations(&mut relations);
-        assert_eq!(relations.len(), 2, "orthogonal types for same pair must both survive");
+        assert_eq!(
+            relations.len(),
+            2,
+            "orthogonal types for same pair must both survive"
+        );
     }
 
     #[test]
@@ -147,7 +156,11 @@ mod tests {
             make_relation(e1, e3, RelationType::DependsOn, 0.9),
         ];
         dedup_relations(&mut relations);
-        assert_eq!(relations.len(), 2, "different pairs must not affect each other");
+        assert_eq!(
+            relations.len(),
+            2,
+            "different pairs must not affect each other"
+        );
     }
 
     #[test]
@@ -159,7 +172,11 @@ mod tests {
             make_relation(e1, e2, RelationType::RelatedTo, 0.7),
         ];
         dedup_relations(&mut relations);
-        assert_eq!(relations.len(), 2, "same-type duplicates should not be removed by subsumption");
+        assert_eq!(
+            relations.len(),
+            2,
+            "same-type duplicates should not be removed by subsumption"
+        );
     }
 
     #[test]

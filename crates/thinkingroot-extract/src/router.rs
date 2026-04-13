@@ -36,21 +36,36 @@ pub enum Tier {
 pub fn classify(chunk: &Chunk) -> Tier {
     match chunk.chunk_type {
         ChunkType::FunctionDef => {
-            if chunk.metadata.function_name.as_deref().is_some_and(|n| !n.is_empty()) {
+            if chunk
+                .metadata
+                .function_name
+                .as_deref()
+                .is_some_and(|n| !n.is_empty())
+            {
                 Tier::Structural
             } else {
                 Tier::Llm
             }
         }
         ChunkType::TypeDef => {
-            if chunk.metadata.type_name.as_deref().is_some_and(|n| !n.is_empty()) {
+            if chunk
+                .metadata
+                .type_name
+                .as_deref()
+                .is_some_and(|n| !n.is_empty())
+            {
                 Tier::Structural
             } else {
                 Tier::Llm
             }
         }
         ChunkType::Import => {
-            if chunk.metadata.import_path.as_deref().is_some_and(|p| !p.is_empty()) {
+            if chunk
+                .metadata
+                .import_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+            {
                 Tier::Structural
             } else {
                 Tier::Llm
@@ -223,7 +238,11 @@ mod tests {
 
         let (structural, llm) = route_chunks(&chunks);
 
-        assert_eq!(structural, vec![0, 2], "expected indices 0 and 2 in structural");
+        assert_eq!(
+            structural,
+            vec![0, 2],
+            "expected indices 0 and 2 in structural"
+        );
         assert_eq!(llm, vec![1], "expected index 1 in llm");
     }
 }

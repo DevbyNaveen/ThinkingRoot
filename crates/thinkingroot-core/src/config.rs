@@ -60,7 +60,8 @@ impl Config {
         if !has_llm_section {
             workspace.llm = global.llm.clone();
         } else {
-            // Workspace set its own LLM section — inherit individual provider creds from global
+            // Workspace set its own LLM section — inherit individual provider slots from global
+            // when the workspace leaves them as None (whole-slot inheritance).
             macro_rules! inherit {
                 ($field:ident) => {
                     if workspace.llm.providers.$field.is_none() {
@@ -79,6 +80,41 @@ impl Config {
             inherit!(perplexity);
             inherit!(litellm);
             inherit!(custom);
+
+            // Field-level api_key_env inheritance: if workspace defines a provider slot
+            // but leaves api_key_env as None, pull it from the global slot so credentials
+            // set globally are not silently dropped by a partial workspace override.
+            macro_rules! inherit_key {
+                ($field:ident) => {
+                    if let (Some(ws), Some(g)) = (
+                        workspace.llm.providers.$field.as_mut(),
+                        global.llm.providers.$field.as_ref(),
+                    ) {
+                        if ws.api_key_env.is_none() {
+                            ws.api_key_env = g.api_key_env.clone();
+                        }
+                    }
+                };
+            }
+            inherit_key!(openai);
+            inherit_key!(anthropic);
+            inherit_key!(ollama);
+            inherit_key!(groq);
+            inherit_key!(deepseek);
+            inherit_key!(openrouter);
+            inherit_key!(together);
+            inherit_key!(perplexity);
+            inherit_key!(litellm);
+            inherit_key!(custom);
+            // Azure uses a different struct type but has the same api_key_env field.
+            if let (Some(ws), Some(g)) = (
+                workspace.llm.providers.azure.as_mut(),
+                global.llm.providers.azure.as_ref(),
+            ) {
+                if ws.api_key_env.is_none() {
+                    ws.api_key_env = g.api_key_env.clone();
+                }
+            }
         }
         workspace
     }
@@ -86,7 +122,10 @@ impl Config {
     /// Load workspace config merged with global config.
     /// Priority: per-workspace `.thinkingroot/config.toml` > global `~/.config/thinkingroot/config.toml` > defaults.
     pub fn load_merged(workspace_path: &std::path::Path) -> Result<Self> {
-        let global = crate::global_config::GlobalConfig::load().unwrap_or_default();
+        let global = crate::global_config::GlobalConfig::load().unwrap_or_else(|e| {
+            eprintln!("  Warning: could not load global config, using defaults: {e}");
+            crate::global_config::GlobalConfig::default()
+        });
         let config_path = workspace_path.join(".thinkingroot").join("config.toml");
 
         if !config_path.exists() {
@@ -97,8 +136,8 @@ impl Config {
             return Ok(config);
         }
 
-        let raw = std::fs::read_to_string(&config_path)
-            .map_err(|e| Error::io_path(&config_path, e))?;
+        let raw =
+            std::fs::read_to_string(&config_path).map_err(|e| Error::io_path(&config_path, e))?;
         let workspace: Config = toml::from_str(&raw)?;
         Ok(Self::merge_with_global(workspace, &raw, &global))
     }
@@ -156,13 +195,20 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            default_provider: "bedrock".to_string(),
-            extraction_model: "us.amazon.nova-pro-v1:0".to_string(),
-            compilation_model: "us.amazon.nova-pro-v1:0".to_string(),
+            default_provider: String::new(),
+            extraction_model: String::new(),
+            compilation_model: String::new(),
             max_concurrent_requests: 5,
             request_timeout_secs: 120,
             providers: ProvidersConfig::default(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// Returns true if a provider and model have been configured (i.e. `root setup` has been run).
+    pub fn is_configured(&self) -> bool {
+        !self.default_provider.is_empty() && !self.extraction_model.is_empty()
     }
 }
 
@@ -374,7 +420,6 @@ pub struct SourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn load_merged_uses_global_llm_when_workspace_has_no_llm_section() {
@@ -444,12 +489,199 @@ request_timeout_secs = 60
         assert_eq!(merged.llm.extraction_model, "llama3");
     }
 
+    // ── is_configured() ──────────────────────────────────────────
+
     #[test]
-    fn default_config_is_valid() {
+    fn default_llm_config_is_not_configured() {
+        // After removing hardcoded defaults, bare Config::default() must be
+        // unconfigured — so `root compile` without `root setup` fails fast.
         let config = Config::default();
-        assert_eq!(config.llm.default_provider, "bedrock");
+        assert!(!config.llm.is_configured());
+        assert_eq!(config.llm.default_provider, "");
+        assert_eq!(config.llm.extraction_model, "");
+    }
+
+    #[test]
+    fn llm_config_is_configured_when_provider_and_model_set() {
+        let llm = LlmConfig {
+            default_provider: "openai".to_string(),
+            extraction_model: "gpt-4o".to_string(),
+            compilation_model: "gpt-4o".to_string(),
+            max_concurrent_requests: 5,
+            request_timeout_secs: 60,
+            providers: ProvidersConfig::default(),
+        };
+        assert!(llm.is_configured());
+    }
+
+    #[test]
+    fn llm_config_not_configured_when_provider_empty() {
+        let llm = LlmConfig {
+            default_provider: String::new(),
+            extraction_model: "gpt-4o".to_string(),
+            compilation_model: "gpt-4o".to_string(),
+            max_concurrent_requests: 5,
+            request_timeout_secs: 60,
+            providers: ProvidersConfig::default(),
+        };
+        assert!(!llm.is_configured());
+    }
+
+    #[test]
+    fn llm_config_not_configured_when_model_empty() {
+        let llm = LlmConfig {
+            default_provider: "openai".to_string(),
+            extraction_model: String::new(),
+            compilation_model: String::new(),
+            max_concurrent_requests: 5,
+            request_timeout_secs: 60,
+            providers: ProvidersConfig::default(),
+        };
+        assert!(!llm.is_configured());
+    }
+
+    // ── non-LLM defaults still correct ───────────────────────────
+
+    #[test]
+    fn default_non_llm_config_is_valid() {
+        let config = Config::default();
         assert_eq!(config.extraction.max_chunk_tokens, 2000);
         assert!(config.parsers.respect_gitignore);
+    }
+
+    // ── merge_with_global: credential inheritance ─────────────────
+
+    #[test]
+    fn workspace_llm_inherits_global_credentials() {
+        use crate::config::ProviderConfig;
+        use crate::global_config::{GlobalConfig, ServeConfig};
+
+        let global = GlobalConfig {
+            llm: LlmConfig {
+                default_provider: "openai".to_string(),
+                extraction_model: "gpt-4o".to_string(),
+                compilation_model: "gpt-4o".to_string(),
+                max_concurrent_requests: 5,
+                request_timeout_secs: 60,
+                providers: ProvidersConfig {
+                    openai: Some(ProviderConfig {
+                        api_key_env: Some("OPENAI_API_KEY".to_string()),
+                        base_url: Some("https://api.openai.com".to_string()),
+                        default_model: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+            serve: ServeConfig::default(),
+        };
+
+        // Workspace overrides provider+model but has no credentials
+        let workspace_toml = r#"
+[llm]
+default_provider = "openai"
+extraction_model = "gpt-4o-mini"
+compilation_model = "gpt-4o-mini"
+max_concurrent_requests = 5
+request_timeout_secs = 60
+"#;
+        let merged = Config::merge_with_global(
+            toml::from_str(workspace_toml).unwrap(),
+            workspace_toml,
+            &global,
+        );
+        // Workspace model wins
+        assert_eq!(merged.llm.extraction_model, "gpt-4o-mini");
+        // Global credentials inherited
+        assert_eq!(
+            merged
+                .llm
+                .providers
+                .openai
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .as_deref(),
+            Some("OPENAI_API_KEY")
+        );
+    }
+
+    #[test]
+    fn workspace_provider_overrides_global_provider() {
+        use crate::config::ProviderConfig;
+        use crate::global_config::{GlobalConfig, ServeConfig};
+
+        let global = GlobalConfig {
+            llm: LlmConfig {
+                default_provider: "openai".to_string(),
+                extraction_model: "gpt-4o".to_string(),
+                compilation_model: "gpt-4o".to_string(),
+                max_concurrent_requests: 5,
+                request_timeout_secs: 60,
+                providers: ProvidersConfig {
+                    openai: Some(ProviderConfig {
+                        api_key_env: Some("OPENAI_API_KEY".to_string()),
+                        base_url: None,
+                        default_model: None,
+                    }),
+                    anthropic: Some(ProviderConfig {
+                        api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                        base_url: None,
+                        default_model: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+            serve: ServeConfig::default(),
+        };
+
+        // Workspace switches to anthropic locally
+        let workspace_toml = r#"
+[llm]
+default_provider = "anthropic"
+extraction_model = "claude-sonnet-4-6"
+compilation_model = "claude-sonnet-4-6"
+max_concurrent_requests = 5
+request_timeout_secs = 60
+"#;
+        let merged = Config::merge_with_global(
+            toml::from_str(workspace_toml).unwrap(),
+            workspace_toml,
+            &global,
+        );
+        assert_eq!(merged.llm.default_provider, "anthropic");
+        assert_eq!(merged.llm.extraction_model, "claude-sonnet-4-6");
+        // Both provider credential slots inherited from global
+        assert!(merged.llm.providers.anthropic.is_some());
+        assert!(merged.llm.providers.openai.is_some());
+    }
+
+    #[test]
+    fn no_llm_section_in_workspace_means_global_wins_entirely() {
+        use crate::global_config::{GlobalConfig, ServeConfig};
+
+        let global = GlobalConfig {
+            llm: LlmConfig {
+                default_provider: "groq".to_string(),
+                extraction_model: "llama-3.1-8b-instant".to_string(),
+                compilation_model: "llama-3.1-8b-instant".to_string(),
+                max_concurrent_requests: 5,
+                request_timeout_secs: 30,
+                providers: ProvidersConfig::default(),
+            },
+            serve: ServeConfig::default(),
+        };
+
+        let workspace_toml = r#"
+[workspace]
+name = "test"
+"#;
+        let merged = Config::merge_with_global(
+            toml::from_str(workspace_toml).unwrap(),
+            workspace_toml,
+            &global,
+        );
+        assert_eq!(merged.llm.default_provider, "groq");
+        assert_eq!(merged.llm.extraction_model, "llama-3.1-8b-instant");
     }
 
     #[test]
@@ -487,7 +719,14 @@ api_key_env = "AZURE_OPENAI_API_KEY"
         let out = toml::to_string_pretty(&config).unwrap();
         let reparsed: Config = toml::from_str(&out).unwrap();
         assert_eq!(
-            reparsed.llm.providers.azure.as_ref().unwrap().resource_name.as_deref(),
+            reparsed
+                .llm
+                .providers
+                .azure
+                .as_ref()
+                .unwrap()
+                .resource_name
+                .as_deref(),
             Some("my-company-openai")
         );
     }
@@ -521,23 +760,58 @@ base_url = "https://my-endpoint.com/v1"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.llm.default_provider, "openrouter");
         assert_eq!(
-            config.llm.providers.openrouter.as_ref().unwrap().api_key_env.as_deref(),
+            config
+                .llm
+                .providers
+                .openrouter
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .as_deref(),
             Some("OPENROUTER_API_KEY")
         );
         assert_eq!(
-            config.llm.providers.together.as_ref().unwrap().api_key_env.as_deref(),
+            config
+                .llm
+                .providers
+                .together
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .as_deref(),
             Some("TOGETHER_API_KEY")
         );
         assert_eq!(
-            config.llm.providers.perplexity.as_ref().unwrap().api_key_env.as_deref(),
+            config
+                .llm
+                .providers
+                .perplexity
+                .as_ref()
+                .unwrap()
+                .api_key_env
+                .as_deref(),
             Some("PERPLEXITY_API_KEY")
         );
         assert_eq!(
-            config.llm.providers.litellm.as_ref().unwrap().base_url.as_deref(),
+            config
+                .llm
+                .providers
+                .litellm
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
             Some("http://localhost:4000")
         );
         assert_eq!(
-            config.llm.providers.custom.as_ref().unwrap().base_url.as_deref(),
+            config
+                .llm
+                .providers
+                .custom
+                .as_ref()
+                .unwrap()
+                .base_url
+                .as_deref(),
             Some("https://my-endpoint.com/v1")
         );
     }

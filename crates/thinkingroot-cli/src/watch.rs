@@ -1,9 +1,9 @@
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use console::style;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 
 use thinkingroot_core::config::Config;
 
@@ -106,23 +106,18 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
         .watcher()
         .watch(root_path, notify::RecursiveMode::Recursive)?;
 
-    println!(
-        "  {} waiting for changes...\n",
-        style("--").dim()
-    );
+    println!("  {} waiting for changes...\n", style("--").dim());
 
     loop {
         let rx_clone = Arc::clone(&rx);
-        let recv_result = tokio::task::spawn_blocking(move || rx_clone.lock().unwrap().recv())
-            .await?;
+        let recv_result =
+            tokio::task::spawn_blocking(move || rx_clone.lock().unwrap().recv()).await?;
 
         match recv_result {
             Ok(Ok(events)) => {
                 let relevant: Vec<_> = events
                     .iter()
-                    .filter(|e| {
-                        e.kind == DebouncedEventKind::Any && !should_ignore(&e.path)
-                    })
+                    .filter(|e| e.kind == DebouncedEventKind::Any && !should_ignore(&e.path))
                     .collect();
 
                 if relevant.is_empty() {
@@ -171,10 +166,7 @@ pub async fn run_watch(root_path: &Path) -> anyhow::Result<()> {
                     }
                 }
 
-                println!(
-                    "  {} waiting for changes...\n",
-                    style("--").dim()
-                );
+                println!("  {} waiting for changes...\n", style("--").dim());
             }
             Ok(Err(e)) => {
                 eprintln!("  {} watch error: {e}", style("ERR").red().bold());

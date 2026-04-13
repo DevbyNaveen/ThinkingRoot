@@ -225,21 +225,15 @@ impl BedrockProvider {
 struct AzureProvider {
     client: reqwest::Client,
     api_key: String,
-    model: String,          // deployment name; used for display/logging
-    endpoint_url: String,   // pre-built full URL with api-version query param
+    model: String,        // deployment name; used for display/logging
+    endpoint_url: String, // pre-built full URL with api-version query param
     max_output_tokens: i32,
 }
 
 impl AzureProvider {
-    fn new(
-        api_key: &str,
-        model: &str,
-        cfg: &AzureConfig,
-    ) -> Result<Self> {
+    fn new(api_key: &str, model: &str, cfg: &AzureConfig) -> Result<Self> {
         let deployment = cfg.deployment.as_deref().ok_or_else(|| {
-            Error::MissingConfig(
-                "set [llm.providers.azure].deployment in your config".into(),
-            )
+            Error::MissingConfig("set [llm.providers.azure].deployment in your config".into())
         })?;
         let api_version = cfg.api_version.as_deref().unwrap_or("2024-12-01-preview");
 
@@ -250,7 +244,8 @@ impl AzureProvider {
         } else {
             let resource = cfg.resource_name.as_deref().ok_or_else(|| {
                 Error::MissingConfig(
-                    "set [llm.providers.azure].resource_name or endpoint_base in your config".into(),
+                    "set [llm.providers.azure].resource_name or endpoint_base in your config"
+                        .into(),
                 )
             })?;
             format!("https://{resource}.openai.azure.com")
@@ -611,9 +606,8 @@ fn resolve_key(cfg: Option<&ProviderConfig>, default_env: &str) -> Result<String
     let env_var = cfg
         .and_then(|p| p.api_key_env.as_deref())
         .unwrap_or(default_env);
-    std::env::var(env_var).map_err(|_| {
-        Error::MissingConfig(format!("set the {} environment variable", env_var))
-    })
+    std::env::var(env_var)
+        .map_err(|_| Error::MissingConfig(format!("set the {} environment variable", env_var)))
 }
 
 fn resolve_key_optional(cfg: Option<&ProviderConfig>) -> String {
@@ -638,7 +632,6 @@ fn resolve_base_url_required(cfg: Option<&ProviderConfig>, provider: &str) -> Re
         })
 }
 
-
 // ── LLM Client (unified wrapper with retry + truncation handling) ─
 
 pub struct LlmClient {
@@ -651,6 +644,11 @@ pub struct LlmClient {
 impl LlmClient {
     /// Create a new LLM client from config. Auto-detects provider.
     pub async fn new(config: &LlmConfig) -> Result<Self> {
+        if !config.is_configured() {
+            return Err(Error::MissingConfig(
+                "No LLM provider configured.\n  Run `root setup` to get started (takes ~2 minutes).".into(),
+            ));
+        }
         let provider = match config.default_provider.as_str() {
             "bedrock" => {
                 let region = config
@@ -663,10 +661,8 @@ impl LlmClient {
             }
             "openai" => {
                 let key = resolve_key(config.providers.openai.as_ref(), "OPENAI_API_KEY")?;
-                let base_url = resolve_base_url(
-                    config.providers.openai.as_ref(),
-                    "https://api.openai.com",
-                );
+                let base_url =
+                    resolve_base_url(config.providers.openai.as_ref(), "https://api.openai.com");
                 Provider::OpenAi(OpenAiProvider::new(
                     &key,
                     &config.extraction_model,
@@ -680,21 +676,26 @@ impl LlmClient {
                         "azure provider requires [llm.providers.azure] in your config".into(),
                     )
                 })?;
-                let key_env = azure_cfg.api_key_env.as_deref().unwrap_or("AZURE_OPENAI_API_KEY");
+                let key_env = azure_cfg
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or("AZURE_OPENAI_API_KEY");
                 let key = std::env::var(key_env).map_err(|_| {
                     Error::MissingConfig(format!("set the {key_env} environment variable"))
                 })?;
-                Provider::Azure(AzureProvider::new(&key, &config.extraction_model, azure_cfg)?)
+                Provider::Azure(AzureProvider::new(
+                    &key,
+                    &config.extraction_model,
+                    azure_cfg,
+                )?)
             }
             "anthropic" => {
                 let key = resolve_key(config.providers.anthropic.as_ref(), "ANTHROPIC_API_KEY")?;
                 Provider::Anthropic(AnthropicProvider::new(&key, &config.extraction_model))
             }
             "ollama" => {
-                let base_url = resolve_base_url(
-                    config.providers.ollama.as_ref(),
-                    "http://localhost:11434",
-                );
+                let base_url =
+                    resolve_base_url(config.providers.ollama.as_ref(), "http://localhost:11434");
                 Provider::Ollama(OllamaProvider::new(&config.extraction_model, &base_url))
             }
             "groq" => {
@@ -724,8 +725,7 @@ impl LlmClient {
                 ))
             }
             "openrouter" => {
-                let key =
-                    resolve_key(config.providers.openrouter.as_ref(), "OPENROUTER_API_KEY")?;
+                let key = resolve_key(config.providers.openrouter.as_ref(), "OPENROUTER_API_KEY")?;
                 let base_url = resolve_base_url(
                     config.providers.openrouter.as_ref(),
                     "https://openrouter.ai/api/v1",
@@ -751,8 +751,7 @@ impl LlmClient {
                 ))
             }
             "perplexity" => {
-                let key =
-                    resolve_key(config.providers.perplexity.as_ref(), "PERPLEXITY_API_KEY")?;
+                let key = resolve_key(config.providers.perplexity.as_ref(), "PERPLEXITY_API_KEY")?;
                 let base_url = resolve_base_url(
                     config.providers.perplexity.as_ref(),
                     "https://api.perplexity.ai",
@@ -766,10 +765,8 @@ impl LlmClient {
             }
             "litellm" => {
                 let key = resolve_key_optional(config.providers.litellm.as_ref());
-                let base_url = resolve_base_url(
-                    config.providers.litellm.as_ref(),
-                    "http://localhost:4000",
-                );
+                let base_url =
+                    resolve_base_url(config.providers.litellm.as_ref(), "http://localhost:4000");
                 Provider::OpenAi(OpenAiProvider::new(
                     &key,
                     &config.extraction_model,
@@ -847,11 +844,8 @@ impl LlmClient {
         context: &str,
         known_entities_section: &str,
     ) -> Result<ExtractionResult> {
-        let user_prompt = prompts::build_extraction_prompt_with_context(
-            content,
-            context,
-            known_entities_section,
-        );
+        let user_prompt =
+            prompts::build_extraction_prompt_with_context(content, context, known_entities_section);
         self.extract_prompt(user_prompt).await
     }
 
@@ -882,7 +876,11 @@ impl LlmClient {
                 None
             };
 
-            match self.provider.chat(prompts::SYSTEM_PROMPT, &user_prompt).await {
+            match self
+                .provider
+                .chat(prompts::SYSTEM_PROMPT, &user_prompt)
+                .await
+            {
                 Ok(output) => {
                     if output.truncated {
                         return Err(Error::TruncatedOutput {
@@ -938,9 +936,13 @@ impl LlmClient {
                     };
 
                     // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, capped at 60s.
-                    let backoff_ms = (1000u64 * 2u64.pow(rl_attempts.saturating_sub(1)))
-                        .min(60_000);
-                    let base_delay = if provider_hint > 0 { provider_hint } else { backoff_ms };
+                    let backoff_ms =
+                        (1000u64 * 2u64.pow(rl_attempts.saturating_sub(1))).min(60_000);
+                    let base_delay = if provider_hint > 0 {
+                        provider_hint
+                    } else {
+                        backoff_ms
+                    };
 
                     // Add jitter: ±25% random spread to prevent thundering herd.
                     let jitter = (base_delay as f64 * 0.25 * (rand_jitter() - 0.5)) as i64;
@@ -1039,9 +1041,7 @@ fn strip_trailing_commas(s: &str) -> String {
         if bytes[i] == b',' {
             // Peek ahead past whitespace to see if the next token closes an array/object.
             let mut j = i + 1;
-            while j < bytes.len()
-                && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r')
-            {
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
                 j += 1;
             }
             if j < bytes.len() && matches!(bytes[j], b']' | b'}') {
@@ -1070,11 +1070,7 @@ fn strip_trailing_commas(s: &str) -> String {
 fn repair_bare_array_items(s: &str) -> String {
     // First-field of each array item type in ExtractionResult.
     // A new object starts whenever one of these appears after a comma at depth 0.
-    const BOUNDARY_KEYS: &[&str] = &[
-        r#""statement":"#,
-        r#""name":"#,
-        r#""from_entity":"#,
-    ];
+    const BOUNDARY_KEYS: &[&str] = &[r#""statement":"#, r#""name":"#, r#""from_entity":"#];
 
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + 128);
@@ -1242,14 +1238,20 @@ mod tests {
 
     #[test]
     fn model_max_tokens_haiku_45() {
-        assert_eq!(model_max_output_tokens("eu.anthropic.claude-haiku-4-5-20251001-v1:0"), 64_000);
+        assert_eq!(
+            model_max_output_tokens("eu.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            64_000
+        );
         assert_eq!(model_max_output_tokens("claude-haiku-4-5-20251001"), 64_000);
     }
 
     #[test]
     fn model_max_tokens_haiku_3() {
         assert_eq!(model_max_output_tokens("claude-3-haiku-20240307"), 4_096);
-        assert_eq!(model_max_output_tokens("anthropic.claude-3-haiku-20240307-v1:0"), 4_096);
+        assert_eq!(
+            model_max_output_tokens("anthropic.claude-3-haiku-20240307-v1:0"),
+            4_096
+        );
     }
 
     #[test]
@@ -1361,8 +1363,8 @@ mod tests {
   "relations": []
 }"#;
         let repaired = repair_bare_array_items(malformed);
-        let result: ExtractionResult = serde_json::from_str(&repaired)
-            .expect("repaired JSON should parse");
+        let result: ExtractionResult =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
         assert_eq!(result.claims.len(), 1);
         assert_eq!(result.claims[0].statement, "X is a function");
     }
@@ -1387,8 +1389,8 @@ mod tests {
   "relations": []
 }"#;
         let repaired = repair_bare_array_items(malformed);
-        let result: ExtractionResult = serde_json::from_str(&repaired)
-            .expect("repaired JSON should parse");
+        let result: ExtractionResult =
+            serde_json::from_str(&repaired).expect("repaired JSON should parse");
         assert_eq!(result.claims.len(), 2);
     }
 
@@ -1419,10 +1421,43 @@ mod tests {
   ],
   "relations": []
 }"#;
-        let result = parse_extraction_result(malformed)
-            .expect("parse_extraction_result should recover");
+        let result =
+            parse_extraction_result(malformed).expect("parse_extraction_result should recover");
         assert_eq!(result.claims.len(), 1);
         assert_eq!(result.entities.len(), 1);
         assert_eq!(result.entities[0].name, "engine");
+    }
+
+    // ── LlmClient::new() unconfigured guard ───────────────────────
+
+    #[tokio::test]
+    async fn llm_client_new_fails_when_provider_empty() {
+        let config = thinkingroot_core::config::LlmConfig::default();
+        // default() now has empty strings — is_configured() = false
+        assert!(!config.is_configured());
+        let result = LlmClient::new(&config).await;
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(
+            msg.contains("root setup") || msg.contains("No LLM provider"),
+            "expected setup hint in error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_client_new_fails_when_model_empty() {
+        let config = thinkingroot_core::config::LlmConfig {
+            default_provider: "openai".to_string(),
+            extraction_model: String::new(),
+            compilation_model: String::new(),
+            max_concurrent_requests: 5,
+            request_timeout_secs: 60,
+            providers: thinkingroot_core::config::ProvidersConfig::default(),
+        };
+        assert!(!config.is_configured());
+        let result = LlmClient::new(&config).await;
+        assert!(result.is_err());
+        let msg = result.err().expect("should be Err").to_string();
+        assert!(msg.contains("root setup") || msg.contains("No LLM provider"));
     }
 }

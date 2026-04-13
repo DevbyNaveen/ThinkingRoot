@@ -123,7 +123,14 @@ async fn handle_post(
         .ok()
         .and_then(|ws| ws.first().map(|w| w.name.clone()));
 
-    let response = super::dispatch(&request, &engine, default_ws.as_deref()).await;
+    let response = super::dispatch(
+        &request,
+        &engine,
+        default_ws.as_deref(),
+        &session_id,
+        &state.sessions,
+    )
+    .await;
     drop(engine);
 
     let json_str = match serde_json::to_string(&response) {

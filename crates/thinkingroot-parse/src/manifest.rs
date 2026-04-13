@@ -31,7 +31,7 @@ pub fn parse(path: &Path) -> Result<DocumentIR> {
         _ => {
             return Err(Error::UnsupportedFileType {
                 extension: "unknown-manifest".to_string(),
-            })
+            });
         }
     };
 
@@ -122,7 +122,10 @@ fn parse_go_mod(content: &str) -> Vec<Chunk> {
             if let Some(dep_name) = trimmed.split_whitespace().next() {
                 chunks.push(make_dep_chunk(trimmed, &project_name, dep_name));
             }
-        } else if let Some(rest_raw) = trimmed.strip_prefix("require ").filter(|_| !trimmed.contains('(')) {
+        } else if let Some(rest_raw) = trimmed
+            .strip_prefix("require ")
+            .filter(|_| !trimmed.contains('('))
+        {
             let rest = rest_raw.trim();
             if let Some(dep_name) = rest.split_whitespace().next() {
                 chunks.push(make_dep_chunk(rest, &project_name, dep_name));
@@ -246,17 +249,22 @@ tempfile = "3"
         assert!(dep_names.contains(&"serde"));
         assert!(dep_names.contains(&"tokio"));
         assert!(dep_names.contains(&"tempfile"));
-        assert!(chunks
-            .iter()
-            .all(|c| c.metadata.type_name.as_deref() == Some("my-crate")));
-        assert!(chunks
-            .iter()
-            .all(|c| c.chunk_type == ChunkType::ManifestDependency));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.metadata.type_name.as_deref() == Some("my-crate"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.chunk_type == ChunkType::ManifestDependency)
+        );
     }
 
     #[test]
     fn package_json_extracts_deps() {
-        let content = r#"{"name":"my-app","dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#;
+        let content =
+            r#"{"name":"my-app","dependencies":{"react":"18"},"devDependencies":{"jest":"29"}}"#;
         let chunks = parse_package_json(content);
         assert_eq!(chunks.len(), 2);
         let names: Vec<_> = chunks
@@ -265,9 +273,11 @@ tempfile = "3"
             .collect();
         assert!(names.contains(&"react"));
         assert!(names.contains(&"jest"));
-        assert!(chunks
-            .iter()
-            .all(|c| c.metadata.type_name.as_deref() == Some("my-app")));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.metadata.type_name.as_deref() == Some("my-app"))
+        );
     }
 
     #[test]
@@ -281,9 +291,11 @@ tempfile = "3"
             .collect();
         assert!(paths.contains(&"github.com/foo/bar"));
         assert!(paths.contains(&"golang.org/x/text"));
-        assert!(chunks
-            .iter()
-            .all(|c| c.metadata.type_name.as_deref() == Some("github.com/myorg/myapp")));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.metadata.type_name.as_deref() == Some("github.com/myorg/myapp"))
+        );
     }
 
     #[test]
@@ -328,8 +340,10 @@ pydantic = "^2"
             .collect();
         assert!(names.contains(&"httpx"));
         assert!(names.contains(&"pydantic"));
-        assert!(chunks
-            .iter()
-            .all(|c| c.metadata.type_name.as_deref() == Some("my-python-app")));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.metadata.type_name.as_deref() == Some("my-python-app"))
+        );
     }
 }

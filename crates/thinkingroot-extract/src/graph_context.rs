@@ -28,7 +28,10 @@ pub struct GraphPrimedContext {
 impl GraphPrimedContext {
     /// Create a context from a list of `KnownEntity` values.
     pub fn new(entities: Vec<KnownEntity>) -> Self {
-        Self { entities, relations: Vec::new() }
+        Self {
+            entities,
+            relations: Vec::new(),
+        }
     }
 
     /// Create a context from raw (name, entity_type) tuples as returned by
@@ -38,7 +41,10 @@ impl GraphPrimedContext {
             .into_iter()
             .map(|(name, entity_type)| KnownEntity { name, entity_type })
             .collect();
-        Self { entities, relations: Vec::new() }
+        Self {
+            entities,
+            relations: Vec::new(),
+        }
     }
 
     /// Attach known relations (from `GraphStore::get_known_relations`) to this context.
@@ -89,7 +95,10 @@ Do NOT re-extract these exact pairs — only extract NEW relations not listed he
             );
             lines.push(String::new());
             for rel in self.relations.iter().take(MAX_KNOWN_RELATIONS) {
-                lines.push(format!("- {} --[{}]--> {}", rel.from, rel.relation_type, rel.to));
+                lines.push(format!(
+                    "- {} --[{}]--> {}",
+                    rel.from, rel.relation_type, rel.to
+                ));
             }
             lines.push("</KNOWN_RELATIONS>".to_string());
         }
@@ -148,7 +157,10 @@ mod tests {
         let ctx = GraphPrimedContext::from_tuples(tuples);
         let section = ctx.prompt_section();
         // Count how many "- Entity" lines appear.
-        let entry_count = section.lines().filter(|l| l.starts_with("- Entity")).count();
+        let entry_count = section
+            .lines()
+            .filter(|l| l.starts_with("- Entity"))
+            .count();
         assert_eq!(entry_count, MAX_KNOWN_ENTITIES);
     }
 
@@ -162,45 +174,63 @@ mod tests {
             })
             .collect();
         let ctx = GraphPrimedContext {
-            entities: vec![KnownEntity { name: "Seed".to_string(), entity_type: "concept".to_string() }],
+            entities: vec![KnownEntity {
+                name: "Seed".to_string(),
+                entity_type: "concept".to_string(),
+            }],
             relations,
         };
         let section = ctx.prompt_section();
-        let rel_count = section.lines().filter(|l| l.starts_with("- Entity")).count();
+        let rel_count = section
+            .lines()
+            .filter(|l| l.starts_with("- Entity"))
+            .count();
         assert_eq!(rel_count, MAX_KNOWN_RELATIONS);
     }
 
     #[test]
     fn known_relations_appear_in_prompt_section() {
         let ctx = GraphPrimedContext {
-            entities: vec![
-                KnownEntity { name: "AuthService".to_string(), entity_type: "service".to_string() },
-            ],
-            relations: vec![
-                KnownRelation {
-                    from: "AuthService".to_string(),
-                    to: "JWT".to_string(),
-                    relation_type: "uses".to_string(),
-                },
-            ],
+            entities: vec![KnownEntity {
+                name: "AuthService".to_string(),
+                entity_type: "service".to_string(),
+            }],
+            relations: vec![KnownRelation {
+                from: "AuthService".to_string(),
+                to: "JWT".to_string(),
+                relation_type: "uses".to_string(),
+            }],
         };
         let section = ctx.prompt_section();
-        assert!(section.contains("KNOWN_RELATIONS"), "section must include KNOWN_RELATIONS block");
-        assert!(section.contains("AuthService"), "section must include from entity");
+        assert!(
+            section.contains("KNOWN_RELATIONS"),
+            "section must include KNOWN_RELATIONS block"
+        );
+        assert!(
+            section.contains("AuthService"),
+            "section must include from entity"
+        );
         assert!(section.contains("JWT"), "section must include to entity");
-        assert!(section.contains("uses"), "section must include relation type");
+        assert!(
+            section.contains("uses"),
+            "section must include relation type"
+        );
     }
 
     #[test]
     fn empty_relations_still_produces_entities_section() {
         let ctx = GraphPrimedContext {
-            entities: vec![
-                KnownEntity { name: "MyService".to_string(), entity_type: "service".to_string() },
-            ],
+            entities: vec![KnownEntity {
+                name: "MyService".to_string(),
+                entity_type: "service".to_string(),
+            }],
             relations: vec![],
         };
         let section = ctx.prompt_section();
         assert!(section.contains("KNOWN_ENTITIES"));
-        assert!(!section.contains("KNOWN_RELATIONS"), "no relations block when empty");
+        assert!(
+            !section.contains("KNOWN_RELATIONS"),
+            "no relations block when empty"
+        );
     }
 }

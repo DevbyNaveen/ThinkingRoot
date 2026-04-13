@@ -380,8 +380,16 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
     };
 
     let file_name = file_name_from_uri(source_uri);
-    let container_name = chunk.metadata.parent.clone().unwrap_or_else(|| file_name.clone());
-    let container_type = if chunk.metadata.parent.is_some() { "concept" } else { "file" };
+    let container_name = chunk
+        .metadata
+        .parent
+        .clone()
+        .unwrap_or_else(|| file_name.clone());
+    let container_type = if chunk.metadata.parent.is_some() {
+        "concept"
+    } else {
+        "file"
+    };
 
     let heading_entity = ExtractedEntity {
         name: heading_text.clone(),
@@ -513,7 +521,11 @@ fn extract_prose_links(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         // Absolute URL (has '://') → 0.7
         let confidence = if url.contains("://") { 0.7 } else { 0.99 };
 
-        let link_type = if url.contains("://") { "service" } else { "file" };
+        let link_type = if url.contains("://") {
+            "service"
+        } else {
+            "file"
+        };
         let link_entity = ExtractedEntity {
             name: url.clone(),
             entity_type: link_type.to_string(),
@@ -543,7 +555,12 @@ fn extract_doc_comment(chunk: &Chunk, _source_uri: &str) -> ExtractionResult {
 
     let statement = format!(
         "{parent}: {}",
-        chunk.content.trim().trim_start_matches("///").trim_start_matches("//!").trim()
+        chunk
+            .content
+            .trim()
+            .trim_start_matches("///")
+            .trim_start_matches("//!")
+            .trim()
     );
 
     let def_claim = ExtractedClaim {
@@ -587,7 +604,10 @@ pub fn infer_entity_type_from_content(content: &str) -> &'static str {
         "system"
     } else if lower.starts_with("enum ") {
         "concept"
-    } else if lower.starts_with("trait ") || lower.starts_with("interface ") || lower.starts_with("protocol ") {
+    } else if lower.starts_with("trait ")
+        || lower.starts_with("interface ")
+        || lower.starts_with("protocol ")
+    {
         "api"
     } else {
         "concept"
@@ -803,7 +823,11 @@ mod tests {
 
     #[test]
     fn function_def_missing_name_returns_empty() {
-        let chunk = make_chunk(ChunkType::FunctionDef, "fn ???() {}", ChunkMetadata::default());
+        let chunk = make_chunk(
+            ChunkType::FunctionDef,
+            "fn ???() {}",
+            ChunkMetadata::default(),
+        );
         let result = extract_structural(&chunk, "src/lib.rs");
         assert!(result.claims.is_empty());
         assert!(result.entities.is_empty());
@@ -832,12 +856,18 @@ mod tests {
 
     #[test]
     fn infer_entity_type_enum_is_concept() {
-        assert_eq!(infer_entity_type_from_content("enum Color { Red, Green }"), "concept");
+        assert_eq!(
+            infer_entity_type_from_content("enum Color { Red, Green }"),
+            "concept"
+        );
     }
 
     #[test]
     fn infer_entity_type_trait_is_api() {
-        assert_eq!(infer_entity_type_from_content("trait Storage { fn save(&self); }"), "api");
+        assert_eq!(
+            infer_entity_type_from_content("trait Storage { fn save(&self); }"),
+            "api"
+        );
     }
 
     #[test]
@@ -848,7 +878,11 @@ mod tests {
             return_type: Some("i32".to_string()),
             ..Default::default()
         };
-        let chunk = make_chunk(ChunkType::FunctionDef, "fn add(a: i32, b: i32) -> i32 { a + b }", meta);
+        let chunk = make_chunk(
+            ChunkType::FunctionDef,
+            "fn add(a: i32, b: i32) -> i32 { a + b }",
+            meta,
+        );
         let sig = build_signature("add", &chunk);
         assert_eq!(sig, "add(a: i32, b: i32) -> i32");
     }
@@ -884,11 +918,7 @@ mod tests {
 
     #[test]
     fn impl_with_trait_produces_implements_relation() {
-        let mut chunk = Chunk::new(
-            "impl Serialize for MyStruct {}",
-            ChunkType::TypeDef,
-            1, 1,
-        );
+        let mut chunk = Chunk::new("impl Serialize for MyStruct {}", ChunkType::TypeDef, 1, 1);
         chunk.metadata = ChunkMetadata {
             type_name: Some("MyStruct".to_string()),
             trait_name: Some("Serialize".to_string()),
@@ -897,7 +927,9 @@ mod tests {
 
         let result = extract_structural(&chunk, "src/models.rs");
 
-        let implements = result.relations.iter()
+        let implements = result
+            .relations
+            .iter()
             .find(|r| r.relation_type == "implements");
         assert!(
             implements.is_some(),
@@ -913,7 +945,8 @@ mod tests {
         let mut chunk = Chunk::new(
             "struct Engine { storage: StorageBackend, config: EngineConfig }",
             ChunkType::TypeDef,
-            1, 3,
+            1,
+            3,
         );
         chunk.metadata = ChunkMetadata {
             type_name: Some("Engine".to_string()),
@@ -923,7 +956,9 @@ mod tests {
 
         let result = extract_structural(&chunk, "src/engine.rs");
 
-        let deps: Vec<_> = result.relations.iter()
+        let deps: Vec<_> = result
+            .relations
+            .iter()
             .filter(|r| r.relation_type == "depends_on")
             .collect();
         assert_eq!(deps.len(), 2, "two field types → two depends_on relations");
@@ -942,7 +977,10 @@ mod tests {
             ..Default::default()
         };
         let result = extract_structural(&chunk, "Cargo.toml");
-        let dep = result.relations.iter().find(|r| r.relation_type == "depends_on");
+        let dep = result
+            .relations
+            .iter()
+            .find(|r| r.relation_type == "depends_on");
         assert!(dep.is_some(), "must emit depends_on relation");
         let dep = dep.unwrap();
         assert_eq!(dep.from_entity, "my-crate");
@@ -973,7 +1011,11 @@ mod tests {
         };
         let chunk = make_chunk(ChunkType::FunctionDef, "fn process() {}", meta);
         let result = extract_structural(&chunk, "src/handler.rs");
-        let calls: Vec<_> = result.relations.iter().filter(|r| r.relation_type == "calls").collect();
+        let calls: Vec<_> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "calls")
+            .collect();
         assert_eq!(calls.len(), 2, "one calls relation per callee");
         assert!(calls.iter().any(|r| r.to_entity == "validate"));
         assert!(calls.iter().any(|r| r.to_entity == "persist"));
@@ -990,7 +1032,10 @@ mod tests {
         chunk.metadata.heading_level = Some(1);
         // No parent set
         let result = extract_structural(&chunk, "docs/guide.md");
-        let contains = result.relations.iter().find(|r| r.relation_type == "contains");
+        let contains = result
+            .relations
+            .iter()
+            .find(|r| r.relation_type == "contains");
         assert!(contains.is_some(), "must emit contains relation");
         assert_eq!(contains.unwrap().from_entity, "guide.md");
         assert_eq!(contains.unwrap().to_entity, "Introduction");
@@ -1003,7 +1048,10 @@ mod tests {
         chunk.metadata.heading_level = Some(2);
         chunk.metadata.parent = Some("Overview".to_string());
         let result = extract_structural(&chunk, "docs/guide.md");
-        let contains = result.relations.iter().find(|r| r.relation_type == "contains");
+        let contains = result
+            .relations
+            .iter()
+            .find(|r| r.relation_type == "contains");
         assert!(contains.is_some());
         assert_eq!(contains.unwrap().from_entity, "Overview");
         assert_eq!(contains.unwrap().to_entity, "Sub-section");
@@ -1019,11 +1067,18 @@ mod tests {
         };
         let chunk = make_chunk(ChunkType::Prose, "See oauth.md and example.com.", meta);
         let result = extract_structural(&chunk, "docs/guide.md");
-        let refs: Vec<_> = result.relations.iter().filter(|r| r.relation_type == "related_to").collect();
+        let refs: Vec<_> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "related_to")
+            .collect();
         assert_eq!(refs.len(), 2);
         let rel = refs.iter().find(|r| r.to_entity == "./oauth.md").unwrap();
         assert_eq!(rel.confidence, 0.99);
-        let abs = refs.iter().find(|r| r.to_entity == "https://example.com").unwrap();
+        let abs = refs
+            .iter()
+            .find(|r| r.to_entity == "https://example.com")
+            .unwrap();
         assert_eq!(abs.confidence, 0.7);
     }
 
@@ -1038,13 +1093,20 @@ mod tests {
         };
         let chunk = make_chunk(ChunkType::Prose, "fix: correct off-by-one error", meta);
         let result = extract_structural(&chunk, "git://abc123def456");
-        let created: Vec<_> = result.relations.iter()
+        let created: Vec<_> = result
+            .relations
+            .iter()
             .filter(|r| r.relation_type == "created_by")
             .collect();
         assert_eq!(created.len(), 2, "one created_by per changed file");
         assert!(created.iter().all(|r| r.to_entity == "Alice"));
         assert!(created.iter().all(|r| r.confidence == 0.7));
-        assert!(result.claims.iter().any(|c| c.statement.contains("abc123def456")));
+        assert!(
+            result
+                .claims
+                .iter()
+                .any(|c| c.statement.contains("abc123def456"))
+        );
     }
 
     #[test]

@@ -123,15 +123,17 @@ pub async fn run_serve(
 
     // Resolve workspace paths: explicit --path > --name > registry
     let resolved_paths: Vec<(String, PathBuf, u16)> = if !paths.is_empty() {
-        paths.iter().map(|p| {
-            let abs = std::fs::canonicalize(p)
-                .unwrap_or_else(|_| p.clone());
-            let ws_name = abs
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "default".to_string());
-            (ws_name, abs, port)
-        }).collect()
+        paths
+            .iter()
+            .map(|p| {
+                let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                let ws_name = abs
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                (ws_name, abs, port)
+            })
+            .collect()
     } else {
         let registry = WorkspaceRegistry::load()?;
         let workspaces = if let Some(ref ws_name) = name {
@@ -143,7 +145,9 @@ pub async fn run_serve(
                 ))?;
             vec![(entry.name.clone(), entry.path.clone(), entry.port)]
         } else {
-            registry.workspaces.iter()
+            registry
+                .workspaces
+                .iter()
                 .map(|w| (w.name.clone(), w.path.clone(), w.port))
                 .collect()
         };
@@ -181,7 +185,11 @@ pub async fn run_serve(
             );
         } else {
             engine.mount(ws_name.clone(), abs_path.clone()).await?;
-            tracing::info!("mounted workspace '{}' from {}", ws_name, abs_path.display());
+            tracing::info!(
+                "mounted workspace '{}' from {}",
+                ws_name,
+                abs_path.display()
+            );
         }
     }
 
@@ -197,9 +205,12 @@ pub async fn run_serve(
                 ws.name, ws.entity_count, ws.claim_count
             );
         }
-        let default_ws = resolved_paths.first().map(|(ws_name, _, _)| ws_name.clone());
+        let default_ws = resolved_paths
+            .first()
+            .map(|(ws_name, _, _)| ws_name.clone());
         let engine = Arc::new(RwLock::new(engine));
-        thinkingroot_serve::mcp::stdio::run(engine, default_ws).await;
+        let sessions = thinkingroot_serve::mcp::stdio::new_stdio_sessions();
+        thinkingroot_serve::mcp::stdio::run(engine, default_ws, sessions).await;
         return Ok(());
     }
 
@@ -301,7 +312,9 @@ async fn run_serve_with_listener(
                 .collect()
         };
         if workspaces.is_empty() {
-            anyhow::bail!("No workspaces registered. Run `root setup` or `root workspace add <path>`.");
+            anyhow::bail!(
+                "No workspaces registered. Run `root setup` or `root workspace add <path>`."
+            );
         }
         workspaces
     };
@@ -331,7 +344,8 @@ async fn run_serve_with_listener(
     if mcp_stdio {
         let default_ws = resolved_paths.first().map(|(ws_name, _)| ws_name.clone());
         let engine = Arc::new(RwLock::new(engine));
-        thinkingroot_serve::mcp::stdio::run(engine, default_ws).await;
+        let sessions = thinkingroot_serve::mcp::stdio::new_stdio_sessions();
+        thinkingroot_serve::mcp::stdio::run(engine, default_ws, sessions).await;
         return Ok(());
     }
 
@@ -403,7 +417,11 @@ pub fn install_service() -> anyhow::Result<()> {
 
         std::fs::write(&plist_path, plist)?;
         println!();
-        println!("  {} {}", console::style("✓ Service file:").green().bold(), plist_path.display());
+        println!(
+            "  {} {}",
+            console::style("✓ Service file:").green().bold(),
+            plist_path.display()
+        );
         println!();
         println!("  To start now:");
         println!("    launchctl load {}", plist_path.display());
@@ -433,7 +451,11 @@ pub fn install_service() -> anyhow::Result<()> {
 
         std::fs::write(&service_path, unit)?;
         println!();
-        println!("  {} {}", console::style("✓ Service file:").green().bold(), service_path.display());
+        println!(
+            "  {} {}",
+            console::style("✓ Service file:").green().bold(),
+            service_path.display()
+        );
         println!();
         println!("  To enable:");
         println!("    systemctl --user daemon-reload");
@@ -458,10 +480,17 @@ pub fn install_service() -> anyhow::Result<()> {
 
         std::fs::write(&ps_path, script)?;
         println!();
-        println!("  {} {}", console::style("✓ Script:").green().bold(), ps_path.display());
+        println!(
+            "  {} {}",
+            console::style("✓ Script:").green().bold(),
+            ps_path.display()
+        );
         println!();
         println!("  Run as Administrator:");
-        println!("    powershell -ExecutionPolicy Bypass -File {}", ps_path.display());
+        println!(
+            "    powershell -ExecutionPolicy Bypass -File {}",
+            ps_path.display()
+        );
     }
 
     Ok(())

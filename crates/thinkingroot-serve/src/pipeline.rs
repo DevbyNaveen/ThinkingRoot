@@ -18,23 +18,44 @@ pub enum ProgressEvent {
     /// first chunk completion; `total_chunks` is the definitive denominator.
     ExtractionStart { total_chunks: usize },
     /// One original chunk processed (cache hit or LLM result).
-    ChunkDone { done: usize, total: usize, source_uri: String },
+    ChunkDone {
+        done: usize,
+        total: usize,
+        source_uri: String,
+    },
     /// All chunks extracted. Summary data for solidifying the bar.
-    ExtractionComplete { claims: usize, entities: usize, cache_hits: usize },
+    ExtractionComplete {
+        claims: usize,
+        entities: usize,
+        cache_hits: usize,
+    },
     /// Grounding tribunal is starting (runs between extraction and linking).
-    GroundingStart { llm_claims: usize, structural_claims: usize },
+    GroundingStart {
+        llm_claims: usize,
+        structural_claims: usize,
+    },
     /// Grounding tribunal finished. `accepted` = claims that survived.
     GroundingDone { accepted: usize, rejected: usize },
     /// Fingerprint check finished. `cutoffs` = sources skipped by fingerprint match.
-    FingerprintDone { truly_changed: usize, cutoffs: usize },
+    FingerprintDone {
+        truly_changed: usize,
+        cutoffs: usize,
+    },
     /// Entity resolution is starting.
     LinkingStart { total_entities: usize },
     /// One entity resolved (created or merged).
     EntityResolved { done: usize, total: usize },
     /// Linking finished.
-    LinkComplete { entities: usize, relations: usize, contradictions: usize },
+    LinkComplete {
+        entities: usize,
+        relations: usize,
+        contradictions: usize,
+    },
     /// Vector index update finished.
-    VectorUpdateDone { entities_indexed: usize, claims_indexed: usize },
+    VectorUpdateDone {
+        entities_indexed: usize,
+        claims_indexed: usize,
+    },
     /// Artifact compilation finished.
     CompilationDone { artifacts: usize },
     /// Verification finished.
@@ -74,7 +95,9 @@ pub async fn run_pipeline(
 
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
-    emit!(ProgressEvent::ParseComplete { files: files_parsed });
+    emit!(ProgressEvent::ParseComplete {
+        files: files_parsed
+    });
 
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
@@ -130,7 +153,10 @@ pub async fn run_pipeline(
     // ── Graph-Primed Context: inject known entities into extraction ──
     let known_entities = match storage.graph.get_known_entities() {
         Ok(entities) if !entities.is_empty() => {
-            tracing::info!("graph-primed context: {} known entities loaded", entities.len());
+            tracing::info!(
+                "graph-primed context: {} known entities loaded",
+                entities.len()
+            );
             thinkingroot_extract::GraphPrimedContext::from_tuples(entities)
         }
         Ok(_) => thinkingroot_extract::GraphPrimedContext::new(Vec::new()),
@@ -143,7 +169,10 @@ pub async fn run_pipeline(
     // ── Graph-Primed Context: also inject known relations ──
     let ctx_with_relations = match storage.graph.get_known_relations() {
         Ok(relations) if !relations.is_empty() => {
-            tracing::info!("graph-primed context: {} known relations loaded", relations.len());
+            tracing::info!(
+                "graph-primed context: {} known relations loaded",
+                relations.len()
+            );
             let known_rels: Vec<thinkingroot_extract::KnownRelation> = relations
                 .into_iter()
                 .map(|(from, to, rel_type)| thinkingroot_extract::KnownRelation {
@@ -175,8 +204,9 @@ pub async fn run_pipeline(
                 let tx_chunk = tx.clone();
                 let pf = Arc::new(move |done: usize, total: usize, uri: &str| {
                     if done == 1 {
-                        let _ = tx_chunk
-                            .send(ProgressEvent::ExtractionStart { total_chunks: total });
+                        let _ = tx_chunk.send(ProgressEvent::ExtractionStart {
+                            total_chunks: total,
+                        });
                     }
                     let _ = tx_chunk.send(ProgressEvent::ChunkDone {
                         done,
@@ -191,7 +221,10 @@ pub async fn run_pipeline(
         };
         let raw = extractor
             .extract_all(
-                &potentially_changed.iter().map(|d| (*d).clone()).collect::<Vec<_>>(),
+                &potentially_changed
+                    .iter()
+                    .map(|d| (*d).clone())
+                    .collect::<Vec<_>>(),
                 workspace_id,
             )
             .await?;
@@ -210,7 +243,9 @@ pub async fn run_pipeline(
             "tiered extraction: {} structural (zero LLM), {} cache hits, {} LLM calls",
             extraction.structural_extractions,
             extraction.cache_hits,
-            extraction.chunks_processed.saturating_sub(extraction.cache_hits + extraction.structural_extractions),
+            extraction
+                .chunks_processed
+                .saturating_sub(extraction.cache_hits + extraction.structural_extractions),
         );
     }
 
@@ -228,7 +263,8 @@ pub async fn run_pipeline(
     // it onto a dedicated blocking thread.
 
     // Partition: structural claims get 0.99, LLM claims go to tribunal.
-    let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction.claims
+    let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction
+        .claims
         .into_iter()
         .partition(|c| c.extraction_tier == thinkingroot_core::types::ExtractionTier::Llm);
 
@@ -274,16 +310,15 @@ pub async fn run_pipeline(
 
         extraction.claims = llm_claims;
         let pre_count = extraction.claims.len();
-        let mut grounded = thinkingroot_ground::Grounder::new(
-            thinkingroot_ground::GroundingConfig::default(),
-        )
-        .ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            Some(&mut storage.vector),
-            #[cfg(feature = "vector")]
-            nli_judge.as_mut(),
-        );
+        let mut grounded =
+            thinkingroot_ground::Grounder::new(thinkingroot_ground::GroundingConfig::default())
+                .ground(
+                    extraction,
+                    #[cfg(feature = "vector")]
+                    Some(&mut storage.vector),
+                    #[cfg(feature = "vector")]
+                    nli_judge.as_mut(),
+                );
         thinkingroot_ground::dedup::dedup_claims(&mut grounded.claims);
         let post_count = grounded.claims.len();
         if pre_count != post_count {
@@ -326,8 +361,7 @@ pub async fn run_pipeline(
             .iter()
             .filter(|c| c.source == doc.source_id)
             .collect();
-        let fp_bytes = serde_json::to_vec(&source_claims)
-            .unwrap_or_default();
+        let fp_bytes = serde_json::to_vec(&source_claims).unwrap_or_default();
         let fp = crate::fingerprint::FingerprintStore::compute(&fp_bytes);
 
         if fingerprints.is_unchanged(&doc.uri, &fp) {
@@ -356,8 +390,7 @@ pub async fn run_pipeline(
         let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
         if !existing_sources.is_empty() {
             for (source_id, _, _) in &existing_sources {
-                affected_triples
-                    .extend(storage.graph.get_source_relation_triples(source_id)?);
+                affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
                 // Fetch entity IDs once, reuse for both cross-file triples and vector stale IDs.
                 let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
                 if !entity_ids_from_source.is_empty() {
@@ -428,7 +461,11 @@ pub async fn run_pipeline(
 
     // If only deletions or all fingerprint hits — no new content to link.
     if truly_changed.is_empty() {
-        emit!(ProgressEvent::LinkComplete { entities: 0, relations: 0, contradictions: 0 });
+        emit!(ProgressEvent::LinkComplete {
+            entities: 0,
+            relations: 0,
+            contradictions: 0
+        });
 
         let (ent_count, clm_count) = update_vector_index_full(&mut storage)?;
         emit!(ProgressEvent::VectorUpdateDone {
@@ -437,8 +474,11 @@ pub async fn run_pipeline(
         });
 
         let compiler = thinkingroot_compile::Compiler::new(&config)?;
-        let artifacts = compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
-        emit!(ProgressEvent::CompilationDone { artifacts: artifacts.len() });
+        let artifacts =
+            compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
+        emit!(ProgressEvent::CompilationDone {
+            artifacts: artifacts.len()
+        });
 
         let verifier = thinkingroot_verify::Verifier::new(&config);
         let verification = verifier.verify(&storage.graph)?;
@@ -575,8 +615,11 @@ pub async fn run_pipeline(
 
         // Build new vector items for affected entities and newly added claims.
         let all_entities = storage.graph.get_all_entities()?;
-        let affected_set: std::collections::HashSet<&str> =
-            link_output.affected_entity_ids.iter().map(|s| s.as_str()).collect();
+        let affected_set: std::collections::HashSet<&str> = link_output
+            .affected_entity_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let new_entity_items: Vec<(String, String, String)> = all_entities
             .iter()
             .filter(|(id, _, _)| affected_set.contains(id.as_str()))
@@ -590,8 +633,11 @@ pub async fn run_pipeline(
             .collect();
 
         let all_claims = storage.graph.get_all_claims_with_sources()?;
-        let added_claim_set: std::collections::HashSet<&str> =
-            link_output.added_claim_ids.iter().map(|s| s.as_str()).collect();
+        let added_claim_set: std::collections::HashSet<&str> = link_output
+            .added_claim_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let new_claim_items: Vec<(String, String, String)> = all_claims
             .iter()
             .filter(|(id, _, _, _, _)| added_claim_set.contains(id.as_str()))
@@ -637,7 +683,9 @@ pub async fn run_pipeline(
         &link_output.affected_entity_ids,
         true,
     )?;
-    emit!(ProgressEvent::CompilationDone { artifacts: artifacts.len() });
+    emit!(ProgressEvent::CompilationDone {
+        artifacts: artifacts.len()
+    });
 
     // ─── Phase 11: Verify + persist ─────────────────────────────────────
     let verifier = thinkingroot_verify::Verifier::new(&config);

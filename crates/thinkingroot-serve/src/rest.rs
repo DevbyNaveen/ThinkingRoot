@@ -20,6 +20,8 @@ pub struct AppState {
     pub engine: RwLock<QueryEngine>,
     pub api_key: Option<String>,
     pub mcp_sessions: crate::mcp::sse::SseSessionMap,
+    /// Per-agent session state for the intelligent serve layer.
+    pub sessions: crate::intelligence::session::SessionStore,
     /// Workspace root path for branch operations (None when multiple workspaces are mounted).
     pub workspace_root: Option<PathBuf>,
 }
@@ -41,6 +43,7 @@ impl AppState {
             engine: RwLock::new(engine),
             api_key,
             mcp_sessions: crate::mcp::sse::new_session_map(),
+            sessions: crate::intelligence::session::new_session_store(),
             workspace_root,
         })
     }
@@ -133,7 +136,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
-            .route("/branches", get(list_branches_handler).post(create_branch_handler))
+            .route(
+                "/branches",
+                get(list_branches_handler).post(create_branch_handler),
+            )
             .route("/branches/{branch}/diff", get(diff_branch_handler))
             .route("/branches/{branch}/merge", post(merge_branch_handler))
             .route("/branches/{branch}/checkout", post(checkout_branch_handler))
@@ -398,7 +404,7 @@ async fn create_branch_handler(
                 StatusCode::BAD_REQUEST,
                 "NOT_CONFIGURED",
                 "workspace_root not set",
-            )
+            );
         }
     };
     let parent = body.parent.as_deref().unwrap_or("main");
@@ -423,7 +429,7 @@ async fn delete_branch_handler(
                 StatusCode::BAD_REQUEST,
                 "NOT_CONFIGURED",
                 "workspace_root not set",
-            )
+            );
         }
     };
     match thinkingroot_branch::delete_branch(&root, &branch) {
@@ -443,7 +449,7 @@ async fn checkout_branch_handler(
                 StatusCode::BAD_REQUEST,
                 "NOT_CONFIGURED",
                 "workspace_root not set",
-            )
+            );
         }
     };
     match thinkingroot_branch::write_head_branch(&root, &branch) {
@@ -467,7 +473,7 @@ async fn diff_branch_handler(
                 StatusCode::BAD_REQUEST,
                 "NOT_CONFIGURED",
                 "workspace_root not set",
-            )
+            );
         }
     };
     use thinkingroot_branch::diff::compute_diff;
@@ -482,7 +488,7 @@ async fn diff_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "CONFIG_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
     let mc = &config.merge;
@@ -504,7 +510,7 @@ async fn diff_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRAPH_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
     let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
@@ -514,7 +520,7 @@ async fn diff_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRAPH_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
 
@@ -553,13 +559,13 @@ async fn merge_branch_handler(
                 StatusCode::BAD_REQUEST,
                 "NOT_CONFIGURED",
                 "workspace_root not set",
-            )
+            );
         }
     };
     use thinkingroot_branch::diff::compute_diff;
     use thinkingroot_branch::merge::execute_merge;
     use thinkingroot_branch::snapshot::resolve_data_dir;
-    use thinkingroot_core::{config::Config, MergedBy};
+    use thinkingroot_core::{MergedBy, config::Config};
     use thinkingroot_graph::graph::GraphStore;
 
     let force = body.as_ref().and_then(|b| b.force).unwrap_or(false);
@@ -575,7 +581,7 @@ async fn merge_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "CONFIG_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
     let mc = &config.merge;
@@ -597,7 +603,7 @@ async fn merge_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRAPH_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
     let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
@@ -607,7 +613,7 @@ async fn merge_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "GRAPH_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
 
@@ -625,7 +631,7 @@ async fn merge_branch_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "DIFF_ERROR",
                 &e.to_string(),
-            )
+            );
         }
     };
 

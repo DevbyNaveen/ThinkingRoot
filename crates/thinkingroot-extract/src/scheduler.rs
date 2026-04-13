@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
@@ -25,9 +25,8 @@ impl HeaderRateLimits {
     /// Parse from reqwest response headers.
     /// Handles both Anthropic (`anthropic-ratelimit-*`) and OpenAI/Groq (`x-ratelimit-*`) formats.
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
-        let get_u32 = |name: &str| -> Option<u32> {
-            headers.get(name)?.to_str().ok()?.parse().ok()
-        };
+        let get_u32 =
+            |name: &str| -> Option<u32> { headers.get(name)?.to_str().ok()?.parse().ok() };
 
         Self {
             rpm: get_u32("anthropic-ratelimit-requests-limit")
@@ -148,7 +147,6 @@ pub struct ThroughputScheduler {
     remaining_tokens: AtomicU64,
 
     // ── Concurrency auto-tuning ───────────────────────────────────
-
     /// HTTP requests currently in-flight (dispatched, not yet responded).
     /// Shared with issued `RequestTicket`s which decrement it on drop.
     in_flight: Arc<AtomicU64>,
@@ -177,22 +175,22 @@ impl ThroughputScheduler {
     pub fn new(max_concurrency: usize) -> Arc<Self> {
         let max = max_concurrency.max(1) as u64;
         Arc::new(Self {
-            interval_ms:          AtomicU64::new(1_000),
-            last_send_ms:         AtomicU64::new(0),
-            send_gate:            Mutex::new(()),
-            token_window:         Mutex::new(VecDeque::with_capacity(20)),
-            token_window_sum:     AtomicU64::new(0),
+            interval_ms: AtomicU64::new(1_000),
+            last_send_ms: AtomicU64::new(0),
+            send_gate: Mutex::new(()),
+            token_window: Mutex::new(VecDeque::with_capacity(20)),
+            token_window_sum: AtomicU64::new(0),
             consecutive_successes: AtomicU64::new(0),
-            limits_known:         AtomicBool::new(false),
-            known_rpm:            AtomicU64::new(0),
-            known_tpm:            AtomicU64::new(0),
-            remaining_requests:   AtomicU64::new(0),
-            remaining_tokens:     AtomicU64::new(0),
-            in_flight:            Arc::new(AtomicU64::new(0)),
-            safe_concurrency:     AtomicU64::new(max), // starts permissive; converges down
-            max_concurrency:      AtomicU64::new(max),
-            latency_window:       Mutex::new(VecDeque::with_capacity(20)),
-            latency_window_sum:   AtomicU64::new(0),
+            limits_known: AtomicBool::new(false),
+            known_rpm: AtomicU64::new(0),
+            known_tpm: AtomicU64::new(0),
+            remaining_requests: AtomicU64::new(0),
+            remaining_tokens: AtomicU64::new(0),
+            in_flight: Arc::new(AtomicU64::new(0)),
+            safe_concurrency: AtomicU64::new(max), // starts permissive; converges down
+            max_concurrency: AtomicU64::new(max),
+            latency_window: Mutex::new(VecDeque::with_capacity(20)),
+            latency_window_sum: AtomicU64::new(0),
         })
     }
 
@@ -215,7 +213,7 @@ impl ThroughputScheduler {
         // ── 1. Concurrency gate ───────────────────────────────────
         loop {
             let in_flight = self.in_flight.load(Ordering::Acquire);
-            let safe     = self.safe_concurrency.load(Ordering::Acquire).max(1);
+            let safe = self.safe_concurrency.load(Ordering::Acquire).max(1);
             if in_flight < safe {
                 break;
             }
@@ -226,8 +224,8 @@ impl ThroughputScheduler {
         let _gate = self.send_gate.lock().await;
 
         let interval = self.interval_ms.load(Ordering::Relaxed);
-        let last     = self.last_send_ms.load(Ordering::Relaxed);
-        let now      = unix_ms();
+        let last = self.last_send_ms.load(Ordering::Relaxed);
+        let now = unix_ms();
 
         if interval > 0 && now < last + interval {
             let wait_ms = (last + interval) - now;
@@ -240,7 +238,7 @@ impl ThroughputScheduler {
         self.in_flight.fetch_add(1, Ordering::AcqRel);
 
         RequestTicket {
-            start_ms:  unix_ms(),
+            start_ms: unix_ms(),
             in_flight: Arc::clone(&self.in_flight),
         }
         // _gate drops here — next waiter can enter the rate gate
@@ -260,7 +258,7 @@ impl ThroughputScheduler {
         let latency_ms = unix_ms().saturating_sub(ticket.start_ms);
         // ticket drops at end of this function → in_flight decremented.
 
-        let avg_tokens  = self.push_token(tokens).await;
+        let avg_tokens = self.push_token(tokens).await;
         let avg_latency = self.push_latency(latency_ms).await;
 
         // Update known limits from headers.
@@ -307,7 +305,7 @@ impl ThroughputScheduler {
         self.safe_concurrency.store(new_conc, Ordering::Relaxed);
 
         tracing::warn!(
-            interval_ms      = new_interval,
+            interval_ms = new_interval,
             safe_concurrency = new_conc,
             "scheduler: 429 hit — doubled interval, halved concurrency (safety net fired)"
         );
@@ -316,7 +314,11 @@ impl ThroughputScheduler {
     /// Current estimated calls per minute at the active send rate.
     pub fn calls_per_min(&self) -> f64 {
         let ms = self.interval_ms.load(Ordering::Relaxed);
-        if ms == 0 { f64::INFINITY } else { 60_000.0 / ms as f64 }
+        if ms == 0 {
+            f64::INFINITY
+        } else {
+            60_000.0 / ms as f64
+        }
     }
 
     /// Current auto-tuned safe concurrency.
@@ -342,11 +344,15 @@ impl ThroughputScheduler {
         let mut w = self.latency_window.lock().await;
         if w.len() >= 20 {
             if let Some(evicted) = w.pop_front() {
-                self.latency_window_sum.fetch_sub(evicted, Ordering::Relaxed);
+                self.latency_window_sum
+                    .fetch_sub(evicted, Ordering::Relaxed);
             }
         }
         w.push_back(latency_ms);
-        let new_sum = self.latency_window_sum.fetch_add(latency_ms, Ordering::Relaxed) + latency_ms;
+        let new_sum = self
+            .latency_window_sum
+            .fetch_add(latency_ms, Ordering::Relaxed)
+            + latency_ms;
         new_sum as f64 / w.len() as f64
     }
 
@@ -384,7 +390,7 @@ impl ThroughputScheduler {
                 } else {
                     1.0
                 };
-                let fraction_remaining  = req_fraction.min(tok_fraction);
+                let fraction_remaining = req_fraction.min(tok_fraction);
                 let window_correction = if fraction_remaining < 0.20 {
                     1.0 + (0.20 - fraction_remaining) * 5.0 // 1.0 at 20%, 2.0 at 0%
                 } else {
@@ -398,8 +404,8 @@ impl ThroughputScheduler {
                         rpm,
                         tpm,
                         avg_tokens,
-                        calls_per_min    = safe_cpm,
-                        interval_ms      = new_interval,
+                        calls_per_min = safe_cpm,
+                        interval_ms = new_interval,
                         window_correction,
                         "scheduler: send rate calibrated from provider limits"
                     );
@@ -408,7 +414,7 @@ impl ThroughputScheduler {
         } else {
             // No limits known (Bedrock, Ollama) — self-tune: ramp up 10% every 20 successes.
             if successes > 0 && successes % 20 == 0 {
-                let current      = self.interval_ms.load(Ordering::Relaxed);
+                let current = self.interval_ms.load(Ordering::Relaxed);
                 let new_interval = ((current as f64 * 0.90) as u64).max(100);
                 self.interval_ms.store(new_interval, Ordering::Relaxed);
                 tracing::debug!(
@@ -436,17 +442,17 @@ impl ThroughputScheduler {
         }
 
         // N = W / T  (ceil to avoid pipeline stall from rounding down)
-        let derived  = (avg_latency_ms / interval as f64).ceil() as u64;
-        let max      = self.max_concurrency.load(Ordering::Relaxed);
+        let derived = (avg_latency_ms / interval as f64).ceil() as u64;
+        let max = self.max_concurrency.load(Ordering::Relaxed);
         let new_safe = derived.max(1).min(max);
 
         let old = self.safe_concurrency.swap(new_safe, Ordering::Relaxed);
         if old != new_safe {
             tracing::info!(
                 avg_latency_ms,
-                interval_ms      = interval,
+                interval_ms = interval,
                 safe_concurrency = new_safe,
-                max_concurrency  = max,
+                max_concurrency = max,
                 "scheduler: concurrency recalibrated (Little's Law)"
             );
         }
@@ -467,9 +473,15 @@ mod tests {
     #[test]
     fn parses_anthropic_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("anthropic-ratelimit-requests-limit",   "1000".parse().unwrap());
-        headers.insert("anthropic-ratelimit-tokens-limit",     "80000".parse().unwrap());
-        headers.insert("anthropic-ratelimit-requests-remaining", "950".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            "1000".parse().unwrap(),
+        );
+        headers.insert("anthropic-ratelimit-tokens-limit", "80000".parse().unwrap());
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            "950".parse().unwrap(),
+        );
 
         let limits = HeaderRateLimits::from_headers(&headers);
         assert_eq!(limits.rpm, Some(1000));
@@ -481,7 +493,7 @@ mod tests {
     fn parses_openai_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-ratelimit-limit-requests", "500".parse().unwrap());
-        headers.insert("x-ratelimit-limit-tokens",   "30000".parse().unwrap());
+        headers.insert("x-ratelimit-limit-tokens", "30000".parse().unwrap());
 
         let limits = HeaderRateLimits::from_headers(&headers);
         assert_eq!(limits.rpm, Some(500));
@@ -502,26 +514,36 @@ mod tests {
             tpm: Some(900_000), // not binding
             ..Default::default()
         };
-        scheduler.record_success(1_000, &limits, RequestTicket::for_test()).await;
+        scheduler
+            .record_success(1_000, &limits, RequestTicket::for_test())
+            .await;
 
         // safe_cpm = 60 × 0.90 = 54 → interval = 60_000/54 ≈ 1111 ms
         let interval = scheduler.interval_ms.load(Ordering::Relaxed);
-        assert!(interval > 1000 && interval < 1200, "expected ~1111ms, got {interval}");
+        assert!(
+            interval > 1000 && interval < 1200,
+            "expected ~1111ms, got {interval}"
+        );
     }
 
     #[tokio::test]
     async fn calibrates_interval_from_tpm_when_binding() {
         let scheduler = ThroughputScheduler::new(5);
         let limits = HeaderRateLimits {
-            rpm: Some(1000),    // not binding
-            tpm: Some(10_000),  // binding
+            rpm: Some(1000),   // not binding
+            tpm: Some(10_000), // binding
             ..Default::default()
         };
-        scheduler.record_success(500, &limits, RequestTicket::for_test()).await;
+        scheduler
+            .record_success(500, &limits, RequestTicket::for_test())
+            .await;
 
         // safe_cpm_by_tpm = (10_000 × 0.90) / 500 = 18 → interval = 60_000/18 = 3333ms
         let interval = scheduler.interval_ms.load(Ordering::Relaxed);
-        assert!(interval > 3000 && interval < 3500, "expected ~3333ms, got {interval}");
+        assert!(
+            interval > 3000 && interval < 3500,
+            "expected ~3333ms, got {interval}"
+        );
     }
 
     #[tokio::test]
@@ -568,7 +590,10 @@ mod tests {
         }
 
         let interval = scheduler.interval_ms.load(Ordering::Relaxed);
-        assert!(interval < 2_000, "expected ramp-up, got interval={interval}");
+        assert!(
+            interval < 2_000,
+            "expected ramp-up, got interval={interval}"
+        );
     }
 
     #[tokio::test]
@@ -580,10 +605,15 @@ mod tests {
             remaining_requests: Some(3), // 3/60 = 5% remaining
             remaining_tokens: None,
         };
-        scheduler.record_success(1_000, &limits, RequestTicket::for_test()).await;
+        scheduler
+            .record_success(1_000, &limits, RequestTicket::for_test())
+            .await;
 
         let interval = scheduler.interval_ms.load(Ordering::Relaxed);
-        assert!(interval > 1500, "expected window correction, got {interval}");
+        assert!(
+            interval > 1500,
+            "expected window correction, got {interval}"
+        );
     }
 
     #[tokio::test]
@@ -595,10 +625,15 @@ mod tests {
             remaining_requests: Some(48), // 80% remaining
             remaining_tokens: None,
         };
-        scheduler.record_success(1_000, &limits, RequestTicket::for_test()).await;
+        scheduler
+            .record_success(1_000, &limits, RequestTicket::for_test())
+            .await;
 
         let interval = scheduler.interval_ms.load(Ordering::Relaxed);
-        assert!(interval < 1300, "expected no window correction, got {interval}");
+        assert!(
+            interval < 1300,
+            "expected no window correction, got {interval}"
+        );
     }
 
     #[tokio::test]
@@ -609,10 +644,14 @@ mod tests {
 
         // Simulate a 3000ms latency.
         let ticket = RequestTicket {
-            start_ms:  unix_ms().saturating_sub(3_000),
+            start_ms: unix_ms().saturating_sub(3_000),
             in_flight: Arc::new(AtomicU64::new(1)),
         };
-        let limits = HeaderRateLimits { rpm: Some(60), tpm: Some(900_000), ..Default::default() };
+        let limits = HeaderRateLimits {
+            rpm: Some(60),
+            tpm: Some(900_000),
+            ..Default::default()
+        };
         scheduler.record_success(1_000, &limits, ticket).await;
 
         // N = ceil(3000 / interval_after_calibration)
@@ -626,10 +665,14 @@ mod tests {
     async fn concurrency_never_exceeds_max() {
         let scheduler = ThroughputScheduler::new(3); // hard cap
         let ticket = RequestTicket {
-            start_ms:  unix_ms().saturating_sub(30_000), // extreme latency
+            start_ms: unix_ms().saturating_sub(30_000), // extreme latency
             in_flight: Arc::new(AtomicU64::new(1)),
         };
-        let limits = HeaderRateLimits { rpm: Some(60), tpm: Some(900_000), ..Default::default() };
+        let limits = HeaderRateLimits {
+            rpm: Some(60),
+            tpm: Some(900_000),
+            ..Default::default()
+        };
         scheduler.record_success(1_000, &limits, ticket).await;
 
         let conc = scheduler.safe_concurrency.load(Ordering::Relaxed);
@@ -641,7 +684,7 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(2));
         {
             let _ticket = RequestTicket {
-                start_ms:  unix_ms(),
+                start_ms: unix_ms(),
                 in_flight: Arc::clone(&counter),
             };
             assert_eq!(counter.load(Ordering::Relaxed), 2);
@@ -654,7 +697,7 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         {
             let _ticket = RequestTicket {
-                start_ms:  unix_ms(),
+                start_ms: unix_ms(),
                 in_flight: Arc::clone(&counter),
             };
         }
@@ -677,6 +720,9 @@ mod tests {
         drop(t3);
         let elapsed = start.elapsed().as_millis();
 
-        assert!(elapsed >= 90, "3 sends at 50ms interval should take ≥100ms, got {elapsed}ms");
+        assert!(
+            elapsed >= 90,
+            "3 sends at 50ms interval should take ≥100ms, got {elapsed}ms"
+        );
     }
 }
