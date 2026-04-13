@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "thinkingroot"
 dynamic = ["version"]
 description = "Knowledge compiler for AI agents — Python SDK"
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Naveen", email = "naveen@thinkingroot.dev" }]
@@ -28,7 +28,7 @@ dependencies = ["httpx>=0.27"]
 
 [project.urls]
 Homepage = "https://thinkingroot.dev"
-Repository = "https://github.com/thinkingroot/thinkingroot"
+Repository = "https://github.com/DevbyNaveen/thinkingroot"
 Documentation = "https://docs.thinkingroot.dev"
 
 [project.optional-dependencies]

@@ -43,7 +43,9 @@ jobs:
           workspaces: thinkingroot-python -> target
           key: ${{ matrix.target }}
 
+      # Only pin Python on macOS/Windows — manylinux Docker handles its own Python
       - name: Set up Python 3.13
+        if: runner.os != 'Linux'
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -68,6 +70,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # pyproject.toml expects README.md inside thinkingroot-python/
+      - name: Copy README for sdist
+        run: cp README.md thinkingroot-python/README.md
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5

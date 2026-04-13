@@ -1,9 +1,7 @@
 name: Publish to crates.io
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:  # manual only — requires CARGO_REGISTRY_TOKEN secret
 
 env:
   CARGO_TERM_COLOR: always
