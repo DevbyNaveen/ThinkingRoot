@@ -1,0 +1,47 @@
+name: Benchmark (PR)
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+concurrency:
+  group: bench-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  micro-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+
+      - name: Run micro-benchmarks
+        run: |
+          BENCH_SCALE=small cargo bench \
+            -p thinkingroot-bench \
+            --no-default-features \
+            --bench graph_queries \
+            --bench parser_throughput \
+            --bench serialization \
+            -- --output-format bencher | tee output.txt
+
+      - name: Store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ThinkingRoot Micro-Benchmarks
+          tool: cargo
+          output-file-path: output.txt
+          alert-threshold: '120%'
+          comment-on-alert: true
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment-always: true
+          save-data-file: false

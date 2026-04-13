@@ -1,0 +1,53 @@
+name: Benchmark (Nightly)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Benchmark scale
+        default: medium
+
+jobs:
+  full-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-nightly
+
+      - name: Run Criterion micro-benchmarks
+        run: |
+          cargo bench \
+            -p thinkingroot-bench \
+            --no-default-features \
+            --bench graph_queries \
+            --bench parser_throughput \
+            --bench serialization \
+            --bench vector_search \
+            -- --output-format bencher | tee micro-output.txt
+
+      - name: Run Divan macro-benchmarks
+        run: |
+          cargo bench \
+            -p thinkingroot-bench \
+            --no-default-features \
+            --bench pipeline_e2e \
+            --bench stage_timing \
+            --bench cache_effectiveness
+
+      - name: Publish to GitHub Pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ThinkingRoot Benchmarks
+          tool: cargo
+          output-file-path: micro-output.txt
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
