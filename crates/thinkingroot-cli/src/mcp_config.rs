@@ -484,6 +484,29 @@ pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: 
             toml::Value::String(workspace_path.to_string()),
         ]),
     );
+    // Forward credential env vars so the subprocess can reach LLM providers
+    // even when Codex is launched outside a shell (e.g., as a GUI app).
+    const CREDENTIAL_VARS: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_REGION",
+        "AWS_REGION",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ];
+    let mut env_map = toml::map::Map::new();
+    for var in CREDENTIAL_VARS {
+        if let Ok(val) = std::env::var(var) {
+            env_map.insert(var.to_string(), toml::Value::String(val));
+        }
+    }
+    if !env_map.is_empty() {
+        entry.insert("env".to_string(), toml::Value::Table(env_map));
+    }
     mcp_servers.insert("thinkingroot".to_string(), toml::Value::Table(entry));
 }
 
@@ -874,5 +897,96 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
         remove_entry(&mut existing, ConfigFormat::GeminiCli);
         assert!(existing["mcpServers"]["other"].is_object());
         assert!(existing["mcpServers"]["thinkingroot"].is_null());
+    }
+
+    #[test]
+    fn codex_toml_captures_env_vars_when_set() {
+        // This test verifies that when credential env vars are set,
+        // they get captured in the Codex TOML env table.
+        // We check with AWS_ACCESS_KEY_ID since it's part of the CREDENTIAL_VARS list.
+        let test_key = "AWS_ACCESS_KEY_ID";
+        let test_value = "AKIAIOSFODNN7EXAMPLE";
+
+        let original_val = std::env::var(test_key).ok();
+        unsafe {
+            std::env::set_var(test_key, test_value);
+        }
+
+        let input = r#"model = "gpt-4o""#;
+        let mut doc: toml::Value = input.parse().unwrap();
+        apply_codex_entry(&mut doc, "/usr/local/bin/root", "/workspace");
+
+        let mcp = doc["mcp_servers"]["thinkingroot"].as_table().unwrap();
+
+        // Verify basic structure: command and args exist
+        assert_eq!(
+            mcp["command"].as_str().unwrap(),
+            "/usr/local/bin/root"
+        );
+
+        // When credentials are set, env table should be populated
+        assert!(
+            mcp.contains_key("env"),
+            "env table should exist when credentials are set"
+        );
+        assert_eq!(
+            mcp["env"][test_key].as_str().unwrap(),
+            test_value,
+            "{} should be captured in env table", test_key
+        );
+
+        // Clean up: restore original state
+        unsafe {
+            if let Some(val) = original_val {
+                std::env::set_var(test_key, val);
+            } else {
+                std::env::remove_var(test_key);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_toml_omits_env_table_when_no_credentials_set() {
+        // This test verifies that when NO credential env vars are set,
+        // the env table is omitted from the TOML (not included if empty).
+        // We save and restore the state of all credential vars for this test.
+        const VARS: &[&str] = &[
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+            "AWS_PROFILE", "AWS_DEFAULT_REGION", "AWS_REGION",
+            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY",
+        ];
+
+        // Save original state
+        let original_vals: Vec<(String, Option<String>)> = VARS
+            .iter()
+            .map(|v| (v.to_string(), std::env::var(v).ok()))
+            .collect();
+
+        // Remove all credential vars for this test
+        unsafe {
+            for v in VARS {
+                std::env::remove_var(v);
+            }
+        }
+
+        let mut doc: toml::Value = toml::Value::Table(toml::map::Map::new());
+        apply_codex_entry(&mut doc, "/usr/local/bin/root", "/workspace");
+
+        let mcp = doc["mcp_servers"]["thinkingroot"].as_table().unwrap();
+        assert!(
+            !mcp.contains_key("env"),
+            "env table should be absent when no credentials are set"
+        );
+
+        // Restore original state
+        unsafe {
+            for (var_name, original_val) in original_vals {
+                if let Some(val) = original_val {
+                    std::env::set_var(&var_name, val);
+                } else {
+                    std::env::remove_var(&var_name);
+                }
+            }
+        }
     }
 }
