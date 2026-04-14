@@ -455,6 +455,28 @@ fn write_codex_config(
     })
 }
 
+/// LLM provider credential environment variables forwarded to the Codex subprocess.
+/// Keeps in sync with the providers registered in the setup wizard.
+const CREDENTIAL_VARS: &[&str] = &[
+    // AWS Bedrock
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    // API providers
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "LITELLM_API_KEY",
+];
+
 pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: &str) {
     let root = doc.as_table_mut().expect("TOML root must be a table");
 
@@ -486,18 +508,6 @@ pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: 
     );
     // Forward credential env vars so the subprocess can reach LLM providers
     // even when Codex is launched outside a shell (e.g., as a GUI app).
-    const CREDENTIAL_VARS: &[&str] = &[
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_PROFILE",
-        "AWS_DEFAULT_REGION",
-        "AWS_REGION",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GROQ_API_KEY",
-        "DEEPSEEK_API_KEY",
-    ];
     let mut env_map = toml::map::Map::new();
     for var in CREDENTIAL_VARS {
         if let Ok(val) = std::env::var(var) {
@@ -703,6 +713,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // Serialise tests that mutate process-global environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn merge_mcp_servers_inserts_entry_preserving_others() {
         let mut existing = json!({
@@ -901,6 +914,7 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
 
     #[test]
     fn codex_toml_captures_env_vars_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // This test verifies that when credential env vars are set,
         // they get captured in the Codex TOML env table.
         // We check with AWS_ACCESS_KEY_ID since it's part of the CREDENTIAL_VARS list.
@@ -947,26 +961,20 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
 
     #[test]
     fn codex_toml_omits_env_table_when_no_credentials_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // This test verifies that when NO credential env vars are set,
         // the env table is omitted from the TOML (not included if empty).
         // We save and restore the state of all credential vars for this test.
-        const VARS: &[&str] = &[
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "AWS_PROFILE", "AWS_DEFAULT_REGION", "AWS_REGION",
-            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "DEEPSEEK_API_KEY",
-        ];
 
         // Save original state
-        let original_vals: Vec<(String, Option<String>)> = VARS
+        let original_vals: Vec<(String, Option<String>)> = CREDENTIAL_VARS
             .iter()
             .map(|v| (v.to_string(), std::env::var(v).ok()))
             .collect();
 
         // Remove all credential vars for this test
         unsafe {
-            for v in VARS {
-                std::env::remove_var(v);
-            }
+            for v in CREDENTIAL_VARS { std::env::remove_var(v); }
         }
 
         let mut doc: toml::Value = toml::Value::Table(toml::map::Map::new());
