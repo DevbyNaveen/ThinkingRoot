@@ -23,6 +23,10 @@ pub struct ExtractedClaim {
     pub source_quote: Option<String>,
     #[serde(default)]
     pub extraction_tier: ExtractionTier,
+    /// ISO date (YYYY-MM-DD) of when the described event actually occurred.
+    /// Null/absent when the claim has no specific associated event date.
+    #[serde(default)]
+    pub event_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

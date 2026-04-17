@@ -67,6 +67,148 @@ pub fn model_max_output_tokens(model: &str) -> i32 {
     8_192
 }
 
+/// Returns the input context window (in tokens) for a known model.
+/// Falls back to a conservative 32_768 for unknown models.
+/// Sources: official provider documentation, April 2026.
+pub fn model_context_window(model: &str) -> usize {
+    let m = model.to_lowercase();
+
+    // ── Anthropic Claude ────────────────────────────────────────────
+    // Sonnet 4.6, Opus 4.6, Opus 4.7 — 1M context
+    if m.contains("sonnet") || m.contains("opus") {
+        return 1_000_000;
+    }
+    // Haiku 4.5 — 200K context
+    if m.contains("haiku-4-5") || m.contains("haiku-4.5") {
+        return 200_000;
+    }
+    // Haiku 3 — 200K context
+    if m.contains("haiku") {
+        return 200_000;
+    }
+
+    // ── OpenAI / Azure gpt-4.1 family (2025) — 1M on direct, 300K on Azure standard ──
+    // We conservatively use 300K (the Azure standard cap) so the same table works for both.
+    if m.contains("gpt-4.1") || m.contains("gpt-4-1") {
+        return 300_000;
+    }
+    // gpt-4o family — 128K
+    if m.contains("gpt-4o") || m.contains("gpt-4-turbo") {
+        return 128_000;
+    }
+    // gpt-3.5 — 16K
+    if m.contains("gpt-3.5") || m.contains("gpt-35") {
+        return 16_384;
+    }
+
+    // ── Amazon Bedrock Nova ─────────────────────────────────────────
+    // Nova Lite / Pro — 300K context
+    if m.contains("nova-lite") || m.contains("nova-pro") {
+        return 300_000;
+    }
+    // Nova Micro — 128K context
+    if m.contains("nova-micro") || m.contains("nova") {
+        return 128_000;
+    }
+
+    // ── Groq / Together / Meta Llama ───────────────────────────────
+    // Llama 3.x — 131K (production Groq/Together limit)
+    if m.contains("llama-3") || m.contains("llama3") || m.contains("llama-4") {
+        return 131_072;
+    }
+
+    // ── Mistral / Mixtral ──────────────────────────────────────────
+    // Mixtral-8x7b — 32K (legacy; new mistral-large is 128K)
+    if m.contains("mixtral") {
+        return 32_768;
+    }
+    if m.contains("mistral-large") || m.contains("mistral-medium") {
+        return 128_000;
+    }
+    if m.contains("mistral") {
+        return 32_768;
+    }
+
+    // ── DeepSeek ───────────────────────────────────────────────────
+    if m.contains("deepseek") {
+        return 128_000;
+    }
+
+    // ── Perplexity Sonar ───────────────────────────────────────────
+    // Sonar models are search-grounded; web retrieval consumes ~30% of context.
+    // We report the raw window but batch size is further capped in model_batch_size.
+    if m.contains("sonar") {
+        return 127_000;
+    }
+
+    // ── Ollama (local) ─────────────────────────────────────────────
+    // Ollama default num_ctx is 2048 regardless of model native limit.
+    // We return 2048 as the safe default; users who set num_ctx in their
+    // Ollama server will benefit from a higher batch size via config override.
+    if m.contains("ollama") {
+        return 2_048;
+    }
+
+    // Unknown model — conservative safe default
+    32_768
+}
+
+/// Returns the safe extraction batch size for a given provider + model combination.
+///
+/// Takes the minimum of two constraints:
+///   input_safe  = floor((context_window * 0.80 - overhead) / max_chunk_tokens)
+///   output_safe = floor(max_output_tokens / tokens_per_chunk_output)
+///
+/// Constants:
+///   overhead            = 700   (system prompt ~500 + batch wrapper ~200)
+///   tokens_per_chunk_output = 500   (typical JSON output per extracted chunk)
+///   safety_margin       = 0.80  (guards tokenizer variance + prompt reformatting)
+///
+/// Clamped to [1, 64] — never zero (at least try 1 chunk), never more than 64
+/// (empirical ceiling where LLMs reliably track chunk IDs and maintain JSON format).
+pub fn model_batch_size(provider: &str, model: &str, max_chunk_tokens: usize) -> usize {
+    let context = model_context_window(model);
+    let max_output = model_max_output_tokens(model) as usize;
+
+    // Perplexity sonar: search grounding consumes ~30% of context, not suitable for batching
+    if provider == "perplexity" || model.to_lowercase().contains("sonar") {
+        return 1;
+    }
+
+    // Ollama: default num_ctx of 2048 fits at most 1 chunk — user must override via config
+    if provider == "ollama" {
+        let m = model.to_lowercase();
+        // Detect explicitly larger models by name (user chose them knowing the size)
+        if m.contains("llama3.1") || m.contains("llama-3.1") || m.contains("llama-3.3") {
+            // Still conservative — user must set num_ctx in Ollama to benefit
+            return 2;
+        }
+        return 1;
+    }
+
+    const OVERHEAD: usize = 700;
+    const OUTPUT_PER_CHUNK: usize = 500;
+    const HARD_MAX: usize = 64;
+
+    let safe_input = context * 4 / 5; // 80% safety margin (integer arithmetic, no floats)
+    let input_safe_n = if safe_input > OVERHEAD + max_chunk_tokens {
+        (safe_input - OVERHEAD) / max_chunk_tokens
+    } else {
+        1
+    };
+
+    let output_safe_n = max_output / OUTPUT_PER_CHUNK;
+
+    let n = input_safe_n.min(output_safe_n).min(HARD_MAX).max(1);
+
+    tracing::debug!(
+        "batch_size for {provider}/{model}: context={context} output={max_output} \
+         input_safe={input_safe_n} output_safe={output_safe_n} → {n}"
+    );
+
+    n
+}
+
 // ── Provider Enum (enum dispatch — zero-cost, no dyn) ────────────
 
 enum Provider {
@@ -352,6 +494,13 @@ struct OpenAiProvider {
 impl OpenAiProvider {
     fn new(api_key: &str, model: &str, base_url: &str, provider_name: &str) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
+        // Strip trailing /v1 so providers that store "https://host/v1" in config
+        // don't end up with a double /v1 when chat() appends /v1/chat/completions.
+        let base_url = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string();
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(90))
@@ -359,7 +508,7 @@ impl OpenAiProvider {
                 .unwrap_or_default(),
             api_key: api_key.to_string(),
             model: model.to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             provider_name: provider_name.to_string(),
             max_output_tokens,
         }
@@ -614,17 +763,51 @@ impl OllamaProvider {
 
 // ── Provider config helpers ──────────────────────────────────────
 
+/// Resolve the API key for a provider using a three-level priority chain:
+///   1. Environment variable (highest priority — allows CI/CD injection without touching files)
+///   2. `api_key` field stored in credentials.toml (set by `root setup`)
+///   3. Hard error with a clear message pointing to `root setup`
 fn resolve_key(cfg: Option<&ProviderConfig>, default_env: &str) -> Result<String> {
     let env_var = cfg
         .and_then(|p| p.api_key_env.as_deref())
         .unwrap_or(default_env);
-    std::env::var(env_var)
-        .map_err(|_| Error::MissingConfig(format!("set the {} environment variable", env_var)))
+
+    // Priority 1: live environment variable
+    if let Ok(val) = std::env::var(env_var) {
+        if !val.is_empty() {
+            return Ok(val);
+        }
+    }
+
+    // Priority 2: stored value in ProviderConfig.api_key (populated from credentials.toml
+    // by GlobalConfig::load → Credentials::inject_into)
+    if let Some(stored) = cfg.and_then(|p| p.api_key.as_deref()) {
+        if !stored.is_empty() {
+            return Ok(stored.to_string());
+        }
+    }
+
+    Err(Error::MissingConfig(format!(
+        "API key not found. Run `root setup` to configure your LLM provider, \
+         or set the {env_var} environment variable."
+    )))
 }
 
+/// Same as `resolve_key` but returns an empty string rather than Err when no key is
+/// available (used for optional-key providers like LiteLLM and Ollama).
 fn resolve_key_optional(cfg: Option<&ProviderConfig>) -> String {
-    cfg.and_then(|p| p.api_key_env.as_deref())
-        .and_then(|env| std::env::var(env).ok())
+    // Priority 1: env var
+    if let Some(env_var) = cfg.and_then(|p| p.api_key_env.as_deref()) {
+        if let Ok(val) = std::env::var(env_var) {
+            if !val.is_empty() {
+                return val;
+            }
+        }
+    }
+    // Priority 2: stored value
+    cfg.and_then(|p| p.api_key.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .unwrap_or_default()
 }
 
@@ -692,9 +875,17 @@ impl LlmClient {
                     .api_key_env
                     .as_deref()
                     .unwrap_or("AZURE_OPENAI_API_KEY");
-                let key = std::env::var(key_env).map_err(|_| {
-                    Error::MissingConfig(format!("set the {key_env} environment variable"))
-                })?;
+                // Priority 1: env var, Priority 2: stored value from credentials.toml
+                let key = std::env::var(key_env)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| azure_cfg.api_key.clone().filter(|s| !s.is_empty()))
+                    .ok_or_else(|| {
+                        Error::MissingConfig(format!(
+                            "Azure API key not found. Run `root setup` to configure, \
+                             or set the {key_env} environment variable."
+                        ))
+                    })?;
                 Provider::Azure(AzureProvider::new(
                     &key,
                     &config.extraction_model,
@@ -904,11 +1095,26 @@ impl LlmClient {
                 None
             };
 
-            match self
-                .provider
-                .chat(prompts::SYSTEM_PROMPT, batch_prompt)
-                .await
-            {
+            let chat_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(120),
+                self.provider.chat(prompts::SYSTEM_PROMPT, batch_prompt),
+            ).await;
+
+            let provider_result = match chat_result {
+                Ok(r) => r,
+                Err(_) => {
+                    normal_attempts += 1;
+                    tracing::warn!(
+                        attempt = normal_attempts,
+                        max = self.max_retries,
+                        "batch LLM call timed out after 120s, retrying..."
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            match provider_result {
                 Ok(output) => {
                     let tokens = (prompts::SYSTEM_PROMPT.len()
                         + batch_prompt.len()
@@ -1091,11 +1297,32 @@ impl LlmClient {
                 None
             };
 
-            match self
-                .provider
-                .chat(prompts::SYSTEM_PROMPT, &user_prompt)
-                .await
-            {
+            let chat_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(120),
+                self.provider.chat(prompts::SYSTEM_PROMPT, &user_prompt),
+            ).await;
+
+            let provider_output = match chat_result {
+                Ok(r) => r,
+                Err(_) => {
+                    normal_attempts += 1;
+                    tracing::warn!(
+                        attempt = normal_attempts,
+                        max = self.max_retries,
+                        "LLM extraction call timed out after 120s, retrying..."
+                    );
+                    if normal_attempts >= self.max_retries {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * 2u64.pow(normal_attempts.saturating_sub(1)),
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+
+            match provider_output {
                 Ok(output) => {
                     if output.truncated {
                         return Err(Error::TruncatedOutput {
@@ -1486,6 +1713,143 @@ mod tests {
         assert_eq!(model_max_output_tokens("some-unknown-model-v99"), 8_192);
     }
 
+    // ── model_context_window ──────────────────────────────────────
+
+    #[test]
+    fn context_window_claude_sonnet() {
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(model_context_window("claude-opus-4-6"), 1_000_000);
+    }
+
+    #[test]
+    fn context_window_claude_haiku() {
+        assert_eq!(model_context_window("claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(model_context_window("claude-3-haiku-20240307"), 200_000);
+    }
+
+    #[test]
+    fn context_window_gpt41_family() {
+        // gpt-4.1 and gpt-4-1 (Azure deployment naming)
+        assert_eq!(model_context_window("gpt-4.1"), 300_000);
+        assert_eq!(model_context_window("gpt-4.1-mini"), 300_000);
+        assert_eq!(model_context_window("gpt-4-1-mini"), 300_000);
+    }
+
+    #[test]
+    fn context_window_gpt4o_family() {
+        assert_eq!(model_context_window("gpt-4o"), 128_000);
+        assert_eq!(model_context_window("gpt-4o-mini"), 128_000);
+        assert_eq!(model_context_window("gpt-4-turbo"), 128_000);
+    }
+
+    #[test]
+    fn context_window_nova_models() {
+        assert_eq!(model_context_window("amazon.nova-micro-v1:0"), 128_000);
+        assert_eq!(model_context_window("amazon.nova-lite-v1:0"), 300_000);
+        assert_eq!(model_context_window("amazon.nova-pro-v1:0"), 300_000);
+    }
+
+    #[test]
+    fn context_window_groq_llama() {
+        assert_eq!(model_context_window("llama-3.1-8b-instant"), 131_072);
+        assert_eq!(model_context_window("llama-3.3-70b-versatile"), 131_072);
+        assert_eq!(model_context_window("meta-llama/llama-3.1-8b-instruct"), 131_072);
+    }
+
+    #[test]
+    fn context_window_deepseek() {
+        assert_eq!(model_context_window("deepseek-chat"), 128_000);
+        assert_eq!(model_context_window("deepseek-coder"), 128_000);
+    }
+
+    #[test]
+    fn context_window_unknown_falls_back() {
+        assert_eq!(model_context_window("some-unknown-v99"), 32_768);
+    }
+
+    // ── model_batch_size ─────────────────────────────────────────
+
+    #[test]
+    fn batch_size_azure_gpt41_mini() {
+        // gpt-4.1-mini: context=300K, output=32K, chunk=2000
+        // input_safe = (300000*0.8 - 700) / 2000 = (240000-700)/2000 = 119
+        // output_safe = 32768 / 500 = 65
+        // min(119, 65, 64) = 64
+        let n = model_batch_size("azure", "gpt-4-1-mini", 2000);
+        assert_eq!(n, 64, "azure gpt-4.1-mini must reach the hard cap of 64");
+    }
+
+    #[test]
+    fn batch_size_gpt4o() {
+        // context=128K, output=16K, chunk=2000
+        // input_safe = (102400-700)/2000 = 50
+        // output_safe = 16384/500 = 32
+        // min(50, 32, 64) = 32
+        let n = model_batch_size("openai", "gpt-4o", 2000);
+        assert_eq!(n, 32);
+    }
+
+    #[test]
+    fn batch_size_claude_sonnet() {
+        // context=1M, output=8192, chunk=2000
+        // output_safe = 8192/500 = 16
+        let n = model_batch_size("anthropic", "claude-sonnet-4-6", 2000);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn batch_size_claude_haiku_45() {
+        // context=200K, output=64K, chunk=2000
+        // input_safe = (160000-700)/2000 = 79
+        // output_safe = 64000/500 = 128
+        // min(79, 128, 64) = 64 (hits hard cap)
+        let n = model_batch_size("anthropic", "claude-haiku-4-5-20251001", 2000);
+        assert_eq!(n, 64);
+    }
+
+    #[test]
+    fn batch_size_nova_micro_output_capped() {
+        // Nova micro: context=128K, output=5120, chunk=2000
+        // output_safe = 5120/500 = 10
+        let n = model_batch_size("bedrock", "amazon.nova-micro-v1:0", 2000);
+        assert_eq!(n, 10, "nova-micro must be output-capped at 10");
+    }
+
+    #[test]
+    fn batch_size_groq_llama() {
+        // llama-3.1-8b: context=131K, output=8192, chunk=2000
+        // input_safe = (104857-700)/2000 = 52
+        // output_safe = 8192/500 = 16
+        let n = model_batch_size("groq", "llama-3.1-8b-instant", 2000);
+        assert_eq!(n, 16);
+    }
+
+    #[test]
+    fn batch_size_perplexity_always_one() {
+        let n = model_batch_size("perplexity", "sonar-pro", 2000);
+        assert_eq!(n, 1, "perplexity sonar must always return 1 — search-grounded");
+    }
+
+    #[test]
+    fn batch_size_ollama_default_one() {
+        let n = model_batch_size("ollama", "llama3", 2000);
+        assert_eq!(n, 1, "ollama default num_ctx=2048 fits only 1 chunk");
+    }
+
+    #[test]
+    fn batch_size_never_zero() {
+        // Even tiny context must produce at least 1
+        let n = model_batch_size("ollama", "tiny-model", 2000);
+        assert!(n >= 1, "batch size must never be zero");
+    }
+
+    #[test]
+    fn batch_size_hard_cap_64() {
+        // Very large context must be capped at 64
+        let n = model_batch_size("anthropic", "claude-sonnet-4-6-future", 100);
+        assert!(n <= 64, "batch size must never exceed 64");
+    }
+
     #[test]
     fn resolve_key_uses_default_env_when_config_is_none() {
         unsafe {
@@ -1505,6 +1869,7 @@ mod tests {
         }
         let cfg = thinkingroot_core::config::ProviderConfig {
             api_key_env: Some("MY_CUSTOM_ENV".to_string()),
+            api_key: None,
             base_url: None,
             default_model: None,
         };
@@ -1525,11 +1890,66 @@ mod tests {
     fn resolve_base_url_returns_config_url_when_set() {
         let cfg = thinkingroot_core::config::ProviderConfig {
             api_key_env: None,
+            api_key: None,
             base_url: Some("https://custom.example.com".to_string()),
             default_model: None,
         };
         let result = resolve_base_url(Some(&cfg), "https://default.example.com");
         assert_eq!(result, "https://custom.example.com");
+    }
+
+    #[test]
+    fn openai_provider_strips_trailing_v1_from_base_url() {
+        // Providers like OpenRouter store "https://host/api/v1" in config.
+        // OpenAiProvider must strip the /v1 so chat() doesn't produce a double /v1.
+        let p = OpenAiProvider::new("key", "model", "https://openrouter.ai/api/v1", "openrouter");
+        assert_eq!(p.base_url, "https://openrouter.ai/api");
+
+        let p2 = OpenAiProvider::new("key", "model", "https://api.together.xyz/v1", "together");
+        assert_eq!(p2.base_url, "https://api.together.xyz");
+
+        // Providers without /v1 suffix must be unchanged.
+        let p3 = OpenAiProvider::new("key", "model", "https://api.openai.com", "openai");
+        assert_eq!(p3.base_url, "https://api.openai.com");
+
+        // Groq's /openai path must not be stripped.
+        let p4 = OpenAiProvider::new("key", "model", "https://api.groq.com/openai", "groq");
+        assert_eq!(p4.base_url, "https://api.groq.com/openai");
+    }
+
+    #[test]
+    fn resolve_key_falls_back_to_stored_api_key() {
+        // When no env var is set but api_key is stored in ProviderConfig, resolve_key must
+        // return the stored value — this is the path taken after `root setup` in a fresh shell.
+        let env_var = "__TR_TEST_KEY_NOT_SET_7f3a9b__";
+        // SAFETY: test-only mutation of env vars; tests using unique names avoid races.
+        unsafe { std::env::remove_var(env_var); }
+
+        let cfg = thinkingroot_core::config::ProviderConfig {
+            api_key_env: Some(env_var.to_string()),
+            api_key: Some("stored-secret-key".to_string()),
+            base_url: None,
+            default_model: None,
+        };
+        let result = resolve_key(Some(&cfg), env_var);
+        assert_eq!(result.unwrap(), "stored-secret-key");
+    }
+
+    #[test]
+    fn resolve_key_env_var_takes_priority_over_stored() {
+        let env_var = "__TR_TEST_KEY_SET_9c1d2e__";
+        // SAFETY: test-only mutation of env vars; tests using unique names avoid races.
+        unsafe { std::env::set_var(env_var, "live-env-value"); }
+
+        let cfg = thinkingroot_core::config::ProviderConfig {
+            api_key_env: Some(env_var.to_string()),
+            api_key: Some("stored-value".to_string()),
+            base_url: None,
+            default_model: None,
+        };
+        let result = resolve_key(Some(&cfg), env_var);
+        unsafe { std::env::remove_var(env_var); }
+        assert_eq!(result.unwrap(), "live-env-value");
     }
 
     #[test]

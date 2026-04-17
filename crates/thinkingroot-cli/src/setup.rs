@@ -7,7 +7,7 @@ use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use thinkingroot_core::config::{
     AzureConfig, BedrockConfig, LlmConfig, ProviderConfig, ProvidersConfig,
 };
-use thinkingroot_core::global_config::{GlobalConfig, ServeConfig};
+use thinkingroot_core::global_config::{Credentials, GlobalConfig, ServeConfig};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 
 // ── Provider catalogue ───────────────────────────────────────────
@@ -225,17 +225,23 @@ pub async fn run_setup() -> anyhow::Result<()> {
     println!("  Scanning for installed tools...\n");
 
     let detected = crate::mcp_config::detect_tools();
-    for tool in &detected {
-        println!("  {} {}", style("✓").green(), tool.name);
-    }
     if detected.is_empty() {
-        println!("  No supported tools detected. You can run `root connect` later.");
+        println!("  No supported AI tools detected.");
+        println!("  You can run {} later.", style("root connect").cyan());
+    } else {
+        println!("  Found {} tool(s):", detected.len());
+        for tool in &detected {
+            println!("    {} {}", style("·").dim(), style(tool.name).white().bold());
+        }
     }
     println!();
 
     let connect = if !detected.is_empty() {
         Confirm::with_theme(&theme)
-            .with_prompt("Connect detected tools now?")
+            .with_prompt(format!(
+                "Connect all {} tool(s) to ThinkingRoot now?",
+                detected.len()
+            ))
             .default(true)
             .interact()?
     } else {
@@ -261,13 +267,26 @@ pub async fn run_setup() -> anyhow::Result<()> {
     global.save()?;
     registry.save()?;
 
-    // Connect tools
+    // Connect tools — show per-tool feedback in real time
     if connect {
+        println!("  Connecting AI tools...");
         for tool in &detected {
-            if let Err(e) = crate::mcp_config::write_tool_config(tool, ws_port, false) {
-                eprintln!("  Warning: failed to configure {}: {}", tool.name, e);
+            match crate::mcp_config::write_tool_config(tool, ws_port, false) {
+                Ok(result) => println!(
+                    "    {} {}  {}",
+                    style("✓").green().bold(),
+                    style(tool.name).white().bold(),
+                    style(result.path.display().to_string()).dim()
+                ),
+                Err(e) => println!(
+                    "    {} {}  {}",
+                    style("✗").red().bold(),
+                    style(tool.name).white().bold(),
+                    style(format!("failed: {e}")).red()
+                ),
             }
         }
+        println!();
     }
 
     // Compile — reuse the same world-class progress display used by `root compile`.
@@ -305,48 +324,50 @@ pub async fn run_setup() -> anyhow::Result<()> {
         .dim()
     );
     println!("  Workspace       {}/.thinkingroot/", abs_ws_path.display());
-    println!(
-        "  MCP endpoint    {}",
-        style(format!("http://localhost:{}/mcp/sse", ws_port)).cyan()
-    );
 
     if connect && !detected.is_empty() {
         println!();
-        println!("  Connected tools:");
+        println!("  Connected tools (stdio — no server needed):");
         for tool in &detected {
-            println!("    {} {}", style("✓").green(), tool.name);
+            println!(
+                "    {} {}  {}",
+                style("✓").green(),
+                style(tool.name).white().bold(),
+                style(tool.config_path.display().to_string()).dim()
+            );
         }
     }
 
     println!();
     println!("  Next steps:");
+    if !connect || detected.is_empty() {
+        println!("    {}  wire AI tools (Claude, Cursor, VS Code…)", style("root connect").cyan());
+    }
     println!(
-        "    {}  start the knowledge server",
+        "    {}  start the knowledge server (REST + MCP HTTP)",
         style("root serve").cyan()
     );
     println!(
         "    {}  add more folders",
         style("root workspace add <path>").cyan()
     );
-    println!("    {}  wire more AI tools", style("root connect").cyan());
+    println!(
+        "    {}  answer a question from your knowledge base",
+        style("root ask \"…\"").cyan()
+    );
 
-    // Remind the user to persist the API key across shell sessions.
-    // set_provider_config() only sets the env var for this process; it is not
-    // written to any file, so it will be gone after this terminal session ends.
+    // Show credentials file location so users know where the key is stored.
     if !provider.default_env.is_empty() && provider.id != "bedrock" && provider.id != "ollama" {
-        println!();
+        if let Some(creds_path) = GlobalConfig::credentials_path() {
+            println!("  Credentials      {}", style(creds_path.display()).dim());
+        }
         println!(
-            "  {} API key persistence",
-            style("Action required —").yellow().bold()
+            "  {}  (mode 0600 — readable only by you)",
+            style("Key saved to credentials.toml").green()
         );
         println!(
-            "  Your {} key was used for this session but is not saved on disk.",
-            style(provider.label).white()
-        );
-        println!("  Add the following line to your shell profile (~/.zshrc, ~/.bashrc, etc.):");
-        println!(
-            "    {}",
-            style(format!("export {}=\"<your-key>\"", provider.default_env)).cyan()
+            "  You can also set {} in your shell profile to override.",
+            style(format!("export {}=\"...\"", provider.default_env)).cyan()
         );
     }
 
@@ -406,15 +427,13 @@ async fn run_setup_update(theme: &ColorfulTheme) -> anyhow::Result<()> {
                 && provider.id != "bedrock"
                 && provider.id != "ollama"
             {
-                println!();
                 println!(
-                    "  {} API key persistence",
-                    style("Action required —").yellow().bold()
+                    "  {} Key saved to credentials.toml (mode 0600).",
+                    style("✓").green()
                 );
-                println!("  Add to your shell profile (~/.zshrc, ~/.bashrc, etc.):");
                 println!(
-                    "    {}",
-                    style(format!("export {}=\"<your-key>\"", provider.default_env)).cyan()
+                    "  You can also set {} in your shell profile to override.",
+                    style(format!("export {}=\"...\"", provider.default_env)).cyan()
                 );
             }
         }
@@ -784,73 +803,107 @@ async fn configure_generic(
 
 // ── Config writer ─────────────────────────────────────────────────
 
+/// Populate `llm` provider slots from the collected setup data AND save the API
+/// key to `credentials.toml` (mode 0600) so every subsequent command works
+/// in a fresh shell without requiring the user to export env vars.
+///
+/// Key resolution order at runtime (see `resolve_key` in thinkingroot-extract):
+///   1. Live env var (highest — allows CI/CD override)
+///   2. Value in credentials.toml (set here)
+///   3. Hard error → `root setup`
 fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &ProviderSetup) {
     match provider.id {
         "bedrock" => {
+            // Bedrock uses AWS SDK credential chain — no API key to store.
             llm.providers.bedrock = Some(BedrockConfig {
                 region: setup.bedrock_region.clone(),
                 profile: None,
             });
         }
         "azure" => {
-            // Store the key in env immediately so it's usable in this process.
-            // SAFETY: single-threaded at this point in setup.
-            unsafe {
-                std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key);
-            }
+            // Inject into env for this process session.
+            unsafe { std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key); }
+            persist_credential("AZURE_OPENAI_API_KEY", &setup.api_key);
             llm.providers.azure = Some(AzureConfig {
                 resource_name: setup.azure_resource.clone(),
-                endpoint_base: None, // set manually for AIServices/cognitiveservices resources
+                endpoint_base: None,
                 deployment: setup.azure_deployment.clone(),
                 api_version: setup.azure_api_version.clone(),
                 api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
+                api_key: None, // never stored in config.toml — lives in credentials.toml
             });
         }
         _ => {
             if provider.default_env.is_empty() {
-                // Ollama: no key, but may have base_url.
-                if let Some(base) = provider.base_url {
-                    let cfg = ProviderConfig {
-                        api_key_env: None,
-                        base_url: Some(base.to_string()),
-                        default_model: None,
-                    };
-                    if provider.id == "ollama" {
-                        llm.providers.ollama = Some(cfg);
-                    }
+                // Ollama / LiteLLM (no API key required).
+                let resolved_base_url = setup
+                    .base_url
+                    .clone()
+                    .or_else(|| provider.base_url.map(str::to_string));
+                let cfg = ProviderConfig {
+                    api_key_env: None,
+                    api_key: None,
+                    base_url: resolved_base_url,
+                    default_model: None,
+                };
+                match provider.id {
+                    "ollama"  => llm.providers.ollama  = Some(cfg),
+                    "litellm" => llm.providers.litellm = Some(cfg),
+                    _ => {}
                 }
                 return;
             }
             // Standard API-key providers.
             let env_var = provider.default_env;
-            // SAFETY: single-threaded at this point in setup.
-            unsafe {
-                std::env::set_var(env_var, &setup.api_key);
-            }
-            // setup.base_url takes precedence (collected interactively for custom);
-            // fall back to the catalogue's default base_url for all other providers.
+            // Inject into env for this process session.
+            unsafe { std::env::set_var(env_var, &setup.api_key); }
+            // Persist to credentials.toml so future invocations work without
+            // requiring `export KEY=...` in the shell profile.
+            persist_credential(env_var, &setup.api_key);
             let resolved_base_url = setup
                 .base_url
                 .clone()
                 .or_else(|| provider.base_url.map(str::to_string));
             let cfg = ProviderConfig {
                 api_key_env: Some(env_var.to_string()),
+                api_key: None, // never stored in config.toml — lives in credentials.toml
                 base_url: resolved_base_url,
                 default_model: None,
             };
             match provider.id {
                 "openrouter" => llm.providers.openrouter = Some(cfg),
-                "openai" => llm.providers.openai = Some(cfg),
-                "anthropic" => llm.providers.anthropic = Some(cfg),
-                "groq" => llm.providers.groq = Some(cfg),
-                "together" => llm.providers.together = Some(cfg),
-                "deepseek" => llm.providers.deepseek = Some(cfg),
+                "openai"     => llm.providers.openai     = Some(cfg),
+                "anthropic"  => llm.providers.anthropic  = Some(cfg),
+                "groq"       => llm.providers.groq        = Some(cfg),
+                "together"   => llm.providers.together   = Some(cfg),
+                "deepseek"   => llm.providers.deepseek   = Some(cfg),
                 "perplexity" => llm.providers.perplexity = Some(cfg),
-                "litellm" => llm.providers.litellm = Some(cfg),
-                "custom" => llm.providers.custom = Some(cfg),
+                "litellm"    => llm.providers.litellm    = Some(cfg),
+                "custom"     => llm.providers.custom     = Some(cfg),
                 _ => {}
             }
         }
+    }
+}
+
+/// Write a single credential to `~/.config/thinkingroot/credentials.toml`.
+/// Silently skips empty values (e.g. Ollama / Bedrock).
+/// Errors are printed but not fatal — the user can always set an env var as fallback.
+pub(crate) fn persist_credential(env_var: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    let mut creds = Credentials::load().unwrap_or_default();
+    creds.set(env_var, value);
+    if let Err(e) = creds.save() {
+        eprintln!(
+            "  {} Could not save credential to credentials.toml: {e}",
+            style("!").yellow().bold()
+        );
+        eprintln!(
+            "  Add {} to your shell profile as a fallback.",
+            style(format!("export {env_var}=\"...\"")).cyan()
+        );
     }
 }
 

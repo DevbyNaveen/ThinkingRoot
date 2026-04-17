@@ -1,3 +1,10 @@
+pub mod augmenter;
 pub mod compressor;
 pub mod planner;
+pub mod react;
+pub mod reranker;
+pub mod retriever;
+pub mod router;
 pub mod session;
+pub mod synthesizer;
+pub mod temporal;

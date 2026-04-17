@@ -116,7 +116,6 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
 
     let mut router = Router::new();
 
-    // Graph explorer — always available when REST is on
     if enable_rest {
         router = router.route("/graph", get(serve_graph));
     }
@@ -133,6 +132,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/artifacts/{artifact_type}", get(get_artifact))
             .route("/ws/{ws}/health", get(get_health))
             .route("/ws/{ws}/search", get(search))
+            .route("/ws/{ws}/ask", post(ask_handler))
+            .route("/ws/{ws}/galaxy", get(get_galaxy))
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
@@ -238,6 +239,14 @@ async fn list_claims(
     };
     match engine.list_claims(&ws, filter).await {
         Ok(claims) => ok_response(claims).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn get_galaxy(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_galaxy_map(&ws).await {
+        Ok(map) => ok_response(map).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
@@ -664,6 +673,111 @@ async fn merge_branch_handler(
             &e.to_string(),
         ),
     }
+}
+
+// ─── Intelligence Ask Endpoint ───────────────────────────────
+
+/// POST /api/v1/ws/{workspace}/ask
+///
+/// Runs the full hybrid retrieval + synthesis pipeline proven at 91.2% on
+/// LongMemEval-500. Returns a synthesized natural-language answer with source
+/// attribution.
+///
+/// Body:
+/// ```json
+/// {
+///   "question": "What time did I reach the clinic on Monday?",
+///   "session_scope": ["session_001", "session_002"],  // optional
+///   "question_date": "2023/05/30 (Tue) 22:10",        // optional, for temporal
+///   "category_hint": "temporal-reasoning"              // optional
+/// }
+/// ```
+
+#[derive(Deserialize)]
+struct AskRequest {
+    question: String,
+    #[serde(default)]
+    session_scope: Vec<String>,
+    #[serde(default)]
+    question_date: String,
+    #[serde(default)]
+    category_hint: String,
+}
+
+#[derive(Serialize)]
+struct AskResponseBody {
+    answer: String,
+    claims_used: usize,
+    category: String,
+}
+
+async fn ask_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<AskRequest>,
+) -> Response {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use crate::intelligence::synthesizer::{ask, AskRequest as SynthAskRequest};
+
+    let engine = state.engine.read().await;
+
+    // Resolve workspace root for sessions directory.
+    // Prefer AppState.workspace_root (set by --path), fall back to engine's per-workspace root.
+    let sessions_dir = state
+        .workspace_root
+        .as_ref()
+        .cloned()
+        .or_else(|| engine.workspace_root_path(&ws))
+        .map(|p| p.join("sessions"))
+        .unwrap_or_else(|| std::path::PathBuf::from("sessions"));
+
+    // If no session_scope provided, use an empty set (no scoping — all claims allowed)
+    let allowed_sources: HashSet<String> = body.session_scope.iter().cloned().collect();
+
+    // Infer category from hint or router
+    let category = if !body.category_hint.is_empty() {
+        body.category_hint.clone()
+    } else {
+        // Use the query router to infer category
+        let tmp_session = crate::intelligence::session::SessionContext::new("_ask", &ws);
+        match crate::intelligence::router::classify_query(&body.question, &tmp_session) {
+            crate::intelligence::router::QueryPath::Agentic => {
+                let q = body.question.to_lowercase();
+                if q.contains("when") || q.contains(" ago") || q.contains("last ") || q.contains("how many days") {
+                    "temporal-reasoning".to_string()
+                } else if q.contains("how many") || q.contains("how much") || q.contains("count") {
+                    "multi-session".to_string()
+                } else {
+                    "multi-session".to_string()
+                }
+            }
+            crate::intelligence::router::QueryPath::Fast => "single-session-user".to_string(),
+        }
+    };
+
+    // Retrieve the LLM client from the engine's workspace config
+    let llm = engine.workspace_llm(&ws);
+
+    let req = SynthAskRequest {
+        workspace: &ws,
+        question: &body.question,
+        category: &category,
+        allowed_sources: &allowed_sources,
+        question_date: &body.question_date,
+        session_dates: &HashMap::new(),
+        answer_sids: &body.session_scope,
+        sessions_dir: &sessions_dir,
+    };
+
+    let result = ask(&engine, llm, &req).await;
+
+    ok_response(AskResponseBody {
+        answer: result.answer,
+        claims_used: result.claims_used,
+        category: result.category,
+    })
+    .into_response()
 }
 
 // ─── Error Mapping ───────────────────────────────────────────

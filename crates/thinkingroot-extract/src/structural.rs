@@ -89,6 +89,7 @@ fn extract_manifest_dep(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![project.clone(), library.clone()],
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     ExtractionResult {
@@ -126,6 +127,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![name.clone()],
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     let def_claim = ExtractedClaim {
@@ -135,6 +137,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![name.clone(), file_name.clone()],
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     // ── Relations ─────────────────────────────────────────────────────────────
@@ -232,6 +235,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![name.clone(), file_name.clone()],
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     let file_entity = ExtractedEntity {
@@ -282,6 +286,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
             entities: vec![name.clone(), trait_name.clone()],
             source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
             extraction_tier: ExtractionTier::Structural,
+            event_date: None,
         };
         result.claims.push(impl_claim);
     }
@@ -349,6 +354,7 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![file_name.clone(), module_name.clone()],
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     let uses_relation = ExtractedRelation {
@@ -417,6 +423,7 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         entities: vec![heading_text.clone(), file_name.clone()],
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     ExtractionResult {
@@ -489,6 +496,7 @@ fn extract_git_commit(chunk: &Chunk, source_uri: &str, author: &str) -> Extracti
             entities: vec![author.to_string(), file_path.clone()],
             source_quote: None,
             extraction_tier: ExtractionTier::Structural,
+            event_date: None,
         };
         result.entities.push(file_entity);
         result.relations.push(created_by);
@@ -569,6 +577,7 @@ fn extract_doc_comment(chunk: &Chunk, _source_uri: &str) -> ExtractionResult {
         entities: vec![parent],
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
+        event_date: None,
     };
 
     ExtractionResult {

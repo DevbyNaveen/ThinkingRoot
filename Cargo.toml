@@ -44,7 +44,7 @@ repository = "https://github.com/thinkingroot/thinkingroot"
 homepage = "https://thinkingroot.dev"
 documentation = "https://docs.thinkingroot.dev"
 rust-version = "1.91"
-keywords = ["knowledge-graph", "llm", "ai", "mcp", "rag"]
+keywords = ["knowledge-compiler", "ai-agents", "mcp", "memory", "knowledge-graph"]
 categories = ["development-tools", "database", "parser-implementations"]
 
 [workspace.dependencies]

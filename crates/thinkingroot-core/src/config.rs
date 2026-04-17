@@ -27,6 +27,9 @@ pub struct Config {
 
     #[serde(default)]
     pub merge: MergeConfig,
+
+    #[serde(default)]
+    pub streams: StreamsConfig,
 }
 
 impl Config {
@@ -229,7 +232,15 @@ pub struct ProvidersConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// Name of the environment variable that holds the API key
+    /// (e.g. `"OPENAI_API_KEY"`). Checked first at runtime.
     pub api_key_env: Option<String>,
+    /// Actual API key value stored in credentials.toml (mode 0600).
+    /// Used as fallback when the env var is absent — lets `root compile`
+    /// and `root serve --mcp-stdio` work in a fresh shell without requiring
+    /// `export KEY=...` in the shell profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub default_model: Option<String>,
 }
@@ -259,6 +270,10 @@ pub struct AzureConfig {
     pub api_version: Option<String>,
     /// Environment variable holding the api-key.
     pub api_key_env: Option<String>,
+    /// Actual API key value stored in credentials.toml (mode 0600).
+    /// Fallback when the env var named by `api_key_env` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 /// Extraction pipeline settings.
@@ -272,6 +287,12 @@ pub struct ExtractionConfig {
     pub extract_relations: bool,
     /// Maximum retries per extraction request.
     pub max_retries: u32,
+    /// Number of chunks to pack into a single LLM batch call.
+    /// When set, overrides the automatic per-model calculation.
+    /// Automatic sizing uses context window + output cap for the configured model.
+    /// Set to 1 to disable batching entirely.
+    #[serde(default)]
+    pub extraction_batch_size: Option<usize>,
 }
 
 impl Default for ExtractionConfig {
@@ -281,6 +302,7 @@ impl Default for ExtractionConfig {
             min_confidence: 0.5,
             extract_relations: true,
             max_retries: 3,
+            extraction_batch_size: None,
         }
     }
 }
@@ -404,6 +426,16 @@ impl Default for MergeConfig {
             require_approval: false,
         }
     }
+}
+
+/// Configuration for agent session streaming behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StreamsConfig {
+    /// When `true`, each new MCP agent session automatically creates a
+    /// `stream/{session_id}` branch so contributed claims are isolated.
+    /// Disabled by default — enables safe multi-agent write concurrency.
+    #[serde(default)]
+    pub auto_session_branch: bool,
 }
 
 /// Configuration for a single source connector.
@@ -565,6 +597,7 @@ request_timeout_secs = 60
                 providers: ProvidersConfig {
                     openai: Some(ProviderConfig {
                         api_key_env: Some("OPENAI_API_KEY".to_string()),
+                        api_key: None,
                         base_url: Some("https://api.openai.com".to_string()),
                         default_model: None,
                     }),
@@ -619,11 +652,13 @@ request_timeout_secs = 60
                 providers: ProvidersConfig {
                     openai: Some(ProviderConfig {
                         api_key_env: Some("OPENAI_API_KEY".to_string()),
+                        api_key: None,
                         base_url: None,
                         default_model: None,
                     }),
                     anthropic: Some(ProviderConfig {
                         api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                        api_key: None,
                         base_url: None,
                         default_model: None,
                     }),

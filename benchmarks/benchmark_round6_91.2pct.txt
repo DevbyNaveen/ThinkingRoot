@@ -1,0 +1,528 @@
+
+● LongMemEval — 500 questions
+[32m INFO[0m graph schema initialized (cozo/datalog)
+[32m INFO[0m vector store ready (141490 cached embeddings, model deferred)
+[32m INFO[0m knowledge graph indexes built [3mentities[0m[2m=[0m45906 [3mclaims[0m[2m=[0m95584 [3msources[0m[2m=[0m990
+[32m INFO[0m LLM provider: azure / gpt-4-1-mini (max_output_tokens=32768)
+[32m INFO[0m LLM provider: azure / gpt-4-1-mini (max_output_tokens=32768)
+  Synthesis LLM : azure / gpt-4-1-mini
+  Judge LLM     : azure / gpt-4-1-mini (same as synthesis)
+[32m INFO[0m loading embedding model (first use)…
+[32m INFO[0m embedding model loaded
+  [   1/500] ✓ [100%] [single-session-user] What degree did I graduate with?
+  [   2/500] ✓ [100%] [single-session-user] How long is my daily commute to work?
+  [   3/500] ✓ [100%] [single-session-user] Where did I redeem a $5 coupon on coffee creamer?
+  [   4/500] ✓ [100%] [single-session-user] What play did I attend at the local community theater?
+  [   5/500] ✓ [100%] [single-session-user] What is the name of the playlist I created on Spotify?
+  [   6/500] ✓ [100%] [single-session-user] What was my last name before I changed it?
+  [   7/500] ✓ [100%] [single-session-user] Where do I take yoga classes?
+  [   8/500] ✓ [100%] [single-session-user] What color did I repaint my bedroom walls?
+  [   9/500] ✓ [100%] [single-session-user] When did I volunteer at the local animal shelter's fundraising di
+  [  10/500] ✓ [100%] [single-session-user] Where did I buy my new tennis racket from?
+  [  11/500] ✓ [100%] [single-session-user] What was my previous occupation?
+  [  12/500] ✓ [100%] [single-session-user] How much did I spend on a designer handbag?
+  [  13/500] ✓ [100%] [single-session-user] How many playlists do I have on Spotify?
+  [  14/500] ✓ [100%] [single-session-user] Where did I attend for my study abroad program?
+  [  15/500] ✓ [100%] [single-session-user] What was the discount I got on my first purchase from the new clo
+  [  16/500] ✓ [100%] [single-session-user] How long did it take me to assemble the IKEA bookshelf?
+  [  17/500] ✓ [100%] [single-session-user] What did I buy for my sister's birthday gift?
+  [  18/500] ✓ [100%] [single-session-user] What speed is my new internet plan?
+  [  19/500] ✓ [100%] [single-session-user] How many shirts did I pack for my 5-day trip to Costa Rica?
+  [  20/500] ✓ [100%] [single-session-user] What was my previous stance on spirituality?
+  [  21/500] ✓ [100%] [single-session-user] What brand are my favorite running shoes?
+  [  22/500] ✓ [100%] [single-session-user] What certification did I complete last month?
+  [  23/500] ✓ [100%] [single-session-user] How many bikes do I own?
+  [  24/500] ✓ [100%] [single-session-user] What breed is my dog?
+  [  25/500] ✓ [100%] [single-session-user] How many largemouth bass did I catch on my fishing trip to Lake M
+  [  26/500] ✓ [100%] [single-session-user] How many amateur comedians did I watch perform at the open mic ni
+  [  27/500] ✓ [100%] [single-session-user] What is the name of my cat?
+  [  28/500] ✓ [100%] [single-session-user] How old was I when my grandma gave me the silver necklace?
+  [  29/500] ✓ [100%] [single-session-user] What is my preferred gin-to-vermouth ratio for a classic gin mart
+  [  30/500] ✓ [100%] [single-session-user] How much RAM did I upgrade my laptop to?
+  [  31/500] ✓ [100%] [single-session-user] How much is the painting of a sunset worth in terms of the amount
+  [  32/500] ✓ [100%] [single-session-user] Where did I attend my cousin's wedding?
+  [  33/500] ✓ [100%] [single-session-user] Where did I complete my Bachelor's degree in Computer Science?
+  [  34/500] ✓ [100%] [single-session-user] How long did it take to move to the new apartment?
+  [  35/500] ✓ [100%] [single-session-user] What type of cocktail recipe did I try last weekend?
+  [  36/500] ✓ [100%] [single-session-user] What type of rice is my favorite?
+  [  37/500] ✓ [100%] [single-session-user] Who did I have a conversation with about destiny?
+  [  38/500] ✓ [100%] [single-session-user] Where did I buy my new bookshelf from?
+  [  39/500] ✓ [100%] [single-session-user] What time do I stop checking work emails and messages?
+  [  40/500] ✓ [100%] [single-session-user] How many copies of my favorite artist's debut album were released
+  [  41/500] ✓ [100%] [single-session-user] How long have I been collecting vintage cameras?
+  [  42/500] ✓ [100%] [single-session-user] Where did I go on a week-long trip with my family?
+  [  43/500] ✓ [100%] [single-session-user] What did I bake for my niece's birthday party?
+  [  44/500] ✓ [100%] [single-session-user] What is the name of the music streaming service have I been using
+  [  45/500] ✓ [100%] [single-session-user] How long did I wait for the decision on my asylum application?
+[33m WARN[0m LLM chat timed out after 45s, retrying (1/3)...
+  [  46/500] ✓ [100%] [single-session-user] What type of action figure did I buy from a thrift store?
+  [  47/500] ✓ [100%] [single-session-user] How long was I in Japan for?
+  [  48/500] ✓ [100%] [single-session-user] Where did I attend the Imagine Dragons concert?
+  [  49/500] ✓ [100%] [single-session-user] How much screen time have I been averaging on Instagram per day?
+  [  50/500] ✓ [100%] [single-session-user] What type of bulb did I replace in my bedside lamp?
+  [  51/500] ✓ [100%] [single-session-user] What size is my new Samsung TV?
+  [  52/500] ✓ [100%] [single-session-user] What book am I currently reading?
+  [  53/500] ✓ [100%] [single-session-user] How many skeins of worsted weight yarn did I find in my stash?
+  [  54/500] ✓ [100%] [single-session-user] How many hours did I spend watching documentaries on Netflix last
+  [  55/500] ✓ [100%] [single-session-user] What time do I usually get home from work on weeknights?
+  [  56/500] ✓ [100%] [single-session-user] What is my ethnicity?
+  [  57/500] ✓ [100%] [single-session-user] How much time do I dedicate to practicing guitar every day?
+  [  58/500] ✓ [100%] [single-session-user] Where does my sister Emily live?
+  [  59/500] ✓ [100%] [single-session-user] How long did Alex marinate the BBQ ribs in special sauce?
+  [  60/500] ✓ [100%] [single-session-user] Who gave me a new stand mixer as a birthday gift?
+  [  61/500] ✓ [100%] [single-session-user] What brand of shampoo do I currently use?
+  [  62/500] ✓ [100%] [single-session-user] What health issue did I initially think was just a cold?
+  [  63/500] ✓ [100%] [single-session-user] Where did I meet Sophia?
+  [  64/500] ✓ [100%] [single-session-user] What game did I finally beat last weekend?
+  [  65/500] ✓ [100%] [single-session-user] What is the name of my hamster?
+  [  66/500] ✓ [100%] [single-session-user] How long have I been collecting vintage films?
+  [  67/500] ✓ [100%] [single-session-user] What did I bake for my uncle's birthday party?
+  [  68/500] ✓ [100%] [single-session-user] How long was I in Korea for?
+  [  69/500] ✓ [100%] [single-session-user] How much time do I dedicate to practicing violin every day?
+  [  70/500] ✓ [100%] [single-session-user] What did my dad gave me as a birthday gift?
+  [  71/500] ✗ [99%] [multi-session] How many items of clothing do I need to pick up or return from a 
+  [  72/500] ✗ [97%] [multi-session] How many projects have I led or am currently leading?
+  [  73/500] ✓ [97%] [multi-session] How many model kits have I worked on or bought?
+  [  74/500] ✓ [97%] [multi-session] How many days did I spend on camping trips in the United States t
+  [  75/500] ✓ [97%] [multi-session] How many weeks did it take me to watch all the Marvel Cinematic U
+  [  76/500] ✓ [97%] [multi-session] How many plants did I acquire in the last month?
+  [  77/500] ✗ [96%] [multi-session] How much total money have I spent on bike-related expenses since 
+  [  78/500] ✗ [95%] [multi-session] How many hours in total did I spend driving to my three road trip
+  [  79/500] ✓ [95%] [multi-session] How many different doctors did I visit?
+  [  80/500] ✓ [95%] [multi-session] What time did I go to bed on the day before I had a doctor's appo
+  [  81/500] ✓ [95%] [multi-session] How many different types of citrus fruits have I used in my cockt
+  [  82/500] ✓ [95%] [multi-session] How many movie festivals that I attended?
+  [  83/500] ✓ [95%] [multi-session] How many days did I take social media breaks in total?
+  [  84/500] ✓ [95%] [multi-session] How many tanks do I currently have, including the one I set up fo
+  [  85/500] ✓ [95%] [multi-session] What is the total amount I spent on luxury items in the past few 
+  [  86/500] ✗ [94%] [multi-session] How many hours have I spent playing games in total?
+  [  87/500] ✗ [93%] [multi-session] How many weddings have I attended in this year?
+  [  88/500] ✓ [93%] [multi-session] How many babies were born to friends and family members in the la
+  [  89/500] ✓ [93%] [multi-session] How many pieces of furniture did I buy, assemble, sell, or fix in
+  [  90/500] ✓ [93%] [multi-session] How many times did I bake something in the past two weeks?
+  [  91/500] ✓ [93%] [multi-session] How many different museums or galleries did I visit in the month 
+  [  92/500] ✓ [93%] [multi-session] How many different cuisines have I learned to cook or tried out i
+  [  93/500] ✗ [92%] [multi-session] How many properties did I view before making an offer on the town
+  [  94/500] ✓ [93%] [multi-session] How many different types of food delivery services have I used re
+  [  95/500] ✓ [93%] [multi-session] How many hours of jogging and yoga did I do last week?
+  [  96/500] ✓ [93%] [multi-session] Which social media platform did I gain the most followers on over
+  [  97/500] ✓ [93%] [multi-session] Which grocery store did I spend the most money at in the past mon
+  [  98/500] ✓ [93%] [multi-session] How much more did I spend on accommodations per night in Hawaii c
+  [  99/500] ✗ [92%] [multi-session] How many different art-related events did I attend in the past mo
+  [ 100/500] ✓ [92%] [multi-session] What is the average age of me, my parents, and my grandparents?
+  [ 101/500] ✓ [92%] [multi-session] How many doctor's appointments did I go to in March?
+  [ 102/500] ✓ [92%] [multi-session] How many days did it take for me to receive the new remote shutte
+  [ 103/500] ✗ [91%] [multi-session] How many health-related devices do I use in a day?
+  [ 104/500] ✓ [91%] [multi-session] How many fish are there in total in both of my aquariums?
+  [ 105/500] ✗ [90%] [multi-session] How many fitness classes do I attend in a typical week?
+  [ 106/500] ✓ [91%] [multi-session] How many days did it take for my laptop backpack to arrive after 
+  [ 107/500] ✓ [91%] [multi-session] How many pieces of jewelry did I acquire in the last two months?
+  [ 108/500] ✓ [91%] [multi-session] How much money did I raise in total through all the charity event
+  [ 109/500] ✓ [91%] [multi-session] How many projects have I been working on simultaneously, excludin
+  [ 110/500] ✓ [91%] [multi-session] How many musical instruments do I currently own?
+  [ 111/500] ✓ [91%] [multi-session] How many bikes did I service or plan to service in March?
+  [ 112/500] ✓ [91%] [multi-session] How much money did I raise for charity in total?
+  [ 113/500] ✓ [91%] [multi-session] How many days did I spend participating in faith-related activiti
+  [ 114/500] ✓ [91%] [multi-session] How many kitchen items did I replace or fix?
+  [ 115/500] ✓ [91%] [multi-session] How many times did I ride rollercoasters across all the events I 
+  [ 116/500] ✓ [91%] [multi-session] How much total money did I spend on attending workshops in the la
+  [ 117/500] ✓ [91%] [multi-session] How many days did I spend in total traveling in Hawaii and in New
+  [ 118/500] ✓ [92%] [multi-session] How many days did I spend attending workshops, lectures, and conf
+  [ 119/500] ✓ [92%] [multi-session] How many rare items do I have in total?
+  [ 120/500] ✓ [92%] [multi-session] What is the total amount of money I earned from selling my produc
+  [ 121/500] ✓ [92%] [multi-session] How many magazine subscriptions do I currently have?
+  [ 122/500] ✓ [92%] [multi-session] How many online courses have I completed in total?
+  [ 123/500] ✓ [92%] [multi-session] How many music albums or EPs have I purchased or downloaded?
+  [ 124/500] ✗ [91%] [multi-session] How many years in total did I spend in formal education from high
+  [ 125/500] ✓ [91%] [multi-session] How many total pieces of writing have I completed since I started
+  [ 126/500] ✓ [91%] [multi-session] How many graduation ceremonies have I attended in the past three 
+  [ 127/500] ✓ [91%] [multi-session] How many times did I bake egg tarts in the past two weeks?
+  [ 128/500] ✓ [91%] [multi-session] How many different museums or galleries did I visit in December?
+  [ 129/500] ✓ [91%] [multi-session] How many fish are there in my 30-gallon tank?
+  [ 130/500] ✓ [92%] [multi-session] How many days did it take for my iPad case to arrive after I boug
+  [ 131/500] ✓ [92%] [multi-session] How many days did I spend in total traveling in Hawaii and in Sea
+  [ 132/500] ✓ [92%] [multi-session] How many years in total did I spend in formal education from high
+  [ 133/500] ✓ [92%] [single-session-preference] Can you recommend some resources where I can learn more about vid
+  [ 134/500] ✓ [92%] [single-session-preference] Can you suggest some accessories that would complement my current
+  [ 135/500] ✓ [92%] [single-session-preference] Can you recommend some recent publications or conferences that I 
+  [ 136/500] ✓ [92%] [single-session-preference] Can you suggest a hotel for my upcoming trip to Miami?
+  [ 137/500] ✓ [92%] [single-session-preference] Can you recommend some interesting cultural events happening arou
+  [ 138/500] ✓ [92%] [single-session-preference] Can you recommend a show or movie for me to watch tonight?
+  [ 139/500] ✓ [92%] [single-session-preference] Can you suggest some activities that I can do in the evening?
+  [ 140/500] ✓ [92%] [single-session-preference] My kitchen's becoming a bit of a mess again. Any tips for keeping
+  [ 141/500] ✓ [92%] [single-session-preference] I've been struggling with my slow cooker recipes. Any advice on g
+  [ 142/500] ✓ [92%] [single-session-preference] I've been thinking about ways to stay connected with my colleague
+  [ 143/500] ✓ [92%] [single-session-preference] What should I serve for dinner this weekend with my homegrown ing
+  [ 144/500] ✓ [92%] [single-session-preference] I've been feeling a bit stuck with my paintings lately. Do you ha
+  [ 145/500] ✓ [92%] [single-session-preference] I've been thinking about making a cocktail for an upcoming get-to
+  [ 146/500] ✓ [92%] [single-session-preference] I've been having trouble with the battery life on my phone lately
+  [ 147/500] ✓ [93%] [single-session-preference] I've been feeling like my chocolate chip cookies need something e
+  [ 148/500] ✓ [93%] [single-session-preference] I'm thinking of inviting my colleagues over for a small gathering
+  [ 149/500] ✓ [93%] [single-session-preference] I was thinking about rearranging the furniture in my bedroom this
+  [ 150/500] ✓ [93%] [single-session-preference] I'm getting excited about my visit to the music store this weeken
+  [ 151/500] ✓ [93%] [single-session-preference] I was thinking of trying a new coffee creamer recipe. Any recomme
+  [ 152/500] ✓ [93%] [single-session-preference] I've been sneezing quite a bit lately. Do you think it might be m
+  [ 153/500] ✓ [93%] [single-session-preference] I've been feeling nostalgic lately. Do you think it would be a go
+  [ 154/500] ✓ [93%] [single-session-preference] I'm trying to decide whether to buy a NAS device now or wait. Wha
+  [ 155/500] ✓ [93%] [single-session-preference] I am planning another theme park weekend; do you have any suggest
+  [ 156/500] ✓ [93%] [single-session-preference] I'm planning my meal prep next week, any suggestions for new reci
+  [ 157/500] ✓ [93%] [single-session-preference] I'm planning a trip to Denver soon. Any suggestions on what to do
+  [ 158/500] ✓ [93%] [single-session-preference] I've got some free time tonight, any documentary recommendations?
+  [ 159/500] ✓ [93%] [single-session-preference] I noticed my bike seems to be performing even better during my Su
+  [ 160/500] ✓ [93%] [single-session-preference] Can you suggest some useful accessories for my phone?
+  [ 161/500] ✓ [93%] [single-session-preference] Can you suggest some activities I can do during my commute to wor
+  [ 162/500] ✓ [93%] [single-session-preference] I’m a bit anxious about getting around Tokyo. Do you have any hel
+  [ 163/500] ✓ [93%] [multi-session] What is the total distance of the hikes I did on two consecutive 
+  [ 164/500] ✓ [93%] [multi-session] How many pages do I have left to read in 'The Nightingale'?
+  [ 165/500] ✓ [93%] [multi-session] For my daily commute, how much more expensive was the taxi ride c
+  [ 166/500] ✗ [93%] [multi-session] What was the approximate increase in Instagram followers I experi
+  [ 167/500] ✗ [92%] [multi-session] How many antique items did I inherit or acquire from my family me
+  [ 168/500] ✓ [92%] [multi-session] What is the total cost of the new food bowl, measuring cup, denta
+  [ 169/500] ✓ [92%] [multi-session] How much cashback did I earn at SaveMart last Thursday?
+  [ 170/500] ✓ [92%] [multi-session] What is the difference in price between my luxury boots and the s
+  [ 171/500] ✓ [92%] [multi-session] What percentage of packed shoes did I wear on my last trip?
+  [ 172/500] ✓ [92%] [multi-session] When did I submit my research paper on sentiment analysis?
+  [ 173/500] ✓ [92%] [multi-session] What percentage discount did I get on the book from my favorite a
+  [ 174/500] ✓ [93%] [multi-session] Did I receive a higher percentage discount on my first order from
+  [ 175/500] ✓ [93%] [multi-session] What is the total number of episodes I've listened to from 'How I
+  [ 176/500] ✓ [93%] [multi-session] How many plants did I initially plant for tomatoes and cucumbers?
+  [ 177/500] ✓ [93%] [multi-session] How many hours do I work in a typical week during peak campaign s
+  [ 178/500] ✓ [93%] [multi-session] How much older am I than the average age of employees in my depar
+  [ 179/500] ✓ [93%] [multi-session] What was the total number of people reached by my Facebook ad cam
+  [ 180/500] ✓ [93%] [multi-session] How many Marvel movies did I re-watch?
+  [ 181/500] ✓ [93%] [multi-session] How much did I save on the designer handbag at TK Maxx?
+  [ 182/500] ✓ [93%] [multi-session] What is the total number of goals and assists I have in the recre
+  [ 183/500] ✓ [93%] [multi-session] How much did I spend on car wash and parking ticket?
+  [ 184/500] ✓ [93%] [multi-session] How many sports have I played competitively in the past?
+  [ 185/500] ✓ [93%] [multi-session] What are the two hobbies that led me to join online communities?
+  [ 186/500] ✓ [93%] [multi-session] How old was I when Alex was born?
+  [ 187/500] ✗ [93%] [multi-session] How many points do I need to earn to redeem a free skincare produ
+  [ 188/500] ✗ [92%] [multi-session] What is the total number of days I spent in Japan and Chicago?
+  [ 189/500] ✓ [92%] [multi-session] What is the minimum amount I could get if I sold the vintage diam
+  [ 190/500] ✓ [92%] [multi-session] What percentage of the countryside property's price is the cost o
+  [ 191/500] ✓ [92%] [multi-session] What is the total cost of Lola's vet visit and flea medication?
+  [ 192/500] ✓ [92%] [multi-session] How much more did I have to pay for the trip after the initial qu
+  [ 193/500] ✓ [92%] [multi-session] What is the total number of lunch meals I got from the chicken fa
+  [ 194/500] ✓ [92%] [multi-session] How much did I spend on each coffee mug for my coworkers?
+  [ 195/500] ✓ [92%] [multi-session] At which university did I present a poster on my thesis research?
+  [ 196/500] ✗ [92%] [multi-session] How long have I been working in my current role?
+  [ 197/500] ✓ [92%] [multi-session] How much more was the pre-approval amount than the final sale pri
+  [ 198/500] ✓ [92%] [multi-session] What is the total cost of the car cover and detailing spray I pur
+  [ 199/500] ✓ [92%] [multi-session] What is the total distance I covered in my four road trips?
+  [ 200/500] ✓ [92%] [multi-session] What is the total time it takes I to get ready and commute to wor
+  [ 201/500] ✓ [92%] [multi-session] How much more miles per gallon was my car getting a few months ag
+  [ 202/500] ✓ [92%] [multi-session] What is the total number of online courses I've completed?
+  [ 203/500] ✓ [92%] [multi-session] How much did I save on the Jimmy Choo heels?
+  [ 204/500] ✓ [92%] [multi-session] How many years will I be when my friend Rachel gets married?
+  [ 205/500] ✓ [92%] [multi-session] How much faster did I finish the 5K run compared to my previous y
+  [ 206/500] ✓ [92%] [multi-session] How many dinner parties have I attended in the past month?
+  [ 207/500] ✓ [92%] [multi-session] How much did I spend on gifts for my sister?
+  [ 208/500] ✓ [92%] [multi-session] What time did I reach the clinic on Monday?
+  [ 209/500] ✓ [92%] [multi-session] What is the total weight of the new feed I purchased in the past 
+  [ 210/500] ✓ [92%] [multi-session] What percentage of leadership positions do women hold in the my c
+  [ 211/500] ✗ [92%] [multi-session] How much will I save by taking the train from the airport to my h
+  [ 212/500] ✓ [92%] [multi-session] What is the total number of views on my most popular videos on Yo
+  [ 213/500] ✓ [92%] [multi-session] How many years older is my grandma than me?
+  [ 214/500] ✓ [92%] [multi-session] How many years older am I than when I graduated from college?
+  [ 215/500] ✓ [92%] [multi-session] What is the total amount I spent on gifts for my coworker and bro
+  [ 216/500] ✓ [92%] [multi-session] What is the total number of comments on my recent Facebook Live s
+  [ 217/500] ✗ [92%] [multi-session] How many days a week do I attend fitness classes?
+  [ 218/500] ✓ [92%] [multi-session] What is the total amount I spent on the designer handbag and high
+  [ 219/500] ✓ [92%] [multi-session] How much more money did I raise than my initial goal in the chari
+  [ 220/500] ✓ [92%] [multi-session] What is the average GPA of my undergraduate and graduate studies?
+  [ 221/500] ✓ [92%] [multi-session] How many minutes did I exceed my target time by in the marathon?
+  [ 222/500] ✗ [91%] [multi-session] What was the page count of the two novels I finished in January a
+  [ 223/500] ✓ [91%] [multi-session] What is the total number of siblings I have?
+  [ 224/500] ✓ [92%] [multi-session] How much have I made from selling eggs this month?
+  [ 225/500] ✓ [92%] [multi-session] How much discount will I get on my next purchase at FreshMart?
+  [ 226/500] ✓ [92%] [multi-session] How much earlier do I wake up on Fridays compared to other weekda
+  [ 227/500] ✓ [92%] [multi-session] How many fun runs did I miss in March due to work commitments?
+  [ 228/500] ✓ [92%] [multi-session] How many pages do I have left to read in 'Sapiens'?
+  [ 229/500] ✓ [92%] [multi-session] How many plants did I initially plant for tomatoes and chili pepp
+  [ 230/500] ✓ [92%] [multi-session] What is the total cost of my recently purchased headphones and th
+  [ 231/500] ✓ [92%] [multi-session] At which university did I present a poster for my undergrad cours
+  [ 232/500] ✓ [92%] [multi-session] How old will Rachel be when I get married?
+  [ 233/500] ✗ [91%] [multi-session] How much will I save by taking the bus from the airport to my hot
+  [ 234/500] ✓ [91%] [temporal-reasoning] How many days passed between my visit to the Museum of Modern Art
+  [ 235/500] ✓ [91%] [temporal-reasoning] Which three events happened in the order from first to last: the 
+  [ 236/500] ✓ [92%] [temporal-reasoning] How many weeks ago did I meet up with my aunt and receive the cry
+  [ 237/500] ✓ [92%] [temporal-reasoning] How many months have passed since I participated in two charity e
+  [ 238/500] ✓ [92%] [temporal-reasoning] How many days passed between the day I started playing along to m
+  [ 239/500] ✓ [92%] [temporal-reasoning] How many months have passed since I last visited a museum with a 
+  [ 240/500] ✓ [92%] [temporal-reasoning] How many weeks ago did I attend the friends and family sale at No
+  [ 241/500] ✓ [92%] [temporal-reasoning] Which event happened first, my cousin's wedding or Michael's enga
+  [ 242/500] ✓ [92%] [temporal-reasoning] How many days ago did I attend the Maundy Thursday service at the
+  [ 243/500] ✓ [92%] [temporal-reasoning] How many days ago did I attend a baking class at a local culinary
+  [ 244/500] ✓ [92%] [temporal-reasoning] How many days passed between the day I started watering my herb g
+  [ 245/500] ✓ [92%] [temporal-reasoning] How many weeks ago did I start using the cashback app 'Ibotta'?
+  [ 246/500] ✓ [92%] [temporal-reasoning] How many days had passed since I finished reading 'The Seven Husb
+  [ 247/500] ✓ [92%] [temporal-reasoning] How many days did I spend on my solo camping trip to Yosemite Nat
+  [ 248/500] ✓ [92%] [temporal-reasoning] What is the order of the three trips I took in the past three mon
+  [ 249/500] ✓ [92%] [temporal-reasoning] How many months ago did I attend the Seattle International Film F
+  [ 250/500] ✓ [92%] [temporal-reasoning] How many days ago did I buy a smoker?
+  [ 251/500] ✓ [92%] [temporal-reasoning] What is the order of the three events: 'I signed up for the rewar
+  [ 252/500] ✓ [92%] [temporal-reasoning] How many weeks in total do I spent on reading 'The Nightingale' a
+  [ 253/500] ✓ [92%] [temporal-reasoning] How many days passed between the day I cancelled my FarmFresh sub
+  [ 254/500] ✓ [92%] [temporal-reasoning] How many weeks passed between the day I bought my new tennis rack
+  [ 255/500] ✗ [92%] [temporal-reasoning] How many days ago did I meet Emma?
+  [ 256/500] ✗ [91%] [temporal-reasoning] What is the order of the six museums I visited from earliest to l
+  [ 257/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I attended the gardening wor
+  [ 258/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I received feedback about my
+  [ 259/500] ✓ [92%] [temporal-reasoning] How many days had passed since I started taking ukulele lessons w
+  [ 260/500] ✓ [92%] [temporal-reasoning] How many weeks passed between the time I sold homemade baked good
+  [ 261/500] ✓ [92%] [temporal-reasoning] What is the order of the sports events I watched in January?
+  [ 262/500] ✓ [92%] [temporal-reasoning] How many days did it take me to finish 'The Nightingale' by Krist
+  [ 263/500] ✓ [92%] [temporal-reasoning] What is the order of the three sports events I participated in du
+  [ 264/500] ✗ [91%] [temporal-reasoning] How many weeks had passed since I recovered from the flu when I w
+  [ 265/500] ✗ [91%] [temporal-reasoning] What is the order of the concerts and musical events I attended i
+  [ 266/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I finished reading 'The Nigh
+  [ 267/500] ✓ [91%] [temporal-reasoning] Which mode of transport did I use most recently, a bus or a train
+  [ 268/500] ✓ [91%] [temporal-reasoning] How many weeks have I been taking sculpting classes when I invest
+  [ 269/500] ✓ [91%] [temporal-reasoning] How many days ago did I attend a networking event?
+  [ 270/500] ✗ [91%] [temporal-reasoning] What is the order of airlines I flew with from earliest to latest
+  [ 271/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I repotted the previous spid
+  [ 272/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I replaced my spark plugs an
+  [ 273/500] ✓ [91%] [temporal-reasoning] How many weeks ago did I attend a bird watching workshop at the l
+  [ 274/500] ✓ [91%] [temporal-reasoning] How many months passed between the completion of my undergraduate
+  [ 275/500] ✓ [91%] [temporal-reasoning] How many months ago did I attend the photography workshop?
+  [ 276/500] ✓ [91%] [temporal-reasoning] Which event did I participate in first, the charity gala or the c
+  [ 277/500] ✓ [91%] [temporal-reasoning] How many days ago did I watch the Super Bowl?
+  [ 278/500] ✓ [91%] [temporal-reasoning] How many days ago did I launch my website when I signed a contrac
+  [ 279/500] ✓ [91%] [temporal-reasoning] How many days ago did I go on a whitewater rafting trip in the Or
+  [ 280/500] ✓ [91%] [temporal-reasoning] How many days ago did I harvest my first batch of fresh herbs fro
+  [ 281/500] ✓ [91%] [temporal-reasoning] How many weeks ago did I attend the 'Summer Nights' festival at U
+  [ 282/500] ✓ [91%] [temporal-reasoning] How many days ago did I participate in the 5K charity run?
+  [ 283/500] ✓ [91%] [temporal-reasoning] Which event happened first, my participation in the #PlankChallen
+  [ 284/500] ✓ [91%] [temporal-reasoning] How many days passed between the day I fixed my mountain bike and
+  [ 285/500] ✓ [91%] [temporal-reasoning] Who graduated first, second and third among Emma, Rachel and Alex
+  [ 286/500] ✓ [91%] [temporal-reasoning] How many days ago did I read the March 15th issue of The New York
+  [ 287/500] ✓ [91%] [temporal-reasoning] Which book did I finish a week ago?
+  [ 288/500] ✓ [91%] [temporal-reasoning] I mentioned participating in a sports event two weeks ago. What w
+  [ 289/500] ✗ [91%] [temporal-reasoning] I received a piece of jewelry last Saturday from whom?
+  [ 290/500] ✓ [91%] [temporal-reasoning] What charity event did I participate in a month ago?
+  [ 291/500] ✗ [91%] [temporal-reasoning] Who did I go with to the music event last Saturday?
+  [ 292/500] ✓ [91%] [temporal-reasoning] What gardening-related activity did I do two weeks ago?
+  [ 293/500] ✗ [90%] [temporal-reasoning] What was the airline that I flied with on Valentine's day?
+  [ 294/500] ✗ [90%] [temporal-reasoning] I mentioned that I participated in an art-related event two weeks
+  [ 295/500] ✓ [90%] [temporal-reasoning] Which bike did I fixed or serviced the past weekend?
+  [ 296/500] ✓ [90%] [temporal-reasoning] What was the the life event of one of my relatives that I partici
+  [ 297/500] ✓ [90%] [temporal-reasoning] Who did I meet with during the lunch last Tuesday?
+  [ 298/500] ✗ [90%] [temporal-reasoning] What is the artist that I started to listen to last Friday?
+  [ 299/500] ✓ [90%] [temporal-reasoning] I mentioned cooking something for my friend a couple of days ago.
+  [ 300/500] ✓ [90%] [temporal-reasoning] What was the significant buisiness milestone I mentioned four wee
+  [ 301/500] ✓ [90%] [temporal-reasoning] What did I do with Rachel on the Wednesday two months ago?
+  [ 302/500] ✓ [90%] [temporal-reasoning] I mentioned visiting a museum two months ago. Did I visit with a 
+  [ 303/500] ✗ [90%] [temporal-reasoning] I mentioned an investment for a competition four weeks ago? What 
+  [ 304/500] ✓ [90%] [temporal-reasoning] What kitchen appliance did I buy 10 days ago?
+  [ 305/500] ✓ [90%] [temporal-reasoning] Where did I attend the religious activity last week?
+  [ 306/500] ✓ [90%] [temporal-reasoning] What was the social media activity I participated 5 days ago?
+  [ 307/500] ✓ [90%] [temporal-reasoning] What was the first issue I had with my new car after its first se
+  [ 308/500] ✓ [90%] [temporal-reasoning] Which event did I attend first, the 'Effective Time Management' w
+  [ 309/500] ✓ [90%] [temporal-reasoning] Which vehicle did I take care of first in February, the bike or t
+  [ 310/500] ✓ [90%] [temporal-reasoning] Which device did I got first, the Samsung Galaxy S22 or the Dell 
+  [ 311/500] ✓ [90%] [temporal-reasoning] How many days before the team meeting I was preparing for did I a
+  [ 312/500] ✓ [90%] [temporal-reasoning] How many days had passed between the Sunday mass at St. Mary's Ch
+  [ 313/500] ✓ [90%] [temporal-reasoning] How many days did it take for me to find a house I loved after st
+  [ 314/500] ✓ [90%] [temporal-reasoning] Which seeds were started first, the tomatoes or the marigolds?
+  [ 315/500] ✓ [90%] [temporal-reasoning] How many days had passed between the Hindu festival of Holi and t
+  [ 316/500] ✓ [90%] [temporal-reasoning] How many days before the 'Rack Fest' did I participate in the 'Tu
+  [ 317/500] ✓ [90%] [temporal-reasoning] Which pair of shoes did I clean last month?
+  [ 318/500] ✓ [90%] [temporal-reasoning] Which event happened first, the purchase of the coffee maker or t
+  [ 319/500] ✓ [90%] [temporal-reasoning] How many days had passed between the 'Walk for Hunger' event and 
+  [ 320/500] ✓ [90%] [temporal-reasoning] Which item did I purchase first, the dog bed for Max or the train
+  [ 321/500] ✓ [90%] [temporal-reasoning] Which task did I complete first, fixing the fence or trimming the
+  [ 322/500] ✗ [90%] [temporal-reasoning] How many charity events did I participate in before the 'Run for 
+  [ 323/500] ✓ [90%] [temporal-reasoning] How long have I been working before I started my current job at N
+  [ 324/500] ✓ [90%] [temporal-reasoning] Which book did I finish reading first, 'The Hate U Give' or 'The 
+  [ 325/500] ✓ [90%] [temporal-reasoning] Which device did I set up first, the smart thermostat or the mesh
+  [ 326/500] ✗ [90%] [temporal-reasoning] How many months ago did I book the Airbnb in San Francisco?
+  [ 327/500] ✓ [90%] [temporal-reasoning] How long did I take to finish 'The Seven Husbands of Evelyn Hugo'
+  [ 328/500] ✓ [90%] [temporal-reasoning] What was the date on which I attended the first BBQ event in June
+  [ 329/500] ✓ [90%] [temporal-reasoning] How many days before I bought the iPhone 13 Pro did I attend the 
+  [ 330/500] ✓ [90%] [temporal-reasoning] Which show did I start watching first, 'The Crown' or 'Game of Th
+  [ 331/500] ✗ [90%] [temporal-reasoning] How long had I been a member of 'Book Lovers Unite' when I attend
+  [ 332/500] ✓ [90%] [temporal-reasoning] How long had I been watching stand-up comedy specials regularly w
+  [ 333/500] ✗ [89%] [temporal-reasoning] What time do I wake up on Tuesdays and Thursdays?
+  [ 334/500] ✓ [90%] [temporal-reasoning] How many days had passed since I bought my Adidas running shoes w
+  [ 335/500] ✓ [90%] [temporal-reasoning] Which event happened first, the road trip to the coast or the arr
+  [ 336/500] ✓ [90%] [temporal-reasoning] Which airline did I fly with the most in March and April?
+  [ 337/500] ✓ [90%] [temporal-reasoning] How long had I been bird watching when I attended the bird watchi
+  [ 338/500] ✓ [90%] [temporal-reasoning] Which trip did I take first, the one to Europe with family or the
+  [ 339/500] ✓ [90%] [temporal-reasoning] Which device did I set up first, the smart thermostat or the new 
+  [ 340/500] ✓ [90%] [temporal-reasoning] Which health issue did I deal with first, the persistent cough or
+  [ 341/500] ✓ [90%] [temporal-reasoning] How old was I when I moved to the United States?
+  [ 342/500] ✓ [90%] [temporal-reasoning] How long had I been using the new area rug when I rearranged my l
+  [ 343/500] ✓ [90%] [temporal-reasoning] How many days before my best friend's birthday party did I order 
+  [ 344/500] ✓ [90%] [temporal-reasoning] Which trip did the narrator take first, the solo trip to Europe o
+  [ 345/500] ✗ [90%] [temporal-reasoning] How long did I use my new binoculars before I saw the American go
+  [ 346/500] ✓ [90%] [temporal-reasoning] Who did I meet first, Mark and Sarah or Tom?
+  [ 347/500] ✓ [90%] [temporal-reasoning] How many weeks have I been accepted into the exchange program whe
+  [ 348/500] ✓ [90%] [temporal-reasoning] Which group did I join first, 'Page Turners' or 'Marketing Profes
+  [ 349/500] ✗ [89%] [temporal-reasoning] How long had I been taking guitar lessons when I bought the new g
+  [ 350/500] ✓ [89%] [temporal-reasoning] Which streaming service did I start using most recently?
+  [ 351/500] ✓ [89%] [temporal-reasoning] How many months before my anniversary did Rachel get engaged?
+  [ 352/500] ✓ [89%] [temporal-reasoning] Which event happened first, the narrator losing their phone charg
+  [ 353/500] ✓ [90%] [temporal-reasoning] Who did I meet first, the woman selling jam at the farmer's marke
+  [ 354/500] ✓ [90%] [temporal-reasoning] Which event happened first, the meeting with Rachel or the pride 
+  [ 355/500] ✓ [90%] [temporal-reasoning] Which gift did I buy first, the necklace for my sister or the pho
+  [ 356/500] ✓ [90%] [temporal-reasoning] Which event did I participate in first, the volleyball league or 
+  [ 357/500] ✓ [90%] [temporal-reasoning] Which event happened first, my attendance at a cultural festival 
+  [ 358/500] ✓ [90%] [temporal-reasoning] Which project did I start first, the Ferrari model or the Japanes
+  [ 359/500] ✓ [90%] [temporal-reasoning] Who became a parent first, Rachel or Alex?
+  [ 360/500] ✓ [90%] [temporal-reasoning] How many days had passed between the day I bought a gift for my b
+  [ 361/500] ✓ [90%] [temporal-reasoning] Which task did I complete first, fixing the fence or purchasing t
+  [ 362/500] ✓ [90%] [temporal-reasoning] How long have I been working before I started my current job at G
+  [ 363/500] ✓ [90%] [temporal-reasoning] When did I book the Airbnb in Sacramento?
+  [ 364/500] ✓ [90%] [temporal-reasoning] How many days before I bought my iPad did I attend the Holiday Ma
+  [ 365/500] ✓ [90%] [temporal-reasoning] Which project did I start first, the Ferrari model or the Porsche
+  [ 366/500] ✓ [90%] [temporal-reasoning] Who became a parent first, Tom or Alex?
+  [ 367/500] ✓ [90%] [knowledge-update] What was my personal best time in the charity 5K run?
+  [ 368/500] ✓ [90%] [knowledge-update] How many Korean restaurants have I tried in my city?
+  [ 369/500] ✓ [90%] [knowledge-update] Where did Rachel move to after her recent relocation?
+  [ 370/500] ✓ [90%] [knowledge-update] What was the amount I was pre-approved for when I got my mortgage
+  [ 371/500] ✓ [90%] [knowledge-update] How often do I attend yoga classes to help with my anxiety?
+  [ 372/500] ✓ [90%] [knowledge-update] Is my mom using the same grocery list method as me?
+  [ 373/500] ✓ [90%] [knowledge-update] How many hours have I spent on my abstract ocean sculpture?
+  [ 374/500] ✓ [90%] [knowledge-update] How many bikes do I currently own?
+  [ 375/500] ✓ [90%] [knowledge-update] What day of the week do I take a cocktail-making class?
+  [ 376/500] ✓ [90%] [knowledge-update] Where did I go on my most recent family trip?
+  [ 377/500] ✓ [90%] [knowledge-update] Where do I initially keep my old sneakers?
+  [ 378/500] ✓ [90%] [knowledge-update] How many short stories have I written since I started writing reg
+  [ 379/500] ✓ [90%] [knowledge-update] How many pages of 'A Short History of Nearly Everything' have I r
+  [ 380/500] ✓ [90%] [knowledge-update] How many engineers do I lead when I just started my new role as S
+  [ 381/500] ✓ [90%] [knowledge-update] How many titles are currently on my to-watch list?
+  [ 382/500] ✗ [90%] [knowledge-update] How many stars do I need to reach the gold level on my Starbucks 
+  [ 383/500] ✓ [90%] [knowledge-update] How long have I been using my Fitbit Charge 3?
+  [ 384/500] ✓ [90%] [knowledge-update] How many sessions of the bereavement support group did I attend?
+  [ 385/500] ✓ [90%] [knowledge-update] What type of camera lens did I purchase most recently?
+  [ 386/500] ✓ [90%] [knowledge-update] How often do I see my therapist, Dr. Smith?
+  [ 387/500] ✓ [90%] [knowledge-update] How many MCU films did I watch in the last 3 months?
+  [ 388/500] ✓ [90%] [knowledge-update] How many of Emma's recipes have I tried out?
+  [ 389/500] ✓ [90%] [knowledge-update] What company is Rachel, an old colleague from my previous company
+  [ 390/500] ✓ [90%] [knowledge-update] For the coffee-to-water ratio in my French press, did I switch to
+  [ 391/500] ✓ [90%] [knowledge-update] Where is the painting 'Ethereal Dreams' by Emma Taylor currently 
+  [ 392/500] ✓ [90%] [knowledge-update] How many times have I worn my new black Converse Chuck Taylor All
+  [ 393/500] ✓ [90%] [knowledge-update] How many episodes of the Science series have I completed on Crash
+  [ 394/500] ✗ [90%] [knowledge-update] Do I go to the gym more frequently than I did previously?
+  [ 395/500] ✓ [90%] [knowledge-update] How many new postcards have I added to my collection since I star
+  [ 396/500] ✓ [90%] [knowledge-update] How many videos of Corey Schafer's Python programming series have
+  [ 397/500] ✓ [90%] [knowledge-update] How long have I been living in my current apartment in Harajuku?
+  [ 398/500] ✓ [90%] [knowledge-update] What brand of BBQ sauce am I currently obsessed with?
+  [ 399/500] ✓ [90%] [knowledge-update] How long have my parents been staying with me in the US?
+  [ 400/500] ✓ [90%] [knowledge-update] How long have I been sticking to my daily tidying routine?
+  [ 401/500] ✓ [90%] [knowledge-update] How long have I had my cat, Luna?
+  [ 402/500] ✓ [90%] [knowledge-update] How many Instagram followers do I currently have?
+  [ 403/500] ✓ [90%] [knowledge-update] How many dozen eggs do we currently have stocked up in our refrig
+  [ 404/500] ✓ [90%] [knowledge-update] How many issues of National Geographic have I finished reading?
+  [ 405/500] ✓ [90%] [knowledge-update] Did I finish reading 'The Nightingale' by Kristin Hannah?
+  [ 406/500] ✓ [90%] [knowledge-update] Where did I get my guitar serviced?
+  [ 407/500] ✓ [90%] [knowledge-update] What is my current highest score in Ticket to Ride?
+  [ 408/500] ✓ [90%] [knowledge-update] How many tops have I bought from H&M so far?
+  [ 409/500] ✓ [90%] [knowledge-update] How much did I earn at the Downtown Farmers Market on my most rec
+  [ 410/500] ✓ [90%] [knowledge-update] How many times have I tried making a Negroni at home since my fri
+  [ 411/500] ✓ [91%] [knowledge-update] What time do I usually go to the gym?
+  [ 412/500] ✓ [91%] [knowledge-update] How many Crash Course videos have I watched in the past few weeks
+  [ 413/500] ✓ [91%] [knowledge-update] Where am I planning to stay for my birthday trip to Hawaii?
+  [ 414/500] ✓ [91%] [knowledge-update] How many different species of birds have I seen in my local park?
+  [ 415/500] ✓ [91%] [knowledge-update] What was my previous frequent flyer status on United Airlines bef
+  [ 416/500] ✓ [91%] [knowledge-update] What was my previous personal best time for the charity 5K run?
+  [ 417/500] ✓ [91%] [knowledge-update] How many autographed baseballs have I added to my collection in t
+  [ 418/500] ✓ [91%] [knowledge-update] How often do I play tennis with my friends at the local park prev
+  [ 419/500] ✓ [91%] [knowledge-update] How much time do I dedicate to coding exercises each day?
+  [ 420/500] ✓ [91%] [knowledge-update] What day of the week did I meet with my previous language exchang
+  [ 421/500] ✓ [91%] [knowledge-update] How many pre-1920 American coins do I have in my collection?
+  [ 422/500] ✓ [91%] [knowledge-update] How many free night's stays can I redeem at any Hilton property w
+  [ 423/500] ✓ [91%] [knowledge-update] How much weight have I lost since I started going to the gym cons
+  [ 424/500] ✓ [91%] [knowledge-update] How many followers do I have on Instagram now?
+  [ 425/500] ✓ [91%] [knowledge-update] What is my current record in the recreational volleyball league?
+  [ 426/500] ✓ [91%] [knowledge-update] How many projects have I completed since starting painting classe
+  [ 427/500] ✗ [91%] [knowledge-update] What type of vehicle model am I currently working on?
+  [ 428/500] ✓ [91%] [knowledge-update] What was my previous goal for my Apex Legends level before I upda
+  [ 429/500] ✓ [91%] [knowledge-update] How many largemouth bass did I catch with Alex on the earlier fis
+  [ 430/500] ✓ [91%] [knowledge-update] What time do I wake up on Saturday mornings?
+  [ 431/500] ✓ [91%] [knowledge-update] How many women are on the team led by my former manager Rachel?
+  [ 432/500] ✓ [91%] [knowledge-update] Do I have a spare screwdriver for opening up my laptop?
+  [ 433/500] ✓ [91%] [knowledge-update] How many times have I met up with Alex from Germany?
+  [ 434/500] ✓ [91%] [knowledge-update] Did I mostly recently increase or decrease the limit on the numbe
+  [ 435/500] ✓ [91%] [knowledge-update] How many trips have I taken my Canon EOS 80D camera on?
+  [ 436/500] ✓ [91%] [knowledge-update] What new kitchen gadget did I invest in before getting the Air Fr
+  [ 437/500] ✓ [91%] [knowledge-update] How many Italian restaurants have I tried in my city?
+  [ 438/500] ✗ [91%] [knowledge-update] How many engineers do I lead when I just started my new role as S
+  [ 439/500] ✓ [91%] [knowledge-update] How often do I see Dr. Johnson?
+  [ 440/500] ✓ [91%] [knowledge-update] How long have I been living in my current apartment in Shinjuku?
+  [ 441/500] ✓ [91%] [knowledge-update] How many autographed football have I added to my collection in th
+  [ 442/500] ✓ [91%] [knowledge-update] How often do I play table tennis with my friends at the local par
+  [ 443/500] ✗ [91%] [knowledge-update] Before I purchased the gravel bike, do I have other bikes in addi
+  [ 444/500] ✗ [90%] [knowledge-update] Where do I currently keep my old sneakers?
+  [ 445/500] ✓ [90%] [single-session-assistant] I'm checking our previous chat about the shift rotation sheet for
+  [ 446/500] ✓ [90%] [single-session-assistant] I'm planning to visit Bandung again and I was wondering if you co
+  [ 447/500] ✓ [90%] [single-session-assistant] I'm going back to our previous conversation about the children's 
+  [ 448/500] ✓ [90%] [single-session-assistant] I'm planning to revisit Orlando. I was wondering if you could rem
+  [ 449/500] ✓ [90%] [single-session-assistant] Can you remind me of the name of the romantic Italian restaurant 
+  [ 450/500] ✓ [90%] [single-session-assistant] I remember you told me about the refining processes at CITGO's th
+  [ 451/500] ✓ [90%] [single-session-assistant] I'm planning my trip to Amsterdam again and I was wondering, what
+  [ 452/500] ✓ [90%] [single-session-assistant] I think we discussed work from home jobs for seniors earlier. Can
+  [ 453/500] ✓ [91%] [single-session-assistant] In our previous chat, you suggested 'sexual compulsions' and a fe
+  [ 454/500] ✓ [91%] [single-session-assistant] I wanted to check back on our previous conversation about Netflix
+  [ 455/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about binaural
+  [ 456/500] ✓ [91%] [single-session-assistant] I was thinking about our previous conversation about the Fifth Al
+  [ 457/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about front-en
+  [ 458/500] ✓ [91%] [single-session-assistant] I was looking back at our previous conversation about Native Amer
+  [ 459/500] ✓ [91%] [single-session-assistant] I'm going back to our previous chat about the Lost Temple of the 
+  [ 460/500] ✓ [91%] [single-session-assistant] I'm planning to go back to the Natural Park of Moncayo mountain i
+  [ 461/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about The Library o
+  [ 462/500] ✓ [91%] [single-session-assistant] I'm going back to our previous conversation about the grant aim p
+  [ 463/500] ✓ [91%] [single-session-assistant] I was thinking about our previous conversation about data privacy
+  [ 464/500] ✓ [91%] [single-session-assistant] I'm planning to visit the Vatican again and I was wondering if yo
+  [ 465/500] ✓ [91%] [single-session-assistant] I'm going back to our previous conversation about DIY home decor 
+  [ 466/500] ✓ [91%] [single-session-assistant] I'm planning my trip to Speyer again and I wanted to confirm, wha
+  [ 467/500] ✓ [91%] [single-session-assistant] I was going through our previous chat and I wanted to clarify som
+  [ 468/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about the impact of
+  [ 469/500] ✓ [91%] [single-session-assistant] I remember you provided a list of 100 prompt parameters that I ca
+  [ 470/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous conversation about building a co
+  [ 471/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about mindfuln
+  [ 472/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous chess game and I was wondering, 
+  [ 473/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about atmospheric c
+  [ 474/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about making a clas
+  [ 475/500] ✓ [91%] [single-session-assistant] I'm planning another trip to New York City and I was wondering if
+  [ 476/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about the fusi
+  [ 477/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about political pro
+  [ 478/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about natural 
+  [ 479/500] ✓ [91%] [single-session-assistant] I was going through our previous chat. Can you remind me of the n
+  [ 480/500] ✓ [91%] [single-session-assistant] Can you remind me what was the average improvement in framerate w
+  [ 481/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about language
+  [ 482/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous chat about the DHL Wellness Retr
+  [ 483/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation and I was wondering
+  [ 484/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about private 
+  [ 485/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous conversation about the Bajimaya 
+  [ 486/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about YouTube 
+  [ 487/500] ✓ [91%] [single-session-assistant] I was going through our previous chat and I was wondering, what w
+  [ 488/500] ✓ [91%] [single-session-assistant] I was looking back at our previous chat and I wanted to confirm, 
+  [ 489/500] ✗ [91%] [single-session-assistant] I was thinking back to our previous conversation about the Radiat
+  [ 490/500] ✓ [91%] [single-session-assistant] I was looking back at our previous conversation about buying uniq
+  [ 491/500] ✓ [91%] [single-session-assistant] I'm trying to recall what the designation on my jumpsuit was that
+  [ 492/500] ✓ [91%] [single-session-assistant] I'm going back to our previous conversation about music theory. Y
+  [ 493/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous conversation about the Seco de C
+  [ 494/500] ✓ [91%] [single-session-assistant] I wanted to follow up on our previous conversation about fracking
+  [ 495/500] ✓ [91%] [single-session-assistant] I'm looking back at our previous conversation where you created t
+  [ 496/500] ✓ [91%] [single-session-assistant] I'm going back to our previous conversation about traditional Ind
+  [ 497/500] ✓ [91%] [single-session-assistant] I was looking back at our previous conversation about environment
+  [ 498/500] ✓ [91%] [single-session-assistant] I was going through our previous conversation about high-end fash
+  [ 499/500] ✓ [91%] [single-session-assistant] I remember you told me to dilute tea tree oil with a carrier oil 
+  [ 500/500] ✓ [91%] [single-session-assistant] I was looking back at our previous conversation about Caribbean d
+
+  Failure log: longmemeval-workspace/eval_failures.jsonl
+
+────────────────────────────────────────────────────────────
+Results by category:
+                knowledge-update   72/78     92.3%
+                   multi-session  113/133    85.0%
+        single-session-assistant   55/56     98.2%
+       single-session-preference   30/30    100.0%
+             single-session-user   70/70    100.0%
+              temporal-reasoning  116/133    87.2%
+────────────────────────────────────────────────────────────
+  Overall: 456/500 = 91.2%
+
+  → Strong result — optimise retrieval to push toward 95%+
+

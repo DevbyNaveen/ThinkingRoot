@@ -7,6 +7,7 @@ use console::style;
 use tracing_subscriber::EnvFilter;
 
 mod branch_cmd;
+mod eval_cmd;
 mod mcp_config;
 mod pipeline;
 mod progress;
@@ -20,9 +21,9 @@ mod workspace;
 #[derive(Parser)]
 #[command(
     name = "root",
-    about = "ThinkingRoot — The open-source knowledge compiler for AI agents",
+    about = "ThinkingRoot — Compiled knowledge infrastructure for AI agents",
     version,
-    long_about = "ThinkingRoot compiles your docs, code, chats, and tickets into verified, linked knowledge that agents read in 2K tokens instead of 50K."
+    long_about = "ThinkingRoot compiles anything — codebases, docs, PDFs, notes, git history — into typed, verified, source-locked knowledge. Agents query it in <1ms instead of re-reading 50K tokens every session. 91.2% on LongMemEval."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,9 +60,9 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Query the compiled knowledge base
+    /// Query the compiled knowledge base (raw vector search)
     Query {
-        /// The query string (e.g., "what systems depend on PostgreSQL?")
+        /// The query string
         query: String,
         /// Path to the compiled knowledge base
         #[arg(short, long, default_value = ".")]
@@ -69,6 +70,26 @@ enum Commands {
         /// Number of results to show
         #[arg(short = 'n', long, default_value = "10")]
         top_k: usize,
+    },
+    /// Ask a question using the full hybrid intelligence pipeline (91.2% accuracy).
+    /// Handles factual recall, counting, temporal reasoning, preferences — everything.
+    /// Usage: root ask "what did I buy last week?"
+    ///        root ask llm "what happened last Saturday?" --date "2023/05/30"
+    Ask {
+        /// 'llm' keyword (optional) or your question directly.
+        /// Examples:
+        ///   root ask "what did I buy last week?"
+        ///   root ask llm "what did I buy last week?"
+        first: String,
+        /// Your question when 'llm' is the first argument
+        rest: Vec<String>,
+        /// Path to the compiled knowledge base
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Reference date for temporal questions (e.g. "2023/05/30").
+        /// Auto-detected as today's date when omitted.
+        #[arg(long)]
+        date: Option<String>,
     },
     /// Open the interactive knowledge graph in your browser
     Graph {
@@ -221,6 +242,28 @@ enum Commands {
     },
     /// Update root to the latest version
     Update,
+    /// Run the LongMemEval benchmark against a compiled workspace
+    Eval {
+        /// Path to the LongMemEval JSONL dataset file
+        #[arg(long)]
+        dataset: PathBuf,
+        /// Path to the compiled workspace to evaluate
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Limit number of questions to evaluate (0 = all)
+        #[arg(long, default_value = "0")]
+        limit: usize,
+        /// Filter by category (e.g. "TR", "SSP", "MS") — empty = all
+        #[arg(long)]
+        category: Option<String>,
+        /// Azure deployment name for the GPT-4o judge LLM.
+        /// When set, synthesis uses the workspace's configured model (e.g. GPT-4.1)
+        /// while grading uses this deployment (e.g. "gpt-4o-deployment").
+        /// Requires the workspace to use the azure provider.
+        /// If omitted, the workspace's model is used for both synthesis and judging.
+        #[arg(long)]
+        judge_deployment: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -319,8 +362,20 @@ async fn main() -> anyhow::Result<()> {
     use std::io::IsTerminal as _;
     let use_progress = !cli.verbose && std::io::stderr().is_terminal();
 
+    // Detect --mcp-stdio early so we can silence stdout logging.
+    // MCP stdio protocol requires stdout to be pure JSON-RPC lines.
+    // Any non-JSON line (INFO, WARN, etc.) sent to stdout will break every
+    // MCP client (Claude Code, Cursor, Codex, Windsurf, Zed, VS Code).
+    let is_mcp_stdio = matches!(
+        &cli.command,
+        Some(Commands::Serve { mcp_stdio: true, .. })
+    );
+
     let filter = if cli.verbose {
         EnvFilter::new("thinkingroot=debug,root=debug")
+    } else if is_mcp_stdio {
+        // MCP stdio: only WARN/ERROR to stderr; stdout must stay pure JSON-RPC.
+        EnvFilter::new("thinkingroot=warn,root=warn")
     } else if use_progress {
         // TTY + no --verbose: suppress everything below ERROR so progress bars
         // own stderr cleanly. WARN/INFO mixed with indicatif garbles the display.
@@ -333,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
+        .with_writer(std::io::stderr)  // always write to stderr, never stdout
         .init();
 
     match cli.command {
@@ -347,6 +403,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Query { query, path, top_k }) => {
             run_query(&path, &query, top_k).await?;
+        }
+        Some(Commands::Ask { first, rest, path, date }) => {
+            // Accept both:
+            //   root ask "question"
+            //   root ask llm "question"
+            let question = if first.to_lowercase() == "llm" {
+                rest.join(" ")
+            } else if rest.is_empty() {
+                first.clone()
+            } else {
+                format!("{} {}", first, rest.join(" "))
+            };
+            if question.trim().is_empty() {
+                anyhow::bail!("Please provide a question. Example: root ask \"what did I do last week?\"");
+            }
+            run_query_llm(&path, &question, date.as_deref()).await?;
         }
         Some(Commands::Graph { path, port }) => {
             serve::run_graph(port, path).await?;
@@ -489,6 +561,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Update) => {
             update_cmd::run_update().await?;
         }
+        Some(Commands::Eval { dataset, path, limit, category, judge_deployment }) => {
+            eval_cmd::run_eval(&dataset, &path, limit, category.as_deref(), judge_deployment.as_deref()).await?;
+        }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
@@ -534,58 +609,69 @@ async fn run_compile(
     };
 
     let elapsed = start.elapsed();
-    println!();
-    println!(
+    // In TTY mode the progress bars write to stderr (indicatif default).
+    // Using eprintln! here keeps the summary on the same stream so it
+    // appears in correct order after the bars, not interleaved with them.
+    let out = |s: String| {
+        if use_progress {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    };
+
+    out(String::new());
+    out(format!(
         "  {} compiled {} files in {:.1}s",
         style("ThinkingRoot").green().bold(),
         style(result.files_parsed).white().bold(),
         elapsed.as_secs_f64()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {}%",
         style("Knowledge Health:").white().bold(),
         style(result.health_score).green().bold()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {} claims extracted",
         style("  ├──").dim(),
         style(result.claims_count).cyan()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {} entities identified",
         style("  ├──").dim(),
         style(result.entities_count).cyan()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {} relations mapped",
         style("  ├──").dim(),
         style(result.relations_count).cyan()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {} contradictions found",
         style("  ├──").dim(),
         style(result.contradictions_count).yellow()
-    );
-    println!(
+    ));
+    out(format!(
         "  {} {} artifacts generated",
         style("  └──").dim(),
         style(result.artifacts_count).cyan()
-    );
+    ));
     if result.cache_hits > 0 {
-        println!(
+        out(format!(
             "  {} {} extraction cache hits",
             style("  ├──").dim(),
             style(result.cache_hits).green()
-        );
+        ));
     }
     if result.early_cutoffs > 0 {
-        println!(
+        out(format!(
             "  {} {} sources unchanged (early cutoff)",
             style("  └──").dim(),
             style(result.early_cutoffs).green()
-        );
+        ));
     }
-    println!();
+    out(String::new());
 
     Ok(())
 }
@@ -731,6 +817,143 @@ async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<
     Ok(())
 }
 
+/// Full hybrid intelligence pipeline — same 91.2%-accuracy path as POST /ask.
+/// Multi-pass scoped retrieval + transcript loading + temporal anchors + LLM synthesis.
+/// Temporal anchors are always computed (uses today's date when --date is not supplied).
+async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyhow::Result<()> {
+    use std::collections::{HashMap, HashSet};
+    use thinkingroot_core::Config;
+    use thinkingroot_extract::llm::LlmClient;
+    use thinkingroot_serve::engine::QueryEngine;
+    use thinkingroot_serve::intelligence::router::{classify_query, QueryPath};
+    use thinkingroot_serve::intelligence::session::SessionContext;
+    use thinkingroot_serve::intelligence::synthesizer::{ask, AskRequest};
+
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("path not found: {}", path.display()))?;
+    let data_dir = path.join(".thinkingroot");
+
+    if !data_dir.exists() {
+        anyhow::bail!(
+            "No ThinkingRoot data found. Run `root compile {}` first.",
+            path.display()
+        );
+    }
+
+    println!();
+    println!(
+        "  {} \"{}\"",
+        style("Thinking:").cyan().bold(),
+        style(query).white()
+    );
+
+    // Mount engine
+    let mut engine = QueryEngine::new();
+    engine
+        .mount("default".to_string(), path.clone())
+        .await
+        .context("failed to mount workspace")?;
+
+    // Load LLM
+    let config = Config::load_merged(&path).unwrap_or_default();
+    let llm = match LlmClient::new(&config.llm).await {
+        Ok(c) => {
+            println!(
+                "  {} {} / {}",
+                style("LLM:").dim(),
+                config.llm.default_provider,
+                config.llm.extraction_model
+            );
+            Some(std::sync::Arc::new(c))
+        }
+        Err(e) => {
+            println!(
+                "  {} LLM unavailable ({}), using best claim fallback",
+                style("Warning:").yellow(),
+                e
+            );
+            None
+        }
+    };
+
+    // Auto-detect category from query
+    let tmp_session = SessionContext::new("cli", "default");
+    let category = match classify_query(query, &tmp_session) {
+        QueryPath::Agentic => {
+            let q = query.to_lowercase();
+            if q.contains(" ago") || q.contains("last ") || q.contains("when ")
+                || q.contains("how many days") || q.contains("how many weeks")
+                || q.contains("how many months") || q.contains("what day")
+                || q.contains("what date") || q.contains("yesterday")
+            {
+                "temporal-reasoning"
+            } else if q.contains("prefer") || q.contains("recommend") || q.contains("favourite")
+                || q.contains("favorite") || q.contains("gift") || q.contains("enjoy")
+            {
+                "single-session-preference"
+            } else {
+                "multi-session"
+            }
+        }
+        QueryPath::Fast => "single-session-user",
+    };
+
+    // Always provide a date for temporal anchoring.
+    // Use --date if supplied, otherwise today's local date (YYYY/MM/DD format).
+    let today_str;
+    let question_date = match date {
+        Some(d) => d,
+        None => {
+            let now = chrono::Local::now();
+            today_str = now.format("%Y/%m/%d").to_string();
+            &today_str
+        }
+    };
+
+    let sessions_dir = path.join("sessions");
+
+    let req = AskRequest {
+        workspace: "default",
+        question: query,
+        category,
+        allowed_sources: &HashSet::new(),
+        question_date,
+        session_dates: &HashMap::new(),
+        answer_sids: &[],
+        sessions_dir: &sessions_dir,
+    };
+
+    let spinner_msg = format!(
+        "  {} Running hybrid retrieval [{}]...",
+        style("·").dim(),
+        style(category).cyan()
+    );
+    print!("{spinner_msg}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    let result = ask(&engine, llm, &req).await;
+
+    // Clear spinner line
+    print!("\r{}\r", " ".repeat(spinner_msg.len() + 4));
+
+    println!();
+    println!("  {}", style("Answer").green().bold());
+    println!();
+    for line in result.answer.lines() {
+        println!("  {line}");
+    }
+    println!();
+    println!(
+        "  {} claims · {} · date ref: {}",
+        style(result.claims_used).dim(),
+        style(&result.category).dim(),
+        style(question_date).dim(),
+    );
+    println!();
+
+    Ok(())
+}
+
 fn run_init(path: &Path) -> anyhow::Result<()> {
     let data_dir = path.join(".thinkingroot");
 
@@ -743,8 +966,11 @@ fn run_init(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let config = thinkingroot_core::Config::default();
-    config.save(path)?;
+    // Only create the data directory — no local config.toml.
+    // LLM settings are inherited from the global config (~/.config/thinkingroot/config.toml).
+    // Users who need per-workspace overrides can create .thinkingroot/config.toml manually.
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| anyhow::anyhow!("could not create {}: {e}", data_dir.display()))?;
 
     println!(
         "  {} initialized at {}",

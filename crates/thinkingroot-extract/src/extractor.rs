@@ -12,15 +12,40 @@ use crate::prompts;
 use crate::scheduler::ThroughputScheduler;
 use crate::schema::ExtractionResult;
 
-/// Number of cache-miss chunks packed into a single LLM batch call.
-/// 6 × 2000-token chunks + system prompt ≈ 13k tokens — within 32k context limits.
+/// Fallback batch size used only in tests that construct Extractor directly.
+/// Production code always uses the dynamically computed value from `model_batch_size`.
 pub const EXTRACTION_BATCH_SIZE: usize = 6;
 
 type SharedLlm = Arc<LlmClient>;
 
-/// Callback fired after each original chunk is processed (cached or via LLM).
-/// Arguments: (done, total, source_uri)
-pub type ChunkProgressFn = Arc<dyn Fn(usize, usize, &str) + Send + Sync>;
+/// Progress events emitted by the extractor so the CLI can render a live,
+/// batch-aware extraction bar without compromising batch size.
+#[derive(Debug, Clone)]
+pub enum ExtractionProgressEvent {
+    /// Extraction is ready to begin.
+    Start {
+        total_chunks: usize,
+        batch_size: usize,
+        total_batches: usize,
+    },
+    /// A new LLM batch has started running.
+    BatchStart {
+        batch_index: usize,
+        total_batches: usize,
+        range_start: usize,
+        range_end: usize,
+        batch_chunks: usize,
+    },
+    /// One original chunk finished (cache hit or completed LLM batch result).
+    ChunkDone {
+        done: usize,
+        total: usize,
+        source_uri: String,
+    },
+}
+
+/// Callback fired for extractor progress updates.
+pub type ChunkProgressFn = Arc<dyn Fn(ExtractionProgressEvent) + Send + Sync>;
 
 /// The main extraction engine. Takes DocumentIRs and produces
 /// Claims, Entities, and Relations via LLM extraction.
@@ -30,6 +55,10 @@ pub struct Extractor {
     min_confidence: f64,
     /// Approximate max tokens per chunk sent to the LLM (chars / 4 approximation).
     max_chunk_tokens: usize,
+    /// Number of cache-miss chunks packed into a single LLM batch call.
+    /// Computed from model context window + output cap at construction time;
+    /// overridable via `extraction_batch_size` in config.
+    batch_size: usize,
     cache: Option<crate::cache::ExtractionCache>,
     progress: Option<ChunkProgressFn>,
     /// Known entities from the existing graph, injected into LLM prompts.
@@ -73,11 +102,28 @@ impl Extractor {
             .with_max_retries(config.extraction.max_retries)
             .with_scheduler(Arc::clone(&scheduler));
 
+        // Compute batch size: config override wins, otherwise auto-detect from model.
+        let batch_size = config.extraction.extraction_batch_size.unwrap_or_else(|| {
+            crate::llm::model_batch_size(
+                &config.llm.default_provider,
+                &config.llm.extraction_model,
+                config.extraction.max_chunk_tokens,
+            )
+        });
+
+        tracing::info!(
+            "extraction batch size: {} (provider={}, model={})",
+            batch_size,
+            config.llm.default_provider,
+            config.llm.extraction_model,
+        );
+
         Ok(Self {
             llm: Arc::new(llm),
             concurrency: config.llm.max_concurrent_requests,
             min_confidence: config.extraction.min_confidence,
             max_chunk_tokens: config.extraction.max_chunk_tokens,
+            batch_size,
             cache: None,
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
@@ -217,11 +263,27 @@ impl Extractor {
         // Total = number of original chunks across all documents.
         // Each chunk fires one progress event from the LLM path (cache hit or LLM task).
         // Structural results are additive — they run in addition to the LLM path, not instead.
-        let total_chunks = cache_hits_data.len() + llm_work.len();
+        let cache_hits_count = cache_hits_data.len();
+        let total_chunks = cache_hits_count + llm_work.len();
+        let total_batches = if llm_work.is_empty() {
+            0
+        } else {
+            llm_work.len().div_ceil(self.batch_size)
+        };
         let mut done: usize = 0;
 
+        // Emit a start event immediately so the progress bar can switch from
+        // "waiting for LLM..." to a real counted bar BEFORE any batch call starts.
+        if let Some(ref pf) = self.progress {
+            pf(ExtractionProgressEvent::Start {
+                total_chunks,
+                batch_size: self.batch_size,
+                total_batches,
+            });
+        }
+
         // ── Process cache hits (instant, no LLM) ───────────────────────
-        output.cache_hits = cache_hits_data.len();
+        output.cache_hits = cache_hits_count;
         for (source_id, source_uri, cached_result) in cache_hits_data {
             let converted =
                 Self::convert_result_static(cached_result, source_id, workspace_id, min_confidence);
@@ -229,7 +291,11 @@ impl Extractor {
             output.chunks_processed += 1;
             done += 1;
             if let Some(ref pf) = self.progress {
-                pf(done, total_chunks, &source_uri);
+                pf(ExtractionProgressEvent::ChunkDone {
+                    done,
+                    total: total_chunks,
+                    source_uri,
+                });
             }
         }
 
@@ -261,14 +327,29 @@ impl Extractor {
         let known_entities_section = self.known_entities.prompt_section();
         let mut join_set = tokio::task::JoinSet::new();
 
-        for batch_work in llm_work.chunks(EXTRACTION_BATCH_SIZE) {
+        for (batch_idx, batch_work) in llm_work.chunks(self.batch_size).enumerate() {
             let batch_work: Vec<_> = batch_work.to_vec();
             let llm = Arc::clone(&self.llm);
             let sem = Arc::clone(&semaphore);
             let graph_ctx = known_entities_section.clone();
+            let progress = self.progress.clone();
+            let batch_index = batch_idx + 1;
+            let range_start = cache_hits_count + (batch_idx * self.batch_size) + 1;
+            let range_end = (range_start + batch_work.len()).saturating_sub(1);
+            let batch_chunks = batch_work.len();
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.ok()?;
+
+                if let Some(ref pf) = progress {
+                    pf(ExtractionProgressEvent::BatchStart {
+                        batch_index,
+                        total_batches,
+                        range_start,
+                        range_end,
+                        batch_chunks,
+                    });
+                }
 
                 // Build batch chunks — combine ast_anchor with graph context per chunk.
                 let batch_chunks: Vec<crate::batch::BatchChunk> = batch_work
@@ -346,7 +427,11 @@ impl Extractor {
                     output.chunks_processed += 1;
                     done += 1;
                     if let Some(ref pf) = self.progress {
-                        pf(done, total_chunks, &work.source_uri);
+                        pf(ExtractionProgressEvent::ChunkDone {
+                            done,
+                            total: total_chunks,
+                            source_uri: work.source_uri.clone(),
+                        });
                     }
                 }
             }
@@ -357,7 +442,11 @@ impl Extractor {
         if done < total_chunks
             && let Some(ref pf) = self.progress
         {
-            pf(total_chunks, total_chunks, "");
+            pf(ExtractionProgressEvent::ChunkDone {
+                done: total_chunks,
+                total: total_chunks,
+                source_uri: String::new(),
+            });
         }
 
         // Deduplicate claims by normalized statement — prevents graph bloat from

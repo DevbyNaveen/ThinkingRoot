@@ -87,10 +87,8 @@ impl<'a> Linker<'a> {
             }
         }
 
-        // Write resolved entities to graph.
-        for entity in &resolved_entities {
-            self.graph.insert_entity(entity)?;
-        }
+        // Write resolved entities to graph in one batch (100x faster than individual inserts).
+        self.graph.insert_entities_batch(&resolved_entities)?;
 
         // Phase 2: Link claims to sources and entities.
         // Build a name→resolved EntityId lookup (case-insensitive).
@@ -105,24 +103,33 @@ impl<'a> Linker<'a> {
             })
             .collect();
 
+        // Batch-insert all claims at once.
+        self.graph.insert_claims_batch(&extraction.claims)?;
+        output.claims_linked = extraction.claims.len();
         for claim in &extraction.claims {
-            self.graph.insert_claim(claim)?;
             output.added_claim_ids.push(claim.id.to_string());
-            self.graph
-                .link_claim_to_source(&claim.id.to_string(), &claim.source.to_string())?;
+        }
 
-            // Link claim to its referenced entities.
+        // Batch-insert claim→source edges.
+        let source_edges: Vec<(String, String)> = extraction
+            .claims
+            .iter()
+            .map(|c| (c.id.to_string(), c.source.to_string()))
+            .collect();
+        self.graph.link_claims_to_sources_batch(&source_edges)?;
+
+        // Collect and batch-insert claim→entity edges.
+        let mut entity_edges: Vec<(String, String)> = Vec::new();
+        for claim in &extraction.claims {
             if let Some(entity_names) = extraction.claim_entity_names.get(&claim.id) {
                 for name in entity_names {
                     if let Some(&entity_id) = name_to_entity.get(&name.to_lowercase()) {
-                        self.graph
-                            .link_claim_to_entity(&claim.id.to_string(), &entity_id.to_string())?;
+                        entity_edges.push((claim.id.to_string(), entity_id.to_string()));
                     }
                 }
             }
-
-            output.claims_linked += 1;
         }
+        self.graph.link_claims_to_entities_batch(&entity_edges)?;
 
         // Phase 3: Link relations (with resolved entity IDs).
         // Deduplicate first: keep most-specific type per (from, to) pair.
@@ -138,26 +145,30 @@ impl<'a> Linker<'a> {
                 removed
             );
         }
-        for sourced_relation in &deduped_relations {
-            let relation = &sourced_relation.relation;
-            let from_id = entity_id_map
-                .get(&relation.from)
-                .copied()
-                .unwrap_or(relation.from);
-            let to_id = entity_id_map
-                .get(&relation.to)
-                .copied()
-                .unwrap_or(relation.to);
-
-            self.graph.link_entities_for_source(
-                &sourced_relation.source.to_string(),
-                &from_id.to_string(),
-                &to_id.to_string(),
-                &format!("{:?}", relation.relation_type),
-                relation.strength.value(),
-            )?;
-            output.relations_linked += 1;
-        }
+        // Batch-insert all relations at once.
+        let relation_tuples: Vec<(String, String, String, String, f64)> = deduped_relations
+            .iter()
+            .map(|sr| {
+                let relation = &sr.relation;
+                let from_id = entity_id_map
+                    .get(&relation.from)
+                    .copied()
+                    .unwrap_or(relation.from);
+                let to_id = entity_id_map
+                    .get(&relation.to)
+                    .copied()
+                    .unwrap_or(relation.to);
+                (
+                    sr.source.to_string(),
+                    from_id.to_string(),
+                    to_id.to_string(),
+                    format!("{:?}", relation.relation_type),
+                    relation.strength.value(),
+                )
+            })
+            .collect();
+        self.graph.link_entities_for_source_batch(&relation_tuples)?;
+        output.relations_linked = relation_tuples.len();
 
         // Phase 4: Contradiction detection.
         // Group claims by entity, then look for opposing statements.
@@ -200,20 +211,16 @@ impl<'a> Linker<'a> {
         }
 
         let mut count = 0;
+
+        // Only specific semantic oppositions — NOT generic words like "is"/"has"/"true"
+        // which appear in almost every sentence and generate massive false positives.
         let negation_pairs = [
-            ("is", "is not"),
             ("uses", "does not use"),
-            ("has", "does not have"),
             ("supports", "does not support"),
             ("requires", "does not require"),
             ("enabled", "disabled"),
-            ("true", "false"),
-            ("yes", "no"),
             ("deprecated", "active"),
             ("removed", "added"),
-            // New patterns:
-            ("migrated from", "uses"),
-            ("replaced by", "depends on"),
             ("optional", "required"),
             ("synchronous", "asynchronous"),
             ("mutable", "immutable"),
@@ -221,14 +228,24 @@ impl<'a> Linker<'a> {
             ("internal", "external"),
             ("production", "development"),
             ("legacy", "current"),
-            ("before", "after"),
         ];
 
+        // Cap per-entity comparisons to prevent O(n²) explosion on high-degree entities.
+        // An entity with 1000 claims would generate 500k pairs — nearly all false positives.
+        const MAX_CLAIMS_PER_ENTITY: usize = 50;
+
         for group in entity_claims.values() {
-            for i in 0..group.len() {
-                for j in (i + 1)..group.len() {
-                    let a = &group[i];
-                    let b = &group[j];
+            // For large groups, take the highest-confidence claims only.
+            let window: &[&Claim] = if group.len() > MAX_CLAIMS_PER_ENTITY {
+                &group[..MAX_CLAIMS_PER_ENTITY]
+            } else {
+                group
+            };
+
+            for i in 0..window.len() {
+                for j in (i + 1)..window.len() {
+                    let a = &window[i];
+                    let b = &window[j];
                     let a_lower = a.statement.to_lowercase();
                     let b_lower = b.statement.to_lowercase();
 
@@ -254,8 +271,6 @@ impl<'a> Linker<'a> {
                             contradiction.explanation.as_deref().unwrap_or(""),
                         )?;
 
-                        // Auto-supersession: if confidence difference > 0.15,
-                        // supersede the lower-confidence claim.
                         if (conf_a - conf_b).abs() > 0.15 {
                             if conf_a > conf_b {
                                 self.graph
@@ -269,9 +284,10 @@ impl<'a> Linker<'a> {
                         count += 1;
                     }
 
-                    // Second pass: claims with high word overlap but different key terms
-                    // may indicate contradictions the keyword pairs missed.
+                    // Jaccard pass: same sentence structure, different key terms.
                     // Example: "uses PostgreSQL" vs "uses MySQL" — same structure, different DB.
+                    // Threshold raised to 0.80 (was 0.60) to avoid false positives on
+                    // related-but-not-contradictory facts about the same entity.
                     if !is_contradiction {
                         let a_words: std::collections::HashSet<&str> =
                             a_lower.split_whitespace().collect();
@@ -286,9 +302,7 @@ impl<'a> Linker<'a> {
                             0.0
                         };
 
-                        // High overlap (same structure) but not identical (different values)
-                        // suggests a potential contradiction.
-                        if jaccard > 0.6 && jaccard < 0.95 && a.claim_type == b.claim_type {
+                        if jaccard > 0.80 && jaccard < 0.95 && a.claim_type == b.claim_type {
                             let contradiction =
                                 Contradiction::new(a.id, b.id).with_explanation(format!(
                                     "Potential conflict (Jaccard={jaccard:.2}): \"{}\" vs \"{}\"",
@@ -324,7 +338,17 @@ impl<'a> Linker<'a> {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        // Find the largest char boundary at or before max bytes.
+        let boundary = s.char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max)
+            .last()
+            .unwrap_or(0);
+        &s[..boundary]
+    }
 }
 
 #[cfg(test)]

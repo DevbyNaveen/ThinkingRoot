@@ -3,23 +3,28 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use console::style;
 use serde_json::{Value, json};
+use thinkingroot_core::global_config::Credentials;
 
 /// The JSON key / format that each tool uses for MCP server configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConfigFormat {
-    /// `{ "mcpServers": { "thinkingroot": { "url": "..." } } }`
+    /// `{ "mcpServers": { "thinkingroot": { "command": "...", "args": [...] } } }`
+    /// Used by: Cursor, Windsurf, Cline, Antigravity, Claude Desktop
     McpServers,
-    /// `{ "servers": { "thinkingroot": { "type": "sse", "url": "..." } } }`
+    /// `{ "servers": { "thinkingroot": { "type": "stdio", "command": "...", "args": [...] } } }`
+    /// Used by: VS Code (requires explicit `type` field)
     Servers,
-    /// `{ "context_servers": { "thinkingroot": { "url": "..." } } }`
+    /// `{ "context_servers": { "thinkingroot": { "command": "...", "args": [...] } } }`
+    /// Used by: Zed (no `type` field, inferred from presence of `command`)
     ContextServers,
-    /// Individual file, same JSON as McpServers
+    /// Same JSON as McpServers, written to a standalone file per server.
+    /// Used by: Continue.dev (`~/.continue/mcpServers/thinkingroot.json`)
     ContinueDev,
-    /// Claude Code CLI: `~/.claude.json` with per-project `mcpServers` nesting
+    /// Claude Code CLI: per-project `mcpServers` nesting in `~/.claude.json`
     ClaudeCode,
-    /// OpenAI Codex CLI: `~/.codex/config.toml` (TOML format)
+    /// OpenAI Codex CLI: `~/.codex/config.toml` (TOML format, stdio)
     CodexToml,
-    /// Gemini CLI (~/.gemini/settings.json): uses mcpServers key with httpUrl instead of url
+    /// Gemini CLI: `~/.gemini/settings.json` with `httpUrl` key (HTTP-only, no stdio support)
     GeminiCli,
 }
 
@@ -161,6 +166,83 @@ fn tool_defs() -> Vec<(&'static str, Box<dyn Fn() -> Option<PathBuf>>, ConfigFor
     ]
 }
 
+// ── Credential forwarding ────────────────────────────────────────
+
+/// LLM provider credential environment variables forwarded to stdio subprocesses.
+/// Keeps in sync with the providers registered in the setup wizard.
+pub(crate) const CREDENTIAL_VARS: &[&str] = &[
+    // AWS Bedrock
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    // API providers
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "LITELLM_API_KEY",
+    "CUSTOM_LLM_API_KEY",
+];
+
+/// Build a JSON object of credential env vars for injection into stdio subprocess configs.
+///
+/// Resolution order per variable:
+///   1. Live env var (highest — allows CI/CD override)
+///   2. Value from `~/.config/thinkingroot/credentials.toml` (set by `root setup`)
+///
+/// This ensures that tools like Claude Desktop get the key even when the user's
+/// shell profile hasn't exported it — which is the common case for GUI apps.
+fn credential_env_json() -> serde_json::Map<String, Value> {
+    // Load stored credentials once; fall back to empty map on any error.
+    let stored = Credentials::load().unwrap_or_default();
+
+    let mut map = serde_json::Map::new();
+    for var in CREDENTIAL_VARS {
+        // Priority 1: live env var
+        let value = std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            // Priority 2: credentials.toml
+            .or_else(|| stored.get(var).map(str::to_string));
+
+        if let Some(val) = value {
+            map.insert(var.to_string(), json!(val));
+        }
+    }
+    map
+}
+
+/// Build the stdio MCP entry object for JSON-based config files.
+///
+/// VS Code requires an explicit `"type": "stdio"` field; all other tools infer
+/// the transport from the presence of a `command` key.
+fn stdio_entry(bin_path: &str, workspace_path: &str, needs_type_field: bool) -> Value {
+    let env_obj = credential_env_json();
+    let mut entry = if needs_type_field {
+        json!({
+            "type": "stdio",
+            "command": bin_path,
+            "args": ["serve", "--mcp-stdio", "--path", workspace_path],
+        })
+    } else {
+        json!({
+            "command": bin_path,
+            "args": ["serve", "--mcp-stdio", "--path", workspace_path],
+        })
+    };
+    if !env_obj.is_empty() {
+        entry["env"] = json!(env_obj);
+    }
+    entry
+}
+
 // ── JSON helpers (pub for tests) ─────────────────────────────────
 
 pub fn apply_entry(existing: &mut Value, format: ConfigFormat, port: u16) {
@@ -173,17 +255,27 @@ pub fn apply_entry(existing: &mut Value, format: ConfigFormat, port: u16) {
         ConfigFormat::ClaudeCode | ConfigFormat::CodexToml => return,
     };
 
+    let bin_path = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("root"))
+        .to_string_lossy()
+        .into_owned();
+    let workspace_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .to_string_lossy()
+        .into_owned();
+
     let entry = match format {
+        // Gemini CLI is HTTP-only; no stdio subprocess support.
         ConfigFormat::GeminiCli => json!({
             "httpUrl": format!("http://localhost:{}/mcp/sse", port)
         }),
-        ConfigFormat::ContextServers => json!({
-            "url": format!("http://localhost:{}/mcp/sse", port)
-        }),
-        _ => json!({
-            "type": "sse",
-            "url": format!("http://localhost:{}/mcp/sse", port)
-        }),
+        // VS Code requires an explicit "type": "stdio" field.
+        ConfigFormat::Servers | ConfigFormat::ContinueDev => {
+            stdio_entry(&bin_path, &workspace_path, true)
+        }
+        // All other tools (Cursor, Windsurf, Cline, Zed, Claude Desktop, Antigravity)
+        // infer the transport from the presence of a "command" key — no type field needed.
+        _ => stdio_entry(&bin_path, &workspace_path, false),
     };
 
     if !existing[servers_key].is_object() {
@@ -293,9 +385,9 @@ pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<
     })
 }
 
-// ── Claude Code: per-project config in ~/.claude.json ────────────
+// ── Claude Code: per-project stdio config in ~/.claude.json ─────
 
-pub fn apply_claude_code_entry(existing: &mut Value, port: u16, project_dir: &str) {
+pub fn apply_claude_code_entry(existing: &mut Value, _port: u16, project_dir: &str) {
     if !existing["projects"].is_object() {
         existing["projects"] = json!({});
     }
@@ -305,10 +397,19 @@ pub fn apply_claude_code_entry(existing: &mut Value, port: u16, project_dir: &st
     if !existing["projects"][project_dir]["mcpServers"].is_object() {
         existing["projects"][project_dir]["mcpServers"] = json!({});
     }
-    existing["projects"][project_dir]["mcpServers"]["thinkingroot"] = json!({
-        "type": "sse",
-        "url": format!("http://localhost:{}/mcp/sse", port)
-    });
+
+    let bin_path = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("root"))
+        .to_string_lossy()
+        .into_owned();
+    let workspace_path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .to_string_lossy()
+        .into_owned();
+
+    // Claude Code CLI infers stdio from "command" key — no "type" field needed.
+    existing["projects"][project_dir]["mcpServers"]["thinkingroot"] =
+        stdio_entry(&bin_path, &workspace_path, false);
 }
 
 pub fn remove_claude_code_entry(existing: &mut Value, project_dir: &str) {
@@ -455,28 +556,6 @@ fn write_codex_config(
     })
 }
 
-/// LLM provider credential environment variables forwarded to the Codex subprocess.
-/// Keeps in sync with the providers registered in the setup wizard.
-const CREDENTIAL_VARS: &[&str] = &[
-    // AWS Bedrock
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_PROFILE",
-    "AWS_DEFAULT_REGION",
-    "AWS_REGION",
-    // API providers
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GROQ_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "OPENROUTER_API_KEY",
-    "AZURE_OPENAI_API_KEY",
-    "TOGETHER_API_KEY",
-    "PERPLEXITY_API_KEY",
-    "LITELLM_API_KEY",
-];
-
 pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: &str) {
     let root = doc.as_table_mut().expect("TOML root must be a table");
 
@@ -508,9 +587,15 @@ pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: 
     );
     // Forward credential env vars so the subprocess can reach LLM providers
     // even when Codex is launched outside a shell (e.g., as a GUI app).
+    // Uses the same two-level resolution as credential_env_json().
+    let stored = Credentials::load().unwrap_or_default();
     let mut env_map = toml::map::Map::new();
     for var in CREDENTIAL_VARS {
-        if let Ok(val) = std::env::var(var) {
+        let value = std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| stored.get(var).map(str::to_string));
+        if let Some(val) = value {
             env_map.insert(var.to_string(), toml::Value::String(val));
         }
     }
@@ -580,8 +665,10 @@ fn find_available_port(start: u16) -> u16 {
         .unwrap_or(start)
 }
 
-fn is_stdio_tool(format: ConfigFormat) -> bool {
-    matches!(format, ConfigFormat::ClaudeCode | ConfigFormat::CodexToml)
+/// Returns true for all formats that use a stdio subprocess.
+/// Only Gemini CLI is HTTP-only (no stdio support).
+fn is_http_only_tool(format: ConfigFormat) -> bool {
+    matches!(format, ConfigFormat::GeminiCli)
 }
 
 // ── run_connect entry point ───────────────────────────────────────
@@ -622,9 +709,9 @@ pub fn run_connect(
         None => all_tools.iter().collect(),
     };
 
-    // For SSE tools, check if the requested port is free and find one that is.
-    let has_sse_tools = tools_to_process.iter().any(|t| !is_stdio_tool(t.format));
-    let effective_port = if !remove && has_sse_tools && !is_port_available(port) {
+    // Only HTTP-only tools (Gemini CLI) need a running server on a port.
+    let has_http_tools = tools_to_process.iter().any(|t| is_http_only_tool(t.format));
+    let effective_port = if !remove && has_http_tools && !is_port_available(port) {
         let next = find_available_port(port + 1);
         println!(
             "  {} Port {} is in use — using {} instead\n",
@@ -644,8 +731,8 @@ pub fn run_connect(
         );
     }
 
-    let mut sse_connected = false;
     let mut stdio_connected = false;
+    let mut http_connected = false;
 
     for tool in &tools_to_process {
         let result = if remove {
@@ -662,10 +749,10 @@ pub fn run_connect(
                     result.tool,
                     style(result.path.display()).dim()
                 );
-                if is_stdio_tool(tool.format) {
-                    stdio_connected = true;
+                if is_http_only_tool(tool.format) {
+                    http_connected = true;
                 } else {
-                    sse_connected = true;
+                    stdio_connected = true;
                 }
             }
             WriteAction::DryRun(content) => {
@@ -693,14 +780,20 @@ pub fn run_connect(
 
     if !dry_run && !remove {
         println!();
-        if sse_connected {
+        if stdio_connected {
             println!(
-                "  SSE tools connected to {}",
-                style(format!("http://localhost:{}/mcp/sse", effective_port)).cyan()
+                "  Stdio tools connected — no server needed, spawned per session."
             );
         }
-        if stdio_connected {
-            println!("  Stdio tools (Codex, Claude Code) connected via subprocess.");
+        if http_connected {
+            println!(
+                "  Gemini CLI connected to {}",
+                style(format!("http://localhost:{}/mcp/sse", effective_port)).cyan()
+            );
+            println!(
+                "  Start the server: {}",
+                style("root serve --port <port> --path <workspace>").dim()
+            );
         }
         println!("  Restart your AI tools to pick up the new config.");
     }
@@ -716,50 +809,112 @@ mod tests {
     // Serialise tests that mutate process-global environment variables.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // ── apply_entry: McpServers (Cursor, Windsurf, etc.) ────────────
+
     #[test]
-    fn merge_mcp_servers_inserts_entry_preserving_others() {
+    fn mcpservers_entry_has_command_and_args() {
+        let mut existing = json!({});
+        apply_entry(&mut existing, ConfigFormat::McpServers, 3000);
+        let entry = &existing["mcpServers"]["thinkingroot"];
+        assert!(entry["command"].is_string(), "command must be a string");
+        let args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "--mcp-stdio");
+        assert_eq!(args[2], "--path");
+        // No "type" field — inferred from presence of "command"
+        assert!(entry["type"].is_null(), "McpServers must not have a type field");
+        // No "url" field
+        assert!(entry["url"].is_null(), "McpServers must not have a url field");
+    }
+
+    #[test]
+    fn mcpservers_preserves_existing_servers() {
         let mut existing = json!({
             "mcpServers": {
                 "github": { "command": "npx", "args": ["-y", "@github/mcp"] }
             }
         });
         apply_entry(&mut existing, ConfigFormat::McpServers, 3000);
-        assert!(existing["mcpServers"]["github"].is_object());
-        assert_eq!(
-            existing["mcpServers"]["thinkingroot"]["url"],
-            "http://localhost:3000/mcp/sse"
-        );
+        assert!(existing["mcpServers"]["github"].is_object(), "existing server preserved");
+        assert!(existing["mcpServers"]["thinkingroot"]["command"].is_string());
     }
 
+    // ── apply_entry: Servers (VS Code) ───────────────────────────────
+
     #[test]
-    fn merge_servers_format_for_vscode() {
+    fn servers_entry_has_type_stdio() {
         let mut existing = json!({});
         apply_entry(&mut existing, ConfigFormat::Servers, 3001);
-        assert_eq!(existing["servers"]["thinkingroot"]["type"], "sse");
+        let entry = &existing["servers"]["thinkingroot"];
+        assert_eq!(entry["type"], "stdio", "VS Code requires explicit type:stdio");
+        assert!(entry["command"].is_string());
+        assert!(entry["url"].is_null(), "must not have url field");
+    }
+
+    // ── apply_entry: ContextServers (Zed) ───────────────────────────
+
+    #[test]
+    fn context_servers_entry_has_command_no_type() {
+        let mut existing = json!({});
+        apply_entry(&mut existing, ConfigFormat::ContextServers, 3000);
+        let entry = &existing["context_servers"]["thinkingroot"];
+        assert!(entry["command"].is_string());
+        assert!(entry["type"].is_null(), "Zed infers transport from command key — no type field");
+        assert!(entry["url"].is_null());
+    }
+
+    // ── apply_entry: ContinueDev ─────────────────────────────────────
+
+    #[test]
+    fn continue_dev_entry_has_type_stdio() {
+        let mut existing = json!({});
+        apply_entry(&mut existing, ConfigFormat::ContinueDev, 3000);
+        let entry = &existing["mcpServers"]["thinkingroot"];
+        assert_eq!(entry["type"], "stdio");
+        assert!(entry["command"].is_string());
+    }
+
+    // ── apply_entry: GeminiCli (HTTP-only) ──────────────────────────
+
+    #[test]
+    fn gemini_cli_entry_uses_http_url_key() {
+        let mut existing = json!({ "theme": "Default" });
+        apply_entry(&mut existing, ConfigFormat::GeminiCli, 3000);
         assert_eq!(
-            existing["servers"]["thinkingroot"]["url"],
-            "http://localhost:3001/mcp/sse"
+            existing["mcpServers"]["thinkingroot"]["httpUrl"],
+            "http://localhost:3000/mcp/sse"
         );
+        assert!(existing["mcpServers"]["thinkingroot"]["url"].is_null(), "must use httpUrl not url");
+        assert!(existing["mcpServers"]["thinkingroot"]["command"].is_null(), "no command for Gemini CLI");
+        assert_eq!(existing["theme"], "Default", "other settings preserved");
     }
 
     #[test]
-    fn merge_context_servers_format_for_zed() {
-        let mut existing = json!({});
-        apply_entry(&mut existing, ConfigFormat::ContextServers, 3000);
-        assert_eq!(
-            existing["context_servers"]["thinkingroot"]["url"],
-            "http://localhost:3000/mcp/sse"
-        );
-        // Zed uses context_servers format which does not use a "type" discriminator
-        assert!(existing["context_servers"]["thinkingroot"]["type"].is_null());
+    fn gemini_cli_remove_leaves_other_servers() {
+        let mut existing = json!({
+            "mcpServers": {
+                "other": { "httpUrl": "http://example.com" },
+                "thinkingroot": { "httpUrl": "http://localhost:3000/mcp/sse" }
+            }
+        });
+        remove_entry(&mut existing, ConfigFormat::GeminiCli);
+        assert!(existing["mcpServers"]["other"].is_object());
+        assert!(existing["mcpServers"]["thinkingroot"].is_null());
     }
+
+    // ── remove_entry ────────────────────────────────────────────────
 
     #[test]
     fn remove_entry_leaves_other_servers_intact() {
         let mut existing = json!({
             "mcpServers": {
                 "github": { "command": "npx" },
-                "thinkingroot": { "url": "http://localhost:3000/mcp/sse" }
+                "thinkingroot": { "command": "/usr/local/bin/root" }
             }
         });
         remove_entry(&mut existing, ConfigFormat::McpServers);
@@ -774,8 +929,10 @@ mod tests {
         assert!(existing["mcpServers"]["thinkingroot"].is_object());
     }
 
+    // ── Claude Code: per-project stdio config ───────────────────────
+
     #[test]
-    fn claude_code_inserts_project_scoped_entry() {
+    fn claude_code_entry_is_stdio_not_sse() {
         let mut existing = json!({
             "numStartups": 10,
             "projects": {
@@ -783,15 +940,20 @@ mod tests {
             }
         });
         apply_claude_code_entry(&mut existing, 3000, "/my/workspace");
-        assert_eq!(
-            existing["projects"]["/my/workspace"]["mcpServers"]["thinkingroot"]["url"],
-            "http://localhost:3000/mcp/sse"
-        );
-        assert_eq!(
-            existing["projects"]["/my/workspace"]["mcpServers"]["thinkingroot"]["type"],
-            "sse"
-        );
-        // Other project and top-level keys preserved.
+        let entry = &existing["projects"]["/my/workspace"]["mcpServers"]["thinkingroot"];
+        assert!(entry["command"].is_string(), "Claude Code must use stdio command");
+        let args: Vec<&str> = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "--mcp-stdio");
+        // No SSE url
+        assert!(entry["url"].is_null(), "Claude Code must not have url field");
+        assert!(entry["type"].is_null(), "Claude Code infers stdio from command key");
+        // Other project preserved
         assert!(existing["projects"]["/other/project"]["mcpServers"]["github"].is_object());
         assert_eq!(existing["numStartups"], 10);
     }
@@ -803,7 +965,7 @@ mod tests {
                 "/my/ws": {
                     "mcpServers": {
                         "github": {},
-                        "thinkingroot": { "type": "sse", "url": "http://localhost:3000/mcp/sse" }
+                        "thinkingroot": { "command": "/usr/local/bin/root" }
                     }
                 }
             }
@@ -812,6 +974,8 @@ mod tests {
         assert!(existing["projects"]["/my/ws"]["mcpServers"]["github"].is_object());
         assert!(existing["projects"]["/my/ws"]["mcpServers"]["thinkingroot"].is_null());
     }
+
+    // ── Codex TOML ──────────────────────────────────────────────────
 
     #[test]
     fn codex_toml_inserts_mcp_server_entry() {
@@ -826,10 +990,7 @@ args = ["@playwright/mcp@latest"]
         apply_codex_entry(&mut doc, "/usr/local/bin/root", "/workspace");
         let root = doc.as_table().unwrap();
         let mcp = root["mcp_servers"].as_table().unwrap();
-        assert_eq!(
-            mcp["thinkingroot"]["command"].as_str().unwrap(),
-            "/usr/local/bin/root"
-        );
+        assert_eq!(mcp["thinkingroot"]["command"].as_str().unwrap(), "/usr/local/bin/root");
         let args: Vec<&str> = mcp["thinkingroot"]["args"]
             .as_array()
             .unwrap()
@@ -837,10 +998,8 @@ args = ["@playwright/mcp@latest"]
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(args, ["serve", "--mcp-stdio", "--path", "/workspace"]);
-        // Existing server preserved.
-        assert!(mcp["playwright"].is_table());
-        // Top-level key preserved.
-        assert_eq!(root["model"].as_str().unwrap(), "gpt-4o");
+        assert!(mcp["playwright"].is_table(), "existing server preserved");
+        assert_eq!(root["model"].as_str().unwrap(), "gpt-4o", "top-level key preserved");
     }
 
     #[test]
@@ -861,95 +1020,20 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
     }
 
     #[test]
-    fn mcp_servers_entry_includes_type_sse() {
-        let mut existing = json!({});
-        apply_entry(&mut existing, ConfigFormat::McpServers, 3000);
-        assert_eq!(existing["mcpServers"]["thinkingroot"]["type"], "sse");
-        assert_eq!(
-            existing["mcpServers"]["thinkingroot"]["url"],
-            "http://localhost:3000/mcp/sse"
-        );
-    }
-
-    #[test]
-    fn continue_dev_entry_includes_type_sse() {
-        let mut existing = json!({});
-        apply_entry(&mut existing, ConfigFormat::ContinueDev, 3000);
-        assert_eq!(existing["mcpServers"]["thinkingroot"]["type"], "sse");
-        assert_eq!(
-            existing["mcpServers"]["thinkingroot"]["url"],
-            "http://localhost:3000/mcp/sse"
-        );
-    }
-
-    #[test]
-    fn gemini_cli_entry_uses_http_url_key() {
-        let mut existing = json!({
-            "theme": "Default"
-        });
-        apply_entry(&mut existing, ConfigFormat::GeminiCli, 3000);
-        // Must use "httpUrl", not "url"
-        assert_eq!(
-            existing["mcpServers"]["thinkingroot"]["httpUrl"],
-            "http://localhost:3000/mcp/sse"
-        );
-        // Must NOT have a "url" key
-        assert!(existing["mcpServers"]["thinkingroot"]["url"].is_null());
-        // Other settings preserved
-        assert_eq!(existing["theme"], "Default");
-    }
-
-    #[test]
-    fn gemini_cli_remove_leaves_other_servers() {
-        let mut existing = json!({
-            "mcpServers": {
-                "other": { "httpUrl": "http://example.com" },
-                "thinkingroot": { "httpUrl": "http://localhost:3000/mcp/sse" }
-            }
-        });
-        remove_entry(&mut existing, ConfigFormat::GeminiCli);
-        assert!(existing["mcpServers"]["other"].is_object());
-        assert!(existing["mcpServers"]["thinkingroot"].is_null());
-    }
-
-    #[test]
     fn codex_toml_captures_env_vars_when_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // This test verifies that when credential env vars are set,
-        // they get captured in the Codex TOML env table.
-        // We check with AWS_ACCESS_KEY_ID since it's part of the CREDENTIAL_VARS list.
         let test_key = "AWS_ACCESS_KEY_ID";
         let test_value = "AKIAIOSFODNN7EXAMPLE";
-
         let original_val = std::env::var(test_key).ok();
-        unsafe {
-            std::env::set_var(test_key, test_value);
-        }
+        unsafe { std::env::set_var(test_key, test_value); }
 
-        let input = r#"model = "gpt-4o""#;
-        let mut doc: toml::Value = input.parse().unwrap();
+        let mut doc: toml::Value = toml::Value::Table(toml::map::Map::new());
         apply_codex_entry(&mut doc, "/usr/local/bin/root", "/workspace");
-
         let mcp = doc["mcp_servers"]["thinkingroot"].as_table().unwrap();
+        assert_eq!(mcp["command"].as_str().unwrap(), "/usr/local/bin/root");
+        assert!(mcp.contains_key("env"), "env table should exist when credentials are set");
+        assert_eq!(mcp["env"][test_key].as_str().unwrap(), test_value);
 
-        // Verify basic structure: command and args exist
-        assert_eq!(
-            mcp["command"].as_str().unwrap(),
-            "/usr/local/bin/root"
-        );
-
-        // When credentials are set, env table should be populated
-        assert!(
-            mcp.contains_key("env"),
-            "env table should exist when credentials are set"
-        );
-        assert_eq!(
-            mcp["env"][test_key].as_str().unwrap(),
-            test_value,
-            "{} should be captured in env table", test_key
-        );
-
-        // Clean up: restore original state
         unsafe {
             if let Some(val) = original_val {
                 std::env::set_var(test_key, val);
@@ -962,31 +1046,17 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
     #[test]
     fn codex_toml_omits_env_table_when_no_credentials_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // This test verifies that when NO credential env vars are set,
-        // the env table is omitted from the TOML (not included if empty).
-        // We save and restore the state of all credential vars for this test.
-
-        // Save original state
         let original_vals: Vec<(String, Option<String>)> = CREDENTIAL_VARS
             .iter()
             .map(|v| (v.to_string(), std::env::var(v).ok()))
             .collect();
-
-        // Remove all credential vars for this test
-        unsafe {
-            for v in CREDENTIAL_VARS { std::env::remove_var(v); }
-        }
+        unsafe { for v in CREDENTIAL_VARS { std::env::remove_var(v); } }
 
         let mut doc: toml::Value = toml::Value::Table(toml::map::Map::new());
         apply_codex_entry(&mut doc, "/usr/local/bin/root", "/workspace");
-
         let mcp = doc["mcp_servers"]["thinkingroot"].as_table().unwrap();
-        assert!(
-            !mcp.contains_key("env"),
-            "env table should be absent when no credentials are set"
-        );
+        assert!(!mcp.contains_key("env"), "env table should be absent when no credentials are set");
 
-        // Restore original state
         unsafe {
             for (var_name, original_val) in original_vals {
                 if let Some(val) = original_val {

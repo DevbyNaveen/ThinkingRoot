@@ -102,6 +102,14 @@ pub fn create_branch_layout(parent_data_dir: &Path, branch_data_dir: &Path) -> R
         fs::copy(&src_db, &dst_db)?;
     }
 
+    // Copy vectors.bin — must be a physical copy, not a symlink.
+    // Each branch has its own writable vector index; sharing would corrupt the parent.
+    let src_vec = parent_data_dir.join("vectors.bin");
+    let dst_vec = branch_data_dir.join("vectors.bin");
+    if src_vec.exists() {
+        fs::copy(&src_vec, &dst_vec)?;
+    }
+
     // Share models/ (fastembed cache — ~300MB, never duplicate).
     // Unix: symlink. Windows: copy recursively (junctions require elevated perms).
     let parent_models = parent_data_dir.join("models");

@@ -227,7 +227,8 @@ pub async fn run_serve(
         println!("  REST API:  http://{}:{}/api/v1/", host, port);
     }
     if !no_mcp {
-        println!("  MCP SSE:   http://{}:{}/mcp/sse", host, port);
+        println!("  MCP HTTP:  http://{}:{}/mcp/sse  (Gemini CLI)", host, port);
+        println!("  MCP stdio: root serve --mcp-stdio  (Claude Code, Codex, Cursor, VS Code, Windsurf, Zed)");
     }
     for (ws_name, _path, _ws_port) in &resolved_paths {
         println!(

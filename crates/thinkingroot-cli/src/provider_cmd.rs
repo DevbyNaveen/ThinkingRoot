@@ -524,6 +524,8 @@ async fn collect_azure(
 
     let model_str = resolve_model(theme, model, &[&deployment])?;
 
+    // Persist key to credentials.toml so future commands work in a fresh shell.
+    crate::setup::persist_credential(pdef.default_env, &api_key);
     let mut llm = base_llm_config("azure", &model_str);
     llm.providers.azure = Some(AzureConfig {
         resource_name: Some(resource),
@@ -531,6 +533,7 @@ async fn collect_azure(
         deployment: Some(deployment),
         api_version: Some(api_version),
         api_key_env: Some(pdef.default_env.to_string()),
+        api_key: None, // stored in credentials.toml, not config.toml
     });
     Ok(llm)
 }
@@ -562,6 +565,7 @@ async fn collect_ollama(
     let mut llm = base_llm_config("ollama", &model_str);
     llm.providers.ollama = Some(ProviderConfig {
         api_key_env: None,
+        api_key: None,
         base_url: Some(effective_base.to_string()),
         default_model: None,
     });
@@ -659,12 +663,17 @@ async fn collect_generic(
     let model_str = resolve_model(theme, model, &effective)?;
 
     // ── Build LlmConfig ───────────────────────────────────────────
+    // Persist key to credentials.toml so future commands work in a fresh shell.
+    if !pdef.default_env.is_empty() && !api_key.is_empty() {
+        crate::setup::persist_credential(pdef.default_env, &api_key);
+    }
     let provider_cfg = ProviderConfig {
         api_key_env: if pdef.default_env.is_empty() {
             None
         } else {
             Some(pdef.default_env.to_string())
         },
+        api_key: None, // stored in credentials.toml, not config.toml
         base_url: effective_base,
         default_model: None,
     };

@@ -103,19 +103,19 @@ pub fn compute_diff(
     // Build main hash set for deduplication
     let main_hashes: HashSet<String> = main_claims_raw
         .iter()
-        .map(|(_, stmt, _, _, _)| semantic_hash(stmt))
+        .map(|(_, stmt, _, _, _, _)| semantic_hash(stmt))
         .collect();
 
     // Identify new claims (branch claims not in main by semantic hash)
-    let new_claim_rows: Vec<&(String, String, String, f64, String)> = branch_claims_raw
+    let new_claim_rows: Vec<&(String, String, String, f64, String, f64)> = branch_claims_raw
         .iter()
-        .filter(|(_, stmt, _, _, _)| !main_hashes.contains(&semantic_hash(stmt)))
+        .filter(|(_, stmt, _, _, _, _)| !main_hashes.contains(&semantic_hash(stmt)))
         .collect();
 
     // Get entity context for new claims
     let new_claim_id_strs: Vec<&str> = new_claim_rows
         .iter()
-        .map(|(id, _, _, _, _)| id.as_str())
+        .map(|(id, _, _, _, _, _)| id.as_str())
         .collect();
     let entity_map: HashMap<String, Vec<String>> =
         branch_graph.get_entity_names_for_claims(&new_claim_id_strs)?;
@@ -128,11 +128,11 @@ pub fn compute_diff(
     let mut auto_resolved: Vec<AutoResolution> = Vec::new();
     let mut needs_review: Vec<ContradictionPair> = Vec::new();
 
-    for (id, statement, claim_type_str, confidence, _uri) in &new_claim_rows {
+    for (id, statement, claim_type_str, confidence, _uri, _) in &new_claim_rows {
         let entity_context = entity_map.get(id.as_str()).cloned().unwrap_or_default();
 
         let mut contradiction_found = false;
-        for (main_id, main_stmt, _, main_conf, _) in &main_claims_raw {
+        for (main_id, main_stmt, _, main_conf, _, _) in &main_claims_raw {
             if is_contradiction_pair(statement, main_stmt) {
                 contradiction_found = true;
                 let delta = (confidence - main_conf).abs();
@@ -194,6 +194,7 @@ pub fn compute_diff(
                 grounding_score: None,
                 grounding_method: None,
                 extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
+                event_date: None,
             };
             new_claims.push(DiffClaim {
                 claim,
@@ -207,12 +208,12 @@ pub fn compute_diff(
     // Claims that share >60% token overlap but different semantic hashes and
     // share entity context are flagged as potential conflicts, even when the
     // negation-pair heuristic missed them.
-    for (id, statement, _, confidence, _) in &new_claim_rows {
+    for (id, statement, _, confidence, _, _) in &new_claim_rows {
         let entity_context = entity_map.get(id.as_str()).cloned().unwrap_or_default();
         if entity_context.is_empty() {
             continue;
         }
-        for (main_id, main_stmt, _, main_conf, _) in &main_claims_raw {
+        for (main_id, main_stmt, _, main_conf, _, _) in &main_claims_raw {
             // Skip pairs already caught by negation-pair pass.
             let already_flagged = auto_resolved
                 .iter()

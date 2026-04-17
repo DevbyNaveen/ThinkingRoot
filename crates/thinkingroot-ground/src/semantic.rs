@@ -20,7 +20,6 @@ impl SemanticJudge {
     /// - 0.4-0.7: partially related
     /// - < 0.4: likely off-topic / hallucinated
     pub fn score(claim: &str, source_text: &str, vector_store: &mut VectorStore) -> f64 {
-        // Embed both texts using the existing model.
         let texts = vec![claim, source_text];
         match vector_store.embed_texts(&texts) {
             Ok(embeddings) if embeddings.len() == 2 => {
@@ -28,11 +27,48 @@ impl SemanticJudge {
             }
             Ok(_) => {
                 tracing::warn!("semantic judge: unexpected embedding count");
-                0.5 // neutral fallback
+                0.5
             }
             Err(e) => {
                 tracing::warn!("semantic judge: embedding failed: {e}");
-                0.5 // neutral fallback — don't reject on infra failure
+                0.5
+            }
+        }
+    }
+
+    /// Score a batch of (claim, source_text) pairs in a single embedding call.
+    ///
+    /// Flattens pairs into `[claim₀, src₀, claim₁, src₁, …]`, calls
+    /// `embed_texts` once, then pairs up the resulting vectors.
+    /// Falls back to 0.5 (neutral) for any pair where embedding is missing.
+    pub fn score_batch(pairs: &[(&str, &str)], vector_store: &mut VectorStore) -> Vec<f64> {
+        if pairs.is_empty() {
+            return vec![];
+        }
+
+        // Flatten: [claim0, src0, claim1, src1, ...]
+        let texts: Vec<&str> = pairs
+            .iter()
+            .flat_map(|(c, s)| [*c, *s])
+            .collect();
+
+        match vector_store.embed_texts(&texts) {
+            Ok(embeddings) if embeddings.len() == texts.len() => pairs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| cosine_similarity(&embeddings[i * 2], &embeddings[i * 2 + 1]))
+                .collect(),
+            Ok(other) => {
+                tracing::warn!(
+                    "semantic batch: unexpected embedding count {} for {} pairs",
+                    other.len(),
+                    pairs.len()
+                );
+                vec![0.5; pairs.len()]
+            }
+            Err(e) => {
+                tracing::warn!("semantic batch: embedding failed: {e}");
+                vec![0.5; pairs.len()]
             }
         }
     }

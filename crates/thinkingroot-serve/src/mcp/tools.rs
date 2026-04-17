@@ -5,6 +5,14 @@ use crate::intelligence::planner::{self, PlanStep};
 use crate::intelligence::session::{SessionContext, SessionStore};
 use serde_json::Value;
 
+// Path to the workspace sessions directory is resolved from the engine's workspace root_path.
+fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
+    engine
+        .workspace_root_path(ws)
+        .map(|p| p.join("sessions"))
+        .unwrap_or_else(|| std::path::PathBuf::from("sessions"))
+}
+
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     let tools = serde_json::json!({
         "tools": [
@@ -120,6 +128,30 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["workspace"]
                 }
             },
+            // ── Intelligent memory retrieval ─────────────────────────────
+            {
+                "name": "ask",
+                "description": "Ask a natural-language question against the personal memory graph. Uses hybrid retrieval + LLM synthesis (91.2% accuracy on LongMemEval-500). Handles factual recall, counting, temporal reasoning, preference recommendations, and knowledge updates. Returns a synthesized natural-language answer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "question":      { "type": "string", "description": "Natural-language question to answer from memory" },
+                        "workspace":     { "type": "string" },
+                        "session_scope": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional list of session IDs to restrict retrieval to (e.g. haystack_session_ids from LongMemEval)"
+                        },
+                        "question_date": { "type": "string", "description": "Reference date for temporal questions, e.g. '2023/05/30 (Tue) 22:10'" },
+                        "category_hint": {
+                            "type": "string",
+                            "enum": ["single-session-user", "single-session-assistant", "single-session-preference", "multi-session", "temporal-reasoning", "knowledge-update"],
+                            "description": "Optional category hint for strategy selection. Auto-detected if omitted."
+                        }
+                    },
+                    "required": ["question", "workspace"]
+                }
+            },
             // ── Intelligent serve tools ───────────────────────────────────
             {
                 "name": "brief",
@@ -166,7 +198,7 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                                 "type": "object",
                                 "properties": {
                                     "statement":   { "type": "string", "description": "Atomic statement of fact/decision/etc." },
-                                    "claim_type":  { "type": "string", "enum": ["fact","decision","opinion","plan","requirement","metric","definition","dependency","api_signature","architecture"], "default": "fact" },
+                                    "claim_type":  { "type": "string", "enum": ["fact","decision","opinion","plan","requirement","metric","definition","dependency","api_signature","architecture","preference"], "default": "fact" },
                                     "confidence":  { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
                                     "entities":    { "type": "array", "items": { "type": "string" }, "description": "Entity names this claim is about" }
                                 },
@@ -206,6 +238,75 @@ pub async fn handle_call(
         .unwrap_or("default");
 
     match tool_name {
+        // ── Intelligent memory ask (Phase 3.6 — full hybrid pipeline) ─────
+        "ask" => {
+            let question = match arguments.get("question").and_then(|v| v.as_str()) {
+                Some(q) => q.to_string(),
+                None => {
+                    return JsonRpcResponse::error(id, -32602, "Missing 'question' argument".to_string());
+                }
+            };
+            let session_scope: Vec<String> = arguments
+                .get("session_scope")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let question_date = arguments
+                .get("question_date")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Infer category: use hint if given, else router
+            let category_hint = arguments
+                .get("category_hint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let category = if !category_hint.is_empty() {
+                category_hint.clone()
+            } else {
+                let tmp_session = SessionContext::new(session_id, ws);
+                match crate::intelligence::router::classify_query(&question, &tmp_session) {
+                    crate::intelligence::router::QueryPath::Agentic => {
+                        let q = question.to_lowercase();
+                        if q.contains(" ago") || q.contains("last ") || q.contains("when ") || q.contains("how many days") {
+                            "temporal-reasoning".to_string()
+                        } else {
+                            "multi-session".to_string()
+                        }
+                    }
+                    crate::intelligence::router::QueryPath::Fast => "single-session-user".to_string(),
+                }
+            };
+
+            let allowed_sources: std::collections::HashSet<String> =
+                session_scope.iter().cloned().collect();
+            let sessions_dir = sessions_dir_for(engine, ws);
+            let llm = engine.workspace_llm(ws);
+
+            use crate::intelligence::synthesizer::{ask as synth_ask, AskRequest};
+            let req = AskRequest {
+                workspace: ws,
+                question: &question,
+                category: &category,
+                allowed_sources: &allowed_sources,
+                question_date: &question_date,
+                session_dates: &std::collections::HashMap::new(),
+                answer_sids: &session_scope,
+                sessions_dir: &sessions_dir,
+            };
+            let result = synth_ask(engine, llm, &req).await;
+            let text = format!(
+                "{}\n\n[claims_used: {} | category: {}]",
+                result.answer, result.claims_used, result.category
+            );
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+            )
+        }
+
         // ── Classic search ────────────────────────────────────────────────
         "search" => {
             let query = match arguments.get("query").and_then(|v| v.as_str()) {
@@ -222,20 +323,28 @@ pub async fn handle_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            match engine.search(ws, query, top_k).await {
-                Ok(results) => {
-                    let content = serde_json::to_string_pretty(&results).unwrap_or_default();
-                    JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                    )
-                }
+            let session_snapshot = {
+                let store = sessions.lock().await;
+                store.get(session_id).cloned()
+            };
+            let session_ctx = session_snapshot.unwrap_or_else(|| {
+                crate::intelligence::session::SessionContext::new(session_id, ws)
+            });
+            match engine.search_with_routing(ws, query, top_k, &session_ctx).await {
+                Ok(content) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                ),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
 
         // ── Classic claim filter ──────────────────────────────────────────
         "query_claims" => {
+            let active_branch: Option<String> = {
+                let store = sessions.lock().await;
+                store.get(session_id).and_then(|s| s.active_branch.clone())
+            };
             let filter = ClaimFilter {
                 claim_type: arguments
                     .get("type")
@@ -249,7 +358,7 @@ pub async fn handle_call(
                 limit: Some(100),
                 offset: None,
             };
-            match engine.list_claims(ws, filter).await {
+            match engine.list_claims_branched(ws, filter, active_branch.as_deref()).await {
                 Ok(claims) => {
                     let content = serde_json::to_string_pretty(&claims).unwrap_or_default();
                     JsonRpcResponse::success(
@@ -263,6 +372,10 @@ pub async fn handle_call(
 
         // ── Classic relations ─────────────────────────────────────────────
         "get_relations" => {
+            let active_branch: Option<String> = {
+                let store = sessions.lock().await;
+                store.get(session_id).and_then(|s| s.active_branch.clone())
+            };
             let entity = match arguments.get("entity").and_then(|v| v.as_str()) {
                 Some(e) => e,
                 None => {
@@ -273,7 +386,7 @@ pub async fn handle_call(
                     );
                 }
             };
-            match engine.get_relations(ws, entity).await {
+            match engine.get_relations_branched(ws, entity, active_branch.as_deref()).await {
                 Ok(rels) => {
                     let content = serde_json::to_string_pretty(&rels).unwrap_or_default();
                     JsonRpcResponse::success(
@@ -533,31 +646,37 @@ pub async fn handle_call(
         // ── Intelligent serve tools ───────────────────────────────────────
 
         // `brief` — Tier-0 workspace orientation (~100-200 tokens).
-        "brief" => match engine.get_workspace_brief(ws).await {
-            Ok(summary) => {
-                let text = compressor::format_workspace_brief(
-                    &summary.workspace,
-                    summary.entity_count,
-                    summary.claim_count,
-                    summary.source_count,
-                    &summary.top_entities,
-                    &summary.recent_decisions,
-                    summary.contradiction_count,
-                );
-                // Update session with workspace context.
-                let mut store = sessions.lock().await;
-                let session = store
-                    .entry(session_id.to_string())
-                    .or_insert_with(|| SessionContext::new(session_id, ws));
-                session.reset_budget();
-                drop(store);
+        "brief" => {
+            let active_branch: Option<String> = {
+                let store = sessions.lock().await;
+                store.get(session_id).and_then(|s| s.active_branch.clone())
+            };
+            match engine.get_workspace_brief_branched(ws, active_branch.as_deref()).await {
+                Ok(summary) => {
+                    let text = compressor::format_workspace_brief(
+                        &summary.workspace,
+                        summary.entity_count,
+                        summary.claim_count,
+                        summary.source_count,
+                        &summary.top_entities,
+                        &summary.recent_decisions,
+                        summary.contradiction_count,
+                    );
+                    // Update session with workspace context.
+                    let mut store = sessions.lock().await;
+                    let session = store
+                        .entry(session_id.to_string())
+                        .or_insert_with(|| SessionContext::new(session_id, ws));
+                    session.reset_budget();
+                    drop(store);
 
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-                )
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
-            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
 
         // `investigate` — intent-aware deep retrieval with session delta delivery.
@@ -585,13 +704,15 @@ pub async fn handle_call(
                 }
             };
 
-            // Read session snapshot for planner.
-            let session_snapshot = {
+            // Read session snapshot for planner (and capture active_branch).
+            let (session_snapshot, active_branch) = {
                 let store = sessions.lock().await;
-                store
+                let snap = store
                     .get(session_id)
                     .cloned()
-                    .unwrap_or_else(|| SessionContext::new(session_id, ws))
+                    .unwrap_or_else(|| SessionContext::new(session_id, ws));
+                let branch = snap.active_branch.clone();
+                (snap, branch)
             };
 
             // Plan: choose retrieval strategy (full context / reverse deps / neighborhood).
@@ -599,7 +720,7 @@ pub async fn handle_call(
 
             let text = match plan.steps.first() {
                 Some(PlanStep::FindReverseDeps(name)) => {
-                    match engine.get_entity_context(ws, name).await {
+                    match engine.get_entity_context_branched(ws, name, active_branch.as_deref()).await {
                         Ok(Some(ctx)) => {
                             let mut out = format!("## Reverse dependencies of {name}\n");
                             if ctx.incoming_relations.is_empty() {
@@ -616,7 +737,7 @@ pub async fn handle_call(
                     }
                 }
                 Some(PlanStep::GetNeighborhood(name)) => {
-                    match engine.get_entity_context(ws, name).await {
+                    match engine.get_entity_context_branched(ws, name, active_branch.as_deref()).await {
                         Ok(Some(ctx)) => {
                             let mut out = format!("## Neighborhood of {name}\n");
                             for (t, rel, str) in &ctx.outgoing_relations {
@@ -633,7 +754,7 @@ pub async fn handle_call(
                 }
                 _ => {
                     // Full entity context with session-aware compression.
-                    match engine.get_entity_context(ws, &entity_name).await {
+                    match engine.get_entity_context_branched(ws, &entity_name, active_branch.as_deref()).await {
                         Ok(None) => {
                             return JsonRpcResponse::error(
                                 id,
@@ -768,7 +889,7 @@ pub async fn handle_call(
             };
 
             match engine
-                .contribute_claims(ws, session_id, active_branch.as_deref(), agent_claims)
+                .contribute_claims(ws, session_id, active_branch.as_deref(), agent_claims, sessions)
                 .await
             {
                 Ok(result) => {

@@ -30,10 +30,21 @@ pub fn walk(root: &Path, config: &ParserConfig) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     for entry in builder.build() {
-        let entry = entry.map_err(|e| Error::Io {
-            path: Some(root.to_path_buf()),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // Permission errors on system directories (e.g. macOS ~/Library) are
+                // expected when compiling a broad path like $HOME. Skip and continue.
+                if let Some(io_err) = e.io_error() {
+                    if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                        tracing::warn!("skipping inaccessible path: {e}");
+                        continue;
+                    }
+                }
+                tracing::debug!("walk error (skipping): {e}");
+                continue;
+            }
+        };
 
         let path = entry.path();
 

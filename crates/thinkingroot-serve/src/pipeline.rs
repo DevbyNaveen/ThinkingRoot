@@ -14,9 +14,21 @@ use thinkingroot_graph::StorageEngine;
 pub enum ProgressEvent {
     /// Parsing finished. `files` = number of documents parsed.
     ParseComplete { files: usize },
-    /// Extraction is starting. Fired inside the `ChunkProgressFn` on the
-    /// first chunk completion; `total_chunks` is the definitive denominator.
-    ExtractionStart { total_chunks: usize },
+    /// Extraction is starting. Includes batch sizing so the UI can explain
+    /// what work is about to happen before the first batch returns.
+    ExtractionStart {
+        total_chunks: usize,
+        batch_size: usize,
+        total_batches: usize,
+    },
+    /// A batch of extraction work has started running.
+    ExtractionBatchStart {
+        batch_index: usize,
+        total_batches: usize,
+        range_start: usize,
+        range_end: usize,
+        batch_chunks: usize,
+    },
     /// One original chunk processed (cache hit or LLM result).
     ChunkDone {
         done: usize,
@@ -34,6 +46,11 @@ pub enum ProgressEvent {
         llm_claims: usize,
         structural_claims: usize,
     },
+    /// NLI model finished loading — tribunal is now actively processing claims.
+    /// Fired once, between GroundingStart and the first GroundingProgress event.
+    GroundingModelReady,
+    /// One batch of claims grounded. Drives the real progress bar.
+    GroundingProgress { done: usize, total: usize },
     /// Grounding tribunal finished. `accepted` = claims that survived.
     GroundingDone { accepted: usize, rejected: usize },
     /// Fingerprint check finished. `cutoffs` = sources skipped by fingerprint match.
@@ -56,8 +73,12 @@ pub enum ProgressEvent {
         entities_indexed: usize,
         claims_indexed: usize,
     },
+    /// Incremental vector upsert progress.
+    VectorProgress { done: usize, total: usize },
     /// Artifact compilation finished.
     CompilationDone { artifacts: usize },
+    /// One artifact compiled. Drives the real progress bar.
+    CompilationProgress { done: usize, total: usize },
     /// Verification finished.
     VerificationDone { health: u8 },
 }
@@ -135,6 +156,17 @@ pub async fn run_pipeline(
 
     // ─── Early exit: nothing to process ────────────────────────────────
     if potentially_changed.is_empty() && deleted_sources.is_empty() {
+        // If the vector index is missing (e.g. previous run crashed before
+        // save), rebuild it now from the graph before returning.
+        if storage.vector.is_empty() {
+            tracing::info!("vector index empty on early-exit — rebuilding from graph");
+            let (ent_count, clm_count) =
+                update_vector_index_full_with_progress(&mut storage, &progress)?;
+            emit!(ProgressEvent::VectorUpdateDone {
+                entities_indexed: ent_count,
+                claims_indexed: clm_count,
+            });
+        }
         return Ok(PipelineResult {
             files_parsed,
             claims_count: 0,
@@ -208,17 +240,41 @@ pub async fn run_pipeline(
                 .with_known_entities(ctx_with_relations);
             if let Some(ref tx) = progress {
                 let tx_chunk = tx.clone();
-                let pf = Arc::new(move |done: usize, total: usize, uri: &str| {
-                    if done == 1 {
-                        let _ = tx_chunk.send(ProgressEvent::ExtractionStart {
-                            total_chunks: total,
-                        });
-                    }
-                    let _ = tx_chunk.send(ProgressEvent::ChunkDone {
-                        done,
-                        total,
-                        source_uri: uri.to_string(),
-                    });
+                let pf = Arc::new(move |event: thinkingroot_extract::ExtractionProgressEvent| {
+                    let progress_event = match event {
+                        thinkingroot_extract::ExtractionProgressEvent::Start {
+                            total_chunks,
+                            batch_size,
+                            total_batches,
+                        } => ProgressEvent::ExtractionStart {
+                            total_chunks,
+                            batch_size,
+                            total_batches,
+                        },
+                        thinkingroot_extract::ExtractionProgressEvent::BatchStart {
+                            batch_index,
+                            total_batches,
+                            range_start,
+                            range_end,
+                            batch_chunks,
+                        } => ProgressEvent::ExtractionBatchStart {
+                            batch_index,
+                            total_batches,
+                            range_start,
+                            range_end,
+                            batch_chunks,
+                        },
+                        thinkingroot_extract::ExtractionProgressEvent::ChunkDone {
+                            done,
+                            total,
+                            source_uri,
+                        } => ProgressEvent::ChunkDone {
+                            done,
+                            total,
+                            source_uri,
+                        },
+                    };
+                    let _ = tx_chunk.send(progress_event);
                 }) as thinkingroot_extract::ChunkProgressFn;
                 e.with_progress(pf)
             } else {
@@ -263,10 +319,9 @@ pub async fn run_pipeline(
     // the tribunal cannot overwrite auto-grounded structural scores. The
     // structural claims are merged back after the tribunal completes.
     //
-    // NliJudge::load() uses hf-hub's sync API (reqwest::blocking) which must
-    // NOT be called from within an async context — it creates a nested Tokio
-    // runtime that deadlocks the worker thread. We use spawn_blocking to move
-    // it onto a dedicated blocking thread.
+    // NLI model is embedded in the binary (no downloads). Pool creation is
+    // cheap (just RAM detection), but we still use spawn_blocking because
+    // ONNX session creation from memory is CPU-heavy.
 
     // Partition: structural claims get 0.99, LLM claims go to tribunal.
     let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction
@@ -295,36 +350,63 @@ pub async fn run_pipeline(
     // Run tribunal on LLM claims only.
     let grounded_llm_claims = if !llm_claims.is_empty() {
         #[cfg(feature = "vector")]
-        let mut nli_judge = {
+        let nli_pool = {
             let data_dir_clone = data_dir.clone();
-            match tokio::task::spawn_blocking(move || {
-                thinkingroot_ground::NliJudge::load(Some(&data_dir_clone))
+            let result = match tokio::task::spawn_blocking(move || {
+                thinkingroot_ground::NliJudgePool::load(Some(&data_dir_clone))
             })
             .await
             {
-                Ok(Ok(judge)) => Some(judge),
+                Ok(Ok(pool)) => {
+                    tracing::info!(
+                        "NLI pool ready: {} parallel workers",
+                        pool.num_workers
+                    );
+                    Some(pool)
+                }
                 Ok(Err(e)) => {
-                    tracing::warn!("NLI model (Judge 4) unavailable, using Judges 1-3 only: {e}");
+                    tracing::warn!("NLI pool unavailable, using Judges 1-3 only: {e}");
                     None
                 }
                 Err(e) => {
-                    tracing::warn!("NLI model load task failed: {e}, using Judges 1-3 only");
+                    tracing::warn!("NLI pool load task failed: {e}, using Judges 1-3 only");
                     None
                 }
-            }
+            };
+            // Signal the progress bar — model is loaded, tribunal is starting.
+            emit!(ProgressEvent::GroundingModelReady);
+            result
         };
 
         extraction.claims = llm_claims;
         let pre_count = extraction.claims.len();
-        let mut grounded =
-            thinkingroot_ground::Grounder::new(thinkingroot_ground::GroundingConfig::default())
-                .ground(
-                    extraction,
-                    #[cfg(feature = "vector")]
-                    Some(&mut storage.vector),
-                    #[cfg(feature = "vector")]
-                    nli_judge.as_mut(),
-                );
+        let grounder = {
+            let g = thinkingroot_ground::Grounder::new(
+                thinkingroot_ground::GroundingConfig::default(),
+            );
+            if let Some(ref tx) = progress {
+                let tx_ground = tx.clone();
+                let pf = Arc::new(move |done: usize, total: usize| {
+                    let _ = tx_ground
+                        .send(ProgressEvent::GroundingProgress { done, total });
+                }) as thinkingroot_ground::GroundingProgressFn;
+                g.with_progress(pf)
+            } else {
+                g
+            }
+        };
+        // block_in_place: grounder.ground() is a long synchronous CPU/ONNX operation.
+        // Telling tokio this thread will block lets it keep the spawned bar_driver task
+        // and other async work scheduled on the remaining threads.
+        let mut grounded = tokio::task::block_in_place(|| {
+            grounder.ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                Some(&mut storage.vector),
+                #[cfg(feature = "vector")]
+                nli_pool.as_ref(),
+            )
+        });
         thinkingroot_ground::dedup::dedup_claims(&mut grounded.claims);
         let post_count = grounded.claims.len();
         if pre_count != post_count {
@@ -353,6 +435,11 @@ pub async fn run_pipeline(
         accepted: post_grounding_total,
         rejected: pre_grounding_total.saturating_sub(post_grounding_total),
     });
+
+    // Phase 2c (SVO event extraction) is intentionally deferred to Phase 2c-post-link
+    // below.  It must run AFTER Phase 7 (Linker) so that entity names can be resolved
+    // to their real CozoDB ULIDs.  Running it here (before entities exist) would
+    // produce events with wrong / empty entity references, breaking the event calendar.
 
     // ─── Phase 3: Fingerprint check ────────────────────────────────────
     // For each potentially-changed doc, compute a fingerprint of its extracted
@@ -473,13 +560,26 @@ pub async fn run_pipeline(
             contradictions: 0
         });
 
-        let (ent_count, clm_count) = update_vector_index_full(&mut storage)?;
+        let (ent_count, clm_count) =
+            update_vector_index_full_with_progress(&mut storage, &progress)?;
         emit!(ProgressEvent::VectorUpdateDone {
             entities_indexed: ent_count,
             claims_indexed: clm_count,
         });
 
-        let compiler = thinkingroot_compile::Compiler::new(&config)?;
+        let compiler = {
+            let c = thinkingroot_compile::Compiler::new(&config)?;
+            if let Some(ref tx) = progress {
+                let tx_compile = tx.clone();
+                let pf = Arc::new(move |done: usize, total: usize| {
+                    let _ = tx_compile
+                        .send(ProgressEvent::CompilationProgress { done, total });
+                }) as thinkingroot_compile::CompileProgressFn;
+                c.with_progress(pf)
+            } else {
+                c
+            }
+        };
         let artifacts =
             compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
         emit!(ProgressEvent::CompilationDone {
@@ -550,6 +650,11 @@ pub async fn run_pipeline(
     let entities_count = filtered_extraction.entities.len();
     let relations_count = filtered_extraction.relations.len();
 
+    // Retain a lightweight clone of the filtered claims for Phase 2c-post-link
+    // (SVO event extraction).  We clone before the linker takes ownership so that
+    // the post-link phase has access to statements + event_date timestamps.
+    let claims_for_svo: Vec<thinkingroot_core::Claim> = filtered_extraction.claims.clone();
+
     // ─── Phase 7: Link ─────────────────────────────────────────────────
     let linker = {
         let l = thinkingroot_link::Linker::new(&storage.graph);
@@ -571,6 +676,49 @@ pub async fn run_pipeline(
         relations: link_output.relations_linked,
         contradictions: link_output.contradictions_detected,
     });
+
+    // ─── Phase 2c-post-link: SVO Event Calendar ──────────────────────────
+    // Now that Phase 7 has written all entities to CozoDB, we can build the
+    // complete entity_name → ULID map and extract SVO events with correct IDs.
+    //
+    // This is the world-class temporal memory architecture:
+    //   compile time  → events table populated with real entity ULIDs
+    //   query time    → 50µs Datalog range scan (vs Chronos 100-200ms)
+    //
+    // Non-fatal: event calendar failure must never abort the pipeline.
+    {
+        let entity_name_to_id: std::collections::HashMap<String, String> = storage
+            .graph
+            .get_all_entities()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, name, _)| (name.to_lowercase(), id))
+            .collect();
+
+        if entity_name_to_id.is_empty() {
+            tracing::warn!("event calendar: entity table empty after linking — skipping");
+        } else {
+            let extractor = thinkingroot_extract::EventExtractor::new();
+            let extracted_events =
+                extractor.extract_from_claims(&claims_for_svo, &entity_name_to_id);
+
+            if !extracted_events.is_empty() {
+                match storage.graph.insert_events(&extracted_events) {
+                    Ok(n) => tracing::info!(
+                        count = n,
+                        entities = entity_name_to_id.len(),
+                        "event calendar: SVO events compiled with correct entity IDs"
+                    ),
+                    Err(e) => tracing::warn!("event calendar: insertion failed (non-fatal): {e}"),
+                }
+            } else {
+                tracing::info!(
+                    "event calendar: no SVO events found in {} claims",
+                    claims_for_svo.len()
+                );
+            }
+        }
+    }
 
     // ─── Phase 8: Incremental entity relation update for new sources ───
     let mut new_triples: Vec<(String, String, String)> = Vec::new();
@@ -648,8 +796,8 @@ pub async fn run_pipeline(
             .collect();
         let new_claim_items: Vec<(String, String, String)> = all_claims
             .iter()
-            .filter(|(id, _, _, _, _)| added_claim_set.contains(id.as_str()))
-            .map(|(id, statement, ctype, conf, uri)| {
+            .filter(|(id, _, _, _, _, _)| added_claim_set.contains(id.as_str()))
+            .map(|(id, statement, ctype, conf, uri, _)| {
                 (
                     format!("claim:{id}"),
                     statement.clone(),
@@ -658,12 +806,28 @@ pub async fn run_pipeline(
             })
             .collect();
 
-        storage.vector.upsert_batch(&new_entity_items)?;
-        storage.vector.upsert_batch(&new_claim_items)?;
-        storage.vector.save()?;
-
         let ent_count = new_entity_items.len();
         let clm_count = new_claim_items.len();
+        let total_vec = ent_count + clm_count;
+
+        upsert_with_vector_progress(
+            &mut storage.vector,
+            &new_entity_items,
+            512,
+            0,
+            total_vec,
+            &progress,
+        )?;
+        upsert_with_vector_progress(
+            &mut storage.vector,
+            &new_claim_items,
+            512,
+            ent_count,
+            total_vec,
+            &progress,
+        )?;
+        storage.vector.save()?;
+
         tracing::info!(
             "vector index updated surgically: removed {}, added {} entities + {} claims",
             stale_ids.len(),
@@ -676,7 +840,8 @@ pub async fn run_pipeline(
         });
     } else {
         // Deletions occurred — full rebuild to correctly handle orphaned entries.
-        let (ent_count, clm_count) = update_vector_index_full(&mut storage)?;
+        let (ent_count, clm_count) =
+            update_vector_index_full_with_progress(&mut storage, &progress)?;
         emit!(ProgressEvent::VectorUpdateDone {
             entities_indexed: ent_count,
             claims_indexed: clm_count,
@@ -684,7 +849,19 @@ pub async fn run_pipeline(
     }
 
     // ─── Phase 10: Selective compilation ────────────────────────────────
-    let compiler = thinkingroot_compile::Compiler::new(&config)?;
+    let compiler = {
+        let c = thinkingroot_compile::Compiler::new(&config)?;
+        if let Some(ref tx) = progress {
+            let tx_compile = tx.clone();
+            let pf = Arc::new(move |done: usize, total: usize| {
+                let _ = tx_compile
+                    .send(ProgressEvent::CompilationProgress { done, total });
+            }) as thinkingroot_compile::CompileProgressFn;
+            c.with_progress(pf)
+        } else {
+            c
+        }
+    };
     let artifacts = compiler.compile_affected(
         &storage.graph,
         &data_dir,
@@ -721,7 +898,35 @@ pub async fn run_pipeline(
     })
 }
 
-fn update_vector_index_full(storage: &mut StorageEngine) -> Result<(usize, usize)> {
+/// Chunk `items` into batches of `chunk_size`, calling `upsert_batch` per chunk
+/// and emitting `VectorProgress` events.  `offset` is added to the running
+/// `done` counter so that entity and claim passes share a single progress bar.
+fn upsert_with_vector_progress(
+    vector: &mut thinkingroot_graph::vector::VectorStore,
+    items: &[(String, String, String)],
+    chunk_size: usize,
+    offset: usize,
+    total: usize,
+    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<usize> {
+    let mut done = 0usize;
+    for chunk in items.chunks(chunk_size) {
+        vector.upsert_batch(chunk)?;
+        done += chunk.len();
+        if let Some(tx) = progress {
+            let _ = tx.send(ProgressEvent::VectorProgress {
+                done: offset + done,
+                total,
+            });
+        }
+    }
+    Ok(done)
+}
+
+fn update_vector_index_full_with_progress(
+    storage: &mut StorageEngine,
+    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<(usize, usize)> {
     storage.vector.reset();
 
     let entities = storage.graph.get_all_entities()?;
@@ -738,11 +943,9 @@ fn update_vector_index_full(storage: &mut StorageEngine) -> Result<(usize, usize
         })
         .collect();
 
-    let entity_count = storage.vector.upsert_batch(&entity_items)?;
-
     let claim_items: Vec<(String, String, String)> = claims
         .iter()
-        .map(|(id, statement, ctype, conf, uri)| {
+        .map(|(id, statement, ctype, conf, uri, _)| {
             (
                 format!("claim:{id}"),
                 statement.clone(),
@@ -751,7 +954,18 @@ fn update_vector_index_full(storage: &mut StorageEngine) -> Result<(usize, usize
         })
         .collect();
 
-    let claim_count = storage.vector.upsert_batch(&claim_items)?;
+    let total = entity_items.len() + claim_items.len();
+
+    let entity_count =
+        upsert_with_vector_progress(&mut storage.vector, &entity_items, 512, 0, total, progress)?;
+    let claim_count = upsert_with_vector_progress(
+        &mut storage.vector,
+        &claim_items,
+        512,
+        entity_count,
+        total,
+        progress,
+    )?;
     storage.vector.save()?;
 
     Ok((entity_count, claim_count))

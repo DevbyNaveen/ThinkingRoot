@@ -22,6 +22,9 @@ pub struct CachedClaim {
     pub claim_type: String,
     pub confidence: f64,
     pub source_uri: String,
+    /// Unix epoch of when the event actually occurred (not ingestion time).
+    /// None when the LLM did not extract an explicit event date.
+    pub event_date: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +106,7 @@ pub(crate) struct RawGraphData {
     pub source_hashes: Vec<(String, String)>,             // (uri, content_hash)
     pub entities: Vec<(String, String, String)>,          // (id, canonical_name, entity_type)
     pub aliases: Vec<(String, String)>,                   // (entity_id, alias)
-    pub claims: Vec<(String, String, String, f64, String)>, // (id, stmt, type, conf, source_uri)
+    pub claims: Vec<(String, String, String, f64, String, f64)>, // (id, stmt, type, conf, source_uri, event_date)
     pub claim_entity_edges: Vec<(String, String)>,        // (claim_id, entity_id)
     pub relations: Vec<(String, String, String, String, String, f64)>, // (from_name, to_name, rel_type, from_type, to_type, strength)
     pub contradictions: Vec<(String, String, String, String, String)>, // (id, a, b, expl, status)
@@ -196,11 +199,13 @@ impl KnowledgeGraph {
             HashMap::with_capacity(claim_count);
         let mut claims_by_type: HashMap<String, Vec<String>> = HashMap::new();
 
-        for (id, statement, claim_type, confidence, source_uri) in raw.claims {
+        for (id, statement, claim_type, confidence, source_uri, event_date_raw) in raw.claims {
             claims_by_type
                 .entry(claim_type.clone())
                 .or_default()
                 .push(id.clone());
+            // 0.0 is the default sentinel stored in CozoDB — treat it as "no date".
+            let event_date = if event_date_raw != 0.0 { Some(event_date_raw) } else { None };
             claims_by_id.insert(
                 id.clone(),
                 CachedClaim {
@@ -209,6 +214,7 @@ impl KnowledgeGraph {
                     claim_type,
                     confidence,
                     source_uri,
+                    event_date,
                 },
             );
         }
@@ -310,6 +316,12 @@ impl KnowledgeGraph {
     /// O(1) lookup by entity ID.
     pub fn entity_by_id(&self, id: &str) -> Option<&CachedEntity> {
         self.entities_by_id.get(id)
+    }
+
+    /// O(1) lookup of canonical name by entity ID.
+    /// Used to resolve ULID entity IDs (from the events table) to human-readable names.
+    pub fn entity_name_by_id(&self, id: &str) -> Option<&str> {
+        self.entities_by_id.get(id).map(|e| e.canonical_name.as_str())
     }
 
     /// O(1) lookup by canonical name or alias (case-insensitive).

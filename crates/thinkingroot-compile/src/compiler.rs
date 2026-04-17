@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use tera::{Context, Tera};
 
@@ -9,10 +10,15 @@ use thinkingroot_graph::graph::GraphStore;
 
 use crate::templates;
 
+/// Callback fired after each artifact is compiled.
+/// Arguments: (done, total)
+pub type CompileProgressFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
 /// The Compiler reads the knowledge graph and produces compiled artifacts.
 pub struct Compiler {
     tera: Tera,
     output_dir: String,
+    progress: Option<CompileProgressFn>,
 }
 
 impl Compiler {
@@ -21,7 +27,15 @@ impl Compiler {
         Ok(Self {
             tera,
             output_dir: config.compilation.output_dir.clone(),
+            progress: None,
         })
+    }
+
+    /// Attach a progress callback. Called once per artifact compiled.
+    /// Arguments: (done, total)
+    pub fn with_progress(mut self, f: CompileProgressFn) -> Self {
+        self.progress = Some(f);
+        self
     }
 
     /// Compile all artifacts and write them to disk.
@@ -33,6 +47,10 @@ impl Compiler {
 
         // 1. Compile entity pages.
         let entities = graph.get_all_entities()?;
+        // Total = entity pages + 7 global artifacts.
+        let total = entities.len() + 7;
+        let mut done: usize = 0;
+
         let entities_dir = output_path.join("entities");
         std::fs::create_dir_all(&entities_dir).map_err(|e| Error::io_path(&entities_dir, e))?;
 
@@ -49,96 +67,60 @@ impl Compiler {
                     tracing::warn!("failed to compile entity page for {entity_name}: {e}");
                 }
             }
-        }
-
-        // 2. Compile architecture map.
-        match self.compile_architecture_map(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("architecture-map.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile architecture map: {e}");
+            done += 1;
+            if let Some(ref pf) = self.progress {
+                pf(done, total);
             }
         }
 
-        // 3. Compile contradiction report.
-        match self.compile_contradiction_report(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("contradiction-report.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
+        // 2–8. Global artifacts — one progress tick each.
+        for (label, result, filename) in [
+            (
+                "architecture map",
+                self.compile_architecture_map(graph),
+                "architecture-map.md",
+            ),
+            (
+                "contradiction report",
+                self.compile_contradiction_report(graph),
+                "contradiction-report.md",
+            ),
+            (
+                "decision log",
+                self.compile_decision_log(graph),
+                "decision-log.md",
+            ),
+            (
+                "task pack",
+                self.compile_task_pack(graph),
+                "task-pack.md",
+            ),
+            (
+                "agent brief",
+                self.compile_agent_brief(graph),
+                "agent-brief.md",
+            ),
+            ("runbook", self.compile_runbook(graph), "runbook.md"),
+            (
+                "health report",
+                self.compile_health_report(graph),
+                "health-report.md",
+            ),
+        ] {
+            match result {
+                Ok(artifact) => {
+                    let file_path = output_path.join(filename);
+                    std::fs::write(&file_path, &artifact.content)
+                        .map_err(|e| Error::io_path(&file_path, e))?;
+                    artifacts.push(artifact);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to compile {label}: {e}");
+                }
             }
-            Err(e) => {
-                tracing::warn!("failed to compile contradiction report: {e}");
-            }
-        }
-
-        // 4. Compile decision log.
-        match self.compile_decision_log(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("decision-log.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile decision log: {e}");
-            }
-        }
-
-        // 5. Compile task pack (agent context).
-        match self.compile_task_pack(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("task-pack.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile task pack: {e}");
-            }
-        }
-
-        // 6. Compile agent brief.
-        match self.compile_agent_brief(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("agent-brief.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile agent brief: {e}");
-            }
-        }
-
-        // 7. Compile runbook.
-        match self.compile_runbook(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("runbook.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile runbook: {e}");
-            }
-        }
-
-        // 8. Compile health report.
-        match self.compile_health_report(graph) {
-            Ok(artifact) => {
-                let file_path = output_path.join("health-report.md");
-                std::fs::write(&file_path, &artifact.content)
-                    .map_err(|e| Error::io_path(&file_path, e))?;
-                artifacts.push(artifact);
-            }
-            Err(e) => {
-                tracing::warn!("failed to compile health report: {e}");
+            done += 1;
+            if let Some(ref pf) = self.progress {
+                pf(done, total);
             }
         }
 
@@ -167,6 +149,12 @@ impl Compiler {
 
         let mut artifacts = Vec::new();
 
+        // Pre-compute total so we can fire accurate progress events.
+        let global_count = if has_changes { 7usize } else { 0 };
+        let entity_count = affected_entity_ids.len();
+        let total = entity_count + global_count;
+        let mut done: usize = 0;
+
         // 1. Compile entity pages only for affected entities.
         if !affected_entity_ids.is_empty() {
             let entities_dir = output_path.join("entities");
@@ -191,6 +179,10 @@ impl Compiler {
                     Err(e) => {
                         tracing::warn!("failed to compile entity page for {entity_name}: {e}");
                     }
+                }
+                done += 1;
+                if let Some(ref pf) = self.progress {
+                    pf(done, total);
                 }
             }
         }
@@ -219,6 +211,10 @@ impl Compiler {
                     Err(e) => {
                         tracing::warn!("failed to compile {filename}: {e}");
                     }
+                }
+                done += 1;
+                if let Some(ref pf) = self.progress {
+                    pf(done, total);
                 }
             }
         }
@@ -513,9 +509,9 @@ impl Compiler {
         // High-confidence claims (>= 0.85).
         let high_conf: Vec<serde_json::Value> = all_claims
             .iter()
-            .filter(|(_, _, _, conf, _)| *conf >= 0.85)
+            .filter(|(_, _, _, conf, _, _)| *conf >= 0.85)
             .take(50) // cap to keep brief concise
-            .map(|(_, statement, ctype, conf, uri)| {
+            .map(|(_, statement, ctype, conf, uri, _)| {
                 serde_json::json!({
                     "statement": statement,
                     "claim_type": ctype,

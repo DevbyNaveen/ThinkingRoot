@@ -270,6 +270,7 @@ mod tests {
             grounding_score: None,
             grounding_method: None,
             extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
+            event_date: None,
         };
         graph.insert_claim(&claim).unwrap();
 

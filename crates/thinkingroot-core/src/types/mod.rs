@@ -1,6 +1,7 @@
 mod artifact;
 mod branch;
 mod claim;
+mod event;
 mod contradiction;
 mod diff;
 mod entity;
@@ -11,6 +12,7 @@ mod workspace;
 pub use artifact::*;
 pub use branch::*;
 pub use claim::*;
+pub use event::*;
 pub use contradiction::*;
 pub use diff::*;
 pub use entity::*;

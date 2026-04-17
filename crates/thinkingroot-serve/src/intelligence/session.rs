@@ -35,6 +35,8 @@ pub struct SessionContext {
     pub active_branch: Option<String>,
     /// Remaining token budget for the current tool call.
     pub token_budget: usize,
+    /// Number of contribute calls made in this session (used as turn number for turn calendar).
+    pub turn_count: u64,
     created_at: Instant,
     last_active: Instant,
 }
@@ -50,6 +52,7 @@ impl SessionContext {
             focus_entity: None,
             active_branch: None,
             token_budget: DEFAULT_TOKEN_BUDGET,
+            turn_count: 0,
             created_at: now,
             last_active: now,
         }

@@ -24,6 +24,11 @@ pub struct Claim {
     pub grounding_score: Option<f64>,
     pub grounding_method: Option<GroundingMethod>,
     pub extraction_tier: ExtractionTier,
+    /// When the event described by this claim actually occurred.
+    /// Distinct from `valid_from` (ingestion timestamp) and `created_at`.
+    /// Example: "I graduated in 2018" ingested in 2025 → event_date=2018-05-01, valid_from=2025.
+    /// Used by the event calendar (SVO extractor) for accurate temporal reasoning.
+    pub event_date: Option<DateTime<Utc>>,
 }
 
 impl Claim {
@@ -51,6 +56,7 @@ impl Claim {
             grounding_score: None,
             grounding_method: None,
             extraction_tier: ExtractionTier::default(),
+            event_date: None,
         }
     }
 
@@ -80,6 +86,11 @@ impl Claim {
         self
     }
 
+    pub fn with_event_date(mut self, date: DateTime<Utc>) -> Self {
+        self.event_date = Some(date);
+        self
+    }
+
     /// Mark this claim as superseded by another.
     pub fn supersede(&mut self, by: ClaimId) {
         self.superseded_by = Some(by);
@@ -105,6 +116,8 @@ pub enum ClaimType {
     Dependency,
     ApiSignature,
     Architecture,
+    /// Implicit user preferences: food/drink likes, habits, communication style, scheduling.
+    Preference,
 }
 
 /// Confidence score clamped to [0.0, 1.0].

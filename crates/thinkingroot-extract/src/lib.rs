@@ -12,5 +12,5 @@ pub mod schema;
 pub mod structural;
 
 pub use events::EventExtractor;
-pub use extractor::{ChunkProgressFn, ExtractionOutput, Extractor};
+pub use extractor::{ChunkProgressFn, ExtractionOutput, ExtractionProgressEvent, Extractor};
 pub use graph_context::{GraphPrimedContext, KnownEntity, KnownRelation};

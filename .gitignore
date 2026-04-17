@@ -64,6 +64,8 @@ node_modules/
 
 # Internal AI tooling — not for public repo
 .claude/
+.superpowers/
+.research/
 CLAUDE.md
 AGENTS.md
 
@@ -73,6 +75,15 @@ docs/
 # Local UI/Branding experiments (not for repo)
 logo_concepts.html
 crates/thinkingroot-serve/src/graph.html
+crates/thinkingroot-serve/src/galaxy.html
+
+# NLI model binaries — too large for git, use Git LFS or download separately
+crates/thinkingroot-ground/models/
+
+# Local dev artifacts
+generate_chart.py
+latency_chart.png
+benchmarks/latency_chart.png
 
 # IDE Polishing
 .vscode/
@@ -84,3 +95,7 @@ crates/thinkingroot-serve/src/graph.html
 pkg/
 target/wasm32-unknown-unknown/
 *.lcov
+
+# Benchmarks & Evaluation
+longmemeval-workspace/
+longmemeval-data/

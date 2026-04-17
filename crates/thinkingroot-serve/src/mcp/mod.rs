@@ -5,6 +5,7 @@ pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -76,6 +77,83 @@ pub fn server_info(requested_version: Option<&str>) -> Value {
     })
 }
 
+/// If the workspace config has `streams.auto_session_branch = true` and the
+/// session does not yet have an active branch, create a `stream/{session_id}`
+/// branch so agent-contributed claims are isolated from main.
+///
+/// All failures are non-fatal — they emit a warning and let the tool call proceed.
+async fn maybe_auto_create_branch(
+    params: &Value,
+    engine: &crate::engine::QueryEngine,
+    default_workspace: Option<&str>,
+    session_id: &str,
+    sessions: &crate::intelligence::session::SessionStore,
+) {
+    // ── 1. Resolve workspace ──────────────────────────────────────────────────
+    let ws = match params
+        .get("arguments")
+        .and_then(|a| a.get("workspace"))
+        .and_then(|v| v.as_str())
+        .or(default_workspace)
+    {
+        Some(w) => w.to_string(),
+        None => return,
+    };
+
+    // ── 2. Skip if session already has a branch ───────────────────────────────
+    {
+        let store = sessions.lock().await;
+        if store
+            .get(session_id)
+            .and_then(|s| s.active_branch.as_deref())
+            .is_some()
+        {
+            return;
+        }
+    }
+
+    // ── 3. Check config ───────────────────────────────────────────────────────
+    let streams_cfg = match engine.workspace_streams_config(&ws) {
+        Some(c) => c,
+        None => return,
+    };
+    if !streams_cfg.auto_session_branch {
+        return;
+    }
+
+    // ── 4. Get workspace root path ────────────────────────────────────────────
+    let root = match engine.workspace_root_path(&ws) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // ── 5. Create the stream branch (idempotent — ignore "already exists") ────
+    let branch_name = format!("stream/{session_id}");
+    match thinkingroot_branch::create_branch(&root, &branch_name, "main", None).await {
+        Ok(_) => {
+            tracing::info!(
+                session_id,
+                branch = %branch_name,
+                "auto session branch created"
+            );
+        }
+        Err(e) => {
+            // Branch may already exist from a reconnected session — not an error.
+            tracing::debug!(
+                session_id,
+                branch = %branch_name,
+                "create_branch returned (may already exist): {e}"
+            );
+        }
+    }
+
+    // ── 6. Set the branch on the session ─────────────────────────────────────
+    let mut store = sessions.lock().await;
+    if let Some(session) = store.get_mut(session_id) {
+        session.set_branch(branch_name);
+    }
+}
+
 pub async fn dispatch(
     request: &JsonRpcRequest,
     engine: &crate::engine::QueryEngine,
@@ -96,6 +174,14 @@ pub async fn dispatch(
         }
         "tools/list" => tools::handle_list(id).await,
         "tools/call" => {
+            maybe_auto_create_branch(
+                &request.params,
+                engine,
+                default_workspace,
+                session_id,
+                sessions,
+            )
+            .await;
             tools::handle_call(
                 id,
                 &request.params,

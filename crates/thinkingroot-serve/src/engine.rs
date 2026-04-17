@@ -50,6 +50,19 @@ pub struct ClaimInfo {
     pub claim_type: String,
     pub confidence: f64,
     pub source_uri: String,
+    /// Unix epoch of the actual event date, or None if not extracted.
+    pub event_date: Option<f64>,
+}
+
+/// An SVO event with entity names resolved from the in-memory KG cache.
+/// This is what ReAct uses — entity IDs (ULIDs) would be useless to an LLM.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventHit {
+    pub id: String,
+    pub subject_name: String,
+    pub verb: String,
+    pub object_name: String,
+    pub normalized_date: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +70,31 @@ pub struct RelationInfo {
     pub target: String,
     pub relation_type: String,
     pub strength: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GalaxyNode {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub claim_count: usize,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GalaxyLink {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GalaxyMap {
+    pub nodes: Vec<GalaxyNode>,
+    pub links: Vec<GalaxyLink>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +173,8 @@ struct WorkspaceHandle {
     /// take an exclusive write lock to reload after mutating CozoDB.
     cache: Arc<RwLock<KnowledgeGraph>>,
     config: Config,
+    /// LLM client for ReAct synthesis — None if provider is not configured.
+    llm: Option<Arc<thinkingroot_extract::llm::LlmClient>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +271,16 @@ impl QueryEngine {
         let config = Config::load_merged(&root_path)?;
         let storage = StorageEngine::init(&data_dir).await?;
         let cache = KnowledgeGraph::load_from_graph(&storage.graph)?;
+        let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
+            Ok(client) => {
+                tracing::debug!("LLM client initialised for workspace '{name}'");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                tracing::debug!("LLM not configured for workspace '{name}' (non-fatal): {e}");
+                None
+            }
+        };
 
         self.workspaces.insert(
             name.clone(),
@@ -240,6 +290,7 @@ impl QueryEngine {
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
+                llm,
             },
         );
 
@@ -274,6 +325,10 @@ impl QueryEngine {
         let config = Config::load_merged(&root_path).unwrap_or_default();
         let storage = StorageEngine::init(&data_dir).await?;
         let cache = KnowledgeGraph::load_from_graph(&storage.graph)?;
+        let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
+            Ok(client) => Some(Arc::new(client)),
+            Err(_) => None,
+        };
 
         self.workspaces.insert(
             name.clone(),
@@ -283,6 +338,7 @@ impl QueryEngine {
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
+                llm,
             },
         );
 
@@ -400,6 +456,17 @@ impl QueryEngine {
                 .map(cached_claim_to_info)
                 .collect();
 
+            // Sort newest-first: most recent event_date wins over older claims.
+            // This ensures knowledge-update answers reflect the current state, not
+            // the first time something was mentioned.  Claims without event_date
+            // (event_date = None) sort to the end (treated as oldest).
+            claims.sort_by(|a, b| {
+                b.event_date
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.event_date.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
             apply_pagination(&mut claims, filter.offset, filter.limit);
             return Ok(claims);
         }
@@ -456,6 +523,62 @@ impl QueryEngine {
                 )
             })
             .collect())
+    }
+
+    /// Retrieve the entire knowledge base mapped out into a highly compact
+    /// 3D topology format (`GalaxyMap`).
+    /// Combines the 2D projection from `VectorStore` (Semantic axes)
+    /// with the cache's claim_count mapping (Epistemic Z-axis).
+    /// Used by the high-performance WebGL galaxy viewer.
+    pub async fn get_galaxy_map(&self, ws: &str) -> Result<GalaxyMap> {
+        let handle = self.get_workspace(ws)?;
+        
+        let coords_2d = {
+            let storage = handle.storage.lock().await;
+            storage.vector.project_to_2d()
+        };
+
+        let cache = handle.cache.read().await;
+
+        let mut nodes = Vec::with_capacity(cache.entity_count());
+        for id in cache.entities_ordered() {
+            if let Some(e) = cache.entity_by_id(id) {
+                // VectorStore keys are prefixed with "entity:"
+                let vec_key = format!("entity:{}", e.id);
+                let (x, y) = coords_2d.get(&vec_key).copied().unwrap_or((0.0, 0.0));
+                let claim_count = cache.entity_claim_count(&e.id);
+                // Z-axis: Density of Truth. Logarithmic scaling so outliers don't break the map.
+                let z = (claim_count as f32 + 1.0).ln() * 50.0;
+                let created_at = e.id.parse::<thinkingroot_core::types::EntityId>()
+                    .map(|id| id.timestamp_ms())
+                    .unwrap_or(0);
+
+                nodes.push(GalaxyNode {
+                    id: e.id.to_string(),
+                    name: e.canonical_name.clone(),
+                    entity_type: e.entity_type.clone(),
+                    claim_count,
+                    x,
+                    y,
+                    z,
+                    created_at,
+                });
+            }
+        }
+
+        let mut links = Vec::new();
+        for r in cache.all_relations() {
+            // Re-map name back to ID for the links because frontend graphs prefer ID-based links
+            if let (Some(src), Some(tgt)) = (cache.find_entity_by_name(&r.from_name), cache.find_entity_by_name(&r.to_name)) {
+                links.push(GalaxyLink {
+                    source: src.id.clone(),
+                    target: tgt.id.clone(),
+                    relation_type: r.relation_type.clone(),
+                });
+            }
+        }
+
+        Ok(GalaxyMap { nodes, links })
     }
 
     /// List all known artifact types and whether each is available on disk.
@@ -739,6 +862,112 @@ impl QueryEngine {
         })
     }
 
+    /// Source-scoped search: same as `search` but restricts claim results to
+    /// those whose source URI contains one of the `allowed_source_ids` substrings.
+    ///
+    /// Used for multi-user graphs where each query must be isolated to a specific
+    /// user's sessions. Entities are always included (user-agnostic structural nodes).
+    pub async fn search_scoped(
+        &self,
+        ws: &str,
+        query: &str,
+        top_k: usize,
+        allowed_source_ids: &HashSet<String>,
+    ) -> Result<SearchResult> {
+        let handle = self.get_workspace(ws)?;
+
+        // Phase 1: Scoped vector search.
+        // Empty allowed_source_ids means "no session scope" — treat as unscoped (all sources).
+        let scope = if allowed_source_ids.is_empty() {
+            None
+        } else {
+            Some(allowed_source_ids)
+        };
+        let vector_results = {
+            let mut storage = handle.storage.lock().await;
+            storage.vector.search_scoped(query, top_k * 3, scope)?
+        };
+
+        let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
+        let mut claim_hits: Vec<ClaimSearchHit> = Vec::new();
+        let mut seen_entity_ids: HashSet<String> = HashSet::new();
+        let mut seen_claim_ids: HashSet<String> = HashSet::new();
+
+        {
+            let cache = handle.cache.read().await;
+            for (key, _metadata, score) in &vector_results {
+                if *score < 0.1 {
+                    continue;
+                }
+                if let Some(bare_id) = key.strip_prefix("entity:")
+                    && let Some(e) = cache.entity_by_id(bare_id)
+                    && seen_entity_ids.insert(e.id.clone())
+                {
+                    entity_hits.push(EntitySearchHit {
+                        id: e.id.clone(),
+                        name: e.canonical_name.clone(),
+                        entity_type: e.entity_type.clone(),
+                        claim_count: cache.entity_claim_count(&e.id),
+                        relevance: *score,
+                    });
+                    continue;
+                }
+                if let Some(bare_id) = key.strip_prefix("claim:")
+                    && let Some(c) = cache.claim_by_id(bare_id)
+                    && seen_claim_ids.insert(c.id.clone())
+                {
+                    // Double-check source scope at claim level (defense in depth).
+                    // Empty allowed_sources = unscoped — accept all claims.
+                    let in_scope = allowed_source_ids.is_empty()
+                        || allowed_source_ids
+                            .iter()
+                            .any(|sid| c.source_uri.contains(sid.as_str()));
+                    if in_scope {
+                        claim_hits.push(ClaimSearchHit {
+                            id: c.id.clone(),
+                            statement: c.statement.clone(),
+                            claim_type: c.claim_type.clone(),
+                            confidence: c.confidence,
+                            source_uri: c.source_uri.clone(),
+                            relevance: *score,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Keyword fallback scoped to allowed sources.
+        if claim_hits.len() < top_k {
+            let kw_claims = {
+                let storage = handle.storage.lock().await;
+                storage.graph.search_claims(query)?
+            };
+            let cache = handle.cache.read().await;
+            for (cid, stmt, ctype, conf, uri) in kw_claims {
+                let in_scope = allowed_source_ids
+                    .iter()
+                    .any(|sid| uri.contains(sid.as_str()));
+                if in_scope && seen_claim_ids.insert(cid.clone()) {
+                    claim_hits.push(ClaimSearchHit {
+                        id: cid,
+                        statement: stmt,
+                        claim_type: ctype,
+                        confidence: conf,
+                        source_uri: uri,
+                        relevance: 0.5,
+                    });
+                }
+            }
+        }
+
+        entity_hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        claim_hits.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        entity_hits.truncate(top_k);
+        claim_hits.truncate(top_k);
+
+        Ok(SearchResult { entities: entity_hits, claims: claim_hits })
+    }
+
     /// List tracked contradictions in the workspace.
     /// Served from in-memory cache.
     pub async fn list_contradictions(&self, ws: &str) -> Result<Vec<ContradictionInfo>> {
@@ -811,6 +1040,320 @@ impl QueryEngine {
         storage.graph.get_entity_context(entity_name)
     }
 
+    // ── Branch-aware read wrappers ────────────────────────────────────────────
+    // These accept an optional branch name.  For now they delegate to the
+    // main-only methods; Gap 3 (Item 5) fills in union search for branch+main.
+
+    pub async fn search_branched(
+        &self,
+        ws: &str,
+        query: &str,
+        top_k: usize,
+        branch: Option<&str>,
+    ) -> Result<SearchResult> {
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_graph::graph::GraphStore;
+
+        // Fast path: no branch → main-only search.
+        let branch_name = match branch {
+            Some(b) => b,
+            None => return self.search(ws, query, top_k).await,
+        };
+
+        let handle = self.get_workspace(ws)?;
+        let branch_data_dir = resolve_data_dir(&handle.root_path, Some(branch_name));
+
+        // ── 1. Search branch vector index ─────────────────────────────────────
+        let branch_vector_hits: Vec<(String, String, f32)> = if branch_data_dir.exists() {
+            match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
+                Ok(mut bv) => bv.search(query, top_k * 2).unwrap_or_default(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        };
+
+        let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
+        let mut claim_hits: Vec<ClaimSearchHit> = Vec::new();
+        let mut seen_entity_ids: HashSet<String> = HashSet::new();
+        let mut seen_claim_ids: HashSet<String> = HashSet::new();
+
+        // ── 2. Resolve branch hits (branch priority — more recent than main) ──
+        if !branch_vector_hits.is_empty() {
+            // Open branch graph only if needed for point-lookups on branch-only items.
+            let branch_graph = if branch_data_dir.exists() {
+                GraphStore::init(&branch_data_dir.join("graph")).ok()
+            } else {
+                None
+            };
+            let cache = handle.cache.read().await;
+
+            for (key, _meta, score) in &branch_vector_hits {
+                if *score < 0.1 {
+                    continue;
+                }
+
+                if let Some(bare_id) = key.strip_prefix("entity:") {
+                    if !seen_entity_ids.insert(bare_id.to_string()) {
+                        continue;
+                    }
+                    // Try main cache first (branch inherits from main at creation).
+                    if let Some(e) = cache.entity_by_id(bare_id) {
+                        entity_hits.push(EntitySearchHit {
+                            id: e.id.clone(),
+                            name: e.canonical_name.clone(),
+                            entity_type: e.entity_type.clone(),
+                            claim_count: cache.entity_claim_count(&e.id),
+                            relevance: *score,
+                        });
+                    } else if let Some(ref bg) = branch_graph {
+                        // Branch-only entity — resolve via branch graph point-lookup.
+                        if let Ok(Some((name, etype, _desc))) = bg.get_entity_by_id(bare_id) {
+                            entity_hits.push(EntitySearchHit {
+                                id: bare_id.to_string(),
+                                name,
+                                entity_type: etype,
+                                claim_count: 0,
+                                relevance: *score,
+                            });
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(bare_id) = key.strip_prefix("claim:") {
+                    if !seen_claim_ids.insert(bare_id.to_string()) {
+                        continue;
+                    }
+                    // Try main cache first.
+                    if let Some(c) = cache.claim_by_id(bare_id) {
+                        claim_hits.push(ClaimSearchHit {
+                            id: c.id.clone(),
+                            statement: c.statement.clone(),
+                            claim_type: c.claim_type.clone(),
+                            confidence: c.confidence,
+                            source_uri: c.source_uri.clone(),
+                            relevance: *score,
+                        });
+                    } else if let Some(ref bg) = branch_graph {
+                        // Branch-only claim — resolve via branch graph point-lookup.
+                        if let Ok(Some((stmt, ctype, conf, uri))) =
+                            bg.get_claim_with_source(bare_id)
+                        {
+                            claim_hits.push(ClaimSearchHit {
+                                id: bare_id.to_string(),
+                                statement: stmt,
+                                claim_type: ctype,
+                                confidence: conf,
+                                source_uri: uri,
+                                relevance: *score,
+                            });
+                        }
+                    }
+                }
+            }
+            // cache read lock drops here
+        }
+
+        // ── 3. Append main results (deduplicated against branch hits) ─────────
+        let main_result = self.search(ws, query, top_k).await?;
+        for hit in main_result.entities {
+            if seen_entity_ids.insert(hit.id.clone()) {
+                entity_hits.push(hit);
+            }
+        }
+        for hit in main_result.claims {
+            if seen_claim_ids.insert(hit.id.clone()) {
+                claim_hits.push(hit);
+            }
+        }
+
+        // ── 4. Sort by descending relevance and truncate ──────────────────────
+        entity_hits.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        claim_hits.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entity_hits.truncate(top_k);
+        claim_hits.truncate(top_k);
+
+        Ok(SearchResult {
+            entities: entity_hits,
+            claims: claim_hits,
+        })
+    }
+
+    pub async fn list_claims_branched(
+        &self,
+        ws: &str,
+        filter: ClaimFilter,
+        _branch: Option<&str>,
+    ) -> Result<Vec<ClaimInfo>> {
+        self.list_claims(ws, filter).await
+    }
+
+    pub async fn get_relations_branched(
+        &self,
+        ws: &str,
+        entity: &str,
+        _branch: Option<&str>,
+    ) -> Result<Vec<RelationInfo>> {
+        self.get_relations(ws, entity).await
+    }
+
+    pub async fn get_workspace_brief_branched(
+        &self,
+        ws: &str,
+        _branch: Option<&str>,
+    ) -> Result<WorkspaceSummary> {
+        self.get_workspace_brief(ws).await
+    }
+
+    pub async fn get_entity_context_branched(
+        &self,
+        ws: &str,
+        entity_name: &str,
+        _branch: Option<&str>,
+    ) -> Result<Option<thinkingroot_graph::graph::EntityContext>> {
+        self.get_entity_context(ws, entity_name).await
+    }
+
+    /// Route a query to the Fast or Agentic path based on query classification.
+    ///
+    /// - Fast path (80% of queries): vector search + in-memory cache, sub-5ms.
+    /// - Agentic path (20% of queries): ReAct loop, 200ms-2s.
+    ///
+    /// This is the primary entry point for the `search` MCP tool when used
+    /// with session context.
+    pub async fn search_with_routing(
+        &self,
+        ws: &str,
+        query: &str,
+        top_k: usize,
+        session: &crate::intelligence::session::SessionContext,
+    ) -> Result<String> {
+        use crate::intelligence::react::ReActEngine;
+        use crate::intelligence::router::{classify_query, QueryPath};
+
+        const FAST_SYNTHESIS_PROMPT: &str = "\
+You are a precise personal memory assistant. \
+You are given retrieved memory notes and a question. \
+Answer the question using ONLY the information in the notes. \
+Rules: \
+(1) Be concise and specific — answer in 1-3 sentences max. \
+(2) If multiple claims contradict each other, trust the one with the HIGHER confidence score or the more recent date shown in [brackets]. \
+(3) For yes/no questions answer 'Yes' or 'No' followed by a brief explanation. \
+(4) For counting questions, count only the items explicitly mentioned in the notes. \
+(5) If the answer is genuinely not in the notes, respond with exactly: \
+\"I don't have enough information to answer that.\"";
+
+        match classify_query(query, session) {
+            QueryPath::Fast => {
+                use crate::intelligence::reranker::Reranker;
+                let mut result = self
+                    .search_branched(ws, query, top_k, session.active_branch.as_deref())
+                    .await?;
+                // BM25 reranking: blends vector score with term-overlap score.
+                let reranker = Reranker::new(query);
+                reranker.rerank_claims(&mut result.claims);
+                reranker.rerank_entities(&mut result.entities);
+
+                // LLM synthesis: produce a natural-language answer rather than raw JSON.
+                // The LongMemEval judge (and real-world callers) expect text, not structs.
+                // Falls back to JSON serialization if no LLM is available.
+                let llm = self.workspace_llm(ws);
+                if let Some(ref llm_client) = llm {
+                    let mut notes = String::new();
+                    for hit in result.entities.iter().take(5) {
+                        notes.push_str(&format!("Entity: {} ({})\n", hit.name, hit.entity_type));
+                    }
+                    for hit in result.claims.iter().take(15) {
+                        notes.push_str(&format!(
+                            "Claim [{:.2}]: {}\n",
+                            hit.relevance, hit.statement
+                        ));
+                    }
+                    if notes.is_empty() {
+                        notes.push_str("No relevant memory found.\n");
+                    }
+                    let user_msg = format!(
+                        "## Retrieved Memory Notes\n\n{notes}\n\n## Question\n\n{query}"
+                    );
+                    if let Ok(answer) = llm_client.chat(FAST_SYNTHESIS_PROMPT, &user_msg).await {
+                        return Ok(answer);
+                    }
+                }
+
+                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+            }
+            QueryPath::Agentic => {
+                let llm = self.workspace_llm(ws);
+                // Fetch the temporal anchor: the max event_date in the knowledge base.
+                // This anchors relative queries ("last month", "3 months ago") to the
+                // most recent session date rather than compile/query wall-clock time.
+                let temporal_anchor: Option<f64> = {
+                    let handle = self.get_workspace(ws).ok();
+                    if let Some(h) = handle {
+                        let storage = h.storage.lock().await;
+                        storage.graph.get_max_event_timestamp().ok().flatten()
+                    } else {
+                        None
+                    }
+                };
+                let react = ReActEngine::new(self, ws, llm);
+                let result = react.run_with_anchor(query, session, temporal_anchor).await;
+                Ok(result.answer)
+            }
+        }
+    }
+
+    /// Query SVO events whose timestamp falls in [start_ts, end_ts].
+    /// Returns EventHit with entity names resolved from the KG cache so that
+    /// LLM synthesis receives human-readable text, not ULID strings.
+    pub async fn query_events_in_range(
+        &self,
+        ws: &str,
+        start_ts: f64,
+        end_ts: f64,
+    ) -> Result<Vec<EventHit>> {
+        let handle = self.get_workspace(ws)?;
+        let raw_events = {
+            let storage = handle.storage.lock().await;
+            storage.graph.query_events_in_range(start_ts, end_ts)?
+        };
+        // Resolve entity IDs → names from the in-memory cache (no extra CozoDB round-trip).
+        let cache = handle.cache.read().await;
+        Ok(raw_events
+            .into_iter()
+            .map(|ev| {
+                let subject_name = cache
+                    .entity_name_by_id(&ev.subject_entity_id)
+                    .unwrap_or(&ev.subject_entity_id)
+                    .to_string();
+                let object_name = if ev.object_entity_id.is_empty() {
+                    String::new()
+                } else {
+                    cache
+                        .entity_name_by_id(&ev.object_entity_id)
+                        .unwrap_or(&ev.object_entity_id)
+                        .to_string()
+                };
+                EventHit {
+                    id: ev.id,
+                    subject_name,
+                    verb: ev.verb,
+                    object_name,
+                    normalized_date: ev.normalized_date,
+                }
+            })
+            .collect())
+    }
+
     /// Write agent-inferred claims directly into the graph, bypassing parse→extract.
     ///
     /// Claims are tagged `ExtractionTier::AgentInferred` and `TrustLevel::Untrusted`.
@@ -825,6 +1368,7 @@ impl QueryEngine {
         session_id: &str,
         branch: Option<&str>,
         agent_claims: Vec<AgentClaim>,
+        sessions: &crate::intelligence::session::SessionStore,
     ) -> Result<ContributeResult> {
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_core::types::{ContentHash, SourceType, TrustLevel};
@@ -860,6 +1404,37 @@ impl QueryEngine {
                 .map_err(|e| Error::GraphStorage(format!("branch graph init failed: {e}")))?;
             let (accepted_ids, warnings) =
                 Self::write_agent_claims_to_graph(&graph, &source, &agent_claims)?;
+
+            // Upsert accepted claims into the branch vector index so they are
+            // searchable in the branch without a full recompile.
+            if !accepted_ids.is_empty() {
+                match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
+                    Ok(mut branch_vector) => {
+                        let items: Vec<(String, String, String)> = agent_claims
+                            .iter()
+                            .zip(accepted_ids.iter())
+                            .map(|(ac, id)| {
+                                let ctype = &ac.claim_type;
+                                let conf = ac.confidence.unwrap_or(0.7);
+                                (
+                                    format!("claim:{id}"),
+                                    ac.statement.clone(),
+                                    format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                                )
+                            })
+                            .collect();
+                        if let Err(e) = branch_vector.upsert_batch(&items) {
+                            tracing::warn!("branch vector upsert failed (non-fatal): {e}");
+                        } else if let Err(e) = branch_vector.save() {
+                            tracing::warn!("branch vector save failed (non-fatal): {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("branch vector init failed (non-fatal): {e}");
+                    }
+                }
+            }
+
             return Ok(ContributeResult {
                 accepted_count: accepted_ids.len(),
                 accepted_ids,
@@ -885,6 +1460,22 @@ impl QueryEngine {
                 Err(e) => {
                     tracing::warn!("cache reload after contribute failed (non-fatal): {e}");
                 }
+            }
+        }
+
+        // ── Turn calendar: record which claims were contributed this turn ────
+        if !accepted_ids.is_empty() {
+            let turn_number = {
+                let mut store = sessions.lock().await;
+                let session = store.entry(session_id.to_string()).or_insert_with(|| {
+                    crate::intelligence::session::SessionContext::new(session_id, ws)
+                });
+                session.turn_count += 1;
+                session.turn_count
+            };
+            let storage = handle.storage.lock().await;
+            if let Err(e) = storage.graph.record_turn(session_id, turn_number, &accepted_ids) {
+                tracing::warn!("turn calendar record failed (non-fatal): {e}");
             }
         }
 
@@ -949,6 +1540,27 @@ impl QueryEngine {
             .get(name)
             .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))
     }
+
+    /// Return the LLM client for a workspace, if one was successfully initialised.
+    pub fn workspace_llm(
+        &self,
+        ws: &str,
+    ) -> Option<Arc<thinkingroot_extract::llm::LlmClient>> {
+        self.workspaces.get(ws).and_then(|h| h.llm.clone())
+    }
+
+    /// Return the `StreamsConfig` for a workspace (controls auto_session_branch, etc.).
+    pub fn workspace_streams_config(
+        &self,
+        ws: &str,
+    ) -> Option<thinkingroot_core::config::StreamsConfig> {
+        self.workspaces.get(ws).map(|h| h.config.streams.clone())
+    }
+
+    /// Return the filesystem root path of a mounted workspace.
+    pub fn workspace_root_path(&self, ws: &str) -> Option<PathBuf> {
+        self.workspaces.get(ws).map(|h| h.root_path.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1616,7 @@ fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
         "dependency" => ClaimType::Dependency,
         "api_signature" | "apisignature" => ClaimType::ApiSignature,
         "architecture" => ClaimType::Architecture,
+        "preference" => ClaimType::Preference,
         _ => ClaimType::Fact,
     }
 }
@@ -1019,5 +1632,6 @@ fn cached_claim_to_info(c: &CachedClaim) -> ClaimInfo {
         claim_type: c.claim_type.clone(),
         confidence: c.confidence,
         source_uri: c.source_uri.clone(),
+        event_date: c.event_date,
     }
 }

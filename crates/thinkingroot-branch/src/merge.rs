@@ -146,6 +146,17 @@ pub async fn execute_merge(
                 "File" | "Document" | "Markdown" | "Code"
             );
             if is_file_source && !branch_uris.contains(&uri) {
+                // Collect vector IDs *before* removal so we can purge the vector index.
+                let mut vec_ids: Vec<String> = Vec::new();
+                for (sid, _, _) in main_graph.find_sources_by_uri(&uri).unwrap_or_default() {
+                    for cid in main_graph.get_claim_ids_for_source(&sid).unwrap_or_default() {
+                        vec_ids.push(format!("claim:{cid}"));
+                    }
+                    for eid in main_graph.get_entity_ids_for_source(&sid).unwrap_or_default() {
+                        vec_ids.push(format!("entity:{eid}"));
+                    }
+                }
+
                 let removed = main_graph.remove_source_by_uri(&uri)?;
                 if removed > 0 {
                     tracing::info!(
@@ -153,6 +164,21 @@ pub async fn execute_merge(
                         uri,
                         branch_name
                     );
+
+                    // Purge stale embeddings from the main vector index.
+                    if !vec_ids.is_empty() {
+                        let main_data_dir = resolve_data_dir(root_path, None);
+                        if let Ok(mut main_vec) =
+                            thinkingroot_graph::vector::VectorStore::init(&main_data_dir).await
+                        {
+                            let id_refs: Vec<&str> =
+                                vec_ids.iter().map(|s| s.as_str()).collect();
+                            main_vec.remove_by_ids(&id_refs);
+                            if let Err(e) = main_vec.save() {
+                                tracing::warn!("vector purge save failed (non-fatal): {e}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -160,6 +186,41 @@ pub async fn execute_merge(
 
     // Rebuild entity relations for consistency
     main_graph.rebuild_entity_relations()?;
+
+    // Reconcile vector indexes: copy branch embeddings into main so that
+    // contributed claims written to the branch become searchable in main
+    // after the merge without requiring a full recompile.
+    let branch_data_dir = resolve_data_dir(root_path, Some(branch_name));
+    let main_data_dir = resolve_data_dir(root_path, None);
+    if branch_data_dir.join("vectors.bin").exists() {
+        match (
+            thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await,
+            thinkingroot_graph::vector::VectorStore::init(&main_data_dir).await,
+        ) {
+            (Ok(branch_vec), Ok(mut main_vec)) => {
+                let items = branch_vec.all_items();
+                if !items.is_empty() {
+                    match main_vec.upsert_raw_batch(items) {
+                        Ok(n) => {
+                            if let Err(e) = main_vec.save() {
+                                tracing::warn!("merge vector save failed (non-fatal): {e}");
+                            } else {
+                                tracing::info!(
+                                    "merge: reconciled {n} branch vector embeddings into main"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("merge vector reconciliation failed (non-fatal): {e}");
+                        }
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("merge vector store init failed (non-fatal): {e}");
+            }
+        }
+    }
 
     // Mark branch as merged in registry
     let refs_dir = root_path.join(".thinkingroot-refs");
