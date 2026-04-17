@@ -46,24 +46,32 @@ struct BatchResultEntry {
 ///
 /// Each chunk is wrapped in `<chunk id="N" context="...">` tags.
 /// The known_entities_section (graph context) is prepended once and shared.
-/// Instructs the LLM NOT to create relations between entities from different chunks.
+/// Instructs the LLM to return ONE JSON object with a `results` array wrapper.
 pub fn build_batch_prompt(chunks: &[BatchChunk], known_entities_section: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    parts.push(
-        "Extract knowledge from each chunk below. For EACH chunk, return its results independently under its chunk_id.\n".to_string(),
-    );
+    // Show the required output format FIRST — before any content.
+    // This overrides the LLM's prior for single-chunk extraction format.
+    let chunk_ids: Vec<String> = chunks.iter().map(|c| c.id.to_string()).collect();
+    parts.push(format!(
+        "You will extract knowledge from {} document chunks.\n\
+         \n\
+         REQUIRED OUTPUT FORMAT — return EXACTLY ONE JSON object:\n\
+         {{\"results\":[{{\"chunk_id\":0,\"claims\":[...],\"entities\":[...],\"relations\":[...]}},{{\"chunk_id\":1,...}}]}}\n\
+         \n\
+         RULES:\n\
+         - Output ONE JSON object only. No multiple objects. No extra text.\n\
+         - The top-level key MUST be \"results\" (array).\n\
+         - Each element MUST have \"chunk_id\" matching the chunk's id: {}\n\
+         - Do NOT create relations between entities from different chunks.\n\
+         - Every chunk_id must appear in the results array.",
+        chunks.len(),
+        chunk_ids.join(", ")
+    ));
 
     if !known_entities_section.is_empty() {
-        parts.push(format!("{known_entities_section}\n"));
+        parts.push(format!("{known_entities_section}"));
     }
-
-    parts.push(
-        "Return JSON matching this exact schema:\n\
-         {\"results\":[{\"chunk_id\":0,\"claims\":[...],\"entities\":[...],\"relations\":[...]}]}\n\n\
-         Do NOT create relations between entities from different chunks.\n"
-            .to_string(),
-    );
 
     for chunk in chunks {
         let mut chunk_parts: Vec<String> = Vec::new();
@@ -79,7 +87,13 @@ pub fn build_batch_prompt(chunks: &[BatchChunk], known_entities_section: &str) -
         parts.push(chunk_parts.join("\n"));
     }
 
-    parts.join("\n")
+    parts.push(format!(
+        "\nRemember: return ONE JSON object with key \"results\" containing {} entries (chunk_ids: {}).",
+        chunks.len(),
+        chunk_ids.join(", ")
+    ));
+
+    parts.join("\n\n")
 }
 
 /// Parse the LLM response for a batch call.
@@ -87,9 +101,75 @@ pub fn build_batch_prompt(chunks: &[BatchChunk], known_entities_section: &str) -
 /// Returns one `BatchChunkResult` per expected_id.
 /// Missing chunks → empty ExtractionResult (never fails the whole batch).
 /// Malformed JSON → empty results for ALL expected_ids.
+///
+/// Fallback: if the LLM ignores the wrapper format and returns N separate
+/// JSON objects (one per chunk), we detect that and assign them in order.
 pub fn parse_batch_response(response: &str, expected_ids: &[usize]) -> Vec<BatchChunkResult> {
-    // Strip markdown fences if present (same logic as the single-chunk parser).
-    let text = response.trim();
+    let text = strip_fences(response);
+
+    // ── Primary path: wrapped {"results":[...]} format ───────────────────────
+    if let Ok(parsed) = serde_json::from_str::<BatchResponse>(text) {
+        let mut map: std::collections::HashMap<usize, ExtractionResult> = parsed
+            .results
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.chunk_id,
+                    ExtractionResult {
+                        claims: entry.claims,
+                        entities: entry.entities,
+                        relations: entry.relations,
+                    },
+                )
+            })
+            .collect();
+        return expected_ids
+            .iter()
+            .map(|&id| BatchChunkResult {
+                id,
+                result: map.remove(&id).unwrap_or_else(ExtractionResult::empty),
+            })
+            .collect();
+    }
+
+    // ── Fallback: LLM returned multiple separate JSON objects ─────────────────
+    // Some models return one {"claims":[...],"entities":[...],"relations":[...]}
+    // per chunk instead of the wrapper. Detect by splitting on `}\n{` boundaries
+    // and parse each object as a single-chunk ExtractionResult, assigned in order.
+    let objects = split_json_objects(text);
+    if !objects.is_empty() && objects.len() <= expected_ids.len() {
+        tracing::debug!(
+            "batch: LLM returned {} separate JSON objects instead of wrapper — using fallback parser",
+            objects.len()
+        );
+        let mut results: Vec<BatchChunkResult> = Vec::with_capacity(expected_ids.len());
+        for (i, &id) in expected_ids.iter().enumerate() {
+            let result = objects
+                .get(i)
+                .and_then(|obj| serde_json::from_str::<ExtractionResult>(obj).ok())
+                .unwrap_or_else(ExtractionResult::empty);
+            results.push(BatchChunkResult { id, result });
+        }
+        return results;
+    }
+
+    // ── Total failure: return empty for all ──────────────────────────────────
+    tracing::warn!(
+        "batch response parse failed — could not parse as wrapper or {} separate objects, returning empty for all chunks",
+        expected_ids.len()
+    );
+    expected_ids
+        .iter()
+        .map(|&id| BatchChunkResult {
+            id,
+            result: ExtractionResult::empty(),
+        })
+        .collect()
+}
+
+/// Strip markdown code fences from LLM output.
+fn strip_fences(text: &str) -> &str {
+    let text = text.trim();
     let text = text
         .strip_prefix("```json")
         .or_else(|| text.strip_prefix("```"))
@@ -97,48 +177,51 @@ pub fn parse_batch_response(response: &str, expected_ids: &[usize]) -> Vec<Batch
         .trim_start()
         .trim_end_matches("```")
         .trim();
+    text
+}
 
-    let parsed: BatchResponse = match serde_json::from_str(text) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                "batch response parse failed ({e}) — returning empty for all {} chunks",
-                expected_ids.len()
-            );
-            return expected_ids
-                .iter()
-                .map(|&id| BatchChunkResult {
-                    id,
-                    result: ExtractionResult::empty(),
-                })
-                .collect();
+/// Split a string containing multiple top-level JSON objects into individual
+/// object strings. Handles the case where an LLM returns N objects separated
+/// by whitespace/newlines instead of a single wrapper array.
+fn split_json_objects(text: &str) -> Vec<&str> {
+    let mut objects: Vec<&str> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape_next {
+            escape_next = false;
+            i += 1;
+            continue;
         }
-    };
-
-    // Map chunk_id → ExtractionResult.
-    let mut map: std::collections::HashMap<usize, ExtractionResult> = parsed
-        .results
-        .into_iter()
-        .map(|entry| {
-            (
-                entry.chunk_id,
-                ExtractionResult {
-                    claims: entry.claims,
-                    entities: entry.entities,
-                    relations: entry.relations,
-                },
-            )
-        })
-        .collect();
-
-    // Return one entry per expected id — fill with empty if missing.
-    expected_ids
-        .iter()
-        .map(|&id| BatchChunkResult {
-            id,
-            result: map.remove(&id).unwrap_or_else(ExtractionResult::empty),
-        })
-        .collect()
+        match b {
+            b'\\' if in_string => escape_next = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        objects.push(&text[s..=i]);
+                        start = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    objects
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -237,5 +320,41 @@ mod tests {
         assert_eq!(results.len(), 2, "must return empty results for all ids on failure");
         assert!(results[0].result.claims.is_empty());
         assert!(results[1].result.claims.is_empty());
+    }
+
+    #[test]
+    fn parse_batch_response_fallback_handles_separate_json_objects() {
+        // LLM ignored wrapper and returned two separate JSON objects
+        let response = r#"{"claims":[{"statement":"Rust is fast","claim_type":"fact","confidence":0.9,"entities":["Rust"],"source_quote":"Rust is fast","event_date":null}],"entities":[{"name":"Rust","entity_type":"concept","aliases":[],"description":null}],"relations":[]}
+{"claims":[{"statement":"Go is simple","claim_type":"fact","confidence":0.85,"entities":["Go"],"source_quote":"Go is simple","event_date":null}],"entities":[{"name":"Go","entity_type":"concept","aliases":[],"description":null}],"relations":[]}"#;
+        let results = parse_batch_response(response, &[0, 1]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 0);
+        assert_eq!(results[0].result.claims[0].statement, "Rust is fast");
+        assert_eq!(results[1].id, 1);
+        assert_eq!(results[1].result.claims[0].statement, "Go is simple");
+    }
+
+    #[test]
+    fn split_json_objects_handles_two_objects() {
+        let text = r#"{"a":1}{"b":2}"#;
+        let objects = split_json_objects(text);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0], r#"{"a":1}"#);
+        assert_eq!(objects[1], r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn build_batch_prompt_contains_required_output_format_instruction() {
+        let chunks = vec![BatchChunk {
+            id: 0,
+            content: "fn main() {}".into(),
+            context: "Source: main.rs".into(),
+            ast_anchor: String::new(),
+        }];
+        let prompt = build_batch_prompt(&chunks, "");
+        assert!(prompt.contains("\"results\""), "prompt must instruct LLM to use results key");
+        assert!(prompt.contains("chunk_id"), "prompt must mention chunk_id field");
+        assert!(prompt.contains("ONE JSON"), "prompt must emphasize single output object");
     }
 }
