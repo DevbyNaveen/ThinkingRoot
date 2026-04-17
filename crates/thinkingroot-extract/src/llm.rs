@@ -257,7 +257,10 @@ impl AzureProvider {
         let max_output_tokens = model_max_output_tokens(model);
 
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_default(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             endpoint_url,
@@ -350,7 +353,10 @@ impl OpenAiProvider {
     fn new(api_key: &str, model: &str, base_url: &str, provider_name: &str) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_default(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -445,7 +451,10 @@ impl AnthropicProvider {
     fn new(api_key: &str, model: &str) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_default(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             max_output_tokens,
@@ -540,7 +549,10 @@ impl OllamaProvider {
     fn new(model: &str, base_url: &str) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_default(),
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             max_output_tokens,
@@ -806,6 +818,24 @@ impl LlmClient {
         })
     }
 
+    /// Create an LlmClient pointed at a specific Azure deployment, bypassing LlmConfig.
+    ///
+    /// Used when you need a different deployment than the workspace's extraction model —
+    /// e.g. a dedicated GPT-4o judge in the eval runner while synthesis uses GPT-4.1.
+    /// The `azure_cfg` must have `deployment` set to the target deployment name.
+    pub fn for_azure_deployment(
+        api_key: &str,
+        display_model: &str,
+        azure_cfg: &AzureConfig,
+    ) -> Result<Self> {
+        let provider = Provider::Azure(AzureProvider::new(api_key, display_model, azure_cfg)?);
+        Ok(Self {
+            provider,
+            max_retries: 3,
+            scheduler: None,
+        })
+    }
+
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
         self
@@ -847,6 +877,191 @@ impl LlmClient {
         let user_prompt =
             prompts::build_extraction_prompt_with_context(content, context, known_entities_section);
         self.extract_prompt(user_prompt).await
+    }
+
+    /// Send a pre-built batch prompt and return the raw LLM response text.
+    ///
+    /// The caller builds the prompt via `batch::build_batch_prompt` and parses
+    /// the result via `batch::parse_batch_response`. This method handles only
+    /// transport: retry, rate-limit backoff, and throughput scheduling.
+    ///
+    /// On truncation: returns the partial text rather than failing — the batch
+    /// parser handles missing chunk sections gracefully.
+    pub async fn extract_batch_raw(&self, batch_prompt: &str) -> Result<String> {
+        let mut last_error = None;
+        let max_rl_retries = self.max_retries * 2;
+        let mut rl_attempts: u32 = 0;
+        let mut normal_attempts: u32 = 0;
+
+        loop {
+            if normal_attempts >= self.max_retries && rl_attempts >= max_rl_retries {
+                break;
+            }
+
+            let opt_ticket = if let Some(ref sched) = self.scheduler {
+                Some(sched.wait_for_slot().await)
+            } else {
+                None
+            };
+
+            match self
+                .provider
+                .chat(prompts::SYSTEM_PROMPT, batch_prompt)
+                .await
+            {
+                Ok(output) => {
+                    let tokens = (prompts::SYSTEM_PROMPT.len()
+                        + batch_prompt.len()
+                        + output.text.len()) as u64
+                        / 4;
+                    if let (Some(sched), Some(ticket)) = (&self.scheduler, opt_ticket) {
+                        sched.record_success(tokens, &output.limits, ticket).await;
+                    }
+                    if output.truncated {
+                        tracing::warn!(
+                            "batch LLM output truncated — partial results will be used by parser"
+                        );
+                    }
+                    return Ok(output.text);
+                }
+                Err(e) if e.is_rate_limited() => {
+                    rl_attempts += 1;
+                    if let (Some(sched), Some(ticket)) = (&self.scheduler, opt_ticket) {
+                        sched.record_throttle(ticket);
+                    }
+                    let provider_hint = match &e {
+                        Error::RateLimited { retry_after_ms, .. } if *retry_after_ms > 0 => {
+                            *retry_after_ms
+                        }
+                        _ => 0,
+                    };
+                    let backoff_ms =
+                        (1000u64 * 2u64.pow(rl_attempts.saturating_sub(1))).min(60_000);
+                    let base_delay = if provider_hint > 0 {
+                        provider_hint
+                    } else {
+                        backoff_ms
+                    };
+                    let jitter = (base_delay as f64 * 0.25 * (rand_jitter() - 0.5)) as i64;
+                    let delay = (base_delay as i64 + jitter).max(500) as u64;
+                    tracing::warn!(
+                        attempt = rl_attempts,
+                        max = max_rl_retries,
+                        delay_ms = delay,
+                        "batch rate-limited — backing off"
+                    );
+                    last_error = Some(e);
+                    if rl_attempts >= max_rl_retries {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Err(e) => {
+                    normal_attempts += 1;
+                    tracing::warn!(
+                        attempt = normal_attempts,
+                        max = self.max_retries,
+                        "batch LLM request failed: {e}"
+                    );
+                    last_error = Some(e);
+                    if normal_attempts >= self.max_retries {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * 2u64.pow(normal_attempts.saturating_sub(1)),
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(Error::Extraction {
+            source_id: "batch".into(),
+            message: "all batch retry attempts exhausted".into(),
+        }))
+    }
+
+    /// Send a raw chat completion with a custom system prompt.
+    ///
+    /// Unlike `extract()`, this does NOT parse the response as knowledge JSON.
+    /// Used by the ReAct synthesis layer to generate natural language answers
+    /// from retrieved memory notes. Same retry/rate-limit behaviour as `extract`.
+    pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        let max_rl_retries = self.max_retries * 2;
+        let mut rl_attempts: u32 = 0;
+        let mut normal_attempts: u32 = 0;
+        let mut last_error: Option<Error> = None;
+
+        loop {
+            if normal_attempts >= self.max_retries && rl_attempts >= max_rl_retries {
+                break;
+            }
+
+            let opt_ticket = if let Some(ref sched) = self.scheduler {
+                Some(sched.wait_for_slot().await)
+            } else {
+                None
+            };
+
+            let chat_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(45),
+                self.provider.chat(system, user),
+            ).await;
+
+            let provider_result = match chat_result {
+                Ok(r) => r,
+                Err(_) => {
+                    // Timed out — count as a transient error and retry.
+                    normal_attempts += 1;
+                    tracing::warn!("LLM chat timed out after 45s, retrying ({normal_attempts}/{})...", self.max_retries);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            match provider_result {
+                Ok(output) => {
+                    if output.truncated {
+                        return Err(Error::TruncatedOutput {
+                            provider: self.provider.provider_name().to_string(),
+                            model: self.provider.model_name().to_string(),
+                        });
+                    }
+                    let tokens =
+                        (system.len() + user.len() + output.text.len()) as u64 / 4;
+                    if let (Some(sched), Some(ticket)) = (&self.scheduler, opt_ticket) {
+                        sched.record_success(tokens, &output.limits, ticket).await;
+                    }
+                    return Ok(output.text);
+                }
+                Err(e) if e.is_rate_limited() => {
+                    rl_attempts += 1;
+                    if let (Some(sched), Some(ticket)) = (&self.scheduler, opt_ticket) {
+                        sched.record_throttle(ticket);
+                    }
+                    let delay = match &e {
+                        Error::RateLimited { retry_after_ms, .. } if *retry_after_ms > 0 => {
+                            *retry_after_ms
+                        }
+                        _ => (1000u64 * 2u64.pow(rl_attempts.saturating_sub(1))).min(60_000),
+                    };
+                    last_error = Some(e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+                Err(e) => {
+                    normal_attempts += 1;
+                    let delay =
+                        (500u64 * 2u64.pow(normal_attempts.saturating_sub(1))).min(10_000);
+                    last_error = Some(e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(Error::Extraction {
+            source_id: "chat".into(),
+            message: "all retry attempts exhausted".into(),
+        }))
     }
 
     /// Core retry/rate-limit loop shared by `extract` and
