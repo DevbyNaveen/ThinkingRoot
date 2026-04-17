@@ -13,8 +13,8 @@
 
 <br/>
 
-[![CI](https://github.com/thinkingroot/thinkingroot/actions/workflows/ci.yml/badge.svg)](https://github.com/thinkingroot/thinkingroot/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![CI](https://github.com/DevbyNaveen/ThinkingRoot/actions/workflows/ci.yml/badge.svg)](https://github.com/DevbyNaveen/ThinkingRoot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Crates.io](https://img.shields.io/crates/v/thinkingroot.svg)](https://crates.io/crates/thinkingroot)
 [![PyPI](https://img.shields.io/pypi/v/thinkingroot.svg)](https://pypi.org/project/thinkingroot)
@@ -624,20 +624,30 @@ ThinkingRoot is designed to take you from 0 to a compiled knowledge graph and MC
 
 ### 1. Install
 
-**macOS / Linux (Homebrew)**
+**Build from Source (recommended)**
+
+```bash
+git clone https://github.com/DevbyNaveen/ThinkingRoot.git
+cd ThinkingRoot
+cargo build --release
+# Binary at: target/release/root
+# Optionally move to PATH:
+sudo mv target/release/root /usr/local/bin/root
+```
+
+**macOS / Linux (Homebrew)** *(coming soon)*
 
 ```bash
 brew install thinkingroot
 ```
 
-**From Source / Cargo**
+**Cargo** *(coming soon)*
 
 ```bash
 cargo install thinkingroot
-# or: git clone && cd thinkingroot && cargo build --release
 ```
 
-**Python SDK**
+**Python SDK** *(coming soon)*
 
 ```bash
 pip install thinkingroot
@@ -997,7 +1007,7 @@ Global:
 **Prerequisites:** Rust 1.85+, optional Python 3.9+ with maturin for the Python SDK
 
 ```bash
-git clone https://github.com/thinkingroot/thinkingroot
+git clone https://github.com/DevbyNaveen/ThinkingRoot
 cd thinkingroot
 
 # Build CLI
@@ -1034,18 +1044,13 @@ We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full gu
 5. Submit a PR
 
 For bugs: [bug report template](.github/ISSUE_TEMPLATE/bug_report.yml)  
-For ideas: [GitHub Discussions](https://github.com/thinkingroot/thinkingroot/discussions)
+For ideas: [GitHub Discussions](https://github.com/DevbyNaveen/ThinkingRoot/discussions)
 
 ---
 
 ## License
 
-Licensed under either of:
-
-- [MIT License](LICENSE-MIT)
-- [Apache License, Version 2.0](LICENSE-APACHE)
-
-at your option.
+Licensed under the [MIT License](LICENSE-MIT).
 
 ---
 
