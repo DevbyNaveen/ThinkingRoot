@@ -255,13 +255,12 @@ impl NliJudge {
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
         let onnx_path = model_dir.join(ONNX_FILENAME);
 
-        let tokenizer =
-            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-                thinkingroot_core::Error::VectorStorage(format!(
-                    "NLI tokenizer load failed from {}: {e}",
-                    tokenizer_path.display()
-                ))
-            })?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            thinkingroot_core::Error::VectorStorage(format!(
+                "NLI tokenizer load failed from {}: {e}",
+                tokenizer_path.display()
+            ))
+        })?;
 
         let session = Session::builder()
             .map_err(|e| {
