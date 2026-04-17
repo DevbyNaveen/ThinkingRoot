@@ -24,7 +24,7 @@ jobs:
             artifact: root-linux-arm64
             cross: true
             no_vector: true
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             artifact: root-macos-amd64
           - os: macos-latest
