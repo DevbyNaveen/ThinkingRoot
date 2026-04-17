@@ -70,7 +70,7 @@ CLAUDE.md
 AGENTS.md
 
 # Internal design docs, specs, planning (business strategy, pricing, roadmap details)
-docs/
+/docs/
 
 # Local UI/Branding experiments (not for repo)
 logo_concepts.html
@@ -83,6 +83,10 @@ crates/thinkingroot-ground/models/
 generate_chart.py
 latency_chart.png
 benchmarks/latency_chart.png
+
+# Personal files
+*.pdf
+compag-paper/
 
 # IDE Polishing
 .vscode/
@@ -98,4 +102,3 @@ target/wasm32-unknown-unknown/
 # Benchmarks & Evaluation
 longmemeval-workspace/
 longmemeval-data/
-tests/fixtures/

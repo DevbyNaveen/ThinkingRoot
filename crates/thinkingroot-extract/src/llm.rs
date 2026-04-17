@@ -199,7 +199,7 @@ pub fn model_batch_size(provider: &str, model: &str, max_chunk_tokens: usize) ->
 
     let output_safe_n = max_output / OUTPUT_PER_CHUNK;
 
-    let n = input_safe_n.min(output_safe_n).min(HARD_MAX).max(1);
+    let n = input_safe_n.min(output_safe_n).clamp(1, HARD_MAX);
 
     tracing::debug!(
         "batch_size for {provider}/{model}: context={context} output={max_output} \
@@ -773,18 +773,18 @@ fn resolve_key(cfg: Option<&ProviderConfig>, default_env: &str) -> Result<String
         .unwrap_or(default_env);
 
     // Priority 1: live environment variable
-    if let Ok(val) = std::env::var(env_var) {
-        if !val.is_empty() {
-            return Ok(val);
-        }
+    if let Ok(val) = std::env::var(env_var)
+        && !val.is_empty()
+    {
+        return Ok(val);
     }
 
     // Priority 2: stored value in ProviderConfig.api_key (populated from credentials.toml
     // by GlobalConfig::load → Credentials::inject_into)
-    if let Some(stored) = cfg.and_then(|p| p.api_key.as_deref()) {
-        if !stored.is_empty() {
-            return Ok(stored.to_string());
-        }
+    if let Some(stored) = cfg.and_then(|p| p.api_key.as_deref())
+        && !stored.is_empty()
+    {
+        return Ok(stored.to_string());
     }
 
     Err(Error::MissingConfig(format!(
@@ -797,12 +797,11 @@ fn resolve_key(cfg: Option<&ProviderConfig>, default_env: &str) -> Result<String
 /// available (used for optional-key providers like LiteLLM and Ollama).
 fn resolve_key_optional(cfg: Option<&ProviderConfig>) -> String {
     // Priority 1: env var
-    if let Some(env_var) = cfg.and_then(|p| p.api_key_env.as_deref()) {
-        if let Ok(val) = std::env::var(env_var) {
-            if !val.is_empty() {
-                return val;
-            }
-        }
+    if let Some(env_var) = cfg.and_then(|p| p.api_key_env.as_deref())
+        && let Ok(val) = std::env::var(env_var)
+        && !val.is_empty()
+    {
+        return val;
     }
     // Priority 2: stored value
     cfg.and_then(|p| p.api_key.as_deref())

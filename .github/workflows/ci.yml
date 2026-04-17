@@ -46,6 +46,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Pin Python to 3.13 — pyo3-ffi 0.23.x max supported version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       # Run without vector feature — no ONNX Runtime needed (fast CI)
       - run: cargo test --no-default-features
       # Type-check the Python cdylib (no linking — requires no Python headers)

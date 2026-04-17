@@ -180,44 +180,43 @@ impl<'q> ReActEngine<'q> {
             // Even when the time-range scan found nothing, the entity's full
             // chronological timeline lets the synthesis LLM compare event dates.
             let mut final_observation = observation.clone();
-            if !entity.is_empty() {
-                if let Ok(entity_events) = self
+            if !entity.is_empty()
+                && let Ok(entity_events) = self
                     .engine
                     .query_events_in_range(self.ws, 0.0, f64::MAX)
                     .await
-                {
-                    let entity_lower = entity.to_lowercase();
-                    let entity_hits: Vec<_> = entity_events
-                        .iter()
-                        .filter(|ev| {
-                            ev.subject_name.to_lowercase().contains(&entity_lower)
-                                || ev.object_name.to_lowercase().contains(&entity_lower)
-                        })
-                        .take(30)
-                        .collect();
-                    if !entity_hits.is_empty() {
+            {
+                let entity_lower = entity.to_lowercase();
+                let entity_hits: Vec<_> = entity_events
+                    .iter()
+                    .filter(|ev| {
+                        ev.subject_name.to_lowercase().contains(&entity_lower)
+                            || ev.object_name.to_lowercase().contains(&entity_lower)
+                    })
+                    .take(30)
+                    .collect();
+                if !entity_hits.is_empty() {
+                    final_observation.push_str(&format!(
+                        "\n## All Events for '{}' (chronological context)\n",
+                        entity
+                    ));
+                    let mut sorted = entity_hits.clone();
+                    sorted.sort_by_key(|a| a.normalized_date.clone());
+                    for ev in sorted {
+                        let date = if !ev.normalized_date.is_empty() {
+                            format!(" [{}]", ev.normalized_date)
+                        } else {
+                            String::new()
+                        };
+                        let obj = if !ev.object_name.is_empty() {
+                            format!(" {}", ev.object_name)
+                        } else {
+                            String::new()
+                        };
                         final_observation.push_str(&format!(
-                            "\n## All Events for '{}' (chronological context)\n",
-                            entity
+                            "- {}{} {}{}\n",
+                            ev.subject_name, date, ev.verb, obj
                         ));
-                        let mut sorted = entity_hits.clone();
-                        sorted.sort_by(|a, b| a.normalized_date.cmp(&b.normalized_date));
-                        for ev in sorted {
-                            let date = if !ev.normalized_date.is_empty() {
-                                format!(" [{}]", ev.normalized_date)
-                            } else {
-                                String::new()
-                            };
-                            let obj = if !ev.object_name.is_empty() {
-                                format!(" {}", ev.object_name)
-                            } else {
-                                String::new()
-                            };
-                            final_observation.push_str(&format!(
-                                "- {}{} {}{}\n",
-                                ev.subject_name, date, ev.verb, obj
-                            ));
-                        }
                     }
                 }
             }
@@ -238,67 +237,66 @@ impl<'q> ReActEngine<'q> {
         // When Turn 1 ran but the time-range expansion was None (query has ordering
         // signals like "which did I buy first?" but no relative time keywords),
         // fetch the entity's full event timeline so the synthesis LLM can compare dates.
-        if steps.is_empty() {
-            if let Some(entity_name) = extract_subject_entity(query) {
-                let lower_q = query.to_lowercase();
-                let needs_ordering = lower_q.contains(" first")
-                    || lower_q.contains("came first")
-                    || lower_q.contains("happened first")
-                    || lower_q.contains("before")
-                    || lower_q.contains("after")
-                    || lower_q.contains("how many days")
-                    || lower_q.contains("how many months")
-                    || lower_q.contains("how long");
-                if needs_ordering {
-                    if let Ok(all_events) = self
-                        .engine
-                        .query_events_in_range(self.ws, 0.0, f64::MAX)
-                        .await
-                    {
-                        let entity_lower = entity_name.to_lowercase();
-                        let mut relevant: Vec<_> = all_events
-                            .into_iter()
-                            .filter(|ev| {
-                                ev.subject_name.to_lowercase().contains(&entity_lower)
-                                    || ev.object_name.to_lowercase().contains(&entity_lower)
-                            })
-                            .collect();
-                        if !relevant.is_empty() {
-                            relevant.sort_by(|a, b| a.normalized_date.cmp(&b.normalized_date));
-                            let mut obs = format!(
-                                "## Full Event Timeline for '{}' (for ordering comparison)\n",
-                                entity_name
-                            );
-                            for ev in relevant.iter().take(40) {
-                                let date = if !ev.normalized_date.is_empty() {
-                                    format!(" [{}]", ev.normalized_date)
-                                } else {
-                                    String::new()
-                                };
-                                let obj = if !ev.object_name.is_empty() {
-                                    format!(" {}", ev.object_name)
-                                } else {
-                                    String::new()
-                                };
-                                obs.push_str(&format!(
-                                    "- {}{} {}{}\n",
-                                    ev.subject_name, date, ev.verb, obj
-                                ));
-                            }
-                            notes.push(obs.clone());
-                            steps.push(ReActStep {
-                                thought: format!(
-                                    "Fetching full event timeline for '{entity_name}' to support ordering comparison."
-                                ),
-                                tool: ReActTool::SearchEvents {
-                                    entity: entity_name,
-                                    start_iso: "all".to_string(),
-                                    end_iso: "all".to_string(),
-                                },
-                                observation: obs,
-                            });
-                        }
+        if steps.is_empty()
+            && let Some(entity_name) = extract_subject_entity(query)
+        {
+            let lower_q = query.to_lowercase();
+            let needs_ordering = lower_q.contains(" first")
+                || lower_q.contains("came first")
+                || lower_q.contains("happened first")
+                || lower_q.contains("before")
+                || lower_q.contains("after")
+                || lower_q.contains("how many days")
+                || lower_q.contains("how many months")
+                || lower_q.contains("how long");
+            if needs_ordering
+                && let Ok(all_events) = self
+                    .engine
+                    .query_events_in_range(self.ws, 0.0, f64::MAX)
+                    .await
+            {
+                let entity_lower = entity_name.to_lowercase();
+                let mut relevant: Vec<_> = all_events
+                    .into_iter()
+                    .filter(|ev| {
+                        ev.subject_name.to_lowercase().contains(&entity_lower)
+                            || ev.object_name.to_lowercase().contains(&entity_lower)
+                    })
+                    .collect();
+                if !relevant.is_empty() {
+                    relevant.sort_by_key(|a| a.normalized_date.clone());
+                    let mut obs = format!(
+                        "## Full Event Timeline for '{}' (for ordering comparison)\n",
+                        entity_name
+                    );
+                    for ev in relevant.iter().take(40) {
+                        let date = if !ev.normalized_date.is_empty() {
+                            format!(" [{}]", ev.normalized_date)
+                        } else {
+                            String::new()
+                        };
+                        let obj = if !ev.object_name.is_empty() {
+                            format!(" {}", ev.object_name)
+                        } else {
+                            String::new()
+                        };
+                        obs.push_str(&format!(
+                            "- {}{} {}{}\n",
+                            ev.subject_name, date, ev.verb, obj
+                        ));
                     }
+                    notes.push(obs.clone());
+                    steps.push(ReActStep {
+                        thought: format!(
+                            "Fetching full event timeline for '{entity_name}' to support ordering comparison."
+                        ),
+                        tool: ReActTool::SearchEvents {
+                            entity: entity_name,
+                            start_iso: "all".to_string(),
+                            end_iso: "all".to_string(),
+                        },
+                        observation: obs,
+                    });
                 }
             }
         }

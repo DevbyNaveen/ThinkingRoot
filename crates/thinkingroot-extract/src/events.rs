@@ -8,6 +8,7 @@
 // and store it in the CozoDB `events` table.  Temporal Datalog queries then
 // run at 50µs — a 2000x speedup on the hot path.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use chrono::{Datelike, Duration, NaiveDate, Utc};
@@ -173,7 +174,7 @@ impl EventExtractor {
         }
 
         // Deduplicate by id (same entity+verb+timestamp might appear in multiple claims).
-        events.sort_by(|a, b| a.id.cmp(&b.id));
+        events.sort_by_key(|a| a.id.clone());
         events.dedup_by(|a, b| a.id == b.id);
         events
     }
@@ -275,7 +276,7 @@ impl EventExtractor {
         let lower = stmt.to_lowercase();
         // Prefer longer names (more specific) over shorter ones.
         let mut candidates: Vec<(&String, &String)> = entity_name_to_id.iter().collect();
-        candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        candidates.sort_by_key(|a| Reverse(a.0.len()));
         for (name, id) in candidates {
             if lower.contains(name.as_str()) {
                 return Some(id.clone());
@@ -292,7 +293,7 @@ impl EventExtractor {
     ) -> Option<String> {
         let lower = stmt.to_lowercase();
         let mut candidates: Vec<(&String, &String)> = entity_name_to_id.iter().collect();
-        candidates.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        candidates.sort_by_key(|a| Reverse(a.0.len()));
         for (name, id) in candidates {
             if id.as_str() != subject_id && lower.contains(name.as_str()) {
                 return Some(id.clone());
@@ -419,7 +420,7 @@ impl EventExtractor {
         }
 
         // Deduplicate by id.
-        events.sort_by(|a, b| a.id.cmp(&b.id));
+        events.sort_by_key(|a| a.id.clone());
         events.dedup_by(|a, b| a.id == b.id);
         events
     }

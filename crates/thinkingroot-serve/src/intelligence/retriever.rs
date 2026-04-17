@@ -137,7 +137,7 @@ fn primary_top_k(category: &str) -> usize {
         "multi-session" => 250,
         "temporal-reasoning" => 200,
         "single-session-assistant" => 200,
-        "knowledge-update" | "single-session-preference" | _ => 150,
+        _ => 150,
     }
 }
 

@@ -9,7 +9,7 @@
 
 **Compiled knowledge infrastructure for AI agents — works like a secondary brain.**
 
-*The world's first knowledge database that is simultaneously the fastest (0.117ms p95) and the most accurate (91.2% LongMemEval) for AI agents.*
+*The world's first knowledge database that is simultaneously the fastest (0.117ms p95) and the most accurate (91.2% LongMemEval) for AI agents — works like a secondary brain.*
 
 <br/>
 
@@ -30,7 +30,7 @@
 ## What is ThinkingRoot?
 
 > **Code has GitHub. Models have HuggingFace. Compiled Knowledge has ThinkingRoot.**
-> 
+>
 > *Building the "GitHub of Knowledge" — an infrastructure layer that treats knowledge preparation as a compilation problem.*
 
 ThinkingRoot compiles **anything** — your entire codebase, docs, PDFs, notes, git history — into a **typed, verified, linked knowledge graph** that your AI agents can query in milliseconds.
@@ -38,6 +38,7 @@ ThinkingRoot compiles **anything** — your entire codebase, docs, PDFs, notes, 
 Instead of re-reading 50,000 tokens every session, your agent reads a **pre-compiled 2,000-token brief** — with full provenance, zero hallucinations, and sub-millisecond retrieval.
 
 > **World's first knowledge system that is both the fastest and most accurate for AI agents:**
+>
 > - ⚡ **0.117ms p95** at 10,000 concurrent agents — 307× faster than the nearest competitor
 > - 🎯 **91.2% on LongMemEval-500** — beats full-context GPT-4 at a fraction of the cost
 > - 🛡️ **99% authentic data** — Grounding Tribunal eliminates hallucinations before graph write
@@ -274,13 +275,13 @@ ThinkingRoot is not a docs tool. It compiles **your entire codebase** — and un
 
 ## Build the Ultimate Secondary Brain (No Fine-Tuning Required)
 
-ThinkingRoot is designed for **anyone** — whether you are a **student**, **developer**, **researcher**, or **business**. 
+ThinkingRoot is designed for **anyone** — whether you are a **student**, **developer**, **researcher**, or **business**.
 
-You can compile your raw data (codebases, research papers, business documents) in seconds, connect your favourite AI tools via MCP, or build entire autonomous agent pipelines directly on top of the ThinkingRoot infrastructure. 
+You can compile your raw data (codebases, research papers, business documents) in seconds, connect your favourite AI tools via MCP, or build entire autonomous agent pipelines directly on top of the ThinkingRoot infrastructure.
 
-Because of our native support for isolated **streaming sessions** and **knowledge branches**, ThinkingRoot acts as an extremely efficient, verifiable **secondary brain**. 
+Because of our native support for isolated **streaming sessions** and **knowledge branches**, ThinkingRoot acts as an extremely efficient, verifiable **secondary brain**.
 
-> **You no longer need to fine-tune LLMs.** Everything your agent needs is compiled, typed, and injected into context identically to how a human reads a curated dossier. 
+> **You no longer need to fine-tune LLMs.** Everything your agent needs is compiled, typed, and injected into context identically to how a human reads a curated dossier.
 
 Build agent automations, research assistants, or intelligent enterprise search without ever paying to retrain a model.
 
@@ -345,6 +346,7 @@ auto_session_branch = true   # Each new MCP session → isolated stream/{id} bra
 ```
 
 With `auto_session_branch` enabled:
+
 - Claude, Cursor, Codex, or any MCP client connects → `stream/abc123` branch created instantly
 - Agent writes claims to its own isolated branch
 - Human reviews the session diff with `root diff stream/abc123`
@@ -366,6 +368,7 @@ root serve --branch v1.0-release --port 3001
 ### Knowledge PR — `root diff`
 
 Before merging, see exactly what changed:
+
 - New claims (with entity context)
 - New entities and relations
 - Auto-resolved contradictions (winner + confidence delta)
@@ -381,6 +384,7 @@ root merge experiment-v2 --resolve 0=keep-branch
 ```
 
 ### Branch Safety
+
 - **Pre-merge snapshot** — `graph.db.pre-merge-*` is created before any mutation
 - **Advisory lock** — concurrent `root merge` on the same workspace immediately errors
 - **Rollback** — `root merge <branch> --rollback` restores to pre-merge state
@@ -581,6 +585,7 @@ ThinkingRoot supports **both MCP protocol versions** simultaneously:
 The server negotiates version with the client automatically — if a client requests `2024-11-05`, it gets `2024-11-05`. If it requests `2025-03-26`, it gets `2025-03-26`. No config needed.
 
 **Two transports:**
+
 - **stdio** — for local tools (Claude Desktop, Cursor, VS Code, Zed). `root serve --mcp-stdio`
 - **SSE (HTTP)** — for remote agents. `GET /mcp/sse` + `POST /mcp?sessionId={id}`
 
@@ -615,22 +620,25 @@ Your codebase / docs
 
 ## Quick Start & Zero-Friction Onboarding
 
-ThinkingRoot is designed to take you from 0 to a compiled knowledge graph and MCP integration in under 2 minutes. 
+ThinkingRoot is designed to take you from 0 to a compiled knowledge graph and MCP integration in under 2 minutes.
 
 ### 1. Install
 
 **macOS / Linux (Homebrew)**
+
 ```bash
 brew install thinkingroot
 ```
 
 **From Source / Cargo**
+
 ```bash
 cargo install thinkingroot
 # or: git clone && cd thinkingroot && cargo build --release
 ```
 
 **Python SDK**
+
 ```bash
 pip install thinkingroot
 ```
@@ -644,6 +652,7 @@ root setup
 ```
 
 The wizard will guide you through:
+
 1. **Selecting your LLM** (AWS Bedrock, OpenAI, Anthropic, local Ollama, Groq, etc.)
 2. **Setting your API key** or local base URL.
 3. **Registering your first workspace** (the directory you want to compile).
@@ -679,6 +688,7 @@ root ask "what did we change last week?"
 ThinkingRoot reads your existing `.gitignore` and excludes everything git ignores. Nothing to configure.
 
 By default, it also ignores:
+
 ```
 target/        node_modules/     .git/
 __pycache__/   .venv/            dist/
@@ -686,6 +696,7 @@ build/         .next/            .tox/
 ```
 
 Add custom patterns in `.thinkingroot/config.toml`:
+
 ```toml
 [parsers]
 exclude_patterns = ["*.generated.ts", "fixtures/**", "legacy/**"]
@@ -732,6 +743,7 @@ block_on_contradictions = true
 ```
 
 **Switch provider in one line:**
+
 ```bash
 root provider use ollama          # fully local, no keys
 root provider use groq            # fast, free tier
@@ -782,6 +794,7 @@ curl http://localhost:3000/api/v1/branches/experiment-v2/diff
 ```
 
 All responses:
+
 ```json
 { "ok": true,  "data": {...}, "error": null }
 { "ok": false, "data": null,  "error": { "code": "NOT_FOUND", "message": "..." } }
@@ -978,7 +991,6 @@ Global:
 | **Version control** | Git commits, PR descriptions |
 
 ---
-
 
 ## Building from Source
 

@@ -208,11 +208,11 @@ fn inject_provider(
     default_env: &str,
     keys: &HashMap<String, String>,
 ) {
-    if let Some(cfg) = slot {
-        if cfg.api_key.is_none() {
-            let env_var = cfg.api_key_env.as_deref().unwrap_or(default_env);
-            cfg.api_key = keys.get(env_var).cloned();
-        }
+    if let Some(cfg) = slot
+        && cfg.api_key.is_none()
+    {
+        let env_var = cfg.api_key_env.as_deref().unwrap_or(default_env);
+        cfg.api_key = keys.get(env_var).cloned();
     }
 }
 

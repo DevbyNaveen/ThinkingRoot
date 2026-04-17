@@ -35,11 +35,11 @@ pub fn walk(root: &Path, config: &ParserConfig) -> Result<Vec<PathBuf>> {
             Err(e) => {
                 // Permission errors on system directories (e.g. macOS ~/Library) are
                 // expected when compiling a broad path like $HOME. Skip and continue.
-                if let Some(io_err) = e.io_error() {
-                    if io_err.kind() == std::io::ErrorKind::PermissionDenied {
-                        tracing::warn!("skipping inaccessible path: {e}");
-                        continue;
-                    }
+                if let Some(io_err) = e.io_error()
+                    && io_err.kind() == std::io::ErrorKind::PermissionDenied
+                {
+                    tracing::warn!("skipping inaccessible path: {e}");
+                    continue;
                 }
                 tracing::debug!("walk error (skipping): {e}");
                 continue;

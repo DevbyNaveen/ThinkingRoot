@@ -745,66 +745,24 @@ fn merge_provider_slot(
     provider_id: &str,
 ) {
     match provider_id {
-        "bedrock" => {
-            if incoming.bedrock.is_some() {
-                existing.bedrock = incoming.bedrock.clone();
-            }
+        "bedrock" if incoming.bedrock.is_some() => existing.bedrock = incoming.bedrock.clone(),
+        "azure" if incoming.azure.is_some() => existing.azure = incoming.azure.clone(),
+        "openai" if incoming.openai.is_some() => existing.openai = incoming.openai.clone(),
+        "anthropic" if incoming.anthropic.is_some() => {
+            existing.anthropic = incoming.anthropic.clone()
         }
-        "azure" => {
-            if incoming.azure.is_some() {
-                existing.azure = incoming.azure.clone();
-            }
+        "ollama" if incoming.ollama.is_some() => existing.ollama = incoming.ollama.clone(),
+        "groq" if incoming.groq.is_some() => existing.groq = incoming.groq.clone(),
+        "together" if incoming.together.is_some() => existing.together = incoming.together.clone(),
+        "deepseek" if incoming.deepseek.is_some() => existing.deepseek = incoming.deepseek.clone(),
+        "openrouter" if incoming.openrouter.is_some() => {
+            existing.openrouter = incoming.openrouter.clone()
         }
-        "openai" => {
-            if incoming.openai.is_some() {
-                existing.openai = incoming.openai.clone();
-            }
+        "perplexity" if incoming.perplexity.is_some() => {
+            existing.perplexity = incoming.perplexity.clone()
         }
-        "anthropic" => {
-            if incoming.anthropic.is_some() {
-                existing.anthropic = incoming.anthropic.clone();
-            }
-        }
-        "ollama" => {
-            if incoming.ollama.is_some() {
-                existing.ollama = incoming.ollama.clone();
-            }
-        }
-        "groq" => {
-            if incoming.groq.is_some() {
-                existing.groq = incoming.groq.clone();
-            }
-        }
-        "together" => {
-            if incoming.together.is_some() {
-                existing.together = incoming.together.clone();
-            }
-        }
-        "deepseek" => {
-            if incoming.deepseek.is_some() {
-                existing.deepseek = incoming.deepseek.clone();
-            }
-        }
-        "openrouter" => {
-            if incoming.openrouter.is_some() {
-                existing.openrouter = incoming.openrouter.clone();
-            }
-        }
-        "perplexity" => {
-            if incoming.perplexity.is_some() {
-                existing.perplexity = incoming.perplexity.clone();
-            }
-        }
-        "litellm" => {
-            if incoming.litellm.is_some() {
-                existing.litellm = incoming.litellm.clone();
-            }
-        }
-        "custom" => {
-            if incoming.custom.is_some() {
-                existing.custom = incoming.custom.clone();
-            }
-        }
+        "litellm" if incoming.litellm.is_some() => existing.litellm = incoming.litellm.clone(),
+        "custom" if incoming.custom.is_some() => existing.custom = incoming.custom.clone(),
         _ => {}
     }
 }

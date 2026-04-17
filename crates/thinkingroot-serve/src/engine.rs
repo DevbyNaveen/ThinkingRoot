@@ -945,7 +945,6 @@ impl QueryEngine {
                 let storage = handle.storage.lock().await;
                 storage.graph.search_claims(query)?
             };
-            let cache = handle.cache.read().await;
             for (cid, stmt, ctype, conf, uri) in kw_claims {
                 let in_scope = allowed_source_ids
                     .iter()

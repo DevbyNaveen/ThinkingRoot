@@ -2437,7 +2437,7 @@ impl GraphStore {
             .collect();
 
         // Deduplicate by explanation text (both sides may yield same contradiction).
-        contradictions.sort_by(|a, b| a.explanation.cmp(&b.explanation));
+        contradictions.sort_by_key(|a| a.explanation.clone());
         contradictions.dedup_by(|a, b| a.explanation == b.explanation);
 
         Ok(Some(EntityContext {

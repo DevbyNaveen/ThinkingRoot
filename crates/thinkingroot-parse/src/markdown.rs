@@ -186,12 +186,10 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 list_content.clear();
                 current_start_line = line_counter + 1;
             }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                if !in_heading && !in_list {
-                    let url = dest_url.to_string();
-                    if !url.is_empty() && !url.starts_with('#') {
-                        current_links.push(url);
-                    }
+            Event::Start(Tag::Link { dest_url, .. }) if !in_heading && !in_list => {
+                let url = dest_url.to_string();
+                if !url.is_empty() && !url.starts_with('#') {
+                    current_links.push(url);
                 }
             }
             Event::Text(text) => {

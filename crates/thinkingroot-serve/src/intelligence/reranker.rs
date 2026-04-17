@@ -41,7 +41,7 @@ impl Reranker {
     }
 
     /// Rerank `claims` in-place, blending BM25 score with existing relevance.
-    pub fn rerank_claims(&self, claims: &mut Vec<ClaimSearchHit>) {
+    pub fn rerank_claims(&self, claims: &mut [ClaimSearchHit]) {
         if self.query_terms.is_empty() || claims.is_empty() {
             return;
         }
@@ -65,7 +65,7 @@ impl Reranker {
     }
 
     /// Rerank `entities` in-place, blending BM25 score with existing relevance.
-    pub fn rerank_entities(&self, entities: &mut Vec<EntitySearchHit>) {
+    pub fn rerank_entities(&self, entities: &mut [EntitySearchHit]) {
         if self.query_terms.is_empty() || entities.is_empty() {
             return;
         }

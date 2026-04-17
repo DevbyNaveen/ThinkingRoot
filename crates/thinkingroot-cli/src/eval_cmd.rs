@@ -504,10 +504,10 @@ fn extract_numbers(s: &str) -> Vec<i64> {
             current.clear();
         }
     }
-    if !current.is_empty() {
-        if let Ok(n) = current.parse::<i64>() {
-            nums.push(n);
-        }
+    if !current.is_empty()
+        && let Ok(n) = current.parse::<i64>()
+    {
+        nums.push(n);
     }
     nums
 }

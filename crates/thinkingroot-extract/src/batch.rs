@@ -70,7 +70,7 @@ pub fn build_batch_prompt(chunks: &[BatchChunk], known_entities_section: &str) -
     ));
 
     if !known_entities_section.is_empty() {
-        parts.push(format!("{known_entities_section}"));
+        parts.push(known_entities_section.to_string());
     }
 
     for chunk in chunks {
@@ -169,15 +169,13 @@ pub fn parse_batch_response(response: &str, expected_ids: &[usize]) -> Vec<Batch
 
 /// Strip markdown code fences from LLM output.
 fn strip_fences(text: &str) -> &str {
-    let text = text.trim();
-    let text = text
+    text.trim()
         .strip_prefix("```json")
-        .or_else(|| text.strip_prefix("```"))
-        .unwrap_or(text)
+        .or_else(|| text.trim().strip_prefix("```"))
+        .unwrap_or(text.trim())
         .trim_start()
         .trim_end_matches("```")
-        .trim();
-    text
+        .trim()
 }
 
 /// Split a string containing multiple top-level JSON objects into individual
@@ -210,11 +208,11 @@ fn split_json_objects(text: &str) -> Vec<&str> {
             }
             b'}' if !in_string => {
                 depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start {
-                        objects.push(&text[s..=i]);
-                        start = None;
-                    }
+                if depth == 0
+                    && let Some(s) = start
+                {
+                    objects.push(&text[s..=i]);
+                    start = None;
                 }
             }
             _ => {}

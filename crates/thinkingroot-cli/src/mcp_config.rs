@@ -1094,6 +1094,9 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
             for v in CREDENTIAL_VARS {
                 std::env::remove_var(v);
             }
+            // Also override the credentials file path to a non-existent temp dir
+            // so that stored credentials on the developer's machine don't leak into the test.
+            std::env::set_var("HOME", std::env::temp_dir().join("thinkingroot-test-empty"));
         }
 
         let mut doc: toml::Value = toml::Value::Table(toml::map::Map::new());
@@ -1112,6 +1115,7 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
                     std::env::remove_var(&var_name);
                 }
             }
+            std::env::remove_var("HOME");
         }
     }
 }

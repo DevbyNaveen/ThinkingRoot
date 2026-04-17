@@ -1034,7 +1034,8 @@ fn print_banner() {
     println!("  {}", style("ThinkingRoot").green().bold());
     println!(
         "  {}",
-        style("Compiled knowledge infrastructure for AI agents — works like a secondary brain.").dim()
+        style("Compiled knowledge infrastructure for AI agents — works like a secondary brain.")
+            .dim()
     );
     println!();
 }

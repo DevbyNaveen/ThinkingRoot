@@ -394,7 +394,7 @@ pub async fn run_compile_progress(
                         }
                     }
 
-                    ProgressEvent::EntityResolved { done, total } => {
+                    ProgressEvent::EntityResolved { done, total: _ } => {
                         if let Some(ref lb) = link_bar {
                             lb.set_position(done as u64);
                             lb.set_message("entities".to_string());

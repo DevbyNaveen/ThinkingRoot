@@ -750,8 +750,6 @@ async fn ask_handler(
                     || q.contains("how many days")
                 {
                     "temporal-reasoning".to_string()
-                } else if q.contains("how many") || q.contains("how much") || q.contains("count") {
-                    "multi-session".to_string()
                 } else {
                     "multi-session".to_string()
                 }
