@@ -23,6 +23,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: root-linux-arm64
             cross: true
+            no_vector: true
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: root-macos-amd64
@@ -48,10 +49,10 @@ jobs:
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --no-default-features --target ${{ matrix.target }} -p thinkingroot-cli
+        run: cargo build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
-      - name: Build (cross)
-        if: matrix.cross
+      - name: Build (cross, no vector)
+        if: ${{ matrix.cross && matrix.no_vector }}
         run: cross build --release --no-default-features --target ${{ matrix.target }} -p thinkingroot-cli
 
       - name: Rename binary
