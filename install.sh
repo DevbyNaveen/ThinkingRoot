@@ -4,6 +4,7 @@
 set -e
 
 REPO="DevbyNaveen/ThinkingRoot"
+RELEASES_REPO="DevbyNaveen/releases"
 BINARY="root"
 INSTALL_DIR="${INSTALL_DIR:-}"
 
@@ -93,11 +94,11 @@ select_install_dir() {
 fetch_latest_version() {
   if is_cmd curl; then
     curl --tlsv1.2 --proto '=https' -fsSL \
-      "https://api.github.com/repos/${REPO}/releases/latest" \
+      "https://api.github.com/repos/${RELEASES_REPO}/releases/latest" \
       | grep '"tag_name"' | cut -d'"' -f4
   elif is_cmd wget; then
     wget -q --https-only -O- \
-      "https://api.github.com/repos/${REPO}/releases/latest" \
+      "https://api.github.com/repos/${RELEASES_REPO}/releases/latest" \
       | grep '"tag_name"' | cut -d'"' -f4
   else
     err "Neither curl nor wget found."
@@ -120,7 +121,7 @@ main() {
   VERSION="${VERSION:-$(fetch_latest_version)}"
   [ -z "$VERSION" ] && err "Could not determine latest version. Set VERSION env var manually."
 
-  BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+  BASE_URL="https://github.com/${RELEASES_REPO}/releases/download/${VERSION}"
   ASSET_URL="${BASE_URL}/${ASSET}"
   CHECKSUM_URL="${BASE_URL}/checksums.txt"
 
