@@ -1,5 +1,6 @@
 /// System prompt for the knowledge extraction LLM.
 /// Kept ≤600 tokens: schema + relation types + critical rules only.
+// Schema intentionally on one line — indenting adds ~50 tokens and would break the ≤600 token budget test.
 pub const SYSTEM_PROMPT: &str = r#"You are a knowledge extraction engine. Extract structured knowledge from source documents.
 
 Return valid JSON matching this exact schema:

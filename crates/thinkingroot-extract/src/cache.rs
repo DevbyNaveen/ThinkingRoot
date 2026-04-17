@@ -140,4 +140,21 @@ mod tests {
             ExtractionCache::cache_key("world")
         );
     }
+
+    #[test]
+    fn cache_key_embeds_prompt_version() {
+        // Same content under a different version must produce a different key.
+        // This guards the cache invalidation invariant: when PROMPT_VERSION changes,
+        // all old cache files become misses automatically.
+        let key = ExtractionCache::cache_key("hello world");
+        let key_content_only = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"hello world");
+            h.finalize().to_hex().to_string()
+        };
+        assert_ne!(
+            key, key_content_only,
+            "cache key must embed PROMPT_VERSION — if keys match, version is not being mixed in"
+        );
+    }
 }
