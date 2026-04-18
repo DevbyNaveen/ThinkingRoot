@@ -20,13 +20,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: root-linux-amd64
 
-          - os: ubuntu-latest
+          # Native ARM64 runner — no cross-compilation, no Docker issues.
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: root-linux-arm64
-            cross: true
 
-          # macOS Intel: cross-compile from ARM64 runner (macos-13 removed by GitHub).
-          # ort has no prebuilt for x86_64-apple-darwin so we supply ORT dylib manually.
+          # Cross-compile from ARM64 macOS to Intel.
+          # ort dropped x86_64-apple-darwin prebuilt in v2.0.0-rc.11, so we
+          # supply Microsoft's official ORT dylib and dynamically link.
+          # Ships as .tar.gz bundle (binary + dylib); installer extracts both.
           - os: macos-14
             target: x86_64-apple-darwin
             artifact: root-macos-amd64.tar.gz
@@ -51,11 +53,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (Linux ARM64)
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      - name: Download ONNX Runtime 1.23.2 (macOS Intel)
+      # macOS Intel: download ORT dylib and set env vars for dynamic linking.
+      - name: Download ONNX Runtime (macOS Intel)
         if: matrix.ort_manual
         run: |
           ORT_VERSION="1.23.2"
@@ -64,28 +63,26 @@ jobs:
             "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${TARBALL}" \
             -o "/tmp/${TARBALL}"
           tar -xzf "/tmp/${TARBALL}" -C /tmp
-          echo "ORT_LIB_LOCATION=/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib" >> "$GITHUB_ENV"
+          ORT_DIR="/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib"
+          echo "ORT_LIB_LOCATION=${ORT_DIR}" >> "$GITHUB_ENV"
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
-          echo "ORT_LIB_DIR=/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib" >> "$GITHUB_ENV"
+          echo "ORT_SKIP_DOWNLOAD=1" >> "$GITHUB_ENV"
 
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
-      - name: Build (cross, Linux ARM64)
-        if: matrix.cross
-        env:
-          CROSS_CONTAINER_OPTS: "-e XDG_CACHE_HOME=/tmp/ort-cache"
-        run: cross build --release --target ${{ matrix.target }} -p thinkingroot-cli
-
+      # macOS Intel: bundle binary + ORT dylib into tar.gz (binary needs dylib at runtime).
       - name: Bundle binary + ORT dylib (macOS Intel)
         if: matrix.ort_manual
         run: |
           BIN="target/${{ matrix.target }}/release/root"
+          ORT_DIR="/tmp/onnxruntime-osx-x86_64-1.23.2/lib"
           install_name_tool -add_rpath @executable_path "$BIN"
-          tar czf root-macos-amd64.tar.gz \
-            -C "target/${{ matrix.target }}/release" root \
-            -C "$ORT_LIB_DIR" libonnxruntime.1.23.2.dylib libonnxruntime.dylib
+          mkdir -p /tmp/bundle
+          cp "$BIN" /tmp/bundle/root
+          cp "${ORT_DIR}/libonnxruntime.1.23.2.dylib" /tmp/bundle/
+          cd /tmp/bundle && ln -sf libonnxruntime.1.23.2.dylib libonnxruntime.dylib
+          tar czf "$GITHUB_WORKSPACE/root-macos-amd64.tar.gz" root libonnxruntime.1.23.2.dylib libonnxruntime.dylib
 
       - name: Rename binary
         if: ${{ !matrix.ort_manual }}
@@ -117,12 +114,12 @@ jobs:
       - name: Generate checksums.txt
         run: |
           cd artifacts
-          for f in root-linux-amd64 root-linux-arm64 "root-macos-amd64.tar.gz" root-macos-arm64 root-windows-amd64.exe; do
+          for f in root-linux-amd64 root-linux-arm64 root-macos-amd64.tar.gz root-macos-arm64 root-windows-amd64.exe; do
             [ -f "$f" ] || { echo "Missing artifact: $f"; exit 1; }
           done
           sha256sum root-linux-amd64 \
                     root-linux-arm64 \
-                    "root-macos-amd64.tar.gz" \
+                    root-macos-amd64.tar.gz \
                     root-macos-arm64 \
                     root-windows-amd64.exe \
             > checksums.txt
