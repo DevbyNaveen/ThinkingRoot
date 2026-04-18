@@ -9,7 +9,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build CLI binaries for all platforms ──────────────────────────────────
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -21,18 +20,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: root-linux-amd64
 
-          # ort has a prebuilt static binary for aarch64-unknown-linux-gnu;
-          # cross downloads it during the build just like x86_64-linux.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: root-linux-arm64
             cross: true
 
-          # ort 2.0.0-rc.11 dropped the prebuilt binary for x86_64-apple-darwin.
-          # We download Microsoft's official ORT 1.23.2 dylib, build with
-          # ORT_LIB_LOCATION + ORT_PREFER_DYNAMIC_LINK=1, then embed
-          # @executable_path rpath and bundle binary + dylib as a tar.gz.
-          - os: macos-13
+          # macOS Intel: cross-compile from ARM64 runner (macos-13 removed by GitHub).
+          # ort has no prebuilt for x86_64-apple-darwin so we supply ORT dylib manually.
+          - os: macos-14
             target: x86_64-apple-darwin
             artifact: root-macos-amd64.tar.gz
             ort_manual: true
@@ -56,12 +51,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # ── Linux ARM64: install cross ─────────────────────────────────────────
       - name: Install cross (Linux ARM64)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      # ── macOS Intel: download ORT 1.23.2 dylib and set env ────────────────
       - name: Download ONNX Runtime 1.23.2 (macOS Intel)
         if: matrix.ort_manual
         run: |
@@ -71,39 +64,29 @@ jobs:
             "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${TARBALL}" \
             -o "/tmp/${TARBALL}"
           tar -xzf "/tmp/${TARBALL}" -C /tmp
-          ORT_LIB="/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib"
-          echo "ORT_LIB_LOCATION=${ORT_LIB}"        >> "$GITHUB_ENV"
-          echo "ORT_PREFER_DYNAMIC_LINK=1"           >> "$GITHUB_ENV"
-          # Store for post-build packaging
-          echo "ORT_LIB_DIR=${ORT_LIB}"              >> "$GITHUB_ENV"
+          echo "ORT_LIB_LOCATION=/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+          echo "ORT_LIB_DIR=/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib" >> "$GITHUB_ENV"
 
-      # ── Build ──────────────────────────────────────────────────────────────
       - name: Build (native)
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
-      - name: Build (cross, Linux ARM64 — full features)
+      - name: Build (cross, Linux ARM64)
         if: matrix.cross
         env:
-          XDG_CACHE_HOME: /tmp/ort-cache
+          CROSS_CONTAINER_OPTS: "-e XDG_CACHE_HOME=/tmp/ort-cache"
         run: cross build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
-      # ── macOS Intel post-build: embed rpath + bundle with dylib ───────────
       - name: Bundle binary + ORT dylib (macOS Intel)
         if: matrix.ort_manual
         run: |
           BIN="target/${{ matrix.target }}/release/root"
-          DYLIB="${ORT_LIB_DIR}/libonnxruntime.1.23.2.dylib"
-
-          # Embed @executable_path so the binary finds the dylib next to itself
           install_name_tool -add_rpath @executable_path "$BIN"
-
-          # Package binary + versioned dylib together
           tar czf root-macos-amd64.tar.gz \
             -C "target/${{ matrix.target }}/release" root \
             -C "$ORT_LIB_DIR" libonnxruntime.1.23.2.dylib libonnxruntime.dylib
 
-      # ── Rename plain binaries (all non-bundle platforms) ──────────────────
       - name: Rename binary
         if: ${{ !matrix.ort_manual }}
         shell: bash
@@ -117,7 +100,6 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  # ── Generate checksums and create GitHub Release ───────────────────────────
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
@@ -164,7 +146,6 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
 
-  # ── Trigger Homebrew formula bump ─────────────────────────────────────────
   homebrew-bump:
     name: Bump Homebrew formula
     runs-on: ubuntu-latest
