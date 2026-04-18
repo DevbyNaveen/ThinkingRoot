@@ -171,8 +171,21 @@ pub async fn execute_merge(
                         vec_ids.push(format!("claim:{cid}"));
                     }
                     for eid in candidate_entities {
-                        if main_graph.get_entity_by_id(&eid)?.is_none() {
-                            vec_ids.push(format!("entity:{eid}"));
+                        match main_graph.get_entity_by_id(&eid) {
+                            Ok(None) => {
+                                // Entity truly removed from graph — candidate for vector purge.
+                                vec_ids.push(format!("entity:{eid}"));
+                            }
+                            Ok(Some(_)) => {
+                                // Entity still exists (supported by other sources).
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "merge: failed to check existence of candidate entity '{}' (non-fatal): {}",
+                                    eid,
+                                    e
+                                );
+                            }
                         }
                     }
 
