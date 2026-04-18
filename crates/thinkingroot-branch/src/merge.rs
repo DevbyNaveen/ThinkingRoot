@@ -146,21 +146,13 @@ pub async fn execute_merge(
                 "File" | "Document" | "Markdown" | "Code"
             );
             if is_file_source && !branch_uris.contains(&uri) {
-                // Collect vector IDs *before* removal so we can purge the vector index.
-                let mut vec_ids: Vec<String> = Vec::new();
+                // Collect candidate IDs *before* removal.
+                let mut candidate_claims = Vec::new();
+                let mut candidate_entities = HashSet::new();
+
                 for (sid, _, _) in main_graph.find_sources_by_uri(&uri).unwrap_or_default() {
-                    for cid in main_graph
-                        .get_claim_ids_for_source(&sid)
-                        .unwrap_or_default()
-                    {
-                        vec_ids.push(format!("claim:{cid}"));
-                    }
-                    for eid in main_graph
-                        .get_entity_ids_for_source(&sid)
-                        .unwrap_or_default()
-                    {
-                        vec_ids.push(format!("entity:{eid}"));
-                    }
+                    candidate_claims.extend(main_graph.get_claim_ids_for_source(&sid).unwrap_or_default());
+                    candidate_entities.extend(main_graph.get_entity_ids_for_source(&sid).unwrap_or_default());
                 }
 
                 let removed = main_graph.remove_source_by_uri(&uri)?;
@@ -170,6 +162,19 @@ pub async fn execute_merge(
                         uri,
                         branch_name
                     );
+
+                    // Identify which IDs should actually be purged from the vector index.
+                    // Claims are always removed when their source is removed.
+                    // Entities are only purged if they were actually orphaned and removed from the graph store.
+                    let mut vec_ids: Vec<String> = Vec::new();
+                    for cid in candidate_claims {
+                        vec_ids.push(format!("claim:{cid}"));
+                    }
+                    for eid in candidate_entities {
+                        if main_graph.get_entity_by_id(&eid)?.is_none() {
+                            vec_ids.push(format!("entity:{eid}"));
+                        }
+                    }
 
                     // Purge stale embeddings from the main vector index.
                     if !vec_ids.is_empty() {
