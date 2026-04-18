@@ -83,12 +83,6 @@ jobs:
 
       - name: Build (cross, Linux ARM64 — full features)
         if: matrix.cross
-        # OPENSSL_VENDORED=1: ort's dev-dep on ureq with native-tls unifies native-tls
-        # across all ureq users, triggering openssl-sys. Vendoring compiles OpenSSL
-        # from source inside the cross container instead of requiring system headers.
-        env:
-          OPENSSL_STATIC: "1"
-          OPENSSL_VENDORED: "1"
         run: cross build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
       # ── macOS Intel post-build: embed rpath + bundle with dylib ───────────
