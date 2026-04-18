@@ -14,6 +14,7 @@ jobs:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -83,6 +84,8 @@ jobs:
 
       - name: Build (cross, Linux ARM64 — full features)
         if: matrix.cross
+        env:
+          XDG_CACHE_HOME: /tmp/ort-cache
         run: cross build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
       # ── macOS Intel post-build: embed rpath + bundle with dylib ───────────
