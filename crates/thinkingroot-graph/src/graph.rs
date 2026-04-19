@@ -1824,7 +1824,9 @@ impl GraphStore {
             .db
             .run_script(
                 "?[entity_id] := *claim_source_edges{claim_id, source_id: $sid}, \
-                 *claim_entity_edges{claim_id, entity_id}",
+                 *claim_entity_edges{claim_id, entity_id}
+                 ?[entity_id] := *source_entity_relations{source_id: $sid, from_id: entity_id}
+                 ?[entity_id] := *source_entity_relations{source_id: $sid, to_id: entity_id}",
                 params,
                 ScriptMutability::Immutable,
             )
