@@ -484,13 +484,15 @@ mod tests {
             .claim_source_quotes
             .insert(claim_id, "PostgreSQL stores user data".to_string());
 
-        let result = Grounder::new(GroundingConfig::default()).ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            None,
-            #[cfg(feature = "vector")]
-            None,
-        ).await;
+        let result = Grounder::new(GroundingConfig::default())
+            .ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                None,
+                #[cfg(feature = "vector")]
+                None,
+            )
+            .await;
         assert_eq!(result.claims.len(), 1);
         assert!(result.claims[0].grounding_score.unwrap() > 0.8);
     }

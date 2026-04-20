@@ -208,11 +208,12 @@ mod inner {
                     // Always include entities — they are user-agnostic structural nodes.
                     // For claims, filter by source URI when a scope is active.
                     if let Some(allowed) = allowed_source_uris
-                        && meta.starts_with("claim|") {
-                            // URI is the last pipe-delimited field.
-                            let uri = meta.rsplit('|').next().unwrap_or("");
-                            // Match by session ID substring — URIs contain the session file name.
-                            return allowed.iter().any(|sid| uri.contains(sid.as_str()));
+                        && meta.starts_with("claim|")
+                    {
+                        // URI is the last pipe-delimited field.
+                        let uri = meta.rsplit('|').next().unwrap_or("");
+                        // Match by session ID substring — URIs contain the session file name.
+                        return allowed.iter().any(|sid| uri.contains(sid.as_str()));
                     }
                     true
                 })

@@ -67,11 +67,12 @@ fn resolve_model_dir(cache_dir: Option<&Path>) -> Option<PathBuf> {
 
     // Executable-adjacent models/ (useful for offline/portable installs)
     if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent() {
-            let candidate = exe_dir.join("models");
-            if candidate.join(ONNX_FILENAME).exists() {
-                return Some(candidate);
-            }
+        && let Some(exe_dir) = exe.parent()
+    {
+        let candidate = exe_dir.join("models");
+        if candidate.join(ONNX_FILENAME).exists() {
+            return Some(candidate);
+        }
     }
 
     None
