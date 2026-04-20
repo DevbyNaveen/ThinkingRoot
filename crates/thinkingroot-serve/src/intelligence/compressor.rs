@@ -285,7 +285,7 @@ mod tests {
     fn estimate_tokens_reasonable() {
         let s = "AuthService uses RS256 for JWT signing and token validation per RFC 7519";
         let tokens = estimate_tokens(s);
-        assert!(tokens >= 12 && tokens <= 22, "got {tokens}");
+        assert!((12..=22).contains(&tokens), "got {tokens}");
     }
 
     #[test]

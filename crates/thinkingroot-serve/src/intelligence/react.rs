@@ -719,7 +719,7 @@ mod tests {
         let result = expand_temporal_query("what did Alice do last week?");
         assert!(result.is_some(), "expected a range for 'last week'");
         let (start, end) = result.unwrap();
-        assert!(start < end || start == end, "start should be <= end");
+        assert!(start <= end, "start should be <= end");
     }
 
     #[test]

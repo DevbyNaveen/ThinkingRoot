@@ -658,7 +658,7 @@ mod tests {
         // interval_after_calibration ≈ 1111ms (60 RPM @ 90%)
         // N = ceil(3000 / 1111) = ceil(2.7) = 3
         let conc = scheduler.safe_concurrency.load(Ordering::Relaxed);
-        assert!(conc >= 1 && conc <= 10, "concurrency out of bounds: {conc}");
+        assert!((1..=10).contains(&conc), "concurrency out of bounds: {conc}");
     }
 
     #[tokio::test]

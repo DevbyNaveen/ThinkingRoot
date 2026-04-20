@@ -392,13 +392,15 @@ pub async fn run_pipeline(
                 g
             }
         };
-        let mut grounded = grounder.ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            Some(&mut storage.vector),
-            #[cfg(feature = "vector")]
-            nli_pool.as_ref(),
-        ).await;
+        let mut grounded = grounder
+            .ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                Some(&mut storage.vector),
+                #[cfg(feature = "vector")]
+                nli_pool.as_ref(),
+            )
+            .await;
         thinkingroot_ground::dedup::dedup_claims(&mut grounded.claims);
         let post_count = grounded.claims.len();
         if pre_count != post_count {
@@ -808,7 +810,8 @@ pub async fn run_pipeline(
             0,
             total_vec,
             &progress,
-        ).await?;
+        )
+        .await?;
         upsert_with_vector_progress(
             &mut storage.vector,
             &new_claim_items,
@@ -816,7 +819,8 @@ pub async fn run_pipeline(
             ent_count,
             total_vec,
             &progress,
-        ).await?;
+        )
+        .await?;
         storage.vector.save()?;
 
         tracing::info!(
@@ -947,7 +951,8 @@ async fn update_vector_index_full_with_progress(
     let total = entity_items.len() + claim_items.len();
 
     let entity_count =
-        upsert_with_vector_progress(&mut storage.vector, &entity_items, 512, 0, total, progress).await?;
+        upsert_with_vector_progress(&mut storage.vector, &entity_items, 512, 0, total, progress)
+            .await?;
     let claim_count = upsert_with_vector_progress(
         &mut storage.vector,
         &claim_items,
@@ -955,7 +960,8 @@ async fn update_vector_index_full_with_progress(
         entity_count,
         total,
         progress,
-    ).await?;
+    )
+    .await?;
     storage.vector.save()?;
 
     Ok((entity_count, claim_count))

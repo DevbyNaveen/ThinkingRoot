@@ -10,8 +10,8 @@ mod inner {
 
     use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
     use std::sync::Arc;
-    use tokio::sync::{Mutex, OnceCell};
     use thinkingroot_core::{Error, Result};
+    use tokio::sync::{Mutex, OnceCell};
 
     /// Vector storage backed by fastembed for local neural embeddings.
     /// Stores embeddings in-memory with persistence to disk via JSON.
@@ -71,38 +71,48 @@ mod inner {
             let model = self.model.clone();
             let cache_dir = self.cache_dir.clone();
             tokio::spawn(async move {
-                let _ = model.get_or_try_init(|| async {
-                    tokio::task::spawn_blocking(move || {
-                        tracing::info!("loading embedding model (background)…");
-                        TextEmbedding::try_new(
-                            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                                .with_cache_dir(cache_dir)
-                                .with_show_download_progress(false),
-                        ).map(Mutex::new)
+                let _ = model
+                    .get_or_try_init(|| async {
+                        tokio::task::spawn_blocking(move || {
+                            tracing::info!("loading embedding model (background)…");
+                            TextEmbedding::try_new(
+                                InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                                    .with_cache_dir(cache_dir)
+                                    .with_show_download_progress(false),
+                            )
+                            .map(Mutex::new)
+                        })
+                        .await
+                        .map_err(|e| Error::GraphStorage(format!("model load task panicked: {e}")))?
+                        .map_err(|e| {
+                            Error::GraphStorage(format!("failed to init embedding model: {e}"))
+                        })
                     })
-                    .await
-                    .map_err(|e| Error::GraphStorage(format!("model load task panicked: {e}")))?
-                    .map_err(|e| Error::GraphStorage(format!("failed to init embedding model: {e}")))
-                }).await;
+                    .await;
             });
         }
 
         /// Ensure the ONNX model is loaded, initialising it on first call.
         async fn ensure_model(&self) -> Result<&Mutex<TextEmbedding>> {
             let cache_dir = self.cache_dir.clone();
-            self.model.get_or_try_init(|| async {
-                tokio::task::spawn_blocking(move || {
-                    tracing::info!("loading embedding model (on-demand)…");
-                    TextEmbedding::try_new(
-                        InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                            .with_cache_dir(cache_dir)
-                            .with_show_download_progress(false),
-                    ).map(Mutex::new)
+            self.model
+                .get_or_try_init(|| async {
+                    tokio::task::spawn_blocking(move || {
+                        tracing::info!("loading embedding model (on-demand)…");
+                        TextEmbedding::try_new(
+                            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                                .with_cache_dir(cache_dir)
+                                .with_show_download_progress(false),
+                        )
+                        .map(Mutex::new)
+                    })
+                    .await
+                    .map_err(|e| Error::GraphStorage(format!("model load task panicked: {e}")))?
+                    .map_err(|e| {
+                        Error::GraphStorage(format!("failed to init embedding model: {e}"))
+                    })
                 })
                 .await
-                .map_err(|e| Error::GraphStorage(format!("model load task panicked: {e}")))?
-                .map_err(|e| Error::GraphStorage(format!("failed to init embedding model: {e}")))
-            }).await
         }
 
         /// Embed and store a text with an ID and metadata string.
@@ -135,7 +145,7 @@ mod inner {
 
             let model_lock = self.ensure_model().await?;
             let mut model = model_lock.lock().await;
-            let mut embeddings = model
+            let embeddings = model
                 .embed(texts, None)
                 .map_err(|e| Error::GraphStorage(format!("batch embedding failed: {e}")))?
                 .into_iter();
@@ -152,7 +162,11 @@ mod inner {
 
         /// Search for the top-k most similar items to a query string.
         /// Returns (id, metadata, similarity_score) sorted by descending similarity.
-        pub async fn search(&mut self, query: &str, top_k: usize) -> Result<Vec<(String, String, f32)>> {
+        pub async fn search(
+            &mut self,
+            query: &str,
+            top_k: usize,
+        ) -> Result<Vec<(String, String, f32)>> {
             self.search_scoped(query, top_k, None).await
         }
 
@@ -193,13 +207,12 @@ mod inner {
                 .filter(|(_, (_, meta))| {
                     // Always include entities — they are user-agnostic structural nodes.
                     // For claims, filter by source URI when a scope is active.
-                    if let Some(allowed) = allowed_source_uris {
-                        if meta.starts_with("claim|") {
+                    if let Some(allowed) = allowed_source_uris
+                        && meta.starts_with("claim|") {
                             // URI is the last pipe-delimited field.
                             let uri = meta.rsplit('|').next().unwrap_or("");
                             // Match by session ID substring — URIs contain the session file name.
                             return allowed.iter().any(|sid| uri.contains(sid.as_str()));
-                        }
                     }
                     true
                 })
@@ -222,7 +235,6 @@ mod inner {
         /// All integers little-endian. This is ~4× smaller than JSON and loads
         /// without a temporary allocation spike.
         pub fn save(&self) -> Result<()> {
-
             let mut buf = Vec::with_capacity(self.index.len() * 400);
             buf.extend_from_slice(b"TRVEC1\n");
 
@@ -301,7 +313,7 @@ mod inner {
             let model_lock = self.ensure_model().await?;
             let mut model = model_lock.lock().await;
             model
-                .embed(texts.to_vec(), None)
+                .embed(texts, None)
                 .map_err(|e| Error::GraphStorage(format!("embedding failed: {e}")))
         }
 
@@ -417,11 +429,8 @@ mod inner {
                 Some(v)
             };
 
-            loop {
-                let id_len = match read_u32(&mut data) {
-                    Some(n) => n as usize,
-                    None => break,
-                };
+            while let Some(n) = read_u32(&mut data) {
+                let id_len = n as usize;
                 if data.len() < id_len {
                     break;
                 }
@@ -612,7 +621,7 @@ mod tests {
                 "meta3".to_string(),
             ),
         ];
-        store.upsert_batch(&items).unwrap();
+        store.upsert_batch(&items).await.unwrap();
         assert_eq!(store.len(), 3);
 
         store.remove_by_ids(&["id-1", "id-3"]);

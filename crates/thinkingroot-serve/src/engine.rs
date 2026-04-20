@@ -890,7 +890,10 @@ impl QueryEngine {
         };
         let vector_results = {
             let mut storage = handle.storage.lock().await;
-            storage.vector.search_scoped(query, top_k * 3, scope).await?
+            storage
+                .vector
+                .search_scoped(query, top_k * 3, scope)
+                .await?
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();

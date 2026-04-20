@@ -192,7 +192,7 @@ impl Grounder {
                     Some(vs) if !ml_indices.is_empty() => {
                         let ml_pairs: Vec<(&str, &str)> =
                             ml_indices.iter().map(|&j| pairs[j]).collect();
-                        let raw = crate::semantic::SemanticJudge::score_batch(&ml_pairs, *vs).await;
+                        let raw = crate::semantic::SemanticJudge::score_batch(&ml_pairs, vs).await;
                         let mut result = vec![None; chunk.len()];
                         for (k, &j) in ml_indices.iter().enumerate() {
                             result[j] = Some(raw[k]);
@@ -435,13 +435,15 @@ mod tests {
             )],
             vec![],
         );
-        let result = Grounder::new(GroundingConfig::default()).ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            None,
-            #[cfg(feature = "vector")]
-            None,
-        ).await;
+        let result = Grounder::new(GroundingConfig::default())
+            .ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                None,
+                #[cfg(feature = "vector")]
+                None,
+            )
+            .await;
         assert_eq!(result.claims.len(), 1);
         assert!(result.claims[0].grounding_score.unwrap() > 0.5);
     }
@@ -457,13 +459,15 @@ mod tests {
             )],
             vec![],
         );
-        let result = Grounder::new(GroundingConfig::default()).ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            None,
-            #[cfg(feature = "vector")]
-            None,
-        ).await;
+        let result = Grounder::new(GroundingConfig::default())
+            .ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                None,
+                #[cfg(feature = "vector")]
+                None,
+            )
+            .await;
         assert_eq!(result.claims.len(), 0);
     }
 
@@ -486,7 +490,7 @@ mod tests {
             None,
             #[cfg(feature = "vector")]
             None,
-        );
+        ).await;
         assert_eq!(result.claims.len(), 1);
         assert!(result.claims[0].grounding_score.unwrap() > 0.8);
     }
@@ -512,7 +516,8 @@ mod tests {
             None,
             #[cfg(feature = "vector")]
             None,
-        ).await;
+        )
+        .await;
         assert_eq!(result.claims.len(), 1);
         assert!(result.claims[0].confidence.value() < 0.8);
     }
@@ -525,13 +530,15 @@ mod tests {
             vec![(src, "PostgreSQL stores data in tables")],
             vec![],
         );
-        let result = Grounder::new(GroundingConfig::default()).ground(
-            extraction,
-            #[cfg(feature = "vector")]
-            None,
-            #[cfg(feature = "vector")]
-            None,
-        ).await;
+        let result = Grounder::new(GroundingConfig::default())
+            .ground(
+                extraction,
+                #[cfg(feature = "vector")]
+                None,
+                #[cfg(feature = "vector")]
+                None,
+            )
+            .await;
         // source_texts should be drained (removed) by the grounder
         assert!(result.source_texts.is_empty());
     }

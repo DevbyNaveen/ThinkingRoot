@@ -3439,14 +3439,14 @@ mod tests {
 
         // Query triples involving e1.
         let triples = store
-            .get_all_triples_involving_entities(&[eid1.clone()])
+            .get_all_triples_involving_entities(std::slice::from_ref(&eid1))
             .unwrap();
         assert_eq!(triples.len(), 1);
         assert!(triples.iter().any(|(f, t, _)| f == &eid1 && t == &eid2));
 
         // Query triples involving e2 (appears in BOTH triples).
         let triples2 = store
-            .get_all_triples_involving_entities(&[eid2.clone()])
+            .get_all_triples_involving_entities(std::slice::from_ref(&eid2))
             .unwrap();
         assert_eq!(
             triples2.len(),

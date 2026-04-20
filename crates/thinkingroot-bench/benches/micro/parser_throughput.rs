@@ -12,7 +12,7 @@ fn generate_rust_source(lines: usize) -> String {
     let mut out = String::with_capacity(lines * 60);
     out.push_str("use std::collections::HashMap;\n");
     out.push_str("use std::sync::Arc;\n");
-    out.push_str("\n");
+    out.push('\n');
 
     let mut line = 3;
     let mut fn_idx = 0;
@@ -69,7 +69,7 @@ fn generate_python_source(lines: usize) -> String {
     out.push_str("import os\n");
     out.push_str("import sys\n");
     out.push_str("from typing import Optional, List, Dict\n");
-    out.push_str("\n");
+    out.push('\n');
 
     let mut line = 4;
     let mut fn_idx = 0;
@@ -110,7 +110,7 @@ fn generate_python_source(lines: usize) -> String {
 
         out.push_str("    return result\n");
         line += 1;
-        out.push_str("\n");
+        out.push('\n');
         line += 1;
         fn_idx += 1;
     }
@@ -122,7 +122,7 @@ fn generate_python_source(lines: usize) -> String {
 fn generate_typescript_source(lines: usize) -> String {
     let mut out = String::with_capacity(lines * 55);
     out.push_str("import { EventEmitter } from 'events';\n");
-    out.push_str("\n");
+    out.push('\n');
 
     let mut line = 2;
     let mut idx = 0;
