@@ -63,14 +63,15 @@ include/
 node_modules/
 
 # Internal AI tooling — not for public repo
-.claude/
-.superpowers/
-.research/
-CLAUDE.md
-AGENTS.md
+# .claude/
+# .superpowers/
+# .research/
+# CLAUDE.md
+# AGENTS.md
+openclawResearch/
 
 # Internal design docs, specs, planning (business strategy, pricing, roadmap details)
-/docs/
+# /docs/
 
 # Local UI/Branding experiments (not for repo)
 logo_concepts.html
@@ -80,13 +81,13 @@ crates/thinkingroot-serve/src/graph.html
 crates/thinkingroot-ground/models/
 
 # Local dev artifacts
-generate_chart.py
-latency_chart.png
-benchmarks/latency_chart.png
+# generate_chart.py
+# latency_chart.png
+# benchmarks/latency_chart.png
 
 # Personal files
-*.pdf
-compag-paper/
+# *.pdf
+# compag-paper/
 
 # IDE Polishing
 .vscode/
@@ -102,3 +103,4 @@ target/wasm32-unknown-unknown/
 # Benchmarks & Evaluation
 longmemeval-workspace/
 longmemeval-data/
+

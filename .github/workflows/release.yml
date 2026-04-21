@@ -139,6 +139,8 @@ jobs:
             artifacts/root-macos-arm64
             artifacts/root-windows-amd64.exe
             artifacts/checksums.txt
+            scripts/install.sh
+            scripts/install.ps1
           generate_release_notes: false
           draft: false
           fail_on_unmatched_files: true
