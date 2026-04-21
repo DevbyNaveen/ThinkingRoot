@@ -818,15 +818,31 @@ impl QueryEngine {
             );
         } else {
             md.push_str(
-                "| Entity Type | When entity has | Expected to also have | Frequency | Sample |\n\
-                 |---|---|---|---:|---:|\n",
+                "_`Stability` = consecutive reflect cycles the pattern has survived. Gap claims use damped confidence (frequency × stability factor) until a pattern stabilizes. `Scope` is `local` for single-workspace or `cross:<id>` for aggregated patterns._\n\n",
             );
-            for (_id, etype, cond, expected, freq, sample, _last_computed, _threshold) in
-                &pattern_rows
+            md.push_str(
+                "| Entity Type | When has | Expected to have | Frequency | Sample | Stability | Scope |\n\
+                 |---|---|---|---:|---:|---:|---|\n",
+            );
+            for (
+                _id,
+                etype,
+                cond,
+                expected,
+                freq,
+                sample,
+                _last_computed,
+                _threshold,
+                _first_seen,
+                stability_runs,
+                source_scope,
+            ) in &pattern_rows
             {
                 md.push_str(&format!(
-                    "| {etype} | `{cond}` | `{expected}` | {freq_pct:.1}% | {sample} |\n",
+                    "| {etype} | `{cond}` | `{expected}` | {freq_pct:.1}% | {sample} | {stab} | {scope} |\n",
                     freq_pct = freq * 100.0,
+                    stab = stability_runs,
+                    scope = source_scope,
                 ));
             }
             md.push('\n');
@@ -2182,6 +2198,50 @@ Rules: \
                 thinkingroot_reflect::list_open_gaps(&bh.graph, entity, min_confidence)
             }
         }
+    }
+
+    /// Cross-workspace reflect — aggregate co-occurrence across every
+    /// named workspace and apply the resulting patterns to each one.
+    /// Useful when no single workspace has enough instances of a given
+    /// entity type to clear the `min_sample_size` threshold, but the
+    /// union does (e.g. 10 services × 5 repos = 50 services combined).
+    ///
+    /// Local patterns are untouched — each workspace's own `reflect()`
+    /// continues to maintain `source_scope = 'local'` rows independently.
+    pub async fn reflect_across(
+        &self,
+        workspaces: &[String],
+    ) -> Result<thinkingroot_reflect::CrossReflectResult> {
+        if workspaces.is_empty() {
+            return Err(Error::Config(
+                "reflect_across: at least one workspace required".into(),
+            ));
+        }
+        // Lock every participating storage handle up front — pattern
+        // aggregation is a read-heavy query across many graphs followed
+        // by per-workspace writes. Holding all locks for the duration
+        // serializes against concurrent writes so the aggregate sample
+        // counts match what each workspace will then be asked to gap
+        // against.
+        //
+        // BTreeMap key: workspace name (for error messages). Value:
+        // the locked guard, held for the scope of this method.
+        let mut guards: Vec<(
+            String,
+            tokio::sync::MutexGuard<'_, thinkingroot_graph::StorageEngine>,
+        )> = Vec::with_capacity(workspaces.len());
+        for name in workspaces {
+            let handle = self.get_workspace(name)?;
+            guards.push((name.clone(), handle.storage.lock().await));
+        }
+
+        let graph_refs: Vec<(String, &thinkingroot_graph::graph::GraphStore)> = guards
+            .iter()
+            .map(|(name, guard)| (name.clone(), &guard.graph))
+            .collect();
+
+        let cfg = thinkingroot_reflect::ReflectConfig::default();
+        thinkingroot_reflect::reflect_across_graphs(&graph_refs, &cfg)
     }
 
     /// Dismiss an open gap — mark the `known_unknowns` row as

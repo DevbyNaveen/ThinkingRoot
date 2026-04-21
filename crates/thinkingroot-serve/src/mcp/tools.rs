@@ -206,6 +206,21 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                 }
             },
             {
+                "name": "reflect_across",
+                "description": "Cross-workspace reflect — aggregate entity co-occurrence counts across multiple mounted workspaces and apply the combined patterns to each. Use when no single workspace has enough instances of a given entity type to clear min_sample_size but the union does. Each workspace's local patterns are unaffected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspaces": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Names of mounted workspaces to aggregate. Min 1, typically 2+."
+                        }
+                    },
+                    "required": ["workspaces"]
+                }
+            },
+            {
                 "name": "dismiss_gap",
                 "description": "Mark a gap (known-unknown) as Dismissed so future `reflect` cycles do not re-raise it. Use for legitimate absences (e.g. 'this internal service really does not need an auth claim'). Dismissed gaps are preserved for audit but stop counting toward health coverage.",
                 "inputSchema": {
@@ -1248,6 +1263,61 @@ pub async fn handle_call(
                         serde_json::json!({
                             "content": [{ "type": "text", "text": text }],
                             "gaps": serde_json::to_value(&gaps).unwrap_or(serde_json::Value::Null),
+                        }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "reflect_across" => {
+            let workspaces: Vec<String> = arguments
+                .get("workspaces")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if workspaces.is_empty() {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    "Missing or empty 'workspaces' array".to_string(),
+                );
+            }
+            match engine.reflect_across(&workspaces).await {
+                Ok(result) => {
+                    let ws_summaries: Vec<String> = result
+                        .per_workspace
+                        .iter()
+                        .map(|(name, r)| {
+                            format!(
+                                "    {name}: +{} / -{} / ={} (open={})",
+                                r.gaps_created,
+                                r.gaps_resolved,
+                                r.gaps_still_open,
+                                r.open_gaps_total
+                            )
+                        })
+                        .collect();
+                    let text = format!(
+                        "reflect_across complete\n\
+                         scope: {}\n\
+                         workspaces: {}\n\
+                         aggregate patterns: {}\n\
+                         per-workspace (+created / -resolved / =carried over):\n{}",
+                        result.scope_id,
+                        result.workspaces.join(", "),
+                        result.aggregate_patterns.len(),
+                        ws_summaries.join("\n"),
+                    );
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "result": serde_json::to_value(&result).unwrap_or(serde_json::Value::Null),
                         }),
                     )
                 }

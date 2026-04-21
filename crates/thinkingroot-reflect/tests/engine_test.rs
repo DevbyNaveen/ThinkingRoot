@@ -109,6 +109,9 @@ fn reflect_discovers_pattern_and_flags_missing_entities() {
         min_sample_size: 30,
         min_frequency: 0.70,
         max_patterns: 500,
+        // ramp=1 disables damping so the test's confidence assertion
+        // uses the raw frequency (37/40 = 0.925).
+        stability_ramp_runs: 1,
     });
     let result = engine.reflect(&fx.graph).unwrap();
 
@@ -354,6 +357,151 @@ fn dismissed_gap_not_reraised_by_reflect() {
     );
     let still_open = list_open_gaps(&fx.graph, None, 0.0).unwrap();
     assert_eq!(still_open.len(), 2, "dismissed gap must stay dismissed");
+}
+
+#[test]
+fn stability_runs_increments_across_reflect_cycles() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    seed_service_pattern(
+        &fx,
+        40,
+        37,
+        ClaimType::ApiSignature,
+        ClaimType::Requirement,
+        "GapService",
+    );
+    let engine = ReflectEngine::new(ReflectConfig::default());
+
+    // Co-occurrence is symmetric at the query level: both
+    // (ApiSignature → Requirement) and (Requirement → ApiSignature) are
+    // discovered because both directions clear the 70% threshold.
+    // Pick the specific pattern we care about (ApiSignature → Requirement).
+    fn find_pattern(
+        rows: &[(
+            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+        )],
+    ) -> &(
+        String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+    ) {
+        rows.iter()
+            .find(|r| r.2 == "ApiSignature" && r.3 == "Requirement")
+            .expect("ApiSignature→Requirement pattern must exist")
+    }
+
+    // First run — new pattern, stability_runs = 1.
+    engine.reflect(&fx.graph).unwrap();
+    let after_1 = fx.graph.reflect_load_structural_patterns().unwrap();
+    let p1 = find_pattern(&after_1);
+    assert_eq!(p1.9, 1, "new pattern must start at stability_runs=1");
+    let first_seen = p1.8;
+
+    // Second run — same graph, same pattern. Stability must increment
+    // and first_seen must be preserved.
+    engine.reflect(&fx.graph).unwrap();
+    let after_2 = fx.graph.reflect_load_structural_patterns().unwrap();
+    let p2 = find_pattern(&after_2);
+    assert_eq!(p2.9, 2, "stability_runs must bump to 2");
+    assert!(
+        (p2.8 - first_seen).abs() < 1e-9,
+        "first_seen_at must be preserved across runs"
+    );
+
+    // Third run — same again.
+    engine.reflect(&fx.graph).unwrap();
+    let after_3 = fx.graph.reflect_load_structural_patterns().unwrap();
+    let p3 = find_pattern(&after_3);
+    assert_eq!(p3.9, 3);
+}
+
+#[test]
+fn stability_damping_lowers_gap_confidence_for_new_patterns() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    seed_service_pattern(
+        &fx,
+        40,
+        37,
+        ClaimType::ApiSignature,
+        ClaimType::Requirement,
+        "GapService",
+    );
+    // Ramp = 5 with default thresholds; first run emits at 1/5 = 20% of raw.
+    let engine = ReflectEngine::new(ReflectConfig::default());
+    engine.reflect(&fx.graph).unwrap();
+
+    let gaps = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    assert_eq!(gaps.len(), 3);
+    // Raw pattern frequency is 37/40 = 0.925. With ramp=5 and stability=1:
+    // damped = 0.925 * (1/5) = 0.185. Allow small epsilon.
+    let expected_damped = 0.925 * 0.2;
+    for g in &gaps {
+        assert!(
+            (g.confidence - expected_damped).abs() < 0.01,
+            "new-pattern gap should carry damped confidence ~{expected_damped:.3}; got {:.3}",
+            g.confidence
+        );
+    }
+}
+
+#[test]
+fn stability_damping_reaches_full_confidence_after_ramp() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    seed_service_pattern(
+        &fx,
+        40,
+        37,
+        ClaimType::ApiSignature,
+        ClaimType::Requirement,
+        "GapService",
+    );
+    let engine = ReflectEngine::new(ReflectConfig {
+        stability_ramp_runs: 3,
+        ..ReflectConfig::default()
+    });
+
+    // Three runs — pattern should reach stability_runs=3, full confidence.
+    for _ in 0..3 {
+        engine.reflect(&fx.graph).unwrap();
+    }
+    let gaps = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    assert_eq!(gaps.len(), 3);
+    for g in &gaps {
+        // Expected = raw frequency (37/40 = 0.925).
+        assert!(
+            (g.confidence - 0.925).abs() < 0.01,
+            "after ramp, gaps should emit at raw frequency; got {:.3}",
+            g.confidence
+        );
+    }
+}
+
+#[test]
+fn stability_ramp_1_disables_damping() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    seed_service_pattern(
+        &fx,
+        40,
+        37,
+        ClaimType::ApiSignature,
+        ClaimType::Requirement,
+        "GapService",
+    );
+    let engine = ReflectEngine::new(ReflectConfig {
+        stability_ramp_runs: 1,
+        ..ReflectConfig::default()
+    });
+    engine.reflect(&fx.graph).unwrap();
+    let gaps = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    for g in &gaps {
+        assert!(
+            (g.confidence - 0.925).abs() < 0.01,
+            "ramp=1 must disable damping; got {:.3}",
+            g.confidence
+        );
+    }
 }
 
 #[test]

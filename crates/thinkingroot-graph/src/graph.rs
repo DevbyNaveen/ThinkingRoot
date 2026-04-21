@@ -24,8 +24,81 @@ impl GraphStore {
         let store = Self { db };
         store.create_schema()?;
         store.migrate_claims_extraction_tier()?;
+        store.migrate_structural_patterns_schema()?;
         store.create_indexes()?;
         Ok(store)
+    }
+
+    /// Reflect (Phase 9) schema migration.
+    ///
+    /// Adds `first_seen_at`, `stability_runs`, and `source_scope` columns
+    /// to `structural_patterns` when they are missing. Since the
+    /// relation is fully re-derivable from graph state on every
+    /// `reflect()` run, the migration just drops and recreates with the
+    /// new shape — no data to preserve.
+    ///
+    /// Idempotent: running against an already-migrated DB is a fast
+    /// probe-and-return.
+    fn migrate_structural_patterns_schema(&self) -> Result<()> {
+        // Probe: does the new column exist?
+        let probe = self.db.run_script(
+            "?[x] := *structural_patterns{source_scope: x}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if probe.is_ok() {
+            return Ok(()); // new schema in place
+        }
+
+        // Either the column is missing or the relation isn't created yet.
+        // If the error is "relation not found", create_schema will handle
+        // it on first run — nothing to migrate.
+        if let Err(e) = &probe {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("does not exist") {
+                return Ok(());
+            }
+        }
+
+        // Drop indexes first — :replace fails while indexes are attached.
+        for drop_idx in ["::index drop structural_patterns:by_entity_type"] {
+            // Index may or may not exist yet; swallow the "not found" error.
+            let _ = self.db.run_script(
+                drop_idx,
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            );
+        }
+
+        // Replace the relation with the new schema. Loses existing rows,
+        // which is safe because reflect() rewrites them in full each run.
+        self.db
+            .run_script(
+                ":replace structural_patterns {
+                    id: String
+                    =>
+                    entity_type: String,
+                    condition_claim_type: String,
+                    expected_claim_type: String,
+                    frequency: Float default 0.0,
+                    sample_size: Int default 0,
+                    last_computed: Float default 0.0,
+                    min_sample_threshold: Int default 30,
+                    first_seen_at: Float default 0.0,
+                    stability_runs: Int default 1,
+                    source_scope: String default 'local'
+                }",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!(
+                    "structural_patterns migration failed: {e}"
+                ))
+            })?;
+
+        tracing::info!("migrated structural_patterns — added first_seen_at, stability_runs, source_scope");
+        Ok(())
     }
 
     /// Create all relations (tables) if they don't exist.
@@ -177,6 +250,15 @@ impl GraphStore {
             // have `condition_claim_type` also have `expected_claim_type`
             // with `frequency` probability across `sample_size` instances."
             // Rewritten in full on every `reflect()` run — not append-only.
+            //
+            // `first_seen_at` + `stability_runs` power pattern decay:
+            // a pattern becomes "trusted" only after it persists across
+            // multiple reflect cycles, preventing one-off noise from
+            // immediately firing high-confidence gap claims.
+            //
+            // `source_scope` distinguishes single-workspace patterns
+            // ("local") from cross-workspace aggregated patterns
+            // ("cross:<id>") so consumers can filter by origin.
             ":create structural_patterns {
                 id: String
                 =>
@@ -186,7 +268,10 @@ impl GraphStore {
                 frequency: Float default 0.0,
                 sample_size: Int default 0,
                 last_computed: Float default 0.0,
-                min_sample_threshold: Int default 30
+                min_sample_threshold: Int default 30,
+                first_seen_at: Float default 0.0,
+                stability_runs: Int default 1,
+                source_scope: String default 'local'
             }",
             // Reflect (Phase 9) — per-entity gap records. One row per
             // (entity, expected_claim_type) where the entity matches a
@@ -1450,25 +1535,46 @@ impl GraphStore {
         Ok(result.rows.first().map(|r| dv_to_string(&r[0])))
     }
 
-    /// Truncate and re-populate the `structural_patterns` relation.
-    /// Patterns are always re-derived in full, so diffing is unnecessary.
+    /// Replace patterns whose `source_scope` matches the given scope,
+    /// leaving patterns at other scopes intact. Use `"local"` for the
+    /// single-workspace reflect cycle and `"cross:<id>"` for
+    /// cross-workspace aggregates — they coexist in the same table.
     ///
     /// Row tuple order: `(id, entity_type, condition_claim_type,
     /// expected_claim_type, frequency, sample_size, last_computed,
-    /// min_sample_threshold)`.
+    /// min_sample_threshold, first_seen_at, stability_runs, source_scope)`.
+    ///
+    /// Every row's `source_scope` must equal the `scope` parameter;
+    /// mismatches are a programming error and the function rejects
+    /// them up front.
     #[allow(clippy::type_complexity)]
-    pub fn reflect_rewrite_patterns(
+    pub fn reflect_rewrite_patterns_for_scope(
         &self,
-        rows: &[(String, String, String, String, f64, usize, f64, usize)],
+        scope: &str,
+        rows: &[(
+            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+        )],
     ) -> Result<()> {
+        for r in rows {
+            if r.10 != scope {
+                return Err(Error::GraphStorage(format!(
+                    "reflect_rewrite_patterns_for_scope: row scope '{}' does not match requested scope '{}'",
+                    r.10, scope
+                )));
+            }
+        }
+        let mut params = BTreeMap::new();
+        params.insert("scope".into(), DataValue::Str(scope.to_string().into()));
         // Row-level delete via subquery. `::remove` would be simpler but
         // cozo rejects it while any `::index` is attached — and we have
-        // `structural_patterns:by_entity_type` to keep.
+        // `structural_patterns:by_entity_type` to keep. We scope the
+        // delete by `source_scope` so local and cross patterns don't
+        // trample each other.
         self.db
             .run_script(
-                r#"?[id] := *structural_patterns{id}
+                r#"?[id] := *structural_patterns{id, source_scope: $scope}
                 :rm structural_patterns {id}"#,
-                BTreeMap::new(),
+                params,
                 ScriptMutability::Mutable,
             )
             .map_err(|e| Error::GraphStorage(format!("truncate structural_patterns: {e}")))?;
@@ -1489,6 +1595,9 @@ impl GraphStore {
                     DataValue::Num(Num::Int(r.5 as i64)),
                     DataValue::Num(Num::Float(r.6)),
                     DataValue::Num(Num::Int(r.7 as i64)),
+                    DataValue::Num(Num::Float(r.8)),
+                    DataValue::Num(Num::Int(r.9 as i64)),
+                    DataValue::Str(r.10.clone().into()),
                 ])
             })
             .collect();
@@ -1496,11 +1605,13 @@ impl GraphStore {
         params.insert("rows".into(), DataValue::List(data_rows));
         self.query(
             r#"?[id, entity_type, condition_claim_type, expected_claim_type,
-                 frequency, sample_size, last_computed, min_sample_threshold] <- $rows
+                 frequency, sample_size, last_computed, min_sample_threshold,
+                 first_seen_at, stability_runs, source_scope] <- $rows
             :put structural_patterns {
                 id =>
                 entity_type, condition_claim_type, expected_claim_type,
-                frequency, sample_size, last_computed, min_sample_threshold
+                frequency, sample_size, last_computed, min_sample_threshold,
+                first_seen_at, stability_runs, source_scope
             }"#,
             params,
         )?;
@@ -1511,20 +1622,26 @@ impl GraphStore {
     ///
     /// Returned tuple: `(id, entity_type, condition_claim_type,
     /// expected_claim_type, frequency, sample_size, last_computed,
-    /// min_sample_threshold)`.
+    /// min_sample_threshold, first_seen_at, stability_runs, source_scope)`.
     #[allow(clippy::type_complexity)]
     pub fn reflect_load_structural_patterns(
         &self,
-    ) -> Result<Vec<(String, String, String, String, f64, usize, f64, usize)>> {
+    ) -> Result<
+        Vec<(
+            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+        )>,
+    > {
         let result = self
             .db
             .run_script(
-                r#"?[id, etype, cond, expected, freq, sample, last_computed, threshold] :=
+                r#"?[id, etype, cond, expected, freq, sample, last_computed, threshold,
+                     first_seen_at, stability_runs, source_scope] :=
                     *structural_patterns{id, entity_type: etype,
                                          condition_claim_type: cond,
                                          expected_claim_type: expected,
                                          frequency: freq, sample_size: sample,
-                                         last_computed, min_sample_threshold: threshold}"#,
+                                         last_computed, min_sample_threshold: threshold,
+                                         first_seen_at, stability_runs, source_scope}"#,
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )
@@ -1545,6 +1662,9 @@ impl GraphStore {
                     count_from_single(&row[5]),
                     dv_to_float(&row[6]),
                     count_from_single(&row[7]),
+                    dv_to_float(&row[8]),
+                    count_from_single(&row[9]) as u32,
+                    dv_to_string(&row[10]),
                 )
             })
             .collect())
