@@ -319,6 +319,38 @@ pub fn count_open_gaps(graph: &GraphStore) -> Result<usize> {
     graph.reflect_count_open_known_unknowns()
 }
 
+/// Transition an open gap to `dismissed` so future `reflect()` cycles
+/// honor the user's "this isn't actually missing" signal instead of
+/// re-raising the gap. No-op (returns `Ok`) if the gap id doesn't exist.
+///
+/// Dismissed gaps are still stored for audit — they just stop counting
+/// toward the health-coverage score and stop appearing in `list_open_gaps`.
+pub fn dismiss_gap(graph: &GraphStore, gap_id: &str) -> Result<()> {
+    let Some(existing) = graph
+        .reflect_load_known_unknowns()?
+        .into_iter()
+        .find(|row| row.0 == gap_id)
+    else {
+        // No such gap — nothing to do. Intentionally not an error: a
+        // double-dismiss or a dismiss-after-reflect-removed-it is benign.
+        return Ok(());
+    };
+    let (id, eid, pid, expected, conf, _prior_status, created, _prior_resolved, _prior_by) =
+        existing;
+    let now = chrono::Utc::now().timestamp() as f64;
+    graph.reflect_upsert_known_unknown(
+        &id,
+        &eid,
+        &pid,
+        &expected,
+        conf,
+        GapStatus::Dismissed.as_str(),
+        created,
+        now,
+        "", // resolver is only meaningful for Resolved status
+    )
+}
+
 // ---------------------------------------------------------------------------
 // ID helpers — deterministic so re-runs are idempotent.
 // ---------------------------------------------------------------------------

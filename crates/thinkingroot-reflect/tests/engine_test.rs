@@ -314,3 +314,52 @@ fn gap_status_parses_roundtrip() {
     }
     assert!(GapStatus::from_str("something-else").is_none());
 }
+
+#[test]
+fn dismissed_gap_not_reraised_by_reflect() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    seed_service_pattern(
+        &fx,
+        40,
+        37,
+        ClaimType::ApiSignature,
+        ClaimType::Requirement,
+        "GapService",
+    );
+    let engine = ReflectEngine::new(ReflectConfig::default());
+    engine.reflect(&fx.graph).unwrap();
+
+    // Three gaps were created by reflect. Dismiss the first one.
+    let open = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    assert_eq!(open.len(), 3);
+    let all = fx.graph.reflect_load_known_unknowns().unwrap();
+    assert_eq!(all.len(), 3);
+    let target_gap_id = all[0].0.clone();
+
+    thinkingroot_reflect::dismiss_gap(&fx.graph, &target_gap_id).unwrap();
+    let open_after_dismiss = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    assert_eq!(
+        open_after_dismiss.len(),
+        2,
+        "dismissed gap must drop from open list"
+    );
+
+    // A second reflect run must not re-raise the dismissed gap.
+    let r2 = engine.reflect(&fx.graph).unwrap();
+    assert_eq!(
+        r2.gaps_created, 0,
+        "dismissed gap must not be re-raised; got {} new gaps",
+        r2.gaps_created
+    );
+    let still_open = list_open_gaps(&fx.graph, None, 0.0).unwrap();
+    assert_eq!(still_open.len(), 2, "dismissed gap must stay dismissed");
+}
+
+#[test]
+fn dismiss_is_idempotent_on_missing_id() {
+    let dir = tempdir().unwrap();
+    let fx = Fixture::new(dir.path());
+    // Dismissing a nonexistent gap id is a no-op, not an error.
+    thinkingroot_reflect::dismiss_gap(&fx.graph, "ku-nonexistent-deadbeef").unwrap();
+}

@@ -217,7 +217,15 @@ const ARTIFACT_TYPES: &[&str] = &[
     "runbook",
     "health-report",
     "entity-pages",
+    "gap-report",
 ];
+
+/// Artifacts rendered on-demand from live graph state rather than read
+/// from a pre-written file in `.thinkingroot/artifacts/`. These are
+/// always "available" — there is no disk file to check.
+fn is_dynamic_artifact(artifact_type: &str) -> bool {
+    matches!(artifact_type, "gap-report")
+}
 
 // ---------------------------------------------------------------------------
 // Pagination helper
@@ -656,7 +664,9 @@ impl QueryEngine {
 
         let mut result = Vec::with_capacity(ARTIFACT_TYPES.len());
         for &atype in ARTIFACT_TYPES {
-            let available = if let Some(filename) = artifact_filename(atype) {
+            let available = if is_dynamic_artifact(atype) {
+                true
+            } else if let Some(filename) = artifact_filename(atype) {
                 artifacts_dir.join(filename).exists()
             } else {
                 false
@@ -689,6 +699,11 @@ impl QueryEngine {
 
     /// Read the content of a specific artifact.
     pub async fn get_artifact(&self, ws: &str, artifact_type: &str) -> Result<ArtifactContent> {
+        // Dynamic artifacts are rendered on-demand from live graph state.
+        if is_dynamic_artifact(artifact_type) {
+            return self.render_dynamic_artifact(ws, artifact_type).await;
+        }
+
         let handle = self.get_workspace(ws)?;
         let filename = artifact_filename(artifact_type).ok_or_else(|| Error::Compilation {
             artifact_type: artifact_type.to_string(),
@@ -748,6 +763,115 @@ impl QueryEngine {
             artifact_type: artifact_type.to_string(),
             content,
         })
+    }
+
+    /// Render a dynamic artifact (not backed by a file on disk) by
+    /// querying live graph state. Currently covers `gap-report`.
+    async fn render_dynamic_artifact(
+        &self,
+        ws: &str,
+        artifact_type: &str,
+    ) -> Result<ArtifactContent> {
+        let content = match artifact_type {
+            "gap-report" => self.render_gap_report(ws).await?,
+            other => {
+                return Err(Error::Compilation {
+                    artifact_type: other.to_string(),
+                    message: format!("unknown dynamic artifact type: {other}"),
+                });
+            }
+        };
+        Ok(ArtifactContent {
+            artifact_type: artifact_type.to_string(),
+            content,
+        })
+    }
+
+    /// Render `gap-report.md` — a human-readable markdown dashboard of
+    /// the patterns Phase 9 Reflect has discovered and the gaps those
+    /// patterns imply for specific entities.
+    ///
+    /// Always reflects *current* state — if the reflect cycle hasn't run
+    /// yet, the report is accurate ("no patterns discovered yet").
+    async fn render_gap_report(&self, ws: &str) -> Result<String> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let graph = &storage.graph;
+
+        // Load patterns (denormalized enough for the report).
+        let pattern_rows = graph.reflect_load_structural_patterns()?;
+        let gaps = thinkingroot_reflect::list_open_gaps(graph, None, 0.0)?;
+        let total_open = graph.reflect_count_open_known_unknowns()?;
+
+        let mut md = String::new();
+        md.push_str(&format!(
+            "# Gap Report — `{ws}`\n\n\
+             _Generated from live graph state. No cron, no compile step — this report reflects the graph as of now._\n\n"
+        ));
+
+        // ── Patterns ──────────────────────────────────────────────────
+        md.push_str("## Discovered Patterns\n\n");
+        if pattern_rows.is_empty() {
+            md.push_str(
+                "_No patterns discovered yet. Run the `reflect` tool after compiling \
+                 enough entities (≥30 of the same type) to establish co-occurrence signal._\n\n",
+            );
+        } else {
+            md.push_str(
+                "| Entity Type | When entity has | Expected to also have | Frequency | Sample |\n\
+                 |---|---|---|---:|---:|\n",
+            );
+            for (_id, etype, cond, expected, freq, sample, _last_computed, _threshold) in
+                &pattern_rows
+            {
+                md.push_str(&format!(
+                    "| {etype} | `{cond}` | `{expected}` | {freq_pct:.1}% | {sample} |\n",
+                    freq_pct = freq * 100.0,
+                ));
+            }
+            md.push('\n');
+        }
+
+        // ── Open gaps ─────────────────────────────────────────────────
+        md.push_str(&format!("## Open Gaps ({total_open})\n\n"));
+        if gaps.is_empty() {
+            md.push_str(
+                "_No open gaps at any confidence. Either no patterns have been discovered \
+                 yet, or every entity matching a pattern's condition also carries the expected claim._\n",
+            );
+        } else {
+            // Group by entity_type for readability.
+            use std::collections::BTreeMap;
+            let mut by_type: BTreeMap<&str, Vec<&thinkingroot_reflect::GapReport>> =
+                BTreeMap::new();
+            for g in &gaps {
+                by_type.entry(g.entity_type.as_str()).or_default().push(g);
+            }
+            for (etype, group) in by_type {
+                md.push_str(&format!("### {etype} ({} gap(s))\n\n", group.len()));
+                for g in group {
+                    md.push_str(&format!(
+                        "- **{ename}** — expected `{expected}` @ {pct:.0}% (sample: {n})\n  > {reason}\n",
+                        ename = g.entity_name,
+                        expected = g.expected_claim_type,
+                        pct = g.confidence * 100.0,
+                        n = g.sample_size,
+                        reason = g.reason,
+                    ));
+                }
+                md.push('\n');
+            }
+        }
+
+        // ── How to act ────────────────────────────────────────────────
+        md.push_str(
+            "## How to act on this report\n\n\
+             - **Fill a gap** — add the expected claim for the entity (e.g. via `contribute` or a new source). Next `reflect` cycle will mark it resolved automatically.\n\
+             - **Dismiss a false positive** — call `dismiss_gap` with the gap id. Dismissed gaps are not re-raised and do not penalize health coverage.\n\
+             - **Lower the noise floor** — if too many weak patterns fire, raise `ReflectConfig::min_frequency` (default 0.70) or `min_sample_size` (default 30).\n",
+        );
+
+        Ok(md)
     }
 
     /// Run health/verification checks on the workspace.
@@ -1984,12 +2108,40 @@ Rules: \
         &self,
         ws: &str,
     ) -> Result<thinkingroot_reflect::ReflectResult> {
+        self.reflect_branched(ws, None).await
+    }
+
+    /// Branch-aware variant of `reflect`.
+    ///
+    /// - `branch = None` (or `Some("main")`) — runs against the mounted
+    ///   workspace's primary `graph.db`, holding the storage mutex.
+    /// - `branch = Some(name)` — runs against the branch's copy-on-write
+    ///   `graph.db` via the `BranchEngineCache`. The branch has its own
+    ///   `structural_patterns` / `known_unknowns` relations (the tables
+    ///   were copied from main at branch create time), so the reflect
+    ///   result is fully branch-scoped.
+    pub async fn reflect_branched(
+        &self,
+        ws: &str,
+        branch: Option<&str>,
+    ) -> Result<thinkingroot_reflect::ReflectResult> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
         let engine = thinkingroot_reflect::ReflectEngine::new(
             thinkingroot_reflect::ReflectConfig::default(),
         );
-        engine.reflect(&storage.graph)
+        match branch {
+            None | Some("main") => {
+                let storage = handle.storage.lock().await;
+                engine.reflect(&storage.graph)
+            }
+            Some(branch_name) => {
+                let bh = self
+                    .branch_engines
+                    .get_or_open(&handle.root_path, branch_name)
+                    .await?;
+                engine.reflect(&bh.graph)
+            }
+        }
     }
 
     /// List open gap reports (known-unknowns) for a workspace. Served
@@ -2001,9 +2153,62 @@ Rules: \
         entity: Option<&str>,
         min_confidence: f64,
     ) -> Result<Vec<thinkingroot_reflect::GapReport>> {
+        self.list_gaps_branched(ws, entity, min_confidence, None).await
+    }
+
+    /// Branch-aware variant of `list_gaps`.
+    pub async fn list_gaps_branched(
+        &self,
+        ws: &str,
+        entity: Option<&str>,
+        min_confidence: f64,
+        branch: Option<&str>,
+    ) -> Result<Vec<thinkingroot_reflect::GapReport>> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        thinkingroot_reflect::list_open_gaps(&storage.graph, entity, min_confidence)
+        match branch {
+            None | Some("main") => {
+                let storage = handle.storage.lock().await;
+                thinkingroot_reflect::list_open_gaps(
+                    &storage.graph,
+                    entity,
+                    min_confidence,
+                )
+            }
+            Some(branch_name) => {
+                let bh = self
+                    .branch_engines
+                    .get_or_open(&handle.root_path, branch_name)
+                    .await?;
+                thinkingroot_reflect::list_open_gaps(&bh.graph, entity, min_confidence)
+            }
+        }
+    }
+
+    /// Dismiss an open gap — mark the `known_unknowns` row as
+    /// `Dismissed`. Subsequent `reflect()` cycles respect this status and
+    /// do not re-raise the gap as open, so agents can suppress known
+    /// false positives ("this service legitimately has no auth — it's
+    /// internal only"). Branch-aware via `branch` param.
+    pub async fn dismiss_gap(
+        &self,
+        ws: &str,
+        gap_id: &str,
+        branch: Option<&str>,
+    ) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        match branch {
+            None | Some("main") => {
+                let storage = handle.storage.lock().await;
+                thinkingroot_reflect::dismiss_gap(&storage.graph, gap_id)
+            }
+            Some(branch_name) => {
+                let bh = self
+                    .branch_engines
+                    .get_or_open(&handle.root_path, branch_name)
+                    .await?;
+                thinkingroot_reflect::dismiss_gap(&bh.graph, gap_id)
+            }
+        }
     }
 
     /// Roll back a previously executed merge by restoring the most recent
