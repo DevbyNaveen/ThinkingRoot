@@ -35,6 +35,30 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
+/// Structured error classification carried in `JsonRpcError::data`.
+///
+/// HelloRoot's orchestrator reads this to decide whether to retry, fall back,
+/// or escalate. Without it, every `-32603` looks the same.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCategory {
+    /// Transient — retry may succeed (provider 5xx, timeout, network flake).
+    Transient,
+    /// Permanent — retry will NOT succeed (validation failure, conflict, 4xx).
+    Permanent,
+    /// Usage — caller mistake (invalid params, unknown tool).
+    Usage,
+}
+
+/// Serialized into `JsonRpcError::data` so clients can make retry decisions.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ErrorData {
+    pub retryable: bool,
+    pub category: ErrorCategory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u32>,
+}
+
 impl JsonRpcResponse {
     pub fn success(id: Option<Value>, result: Value) -> Self {
         Self {
@@ -45,6 +69,9 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Unclassified error — legacy shape. New code should prefer
+    /// [`Self::error_transient`], [`Self::error_permanent`], or
+    /// [`Self::error_usage`] so clients can reason about retries.
     pub fn error(id: Option<Value>, code: i32, message: String) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -56,6 +83,127 @@ impl JsonRpcResponse {
                 data: None,
             }),
         }
+    }
+
+    /// Transient error — retry may succeed. Prefer this for provider 5xx,
+    /// timeouts, network flakes, and locked resources.
+    pub fn error_transient(
+        id: Option<Value>,
+        code: i32,
+        message: String,
+        retry_after_ms: Option<u32>,
+    ) -> Self {
+        Self::error_with_data(
+            id,
+            code,
+            message,
+            ErrorData {
+                retryable: true,
+                category: ErrorCategory::Transient,
+                retry_after_ms,
+            },
+        )
+    }
+
+    /// Permanent error — retry will NOT succeed without state change.
+    /// Prefer this for validation failures, conflicts, not-found, and 4xx.
+    pub fn error_permanent(id: Option<Value>, code: i32, message: String) -> Self {
+        Self::error_with_data(
+            id,
+            code,
+            message,
+            ErrorData {
+                retryable: false,
+                category: ErrorCategory::Permanent,
+                retry_after_ms: None,
+            },
+        )
+    }
+
+    /// Caller-error — invalid params, unknown method, malformed request.
+    pub fn error_usage(id: Option<Value>, code: i32, message: String) -> Self {
+        Self::error_with_data(
+            id,
+            code,
+            message,
+            ErrorData {
+                retryable: false,
+                category: ErrorCategory::Usage,
+                retry_after_ms: None,
+            },
+        )
+    }
+
+    fn error_with_data(
+        id: Option<Value>,
+        code: i32,
+        message: String,
+        data: ErrorData,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: Some(serde_json::to_value(data).unwrap_or(Value::Null)),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn transient_error_serializes_retry_metadata() {
+        let resp = JsonRpcResponse::error_transient(
+            Some(Value::from(1)),
+            -32603,
+            "upstream timeout".to_string(),
+            Some(500),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let data = &json["error"]["data"];
+        assert_eq!(data["retryable"], Value::Bool(true));
+        assert_eq!(data["category"], Value::String("transient".to_string()));
+        assert_eq!(data["retry_after_ms"], Value::from(500));
+    }
+
+    #[test]
+    fn permanent_error_marks_not_retryable() {
+        let resp = JsonRpcResponse::error_permanent(
+            None,
+            -32602,
+            "validation failed".to_string(),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let data = &json["error"]["data"];
+        assert_eq!(data["retryable"], Value::Bool(false));
+        assert_eq!(data["category"], Value::String("permanent".to_string()));
+        assert!(data.get("retry_after_ms").is_none() || data["retry_after_ms"].is_null());
+    }
+
+    #[test]
+    fn usage_error_is_permanent_and_categorized() {
+        let resp = JsonRpcResponse::error_usage(
+            None,
+            -32602,
+            "missing field `question`".to_string(),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let data = &json["error"]["data"];
+        assert_eq!(data["retryable"], Value::Bool(false));
+        assert_eq!(data["category"], Value::String("usage".to_string()));
+    }
+
+    #[test]
+    fn legacy_error_has_no_data() {
+        let resp = JsonRpcResponse::error(None, -32603, "legacy path".to_string());
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["error"].get("data").is_none() || json["error"]["data"].is_null());
     }
 }
 
@@ -154,6 +302,16 @@ async fn maybe_auto_create_branch(
     }
 }
 
+#[tracing::instrument(
+    name = "mcp.dispatch",
+    skip(request, engine, sessions),
+    fields(
+        method = %request.method,
+        session_id = %session_id,
+        workspace = default_workspace.unwrap_or("<none>"),
+        tool = tracing::field::Empty,
+    ),
+)]
 pub async fn dispatch(
     request: &JsonRpcRequest,
     engine: &crate::engine::QueryEngine,
@@ -162,6 +320,13 @@ pub async fn dispatch(
     sessions: &crate::intelligence::session::SessionStore,
 ) -> JsonRpcResponse {
     let id = request.id.clone();
+    // If this is a tools/call, record the tool name as a span field so trace
+    // consumers can filter by tool without parsing params.
+    if request.method == "tools/call" {
+        if let Some(name) = request.params.get("name").and_then(|v| v.as_str()) {
+            tracing::Span::current().record("tool", name);
+        }
+    }
     match request.method.as_str() {
         "initialize" => {
             let requested = request

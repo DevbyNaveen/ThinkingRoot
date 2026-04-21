@@ -13,6 +13,7 @@ fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"))
 }
 
+#[tracing::instrument(name = "mcp.tools.list", skip_all)]
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     let tools = serde_json::json!({
         "tools": [
@@ -346,6 +347,15 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(id, tools)
 }
 
+#[tracing::instrument(
+    name = "mcp.tools.call",
+    skip(params, engine, sessions),
+    fields(
+        tool = tracing::field::Empty,
+        workspace = tracing::field::Empty,
+        session_id = %session_id,
+    ),
+)]
 pub async fn handle_call(
     id: Option<Value>,
     params: &Value,
@@ -367,6 +377,11 @@ pub async fn handle_call(
         .and_then(|v| v.as_str())
         .or(default_ws)
         .unwrap_or("default");
+
+    // Populate the span's pre-declared Empty fields now that we've parsed
+    // the params. Lets trace consumers filter by tool + workspace.
+    tracing::Span::current().record("tool", tool_name);
+    tracing::Span::current().record("workspace", ws);
 
     match tool_name {
         // ── Intelligent memory ask (Phase 3.6 — full hybrid pipeline) ─────
