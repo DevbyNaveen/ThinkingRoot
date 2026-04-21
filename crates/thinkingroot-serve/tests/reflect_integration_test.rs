@@ -139,10 +139,158 @@ async fn reflect_and_gaps_are_advertised_in_mcp_tools_list() {
         .iter()
         .filter_map(|t| t["name"].as_str().map(String::from))
         .collect();
-    for expected in ["reflect", "gaps"] {
+    for expected in ["reflect", "gaps", "dismiss_gap"] {
         assert!(
             names.iter().any(|n| n == expected),
             "MCP tools/list missing '{expected}'"
         );
     }
+}
+
+#[tokio::test]
+async fn reflect_branched_runs_against_branch_graph() {
+    let (_dir, root) = setup_ws_with_pattern().await;
+    let mut engine = QueryEngine::new();
+    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+
+    // Reflect on main — establishes 3 gaps.
+    let main_result = engine.reflect_branched("demo", None).await.unwrap();
+    assert_eq!(main_result.open_gaps_total, 3);
+
+    // Create a branch. The branch's graph.db inherits main's gaps +
+    // pattern state because snapshot::create_branch_layout copies it.
+    thinkingroot_branch::create_branch(&root, "feat/fill-gaps", "main", None)
+        .await
+        .unwrap();
+
+    // Branch-scoped list should see the same 3 gaps (inherited at fork).
+    let branch_gaps = engine
+        .list_gaps_branched("demo", None, 0.0, Some("feat/fill-gaps"))
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_gaps.len(),
+        3,
+        "branch inherits main's gaps at fork time"
+    );
+
+    // Reflect on the branch without adding anything — still 3 gaps.
+    let branch_result = engine
+        .reflect_branched("demo", Some("feat/fill-gaps"))
+        .await
+        .unwrap();
+    assert_eq!(branch_result.open_gaps_total, 3);
+    assert_eq!(
+        branch_result.gaps_created, 0,
+        "branch reflect should re-discover same gaps (already present)"
+    );
+
+    // Main's state must be untouched (no cross-contamination).
+    let main_gaps = engine.list_gaps("demo", None, 0.0).await.unwrap();
+    assert_eq!(main_gaps.len(), 3);
+}
+
+#[tokio::test]
+async fn gap_report_artifact_renders_with_patterns_and_gaps() {
+    let (_dir, root) = setup_ws_with_pattern().await;
+    let mut engine = QueryEngine::new();
+    engine.mount("demo".to_string(), root).await.unwrap();
+
+    // Empty state — no reflect yet. Artifact should render gracefully.
+    let pre = engine.get_artifact("demo", "gap-report").await.unwrap();
+    assert_eq!(pre.artifact_type, "gap-report");
+    assert!(
+        pre.content.contains("No patterns discovered yet"),
+        "pre-reflect report must note absence of patterns; got:\n{}",
+        pre.content
+    );
+
+    engine.reflect("demo").await.unwrap();
+
+    // Post-reflect — patterns + gaps section populated.
+    let post = engine.get_artifact("demo", "gap-report").await.unwrap();
+    assert!(
+        post.content.contains("| Service |"),
+        "patterns table must include Service row; got:\n{}",
+        post.content
+    );
+    assert!(
+        post.content.contains("`ApiSignature`"),
+        "patterns table must mention the condition claim type"
+    );
+    assert!(
+        post.content.contains("`Requirement`"),
+        "patterns table must mention the expected claim type"
+    );
+    assert!(
+        post.content.contains("Open Gaps (3)"),
+        "open gap count must appear in header"
+    );
+    assert!(
+        post.content.contains("**GapSvc37**")
+            && post.content.contains("**GapSvc38**")
+            && post.content.contains("**GapSvc39**"),
+        "all three gap entities must appear in the report"
+    );
+    assert!(
+        post.content.contains("dismiss_gap"),
+        "report must explain the dismiss workflow"
+    );
+}
+
+#[tokio::test]
+async fn gap_report_advertised_in_list_artifacts_as_available() {
+    let (_dir, root) = setup_ws_with_pattern().await;
+    let mut engine = QueryEngine::new();
+    engine.mount("demo".to_string(), root).await.unwrap();
+
+    let artifacts = engine.list_artifacts("demo").await.unwrap();
+    let gap = artifacts
+        .iter()
+        .find(|a| a.artifact_type == "gap-report")
+        .expect("gap-report must be advertised in list_artifacts");
+    assert!(
+        gap.available,
+        "gap-report is dynamic — should always report available=true"
+    );
+}
+
+#[tokio::test]
+async fn dismiss_gap_via_engine_suppresses_gap() {
+    let (dir, root) = setup_ws_with_pattern().await;
+    let mut engine = QueryEngine::new();
+    engine.mount("demo".to_string(), root).await.unwrap();
+    engine.reflect("demo").await.unwrap();
+
+    let gaps = engine.list_gaps("demo", None, 0.0).await.unwrap();
+    assert_eq!(gaps.len(), 3);
+
+    // Gap ids aren't exposed on `GapReport` yet — read one directly
+    // from known_unknowns. In production, the `gaps` MCP payload
+    // already carries the full serialized struct including ids.
+    let gap_id = {
+        let graph_dir = dir.path().join(".thinkingroot").join("graph");
+        let g = GraphStore::init(&graph_dir).unwrap();
+        let all = g.reflect_load_known_unknowns().unwrap();
+        assert_eq!(all.len(), 3);
+        all[0].0.clone()
+    };
+
+    engine.dismiss_gap("demo", &gap_id, None).await.unwrap();
+
+    let after = engine.list_gaps("demo", None, 0.0).await.unwrap();
+    assert_eq!(
+        after.len(),
+        2,
+        "dismissed gap must be excluded from list_gaps"
+    );
+
+    // Re-running reflect must not re-raise the dismissed gap.
+    let r2 = engine.reflect("demo").await.unwrap();
+    assert_eq!(
+        r2.gaps_created, 0,
+        "reflect must respect prior dismissal"
+    );
+    let after_r2 = engine.list_gaps("demo", None, 0.0).await.unwrap();
+    assert_eq!(after_r2.len(), 2);
 }

@@ -1507,6 +1507,49 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Load every row of `structural_patterns`.
+    ///
+    /// Returned tuple: `(id, entity_type, condition_claim_type,
+    /// expected_claim_type, frequency, sample_size, last_computed,
+    /// min_sample_threshold)`.
+    #[allow(clippy::type_complexity)]
+    pub fn reflect_load_structural_patterns(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, f64, usize, f64, usize)>> {
+        let result = self
+            .db
+            .run_script(
+                r#"?[id, etype, cond, expected, freq, sample, last_computed, threshold] :=
+                    *structural_patterns{id, entity_type: etype,
+                                         condition_claim_type: cond,
+                                         expected_claim_type: expected,
+                                         frequency: freq, sample_size: sample,
+                                         last_computed, min_sample_threshold: threshold}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("reflect_load_structural_patterns: {e}"))
+            })?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    dv_to_string(&row[3]),
+                    dv_to_float(&row[4]),
+                    count_from_single(&row[5]),
+                    dv_to_float(&row[6]),
+                    count_from_single(&row[7]),
+                )
+            })
+            .collect())
+    }
+
     /// Load every row of `known_unknowns` (regardless of status).
     ///
     /// Returned tuple: `(id, entity_id, pattern_id, expected_claim_type,

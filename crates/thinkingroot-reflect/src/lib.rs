@@ -31,5 +31,5 @@
 pub mod engine;
 pub mod types;
 
-pub use engine::{count_open_gaps, list_open_gaps, ReflectConfig, ReflectEngine};
+pub use engine::{count_open_gaps, dismiss_gap, list_open_gaps, ReflectConfig, ReflectEngine};
 pub use types::{GapReport, GapStatus, KnownUnknown, ReflectResult, StructuralPattern};

@@ -181,24 +181,41 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             // ── Reflexive (Phase 9): known-unknowns / gaps ───────────────
             {
                 "name": "reflect",
-                "description": "Run Phase 9 Reflect — discover structural co-occurrence patterns across entities and surface 'known unknowns' (expected claim types missing for specific entities). Pure graph + Datalog, no LLM. Returns a summary; use `gaps` to list the actual records.",
+                "description": "Run Phase 9 Reflect — discover structural co-occurrence patterns across entities and surface 'known unknowns' (expected claim types missing for specific entities). Pure graph + Datalog, no LLM. Returns a summary; use `gaps` to list the actual records. Pass `branch` to scope to a knowledge branch.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "workspace": { "type": "string" } },
+                    "properties": {
+                        "workspace": { "type": "string" },
+                        "branch":    { "type": "string", "description": "Optional — branch name. When set, reflect runs against the branch's copy-on-write graph." }
+                    },
                     "required": ["workspace"]
                 }
             },
             {
                 "name": "gaps",
-                "description": "List knowledge gaps (known-unknowns) the graph has inferred from its own structural patterns. Each gap says 'entity X of type T is expected to have claim-type C because N% of similar entities do, but X doesn't.' Filter by entity name or minimum pattern confidence.",
+                "description": "List knowledge gaps (known-unknowns) the graph has inferred from its own structural patterns. Each gap says 'entity X of type T is expected to have claim-type C because N% of similar entities do, but X doesn't.' Filter by entity name, minimum pattern confidence, or branch scope.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "workspace":       { "type": "string" },
                         "entity":          { "type": "string", "description": "Canonical name of a single entity to scope the report to" },
-                        "min_confidence":  { "type": "number", "description": "Minimum pattern frequency in [0.0, 1.0]. Default 0.70." }
+                        "min_confidence":  { "type": "number", "description": "Minimum pattern frequency in [0.0, 1.0]. Default 0.70." },
+                        "branch":          { "type": "string", "description": "Optional — branch name. When set, lists gaps in the branch graph." }
                     },
                     "required": ["workspace"]
+                }
+            },
+            {
+                "name": "dismiss_gap",
+                "description": "Mark a gap (known-unknown) as Dismissed so future `reflect` cycles do not re-raise it. Use for legitimate absences (e.g. 'this internal service really does not need an auth claim'). Dismissed gaps are preserved for audit but stop counting toward health coverage.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string" },
+                        "gap_id":    { "type": "string", "description": "Gap id from the `gaps` tool (ku-...)" },
+                        "branch":    { "type": "string", "description": "Optional — branch name if the gap was found on a branch." }
+                    },
+                    "required": ["workspace", "gap_id"]
                 }
             },
             // ── Intelligent memory retrieval ─────────────────────────────
@@ -1177,23 +1194,28 @@ pub async fn handle_call(
         }
 
         // ── Reflexive (Phase 9) ────────────────────────────────────────────
-        "reflect" => match engine.reflect(ws).await {
-            Ok(summary) => {
-                let text = format!(
-                    "reflect complete — patterns: {}, entity_types_scanned: {}, gaps_created: {}, gaps_resolved: {}, open_gaps_total: {}",
-                    summary.patterns.len(),
-                    summary.entity_types_scanned,
-                    summary.gaps_created,
-                    summary.gaps_resolved,
-                    summary.open_gaps_total,
-                );
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-                )
+        "reflect" => {
+            let branch = arguments.get("branch").and_then(|v| v.as_str());
+            match engine.reflect_branched(ws, branch).await {
+                Ok(summary) => {
+                    let scope = branch.unwrap_or("main");
+                    let text = format!(
+                        "reflect complete (branch: {}) — patterns: {}, entity_types_scanned: {}, gaps_created: {}, gaps_resolved: {}, open_gaps_total: {}",
+                        scope,
+                        summary.patterns.len(),
+                        summary.entity_types_scanned,
+                        summary.gaps_created,
+                        summary.gaps_resolved,
+                        summary.open_gaps_total,
+                    );
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
-            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
-        },
+        }
 
         "gaps" => {
             let entity = arguments.get("entity").and_then(|v| v.as_str());
@@ -1201,7 +1223,8 @@ pub async fn handle_call(
                 .get("min_confidence")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.70);
-            match engine.list_gaps(ws, entity, min_conf).await {
+            let branch = arguments.get("branch").and_then(|v| v.as_str());
+            match engine.list_gaps_branched(ws, entity, min_conf, branch).await {
                 Ok(gaps) => {
                     let text = if gaps.is_empty() {
                         "No open knowledge gaps at this confidence threshold.".to_string()
@@ -1228,6 +1251,36 @@ pub async fn handle_call(
                         }),
                     )
                 }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "dismiss_gap" => {
+            let gap_id = match arguments.get("gap_id").and_then(|v| v.as_str()) {
+                Some(g) => g,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'gap_id' argument".to_string(),
+                    );
+                }
+            };
+            let branch = arguments.get("branch").and_then(|v| v.as_str());
+            match engine.dismiss_gap(ws, gap_id, branch).await {
+                Ok(()) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!(
+                                "Gap '{}' dismissed{}. It will not be re-raised by future reflect cycles.",
+                                gap_id,
+                                branch.map(|b| format!(" on branch '{b}'")).unwrap_or_default()
+                            )
+                        }]
+                    }),
+                ),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
