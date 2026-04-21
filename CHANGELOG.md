@@ -9,6 +9,80 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Phase 3.5 Rooting (admission gate for derived knowledge)
+
+- **`thinkingroot-rooting` crate** — new OSS crate implementing the Rooting
+  admission gate. Zero verified prior art: deterministic re-execution of a
+  derived claim's predicate against the original source corpus as a gating
+  criterion for admission. See `docs/2026-04-20-rooting-and-knowledge-hub-strategy.md`.
+- **Five-probe battery** — Provenance (fatal, byte-range token overlap),
+  Contradiction (fatal, Datalog vs. opposing high-confidence claims),
+  Predicate (non-fatal, dispatches regex / tree-sitter-rust AST / JSONPath
+  engines), Topology (non-fatal, entity co-occurrence for derived claims),
+  Temporal (non-fatal, parent/child timestamp consistency).
+- **Admission tiers** — `Rooted` (all probes passed, certificate issued),
+  `Attested` (legacy tier, preserved for pre-Rooting claims), `Quarantined`
+  (non-fatal probe failed, retained for review), `Rejected` (fatal probe
+  failed, excluded from retrieval but kept for audit).
+- **BLAKE3 certificates** — every admitted claim carries a re-verifiable
+  cryptographic certificate covering probe inputs + outputs, stored in a new
+  `verification_certificates` CozoDB relation.
+- **`FileSystemSourceStore`** — durable content-addressed byte store at
+  `{data_dir}/rooting/sources/{hash[0..2]}/{hash[2..4]}/{full_hash}.bin`
+  with git-style fan-out sharding, atomic writes, and GC tied to source
+  removal. Persists joined chunk text at compile time so probes can re-run
+  months later.
+- **Phase 6.5 pipeline integration** — `thinkingroot-serve::pipeline::run_pipeline`
+  inserts Rooting between source-insertion (Phase 6) and Link (Phase 7).
+  Rejected claims are removed from the extraction before Link sees them;
+  Rooted/Quarantined survivors are stamped with their tier and last_rooted_at.
+  Honors `config.rooting.disabled` + `TR_ROOTING_DISABLED=1` + `--no-rooting`.
+- **Claim struct extended** — four new optional fields on
+  `thinkingroot_core::Claim`: `admission_tier`, `derivation`, `predicate`,
+  `last_rooted_at`. All `Option<T>` with `#[serde(default)]` so older `.claim`
+  bundles deserialize cleanly.
+- **Schema migration 3** — claims relation gains `admission_tier`,
+  `derivation_parents`, `predicate_json`, `last_rooted_at` columns.
+  Idempotent probe+replace pattern; existing claims auto-backfill to
+  `attested`.
+- **New CozoDB relations** — `trial_verdicts` (append-only audit log),
+  `verification_certificates` (content-addressed certificates),
+  `derivation_edges` (parent-child links for derived claims). Five new
+  indexes for tier/time/claim lookups.
+- **LLM predicate extraction** — extractor prompts (both `prompts.rs` and
+  `focused_prompts.rs`) now declare an optional `predicate` field on each
+  claim. Invalid regex patterns are validated + silently dropped at
+  `convert_predicate`, so claims never fail extraction because of a
+  malformed predicate.
+- **MCP tools** — `query_rooted` (tier-filtered claim retrieval) and
+  `rooting_report` (per-tier admission counts). `contribute` MCP tool now
+  routes agent writes through Rooting in advisory mode (config:
+  `[rooting] contribute_gate = "advisory" | "enforce" | "off"`).
+- **CLI** — `root rooting report`, `root rooting verify <claim_id>`,
+  `root rooting re-run [--all | --claim <id>]`. New `--no-rooting` flag on
+  `root compile` skips Phase 6.5 without touching config.
+- **Health Score integration** — `thinkingroot-verify` replaces the binary
+  provenance check with a weighted Rooting survival rate
+  (Rooted 1.0 / Attested 0.5 / Quarantined 0.25 / Rejected 0.0). Legacy
+  pure-Attested packs keep the 1.0 score to preserve backward compatibility.
+- **Benchmarks** — new Divan benchmark `rooting_overhead` at
+  `crates/thinkingroot-bench/benches/macro/rooting_overhead.rs` measuring
+  per-claim Rooting cost at 100 / 1K / 10K claim scales.
+
+### Migration notes
+
+- First workspace open after upgrading runs schema migration 3 automatically.
+  Existing claims get `admission_tier = 'attested'`, preserving current
+  retrieval semantics.
+- Run `root rooting re-run --all` to promote Attested claims to Rooted by
+  executing the probe battery against their source bytes. Safe to run on
+  live workspaces; idempotent; re-generates verdicts + certificates.
+- Opt out with `[rooting] disabled = true` in `.thinkingroot/config.toml`,
+  or pass `--no-rooting` on a single compile, or set
+  `TR_ROOTING_DISABLED=1` in the environment.
+- `.claim` bundles written before this release deserialize cleanly;
+  consumers receive `admission_tier = "attested"` by default.
+
 ---
 
 ## [0.2.0] — 2026-04-11

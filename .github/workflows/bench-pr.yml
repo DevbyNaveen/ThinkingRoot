@@ -45,3 +45,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           comment-always: true
           save-data-file: false
+          # PR runs are ephemeral: never push, never fetch history.
+          # Prevents `fatal: couldn't find remote ref gh-pages` on fresh repos
+          # and 403s on fork PRs where GITHUB_TOKEN is read-only.
+          skip-fetch-gh-pages: true
