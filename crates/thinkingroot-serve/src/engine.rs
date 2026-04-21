@@ -1784,6 +1784,16 @@ Rules: \
     ///
     /// A synthetic source `mcp://agent/{session_id}` is created to anchor provenance.
     /// The in-memory cache is reloaded after writing so subsequent reads see new claims.
+    #[tracing::instrument(
+        name = "engine.contribute_claims",
+        skip(self, agent_claims, sessions),
+        fields(
+            workspace = %ws,
+            session_id = %session_id,
+            branch = branch.unwrap_or("<main>"),
+            claim_count = agent_claims.len(),
+        ),
+    )]
     pub async fn contribute_claims(
         &self,
         ws: &str,
@@ -2016,6 +2026,15 @@ Rules: \
     /// `root_path` equals `root`). If no mounted workspace matches, the merge
     /// still runs — callers using this outside a mounted-workspace context
     /// (e.g. the CLI) get the disk-level behavior without cache side effects.
+    #[tracing::instrument(
+        name = "engine.merge_branch",
+        skip(self, root, merged_by),
+        fields(
+            branch = %branch_name,
+            force,
+            propagate_deletions,
+        ),
+    )]
     pub async fn merge_branch(
         &self,
         root: &std::path::Path,
@@ -2275,6 +2294,11 @@ Rules: \
     /// pre-merge snapshot for the given branch. After the on-disk swap, the
     /// mounted workspace's cache is reloaded so subsequent reads reflect the
     /// pre-merge state without a `compile` or `contribute`.
+    #[tracing::instrument(
+        name = "engine.rollback_merge",
+        skip(self, root),
+        fields(branch = %branch_name),
+    )]
     pub async fn rollback_merge(
         &self,
         root: &std::path::Path,

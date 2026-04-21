@@ -155,13 +155,86 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
         router = router.nest("/mcp", mcp_routes);
     }
 
-    router
+    // Apply CORS + auth middleware to the routes registered above.
+    // Ops endpoints (/metrics, /readyz, /livez) are added AFTER .layer()
+    // so monitoring scrapers don't need the API key. Axum only applies a
+    // layer to routes already registered when `.layer()` was called.
+    let routed = router
         .layer(cors)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
+        ));
+
+    routed
+        .route("/metrics", get(metrics_handler))
+        .route("/readyz", get(readyz_handler))
+        .route("/livez", get(livez_handler))
         .with_state(state)
+}
+
+// ─── Ops endpoints (unauthenticated) ─────────────────────────
+
+async fn livez_handler() -> Response {
+    // If this handler runs, the tokio reactor is alive enough to accept
+    // requests. No deeper check — that's what /readyz is for.
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
+    // Readiness = engine's workspace registry can be read without error.
+    // Distinguishes "warming up" from "serving traffic". Cheap; suitable
+    // for a 1-second probe cadence.
+    let engine = state.engine.read().await;
+    match engine.list_workspaces().await {
+        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not-ready: {e}\n"),
+        )
+            .into_response(),
+    }
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+    // Prometheus text format 0.0.4. Minimal surface for v0.1 — extended
+    // once we wire a histogram backend. HelloRoot's watchdog (spec O-11)
+    // is the primary consumer.
+    let mut out = String::new();
+    out.push_str("# HELP thinkingroot_up Process uptime indicator (always 1 while serving).\n");
+    out.push_str("# TYPE thinkingroot_up gauge\n");
+    out.push_str("thinkingroot_up 1\n");
+
+    out.push_str("# HELP thinkingroot_build_info Static build information as labels.\n");
+    out.push_str("# TYPE thinkingroot_build_info gauge\n");
+    out.push_str(&format!(
+        "thinkingroot_build_info{{version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+    ));
+
+    // Workspace count — cheap read; bounded by the number of mounted
+    // workspaces. Does not iterate entities/claims.
+    let engine = state.engine.read().await;
+    let ws_count = engine.list_workspaces().await.map(|v| v.len()).unwrap_or(0);
+    out.push_str("# HELP thinkingroot_workspaces_total Number of mounted workspaces.\n");
+    out.push_str("# TYPE thinkingroot_workspaces_total gauge\n");
+    out.push_str(&format!("thinkingroot_workspaces_total {ws_count}\n"));
+
+    // MCP active SSE sessions (ops signal for agent concurrency).
+    // `SseSessionMap` is `Arc<Mutex<HashMap<..>>>` — use lock(), not read().
+    let mcp_sessions = state.mcp_sessions.lock().await.len();
+    out.push_str("# HELP thinkingroot_mcp_sessions_active Live MCP SSE sessions.\n");
+    out.push_str("# TYPE thinkingroot_mcp_sessions_active gauge\n");
+    out.push_str(&format!(
+        "thinkingroot_mcp_sessions_active {mcp_sessions}\n"
+    ));
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        out,
+    )
+        .into_response()
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────
