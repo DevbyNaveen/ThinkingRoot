@@ -27,6 +27,27 @@ pub struct ExtractedClaim {
     /// Null/absent when the claim has no specific associated event date.
     #[serde(default)]
     pub event_date: Option<String>,
+    /// Optional executable predicate attached by the LLM at extraction time.
+    /// When present, the Rooting gate re-executes it against the original
+    /// source bytes before admission (Phase 6.5) and periodically thereafter.
+    /// Null/absent when the LLM cannot generate an unambiguous predicate —
+    /// the claim stays in the `Attested` tier rather than being quarantined.
+    #[serde(default)]
+    pub predicate: Option<ExtractedPredicate>,
+}
+
+/// Predicate attached to an extracted claim. Serialized shape is the contract
+/// between the LLM and the pipeline — keep stable or version it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedPredicate {
+    /// Engine language: `"regex"`, `"rust_ast"`, or `"jsonpath"`.
+    pub language: String,
+    /// The query string itself (regex pattern, tree-sitter query, or JSONPath).
+    pub query: String,
+    /// Optional source URI globs scoping where this predicate runs.
+    /// Empty / absent = use the owning claim's own source.
+    #[serde(default)]
+    pub scope_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

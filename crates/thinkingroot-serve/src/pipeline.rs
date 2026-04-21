@@ -81,6 +81,17 @@ pub enum ProgressEvent {
     CompilationProgress { done: usize, total: usize },
     /// Verification finished.
     VerificationDone { health: u8 },
+    /// Rooting is starting — total candidate count.
+    RootingStart { candidates: usize },
+    /// One claim tried by the Rooter.
+    RootingProgress { done: usize, total: usize },
+    /// Rooting finished. Tier counts summarize the outcome.
+    RootingDone {
+        rooted: usize,
+        attested: usize,
+        quarantined: usize,
+        rejected: usize,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -608,11 +619,31 @@ pub async fn run_pipeline(
     }
 
     // ─── Phase 6: Insert sources for truly-changed documents ───────────
+    // Also persist source bytes to the durable Rooting byte-store so Phase 6.5
+    // (and future re-rooting sweeps) can re-execute probes against them. The
+    // byte-store is content-addressed, so multiple writes with the same hash
+    // are no-ops — fresh recompiles of an unchanged file cost zero extra I/O.
+    let byte_store = thinkingroot_rooting::FileSystemSourceStore::new(&data_dir)
+        .map_err(|e| thinkingroot_core::Error::Config(format!("rooting byte store: {e}")))?;
     for doc in &truly_changed {
         let source = thinkingroot_core::Source::new(doc.uri.clone(), doc.source_type)
             .with_id(doc.source_id)
             .with_hash(doc.content_hash.clone());
         storage.graph.insert_source(&source)?;
+
+        // Reconstruct the text used during extraction (chunks joined by \n).
+        // This matches what the Grounder saw, so provenance probe results line
+        // up with Phase 2b's tribunal when re-rooted later.
+        let text: String = doc
+            .chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        use thinkingroot_rooting::SourceByteStore;
+        byte_store
+            .put(doc.source_id, &doc.content_hash, text.as_bytes())
+            .map_err(|e| thinkingroot_core::Error::Config(format!("rooting put: {e}")))?;
     }
 
     // Filter extraction to only truly-changed sources.
@@ -621,7 +652,7 @@ pub async fn run_pipeline(
 
     let structural_extractions = extraction.structural_extractions;
 
-    let filtered_extraction = thinkingroot_extract::ExtractionOutput {
+    let mut filtered_extraction = thinkingroot_extract::ExtractionOutput {
         claims: extraction
             .claims
             .into_iter()
@@ -641,6 +672,122 @@ pub async fn run_pipeline(
         source_texts: extraction.source_texts,
         claim_source_quotes: extraction.claim_source_quotes,
     };
+
+    // ─── Phase 6.5: Rooting ────────────────────────────────────────────
+    // Deterministic admission gate. Each candidate claim faces five probes
+    // (provenance, contradiction, predicate, topology, temporal). Rejected
+    // claims are removed from the extraction before Link sees them.
+    //
+    // Disabled when either the workspace config opts out
+    // (`config.rooting.disabled`) or the per-invocation env flag is set
+    // (`TR_ROOTING_DISABLED=1`, populated by `root compile --no-rooting`).
+    let rooting_disabled_env =
+        std::env::var("TR_ROOTING_DISABLED").map(|v| v == "1").unwrap_or(false);
+    if !config.rooting.disabled
+        && !rooting_disabled_env
+        && !filtered_extraction.claims.is_empty()
+    {
+        let rooting_cfg = thinkingroot_rooting::RootingConfig {
+            disabled: config.rooting.disabled,
+            provenance_threshold: config.rooting.provenance_threshold,
+            contradiction_floor: config.rooting.contradiction_floor,
+            contribute_gate: config.rooting.contribute_gate.clone(),
+        };
+        let candidates_total = filtered_extraction.claims.len();
+        emit!(ProgressEvent::RootingStart {
+            candidates: candidates_total
+        });
+
+        let candidates: Vec<thinkingroot_rooting::CandidateClaim<'_>> = filtered_extraction
+            .claims
+            .iter()
+            .map(|c| thinkingroot_rooting::CandidateClaim {
+                claim: c,
+                predicate: c.predicate.as_ref(),
+                derivation: c.derivation.as_ref(),
+            })
+            .collect();
+
+        let rooter = {
+            let r = thinkingroot_rooting::Rooter::new(&storage.graph, &byte_store, rooting_cfg);
+            if let Some(ref tx) = progress {
+                let tx_root = tx.clone();
+                let pf: thinkingroot_rooting::RootingProgressFn =
+                    Arc::new(move |done: usize, total: usize| {
+                        let _ = tx_root.send(ProgressEvent::RootingProgress { done, total });
+                    });
+                r.with_progress(pf)
+            } else {
+                r
+            }
+        };
+
+        let rooting_output = rooter
+            .root_batch(&candidates)
+            .map_err(|e| thinkingroot_core::Error::Config(format!("rooting: {e}")))?;
+
+        // Drop Rejected claims from the extraction so Link never sees them.
+        let rejected_ids: std::collections::HashSet<thinkingroot_core::ClaimId> = rooting_output
+            .verdicts
+            .iter()
+            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Rejected)
+            .map(|v| v.claim_id)
+            .collect();
+        if !rejected_ids.is_empty() {
+            filtered_extraction
+                .claims
+                .retain(|c| !rejected_ids.contains(&c.id));
+        }
+
+        // Stamp survivors with their tier + last_rooted_at.
+        let tier_map: std::collections::HashMap<thinkingroot_core::ClaimId, _> = rooting_output
+            .verdicts
+            .iter()
+            .map(|v| (v.claim_id, (v.admission_tier, v.trial_at)))
+            .collect();
+        for c in &mut filtered_extraction.claims {
+            if let Some((tier, trial_at)) = tier_map.get(&c.id) {
+                c.admission_tier = *tier;
+                c.last_rooted_at = Some(*trial_at);
+            }
+        }
+
+        // Persist verdicts + certificates into CozoDB.
+        thinkingroot_rooting::storage::insert_verdicts_batch(
+            &storage.graph,
+            &rooting_output.verdicts,
+        )
+        .map_err(|e| thinkingroot_core::Error::Config(format!("rooting verdicts: {e}")))?;
+        thinkingroot_rooting::storage::insert_certificates_batch(
+            &storage.graph,
+            &rooting_output.certificates,
+        )
+        .map_err(|e| thinkingroot_core::Error::Config(format!("rooting certificates: {e}")))?;
+
+        let rooted = rooting_output
+            .verdicts
+            .iter()
+            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Rooted)
+            .count();
+        let attested = rooting_output
+            .verdicts
+            .iter()
+            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Attested)
+            .count();
+        emit!(ProgressEvent::RootingDone {
+            rooted,
+            attested,
+            quarantined: rooting_output.quarantined_count,
+            rejected: rooting_output.rejected_count,
+        });
+        tracing::info!(
+            "rooting: {} rooted, {} attested, {} quarantined, {} rejected",
+            rooted,
+            attested,
+            rooting_output.quarantined_count,
+            rooting_output.rejected_count
+        );
+    }
 
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();

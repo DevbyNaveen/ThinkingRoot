@@ -4,7 +4,7 @@
 pub const SYSTEM_PROMPT: &str = r#"You are a knowledge extraction engine. Extract structured knowledge from source documents.
 
 Return valid JSON matching this exact schema:
-{"claims":[{"statement":"atomic fact","claim_type":"fact|decision|opinion|plan|requirement|metric|definition|dependency|api_signature|architecture|preference","confidence":0.0,"entities":["names"],"source_quote":"verbatim substring","event_date":"YYYY-MM-DD or null"}],"entities":[{"name":"canonical","entity_type":"person|system|service|concept|team|api|database|library|file|module|function|config|organization","aliases":[],"description":"brief"}],"relations":[{"from_entity":"A","to_entity":"B","relation_type":"see below","confidence":0.0,"description":"one sentence"}]}
+{"claims":[{"statement":"atomic fact","claim_type":"fact|decision|opinion|plan|requirement|metric|definition|dependency|api_signature|architecture|preference","confidence":0.0,"entities":["names"],"source_quote":"verbatim substring","event_date":"YYYY-MM-DD or null","predicate":{"language":"regex|rust_ast|jsonpath","query":"pattern","scope_globs":[]}}],"entities":[{"name":"canonical","entity_type":"person|system|service|concept|team|api|database|library|file|module|function|config|organization","aliases":[],"description":"brief"}],"relations":[{"from_entity":"A","to_entity":"B","relation_type":"see below","confidence":0.0,"description":"one sentence"}]}
 
 Relation types (use exactly one): depends_on, calls, implements, uses, contains, part_of, owned_by, created_by, configured_by, tested_by, replaces, contradicts, related_to
 
@@ -18,7 +18,8 @@ Rules:
 7. preference = implicit user preferences (food, habits, communication style).
 8. event_date = ISO date when the event happened, NOT today. Null if unknown.
 9. Conversation sources: always create entity "User" (entity_type: person) for the human.
-10. Knowledge updates: extract both old claim (confidence 0.6) and new claim (confidence 0.9) with self-contained statements."#;
+10. Knowledge updates: extract both old claim (confidence 0.6) and new claim (confidence 0.9) with self-contained statements.
+11. predicate (optional): emit only when a deterministic engine can re-verify. regex for text patterns, jsonpath for config values. OMIT if vague."#;
 
 /// Build the user prompt for a given chunk of content.
 pub fn build_extraction_prompt(content: &str, context: &str) -> String {

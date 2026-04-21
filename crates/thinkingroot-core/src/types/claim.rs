@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use super::{ClaimId, SourceId, WorkspaceId};
+use super::{AdmissionTier, ClaimId, DerivationProof, Predicate, SourceId, WorkspaceId};
 
 /// The fundamental unit of knowledge in ThinkingRoot.
 /// A claim is an atomic, source-locked, typed, timestamped statement.
@@ -29,6 +29,26 @@ pub struct Claim {
     /// Example: "I graduated in 2018" ingested in 2025 → event_date=2018-05-01, valid_from=2025.
     /// Used by the event calendar (SVO extractor) for accurate temporal reasoning.
     pub event_date: Option<DateTime<Utc>>,
+    /// Admission tier set by the Rooting gate.
+    ///
+    /// Defaults to `Attested` for claims that never underwent the full trial
+    /// (extracted claims, pre-Rooting claims). Derived claims admitted through
+    /// Phase 6.5 Rooting carry `Rooted` or `Quarantined`.
+    #[serde(default)]
+    pub admission_tier: AdmissionTier,
+    /// Populated only for derived claims. Records the parent claim IDs and
+    /// the derivation rule so probes can re-verify the projection onto source.
+    #[serde(default)]
+    pub derivation: Option<DerivationProof>,
+    /// Executable assertion attached to this claim. When present, the
+    /// predicate probe re-runs it against source bytes during Rooting and
+    /// during daily re-rooting sweeps.
+    #[serde(default)]
+    pub predicate: Option<Predicate>,
+    /// Timestamp of the most recent successful Rooting trial. `None` means
+    /// this claim has never been through Rooting (pre-Rooting claims).
+    #[serde(default)]
+    pub last_rooted_at: Option<DateTime<Utc>>,
 }
 
 impl Claim {
@@ -57,6 +77,10 @@ impl Claim {
             grounding_method: None,
             extraction_tier: ExtractionTier::default(),
             event_date: None,
+            admission_tier: AdmissionTier::default(),
+            derivation: None,
+            predicate: None,
+            last_rooted_at: None,
         }
     }
 
@@ -89,6 +113,31 @@ impl Claim {
     pub fn with_event_date(mut self, date: DateTime<Utc>) -> Self {
         self.event_date = Some(date);
         self
+    }
+
+    pub fn with_admission_tier(mut self, tier: AdmissionTier) -> Self {
+        self.admission_tier = tier;
+        self
+    }
+
+    pub fn with_derivation(mut self, derivation: DerivationProof) -> Self {
+        self.derivation = Some(derivation);
+        self
+    }
+
+    pub fn with_predicate(mut self, predicate: Predicate) -> Self {
+        self.predicate = Some(predicate);
+        self
+    }
+
+    pub fn with_last_rooted_at(mut self, at: DateTime<Utc>) -> Self {
+        self.last_rooted_at = Some(at);
+        self
+    }
+
+    /// Returns true if this claim is a derivation (has parent claims recorded).
+    pub fn is_derived(&self) -> bool {
+        self.derivation.is_some()
     }
 
     /// Mark this claim as superseded by another.
@@ -273,5 +322,58 @@ mod tests {
         let src = SourceId::new();
         let claim = Claim::new("test", ClaimType::Fact, src, ws);
         assert_eq!(claim.extraction_tier, ExtractionTier::Llm);
+    }
+
+    #[test]
+    fn claim_admission_tier_defaults_to_attested() {
+        let ws = WorkspaceId::new();
+        let src = SourceId::new();
+        let claim = Claim::new("test", ClaimType::Fact, src, ws);
+        assert_eq!(claim.admission_tier, AdmissionTier::Attested);
+        assert!(claim.derivation.is_none());
+        assert!(claim.predicate.is_none());
+        assert!(claim.last_rooted_at.is_none());
+        assert!(!claim.is_derived());
+    }
+
+    #[test]
+    fn claim_with_derivation_marks_as_derived() {
+        let ws = WorkspaceId::new();
+        let src = SourceId::new();
+        let parent_a = ClaimId::new();
+        let parent_b = ClaimId::new();
+        let claim = Claim::new("derived", ClaimType::Fact, src, ws)
+            .with_derivation(DerivationProof {
+                parent_claim_ids: vec![parent_a, parent_b],
+                derivation_rule: "test-rule".into(),
+            })
+            .with_admission_tier(AdmissionTier::Rooted);
+        assert!(claim.is_derived());
+        assert_eq!(claim.admission_tier, AdmissionTier::Rooted);
+        let derivation = claim.derivation.as_ref().expect("derivation set");
+        assert_eq!(derivation.parent_claim_ids.len(), 2);
+        assert_eq!(derivation.derivation_rule, "test-rule");
+    }
+
+    #[test]
+    fn claim_backward_compat_deserializes_without_new_fields() {
+        // Older versions of the Claim struct had no admission_tier / derivation /
+        // predicate / last_rooted_at fields. Ensure deserialization populates
+        // defaults without error.
+        let ws = WorkspaceId::new();
+        let src = SourceId::new();
+        let original = Claim::new("legacy", ClaimType::Fact, src, ws);
+        let mut json_value = serde_json::to_value(&original).unwrap();
+        let obj = json_value.as_object_mut().unwrap();
+        obj.remove("admission_tier");
+        obj.remove("derivation");
+        obj.remove("predicate");
+        obj.remove("last_rooted_at");
+
+        let round: Claim = serde_json::from_value(json_value).unwrap();
+        assert_eq!(round.admission_tier, AdmissionTier::Attested);
+        assert!(round.derivation.is_none());
+        assert!(round.predicate.is_none());
+        assert!(round.last_rooted_at.is_none());
     }
 }

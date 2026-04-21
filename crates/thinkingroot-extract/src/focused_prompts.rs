@@ -111,7 +111,12 @@ You MUST return valid JSON matching this exact schema:
       "claim_type": "fact|decision|opinion|plan|requirement|metric|definition|dependency|api_signature|architecture",
       "confidence": 0.0,
       "entities": ["entity names mentioned in this claim"],
-      "source_quote": "The exact verbatim phrase or sentence from the source that supports this claim"
+      "source_quote": "The exact verbatim phrase or sentence from the source that supports this claim",
+      "predicate": {
+        "language": "regex|rust_ast|jsonpath",
+        "query": "pattern that will still match in the source if this claim is still true",
+        "scope_globs": []
+      }
     }
   ]
 }
@@ -123,7 +128,23 @@ Rules:
 4. entities should only include names from the provided ENTITIES list.
 5. source_quote MUST be a verbatim substring copied from the source. Do NOT paraphrase.
 6. Do NOT fabricate information. Extract only what is explicitly stated or clearly implied.
-7. Return ONLY the JSON object. No markdown, no explanation, no preamble."#;
+7. Return ONLY the JSON object. No markdown, no explanation, no preamble.
+
+Predicate rules (optional — emit only when confident):
+8. `predicate` is OPTIONAL. Omit it (`null` or absent) when you cannot write one
+   that a deterministic engine can verify against the source bytes.
+9. Use `"regex"` when the claim maps to a recognizable text pattern in the
+   source. Write a regex that matches only if the claim is still true.
+   Example: claim "AuthService exposes validate_token" →
+            predicate {language:"regex", query:"fn\\s+validate_token\\b"}
+10. Use `"jsonpath"` for claims about JSON/YAML config values.
+    Example: claim "rate limit is 100 req/sec" →
+             predicate {language:"jsonpath", query:"$.rate_limit[?(@ == 100)]"}
+11. Use `"rust_ast"` for claims about Rust code structure (Week 4+).
+12. `scope_globs` restricts where the predicate runs. Leave empty to run
+    against the claim's own source — the common case.
+13. If your predicate would be vague, ambiguous, or match unrelated text,
+    OMIT it. A missing predicate is safer than a noisy one."#;
 
     let entities_block = build_entities_section(entity_names);
 

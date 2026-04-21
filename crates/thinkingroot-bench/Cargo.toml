@@ -17,6 +17,7 @@ thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-serve = { workspace = true }
+thinkingroot-rooting = { workspace = true }
 rand = { workspace = true }
 tempfile = "3"
 
@@ -69,3 +70,8 @@ path = "benches/macro/stage_timing.rs"
 name = "cache_effectiveness"
 harness = false
 path = "benches/macro/cache_effectiveness.rs"
+
+[[bench]]
+name = "rooting_overhead"
+harness = false
+path = "benches/macro/rooting_overhead.rs"
