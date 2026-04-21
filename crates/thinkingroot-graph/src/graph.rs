@@ -56,7 +56,11 @@ impl GraphStore {
                 grounding_score: Float default -1.0,
                 grounding_method: String default '',
                 extraction_tier: String default 'llm',
-                event_date: Float default 0.0
+                event_date: Float default 0.0,
+                admission_tier: String default 'attested',
+                derivation_parents: String default '',
+                predicate_json: String default '',
+                last_rooted_at: Float default 0.0
             }",
             ":create entities {
                 id: String
@@ -130,6 +134,77 @@ impl GraphStore {
                 claim_ids: String default '[]',
                 timestamp: Float default 0.0
             }",
+            // Rooting — append-only log of every trial run against a claim.
+            // One row per probe battery execution (not per probe). A single claim
+            // can have many verdicts over time (initial trial + re-rooting sweeps).
+            ":create trial_verdicts {
+                id: String
+                =>
+                claim_id: String,
+                trial_at: Float default 0.0,
+                admission_tier: String default 'attested',
+                provenance_score: Float default -1.0,
+                contradiction_score: Float default -1.0,
+                predicate_score: Float default -1.0,
+                topology_score: Float default -1.0,
+                temporal_score: Float default -1.0,
+                certificate_hash: String default '',
+                failure_reason: String default '',
+                rooter_version: String default ''
+            }",
+            // Rooting — cryptographic certificates keyed by BLAKE3 hash of inputs.
+            // Content-addressed: the same trial inputs produce the same certificate hash.
+            ":create verification_certificates {
+                hash: String
+                =>
+                claim_id: String,
+                created_at: Float default 0.0,
+                probe_inputs_json: String default '',
+                probe_outputs_json: String default '',
+                rooter_version: String default '',
+                source_content_hash: String default ''
+            }",
+            // Rooting — derivation DAG edges (parent claim → child claim).
+            // Populated when a claim is created via composition (Reflect, agent contribute, etc.).
+            ":create derivation_edges {
+                parent_claim_id: String,
+                child_claim_id: String
+                =>
+                derivation_rule: String default ''
+            }",
+            // Reflect (Phase 9) — statistical co-occurrence patterns discovered
+            // from graph topology. Each row: "entities of `entity_type` that
+            // have `condition_claim_type` also have `expected_claim_type`
+            // with `frequency` probability across `sample_size` instances."
+            // Rewritten in full on every `reflect()` run — not append-only.
+            ":create structural_patterns {
+                id: String
+                =>
+                entity_type: String,
+                condition_claim_type: String,
+                expected_claim_type: String,
+                frequency: Float default 0.0,
+                sample_size: Int default 0,
+                last_computed: Float default 0.0,
+                min_sample_threshold: Int default 30
+            }",
+            // Reflect (Phase 9) — per-entity gap records. One row per
+            // (entity, expected_claim_type) where the entity matches a
+            // pattern's condition but is missing the expected claim type.
+            // Not a Claim in the claims table — gaps are surfaced through
+            // the `gaps` MCP tool and the health-coverage score.
+            ":create known_unknowns {
+                id: String
+                =>
+                entity_id: String,
+                pattern_id: String,
+                expected_claim_type: String,
+                confidence: Float default 0.0,
+                status: String default 'open',
+                created_at: Float default 0.0,
+                resolved_at: Float default 0.0,
+                resolved_by: String default ''
+            }",
         ];
 
         for stmt in &relations {
@@ -174,6 +249,18 @@ impl GraphStore {
             "::index create events:by_subject { subject_entity_id }",
             "::index create events:by_timestamp { timestamp }",
             "::index create turns:by_session { session_id }",
+            // Rooting indexes — support Rooting reports, Health Score integration,
+            // and derivation-graph traversal.
+            "::index create claims:by_tier { admission_tier }",
+            "::index create trial_verdicts:by_claim { claim_id }",
+            "::index create trial_verdicts:by_time { trial_at }",
+            "::index create derivation_edges:by_parent { parent_claim_id }",
+            "::index create derivation_edges:by_child { child_claim_id }",
+            // Reflect — support the `gaps` tool's entity-scoped query path
+            // and fast "open gaps" filters in the health score.
+            "::index create known_unknowns:by_entity { entity_id }",
+            "::index create known_unknowns:by_status { status }",
+            "::index create structural_patterns:by_entity_type { entity_type }",
         ];
 
         for stmt in &indexes {
@@ -196,25 +283,54 @@ impl GraphStore {
     /// Uses `:replace` to redefine the relation with the new column,
     /// defaulting existing rows to "llm".
     fn migrate_claims_extraction_tier(&self) -> Result<()> {
-        // Probe: if extraction_tier column already exists, skip the migration.
-        // This happens on fresh databases (create_schema just created the schema
-        // with the column) and on databases already migrated. Without this guard,
-        // `:replace` would rebuild the relation on every init() call.
+        // Probe each migration independently. Earlier releases returned from
+        // this function the moment a later migration's column was present,
+        // which silently skipped any migrations added after that point (e.g.
+        // a workspace with event_date but without admission_tier never got
+        // Migration 3). Each probe now gates ONLY its own migration.
+        //
+        // If any migration is going to run, drop the indexes on `claims` and
+        // its link tables first — `:replace` fails while an index is attached.
+        // `create_indexes()` (called next in `init`) recreates them atop the
+        // new schema. Drops are best-effort — missing indexes are fine.
+        let needs_any_migration = {
+            let p1 = self.db.run_script(
+                "?[extraction_tier] := *claims{id: 'probe-noop', extraction_tier}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            );
+            let p2 = self.db.run_script(
+                "?[event_date] := *claims{id: 'probe-noop', event_date}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            );
+            let p3 = self.db.run_script(
+                "?[admission_tier] := *claims{id: 'probe-noop', admission_tier}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            );
+            p1.is_err() || p2.is_err() || p3.is_err()
+        };
+        if needs_any_migration {
+            let index_drops = [
+                "::index drop claims:by_type",
+                "::index drop claims:by_tier",
+                "::index drop claim_entity_edges:by_entity",
+                "::index drop claim_source_edges:by_source",
+            ];
+            for drop_stmt in &index_drops {
+                let _ = self.db.run_default(drop_stmt);
+            }
+        }
+
+        // ── Migration 1: add extraction_tier column ──────────────────────────
         let probe = self.db.run_script(
             "?[extraction_tier] := *claims{id: 'probe-noop', extraction_tier}",
             BTreeMap::new(),
             ScriptMutability::Immutable,
         );
-        if probe.is_ok() {
-            // Column already present — nothing to do.
-            return Ok(());
-        }
-
-        // Pre-condition: grounding_score and grounding_method columns must already exist
-        // in the claims relation (they were added before the TEFS-GP branch). This migration
-        // only adds extraction_tier. If you add another column after this one, extend the
-        // :replace below rather than chaining a new migration.
-        let migration = r#"
+        if probe.is_err() {
+            let migration = r#"
             {
                 ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier] :=
                     *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method},
@@ -222,23 +338,17 @@ impl GraphStore {
                 :replace claims {id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String, extraction_tier: String}
             }
         "#;
-
-        // Column missing: run :replace migration to add extraction_tier,
-        // backfilling existing rows with "llm".
-        match self.db.run_default(migration) {
-            Ok(_) => {
-                tracing::debug!("claims extraction_tier migration applied");
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // If claims relation doesn't exist at all, that's fine — create_schema
-                // will have created it with the new column.
-                if msg.contains("not found") || msg.contains("does not exist") {
-                    // ok
-                } else {
-                    return Err(Error::GraphStorage(format!(
-                        "claims extraction_tier migration failed: {msg}"
-                    )));
+            match self.db.run_default(migration) {
+                Ok(_) => {
+                    tracing::debug!("claims extraction_tier migration applied");
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                        return Err(Error::GraphStorage(format!(
+                            "claims extraction_tier migration failed: {msg}"
+                        )));
+                    }
                 }
             }
         }
@@ -249,11 +359,8 @@ impl GraphStore {
             BTreeMap::new(),
             ScriptMutability::Immutable,
         );
-        if probe2.is_ok() {
-            return Ok(());
-        }
-
-        let migration2 = r#"
+        if probe2.is_err() {
+            let migration2 = r#"
             {
                 ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date] :=
                     *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier},
@@ -262,22 +369,67 @@ impl GraphStore {
             }
         "#;
 
-        match self.db.run_default(migration2) {
-            Ok(_) => {
-                tracing::debug!("claims event_date migration applied");
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("not found") || msg.contains("does not exist") {
-                    Ok(())
-                } else {
-                    Err(Error::GraphStorage(format!(
-                        "claims event_date migration failed: {msg}"
-                    )))
+            match self.db.run_default(migration2) {
+                Ok(_) => {
+                    tracing::debug!("claims event_date migration applied");
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                        return Err(Error::GraphStorage(format!(
+                            "claims event_date migration failed: {msg}"
+                        )));
+                    }
                 }
             }
         }
+
+        // ── Migration 3: add Rooting columns (admission_tier, derivation_parents,
+        // predicate_json, last_rooted_at). Backfill existing rows with defaults
+        // that preserve current behavior:
+        // - admission_tier = 'attested' (pre-Rooting claims honor the legacy binary provenance check)
+        // - derivation_parents = ''    (extracted claims have no parents)
+        // - predicate_json = ''        (no predicate = predicate probe skipped)
+        // - last_rooted_at = 0.0       (never rooted)
+        //
+        // IMPORTANT: `:replace` on a relation fails while any index is still
+        // attached. We drop every index we know about before running the
+        // migration; `create_indexes()` (called next in `init`) recreates them
+        // atop the new schema. Drops are best-effort — missing indexes are fine.
+        let probe3 = self.db.run_script(
+            "?[admission_tier] := *claims{id: 'probe-noop', admission_tier}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if probe3.is_err() {
+            let migration3 = r#"
+            {
+                ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at] :=
+                    *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date},
+                    admission_tier = "attested",
+                    derivation_parents = "",
+                    predicate_json = "",
+                    last_rooted_at = 0.0
+                :replace claims {id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String, extraction_tier: String, event_date: Float, admission_tier: String, derivation_parents: String, predicate_json: String, last_rooted_at: Float}
+            }
+        "#;
+
+            match self.db.run_default(migration3) {
+                Ok(_) => {
+                    tracing::debug!("claims rooting migration applied");
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                        return Err(Error::GraphStorage(format!(
+                            "claims rooting migration failed: {msg}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Run a Datalog query with parameters, returning NamedRows.
@@ -418,12 +570,47 @@ impl GraphStore {
                     .unwrap_or(0.0),
             )),
         );
+        // Rooting columns. Every claim carries an admission_tier; derivation
+        // parents and predicate are serialized as JSON strings for portability.
+        params.insert(
+            "admission_tier".into(),
+            DataValue::Str(claim.admission_tier.as_str().into()),
+        );
+        let derivation_parents_json = match &claim.derivation {
+            Some(d) => {
+                let ids: Vec<String> =
+                    d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
+                serde_json::to_string(&ids).unwrap_or_default()
+            }
+            None => String::new(),
+        };
+        params.insert(
+            "derivation_parents".into(),
+            DataValue::Str(derivation_parents_json.into()),
+        );
+        let predicate_json = match &claim.predicate {
+            Some(p) => serde_json::to_string(p).unwrap_or_default(),
+            None => String::new(),
+        };
+        params.insert(
+            "predicate_json".into(),
+            DataValue::Str(predicate_json.into()),
+        );
+        params.insert(
+            "last_rooted_at".into(),
+            DataValue::Num(Num::Float(
+                claim
+                    .last_rooted_at
+                    .map(|d| d.timestamp() as f64)
+                    .unwrap_or(0.0),
+            )),
+        );
 
         self.query(
-            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date] <- [[
-                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date
+            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at] <- [[
+                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date, $admission_tier, $derivation_parents, $predicate_json, $last_rooted_at
             ]]
-            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date}"#,
+            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at}"#,
             params,
         )?;
         Ok(())
@@ -531,6 +718,18 @@ impl GraphStore {
                         thinkingroot_core::types::ExtractionTier::Llm => "llm",
                         thinkingroot_core::types::ExtractionTier::AgentInferred => "agent_inferred",
                     };
+                    let derivation_parents_json = match &c.derivation {
+                        Some(d) => {
+                            let ids: Vec<String> =
+                                d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
+                            serde_json::to_string(&ids).unwrap_or_default()
+                        }
+                        None => String::new(),
+                    };
+                    let predicate_json = match &c.predicate {
+                        Some(p) => serde_json::to_string(p).unwrap_or_default(),
+                        None => String::new(),
+                    };
                     DataValue::List(vec![
                         DataValue::Str(c.id.to_string().into()),
                         DataValue::Str(c.statement.clone().into()),
@@ -551,6 +750,14 @@ impl GraphStore {
                         DataValue::Num(Num::Float(
                             c.event_date.map(|d| d.timestamp() as f64).unwrap_or(0.0),
                         )),
+                        DataValue::Str(c.admission_tier.as_str().into()),
+                        DataValue::Str(derivation_parents_json.into()),
+                        DataValue::Str(predicate_json.into()),
+                        DataValue::Num(Num::Float(
+                            c.last_rooted_at
+                                .map(|d| d.timestamp() as f64)
+                                .unwrap_or(0.0),
+                        )),
                     ])
                 })
                 .collect();
@@ -559,10 +766,12 @@ impl GraphStore {
             self.query(
                 "?[id, statement, claim_type, source_id, confidence, sensitivity, \
                   workspace_id, created_at, grounding_score, grounding_method, \
-                  extraction_tier, event_date] <- $rows \
+                  extraction_tier, event_date, admission_tier, derivation_parents, \
+                  predicate_json, last_rooted_at] <- $rows \
                  :put claims {id => statement, claim_type, source_id, confidence, \
                   sensitivity, workspace_id, created_at, grounding_score, \
-                  grounding_method, extraction_tier, event_date}",
+                  grounding_method, extraction_tier, event_date, admission_tier, \
+                  derivation_parents, predicate_json, last_rooted_at}",
                 params,
             )?;
         }
@@ -1111,6 +1320,546 @@ impl GraphStore {
         Ok(())
     }
 
+    // ─── Reflect (Phase 9): pattern discovery + gap tracking ────────────
+    //
+    // These helpers keep the cozo/Datalog surface inside this crate so
+    // the `thinkingroot-reflect` phase crate stays cozo-free. Parameters
+    // and return types are plain-tuple or primitive, following the same
+    // convention as the Rooting helpers below.
+
+    /// Discover co-occurrence of claim-type pairs across entities of the
+    /// same type. One row per (entity_type, condition_claim_type,
+    /// expected_claim_type) where both claim types appear on ≥1 entity of
+    /// that type.
+    ///
+    /// Returned tuple: `(entity_type, condition_claim_type,
+    /// expected_claim_type, condition_count, both_count)`.
+    ///
+    /// - `condition_count` = distinct entities of `entity_type` that carry
+    ///   `condition_claim_type` at all.
+    /// - `both_count` = distinct entities that carry both claim types.
+    #[allow(clippy::type_complexity)]
+    pub fn reflect_co_occurrences(
+        &self,
+    ) -> Result<Vec<(String, String, String, usize, usize)>> {
+        let result = self
+            .db
+            .run_script(
+                r#"entity_has[eid, etype, ctype] :=
+                    *entities{id: eid, entity_type: etype},
+                    *claim_entity_edges{entity_id: eid, claim_id: cid},
+                    *claims{id: cid, claim_type: ctype}
+                cond_count[etype, cta, count_unique(eid)] :=
+                    entity_has[eid, etype, cta]
+                both_count[etype, cta, ctb, count_unique(eid)] :=
+                    entity_has[eid, etype, cta],
+                    entity_has[eid, etype, ctb],
+                    cta != ctb
+                ?[etype, cta, ctb, cond_n, both_n] :=
+                    cond_count[etype, cta, cond_n],
+                    both_count[etype, cta, ctb, both_n]"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("reflect_co_occurrences: {e}")))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    count_from_single(&row[3]),
+                    count_from_single(&row[4]),
+                )
+            })
+            .collect())
+    }
+
+    /// Return entity ids of type `entity_type` that have a claim of
+    /// `condition_claim_type` but none of `expected_claim_type`.
+    pub fn reflect_entities_missing_expected(
+        &self,
+        entity_type: &str,
+        condition_claim_type: &str,
+        expected_claim_type: &str,
+    ) -> Result<Vec<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("etype".into(), DataValue::Str(entity_type.to_string().into()));
+        params.insert(
+            "cta".into(),
+            DataValue::Str(condition_claim_type.to_string().into()),
+        );
+        params.insert(
+            "ctb".into(),
+            DataValue::Str(expected_claim_type.to_string().into()),
+        );
+
+        let result = self
+            .db
+            .run_script(
+                r#"has_condition[eid] :=
+                    *entities{id: eid, entity_type: $etype},
+                    *claim_entity_edges{entity_id: eid, claim_id: cid},
+                    *claims{id: cid, claim_type: $cta}
+                has_expected[eid] :=
+                    *claim_entity_edges{entity_id: eid, claim_id: cid},
+                    *claims{id: cid, claim_type: $ctb}
+                ?[eid] :=
+                    has_condition[eid],
+                    not has_expected[eid]"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("reflect_entities_missing_expected: {e}"))
+            })?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| dv_to_string(&row[0]))
+            .collect())
+    }
+
+    /// Find any claim id on `entity_id` whose `claim_type` matches.
+    /// Returns the first match if present.
+    pub fn find_claim_id_for_entity_by_type(
+        &self,
+        entity_id: &str,
+        claim_type: &str,
+    ) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(entity_id.to_string().into()));
+        params.insert("ctype".into(), DataValue::Str(claim_type.to_string().into()));
+        let result = self
+            .db
+            .run_script(
+                r#"?[cid] :=
+                    *claim_entity_edges{entity_id: $eid, claim_id: cid},
+                    *claims{id: cid, claim_type: $ctype}
+                :limit 1"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("find_claim_id_for_entity_by_type: {e}"))
+            })?;
+        Ok(result.rows.first().map(|r| dv_to_string(&r[0])))
+    }
+
+    /// Truncate and re-populate the `structural_patterns` relation.
+    /// Patterns are always re-derived in full, so diffing is unnecessary.
+    ///
+    /// Row tuple order: `(id, entity_type, condition_claim_type,
+    /// expected_claim_type, frequency, sample_size, last_computed,
+    /// min_sample_threshold)`.
+    #[allow(clippy::type_complexity)]
+    pub fn reflect_rewrite_patterns(
+        &self,
+        rows: &[(String, String, String, String, f64, usize, f64, usize)],
+    ) -> Result<()> {
+        // Row-level delete via subquery. `::remove` would be simpler but
+        // cozo rejects it while any `::index` is attached — and we have
+        // `structural_patterns:by_entity_type` to keep.
+        self.db
+            .run_script(
+                r#"?[id] := *structural_patterns{id}
+                :rm structural_patterns {id}"#,
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("truncate structural_patterns: {e}")))?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let data_rows: Vec<DataValue> = rows
+            .iter()
+            .map(|r| {
+                DataValue::List(vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::Num(Num::Float(r.4)),
+                    DataValue::Num(Num::Int(r.5 as i64)),
+                    DataValue::Num(Num::Float(r.6)),
+                    DataValue::Num(Num::Int(r.7 as i64)),
+                ])
+            })
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("rows".into(), DataValue::List(data_rows));
+        self.query(
+            r#"?[id, entity_type, condition_claim_type, expected_claim_type,
+                 frequency, sample_size, last_computed, min_sample_threshold] <- $rows
+            :put structural_patterns {
+                id =>
+                entity_type, condition_claim_type, expected_claim_type,
+                frequency, sample_size, last_computed, min_sample_threshold
+            }"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Load every row of `known_unknowns` (regardless of status).
+    ///
+    /// Returned tuple: `(id, entity_id, pattern_id, expected_claim_type,
+    /// confidence, status, created_at, resolved_at, resolved_by)`.
+    #[allow(clippy::type_complexity)]
+    pub fn reflect_load_known_unknowns(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, f64, String, f64, f64, String)>> {
+        let result = self
+            .db
+            .run_script(
+                r#"?[id, eid, pid, expected, conf, status, created, resolved, resolved_by] :=
+                    *known_unknowns{id, entity_id: eid, pattern_id: pid,
+                                    expected_claim_type: expected, confidence: conf, status,
+                                    created_at: created, resolved_at: resolved,
+                                    resolved_by}"#,
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("reflect_load_known_unknowns: {e}"))
+            })?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    dv_to_string(&row[3]),
+                    dv_to_float(&row[4]),
+                    dv_to_string(&row[5]),
+                    dv_to_float(&row[6]),
+                    dv_to_float(&row[7]),
+                    dv_to_string(&row[8]),
+                )
+            })
+            .collect())
+    }
+
+    /// Upsert one row of `known_unknowns`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reflect_upsert_known_unknown(
+        &self,
+        id: &str,
+        entity_id: &str,
+        pattern_id: &str,
+        expected_claim_type: &str,
+        confidence: f64,
+        status: &str,
+        created_at: f64,
+        resolved_at: f64,
+        resolved_by: &str,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.to_string().into()));
+        params.insert("eid".into(), DataValue::Str(entity_id.to_string().into()));
+        params.insert("pid".into(), DataValue::Str(pattern_id.to_string().into()));
+        params.insert(
+            "expected".into(),
+            DataValue::Str(expected_claim_type.to_string().into()),
+        );
+        params.insert("conf".into(), DataValue::Num(Num::Float(confidence)));
+        params.insert("status".into(), DataValue::Str(status.to_string().into()));
+        params.insert("created".into(), DataValue::Num(Num::Float(created_at)));
+        params.insert("resolved".into(), DataValue::Num(Num::Float(resolved_at)));
+        params.insert(
+            "resolved_by".into(),
+            DataValue::Str(resolved_by.to_string().into()),
+        );
+        self.query(
+            r#"?[id, entity_id, pattern_id, expected_claim_type, confidence,
+                 status, created_at, resolved_at, resolved_by] <-
+                [[$id, $eid, $pid, $expected, $conf, $status, $created, $resolved, $resolved_by]]
+            :put known_unknowns {
+                id =>
+                entity_id, pattern_id, expected_claim_type, confidence,
+                status, created_at, resolved_at, resolved_by
+            }"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Count open gap records (status = 'open').
+    pub fn reflect_count_open_known_unknowns(&self) -> Result<usize> {
+        let result = self
+            .db
+            .run_script(
+                "?[count(gid)] := *known_unknowns{id: gid, status: 'open'}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("reflect_count_open_known_unknowns: {e}"))
+            })?;
+        Ok(result.rows.first().map(|r| count_from_single(&r[0])).unwrap_or(0))
+    }
+
+    /// List open gaps joined with entity + pattern detail, filtered by
+    /// `min_confidence` and optionally scoped to an entity canonical name.
+    ///
+    /// Returned tuple: `(gap_id, entity_id, entity_name, entity_type,
+    /// expected_claim_type, confidence, pattern_id, sample_size,
+    /// created_at)`.
+    #[allow(clippy::type_complexity)]
+    pub fn reflect_list_open_gap_rows(
+        &self,
+        entity_name: Option<&str>,
+        min_confidence: f64,
+    ) -> Result<Vec<(String, String, String, String, String, f64, String, usize, f64)>> {
+        let mut params = BTreeMap::new();
+        params.insert("min_conf".into(), DataValue::Num(Num::Float(min_confidence)));
+        let script = if let Some(name) = entity_name {
+            params.insert("name".into(), DataValue::Str(name.to_string().into()));
+            r#"?[gid, eid, ename, etype, expected, confidence, pid, sample, created] :=
+                *known_unknowns{id: gid, entity_id: eid, pattern_id: pid,
+                                expected_claim_type: expected, confidence, status: 'open',
+                                created_at: created},
+                *entities{id: eid, canonical_name: ename, entity_type: etype},
+                *structural_patterns{id: pid, sample_size: sample},
+                confidence >= $min_conf,
+                ename == $name"#
+        } else {
+            r#"?[gid, eid, ename, etype, expected, confidence, pid, sample, created] :=
+                *known_unknowns{id: gid, entity_id: eid, pattern_id: pid,
+                                expected_claim_type: expected, confidence, status: 'open',
+                                created_at: created},
+                *entities{id: eid, canonical_name: ename, entity_type: etype},
+                *structural_patterns{id: pid, sample_size: sample},
+                confidence >= $min_conf"#
+        };
+
+        let result = self
+            .db
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| Error::GraphStorage(format!("reflect_list_open_gap_rows: {e}")))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    dv_to_string(&row[3]),
+                    dv_to_string(&row[4]),
+                    dv_to_float(&row[5]),
+                    dv_to_string(&row[6]),
+                    count_from_single(&row[7]),
+                    dv_to_float(&row[8]),
+                )
+            })
+            .collect())
+    }
+
+    // ─── Rooting: trial_verdicts / verification_certificates / derivation_edges ──
+
+    /// Batch-insert Rooting trial verdicts. Parameters are passed as primitive
+    /// tuples so this crate does not need to depend on `thinkingroot-rooting`.
+    ///
+    /// Row tuple order:
+    /// `(id, claim_id, trial_at, admission_tier, provenance_score,
+    ///   contradiction_score, predicate_score, topology_score, temporal_score,
+    ///   certificate_hash, failure_reason, rooter_version)`
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub fn insert_trial_verdicts_batch(
+        &self,
+        rows: &[(String, String, f64, String, f64, f64, f64, f64, f64, String, String, String)],
+    ) -> Result<()> {
+        const CHUNK: usize = 500;
+        for chunk in rows.chunks(CHUNK) {
+            let data_rows: Vec<DataValue> = chunk
+                .iter()
+                .map(|r| {
+                    DataValue::List(vec![
+                        DataValue::Str(r.0.clone().into()),
+                        DataValue::Str(r.1.clone().into()),
+                        DataValue::Num(Num::Float(r.2)),
+                        DataValue::Str(r.3.clone().into()),
+                        DataValue::Num(Num::Float(r.4)),
+                        DataValue::Num(Num::Float(r.5)),
+                        DataValue::Num(Num::Float(r.6)),
+                        DataValue::Num(Num::Float(r.7)),
+                        DataValue::Num(Num::Float(r.8)),
+                        DataValue::Str(r.9.clone().into()),
+                        DataValue::Str(r.10.clone().into()),
+                        DataValue::Str(r.11.clone().into()),
+                    ])
+                })
+                .collect();
+            let mut params = BTreeMap::new();
+            params.insert("rows".into(), DataValue::List(data_rows));
+            self.query(
+                "?[id, claim_id, trial_at, admission_tier, provenance_score, \
+                  contradiction_score, predicate_score, topology_score, \
+                  temporal_score, certificate_hash, failure_reason, rooter_version] \
+                  <- $rows \
+                  :put trial_verdicts {id => claim_id, trial_at, admission_tier, \
+                  provenance_score, contradiction_score, predicate_score, \
+                  topology_score, temporal_score, certificate_hash, \
+                  failure_reason, rooter_version}",
+                params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Batch-insert Rooting verification certificates. Idempotent — identical
+    /// `hash` values will upsert the same row.
+    ///
+    /// Row tuple order:
+    /// `(hash, claim_id, created_at, probe_inputs_json, probe_outputs_json,
+    ///   rooter_version, source_content_hash)`
+    #[allow(clippy::type_complexity)]
+    pub fn insert_certificates_batch(
+        &self,
+        rows: &[(String, String, f64, String, String, String, String)],
+    ) -> Result<()> {
+        const CHUNK: usize = 500;
+        for chunk in rows.chunks(CHUNK) {
+            let data_rows: Vec<DataValue> = chunk
+                .iter()
+                .map(|r| {
+                    DataValue::List(vec![
+                        DataValue::Str(r.0.clone().into()),
+                        DataValue::Str(r.1.clone().into()),
+                        DataValue::Num(Num::Float(r.2)),
+                        DataValue::Str(r.3.clone().into()),
+                        DataValue::Str(r.4.clone().into()),
+                        DataValue::Str(r.5.clone().into()),
+                        DataValue::Str(r.6.clone().into()),
+                    ])
+                })
+                .collect();
+            let mut params = BTreeMap::new();
+            params.insert("rows".into(), DataValue::List(data_rows));
+            self.query(
+                "?[hash, claim_id, created_at, probe_inputs_json, probe_outputs_json, \
+                  rooter_version, source_content_hash] <- $rows \
+                  :put verification_certificates {hash => claim_id, created_at, \
+                  probe_inputs_json, probe_outputs_json, rooter_version, \
+                  source_content_hash}",
+                params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get all trial verdicts for a specific claim, ordered by trial time descending.
+    #[allow(clippy::type_complexity)]
+    pub fn get_trial_verdicts_for_claim(
+        &self,
+        claim_id: &str,
+    ) -> Result<Vec<(String, f64, String, f64, f64, f64, f64, f64, String, String, String)>> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        let result = self
+            .db
+            .run_script(
+                "?[id, trial_at, admission_tier, provenance_score, contradiction_score, \
+                  predicate_score, topology_score, temporal_score, certificate_hash, \
+                  failure_reason, rooter_version] := \
+                  *trial_verdicts{id, claim_id: $cid, trial_at, admission_tier, \
+                  provenance_score, contradiction_score, predicate_score, \
+                  topology_score, temporal_score, certificate_hash, failure_reason, \
+                  rooter_version}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_trial_verdicts_for_claim: {e}")))?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if row.len() < 11 {
+                continue;
+            }
+            out.push((
+                dv_to_string(&row[0]),
+                dv_to_float(&row[1]),
+                dv_to_string(&row[2]),
+                dv_to_float(&row[3]),
+                dv_to_float(&row[4]),
+                dv_to_float(&row[5]),
+                dv_to_float(&row[6]),
+                dv_to_float(&row[7]),
+                dv_to_string(&row[8]),
+                dv_to_string(&row[9]),
+                dv_to_string(&row[10]),
+            ));
+        }
+        // Most-recent first — trial_at descending.
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+
+    /// Look up a verification certificate by its BLAKE3 hash.
+    #[allow(clippy::type_complexity)]
+    pub fn get_certificate_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<(String, f64, String, String, String, String)>> {
+        let mut params = BTreeMap::new();
+        params.insert("h".into(), DataValue::Str(hash.into()));
+        let result = self
+            .db
+            .run_script(
+                "?[claim_id, created_at, probe_inputs_json, probe_outputs_json, \
+                  rooter_version, source_content_hash] := \
+                  *verification_certificates{hash: $h, claim_id, created_at, \
+                  probe_inputs_json, probe_outputs_json, rooter_version, \
+                  source_content_hash}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_certificate_by_hash: {e}")))?;
+        if let Some(row) = result.rows.first() {
+            Ok(Some((
+                dv_to_string(&row[0]),
+                dv_to_float(&row[1]),
+                dv_to_string(&row[2]),
+                dv_to_string(&row[3]),
+                dv_to_string(&row[4]),
+                dv_to_string(&row[5]),
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert a derivation edge linking a parent claim to a derived child claim.
+    pub fn insert_derivation_edge(
+        &self,
+        parent_claim_id: &str,
+        child_claim_id: &str,
+        derivation_rule: &str,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("p".into(), DataValue::Str(parent_claim_id.into()));
+        params.insert("c".into(), DataValue::Str(child_claim_id.into()));
+        params.insert("r".into(), DataValue::Str(derivation_rule.into()));
+        self.query(
+            "?[parent_claim_id, child_claim_id, derivation_rule] <- [[$p, $c, $r]] \
+             :put derivation_edges {parent_claim_id, child_claim_id => derivation_rule}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    // ─── End Rooting helpers ─────────────────────────────────────────────
+
     /// Get all contradictions.
     #[allow(clippy::type_complexity)]
     pub fn get_contradictions(&self) -> Result<Vec<(String, String, String, String, String)>> {
@@ -1240,6 +1989,117 @@ impl GraphStore {
             params,
         )?;
         Ok(count_from_rows(&result.rows))
+    }
+
+    /// List claims with `admission_tier = 'rooted'`, optionally filtered by
+    /// claim type, entity name, and/or minimum confidence. Returns tuples of
+    /// `(id, statement, claim_type, confidence, source_uri, event_date)`.
+    /// Used by the `query_rooted` MCP tool.
+    #[allow(clippy::type_complexity)]
+    pub fn get_rooted_claims_filtered(
+        &self,
+        type_filter: Option<&str>,
+        entity_filter: Option<&str>,
+        min_confidence: Option<f64>,
+    ) -> Result<Vec<(String, String, String, f64, String, f64)>> {
+        // Base query: Rooted claims joined with their source URIs.
+        // Entity filter joins through claim_entity_edges + entities.canonical_name.
+        let (script, params) = if let Some(ename) = entity_filter {
+            let mut p = BTreeMap::new();
+            p.insert("ename".into(), DataValue::Str(ename.into()));
+            (
+                "?[id, statement, claim_type, confidence, source_uri, event_date] := \
+                  *claims{id, statement, claim_type, source_id, confidence, event_date, admission_tier}, \
+                  admission_tier = 'rooted', \
+                  *sources{id: source_id, uri: source_uri}, \
+                  *claim_entity_edges{claim_id: id, entity_id}, \
+                  *entities{id: entity_id, canonical_name: $ename}",
+                p,
+            )
+        } else {
+            (
+                "?[id, statement, claim_type, confidence, source_uri, event_date] := \
+                  *claims{id, statement, claim_type, source_id, confidence, event_date, admission_tier}, \
+                  admission_tier = 'rooted', \
+                  *sources{id: source_id, uri: source_uri}",
+                BTreeMap::new(),
+            )
+        };
+
+        let result = self
+            .db
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| Error::GraphStorage(format!("get_rooted_claims_filtered: {e}")))?;
+
+        let mut out: Vec<(String, String, String, f64, String, f64)> = Vec::new();
+        for row in &result.rows {
+            if row.len() < 6 {
+                continue;
+            }
+            let claim_type = dv_to_string(&row[2]);
+            if let Some(t) = type_filter
+                && !claim_type.eq_ignore_ascii_case(t)
+            {
+                continue;
+            }
+            let confidence = dv_to_float(&row[3]);
+            if let Some(min) = min_confidence
+                && confidence < min
+            {
+                continue;
+            }
+            out.push((
+                dv_to_string(&row[0]),
+                dv_to_string(&row[1]),
+                claim_type,
+                confidence,
+                dv_to_string(&row[4]),
+                dv_to_float(&row[5]),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Return every claim ID in the workspace. Used by `root rooting re-run --all`
+    /// to drive re-execution over the full graph.
+    pub fn get_all_claim_ids(&self) -> Result<Vec<String>> {
+        let result = self.query_read("?[id] := *claims{id}")?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| dv_to_string(&row[0]))
+            .collect())
+    }
+
+    /// Count claims grouped by their Rooting admission tier.
+    /// Returns `(rooted, attested, quarantined, rejected)`. Used by the
+    /// Health Score calculation and by `root rooting report`.
+    pub fn count_claims_by_admission_tier(&self) -> Result<(usize, usize, usize, usize)> {
+        let result = self.query_read(
+            "?[tier, count(id)] := *claims{id, admission_tier: tier}",
+        )?;
+        let mut rooted = 0usize;
+        let mut attested = 0usize;
+        let mut quarantined = 0usize;
+        let mut rejected = 0usize;
+        for row in &result.rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let tier = dv_to_string(&row[0]);
+            let count = match &row[1] {
+                DataValue::Num(Num::Int(n)) => *n as usize,
+                DataValue::Num(Num::Float(f)) => *f as usize,
+                _ => 0,
+            };
+            match tier.as_str() {
+                "rooted" => rooted = count,
+                "quarantined" => quarantined = count,
+                "rejected" => rejected = count,
+                _ => attested = count,
+            }
+        }
+        Ok((rooted, attested, quarantined, rejected))
     }
 
     /// Check if a source with this content_hash already exists.
@@ -1495,8 +2355,8 @@ impl GraphStore {
         params.insert("id".into(), DataValue::Str(id.into()));
 
         let result = self.db.run_script(
-            r#"?[statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date] :=
-                *claims{id: $id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date}"#,
+            r#"?[statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at] :=
+                *claims{id: $id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at}"#,
             params,
             ScriptMutability::Immutable,
         ).map_err(|e| Error::GraphStorage(format!("get_claim_by_id query failed: {e}")))?;
@@ -1581,6 +2441,51 @@ impl GraphStore {
             None
         };
 
+        // Rooting columns (Migration 3). Row indices 11–14.
+        let admission_tier = thinkingroot_core::types::AdmissionTier::from_str(
+            dv_to_string(&row[11]).as_str(),
+        );
+        let derivation_parents_str = dv_to_string(&row[12]);
+        let derivation = if derivation_parents_str.is_empty() {
+            None
+        } else {
+            let parsed: std::result::Result<Vec<String>, _> =
+                serde_json::from_str(&derivation_parents_str);
+            match parsed {
+                Ok(ids) => {
+                    let parent_claim_ids: Vec<ClaimId> = ids
+                        .iter()
+                        .filter_map(|s| s.parse::<ClaimId>().ok())
+                        .collect();
+                    if parent_claim_ids.is_empty() {
+                        None
+                    } else {
+                        Some(thinkingroot_core::types::DerivationProof {
+                            parent_claim_ids,
+                            derivation_rule: String::new(),
+                        })
+                    }
+                }
+                Err(_) => None,
+            }
+        };
+        let predicate_json_str = dv_to_string(&row[13]);
+        let predicate = if predicate_json_str.is_empty() {
+            None
+        } else {
+            serde_json::from_str::<thinkingroot_core::types::Predicate>(&predicate_json_str).ok()
+        };
+        let last_rooted_ts = match &row[14] {
+            DataValue::Num(Num::Float(f)) if *f > 0.0 => *f,
+            DataValue::Num(Num::Int(n)) if *n > 0 => *n as f64,
+            _ => 0.0,
+        };
+        let last_rooted_at = if last_rooted_ts > 0.0 {
+            chrono::DateTime::from_timestamp(last_rooted_ts as i64, 0)
+        } else {
+            None
+        };
+
         Ok(Some(Claim {
             id: claim_id,
             statement,
@@ -1603,6 +2508,10 @@ impl GraphStore {
                 _ => thinkingroot_core::types::ExtractionTier::Llm,
             },
             event_date,
+            admission_tier,
+            derivation,
+            predicate,
+            last_rooted_at,
         }))
     }
 
@@ -1899,7 +2808,7 @@ impl GraphStore {
         }))
     }
 
-    fn get_entity_ids_for_claim(&self, claim_id: &str) -> Result<Vec<String>> {
+    pub fn get_entity_ids_for_claim(&self, claim_id: &str) -> Result<Vec<String>> {
         let mut params = BTreeMap::new();
         params.insert("cid".into(), DataValue::Str(claim_id.into()));
 
@@ -2891,13 +3800,19 @@ fn dv_to_float(val: &DataValue) -> f64 {
 
 fn count_from_rows(rows: &[Vec<DataValue>]) -> usize {
     if let Some(row) = rows.first() {
-        match &row[0] {
-            DataValue::Num(Num::Int(n)) => *n as usize,
-            DataValue::Num(Num::Float(n)) => *n as usize,
-            _ => 0,
-        }
+        count_from_single(&row[0])
     } else {
         0
+    }
+}
+
+/// Extract a non-negative integer count from a single DataValue. Handles
+/// both Int and Float variants; negative values clamp to 0.
+fn count_from_single(val: &DataValue) -> usize {
+    match val {
+        DataValue::Num(Num::Int(n)) => (*n).max(0) as usize,
+        DataValue::Num(Num::Float(f)) => f.max(0.0) as usize,
+        _ => 0,
     }
 }
 
@@ -3508,5 +4423,226 @@ mod tests {
             ExtractionTier::Llm,
             "ExtractionTier::Llm must survive insert+get round-trip"
         );
+    }
+
+    // ─── Rooting migration tests ────────────────────────────────────────
+
+    #[test]
+    fn fresh_db_has_admission_tier_column() {
+        // Fresh DBs go through create_schema, which includes the Rooting columns
+        // natively. The migration probe should detect them and no-op.
+        let store = mem_store();
+        store.migrate_claims_extraction_tier().unwrap();
+
+        // Insert a claim and read it back. The migration should have left
+        // things consistent.
+        let source = thinkingroot_core::Source::new(
+            "test://doc.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&source).unwrap();
+
+        let claim = thinkingroot_core::Claim::new(
+            "a plain claim",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        store.insert_claim(&claim).unwrap();
+
+        let retrieved = store
+            .get_claim_by_id(&claim.id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retrieved.admission_tier,
+            thinkingroot_core::types::AdmissionTier::Attested,
+            "plain claim must default to Attested tier"
+        );
+        assert!(retrieved.derivation.is_none());
+        assert!(retrieved.predicate.is_none());
+        assert!(retrieved.last_rooted_at.is_none());
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        // Running the migration path multiple times on a fresh DB must not fail,
+        // must not change the schema, and must not lose data.
+        let store = mem_store();
+        for _ in 0..3 {
+            store.migrate_claims_extraction_tier().unwrap();
+        }
+
+        let source = thinkingroot_core::Source::new(
+            "test://repeat.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&source).unwrap();
+        let claim = thinkingroot_core::Claim::new(
+            "repeat test",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        store.insert_claim(&claim).unwrap();
+
+        // Still readable after multiple migration calls.
+        assert!(store
+            .get_claim_by_id(&claim.id.to_string())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn insert_claim_preserves_rooting_fields_round_trip() {
+        use thinkingroot_core::types::{
+            AdmissionTier, DerivationProof, Predicate, PredicateLanguage, PredicateScope,
+        };
+
+        let store = mem_store();
+
+        let source = thinkingroot_core::Source::new(
+            "test://rooting.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&source).unwrap();
+
+        let parent_id = thinkingroot_core::ClaimId::new();
+        let claim = thinkingroot_core::Claim::new(
+            "derived claim",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        )
+        .with_admission_tier(AdmissionTier::Rooted)
+        .with_derivation(DerivationProof {
+            parent_claim_ids: vec![parent_id],
+            derivation_rule: "test-rule".into(),
+        })
+        .with_predicate(Predicate {
+            language: PredicateLanguage::Regex,
+            query: r"fn\s+main".into(),
+            scope: PredicateScope::from_globs(vec!["src/**/*.rs".into()]),
+        })
+        .with_last_rooted_at(chrono::Utc::now());
+
+        store.insert_claim(&claim).unwrap();
+
+        let round = store
+            .get_claim_by_id(&claim.id.to_string())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(round.admission_tier, AdmissionTier::Rooted);
+        let derivation = round.derivation.expect("derivation round-tripped");
+        assert_eq!(derivation.parent_claim_ids, vec![parent_id]);
+        // derivation_rule is not persisted in the current schema (only parent IDs
+        // are stored in derivation_parents); this is by design for v1.
+        let predicate = round.predicate.expect("predicate round-tripped");
+        assert_eq!(predicate.language, PredicateLanguage::Regex);
+        assert_eq!(predicate.query, r"fn\s+main");
+        assert_eq!(predicate.scope.globs.len(), 1);
+        assert!(round.last_rooted_at.is_some());
+    }
+
+    #[test]
+    fn count_claims_by_admission_tier_groups_correctly() {
+        use thinkingroot_core::types::AdmissionTier;
+
+        let store = mem_store();
+        let source = thinkingroot_core::Source::new(
+            "test://count.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&source).unwrap();
+
+        let make = |tier: AdmissionTier, label: &str| {
+            let c = thinkingroot_core::Claim::new(
+                label,
+                thinkingroot_core::types::ClaimType::Fact,
+                source.id,
+                thinkingroot_core::types::WorkspaceId::new(),
+            )
+            .with_admission_tier(tier);
+            store.insert_claim(&c).unwrap();
+        };
+
+        make(AdmissionTier::Rooted, "r1");
+        make(AdmissionTier::Rooted, "r2");
+        make(AdmissionTier::Attested, "a1");
+        make(AdmissionTier::Quarantined, "q1");
+        make(AdmissionTier::Quarantined, "q2");
+        make(AdmissionTier::Quarantined, "q3");
+        make(AdmissionTier::Rejected, "x1");
+
+        let (rooted, attested, quarantined, rejected) =
+            store.count_claims_by_admission_tier().unwrap();
+        assert_eq!(rooted, 2);
+        assert_eq!(attested, 1);
+        assert_eq!(quarantined, 3);
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn rooting_relations_exist_on_fresh_db() {
+        // Fresh DB must have trial_verdicts, verification_certificates, and
+        // derivation_edges available for insert/query (no errors).
+        let store = mem_store();
+
+        // Trial verdict insert.
+        let mut p = BTreeMap::new();
+        p.insert("id".into(), DataValue::Str("v1".into()));
+        p.insert("claim_id".into(), DataValue::Str("c1".into()));
+        p.insert("trial_at".into(), DataValue::Num(Num::Float(0.0)));
+        p.insert("admission_tier".into(), DataValue::Str("rooted".into()));
+        p.insert("provenance_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert("contradiction_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert("predicate_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert("topology_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert("temporal_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert("certificate_hash".into(), DataValue::Str("abc".into()));
+        p.insert("failure_reason".into(), DataValue::Str("".into()));
+        p.insert("rooter_version".into(), DataValue::Str("0.9.0".into()));
+        store
+            .query(
+                r#"?[id, claim_id, trial_at, admission_tier, provenance_score, contradiction_score, predicate_score, topology_score, temporal_score, certificate_hash, failure_reason, rooter_version] <- [[
+                    $id, $claim_id, $trial_at, $admission_tier, $provenance_score, $contradiction_score, $predicate_score, $topology_score, $temporal_score, $certificate_hash, $failure_reason, $rooter_version
+                ]]
+                :put trial_verdicts {id => claim_id, trial_at, admission_tier, provenance_score, contradiction_score, predicate_score, topology_score, temporal_score, certificate_hash, failure_reason, rooter_version}"#,
+                p,
+            )
+            .unwrap();
+
+        // Certificate insert.
+        let mut p = BTreeMap::new();
+        p.insert("hash".into(), DataValue::Str("abc".into()));
+        p.insert("claim_id".into(), DataValue::Str("c1".into()));
+        p.insert("created_at".into(), DataValue::Num(Num::Float(0.0)));
+        p.insert("inputs".into(), DataValue::Str("{}".into()));
+        p.insert("outputs".into(), DataValue::Str("{}".into()));
+        p.insert("version".into(), DataValue::Str("0.9.0".into()));
+        p.insert("source_hash".into(), DataValue::Str("h".into()));
+        store
+            .query(
+                r#"?[hash, claim_id, created_at, probe_inputs_json, probe_outputs_json, rooter_version, source_content_hash] <- [[
+                    $hash, $claim_id, $created_at, $inputs, $outputs, $version, $source_hash
+                ]]
+                :put verification_certificates {hash => claim_id, created_at, probe_inputs_json, probe_outputs_json, rooter_version, source_content_hash}"#,
+                p,
+            )
+            .unwrap();
+
+        // Derivation edge insert.
+        let mut p = BTreeMap::new();
+        p.insert("parent".into(), DataValue::Str("p1".into()));
+        p.insert("child".into(), DataValue::Str("c1".into()));
+        p.insert("rule".into(), DataValue::Str("test".into()));
+        store
+            .query(
+                r#"?[parent_claim_id, child_claim_id, derivation_rule] <- [[$parent, $child, $rule]]
+                :put derivation_edges {parent_claim_id, child_claim_id => derivation_rule}"#,
+                p,
+            )
+            .unwrap();
     }
 }

@@ -251,7 +251,28 @@ pub async fn run_serve(
     } else {
         None
     };
-    let state = AppState::new_with_root(engine, api_key, workspace_root);
+    let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
+
+    // Spawn background stream-branch cleanup for single-workspace mounts.
+    // Multi-workspace mounts skip this — a single cleanup task can't safely
+    // scan across heterogeneous workspace roots with different configs.
+    let _cleanup_handle = if let Some(ref root) = workspace_root {
+        let ws_name = resolved_paths[0].0.clone();
+        let engine = state.engine.read().await;
+        let streams_cfg = engine
+            .workspace_streams_config(&ws_name)
+            .unwrap_or_default();
+        let branch_engines = Some(engine.branch_engines_arc());
+        drop(engine);
+        Some(thinkingroot_serve::maintenance::spawn_stream_cleanup(
+            state.sessions.clone(),
+            root.clone(),
+            streams_cfg,
+            branch_engines,
+        ))
+    } else {
+        None
+    };
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
     let addr = format!("{}:{}", host, port);
@@ -360,7 +381,26 @@ async fn run_serve_with_listener(
     } else {
         None
     };
-    let state = AppState::new_with_root(engine, api_key, workspace_root);
+    let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
+
+    let _cleanup_handle = if let Some(ref root) = workspace_root {
+        let ws_name = resolved_paths[0].0.clone();
+        let engine = state.engine.read().await;
+        let streams_cfg = engine
+            .workspace_streams_config(&ws_name)
+            .unwrap_or_default();
+        let branch_engines = Some(engine.branch_engines_arc());
+        drop(engine);
+        Some(thinkingroot_serve::maintenance::spawn_stream_cleanup(
+            state.sessions.clone(),
+            root.clone(),
+            streams_cfg,
+            branch_engines,
+        ))
+    } else {
+        None
+    };
+
     let router = build_router_opts(state, !no_rest, !no_mcp);
 
     tracing::info!("server listening on {:?}", listener.local_addr());

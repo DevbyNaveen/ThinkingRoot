@@ -122,6 +122,13 @@ impl SessionContext {
     pub fn age_secs(&self) -> u64 {
         self.created_at.elapsed().as_secs()
     }
+
+    /// Seconds since the last activity touched this session. Used by the
+    /// stream-cleanup task to decide whether an in-memory session is still
+    /// holding its `stream/*` branch alive.
+    pub fn idle_secs(&self) -> u64 {
+        self.last_active.elapsed().as_secs()
+    }
 }
 
 #[cfg(test)]

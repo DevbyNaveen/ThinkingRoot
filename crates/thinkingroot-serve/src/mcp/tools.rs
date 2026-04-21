@@ -128,6 +128,79 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["workspace"]
                 }
             },
+            {
+                "name": "list_branches",
+                "description": "List all active knowledge branches in this workspace with their parent, status, and creation time.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string" },
+                        "root_path": { "type": "string", "description": "Workspace root path (default: current directory)" }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "delete_branch",
+                "description": "Soft-delete a branch (marks Abandoned, retains data dir for audit/recovery). Use gc_branches later to reclaim disk. For permanent deletion of abandoned branches.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branch":    { "type": "string", "description": "Branch to abandon" },
+                        "workspace": { "type": "string" },
+                        "root_path": { "type": "string" }
+                    },
+                    "required": ["branch", "workspace"]
+                }
+            },
+            {
+                "name": "gc_branches",
+                "description": "Permanently delete the data directories of all Abandoned branches. Non-Abandoned branches are untouched. Returns the count of branches purged.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string" },
+                        "root_path": { "type": "string" }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "rollback_merge",
+                "description": "Restore main from the most recent pre-merge snapshot for a given branch. Reverts the merge but keeps the branch intact for re-work. Main cache is reloaded so subsequent reads see the pre-merge state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branch":    { "type": "string", "description": "Branch whose merge should be rolled back" },
+                        "workspace": { "type": "string" },
+                        "root_path": { "type": "string" }
+                    },
+                    "required": ["branch", "workspace"]
+                }
+            },
+            // ── Reflexive (Phase 9): known-unknowns / gaps ───────────────
+            {
+                "name": "reflect",
+                "description": "Run Phase 9 Reflect — discover structural co-occurrence patterns across entities and surface 'known unknowns' (expected claim types missing for specific entities). Pure graph + Datalog, no LLM. Returns a summary; use `gaps` to list the actual records.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "workspace": { "type": "string" } },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "gaps",
+                "description": "List knowledge gaps (known-unknowns) the graph has inferred from its own structural patterns. Each gap says 'entity X of type T is expected to have claim-type C because N% of similar entities do, but X doesn't.' Filter by entity name or minimum pattern confidence.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":       { "type": "string" },
+                        "entity":          { "type": "string", "description": "Canonical name of a single entity to scope the report to" },
+                        "min_confidence":  { "type": "number", "description": "Minimum pattern frequency in [0.0, 1.0]. Default 0.70." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
             // ── Intelligent memory retrieval ─────────────────────────────
             {
                 "name": "ask",
@@ -208,6 +281,32 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                         "workspace": { "type": "string" }
                     },
                     "required": ["claims", "workspace"]
+                }
+            },
+            // ── Rooting tools (Phase 6.5 admission gate) ──────────────────
+            {
+                "name": "query_rooted",
+                "description": "Retrieve only Rooted-tier claims (passed all 5 admission probes). Safer default than query_claims for production agents — guarantees every returned claim has a verified certificate.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "type":           { "type": "string" },
+                        "entity":         { "type": "string" },
+                        "min_confidence": { "type": "number" },
+                        "workspace":      { "type": "string" }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "rooting_report",
+                "description": "Return admission tier counts (rooted / attested / quarantined / rejected) for a workspace. Use to surface memory-quality dashboards or to flag packs whose Rooted fraction is degrading.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string" }
+                    },
+                    "required": ["workspace"]
                 }
             }
         ]
@@ -558,61 +657,23 @@ pub async fn handle_call(
                 .get("force")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            use thinkingroot_branch::diff::compute_diff;
-            use thinkingroot_branch::merge::execute_merge;
-            use thinkingroot_branch::snapshot::resolve_data_dir;
-            use thinkingroot_core::{MergedBy, config::Config};
-            use thinkingroot_graph::graph::GraphStore;
-
-            let config = match Config::load_merged(root) {
-                Ok(c) => c,
-                Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
-            };
-            let mc = &config.merge;
-            let main_data_dir = resolve_data_dir(root, None);
-            let branch_data_dir = resolve_data_dir(root, Some(branch_name));
-            if !branch_data_dir.exists() {
-                return JsonRpcResponse::error(
-                    id,
-                    -32603,
-                    format!("branch '{}' not found", branch_name),
-                );
-            }
-            let main_graph = match GraphStore::init(&main_data_dir.join("graph")) {
-                Ok(g) => g,
-                Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
-            };
-            let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
-                Ok(g) => g,
-                Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
-            };
-            let mut diff = match compute_diff(
-                &main_graph,
-                &branch_graph,
-                branch_name,
-                mc.auto_resolve_threshold,
-                mc.max_health_drop,
-                mc.block_on_contradictions,
-            ) {
-                Ok(d) => d,
-                Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
-            };
-            if force {
-                diff.merge_allowed = true;
-                diff.blocking_reasons.clear();
-            }
-            match execute_merge(
-                root,
-                branch_name,
-                &diff,
-                MergedBy::Human {
-                    user: "mcp".to_string(),
-                },
-                false,
-            )
-            .await
+            let propagate_deletions = arguments
+                .get("propagate_deletions")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match engine
+                .merge_branch(
+                    root,
+                    branch_name,
+                    force,
+                    propagate_deletions,
+                    thinkingroot_core::MergedBy::Human {
+                        user: "mcp".to_string(),
+                    },
+                )
+                .await
             {
-                Ok(_) => JsonRpcResponse::success(
+                Ok(diff) => JsonRpcResponse::success(
                     id,
                     serde_json::json!({
                         "content": [{
@@ -957,6 +1018,214 @@ pub async fn handle_call(
                     JsonRpcResponse::success(
                         id,
                         serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        // ── Rooting: trust-tier filtered query ────────────────────────────
+        //
+        // Week 5 ships a graph-direct implementation that queries claims by
+        // admission_tier rather than going through the in-memory cache. This
+        // guarantees freshness (Phase 6.5 writes tiers synchronously) but
+        // returns the full Claim struct. The cache-backed path that includes
+        // admission_tier in ClaimInfo is Week 6 polish.
+        "query_rooted" => {
+            let type_filter = arguments
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let entity_filter = arguments
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let min_confidence = arguments.get("min_confidence").and_then(|v| v.as_f64());
+            match engine
+                .list_rooted_claims(ws, type_filter, entity_filter, min_confidence)
+                .await
+            {
+                Ok(claims) => {
+                    let content = serde_json::to_string_pretty(&claims).unwrap_or_default();
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        // ── Rooting: admission tier counts + recent failures ──────────────
+        "rooting_report" => match engine.rooting_report(ws).await {
+            Ok(report) => {
+                let content = serde_json::to_string_pretty(&report).unwrap_or_default();
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+                )
+            }
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+
+        // ── Branch management: list / delete / gc / rollback ──────────────
+        "list_branches" => {
+            let root_path_str = arguments
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let root = std::path::Path::new(root_path_str);
+            match thinkingroot_branch::list_branches(root) {
+                Ok(branches) => {
+                    let content =
+                        serde_json::to_string_pretty(&branches).unwrap_or_else(|_| "[]".into());
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": content }]
+                        }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "delete_branch" => {
+            let branch_name = match arguments.get("branch").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'branch' argument".to_string(),
+                    );
+                }
+            };
+            let root_path_str = arguments
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let root = std::path::Path::new(root_path_str);
+            match engine.delete_branch(root, branch_name).await {
+                Ok(()) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!(
+                                "Branch '{}' marked as Abandoned. Data dir retained — run gc_branches to reclaim disk.",
+                                branch_name
+                            )
+                        }]
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "gc_branches" => {
+            let root_path_str = arguments
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let root = std::path::Path::new(root_path_str);
+            match engine.gc_branches(root).await {
+                Ok(n) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!("Purged {} abandoned branch{}", n, if n == 1 { "" } else { "es" })
+                        }]
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "rollback_merge" => {
+            let branch_name = match arguments.get("branch").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'branch' argument".to_string(),
+                    );
+                }
+            };
+            let root_path_str = arguments
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let root = std::path::Path::new(root_path_str);
+            match engine.rollback_merge(root, branch_name).await {
+                Ok(()) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!(
+                                "Rolled back merge of branch '{}' — main restored from most recent pre-merge snapshot. Cache reloaded.",
+                                branch_name
+                            )
+                        }]
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        // ── Reflexive (Phase 9) ────────────────────────────────────────────
+        "reflect" => match engine.reflect(ws).await {
+            Ok(summary) => {
+                let text = format!(
+                    "reflect complete — patterns: {}, entity_types_scanned: {}, gaps_created: {}, gaps_resolved: {}, open_gaps_total: {}",
+                    summary.patterns.len(),
+                    summary.entity_types_scanned,
+                    summary.gaps_created,
+                    summary.gaps_resolved,
+                    summary.open_gaps_total,
+                );
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                )
+            }
+            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        },
+
+        "gaps" => {
+            let entity = arguments.get("entity").and_then(|v| v.as_str());
+            let min_conf = arguments
+                .get("min_confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.70);
+            match engine.list_gaps(ws, entity, min_conf).await {
+                Ok(gaps) => {
+                    let text = if gaps.is_empty() {
+                        "No open knowledge gaps at this confidence threshold.".to_string()
+                    } else {
+                        let mut out = format!("{} open gap(s):\n", gaps.len());
+                        for g in &gaps {
+                            out.push_str(&format!(
+                                "- {} ({}): expected {} @ {:.0}% confidence (sample: {}) — {}\n",
+                                g.entity_name,
+                                g.entity_type,
+                                g.expected_claim_type,
+                                g.confidence * 100.0,
+                                g.sample_size,
+                                g.reason
+                            ));
+                        }
+                        out
+                    };
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "gaps": serde_json::to_value(&gaps).unwrap_or(serde_json::Value::Null),
+                        }),
                     )
                 }
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),

@@ -51,6 +51,14 @@ class Client:
         resp = self._client.post(f"{self._base}{path}")
         return self._handle(resp)
 
+    def _post_json(self, path: str, body: dict[str, Any]) -> Any:
+        resp = self._client.post(f"{self._base}{path}", json=body)
+        return self._handle(resp)
+
+    def _delete(self, path: str) -> Any:
+        resp = self._client.delete(f"{self._base}{path}")
+        return self._handle(resp)
+
     def _handle(self, resp: httpx.Response) -> Any:
         data = resp.json()
         if not data.get("ok"):
@@ -179,3 +187,55 @@ class Client:
         """Run verification checks and return the health report."""
         ws = self._resolve_workspace(workspace)
         return self._post(f"/ws/{ws}/verify")
+
+    # ─── Branches ─────────────────────────────────────────────
+    #
+    # Branch operations are workspace-root-scoped rather than workspace-name
+    # scoped — they are served only when the server was started against a
+    # single workspace root (see rest.rs:362–548). These methods do not
+    # accept a ``workspace`` argument.
+
+    def branches(self) -> list[dict[str, Any]]:
+        """List active knowledge branches for the server's workspace root."""
+        data = self._get("/branches")
+        return data.get("branches", []) if isinstance(data, dict) else []
+
+    def create_branch(
+        self,
+        name: str,
+        parent: str = "main",
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new knowledge branch from *parent* (default: ``main``)."""
+        body: dict[str, Any] = {"name": name, "parent": parent}
+        if description is not None:
+            body["description"] = description
+        return self._post_json("/branches", body)
+
+    def diff_branch(self, branch: str) -> dict[str, Any]:
+        """Compute the semantic diff between *branch* and main."""
+        return self._get(f"/branches/{branch}/diff")
+
+    def merge_branch(
+        self,
+        branch: str,
+        force: bool = False,
+        propagate_deletions: bool = False,
+    ) -> dict[str, Any]:
+        """Merge *branch* into main. ``force`` bypasses the health/contradiction gate."""
+        return self._post_json(
+            f"/branches/{branch}/merge",
+            {"force": force, "propagate_deletions": propagate_deletions},
+        )
+
+    def checkout_branch(self, branch: str) -> dict[str, Any]:
+        """Set *branch* as the HEAD. Subsequent writes go to the branch."""
+        return self._post(f"/branches/{branch}/checkout")
+
+    def delete_branch(self, branch: str) -> dict[str, Any]:
+        """Soft-delete a branch (marks Abandoned, data dir retained)."""
+        return self._delete(f"/branches/{branch}")
+
+    def rollback_merge(self, branch: str) -> dict[str, Any]:
+        """Restore main from the most recent pre-merge snapshot of *branch*."""
+        return self._post(f"/branches/{branch}/rollback")
