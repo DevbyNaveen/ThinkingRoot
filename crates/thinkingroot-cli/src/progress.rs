@@ -562,6 +562,31 @@ pub async fn run_compile_progress(
                             );
                         }
                     }
+
+                    // ── Rooting (Phase 6.5) ────────────────────────────
+                    // Week 2 renders a minimal status line; a dedicated
+                    // progress bar lands in Week 6 polish.
+                    ProgressEvent::RootingStart { candidates } => {
+                        tracing::info!("Rooting trial: {candidates} candidate claim(s)");
+                    }
+                    ProgressEvent::RootingProgress { done, total } => {
+                        tracing::debug!("Rooting progress: {done}/{total}");
+                    }
+                    ProgressEvent::RootingDone {
+                        rooted,
+                        attested,
+                        quarantined,
+                        rejected,
+                    } => {
+                        let summary = format!(
+                            "Rooted {} · Attested {} · Quarantined {} · Rejected {}",
+                            style(rooted).green(),
+                            style(attested).white(),
+                            style(quarantined).yellow(),
+                            style(rejected).red(),
+                        );
+                        tracing::info!("{summary}");
+                    }
                         }
                     }
                 }

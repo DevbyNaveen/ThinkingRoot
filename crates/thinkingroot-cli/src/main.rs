@@ -12,6 +12,7 @@ mod mcp_config;
 mod pipeline;
 mod progress;
 mod provider_cmd;
+mod rooting_cmd;
 mod serve;
 mod setup;
 mod update_cmd;
@@ -47,6 +48,10 @@ enum Commands {
         /// Compile into a specific branch instead of main
         #[arg(long)]
         branch: Option<String>,
+        /// Skip the Rooting admission gate (Phase 6.5). All admitted claims
+        /// stay in the `attested` tier — same as pre-Rooting behavior.
+        #[arg(long)]
+        no_rooting: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -242,6 +247,11 @@ enum Commands {
     },
     /// Update root to the latest version
     Update,
+    /// Inspect the Rooting gate — admission tiers, certificates, and failures
+    Rooting {
+        #[command(subcommand)]
+        action: RootingAction,
+    },
     /// Run the LongMemEval benchmark against a compiled workspace
     Eval {
         /// Path to the LongMemEval JSONL dataset file
@@ -263,6 +273,39 @@ enum Commands {
         /// If omitted, the workspace's model is used for both synthesis and judging.
         #[arg(long)]
         judge_deployment: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RootingAction {
+    /// Show per-tier claim counts and recent trial failures.
+    Report {
+        /// Path to the compiled workspace
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show the full trial history + certificate details for one claim.
+    Verify {
+        /// Claim ID to verify
+        claim_id: String,
+        /// Path to the compiled workspace
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Re-execute Rooting against existing claims + current source bytes.
+    /// Catches drift: a claim whose source changed since it was admitted
+    /// flips tier (Rooted → Quarantined) without re-compiling the whole pack.
+    #[command(name = "re-run")]
+    ReRun {
+        /// Re-run against every claim in the workspace
+        #[arg(long, conflicts_with = "claim")]
+        all: bool,
+        /// Re-run against a single claim by ID
+        #[arg(long)]
+        claim: Option<String>,
+        /// Path to the compiled workspace
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -395,8 +438,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
-        Some(Commands::Compile { path, branch }) => {
-            run_compile(&path, branch.as_deref(), use_progress).await?;
+        Some(Commands::Compile {
+            path,
+            branch,
+            no_rooting,
+        }) => {
+            run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
         }
         Some(Commands::Health { path }) => {
             run_health(&path).await?;
@@ -571,6 +618,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Update) => {
             update_cmd::run_update().await?;
         }
+        Some(Commands::Rooting { action }) => match action {
+            RootingAction::Report { path } => {
+                rooting_cmd::report(&path)?;
+            }
+            RootingAction::Verify { claim_id, path } => {
+                rooting_cmd::verify(&path, &claim_id)?;
+            }
+            RootingAction::ReRun { all, claim, path } => {
+                if !all && claim.is_none() {
+                    anyhow::bail!("root rooting re-run requires --all or --claim <id>");
+                }
+                rooting_cmd::re_run(&path, all, claim.as_deref())?;
+            }
+        },
         Some(Commands::Eval {
             dataset,
             path,
@@ -590,10 +651,10 @@ async fn main() -> anyhow::Result<()> {
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
-                run_compile(&path, None, use_progress).await?;
+                run_compile(&path, None, use_progress, false).await?;
             } else {
                 // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None, use_progress).await?;
+                run_compile(&PathBuf::from("."), None, use_progress, false).await?;
             }
         }
     }
@@ -605,6 +666,7 @@ async fn run_compile(
     path: &PathBuf,
     branch: Option<&str>,
     use_progress: bool,
+    no_rooting: bool,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
@@ -615,6 +677,15 @@ async fn run_compile(
     }
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize path: {}", path.display()))?;
+
+    // `--no-rooting` sets a process-scoped env flag the pipeline reads just
+    // before Phase 6.5. This avoids plumbing another bool through every
+    // intermediate call site.
+    if no_rooting {
+        unsafe {
+            std::env::set_var("TR_ROOTING_DISABLED", "1");
+        }
+    }
 
     print_banner();
     println!(

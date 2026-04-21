@@ -27,6 +27,7 @@ thinkingroot-verify = { workspace = true }
 thinkingroot-serve = { workspace = true }
 thinkingroot-branch = { workspace = true }
 thinkingroot-ground = { workspace = true }
+thinkingroot-rooting = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

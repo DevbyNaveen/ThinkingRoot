@@ -90,6 +90,7 @@ fn extract_manifest_dep(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     ExtractionResult {
@@ -128,6 +129,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     let def_claim = ExtractedClaim {
@@ -138,6 +140,7 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     // ── Relations ─────────────────────────────────────────────────────────────
@@ -236,6 +239,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     let file_entity = ExtractedEntity {
@@ -287,6 +291,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
             source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
             extraction_tier: ExtractionTier::Structural,
             event_date: None,
+            predicate: None,
         };
         result.claims.push(impl_claim);
     }
@@ -355,6 +360,7 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     let uses_relation = ExtractedRelation {
@@ -424,6 +430,7 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     ExtractionResult {
@@ -497,6 +504,7 @@ fn extract_git_commit(chunk: &Chunk, source_uri: &str, author: &str) -> Extracti
             source_quote: None,
             extraction_tier: ExtractionTier::Structural,
             event_date: None,
+            predicate: None,
         };
         result.entities.push(file_entity);
         result.relations.push(created_by);
@@ -578,6 +586,7 @@ fn extract_doc_comment(chunk: &Chunk, _source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        predicate: None,
     };
 
     ExtractionResult {

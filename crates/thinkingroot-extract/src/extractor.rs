@@ -517,6 +517,15 @@ impl Extractor {
             {
                 output.claim_source_quotes.insert(claim.id, quote.clone());
             }
+            // Wire optional predicate from LLM output. Invalid entries
+            // (unknown language, regex that fails to compile) are dropped
+            // silently so the claim lands in `Attested` tier rather than
+            // failing extraction.
+            if let Some(ref ext_pred) = ext_claim.predicate
+                && let Some(pred) = convert_predicate(ext_pred)
+            {
+                claim = claim.with_predicate(pred);
+            }
             output.claims.push(claim);
         }
 
@@ -662,6 +671,33 @@ impl ExtractionOutput {
         self.source_texts.extend(other.source_texts);
         self.claim_source_quotes.extend(other.claim_source_quotes);
     }
+}
+
+/// Convert the LLM's raw predicate payload into a validated core `Predicate`.
+///
+/// Returns `None` when:
+/// - the language string isn't one we support (`regex`, `rust_ast`, `jsonpath`)
+/// - the query is empty
+/// - the query is a regex that fails to compile (dropped silently per plan §5.2)
+fn convert_predicate(
+    raw: &crate::schema::ExtractedPredicate,
+) -> Option<thinkingroot_core::types::Predicate> {
+    use thinkingroot_core::types::{Predicate, PredicateLanguage, PredicateScope};
+
+    if raw.query.trim().is_empty() {
+        return None;
+    }
+    let language = PredicateLanguage::from_str(&raw.language.to_lowercase())?;
+    // Validate regex patterns eagerly so malformed queries never reach Rooting.
+    // AST / JSONPath validation happens in their respective engines (Weeks 4–5).
+    if language == PredicateLanguage::Regex && regex::Regex::new(&raw.query).is_err() {
+        return None;
+    }
+    Some(Predicate {
+        language,
+        query: raw.query.clone(),
+        scope: PredicateScope::from_globs(raw.scope_globs.clone()),
+    })
 }
 
 fn parse_claim_type(s: &str) -> ClaimType {

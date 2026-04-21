@@ -310,6 +310,27 @@ mod inner {
                 base_y[i] = rng.next_f32();
             }
 
+            // Gram-Schmidt: orthogonalize base_y against base_x so the two axes
+            // capture independent variance (prevents diagonal-line collapse).
+            let dot_xy: f32 = base_x.iter().zip(base_y.iter()).map(|(a, b)| a * b).sum();
+            let dot_xx: f32 = base_x.iter().map(|a| a * a).sum();
+            if dot_xx > 0.0 {
+                let proj = dot_xy / dot_xx;
+                for i in 0..dims {
+                    base_y[i] -= proj * base_x[i];
+                }
+            }
+
+            // Normalize both bases to unit length for uniform scaling.
+            let norm_x: f32 = base_x.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let norm_y: f32 = base_y.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm_x > 0.0 {
+                for v in base_x.iter_mut() { *v /= norm_x; }
+            }
+            if norm_y > 0.0 {
+                for v in base_y.iter_mut() { *v /= norm_y; }
+            }
+
             let mut min_x = f32::MAX;
             let mut max_x = f32::MIN;
             let mut min_y = f32::MAX;

@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn merged_by_agent() {
         let mb = MergedBy::Agent {
-            agent_id: "claude".to_string(),
+            agent_id: "thinkingroot".to_string(),
         };
         assert!(matches!(mb, MergedBy::Agent { .. }));
     }
