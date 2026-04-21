@@ -143,6 +143,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/branches/{branch}/diff", get(diff_branch_handler))
             .route("/branches/{branch}/merge", post(merge_branch_handler))
+            .route("/branches/{branch}/rollback", post(rollback_merge_handler))
             .route("/branches/{branch}/checkout", post(checkout_branch_handler))
             .route("/branches/{branch}", delete(delete_branch_handler))
             .route("/head", get(get_head_handler));
@@ -441,7 +442,8 @@ async fn delete_branch_handler(
             );
         }
     };
-    match thinkingroot_branch::delete_branch(&root, &branch) {
+    let engine = state.engine.read().await;
+    match engine.delete_branch(&root, &branch).await {
         Ok(_) => ok_response(serde_json::json!({ "deleted": branch })).into_response(),
         Err(e) => err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &e.to_string()),
     }
@@ -571,11 +573,7 @@ async fn merge_branch_handler(
             );
         }
     };
-    use thinkingroot_branch::diff::compute_diff;
-    use thinkingroot_branch::merge::execute_merge;
-    use thinkingroot_branch::snapshot::resolve_data_dir;
-    use thinkingroot_core::{MergedBy, config::Config};
-    use thinkingroot_graph::graph::GraphStore;
+    use thinkingroot_core::MergedBy;
 
     let force = body.as_ref().and_then(|b| b.force).unwrap_or(false);
     let propagate_deletions = body
@@ -583,93 +581,64 @@ async fn merge_branch_handler(
         .and_then(|b| b.propagate_deletions)
         .unwrap_or(false);
 
-    let config = match Config::load_merged(&root) {
-        Ok(c) => c,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "CONFIG_ERROR",
-                &e.to_string(),
-            );
-        }
-    };
-    let mc = &config.merge;
-    let main_data_dir = resolve_data_dir(&root, None);
-    let branch_data_dir = resolve_data_dir(&root, Some(&branch));
-
-    if !branch_data_dir.exists() {
-        return err_response(
-            StatusCode::NOT_FOUND,
-            "BRANCH_NOT_FOUND",
-            &format!("branch '{}' not found", branch),
-        );
-    }
-
-    let main_graph = match GraphStore::init(&main_data_dir.join("graph")) {
-        Ok(g) => g,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "GRAPH_ERROR",
-                &e.to_string(),
-            );
-        }
-    };
-    let branch_graph = match GraphStore::init(&branch_data_dir.join("graph")) {
-        Ok(g) => g,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "GRAPH_ERROR",
-                &e.to_string(),
-            );
-        }
-    };
-
-    let mut diff = match compute_diff(
-        &main_graph,
-        &branch_graph,
-        &branch,
-        mc.auto_resolve_threshold,
-        mc.max_health_drop,
-        mc.block_on_contradictions,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DIFF_ERROR",
-                &e.to_string(),
-            );
-        }
-    };
-
-    if force {
-        diff.merge_allowed = true;
-        diff.blocking_reasons.clear();
-    }
-
-    match execute_merge(
-        &root,
-        &branch,
-        &diff,
-        MergedBy::Human {
-            user: "api".to_string(),
-        },
-        propagate_deletions,
-    )
-    .await
+    let engine = state.engine.read().await;
+    match engine
+        .merge_branch(
+            &root,
+            &branch,
+            force,
+            propagate_deletions,
+            MergedBy::Human {
+                user: "api".to_string(),
+            },
+        )
+        .await
     {
-        Ok(_) => ok_response(serde_json::json!({
+        Ok(diff) => ok_response(serde_json::json!({
             "merged": branch,
             "new_claims": diff.new_claims.len(),
             "new_entities": diff.new_entities.len(),
             "auto_resolved": diff.auto_resolved.len(),
         }))
         .into_response(),
+        Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
+            err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
+        }
         Err(e) => err_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "MERGE_BLOCKED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn rollback_merge_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+
+    let engine = state.engine.read().await;
+    match engine.rollback_merge(&root, &branch).await {
+        Ok(()) => ok_response(serde_json::json!({
+            "rolled_back": branch,
+        }))
+        .into_response(),
+        Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
+            err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
+        }
+        Err(e) => err_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ROLLBACK_FAILED",
             &e.to_string(),
         ),
     }

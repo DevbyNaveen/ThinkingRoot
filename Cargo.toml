@@ -12,6 +12,8 @@ members = [
     "crates/thinkingroot-safety",
     "crates/thinkingroot-branch",
     "crates/thinkingroot-ground",
+    "crates/thinkingroot-rooting",
+    "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
     "thinkingroot-python",
@@ -31,6 +33,8 @@ default-members = [
     "crates/thinkingroot-safety",
     "crates/thinkingroot-branch",
     "crates/thinkingroot-ground",
+    "crates/thinkingroot-rooting",
+    "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
 ]
@@ -60,6 +64,8 @@ thinkingroot-serve   = { path = "crates/thinkingroot-serve",   version = "0.9.0"
 thinkingroot-safety  = { path = "crates/thinkingroot-safety",  version = "0.9.0" }
 thinkingroot-branch  = { path = "crates/thinkingroot-branch",  version = "0.9.0", default-features = false }
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
+thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }
+thinkingroot-reflect = { path = "crates/thinkingroot-reflect", version = "0.9.0" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -55,15 +55,67 @@ impl Verifier {
             0.0
         };
 
-        // Coverage: ratio of claims to entities (more claims per entity = better coverage).
-        let coverage = if entities > 0 {
+        // Coverage: ratio of claims to entities, further discounted by any
+        // open gaps (Phase 9 Reflect known-unknowns) the graph has
+        // discovered about itself.
+        //
+        // Base factor:  min(claims / entities, 1.0) — how many claims per entity.
+        // Gap factor:   claims / (claims + open_gaps) — fraction of expected
+        //               claims present. 1.0 when no gaps are known (backward-
+        //               compatible for workspaces that have never run Reflect).
+        //
+        // Composite multiplies: filling gaps directly improves the score.
+        let open_gaps = graph.reflect_count_open_known_unknowns().unwrap_or(0);
+        let base_coverage = if entities > 0 {
             (claims as f64 / entities as f64).min(1.0)
         } else {
             0.0
         };
+        let gap_factor = if open_gaps == 0 {
+            1.0
+        } else {
+            let denom = (claims + open_gaps) as f64;
+            if denom > 0.0 {
+                (claims as f64) / denom
+            } else {
+                0.0
+            }
+        };
+        let coverage = (base_coverage * gap_factor).clamp(0.0, 1.0);
+        if open_gaps > 0 {
+            warnings.push(format!(
+                "{open_gaps} open knowledge gap(s) from reflexive pattern discovery — query with 'gaps' tool."
+            ));
+        }
 
-        // Provenance: all claims should have valid source links.
-        let provenance = if claims > 0 && sources > 0 { 1.0 } else { 0.0 };
+        // Provenance: weighted Rooting survival rate.
+        //
+        // Rooting graduates the legacy binary provenance check (sources>0 AND claims>0)
+        // into a per-claim verifiable score. Tier weights:
+        // - Rooted      = 1.0  (passed all active probes + has certificate)
+        // - Attested    = 0.5  (fatal probes passed, no active non-fatal evidence)
+        // - Quarantined = 0.25 (non-fatal probe failed — explicit signal, not silent drop)
+        // - Rejected    = 0.0  (excluded from retrieval anyway; kept for audit)
+        //
+        // Backward compat: when no Rooted claims exist yet (a pack that pre-dates
+        // Rooting or one whose Phase 6.5 is disabled), we fall back to the legacy
+        // binary check so existing tests + dashboards don't regress to 0%.
+        let (rooted, attested, quarantined, rejected) =
+            graph.count_claims_by_admission_tier()?;
+        let tier_total = rooted + attested + quarantined + rejected;
+        let provenance = if tier_total == 0 {
+            // No claims at all.
+            0.0
+        } else if rooted == 0 && quarantined == 0 && rejected == 0 {
+            // Pure-Attested graph — no Rooting has run. Preserve legacy semantics.
+            if claims > 0 && sources > 0 { 1.0 } else { 0.0 }
+        } else {
+            let weighted = (rooted as f64) * 1.0
+                + (attested as f64) * 0.5
+                + (quarantined as f64) * 0.25
+                + (rejected as f64) * 0.0;
+            (weighted / tier_total as f64).clamp(0.0, 1.0)
+        };
 
         if sources == 0 {
             warnings.push("No sources ingested yet.".to_string());
@@ -271,6 +323,10 @@ mod tests {
             grounding_method: None,
             extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
             event_date: None,
+            admission_tier: thinkingroot_core::types::AdmissionTier::default(),
+            derivation: None,
+            predicate: None,
+            last_rooted_at: None,
         };
         graph.insert_claim(&claim).unwrap();
 
@@ -322,6 +378,75 @@ mod tests {
 
         let result = default_verifier().verify(&graph).unwrap();
         assert!(!result.warnings.iter().any(|w| w.contains("low grounding")));
+    }
+
+    // ── Rooting-aware provenance formula ─────────────────────────────────
+
+    #[test]
+    fn provenance_reflects_weighted_rooting_tiers_when_active() {
+        use thinkingroot_core::types::AdmissionTier;
+        let (_dir, graph) = make_graph();
+        let source = make_source("test://rooting.md");
+        graph.insert_source(&source).unwrap();
+
+        // 2 Rooted (1.0 each) + 1 Attested (0.5) + 1 Quarantined (0.25) = 2.75 / 4 = 0.6875
+        let make = |tier: AdmissionTier, label: &str| {
+            let claim = make_claim(label, &source).with_admission_tier(tier);
+            graph.insert_claim(&claim).unwrap();
+        };
+        make(AdmissionTier::Rooted, "r1");
+        make(AdmissionTier::Rooted, "r2");
+        make(AdmissionTier::Attested, "a1");
+        make(AdmissionTier::Quarantined, "q1");
+
+        let result = default_verifier().verify(&graph).unwrap();
+        let expected = (2.0 + 0.5 + 0.25) / 4.0;
+        assert!(
+            (result.health_score.provenance - expected).abs() < 1e-6,
+            "expected provenance {expected}, got {}",
+            result.health_score.provenance
+        );
+    }
+
+    #[test]
+    fn provenance_falls_back_to_legacy_binary_when_only_attested_exists() {
+        // A pack that pre-dates Rooting or whose Rooting phase was disabled
+        // should not silently drop to 50% provenance. Preserve the legacy
+        // binary signal: present source + present claim → 1.0.
+        let (_dir, graph) = make_graph();
+        let source = make_source("test://legacy.md");
+        graph.insert_source(&source).unwrap();
+        let claim = make_claim("legacy claim", &source);
+        // Defaults to AdmissionTier::Attested.
+        graph.insert_claim(&claim).unwrap();
+
+        let result = default_verifier().verify(&graph).unwrap();
+        assert_eq!(result.health_score.provenance, 1.0);
+    }
+
+    #[test]
+    fn provenance_drops_when_rejected_claims_dominate() {
+        use thinkingroot_core::types::AdmissionTier;
+        let (_dir, graph) = make_graph();
+        let source = make_source("test://rejected.md");
+        graph.insert_source(&source).unwrap();
+
+        let make = |tier: AdmissionTier, label: &str| {
+            let claim = make_claim(label, &source).with_admission_tier(tier);
+            graph.insert_claim(&claim).unwrap();
+        };
+        make(AdmissionTier::Rooted, "r1");
+        make(AdmissionTier::Rejected, "x1");
+        make(AdmissionTier::Rejected, "x2");
+        make(AdmissionTier::Rejected, "x3");
+
+        let result = default_verifier().verify(&graph).unwrap();
+        // Weighted: (1.0 + 0 + 0 + 0) / 4 = 0.25
+        assert!(
+            (result.health_score.provenance - 0.25).abs() < 1e-6,
+            "expected 0.25, got {}",
+            result.health_score.provenance
+        );
     }
 
     // ── Overall score formula ────────────────────────────────────────────

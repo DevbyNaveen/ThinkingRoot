@@ -54,6 +54,18 @@ pub struct ClaimInfo {
     pub event_date: Option<f64>,
 }
 
+/// Summary payload returned by the `rooting_report` MCP tool and
+/// `QueryEngine::rooting_report`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RootingReport {
+    pub workspace: String,
+    pub rooted: usize,
+    pub attested: usize,
+    pub quarantined: usize,
+    pub rejected: usize,
+    pub total: usize,
+}
+
 /// An SVO event with entity names resolved from the in-memory KG cache.
 /// This is what ReAct uses — entity IDs (ULIDs) would be useless to an LLM.
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +242,12 @@ fn apply_pagination<T>(vec: &mut Vec<T>, offset: Option<usize>, limit: Option<us
 
 pub struct QueryEngine {
     workspaces: HashMap<String, WorkspaceHandle>,
+    /// Process-wide cache of open branch `GraphStore` handles, keyed by
+    /// `(workspace_root, branch_name)`. Every serve-crate code path that
+    /// reads or writes a branch's graph.db goes through this cache to
+    /// preserve the "one DbInstance per branch" invariant (see
+    /// `branch_cache` module docs for why).
+    branch_engines: Arc<crate::branch_cache::BranchEngineCache>,
 }
 
 impl Default for QueryEngine {
@@ -243,7 +261,32 @@ impl QueryEngine {
     pub fn new() -> Self {
         Self {
             workspaces: HashMap::new(),
+            branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::default_cache()),
         }
+    }
+
+    /// Create a new empty QueryEngine with an explicit branch-cache config.
+    /// Used by callers that want to tune `max_entries`/`ttl_secs`/`disabled`
+    /// (e.g. long-lived servers pulling config from workspace TOML).
+    pub fn with_branch_cache_config(
+        cfg: &thinkingroot_core::config::BranchCacheConfig,
+    ) -> Self {
+        Self {
+            workspaces: HashMap::new(),
+            branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::new(cfg)),
+        }
+    }
+
+    /// Test/telemetry accessor for the branch engine cache.
+    pub fn branch_engines(&self) -> &crate::branch_cache::BranchEngineCache {
+        &self.branch_engines
+    }
+
+    /// Clone of the `Arc<BranchEngineCache>` — handed out to background
+    /// tasks (e.g. the stream-cleanup task) that need to invalidate cache
+    /// entries without borrowing the whole engine.
+    pub fn branch_engines_arc(&self) -> Arc<crate::branch_cache::BranchEngineCache> {
+        self.branch_engines.clone()
     }
 
     /// Mount a workspace by name, opening the `.thinkingroot/` data directory,
@@ -271,6 +314,17 @@ impl QueryEngine {
         let config = Config::load_merged(&root_path)?;
         let storage = StorageEngine::init(&data_dir).await?;
         let cache = KnowledgeGraph::load_from_graph(&storage.graph)?;
+
+        if storage.vector.is_empty() && cache.entity_count() > 0 {
+            tracing::warn!(
+                "Workspace '{}' contains {} entities in graph.db, but the vector index is missing or empty. \
+                 This usually indicates an interrupted compilation. \
+                 3D visualization and semantic search will degrade gracefully. \
+                 Run `root compile` to rebuild the missing embeddings.",
+                name,
+                cache.entity_count()
+            );
+        }
         let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
             Ok(client) => {
                 tracing::debug!("LLM client initialised for workspace '{name}'");
@@ -325,6 +379,17 @@ impl QueryEngine {
         let config = Config::load_merged(&root_path).unwrap_or_default();
         let storage = StorageEngine::init(&data_dir).await?;
         let cache = KnowledgeGraph::load_from_graph(&storage.graph)?;
+
+        if storage.vector.is_empty() && cache.entity_count() > 0 {
+            tracing::warn!(
+                "Workspace '{}' contains {} entities in graph.db, but the vector index is missing or empty. \
+                 This usually indicates an interrupted compilation. \
+                 3D visualization and semantic search will degrade gracefully. \
+                 Run `root compile` to rebuild the missing embeddings.",
+                name,
+                cache.entity_count()
+            );
+        }
         let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
             Ok(client) => Some(Arc::new(client)),
             Err(_) => None,
@@ -692,6 +757,63 @@ impl QueryEngine {
         let storage = handle.storage.lock().await;
         let verifier = Verifier::new(&handle.config);
         verifier.verify(&storage.graph)
+    }
+
+    /// Return Rooting admission-tier counts for a workspace.
+    /// Bypasses the in-memory cache — queries CozoDB directly so MCP callers
+    /// always see the freshest tier distribution (Phase 6.5 writes verdicts
+    /// synchronously).
+    pub async fn rooting_report(&self, ws: &str) -> Result<RootingReport> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let (rooted, attested, quarantined, rejected) =
+            storage.graph.count_claims_by_admission_tier()?;
+        Ok(RootingReport {
+            workspace: ws.to_string(),
+            rooted,
+            attested,
+            quarantined,
+            rejected,
+            total: rooted + attested + quarantined + rejected,
+        })
+    }
+
+    /// List claims that passed Rooting with the `rooted` admission tier.
+    /// Returns `ClaimInfo` rows (same shape as `list_claims`) but guaranteed
+    /// tier-filtered. Reads from CozoDB directly for freshness.
+    pub async fn list_rooted_claims(
+        &self,
+        ws: &str,
+        type_filter: Option<String>,
+        entity_filter: Option<String>,
+        min_confidence: Option<f64>,
+    ) -> Result<Vec<ClaimInfo>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+
+        let rows = storage.graph.get_rooted_claims_filtered(
+            type_filter.as_deref(),
+            entity_filter.as_deref(),
+            min_confidence,
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, statement, claim_type, confidence, source_uri, event_date_raw)| {
+                let event_date = if event_date_raw != 0.0 {
+                    Some(event_date_raw)
+                } else {
+                    None
+                };
+                ClaimInfo {
+                    id,
+                    statement,
+                    claim_type,
+                    confidence,
+                    source_uri,
+                    event_date,
+                }
+            })
+            .collect())
     }
 
     /// Run the full pipeline for a mounted workspace, then refresh the in-memory cache.
@@ -1065,7 +1187,6 @@ impl QueryEngine {
         branch: Option<&str>,
     ) -> Result<SearchResult> {
         use thinkingroot_branch::snapshot::resolve_data_dir;
-        use thinkingroot_graph::graph::GraphStore;
 
         // Fast path: no branch → main-only search.
         let branch_name = match branch {
@@ -1093,12 +1214,15 @@ impl QueryEngine {
 
         // ── 2. Resolve branch hits (branch priority — more recent than main) ──
         if !branch_vector_hits.is_empty() {
-            // Open branch graph only if needed for point-lookups on branch-only items.
-            let branch_graph = if branch_data_dir.exists() {
-                GraphStore::init(&branch_data_dir.join("graph")).ok()
-            } else {
-                None
-            };
+            // Resolve branch graph via the LRU (one DbInstance per branch).
+            // `get_or_open` errors if the branch is missing — we silently
+            // treat that as "no branch-only resolution possible" and fall
+            // back to the main cache, matching the previous behavior.
+            let branch_handle = self
+                .branch_engines
+                .get_or_open(&handle.root_path, branch_name)
+                .await
+                .ok();
             let cache = handle.cache.read().await;
 
             for (key, _meta, score) in &branch_vector_hits {
@@ -1119,9 +1243,11 @@ impl QueryEngine {
                             claim_count: cache.entity_claim_count(&e.id),
                             relevance: *score,
                         });
-                    } else if let Some(ref bg) = branch_graph {
+                    } else if let Some(ref bh) = branch_handle {
                         // Branch-only entity — resolve via branch graph point-lookup.
-                        if let Ok(Some((name, etype, _desc))) = bg.get_entity_by_id(bare_id) {
+                        if let Ok(Some((name, etype, _desc))) =
+                            bh.graph.get_entity_by_id(bare_id)
+                        {
                             entity_hits.push(EntitySearchHit {
                                 id: bare_id.to_string(),
                                 name,
@@ -1148,10 +1274,10 @@ impl QueryEngine {
                             source_uri: c.source_uri.clone(),
                             relevance: *score,
                         });
-                    } else if let Some(ref bg) = branch_graph {
+                    } else if let Some(ref bh) = branch_handle {
                         // Branch-only claim — resolve via branch graph point-lookup.
                         if let Ok(Some((stmt, ctype, conf, uri))) =
-                            bg.get_claim_with_source(bare_id)
+                            bh.graph.get_claim_with_source(bare_id)
                         {
                             claim_hits.push(ClaimSearchHit {
                                 id: bare_id.to_string(),
@@ -1201,39 +1327,183 @@ impl QueryEngine {
         })
     }
 
+    /// Branch-aware `list_claims`.
+    ///
+    /// A branch starts as a copy-on-write snapshot of main, then accumulates
+    /// additional claims via `contribute`. So the branch graph alone is the
+    /// authoritative view of what's visible on that branch — we read straight
+    /// from its GraphStore and apply the same filter semantics as the
+    /// main-cache path.
     pub async fn list_claims_branched(
         &self,
         ws: &str,
         filter: ClaimFilter,
-        _branch: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<Vec<ClaimInfo>> {
-        self.list_claims(ws, filter).await
+        let branch_name = match branch {
+            None | Some("main") => return self.list_claims(ws, filter).await,
+            Some(b) => b,
+        };
+
+        let handle = self.get_workspace(ws)?;
+        let branch_handle = self
+            .branch_engines
+            .get_or_open(&handle.root_path, branch_name)
+            .await?;
+        let branch_graph = &branch_handle.graph;
+
+        // Rows carry (id, statement, claim_type, confidence, source_uri, event_date).
+        let rows: Vec<(String, String, String, f64, String, f64)> =
+            if let Some(ref entity_name) = filter.entity_name {
+                match branch_graph.find_entity_id_by_name(entity_name)? {
+                    Some(eid) => branch_graph
+                        .get_claims_with_sources_for_entity(&eid)?
+                        .into_iter()
+                        .map(|(id, stmt, ctype, uri, conf)| (id, stmt, ctype, conf, uri, 0.0))
+                        .collect(),
+                    None => return Ok(Vec::new()),
+                }
+            } else {
+                branch_graph.get_all_claims_with_sources()?
+            };
+
+        let mut claims: Vec<ClaimInfo> = rows
+            .into_iter()
+            .filter(|(_, _, ctype, _, _, _)| {
+                filter
+                    .claim_type
+                    .as_ref()
+                    .is_none_or(|t| t.eq_ignore_ascii_case(ctype))
+            })
+            .filter(|(_, _, _, conf, _, _)| {
+                filter.min_confidence.is_none_or(|min| *conf >= min)
+            })
+            .map(|(id, statement, claim_type, confidence, source_uri, event_date)| ClaimInfo {
+                id,
+                statement,
+                claim_type,
+                confidence,
+                source_uri,
+                event_date: if event_date > 0.0 { Some(event_date) } else { None },
+            })
+            .collect();
+
+        // Sort newest-first by event_date (matches main path at L496–501).
+        claims.sort_by(|a, b| {
+            b.event_date
+                .unwrap_or(0.0)
+                .partial_cmp(&a.event_date.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        apply_pagination(&mut claims, filter.offset, filter.limit);
+        Ok(claims)
     }
 
+    /// Branch-aware `get_relations`.
     pub async fn get_relations_branched(
         &self,
         ws: &str,
         entity: &str,
-        _branch: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<Vec<RelationInfo>> {
-        self.get_relations(ws, entity).await
+        let branch_name = match branch {
+            None | Some("main") => return self.get_relations(ws, entity).await,
+            Some(b) => b,
+        };
+
+        let handle = self.get_workspace(ws)?;
+        let branch_handle = self
+            .branch_engines
+            .get_or_open(&handle.root_path, branch_name)
+            .await?;
+
+        let rows = branch_handle.graph.get_relations_for_entity(entity)?;
+        Ok(rows
+            .into_iter()
+            .map(|(target, relation_type, strength)| RelationInfo {
+                target,
+                relation_type,
+                strength,
+            })
+            .collect())
     }
 
+    /// Branch-aware `get_workspace_brief`.
+    ///
+    /// Counts come from the branch graph (authoritative). Derived fields
+    /// (`top_entities`, `recent_decisions`, `contradiction_count`) are read
+    /// from the branch graph as well so the summary stays internally
+    /// consistent with the branch's claim set.
     pub async fn get_workspace_brief_branched(
         &self,
         ws: &str,
-        _branch: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<WorkspaceSummary> {
-        self.get_workspace_brief(ws).await
+        let branch_name = match branch {
+            None | Some("main") => return self.get_workspace_brief(ws).await,
+            Some(b) => b,
+        };
+
+        let handle = self.get_workspace(ws)?;
+        let branch_handle = self
+            .branch_engines
+            .get_or_open(&handle.root_path, branch_name)
+            .await?;
+        let branch_graph = &branch_handle.graph;
+
+        let (source_count, claim_count, entity_count) = branch_graph.get_counts()?;
+
+        // Top entities by claim count — one Datalog query.
+        let top_entities = branch_graph
+            .get_top_entities_by_claim_count(10)
+            .unwrap_or_default();
+
+        // Recent decisions — filter branch claims by type=Decision, take 10.
+        let recent_decisions: Vec<(String, f64)> = branch_graph
+            .get_claims_by_type("Decision")
+            .unwrap_or_default()
+            .into_iter()
+            .take(10)
+            .map(|(_id, stmt, _ctype, conf, _uri)| (stmt, conf))
+            .collect();
+
+        let contradiction_count = branch_graph
+            .get_contradictions()
+            .map(|list| list.iter().filter(|(_, _, _, _, s)| s == "Detected").count())
+            .unwrap_or(0);
+
+        Ok(WorkspaceSummary {
+            workspace: ws.to_string(),
+            entity_count,
+            claim_count,
+            source_count,
+            top_entities,
+            recent_decisions,
+            contradiction_count,
+        })
     }
 
+    /// Branch-aware `get_entity_context`. The branch graph has the full
+    /// context by construction (branch is cloned from main at create), so we
+    /// just dispatch `get_entity_context` against it.
     pub async fn get_entity_context_branched(
         &self,
         ws: &str,
         entity_name: &str,
-        _branch: Option<&str>,
+        branch: Option<&str>,
     ) -> Result<Option<thinkingroot_graph::graph::EntityContext>> {
-        self.get_entity_context(ws, entity_name).await
+        let branch_name = match branch {
+            None | Some("main") => return self.get_entity_context(ws, entity_name).await,
+            Some(b) => b,
+        };
+
+        let handle = self.get_workspace(ws)?;
+        let branch_handle = self
+            .branch_engines
+            .get_or_open(&handle.root_path, branch_name)
+            .await?;
+        branch_handle.graph.get_entity_context(entity_name)
     }
 
     /// Route a query to the Fast or Agentic path based on query classification.
@@ -1384,7 +1654,6 @@ Rules: \
     ) -> Result<ContributeResult> {
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_core::types::{ContentHash, SourceType, TrustLevel};
-        use thinkingroot_graph::graph::GraphStore;
 
         if agent_claims.is_empty() {
             return Ok(ContributeResult {
@@ -1412,10 +1681,14 @@ Rules: \
                     "branch '{branch_name}' not found — create it first with create_branch"
                 )));
             }
-            let graph = GraphStore::init(&branch_data_dir.join("graph"))
-                .map_err(|e| Error::GraphStorage(format!("branch graph init failed: {e}")))?;
+            // Route through the LRU so concurrent branched-reads share the
+            // same `GraphStore` (one DbInstance per branch invariant).
+            let branch_handle = self
+                .branch_engines
+                .get_or_open(&handle.root_path, branch_name)
+                .await?;
             let (accepted_ids, warnings) =
-                Self::write_agent_claims_to_graph(&graph, &source, &agent_claims)?;
+                Self::write_agent_claims_to_graph(&branch_handle.graph, &source, &agent_claims)?;
 
             // Upsert accepted claims into the branch vector index so they are
             // searchable in the branch without a full recompile.
@@ -1457,11 +1730,101 @@ Rules: \
 
         // No active branch — write to main graph, then reload cache.
         let accepted_ids;
-        let warnings;
+        let mut warnings;
         {
             let storage = handle.storage.lock().await;
             (accepted_ids, warnings) =
                 Self::write_agent_claims_to_graph(&storage.graph, &source, &agent_claims)?;
+
+            // ── Rooting advisory pass ─────────────────────────────────
+            // Route the freshly-admitted agent claims through the Rooting
+            // gate. The synthetic `mcp://agent/*` source has no bytes on
+            // disk, so we persist the joined claim statements as the source
+            // body — that makes the provenance probe a tautology (intended:
+            // agent attribution, not drift detection) and lets the
+            // contradiction + temporal probes do real work. Advisory mode
+            // logs tier distribution and appends a warning; enforce mode
+            // (future) would also delete Rejected-tier claims.
+            if handle.config.rooting.contribute_gate != "off"
+                && !handle.config.rooting.disabled
+                && !accepted_ids.is_empty()
+            {
+                let byte_store = thinkingroot_rooting::FileSystemSourceStore::new(
+                    &handle.root_path.join(".thinkingroot"),
+                );
+                if let Ok(byte_store) = byte_store {
+                    let joined: String = agent_claims
+                        .iter()
+                        .map(|c| c.statement.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    use thinkingroot_rooting::SourceByteStore;
+                    let _ = byte_store.put(source.id, &source.content_hash, joined.as_bytes());
+
+                    let mut claims: Vec<thinkingroot_core::Claim> =
+                        Vec::with_capacity(accepted_ids.len());
+                    for id in &accepted_ids {
+                        if let Ok(Some(c)) = storage.graph.get_claim_by_id(id) {
+                            claims.push(c);
+                        }
+                    }
+                    let candidates: Vec<thinkingroot_rooting::CandidateClaim<'_>> = claims
+                        .iter()
+                        .map(|c| thinkingroot_rooting::CandidateClaim {
+                            claim: c,
+                            predicate: c.predicate.as_ref(),
+                            derivation: c.derivation.as_ref(),
+                        })
+                        .collect();
+                    let rooting_cfg = thinkingroot_rooting::RootingConfig {
+                        disabled: handle.config.rooting.disabled,
+                        provenance_threshold: handle.config.rooting.provenance_threshold,
+                        contradiction_floor: handle.config.rooting.contradiction_floor,
+                        contribute_gate: handle.config.rooting.contribute_gate.clone(),
+                    };
+                    let rooter = thinkingroot_rooting::Rooter::new(
+                        &storage.graph,
+                        &byte_store,
+                        rooting_cfg,
+                    );
+                    match rooter.root_batch(&candidates) {
+                        Ok(output) => {
+                            // Persist verdicts + certificates for audit.
+                            let _ = thinkingroot_rooting::storage::insert_verdicts_batch(
+                                &storage.graph,
+                                &output.verdicts,
+                            );
+                            let _ = thinkingroot_rooting::storage::insert_certificates_batch(
+                                &storage.graph,
+                                &output.certificates,
+                            );
+                            // Stamp each claim with its new admission_tier.
+                            for (idx, v) in output.verdicts.iter().enumerate() {
+                                if let Some(c) = claims.get(idx) {
+                                    let mut updated = c.clone();
+                                    updated.admission_tier = v.admission_tier;
+                                    updated.last_rooted_at = Some(v.trial_at);
+                                    let _ = storage.graph.insert_claim(&updated);
+                                }
+                            }
+                            if output.rejected_count > 0 || output.quarantined_count > 0 {
+                                warnings.push(format!(
+                                    "rooting: {} rejected, {} quarantined (advisory — nothing removed)",
+                                    output.rejected_count, output.quarantined_count
+                                ));
+                            } else {
+                                tracing::info!(
+                                    "rooting advisory: {} admitted cleanly (contribute)",
+                                    output.admitted_count
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("rooting advisory pass failed (non-fatal): {e}");
+                        }
+                    }
+                }
+            }
 
             // Reload while still holding storage lock so no concurrent write
             // can slip in between the CozoDB write and the cache update.
@@ -1500,6 +1863,173 @@ Rules: \
             source_uri,
             warnings,
         })
+    }
+
+    /// Merge a branch into main with post-merge cache reload.
+    ///
+    /// `execute_merge` lives in `thinkingroot-branch` (disk layer) and has no
+    /// knowledge of the serve-layer cache. Without the reload step in this
+    /// wrapper, `search`/`list_claims` return stale data after a merge until
+    /// the next `contribute` or `compile`.
+    ///
+    /// The workspace handle is located by `root` (any mounted workspace whose
+    /// `root_path` equals `root`). If no mounted workspace matches, the merge
+    /// still runs — callers using this outside a mounted-workspace context
+    /// (e.g. the CLI) get the disk-level behavior without cache side effects.
+    pub async fn merge_branch(
+        &self,
+        root: &std::path::Path,
+        branch_name: &str,
+        force: bool,
+        propagate_deletions: bool,
+        merged_by: thinkingroot_core::MergedBy,
+    ) -> Result<thinkingroot_core::KnowledgeDiff> {
+        use thinkingroot_branch::diff::compute_diff;
+        use thinkingroot_branch::merge::execute_merge;
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_graph::graph::GraphStore;
+
+        let main_data_dir = resolve_data_dir(root, None);
+        let branch_data_dir = resolve_data_dir(root, Some(branch_name));
+        if !branch_data_dir.exists() {
+            return Err(Error::EntityNotFound(format!(
+                "branch '{branch_name}' not found"
+            )));
+        }
+
+        // Merge-time knobs: prefer the mounted workspace config, fall back to
+        // disk config so unmounted callers still work.
+        let mounted = self
+            .workspaces
+            .values()
+            .find(|h| h.root_path == root);
+        let merge_cfg = match mounted {
+            Some(h) => h.config.merge.clone(),
+            None => Config::load_merged(root)?.merge,
+        };
+
+        let main_graph = GraphStore::init(&main_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("main graph init failed: {e}")))?;
+        let branch_graph = GraphStore::init(&branch_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("branch graph init failed: {e}")))?;
+
+        let mut diff = compute_diff(
+            &main_graph,
+            &branch_graph,
+            branch_name,
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )?;
+        if force {
+            diff.merge_allowed = true;
+            diff.blocking_reasons.clear();
+        }
+
+        // Drop the separate GraphStore handle on main *before* executing the
+        // merge so `execute_merge` can take its own handle to `graph.db`
+        // (some SQLite configurations serialize writers).
+        drop(main_graph);
+        drop(branch_graph);
+
+        execute_merge(root, branch_name, &diff, merged_by, propagate_deletions).await?;
+
+        // Reload the mounted workspace's cache so queries reflect the merge.
+        // Hold the storage mutex across reload so no concurrent writer can
+        // slip in between (same discipline as contribute_claims L1647–1656).
+        if let Some(handle) = mounted {
+            let storage = handle.storage.lock().await;
+            match KnowledgeGraph::load_from_graph(&storage.graph) {
+                Ok(new_cache) => {
+                    *handle.cache.write().await = new_cache;
+                }
+                Err(e) => {
+                    tracing::warn!("cache reload after merge failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        Ok(diff)
+    }
+
+    /// Soft-delete a branch (marks Abandoned, data retained). Evicts the
+    /// branch from the engine cache so stale handles can't serve reads
+    /// against an Abandoned entry.
+    pub async fn delete_branch(
+        &self,
+        root: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<()> {
+        self.branch_engines.invalidate(root, branch_name).await;
+        thinkingroot_branch::delete_branch(root, branch_name)
+            .map_err(|e| Error::GraphStorage(format!("delete_branch failed: {e}")))
+    }
+
+    /// Garbage-collect all Abandoned branches (hard-delete their data dirs).
+    /// Evicts every cache entry for this workspace root because we don't
+    /// selectively know which branches got purged.
+    pub async fn gc_branches(&self, root: &std::path::Path) -> Result<usize> {
+        self.branch_engines.invalidate_workspace(root).await;
+        thinkingroot_branch::gc_branches(root)
+            .map_err(|e| Error::GraphStorage(format!("gc_branches failed: {e}")))
+    }
+
+    /// Phase 9 Reflect — discover patterns + surface gaps for a workspace.
+    ///
+    /// Serialised against the storage mutex because pattern discovery
+    /// issues a large read-heavy Datalog query followed by writes to
+    /// `structural_patterns` and `known_unknowns`; interleaving with
+    /// other writes would waste effort (the pattern discovery rescans).
+    pub async fn reflect(
+        &self,
+        ws: &str,
+    ) -> Result<thinkingroot_reflect::ReflectResult> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let engine = thinkingroot_reflect::ReflectEngine::new(
+            thinkingroot_reflect::ReflectConfig::default(),
+        );
+        engine.reflect(&storage.graph)
+    }
+
+    /// List open gap reports (known-unknowns) for a workspace. Served
+    /// directly from CozoDB — no cache since gap sets change infrequently
+    /// and are not in the hot retrieval path.
+    pub async fn list_gaps(
+        &self,
+        ws: &str,
+        entity: Option<&str>,
+        min_confidence: f64,
+    ) -> Result<Vec<thinkingroot_reflect::GapReport>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        thinkingroot_reflect::list_open_gaps(&storage.graph, entity, min_confidence)
+    }
+
+    /// Roll back a previously executed merge by restoring the most recent
+    /// pre-merge snapshot for the given branch. After the on-disk swap, the
+    /// mounted workspace's cache is reloaded so subsequent reads reflect the
+    /// pre-merge state without a `compile` or `contribute`.
+    pub async fn rollback_merge(
+        &self,
+        root: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<()> {
+        thinkingroot_branch::rollback_merge(root, branch_name)
+            .map_err(|e| Error::GraphStorage(format!("rollback failed: {e}")))?;
+
+        if let Some(handle) = self.workspaces.values().find(|h| h.root_path == root) {
+            let storage = handle.storage.lock().await;
+            match KnowledgeGraph::load_from_graph(&storage.graph) {
+                Ok(new_cache) => {
+                    *handle.cache.write().await = new_cache;
+                }
+                Err(e) => {
+                    tracing::warn!("cache reload after rollback failed (non-fatal): {e}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Inner helper: insert a source + claims into any GraphStore.

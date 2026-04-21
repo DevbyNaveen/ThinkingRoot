@@ -30,6 +30,59 @@ pub struct Config {
 
     #[serde(default)]
     pub streams: StreamsConfig,
+
+    #[serde(default)]
+    pub rooting: RootingConfig,
+
+    #[serde(default)]
+    pub branch_cache: BranchCacheConfig,
+}
+
+/// Rooting phase configuration (Phase 6.5 admission gate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootingConfig {
+    /// Master off-switch. When `true`, Phase 6.5 is skipped and every claim
+    /// passes through tagged `Attested` (legacy behavior).
+    #[serde(default)]
+    pub disabled: bool,
+
+    /// Minimum fraction of claim tokens that must appear in the source span
+    /// for the provenance probe to pass. Default: 0.70.
+    #[serde(default = "default_provenance_threshold")]
+    pub provenance_threshold: f64,
+
+    /// Confidence floor for the contradiction probe. A contradicting claim
+    /// below this confidence is ignored. Default: 0.85.
+    #[serde(default = "default_contradiction_floor")]
+    pub contradiction_floor: f64,
+
+    /// How the `contribute` MCP tool handles Rejected-tier claims:
+    /// `"advisory"` (default, log only), `"enforce"` (drop), `"off"`.
+    #[serde(default = "default_contribute_gate")]
+    pub contribute_gate: String,
+}
+
+impl Default for RootingConfig {
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            provenance_threshold: default_provenance_threshold(),
+            contradiction_floor: default_contradiction_floor(),
+            contribute_gate: default_contribute_gate(),
+        }
+    }
+}
+
+fn default_provenance_threshold() -> f64 {
+    0.70
+}
+
+fn default_contradiction_floor() -> f64 {
+    0.85
+}
+
+fn default_contribute_gate() -> String {
+    "advisory".to_string()
 }
 
 impl Config {
@@ -429,13 +482,112 @@ impl Default for MergeConfig {
 }
 
 /// Configuration for agent session streaming behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsConfig {
     /// When `true`, each new MCP agent session automatically creates a
     /// `stream/{session_id}` branch so contributed claims are isolated.
     /// Disabled by default — enables safe multi-agent write concurrency.
     #[serde(default)]
     pub auto_session_branch: bool,
+
+    /// Enable the background task that abandons expired `stream/*` branches.
+    /// Without this, long-running servers accumulate orphaned stream branches
+    /// forever. Default: true.
+    #[serde(default = "StreamsConfig::default_cleanup_enabled")]
+    pub cleanup_enabled: bool,
+
+    /// How often (seconds) the stream-cleanup task runs. Default: 3600 (1h).
+    #[serde(default = "StreamsConfig::default_cleanup_interval_secs")]
+    pub cleanup_interval_secs: u64,
+
+    /// A stream branch is considered expired when the matching session has
+    /// been idle (or absent from the in-memory store) for this many seconds.
+    /// Default: 86400 (24h — matches SESSION_TTL).
+    #[serde(default = "StreamsConfig::default_cleanup_idle_secs")]
+    pub cleanup_idle_secs: u64,
+
+    /// How to dispose of expired stream branches: `"abandon"` (soft — keep
+    /// data on disk) or `"purge"` (hard — delete data dir). Branches that
+    /// carry uncommitted agent contributes are always downgraded to
+    /// `abandon` regardless of this setting, to avoid losing agent work.
+    /// Default: `"abandon"`.
+    #[serde(default = "StreamsConfig::default_cleanup_action")]
+    pub cleanup_action: String,
+}
+
+impl StreamsConfig {
+    fn default_cleanup_enabled() -> bool {
+        true
+    }
+    fn default_cleanup_interval_secs() -> u64 {
+        3600
+    }
+    fn default_cleanup_idle_secs() -> u64 {
+        86400
+    }
+    fn default_cleanup_action() -> String {
+        "abandon".to_string()
+    }
+}
+
+impl Default for StreamsConfig {
+    fn default() -> Self {
+        Self {
+            auto_session_branch: false,
+            cleanup_enabled: Self::default_cleanup_enabled(),
+            cleanup_interval_secs: Self::default_cleanup_interval_secs(),
+            cleanup_idle_secs: Self::default_cleanup_idle_secs(),
+            cleanup_action: Self::default_cleanup_action(),
+        }
+    }
+}
+
+/// Configuration for the process-wide branch engine cache (LRU of open
+/// GraphStore handles keyed by `(workspace_root, branch_name)`).
+///
+/// Motivation: Phase B's branch-aware read methods and the branch-scoped
+/// contribute path each opened a fresh `GraphStore` per call — re-running
+/// schema creation and index setup every time. This cache holds them live
+/// so subsequent reads/writes reuse the same `DbInstance`. Only one
+/// `DbInstance` per branch is safe (cozo keeps per-instance metadata that
+/// would diverge with two handles on the same file), so routing everything
+/// through the cache also enforces that invariant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCacheConfig {
+    /// Upper bound on cached branch handles. LRU evicts the least-recently
+    /// used beyond this. Default: 16.
+    #[serde(default = "BranchCacheConfig::default_max_entries")]
+    pub max_entries: usize,
+
+    /// Re-open a cached handle if it has been in the cache longer than
+    /// this. Bounds the window in which out-of-band file changes (e.g.
+    /// manual `graph.db` swap) can remain invisible. Default: 300 (5 min).
+    #[serde(default = "BranchCacheConfig::default_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Escape hatch: set `true` to force every call to open a fresh
+    /// GraphStore (pre-Phase-C behavior). Default: false.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl BranchCacheConfig {
+    fn default_max_entries() -> usize {
+        16
+    }
+    fn default_ttl_secs() -> u64 {
+        300
+    }
+}
+
+impl Default for BranchCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: Self::default_max_entries(),
+            ttl_secs: Self::default_ttl_secs(),
+            disabled: false,
+        }
+    }
 }
 
 /// Configuration for a single source connector.

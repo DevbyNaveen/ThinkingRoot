@@ -92,6 +92,12 @@ pub async fn execute_merge(
         let c = &diff_claim.claim;
         main_graph.insert_claim(c)?;
 
+        // Populate the claim ↔ source junction. `insert_claim` only writes the
+        // `claims` relation; readers like `get_all_claims_with_sources` join
+        // through `claim_source_edges`, so without this edge the merged claim
+        // is invisible to post-merge queries (and to the serve cache).
+        main_graph.link_claim_to_source(&c.id.to_string(), &c.source.to_string())?;
+
         // Link to entities by canonical name
         for entity_name in &diff_claim.entity_context {
             if let Some(entity_id) = main_graph.find_entity_id_by_name(entity_name)? {
