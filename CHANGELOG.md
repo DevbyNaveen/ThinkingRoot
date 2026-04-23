@@ -7,6 +7,99 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.1.0-rooting] — 2026-04-24
+
+First publicly-tagged release of the Rooting admission gate. Engine code
+is production-complete at 64 green tests (57 unit + 6 integration + 1
+adversarial-corpus integration). Evidence and paper artifacts accompany
+the release.
+
+### Added — Predicate-strength scoring (B1, the paper-critical change)
+
+- **Coverage-based `strength: f32`** on every `PredicateEvaluation`.
+  - Regex and tree-sitter-rust AST: `1 - clamp(matched_bytes / source_bytes, 0, 1)`.
+    A pattern like `.` that covers every byte drops to strength ≈ 0; a
+    tight function signature drops to strength ≈ 1.
+  - JSONPath: `min(1, 1/k)` where `k` is the match count, so a broad
+    `$..*` collapses proportional to the number of nodes it walks.
+- **Live threshold** `predicate_strength_threshold` (default `0.60`) in
+  both `thinkingroot-rooting::RootingConfig` and
+  `thinkingroot-core::config::RootingConfig`. Mirrored through
+  pipeline, MCP contribute, and `root rooting re-run`.
+- **Rooter tier function updated**: a claim whose predicate actively runs
+  and passes but whose strength falls below the threshold is demoted
+  from `Rooted` → `Attested`. Certificate still issued (Attested is an
+  admitted tier); the Rooted badge is reserved for strongly-evidenced
+  admissions.
+- Eliminates the "98.6 % Rooted" artifact reported in pre-B1 runs where
+  workspaces carried no predicates at all.
+
+### Added — Adversarial corpus + honest tier report (B3, B4)
+
+- **`tests/injection_corpus.rs`** — 400 synthetic adversarial claims
+  across four attack classes:
+  - Class A (fabricated source): 100 % Rejected via provenance.
+  - Class B (contradictory): 100 % Rejected via contradiction probe.
+  - Class C (bogus predicate): 100 % Quarantined.
+  - Class D (gamed predicate): 100 % not-Rooted via B1 strength demotion.
+- **`benchmarks/BENCHMARK_ROOTING_INJECTION.md`** — reproducible report
+  written by the test when `TR_WRITE_INJECTION_REPORT=1`.
+- **`benchmarks/ROOTING_TIER_HONEST_2026-04.md`** — full distribution on
+  the 95 584-claim LongMemEval-500 workspace with the key disclosure
+  that zero claims carry predicates, so the 98.73 % Rooted figure is
+  temporal-default, not predicate-verified.
+- **`benchmarks/macro/rooting_overhead_2026-04.md`** — divan bench at
+  `N=100` → 24.22 ms median (242 µs per claim, well under 10 % overhead
+  target).
+
+### Added — Paper update
+
+- `compag-paper/compag.tex` now carries the falsifiable novelty claim
+  verbatim in both the abstract and §1, reframes the probe battery as
+  "2 fatal + 1 central + 2 advisory", adds an §Evaluation subsection
+  for Adversarial Robustness, breaks out the 98.6 % figure into an
+  honest-tier table, expands the prior-art comparison from 9 to 20
+  systems, and attaches three appendices (reproducible search,
+  adversarial-corpus harness, operational decomposition of the novelty
+  claim).
+
+### Migration guide — from `0.9.x` to `0.1.0-rooting`
+
+1. **Back up the graph DB before upgrade.** Migration 3 adds columns
+   to the `claims` relation and creates three new relations
+   (`trial_verdicts`, `verification_certificates`, `derivation_edges`).
+   `cp {data_dir}/graph/graph.db /tmp/graph.db.backup-$(date +%F)`.
+2. **First-time run auto-migrates.** Opening any workspace with
+   `GraphStore::init` detects the missing columns and probes-and-replaces
+   the `claims` relation with defaults `admission_tier = 'attested'`,
+   `predicate_json = ''`, `last_rooted_at = 0.0`. Existing claims are
+   preserved verbatim; no data loss.
+3. **First-time re-run admits everything at `Attested`** because no
+   claim carries a predicate yet. Run `root rooting re-run --all` to
+   promote claims that pass fatal + temporal probes to `Rooted`.
+4. **New compiles emit predicates** via the LLM extraction prompt
+   extension landed in this release. Their admission distribution will
+   split into predicate-verified vs. temporal-only as per B1.
+5. **Opt out** via workspace `[rooting] disabled = true`, env
+   `TR_ROOTING_DISABLED=1`, or CLI `root compile --no-rooting`.
+
+### Rollback
+
+If Migration 3 corrupts a workspace (not observed in any of our
+snapshot tests, but paranoia is cheap):
+
+```bash
+cp /tmp/graph.db.backup-YYYY-MM-DD \
+   {workspace}/.thinkingroot/graph/graph.db
+```
+
+The engine is designed for forward-only migration; rolling back the code
+to `0.9.x` with a post-migration graph.db also works because the added
+columns are ignored by old readers, but this is only tested on small
+fixtures.
+
+---
+
 ## [Unreleased]
 
 ### Added — Phase 3.5 Rooting (admission gate for derived knowledge)
