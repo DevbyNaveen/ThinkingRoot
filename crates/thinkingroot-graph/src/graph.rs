@@ -2366,6 +2366,27 @@ impl GraphStore {
             .collect())
     }
 
+    /// Return claim IDs filtered by admission tier
+    /// (`"rooted"`, `"attested"`, `"quarantined"`, or `"rejected"`). Used by
+    /// the Rooting ablation harness to gate retrieval-time exclusion.
+    pub fn get_claim_ids_by_admission_tier(&self, tier: &str) -> Result<Vec<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("t".into(), DataValue::Str(tier.into()));
+        let result = self
+            .db
+            .run_script(
+                "?[id] := *claims{id, admission_tier}, admission_tier = $t",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_claim_ids_by_admission_tier: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| dv_to_string(&row[0]))
+            .collect())
+    }
+
     /// Count claims grouped by their Rooting admission tier.
     /// Returns `(rooted, attested, quarantined, rejected)`. Used by the
     /// Health Score calculation and by `root rooting report`.

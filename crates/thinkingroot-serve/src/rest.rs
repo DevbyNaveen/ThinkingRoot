@@ -159,12 +159,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
     // Ops endpoints (/metrics, /readyz, /livez) are added AFTER .layer()
     // so monitoring scrapers don't need the API key. Axum only applies a
     // layer to routes already registered when `.layer()` was called.
-    let routed = router
-        .layer(cors)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+    let routed = router.layer(cors).layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
 
     routed
         .route("/metrics", get(metrics_handler))
@@ -188,11 +186,7 @@ async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
     let engine = state.engine.read().await;
     match engine.list_workspaces().await {
         Ok(_) => (StatusCode::OK, "ready\n").into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("not-ready: {e}\n"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not-ready: {e}\n")).into_response(),
     }
 }
 
@@ -812,6 +806,7 @@ async fn ask_handler(
         session_dates: &HashMap::new(),
         answer_sids: &body.session_scope,
         sessions_dir: &sessions_dir,
+        excluded_claim_ids: &HashSet::new(),
     };
 
     let result = ask(&engine, llm, &req).await;

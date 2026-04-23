@@ -148,6 +148,10 @@ pub struct AskRequest<'a> {
     pub answer_sids: &'a [String],
     /// Path to the workspace `sessions/` directory.
     pub sessions_dir: &'a Path,
+    /// Claim IDs to exclude from retrieval after the vector/keyword pass.
+    /// Populated by the Rooting ablation harness to strip Rejected-tier
+    /// claims when `--rooting-mode=on` is active. Empty means no filter.
+    pub excluded_claim_ids: &'a std::collections::HashSet<String>,
 }
 
 /// Response from the intelligence ask endpoint.
@@ -168,7 +172,7 @@ pub async fn ask(
 ) -> AskResponse {
     use crate::intelligence::retriever::retrieve_claims;
 
-    let claims = retrieve_claims(
+    let mut claims = retrieve_claims(
         engine,
         req.workspace,
         req.question,
@@ -178,6 +182,14 @@ pub async fn ask(
         req.answer_sids,
     )
     .await;
+
+    // Rooting ablation: strip claims whose ID the caller has blacklisted
+    // (typically the set of Rejected-tier claim IDs when running in
+    // `--rooting-mode=on`). Happens after retrieval so the vector search
+    // sees the full index but the synthesiser does not.
+    if !req.excluded_claim_ids.is_empty() {
+        claims.retain(|c| !req.excluded_claim_ids.contains(&c.id));
+    }
 
     let claims_used = claims.len();
 

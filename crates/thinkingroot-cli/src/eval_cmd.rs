@@ -138,6 +138,7 @@ pub async fn run_eval(
     limit: usize,
     category_filter: Option<&str>,
     judge_deployment: Option<&str>,
+    rooting_mode: Option<&str>,
 ) -> Result<()> {
     let dataset_str = std::fs::read_to_string(dataset_path)
         .with_context(|| format!("Cannot read dataset: {}", dataset_path.display()))?;
@@ -183,6 +184,36 @@ pub async fn run_eval(
     let sessions_dir = workspace_path.join("sessions");
 
     let config = Config::load_merged(workspace_path).unwrap_or_default();
+
+    // Rooting ablation: when `--rooting-mode=on`, fetch the set of Rejected
+    // claim IDs from the graph and exclude them from retrieval. `off` and
+    // `advisory` leave retrieval unchanged (advisory would only matter at
+    // write time, not read time).
+    let excluded_claim_ids: HashSet<String> = {
+        let mode = rooting_mode.unwrap_or("off");
+        if mode == "on" {
+            let graph = thinkingroot_graph::graph::GraphStore::init(
+                &workspace_path.join(".thinkingroot").join("graph"),
+            )
+            .context("open graph for ablation")?;
+            let ids = graph
+                .get_claim_ids_by_admission_tier("rejected")
+                .context("list rejected claim ids")?;
+            println!(
+                "  {} Rooting ablation : mode=on — excluding {} Rejected claim(s) from retrieval",
+                style("●").yellow(),
+                ids.len()
+            );
+            ids.into_iter().collect()
+        } else {
+            println!(
+                "  {} Rooting ablation : mode={} — no retrieval-time filtering",
+                style("●").dim(),
+                mode
+            );
+            HashSet::new()
+        }
+    };
 
     let synthesis_llm: Option<Arc<LlmClient>> = match LlmClient::new(&config.llm).await {
         Ok(c) => {
@@ -292,6 +323,7 @@ pub async fn run_eval(
             session_dates: &session_dates,
             answer_sids: &answer_sids,
             sessions_dir: &sessions_dir,
+            excluded_claim_ids: &excluded_claim_ids,
         };
         let response = ask(&engine, synthesis_llm.clone(), &ask_req).await;
         let predicted = response.answer;
