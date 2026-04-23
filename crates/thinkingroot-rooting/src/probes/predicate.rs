@@ -6,8 +6,8 @@
 //! test should surface the claim for review, not silently delete it.
 
 use super::{Probe, ProbeContext, ProbeName, ProbeResult};
-use crate::predicate::engine_for;
 use crate::Result;
+use crate::predicate::engine_for;
 
 pub(crate) struct PredicateProbe;
 
@@ -64,9 +64,11 @@ impl Probe for PredicateProbe {
         match engine.evaluate(predicate, &bytes) {
             Ok(eval) => Ok(ProbeResult {
                 name: ProbeName::Predicate,
-                // Graded score: 1.0 for match, small positive for close-but-no
-                // engines (future), 0.0 for no match.
-                score: if eval.passed { 1.0 } else { 0.0 },
+                // Score carries the predicate's evidential strength (see
+                // `PredicateEvaluation::strength`). Downstream in the rooter
+                // this is compared against `config.predicate_strength_threshold`
+                // to demote weak-predicate matches from Rooted to Attested.
+                score: if eval.passed { eval.strength as f64 } else { 0.0 },
                 passed: eval.passed,
                 detail: eval.detail,
             }),
@@ -126,9 +128,12 @@ mod tests {
     #[test]
     fn passes_when_regex_matches_source() {
         let (_dir, graph, store, config) = env();
-        let body = "fn validate_token() -> bool { true }";
+        // Use a source long enough that a 17-byte match yields high strength
+        // (coverage well under the 0.40 cap → strength > 0.6).
+        let body = "pub mod auth {\n    pub fn validate_token(tok: &str) -> bool {\n        !tok.is_empty()\n    }\n    pub fn rotate_key() {}\n    pub fn revoke(tok: &str) {}\n}\n";
         let hash = ContentHash::from_bytes(body.as_bytes());
-        let source = Source::new("file:///auth.rs".into(), SourceType::File).with_hash(hash.clone());
+        let source =
+            Source::new("file:///auth.rs".into(), SourceType::File).with_hash(hash.clone());
         graph.insert_source(&source).unwrap();
         store.put(source.id, &hash, body.as_bytes()).unwrap();
 
@@ -153,7 +158,49 @@ mod tests {
         };
         let result = PredicateProbe.run(&ctx).unwrap();
         assert!(result.passed);
-        assert_eq!(result.score, 1.0);
+        // Score now carries the predicate's coverage-based strength. A tight
+        // match against a realistic source should be well above the default
+        // 0.60 strength threshold.
+        assert!(
+            result.score > 0.6,
+            "tight regex match should score strong, got {}",
+            result.score
+        );
+    }
+
+    #[test]
+    fn weak_predicate_has_low_strength() {
+        // A regex that matches everything (`.`) produces a match, but the
+        // coverage is ~100 %. Strength should collapse near 0.0 so downstream
+        // rooter logic demotes the claim to Attested rather than Rooted.
+        let (_dir, graph, store, config) = env();
+        let body = "fn one() {} fn two() {} fn three() {}";
+        let hash = ContentHash::from_bytes(body.as_bytes());
+        let source = Source::new("file:///b.rs".into(), SourceType::File).with_hash(hash.clone());
+        graph.insert_source(&source).unwrap();
+        store.put(source.id, &hash, body.as_bytes()).unwrap();
+
+        let claim = Claim::new("weak claim", ClaimType::Fact, source.id, WorkspaceId::new());
+        let predicate = Predicate {
+            language: PredicateLanguage::Regex,
+            query: r".".into(),
+            scope: PredicateScope::empty(),
+        };
+        let ctx = ProbeContext {
+            claim: &claim,
+            predicate: Some(&predicate),
+            derivation: None,
+            graph: &graph,
+            store: &store,
+            config: &config,
+        };
+        let result = PredicateProbe.run(&ctx).unwrap();
+        assert!(result.passed, "`.` always matches non-empty source");
+        assert!(
+            result.score < 0.1,
+            "gaming regex should score weak, got {}",
+            result.score
+        );
     }
 
     #[test]
@@ -197,12 +244,7 @@ mod tests {
             .with_hash(ContentHash::from_bytes(b"missing"));
         graph.insert_source(&source).unwrap();
 
-        let claim = Claim::new(
-            "claim",
-            ClaimType::Fact,
-            source.id,
-            WorkspaceId::new(),
-        );
+        let claim = Claim::new("claim", ClaimType::Fact, source.id, WorkspaceId::new());
         let predicate = Predicate {
             language: PredicateLanguage::Regex,
             query: r"anything".into(),

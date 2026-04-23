@@ -60,6 +60,14 @@ pub struct RootingConfig {
     /// `"advisory"` (default, log only), `"enforce"` (drop), `"off"`.
     #[serde(default = "default_contribute_gate")]
     pub contribute_gate: String,
+
+    /// Minimum predicate-strength score required for a claim to be awarded
+    /// the `Rooted` tier. A predicate that matches but whose evidential
+    /// strength falls below this threshold (e.g. a broad `.` regex or a
+    /// generic `(identifier)` AST query) demotes the claim to `Attested` —
+    /// still admitted, but not marked strongly-evidenced. Default: 0.60.
+    #[serde(default = "default_predicate_strength_threshold")]
+    pub predicate_strength_threshold: f64,
 }
 
 impl Default for RootingConfig {
@@ -69,6 +77,7 @@ impl Default for RootingConfig {
             provenance_threshold: default_provenance_threshold(),
             contradiction_floor: default_contradiction_floor(),
             contribute_gate: default_contribute_gate(),
+            predicate_strength_threshold: default_predicate_strength_threshold(),
         }
     }
 }
@@ -83,6 +92,10 @@ fn default_contradiction_floor() -> f64 {
 
 fn default_contribute_gate() -> String {
     "advisory".to_string()
+}
+
+fn default_predicate_strength_threshold() -> f64 {
+    0.60
 }
 
 impl Config {

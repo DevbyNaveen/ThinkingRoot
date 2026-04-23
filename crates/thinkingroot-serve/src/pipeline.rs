@@ -681,17 +681,16 @@ pub async fn run_pipeline(
     // Disabled when either the workspace config opts out
     // (`config.rooting.disabled`) or the per-invocation env flag is set
     // (`TR_ROOTING_DISABLED=1`, populated by `root compile --no-rooting`).
-    let rooting_disabled_env =
-        std::env::var("TR_ROOTING_DISABLED").map(|v| v == "1").unwrap_or(false);
-    if !config.rooting.disabled
-        && !rooting_disabled_env
-        && !filtered_extraction.claims.is_empty()
-    {
+    let rooting_disabled_env = std::env::var("TR_ROOTING_DISABLED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !config.rooting.disabled && !rooting_disabled_env && !filtered_extraction.claims.is_empty() {
         let rooting_cfg = thinkingroot_rooting::RootingConfig {
             disabled: config.rooting.disabled,
             provenance_threshold: config.rooting.provenance_threshold,
             contradiction_floor: config.rooting.contradiction_floor,
             contribute_gate: config.rooting.contribute_gate.clone(),
+            predicate_strength_threshold: config.rooting.predicate_strength_threshold,
         };
         let candidates_total = filtered_extraction.claims.len();
         emit!(ProgressEvent::RootingStart {
