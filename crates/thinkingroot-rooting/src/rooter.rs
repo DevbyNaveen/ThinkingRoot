@@ -18,12 +18,13 @@ use thinkingroot_graph::graph::GraphStore;
 use crate::certificate::Certificate;
 use crate::config::RootingConfig;
 use crate::probes::{
-    contradiction::ContradictionProbe, predicate::PredicateProbe, provenance::ProvenanceProbe,
-    temporal::TemporalProbe, topology::TopologyProbe, Probe, ProbeContext, ProbeName, ProbeResult,
+    Probe, ProbeContext, ProbeName, ProbeResult, contradiction::ContradictionProbe,
+    predicate::PredicateProbe, provenance::ProvenanceProbe, temporal::TemporalProbe,
+    topology::TopologyProbe,
 };
 use crate::source_store::SourceByteStore;
 use crate::verdict::TrialVerdict;
-use crate::{Result, ROOTER_VERSION};
+use crate::{ROOTER_VERSION, Result};
 
 /// Progress callback invoked after each claim is tried. Signature matches the
 /// existing `GroundingProgressFn` convention used elsewhere in the pipeline.
@@ -200,10 +201,26 @@ fn trial_one(ctx: &ProbeContext<'_>) -> Result<(TrialVerdict, Option<Certificate
         .iter()
         .skip(2) // skip provenance + contradiction
         .any(|p| p.score >= 0.0);
+
+    // Predicate-strength demotion (B1): a claim whose predicate actively ran
+    // and passed but whose strength is below threshold is demoted from Rooted
+    // to Attested. Prevents gamed-generic patterns (e.g. `.` or `\w+`) from
+    // earning the Rooted tier on evidence that doesn't actually constrain
+    // the source.
+    let predicate_probe = &probes[2]; // position is stable: provenance, contradiction, predicate, …
+    let predicate_was_active = predicate_probe.score >= 0.0;
+    let predicate_too_weak = predicate_was_active
+        && predicate_probe.passed
+        && predicate_probe.score < ctx.config.predicate_strength_threshold;
+
     let tier = if !all_non_fatal_pass {
         AdmissionTier::Quarantined
     } else if has_active_nonfatal {
-        AdmissionTier::Rooted
+        if predicate_too_weak {
+            AdmissionTier::Attested
+        } else {
+            AdmissionTier::Rooted
+        }
     } else {
         AdmissionTier::Attested
     };
@@ -281,11 +298,15 @@ fn build_certificate(
     let inputs = CertificateInput {
         rooter_version: ROOTER_VERSION,
         claim_id: ctx.claim.id.to_string(),
-        statement_hash: blake3::hash(ctx.claim.statement.as_bytes()).to_hex().to_string(),
+        statement_hash: blake3::hash(ctx.claim.statement.as_bytes())
+            .to_hex()
+            .to_string(),
         source_content_hash: source_content_hash.clone(),
-        predicate_hash: ctx
-            .predicate
-            .map(|p| blake3::hash(format!("{:?}", p).as_bytes()).to_hex().to_string()),
+        predicate_hash: ctx.predicate.map(|p| {
+            blake3::hash(format!("{:?}", p).as_bytes())
+                .to_hex()
+                .to_string()
+        }),
         parent_claim_ids: ctx
             .derivation
             .map(|d| d.parent_claim_ids.iter().map(|id| id.to_string()).collect())

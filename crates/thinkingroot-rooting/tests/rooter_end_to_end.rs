@@ -88,11 +88,13 @@ fn rooter_admits_grounded_claim_and_rejects_fabricated_one() {
         AdmissionTier::Rejected,
         "fabricated claim should be Rejected on provenance"
     );
-    assert!(bogus_verdict
-        .failure_reason
-        .as_deref()
-        .unwrap_or_default()
-        .contains("provenance"));
+    assert!(
+        bogus_verdict
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provenance")
+    );
 
     // Persist verdicts + certificates and read them back.
     thinkingroot_rooting::storage::insert_verdicts_batch(&graph, &output.verdicts)
@@ -301,8 +303,7 @@ pub fn validate_token(t: &str) -> bool { t.starts_with("eyJ") }
     // A certificate must have been issued, and it must survive a
     // round-trip through CozoDB.
     thinkingroot_rooting::storage::insert_verdicts_batch(&graph, &output.verdicts).unwrap();
-    thinkingroot_rooting::storage::insert_certificates_batch(&graph, &output.certificates)
-        .unwrap();
+    thinkingroot_rooting::storage::insert_certificates_batch(&graph, &output.certificates).unwrap();
 
     assert_eq!(output.certificates.len(), 1);
     let cert = &output.certificates[0];
@@ -375,5 +376,138 @@ pub fn validate_token(t: &str) -> bool { true }
         verdict.admission_tier,
         AdmissionTier::Quarantined,
         "derived claim whose AST predicate doesn't match should demote to Quarantined"
+    );
+}
+
+#[test]
+fn weak_predicate_demotes_rooted_to_attested() {
+    // B1 — predicate-strength scoring.
+    //
+    // Two claims share the same source; both have a regex predicate that
+    // technically matches. The "strong" claim's predicate is a specific
+    // function signature, the "weak" claim's predicate is a dot-wildcard
+    // that matches every byte. With the default
+    // `predicate_strength_threshold = 0.60`, the weak claim must demote
+    // from Rooted → Attested while the strong claim stays Rooted.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = thinkingroot_graph::graph::GraphStore::init(dir.path()).unwrap();
+    let store = FileSystemSourceStore::new(dir.path()).unwrap();
+
+    // Source includes the claim vocabulary ("AuthService", "exposes",
+    // "validate_token", "module") so the provenance probe passes on both
+    // claims and we're isolating the predicate-strength behaviour.
+    let source_body = "// AuthService module exposes token helpers\npub mod auth {\n    pub fn validate_token(tok: &str) -> bool {\n        !tok.is_empty()\n    }\n    pub fn rotate_key() {}\n    pub fn revoke(tok: &str) {}\n}\n";
+    let hash = ContentHash::from_bytes(source_body.as_bytes());
+    let source = Source::new("file:///auth.rs".into(), SourceType::File).with_hash(hash.clone());
+    graph.insert_source(&source).unwrap();
+    store.put(source.id, &hash, source_body.as_bytes()).unwrap();
+
+    let strong_pred = Predicate {
+        language: PredicateLanguage::Regex,
+        query: r"fn\s+validate_token".into(),
+        scope: PredicateScope::empty(),
+    };
+    let weak_pred = Predicate {
+        language: PredicateLanguage::Regex,
+        query: r".".into(), // matches every byte → coverage ≈ 1.0 → strength ≈ 0.0
+        scope: PredicateScope::empty(),
+    };
+
+    let strong_claim = Claim::new(
+        "AuthService exposes validate_token",
+        ClaimType::Fact,
+        source.id,
+        WorkspaceId::new(),
+    )
+    .with_predicate(strong_pred.clone());
+    let weak_claim = Claim::new(
+        "AuthService module exposes validate_token",
+        ClaimType::Fact,
+        source.id,
+        WorkspaceId::new(),
+    )
+    .with_predicate(weak_pred);
+
+    let candidates = [
+        CandidateClaim {
+            claim: &strong_claim,
+            predicate: strong_claim.predicate.as_ref(),
+            derivation: None,
+        },
+        CandidateClaim {
+            claim: &weak_claim,
+            predicate: weak_claim.predicate.as_ref(),
+            derivation: None,
+        },
+    ];
+
+    let rooter = Rooter::new(&graph, &store, RootingConfig::default());
+    let output = rooter.root_batch(&candidates).expect("root_batch");
+
+    let v_strong = output.verdict_for(strong_claim.id).unwrap();
+    assert_eq!(
+        v_strong.admission_tier,
+        AdmissionTier::Rooted,
+        "strong specific predicate should earn Rooted"
+    );
+
+    let v_weak = output.verdict_for(weak_claim.id).unwrap();
+    assert_eq!(
+        v_weak.admission_tier,
+        AdmissionTier::Attested,
+        "weak `.` predicate should be demoted from Rooted to Attested"
+    );
+    // A certificate should still be issued for the demoted claim — Attested
+    // is an admitted tier, just without the strongest-evidence badge.
+    assert!(
+        v_weak.certificate_hash.is_some(),
+        "Attested-tier claims should still carry a certificate"
+    );
+}
+
+#[test]
+fn strength_threshold_is_configurable() {
+    // Raising `predicate_strength_threshold` to 0.95 should cause even a
+    // tight regex match (strength ~0.85 on this source) to demote. Confirms
+    // the threshold is a live knob, not a hard-coded constant.
+    let dir = tempfile::tempdir().unwrap();
+    let graph = thinkingroot_graph::graph::GraphStore::init(dir.path()).unwrap();
+    let store = FileSystemSourceStore::new(dir.path()).unwrap();
+
+    let source_body = "// AuthService exposes validate_token\nfn validate_token(t: &str) -> bool { t.starts_with(\"eyJ\") }\n";
+    let hash = ContentHash::from_bytes(source_body.as_bytes());
+    let source = Source::new("file:///s.rs".into(), SourceType::File).with_hash(hash.clone());
+    graph.insert_source(&source).unwrap();
+    store.put(source.id, &hash, source_body.as_bytes()).unwrap();
+
+    let pred = Predicate {
+        language: PredicateLanguage::Regex,
+        query: r"fn\s+validate_token".into(),
+        scope: PredicateScope::empty(),
+    };
+    let claim = Claim::new(
+        "AuthService exposes validate_token",
+        ClaimType::Fact,
+        source.id,
+        WorkspaceId::new(),
+    )
+    .with_predicate(pred);
+
+    let candidates = [CandidateClaim {
+        claim: &claim,
+        predicate: claim.predicate.as_ref(),
+        derivation: None,
+    }];
+
+    let mut strict = RootingConfig::default();
+    strict.predicate_strength_threshold = 0.95; // deliberately strict
+
+    let rooter = Rooter::new(&graph, &store, strict);
+    let output = rooter.root_batch(&candidates).expect("root_batch");
+    let verdict = output.verdict_for(claim.id).unwrap();
+    assert_eq!(
+        verdict.admission_tier,
+        AdmissionTier::Attested,
+        "under a 0.95 strength threshold, even a tight match should demote"
     );
 }

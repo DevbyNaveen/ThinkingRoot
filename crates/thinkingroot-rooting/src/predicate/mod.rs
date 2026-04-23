@@ -19,8 +19,24 @@ pub struct PredicateEvaluation {
     pub passed: bool,
     /// Number of distinct matches found. `0` when `passed = false`.
     pub match_count: usize,
+    /// Evidential strength of the match in `[0.0, 1.0]`. Measures how
+    /// specific the predicate is relative to the source: a pattern that
+    /// covers most of the source bytes (e.g. `.` or `\w+`) scores near
+    /// `0.0`; a pattern with tight, localised matches scores near `1.0`.
+    /// `0.0` when `passed = false`.
+    pub strength: f32,
     /// Short description for the verdict's `detail` field.
     pub detail: String,
+}
+
+/// Compute coverage-based strength: `1 - clamp(matched_bytes / source_bytes, 0, 1)`.
+/// Returns `0.0` when `source_bytes == 0` (no source → no evidence).
+pub(crate) fn coverage_strength(matched_bytes: usize, source_bytes: usize) -> f32 {
+    if source_bytes == 0 {
+        return 0.0;
+    }
+    let ratio = (matched_bytes as f64 / source_bytes as f64).clamp(0.0, 1.0);
+    (1.0 - ratio) as f32
 }
 
 /// Evaluator for a single predicate language.

@@ -276,9 +276,7 @@ impl QueryEngine {
     /// Create a new empty QueryEngine with an explicit branch-cache config.
     /// Used by callers that want to tune `max_entries`/`ttl_secs`/`disabled`
     /// (e.g. long-lived servers pulling config from workspace TOML).
-    pub fn with_branch_cache_config(
-        cfg: &thinkingroot_core::config::BranchCacheConfig,
-    ) -> Self {
+    pub fn with_branch_cache_config(cfg: &thinkingroot_core::config::BranchCacheConfig) -> Self {
         Self {
             workspaces: HashMap::new(),
             branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::new(cfg)),
@@ -938,21 +936,23 @@ impl QueryEngine {
         )?;
         Ok(rows
             .into_iter()
-            .map(|(id, statement, claim_type, confidence, source_uri, event_date_raw)| {
-                let event_date = if event_date_raw != 0.0 {
-                    Some(event_date_raw)
-                } else {
-                    None
-                };
-                ClaimInfo {
-                    id,
-                    statement,
-                    claim_type,
-                    confidence,
-                    source_uri,
-                    event_date,
-                }
-            })
+            .map(
+                |(id, statement, claim_type, confidence, source_uri, event_date_raw)| {
+                    let event_date = if event_date_raw != 0.0 {
+                        Some(event_date_raw)
+                    } else {
+                        None
+                    };
+                    ClaimInfo {
+                        id,
+                        statement,
+                        claim_type,
+                        confidence,
+                        source_uri,
+                        event_date,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -1385,9 +1385,7 @@ impl QueryEngine {
                         });
                     } else if let Some(ref bh) = branch_handle {
                         // Branch-only entity — resolve via branch graph point-lookup.
-                        if let Ok(Some((name, etype, _desc))) =
-                            bh.graph.get_entity_by_id(bare_id)
-                        {
+                        if let Ok(Some((name, etype, _desc))) = bh.graph.get_entity_by_id(bare_id) {
                             entity_hits.push(EntitySearchHit {
                                 id: bare_id.to_string(),
                                 name,
@@ -1515,17 +1513,21 @@ impl QueryEngine {
                     .as_ref()
                     .is_none_or(|t| t.eq_ignore_ascii_case(ctype))
             })
-            .filter(|(_, _, _, conf, _, _)| {
-                filter.min_confidence.is_none_or(|min| *conf >= min)
-            })
-            .map(|(id, statement, claim_type, confidence, source_uri, event_date)| ClaimInfo {
-                id,
-                statement,
-                claim_type,
-                confidence,
-                source_uri,
-                event_date: if event_date > 0.0 { Some(event_date) } else { None },
-            })
+            .filter(|(_, _, _, conf, _, _)| filter.min_confidence.is_none_or(|min| *conf >= min))
+            .map(
+                |(id, statement, claim_type, confidence, source_uri, event_date)| ClaimInfo {
+                    id,
+                    statement,
+                    claim_type,
+                    confidence,
+                    source_uri,
+                    event_date: if event_date > 0.0 {
+                        Some(event_date)
+                    } else {
+                        None
+                    },
+                },
+            )
             .collect();
 
         // Sort newest-first by event_date (matches main path at L496–501).
@@ -1610,7 +1612,11 @@ impl QueryEngine {
 
         let contradiction_count = branch_graph
             .get_contradictions()
-            .map(|list| list.iter().filter(|(_, _, _, _, s)| s == "Detected").count())
+            .map(|list| {
+                list.iter()
+                    .filter(|(_, _, _, _, s)| s == "Detected")
+                    .count()
+            })
             .unwrap_or(0);
 
         Ok(WorkspaceSummary {
@@ -1931,12 +1937,13 @@ Rules: \
                         provenance_threshold: handle.config.rooting.provenance_threshold,
                         contradiction_floor: handle.config.rooting.contradiction_floor,
                         contribute_gate: handle.config.rooting.contribute_gate.clone(),
+                        predicate_strength_threshold: handle
+                            .config
+                            .rooting
+                            .predicate_strength_threshold,
                     };
-                    let rooter = thinkingroot_rooting::Rooter::new(
-                        &storage.graph,
-                        &byte_store,
-                        rooting_cfg,
-                    );
+                    let rooter =
+                        thinkingroot_rooting::Rooter::new(&storage.graph, &byte_store, rooting_cfg);
                     match rooter.root_batch(&candidates) {
                         Ok(output) => {
                             // Persist verdicts + certificates for audit.
@@ -2058,10 +2065,7 @@ Rules: \
 
         // Merge-time knobs: prefer the mounted workspace config, fall back to
         // disk config so unmounted callers still work.
-        let mounted = self
-            .workspaces
-            .values()
-            .find(|h| h.root_path == root);
+        let mounted = self.workspaces.values().find(|h| h.root_path == root);
         let merge_cfg = match mounted {
             Some(h) => h.config.merge.clone(),
             None => Config::load_merged(root)?.merge,
@@ -2114,11 +2118,7 @@ Rules: \
     /// Soft-delete a branch (marks Abandoned, data retained). Evicts the
     /// branch from the engine cache so stale handles can't serve reads
     /// against an Abandoned entry.
-    pub async fn delete_branch(
-        &self,
-        root: &std::path::Path,
-        branch_name: &str,
-    ) -> Result<()> {
+    pub async fn delete_branch(&self, root: &std::path::Path, branch_name: &str) -> Result<()> {
         self.branch_engines.invalidate(root, branch_name).await;
         thinkingroot_branch::delete_branch(root, branch_name)
             .map_err(|e| Error::GraphStorage(format!("delete_branch failed: {e}")))
@@ -2139,10 +2139,7 @@ Rules: \
     /// issues a large read-heavy Datalog query followed by writes to
     /// `structural_patterns` and `known_unknowns`; interleaving with
     /// other writes would waste effort (the pattern discovery rescans).
-    pub async fn reflect(
-        &self,
-        ws: &str,
-    ) -> Result<thinkingroot_reflect::ReflectResult> {
+    pub async fn reflect(&self, ws: &str) -> Result<thinkingroot_reflect::ReflectResult> {
         self.reflect_branched(ws, None).await
     }
 
@@ -2188,7 +2185,8 @@ Rules: \
         entity: Option<&str>,
         min_confidence: f64,
     ) -> Result<Vec<thinkingroot_reflect::GapReport>> {
-        self.list_gaps_branched(ws, entity, min_confidence, None).await
+        self.list_gaps_branched(ws, entity, min_confidence, None)
+            .await
     }
 
     /// Branch-aware variant of `list_gaps`.
@@ -2203,11 +2201,7 @@ Rules: \
         match branch {
             None | Some("main") => {
                 let storage = handle.storage.lock().await;
-                thinkingroot_reflect::list_open_gaps(
-                    &storage.graph,
-                    entity,
-                    min_confidence,
-                )
+                thinkingroot_reflect::list_open_gaps(&storage.graph, entity, min_confidence)
             }
             Some(branch_name) => {
                 let bh = self
@@ -2268,12 +2262,7 @@ Rules: \
     /// do not re-raise the gap as open, so agents can suppress known
     /// false positives ("this service legitimately has no auth — it's
     /// internal only"). Branch-aware via `branch` param.
-    pub async fn dismiss_gap(
-        &self,
-        ws: &str,
-        gap_id: &str,
-        branch: Option<&str>,
-    ) -> Result<()> {
+    pub async fn dismiss_gap(&self, ws: &str, gap_id: &str, branch: Option<&str>) -> Result<()> {
         let handle = self.get_workspace(ws)?;
         match branch {
             None | Some("main") => {
@@ -2299,11 +2288,7 @@ Rules: \
         skip(self, root),
         fields(branch = %branch_name),
     )]
-    pub async fn rollback_merge(
-        &self,
-        root: &std::path::Path,
-        branch_name: &str,
-    ) -> Result<()> {
+    pub async fn rollback_merge(&self, root: &std::path::Path, branch_name: &str) -> Result<()> {
         thinkingroot_branch::rollback_merge(root, branch_name)
             .map_err(|e| Error::GraphStorage(format!("rollback failed: {e}")))?;
 

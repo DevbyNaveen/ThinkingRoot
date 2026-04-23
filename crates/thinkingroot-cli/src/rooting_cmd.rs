@@ -12,9 +12,7 @@ use std::path::Path;
 use console::style;
 use thinkingroot_core::config::Config;
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_rooting::{
-    CandidateClaim, FileSystemSourceStore, Rooter, RootingConfig,
-};
+use thinkingroot_rooting::{CandidateClaim, FileSystemSourceStore, Rooter, RootingConfig};
 
 pub fn report(workspace_path: &Path) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(workspace_path)?;
@@ -26,7 +24,10 @@ pub fn report(workspace_path: &Path) -> anyhow::Result<()> {
 
     println!();
     println!("{}", style("Rooting Report").bold());
-    println!("{}", style(format!("  workspace: {}", data_dir.display())).dim());
+    println!(
+        "{}",
+        style(format!("  workspace: {}", data_dir.display())).dim()
+    );
     println!();
     if total == 0 {
         println!(
@@ -74,7 +75,11 @@ pub fn verify(workspace_path: &Path, claim_id: &str) -> anyhow::Result<()> {
     let graph = GraphStore::init(&graph_dir)?;
 
     println!();
-    println!("{} {}", style("Rooting Verification").bold(), style(claim_id).dim());
+    println!(
+        "{} {}",
+        style("Rooting Verification").bold(),
+        style(claim_id).dim()
+    );
     println!();
 
     let verdicts = graph.get_trial_verdicts_for_claim(claim_id)?;
@@ -83,13 +88,14 @@ pub fn verify(workspace_path: &Path, claim_id: &str) -> anyhow::Result<()> {
             "  {}  no trial verdicts found for this claim",
             style("!").yellow()
         );
-        println!(
-            "      (claim may pre-date Rooting or never went through Phase 6.5)",
-        );
+        println!("      (claim may pre-date Rooting or never went through Phase 6.5)",);
         return Ok(());
     }
 
-    println!("{}", style(format!("  {} trial(s) on record", verdicts.len())).bold());
+    println!(
+        "{}",
+        style(format!("  {} trial(s) on record", verdicts.len())).bold()
+    );
     for (i, v) in verdicts.iter().enumerate() {
         let (vid, trial_at, tier, prov, contra, pred, topo, temp, cert, reason, version) = v;
         let trial_time = chrono::DateTime::<chrono::Utc>::from_timestamp(*trial_at as i64, 0)
@@ -103,7 +109,12 @@ pub fn verify(workspace_path: &Path, claim_id: &str) -> anyhow::Result<()> {
             _ => tier.to_string(),
         };
         println!();
-        println!("  #{}  {}   {}", i + 1, tier_styled, style(&trial_time).dim());
+        println!(
+            "  #{}  {}   {}",
+            i + 1,
+            tier_styled,
+            style(&trial_time).dim()
+        );
         println!("     trial_id    {}", style(vid).dim());
         println!("     rooter      {}", style(version).dim());
         let probe = |label: &str, score: f64| {
@@ -129,11 +140,7 @@ pub fn verify(workspace_path: &Path, claim_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn re_run(
-    workspace_path: &Path,
-    all: bool,
-    claim_id: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn re_run(workspace_path: &Path, all: bool, claim_id: Option<&str>) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(workspace_path)?;
     let graph_dir = data_dir.join("graph");
     let graph = GraphStore::init(&graph_dir)?;
@@ -143,9 +150,7 @@ pub fn re_run(
     let ids: Vec<String> = if all {
         graph.get_all_claim_ids()?
     } else {
-        vec![claim_id
-            .expect("caller validated all-or-claim")
-            .to_string()]
+        vec![claim_id.expect("caller validated all-or-claim").to_string()]
     };
 
     if ids.is_empty() {
@@ -171,6 +176,7 @@ pub fn re_run(
         provenance_threshold: cfg.rooting.provenance_threshold,
         contradiction_floor: cfg.rooting.contradiction_floor,
         contribute_gate: cfg.rooting.contribute_gate.clone(),
+        predicate_strength_threshold: cfg.rooting.predicate_strength_threshold,
     };
     if rooting_cfg.disabled {
         anyhow::bail!("rooting is disabled in workspace config — re-run aborted");
@@ -223,9 +229,10 @@ pub fn re_run(
         match (old_tier, new_tier) {
             (a, b) if a == b => unchanged += 1,
             (thinkingroot_core::types::AdmissionTier::Attested, _)
-            | (thinkingroot_core::types::AdmissionTier::Quarantined, thinkingroot_core::types::AdmissionTier::Rooted) => {
-                promoted += 1
-            }
+            | (
+                thinkingroot_core::types::AdmissionTier::Quarantined,
+                thinkingroot_core::types::AdmissionTier::Rooted,
+            ) => promoted += 1,
             _ => demoted += 1,
         }
     }
