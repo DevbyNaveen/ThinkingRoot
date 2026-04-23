@@ -455,6 +455,7 @@ pub async fn handle_call(
                 session_dates: &std::collections::HashMap::new(),
                 answer_sids: &session_scope,
                 sessions_dir: &sessions_dir,
+                excluded_claim_ids: &std::collections::HashSet::new(),
             };
             let result = synth_ask(engine, llm, &req).await;
             let text = format!(
@@ -1254,7 +1255,10 @@ pub async fn handle_call(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.70);
             let branch = arguments.get("branch").and_then(|v| v.as_str());
-            match engine.list_gaps_branched(ws, entity, min_conf, branch).await {
+            match engine
+                .list_gaps_branched(ws, entity, min_conf, branch)
+                .await
+            {
                 Ok(gaps) => {
                     let text = if gaps.is_empty() {
                         "No open knowledge gaps at this confidence threshold.".to_string()

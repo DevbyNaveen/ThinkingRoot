@@ -273,6 +273,12 @@ enum Commands {
         /// If omitted, the workspace's model is used for both synthesis and judging.
         #[arg(long)]
         judge_deployment: Option<String>,
+        /// Rooting ablation mode. `on` filters Rejected-tier claims out of
+        /// retrieval (what a production consumer with `trust=rooted` sees);
+        /// `off` and `advisory` leave retrieval unchanged. Use `on` vs
+        /// `off` as the ablation pair.
+        #[arg(long, value_parser = ["on", "off", "advisory"])]
+        rooting_mode: Option<String>,
     },
 }
 
@@ -638,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
             category,
             judge_deployment,
+            rooting_mode,
         }) => {
             eval_cmd::run_eval(
                 &dataset,
@@ -645,6 +652,7 @@ async fn main() -> anyhow::Result<()> {
                 limit,
                 category.as_deref(),
                 judge_deployment.as_deref(),
+                rooting_mode.as_deref(),
             )
             .await?;
         }
@@ -1024,6 +1032,7 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
         session_dates: &HashMap::new(),
         answer_sids: &[],
         sessions_dir: &sessions_dir,
+        excluded_claim_ids: &HashSet::new(),
     };
 
     let spinner_msg = format!(
