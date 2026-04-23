@@ -1964,14 +1964,50 @@ Rules: \
                                     let _ = storage.graph.insert_claim(&updated);
                                 }
                             }
+
+                            // Enforce mode excises any Rejected-tier claim
+                            // from the graph. Advisory keeps everything.
+                            let enforce = handle.config.rooting.contribute_gate == "enforce";
+                            let mut enforced_removed = 0usize;
+                            if enforce {
+                                for (idx, v) in output.verdicts.iter().enumerate() {
+                                    if v.admission_tier
+                                        == thinkingroot_core::types::AdmissionTier::Rejected
+                                    {
+                                        if let Some(c) = claims.get(idx) {
+                                            let cid = c.id.to_string();
+                                            if let Err(e) =
+                                                storage.graph.remove_claim_fully(&cid)
+                                            {
+                                                tracing::warn!(
+                                                    "contribute enforce: remove_claim_fully({}) failed: {e}",
+                                                    cid
+                                                );
+                                            } else {
+                                                enforced_removed += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            let enforce_note = if enforce {
+                                format!(" — enforce mode removed {enforced_removed}")
+                            } else {
+                                String::from(" — advisory mode, nothing removed")
+                            };
+
                             if output.rejected_count > 0 || output.quarantined_count > 0 {
                                 warnings.push(format!(
-                                    "rooting: {} rejected, {} quarantined (advisory — nothing removed)",
-                                    output.rejected_count, output.quarantined_count
+                                    "rooting: {} rejected, {} quarantined{}",
+                                    output.rejected_count,
+                                    output.quarantined_count,
+                                    enforce_note
                                 ));
                             } else {
                                 tracing::info!(
-                                    "rooting advisory: {} admitted cleanly (contribute)",
+                                    "rooting {}: {} admitted cleanly (contribute)",
+                                    if enforce { "enforce" } else { "advisory" },
                                     output.admitted_count
                                 );
                             }
