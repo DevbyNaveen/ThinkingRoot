@@ -63,11 +63,9 @@ impl GraphStore {
         // Drop indexes first — :replace fails while indexes are attached.
         for drop_idx in ["::index drop structural_patterns:by_entity_type"] {
             // Index may or may not exist yet; swallow the "not found" error.
-            let _ = self.db.run_script(
-                drop_idx,
-                BTreeMap::new(),
-                ScriptMutability::Mutable,
-            );
+            let _ = self
+                .db
+                .run_script(drop_idx, BTreeMap::new(), ScriptMutability::Mutable);
         }
 
         // Replace the relation with the new schema. Loses existing rows,
@@ -92,12 +90,12 @@ impl GraphStore {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| {
-                Error::GraphStorage(format!(
-                    "structural_patterns migration failed: {e}"
-                ))
+                Error::GraphStorage(format!("structural_patterns migration failed: {e}"))
             })?;
 
-        tracing::info!("migrated structural_patterns — added first_seen_at, stability_runs, source_scope");
+        tracing::info!(
+            "migrated structural_patterns — added first_seen_at, stability_runs, source_scope"
+        );
         Ok(())
     }
 
@@ -663,8 +661,7 @@ impl GraphStore {
         );
         let derivation_parents_json = match &claim.derivation {
             Some(d) => {
-                let ids: Vec<String> =
-                    d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
+                let ids: Vec<String> = d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
                 serde_json::to_string(&ids).unwrap_or_default()
             }
             None => String::new(),
@@ -1348,6 +1345,69 @@ impl GraphStore {
         Ok(sources.len())
     }
 
+    /// Delete a claim and every downstream edge that names it: the
+    /// `claim_source_edges`, `claim_entity_edges`, and `claim_temporal`
+    /// rows, plus any `contradictions` referring to the claim.
+    ///
+    /// Used by the Rooting contribute-gate enforce mode to excise a
+    /// Rejected-tier claim after the trial has recorded its verdict +
+    /// certificate. The `trial_verdicts` row is deliberately retained for
+    /// audit — enforce removes the admission, not the proof that it was
+    /// ever considered.
+    pub fn remove_claim_fully(&self, claim_id: &str) -> Result<()> {
+        // Gather entity edges first (we need to query before deletion).
+        let entity_edges = {
+            let mut params = BTreeMap::new();
+            params.insert("cid".into(), DataValue::Str(claim_id.into()));
+            let r = self
+                .db
+                .run_script(
+                    "?[entity_id] := *claim_entity_edges{claim_id: $cid, entity_id}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("entity edges: {e}")))?;
+            r.rows
+                .into_iter()
+                .map(|row| dv_to_string(&row[0]))
+                .collect::<Vec<_>>()
+        };
+
+        for eid in entity_edges {
+            self.remove_claim_entity_edge(claim_id, &eid)?;
+        }
+
+        // Source edges are cleaned by a single pass.
+        {
+            let mut params = BTreeMap::new();
+            params.insert("cid".into(), DataValue::Str(claim_id.into()));
+            let r = self
+                .db
+                .run_script(
+                    "?[source_id] := *claim_source_edges{claim_id: $cid, source_id}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("source edges: {e}")))?;
+            for row in &r.rows {
+                let sid = dv_to_string(&row[0]);
+                let mut rm_params = BTreeMap::new();
+                rm_params.insert("cid".into(), DataValue::Str(claim_id.into()));
+                rm_params.insert("sid".into(), DataValue::Str(sid.into()));
+                self.query(
+                    r#"?[claim_id, source_id] <- [[$cid, $sid]]
+                       :rm claim_source_edges {claim_id, source_id}"#,
+                    rm_params,
+                )?;
+            }
+        }
+
+        self.remove_claim_temporal(claim_id)?;
+        self.remove_contradictions_for_claim(claim_id)?;
+        self.remove_claim(claim_id)?;
+        Ok(())
+    }
+
     /// Query all claims for a given entity (Datalog join).
     pub fn get_claims_for_entity(&self, entity_id: &str) -> Result<Vec<(String, String, String)>> {
         let mut params = BTreeMap::new();
@@ -1424,9 +1484,7 @@ impl GraphStore {
     ///   `condition_claim_type` at all.
     /// - `both_count` = distinct entities that carry both claim types.
     #[allow(clippy::type_complexity)]
-    pub fn reflect_co_occurrences(
-        &self,
-    ) -> Result<Vec<(String, String, String, usize, usize)>> {
+    pub fn reflect_co_occurrences(&self) -> Result<Vec<(String, String, String, usize, usize)>> {
         let result = self
             .db
             .run_script(
@@ -1472,7 +1530,10 @@ impl GraphStore {
         expected_claim_type: &str,
     ) -> Result<Vec<String>> {
         let mut params = BTreeMap::new();
-        params.insert("etype".into(), DataValue::Str(entity_type.to_string().into()));
+        params.insert(
+            "etype".into(),
+            DataValue::Str(entity_type.to_string().into()),
+        );
         params.insert(
             "cta".into(),
             DataValue::Str(condition_claim_type.to_string().into()),
@@ -1498,9 +1559,7 @@ impl GraphStore {
                 params,
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| {
-                Error::GraphStorage(format!("reflect_entities_missing_expected: {e}"))
-            })?;
+            .map_err(|e| Error::GraphStorage(format!("reflect_entities_missing_expected: {e}")))?;
 
         Ok(result
             .rows
@@ -1518,7 +1577,10 @@ impl GraphStore {
     ) -> Result<Option<String>> {
         let mut params = BTreeMap::new();
         params.insert("eid".into(), DataValue::Str(entity_id.to_string().into()));
-        params.insert("ctype".into(), DataValue::Str(claim_type.to_string().into()));
+        params.insert(
+            "ctype".into(),
+            DataValue::Str(claim_type.to_string().into()),
+        );
         let result = self
             .db
             .run_script(
@@ -1529,9 +1591,7 @@ impl GraphStore {
                 params,
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| {
-                Error::GraphStorage(format!("find_claim_id_for_entity_by_type: {e}"))
-            })?;
+            .map_err(|e| Error::GraphStorage(format!("find_claim_id_for_entity_by_type: {e}")))?;
         Ok(result.rows.first().map(|r| dv_to_string(&r[0])))
     }
 
@@ -1552,7 +1612,17 @@ impl GraphStore {
         &self,
         scope: &str,
         rows: &[(
-            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            u32,
+            String,
         )],
     ) -> Result<()> {
         for r in rows {
@@ -1628,7 +1698,17 @@ impl GraphStore {
         &self,
     ) -> Result<
         Vec<(
-            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            u32,
+            String,
         )>,
     > {
         let result = self
@@ -1645,9 +1725,7 @@ impl GraphStore {
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| {
-                Error::GraphStorage(format!("reflect_load_structural_patterns: {e}"))
-            })?;
+            .map_err(|e| Error::GraphStorage(format!("reflect_load_structural_patterns: {e}")))?;
 
         Ok(result
             .rows
@@ -1677,7 +1755,19 @@ impl GraphStore {
     #[allow(clippy::type_complexity)]
     pub fn reflect_load_known_unknowns(
         &self,
-    ) -> Result<Vec<(String, String, String, String, f64, String, f64, f64, String)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            String,
+            String,
+            f64,
+            String,
+            f64,
+            f64,
+            String,
+        )>,
+    > {
         let result = self
             .db
             .run_script(
@@ -1689,9 +1779,7 @@ impl GraphStore {
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| {
-                Error::GraphStorage(format!("reflect_load_known_unknowns: {e}"))
-            })?;
+            .map_err(|e| Error::GraphStorage(format!("reflect_load_known_unknowns: {e}")))?;
 
         Ok(result
             .rows
@@ -1765,10 +1853,12 @@ impl GraphStore {
                 BTreeMap::new(),
                 ScriptMutability::Immutable,
             )
-            .map_err(|e| {
-                Error::GraphStorage(format!("reflect_count_open_known_unknowns: {e}"))
-            })?;
-        Ok(result.rows.first().map(|r| count_from_single(&r[0])).unwrap_or(0))
+            .map_err(|e| Error::GraphStorage(format!("reflect_count_open_known_unknowns: {e}")))?;
+        Ok(result
+            .rows
+            .first()
+            .map(|r| count_from_single(&r[0]))
+            .unwrap_or(0))
     }
 
     /// List open gaps joined with entity + pattern detail, filtered by
@@ -1782,9 +1872,24 @@ impl GraphStore {
         &self,
         entity_name: Option<&str>,
         min_confidence: f64,
-    ) -> Result<Vec<(String, String, String, String, String, f64, String, usize, f64)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            String,
+            usize,
+            f64,
+        )>,
+    > {
         let mut params = BTreeMap::new();
-        params.insert("min_conf".into(), DataValue::Num(Num::Float(min_confidence)));
+        params.insert(
+            "min_conf".into(),
+            DataValue::Num(Num::Float(min_confidence)),
+        );
         let script = if let Some(name) = entity_name {
             params.insert("name".into(), DataValue::Str(name.to_string().into()));
             r#"?[gid, eid, ename, etype, expected, confidence, pid, sample, created] :=
@@ -1841,7 +1946,20 @@ impl GraphStore {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn insert_trial_verdicts_batch(
         &self,
-        rows: &[(String, String, f64, String, f64, f64, f64, f64, f64, String, String, String)],
+        rows: &[(
+            String,
+            String,
+            f64,
+            String,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            String,
+            String,
+            String,
+        )],
     ) -> Result<()> {
         const CHUNK: usize = 500;
         for chunk in rows.chunks(CHUNK) {
@@ -1927,7 +2045,21 @@ impl GraphStore {
     pub fn get_trial_verdicts_for_claim(
         &self,
         claim_id: &str,
-    ) -> Result<Vec<(String, f64, String, f64, f64, f64, f64, f64, String, String, String)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            f64,
+            String,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            String,
+            String,
+            String,
+        )>,
+    > {
         let mut params = BTreeMap::new();
         params.insert("cid".into(), DataValue::Str(claim_id.into()));
         let result = self
@@ -2238,9 +2370,7 @@ impl GraphStore {
     /// Returns `(rooted, attested, quarantined, rejected)`. Used by the
     /// Health Score calculation and by `root rooting report`.
     pub fn count_claims_by_admission_tier(&self) -> Result<(usize, usize, usize, usize)> {
-        let result = self.query_read(
-            "?[tier, count(id)] := *claims{id, admission_tier: tier}",
-        )?;
+        let result = self.query_read("?[tier, count(id)] := *claims{id, admission_tier: tier}")?;
         let mut rooted = 0usize;
         let mut attested = 0usize;
         let mut quarantined = 0usize;
@@ -2605,9 +2735,8 @@ impl GraphStore {
         };
 
         // Rooting columns (Migration 3). Row indices 11–14.
-        let admission_tier = thinkingroot_core::types::AdmissionTier::from_str(
-            dv_to_string(&row[11]).as_str(),
-        );
+        let admission_tier =
+            thinkingroot_core::types::AdmissionTier::from_str(dv_to_string(&row[11]).as_str());
         let derivation_parents_str = dv_to_string(&row[12]);
         let derivation = if derivation_parents_str.is_empty() {
             None
@@ -4650,10 +4779,12 @@ mod tests {
         store.insert_claim(&claim).unwrap();
 
         // Still readable after multiple migration calls.
-        assert!(store
-            .get_claim_by_id(&claim.id.to_string())
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_claim_by_id(&claim.id.to_string())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -4759,7 +4890,10 @@ mod tests {
         p.insert("trial_at".into(), DataValue::Num(Num::Float(0.0)));
         p.insert("admission_tier".into(), DataValue::Str("rooted".into()));
         p.insert("provenance_score".into(), DataValue::Num(Num::Float(1.0)));
-        p.insert("contradiction_score".into(), DataValue::Num(Num::Float(1.0)));
+        p.insert(
+            "contradiction_score".into(),
+            DataValue::Num(Num::Float(1.0)),
+        );
         p.insert("predicate_score".into(), DataValue::Num(Num::Float(1.0)));
         p.insert("topology_score".into(), DataValue::Num(Num::Float(1.0)));
         p.insert("temporal_score".into(), DataValue::Num(Num::Float(1.0)));
