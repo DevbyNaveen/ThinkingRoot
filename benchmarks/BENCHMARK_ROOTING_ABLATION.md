@@ -6,7 +6,7 @@ Azure gpt-4.1-mini for both synthesis and judging), toggling only
 whether Rooting filters Rejected-tier claims out of retrieval.
 
 Harness: `scripts/b2_ablation_run.sh`
-Raw logs: `/Users/naveen/Desktop/thinkingroot/benchmarks/ablation/2026-04-24-gpt-5.4/off.log`, `/Users/naveen/Desktop/thinkingroot/benchmarks/ablation/2026-04-24-gpt-5.4/on.log`
+Raw logs: `benchmarks/ablation/2026-04-24-gpt-5.4/{off,on}.log` (retained internally, not shipped in the public repo)
 
 ## Headline
 
