@@ -173,7 +173,11 @@ async fn list_claims_branched_entity_filter_works() {
 async fn get_relations_branched_sees_branch_only_relation() {
     let (_dir, _root, engine, _, _) = setup_ws_with_branch().await;
     let main = engine.get_relations("demo", "AuthService").await.unwrap();
-    assert_eq!(main.len(), 1, "main relation count = 1 (DependsOn Database)");
+    assert_eq!(
+        main.len(),
+        1,
+        "main relation count = 1 (DependsOn Database)"
+    );
 
     let branch = engine
         .get_relations_branched("demo", "AuthService", Some("feature/oauth"))

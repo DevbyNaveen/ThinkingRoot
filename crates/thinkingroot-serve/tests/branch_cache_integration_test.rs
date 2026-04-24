@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use tempfile::tempdir;
 
-use thinkingroot_core::{Claim, ClaimType, ContentHash, Source, SourceType, TrustLevel, WorkspaceId};
+use thinkingroot_core::{
+    Claim, ClaimType, ContentHash, Source, SourceType, TrustLevel, WorkspaceId,
+};
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_serve::engine::{ClaimFilter, QueryEngine};
 
@@ -31,7 +33,10 @@ async fn setup_ws() -> (tempfile::TempDir, PathBuf, QueryEngine) {
         .await
         .unwrap();
     let mut engine = QueryEngine::new();
-    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
     (dir, root, engine)
 }
 
@@ -135,14 +140,14 @@ async fn gc_branches_invalidates_workspace_cache() {
 #[tokio::test]
 async fn contribute_to_branch_routes_through_cache() {
     use thinkingroot_serve::engine::AgentClaim;
-    use thinkingroot_serve::intelligence::session::{new_session_store, SessionContext};
+    use thinkingroot_serve::intelligence::session::{SessionContext, new_session_store};
 
     let (_dir, _root, engine) = setup_ws().await;
     let sessions = new_session_store();
-    sessions.lock().await.insert(
-        "sess-1".to_string(),
-        SessionContext::new("sess-1", "demo"),
-    );
+    sessions
+        .lock()
+        .await
+        .insert("sess-1".to_string(), SessionContext::new("sess-1", "demo"));
 
     assert_eq!(engine.branch_engines().len().await, 0);
 

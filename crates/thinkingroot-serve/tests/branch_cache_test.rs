@@ -193,7 +193,9 @@ async fn cached_handle_observes_writes_through_same_handle() {
     let claim = Claim::new("hello", ClaimType::Fact, source.id, workspace);
     let cid = claim.id.to_string();
     h.graph.insert_claim(&claim).unwrap();
-    h.graph.link_claim_to_source(&cid, &source.id.to_string()).unwrap();
+    h.graph
+        .link_claim_to_source(&cid, &source.id.to_string())
+        .unwrap();
 
     let h_again = cache.get_or_open(&root, "feat/writes").await.unwrap();
     let rows = h_again.graph.get_all_claims_with_sources().unwrap();

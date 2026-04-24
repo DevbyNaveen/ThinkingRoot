@@ -123,9 +123,7 @@ impl ReflectEngine {
                 let (first_seen_at, stability_runs) = match previous_patterns.get(&id) {
                     // Pattern survived another run — keep first_seen,
                     // bump the stability counter (saturating at u32::MAX).
-                    Some((first_seen, prev_runs)) => {
-                        (*first_seen, prev_runs.saturating_add(1))
-                    }
+                    Some((first_seen, prev_runs)) => (*first_seen, prev_runs.saturating_add(1)),
                     // Brand new pattern — start the damping curve at 1.
                     None => (now, 1),
                 };
@@ -159,7 +157,17 @@ impl ReflectEngine {
 
         // ── 2. Rewrite structural_patterns in bulk ────────────────
         let rows: Vec<(
-            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            u32,
+            String,
         )> = patterns
             .iter()
             .map(|p| {
@@ -187,8 +195,7 @@ impl ReflectEngine {
         // 92% certainty for their gaps.
         let mut current: HashMap<String, (String, String, String, f64)> = HashMap::new();
         for p in &patterns {
-            let damped_confidence =
-                p.frequency * self.cfg.stability_factor(p.stability_runs);
+            let damped_confidence = p.frequency * self.cfg.stability_factor(p.stability_runs);
             let missing = graph.reflect_entities_missing_expected(
                 &p.entity_type,
                 &p.condition_claim_type,
@@ -212,22 +219,24 @@ impl ReflectEngine {
         let previous: HashMap<String, KnownUnknown> = graph
             .reflect_load_known_unknowns()?
             .into_iter()
-            .map(|(id, eid, pid, expected, conf, status, created, resolved, resolved_by)| {
-                (
-                    id.clone(),
-                    KnownUnknown {
-                        id,
-                        entity_id: eid,
-                        pattern_id: pid,
-                        expected_claim_type: expected,
-                        confidence: conf,
-                        status: GapStatus::from_str(&status).unwrap_or(GapStatus::Open),
-                        created_at: created,
-                        resolved_at: resolved,
-                        resolved_by,
-                    },
-                )
-            })
+            .map(
+                |(id, eid, pid, expected, conf, status, created, resolved, resolved_by)| {
+                    (
+                        id.clone(),
+                        KnownUnknown {
+                            id,
+                            entity_id: eid,
+                            pattern_id: pid,
+                            expected_claim_type: expected,
+                            confidence: conf,
+                            status: GapStatus::from_str(&status).unwrap_or(GapStatus::Open),
+                            created_at: created,
+                            resolved_at: resolved,
+                            resolved_by,
+                        },
+                    )
+                },
+            )
             .collect();
 
         let mut gaps_created = 0usize;
@@ -361,7 +370,8 @@ pub fn list_open_gaps(
     let mut out: Vec<GapReport> = rows
         .into_iter()
         .map(
-            |(_gid, eid, ename, etype, expected, confidence, pid, sample, created)| GapReport {
+            |(gid, eid, ename, etype, expected, confidence, pid, sample, created)| GapReport {
+                id: gid,
                 entity_id: eid,
                 entity_name: ename.clone(),
                 entity_type: etype.clone(),
@@ -507,7 +517,17 @@ pub fn reflect_across_graphs(
 
     // ── 4. Persist patterns + per-workspace gaps ─────────────────
     let pattern_rows: Vec<(
-        String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        usize,
+        f64,
+        usize,
+        f64,
+        u32,
+        String,
     )> = patterns
         .iter()
         .map(|p| {
@@ -584,22 +604,24 @@ fn apply_patterns_to_graph(
         .reflect_load_known_unknowns()?
         .into_iter()
         .filter(|(_id, _eid, pid, _, _, _, _, _, _)| pattern_id_set.contains(pid))
-        .map(|(id, eid, pid, expected, conf, status, created, resolved, resolved_by)| {
-            (
-                id.clone(),
-                KnownUnknown {
-                    id,
-                    entity_id: eid,
-                    pattern_id: pid,
-                    expected_claim_type: expected,
-                    confidence: conf,
-                    status: GapStatus::from_str(&status).unwrap_or(GapStatus::Open),
-                    created_at: created,
-                    resolved_at: resolved,
-                    resolved_by,
-                },
-            )
-        })
+        .map(
+            |(id, eid, pid, expected, conf, status, created, resolved, resolved_by)| {
+                (
+                    id.clone(),
+                    KnownUnknown {
+                        id,
+                        entity_id: eid,
+                        pattern_id: pid,
+                        expected_claim_type: expected,
+                        confidence: conf,
+                        status: GapStatus::from_str(&status).unwrap_or(GapStatus::Open),
+                        created_at: created,
+                        resolved_at: resolved,
+                        resolved_by,
+                    },
+                )
+            },
+        )
         .collect();
 
     let mut gaps_created = 0usize;
@@ -751,12 +773,7 @@ fn pattern_id(entity_type: &str, condition: &str, expected: &str) -> String {
 /// condition, expected) but different scopes (e.g. "local" vs
 /// "cross:abc") get distinct ids so they can coexist in
 /// `structural_patterns` without a primary-key collision.
-fn pattern_id_scoped(
-    scope: &str,
-    entity_type: &str,
-    condition: &str,
-    expected: &str,
-) -> String {
+fn pattern_id_scoped(scope: &str, entity_type: &str, condition: &str, expected: &str) -> String {
     let key = format!("pattern:{scope}:{entity_type}:{condition}:{expected}");
     format!("pat-{}", fnv1a_hex(&key))
 }

@@ -103,11 +103,7 @@ mod tests {
         claim
     }
 
-    fn insert_contradiction(
-        graph: &thinkingroot_graph::graph::GraphStore,
-        a: ClaimId,
-        b: ClaimId,
-    ) {
+    fn insert_contradiction(graph: &thinkingroot_graph::graph::GraphStore, a: ClaimId, b: ClaimId) {
         let id = thinkingroot_core::types::ContradictionId::new().to_string();
         graph
             .insert_contradiction(&id, &a.to_string(), &b.to_string(), "test")

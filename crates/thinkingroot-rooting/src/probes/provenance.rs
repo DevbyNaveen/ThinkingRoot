@@ -110,7 +110,9 @@ mod tests {
     use super::*;
     use crate::config::RootingConfig;
     use crate::source_store::{FileSystemSourceStore, SourceByteStore};
-    use thinkingroot_core::types::{Claim, ClaimType, ContentHash, Source, SourceType, WorkspaceId};
+    use thinkingroot_core::types::{
+        Claim, ClaimType, ContentHash, Source, SourceType, WorkspaceId,
+    };
 
     fn make_ctx_env() -> (
         tempfile::TempDir,
@@ -222,7 +224,10 @@ mod tests {
             config: &config,
         };
         let result = ProvenanceProbe.run(&ctx).unwrap();
-        assert!(result.passed, "should pass-through when bytes are unavailable");
+        assert!(
+            result.passed,
+            "should pass-through when bytes are unavailable"
+        );
         assert_eq!(result.score, -1.0, "skipped probes score -1.0");
         assert!(result.detail.contains("not in store"));
     }

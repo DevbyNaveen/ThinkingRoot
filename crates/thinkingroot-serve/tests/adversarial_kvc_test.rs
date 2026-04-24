@@ -68,8 +68,7 @@ async fn seed_branch(root: &std::path::Path, name: &str, statement: &str, uri: &
         .join(".thinkingroot")
         .join("branches")
         .join(&branch_dir_name);
-    let branch_graph =
-        GraphStore::init(&branch_data_dir.join("graph")).expect("init branch graph");
+    let branch_graph = GraphStore::init(&branch_data_dir.join("graph")).expect("init branch graph");
     seed_claim(&branch_graph, WorkspaceId::new(), statement, uri);
 }
 
@@ -132,8 +131,7 @@ async fn concurrent_merges_into_main_preserve_all_claims() {
     }
 
     while let Some(res) = set.join_next().await {
-        res.expect("task panicked")
-            .expect("merge returned error");
+        res.expect("task panicked").expect("merge returned error");
     }
 
     // Post-merge, main cache should list 3 claims (baseline + alpha + beta).
@@ -178,7 +176,10 @@ async fn rollback_after_merge_restores_pre_merge_state() {
     .await;
 
     let mut engine = QueryEngine::new();
-    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
 
     // Merge.
     engine
@@ -204,7 +205,10 @@ async fn rollback_after_merge_restores_pre_merge_state() {
             .iter()
             .any(|c| c.statement.contains("rolled back")),
         "merged claim not visible pre-rollback: {:?}",
-        pre_rollback.iter().map(|c| &c.statement).collect::<Vec<_>>()
+        pre_rollback
+            .iter()
+            .map(|c| &c.statement)
+            .collect::<Vec<_>>()
     );
 
     // Rollback.
@@ -222,7 +226,10 @@ async fn rollback_after_merge_restores_pre_merge_state() {
         post_rollback.len(),
         1,
         "expected 1 claim after rollback, got {:?}",
-        post_rollback.iter().map(|c| &c.statement).collect::<Vec<_>>()
+        post_rollback
+            .iter()
+            .map(|c| &c.statement)
+            .collect::<Vec<_>>()
     );
     assert!(
         post_rollback[0].statement.contains("Baseline"),
@@ -251,7 +258,10 @@ async fn branch_cache_arc_survives_invalidation() {
     .await;
 
     let mut engine = QueryEngine::new();
-    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
 
     // Prime the branch cache via a read that goes through get_or_open.
     let first = engine

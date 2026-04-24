@@ -105,8 +105,8 @@ pub async fn cleanup_once(
         }
 
         // Safety: if the branch holds agent contributes, never hard-purge.
-        let has_contributes = branch_has_agent_contributes(workspace_root, &branch.name)
-            .unwrap_or(false); // on error, assume has contributes (safe default)
+        let has_contributes =
+            branch_has_agent_contributes(workspace_root, &branch.name).unwrap_or(false); // on error, assume has contributes (safe default)
 
         let effective_action = if action == "purge" && has_contributes {
             tracing::warn!(
@@ -134,20 +134,18 @@ pub async fn cleanup_once(
         // operation does not race a live DbInstance.
 
         match effective_action {
-            "purge" => {
-                match thinkingroot_branch::purge_branch(workspace_root, &branch.name) {
-                    Ok(_) => {
-                        stats.purged += 1;
-                        tracing::info!(branch = %branch.name, session_id, "stream_cleanup: purged");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            branch = %branch.name,
-                            "stream_cleanup: purge failed: {e}"
-                        );
-                    }
+            "purge" => match thinkingroot_branch::purge_branch(workspace_root, &branch.name) {
+                Ok(_) => {
+                    stats.purged += 1;
+                    tracing::info!(branch = %branch.name, session_id, "stream_cleanup: purged");
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %branch.name,
+                        "stream_cleanup: purge failed: {e}"
+                    );
+                }
+            },
             _ => {
                 // "abandon" (default) and any unknown value both soft-delete.
                 match thinkingroot_branch::delete_branch(workspace_root, &branch.name) {
@@ -205,5 +203,7 @@ fn branch_has_agent_contributes(
     // Scan sources for any mcp://agent/ URI. `find_sources_by_uri` matches
     // exact URIs, so we look at get_all_sources and filter the prefix.
     let sources = graph.get_all_sources()?;
-    Ok(sources.iter().any(|(_, uri, _)| uri.starts_with("mcp://agent/")))
+    Ok(sources
+        .iter()
+        .any(|(_, uri, _)| uri.starts_with("mcp://agent/")))
 }

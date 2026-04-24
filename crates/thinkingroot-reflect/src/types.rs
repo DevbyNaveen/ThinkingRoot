@@ -114,6 +114,14 @@ pub struct CrossReflectResult {
 /// A gap surfaced via the `gaps` MCP tool — denormalized for agent display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapReport {
+    /// Stable identifier assigned when the gap row was first upserted
+    /// into `known_unknowns`. Pass this to [`dismiss_gap`] to suppress
+    /// a false-positive gap — previously the id was read from CozoDB
+    /// but discarded before reaching clients, making dismissals
+    /// impossible from outside this crate.
+    ///
+    /// [`dismiss_gap`]: crate::dismiss_gap
+    pub id: String,
     pub entity_id: String,
     pub entity_name: String,
     pub entity_type: String,

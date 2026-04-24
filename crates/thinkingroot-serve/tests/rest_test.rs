@@ -163,7 +163,12 @@ async fn head_endpoint_returns_ok() {
 async fn livez_returns_ok_plain_text() {
     let app = empty_app(None).await;
     let response = app
-        .oneshot(Request::builder().uri("/livez").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

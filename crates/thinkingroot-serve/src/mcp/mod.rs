@@ -134,12 +134,7 @@ impl JsonRpcResponse {
         )
     }
 
-    fn error_with_data(
-        id: Option<Value>,
-        code: i32,
-        message: String,
-        data: ErrorData,
-    ) -> Self {
+    fn error_with_data(id: Option<Value>, code: i32, message: String, data: ErrorData) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -174,11 +169,7 @@ mod error_envelope_tests {
 
     #[test]
     fn permanent_error_marks_not_retryable() {
-        let resp = JsonRpcResponse::error_permanent(
-            None,
-            -32602,
-            "validation failed".to_string(),
-        );
+        let resp = JsonRpcResponse::error_permanent(None, -32602, "validation failed".to_string());
         let json = serde_json::to_value(&resp).unwrap();
         let data = &json["error"]["data"];
         assert_eq!(data["retryable"], Value::Bool(false));
@@ -188,11 +179,8 @@ mod error_envelope_tests {
 
     #[test]
     fn usage_error_is_permanent_and_categorized() {
-        let resp = JsonRpcResponse::error_usage(
-            None,
-            -32602,
-            "missing field `question`".to_string(),
-        );
+        let resp =
+            JsonRpcResponse::error_usage(None, -32602, "missing field `question`".to_string());
         let json = serde_json::to_value(&resp).unwrap();
         let data = &json["error"]["data"];
         assert_eq!(data["retryable"], Value::Bool(false));
