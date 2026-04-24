@@ -389,12 +389,12 @@ default_host = "127.0.0.1"
         let toml_str = r#"
 [[workspace]]
 name = "notes"
-path = "/Users/naveen/notes"
+path = "/home/alice/notes"
 port = 3000
 
 [[workspace]]
 name = "work"
-path = "/Users/naveen/work"
+path = "/home/alice/work"
 port = 3001
 "#;
         let reg: WorkspaceRegistry = toml::from_str(toml_str).unwrap();
