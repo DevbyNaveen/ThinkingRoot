@@ -52,16 +52,55 @@ the release.
   `N=100` → 24.22 ms median (242 µs per claim, well under 10 % overhead
   target).
 
+### Added — Read-time ablation (B2) on LongMemEval-500
+
+- `--rooting-mode {on,off,advisory}` flag on `root eval` wires the
+  Rooting filter into retrieval at read time. When `mode=on`, the
+  retriever excludes every claim whose admission tier is Rejected.
+- `GraphStore::get_claim_ids_by_admission_tier(tier)` — new public
+  API that loads the filter set deterministically.
+- `AskRequest::excluded_claim_ids` — new field threaded through the
+  intelligence synthesizer.
+- `scripts/b2_ablation_run.sh` — two-run orchestrator that runs
+  LongMemEval-500 with `--rooting-mode=off` and `--rooting-mode=on`
+  against the identical workspace, captures both logs, and emits a
+  headline + per-category markdown summary.
+- Azure / OpenAI client gained
+  `requires_max_completion_tokens()` detection so GPT-5.x and
+  o-series reasoning models route through the newer
+  `max_completion_tokens` field. Unblocked running the ablation on
+  `gpt-5.4` v2026-03-05.
+
+### Added — Full ablation + accuracy headline on `gpt-5.4`
+
+- **93.0 % (465/500) on LongMemEval-500** with Azure `gpt-5.4`
+  2026-03-05, pure OSS retrieval stack. Ties MemMachine for #3
+  globally on the April 2026 leaderboard, trails only Chronos (95.6 %)
+  and OMEGA (95.4 %). New canonical headline replacing the historical
+  91.2 % figure from an Azure Cognitive Services endpoint that has
+  since been decommissioned.
+- Read-time ablation outcome:
+  - `gpt-5.4`:    off 93.0 %, on 92.6 % (**multi-session +4 pp**, net −0.4)
+  - `gpt-4.1-mini`: off 89.6 %, on 89.8 % (net +0.2)
+  - Mode=on ran 9–41 s faster on both models (smaller retrieval set).
+- **Interpretation**: Rooting is a write-gate, not a relevance filter.
+  Its read-time effect is second-order and category-dependent; the
+  primary validation is the injection corpus (B3, 100 %/class).
+
 ### Added — Paper update
 
 - `compag-paper/compag.tex` now carries the falsifiable novelty claim
   verbatim in both the abstract and §1, reframes the probe battery as
-  "2 fatal + 1 central + 2 advisory", adds an §Evaluation subsection
-  for Adversarial Robustness, breaks out the 98.6 % figure into an
-  honest-tier table, expands the prior-art comparison from 9 to 20
-  systems, and attaches three appendices (reproducible search,
+  "2 fatal + 1 central + 2 advisory", adds §Evaluation subsections for
+  **Adversarial Robustness** (B3 injection) and **Read-time ablation**
+  (B2) with full per-category breakdown and honest interpretation,
+  breaks out the old 98.6 % figure into a predicate-verified vs.
+  temporal-default split, expands the prior-art comparison from 9 to
+  20 systems, and attaches three appendices (reproducible search,
   adversarial-corpus harness, operational decomposition of the novelty
-  claim).
+  claim). The headline accuracy in the abstract, §1, §6.1, §6.4, and
+  the conclusion has been updated to 93.0 % with proper historical
+  attribution of the 91.2 % figure.
 
 ### Migration guide — from `0.9.x` to `0.1.0-rooting`
 

@@ -19,6 +19,25 @@ struct ChatOutput {
 
 /// Returns the maximum output tokens for a known model.
 /// Falls back to a conservative 8_192 for unknown models.
+/// Whether an Azure / OpenAI deployment requires the newer
+/// `max_completion_tokens` field instead of the deprecated `max_tokens`.
+///
+/// Applies to GPT-5.x family (2025-08-07 onwards) and the o-series
+/// reasoning models (o1, o3, o4). Models that fail this check use the
+/// legacy `max_tokens`. Called on both the model name ("gpt-5.4") and
+/// deployment name ("gpt-5.4" or a custom deployment label) so callers
+/// can pass whichever identifier they have.
+pub fn requires_max_completion_tokens(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    // GPT-5 family and everything labelled with a 5.x or 6.x version.
+    lower.starts_with("gpt-5")
+        || lower.starts_with("gpt-6")
+        // Reasoning models: o1, o3, o4 + mini variants.
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+}
+
 pub fn model_max_output_tokens(model: &str) -> i32 {
     let m = model.to_lowercase();
 
@@ -412,14 +431,25 @@ impl AzureProvider {
 
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
         // Azure AOAI: no `model` field in body — deployment is in the URL.
-        let body = serde_json::json!({
+        //
+        // GPT-5.x and the o-series reasoning models require
+        // `max_completion_tokens` in place of the deprecated `max_tokens`,
+        // and reject the latter with an "Unsupported parameter" 400. Detect
+        // by model / deployment name so existing GPT-4.x callers are
+        // unchanged.
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user},
             ],
             "temperature": 0.1,
-            "max_tokens": self.max_output_tokens,
         });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
 
         let resp = self
             .client
@@ -515,15 +545,22 @@ impl OpenAiProvider {
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
-        let body = serde_json::json!({
+        // Same max_tokens → max_completion_tokens switch as the Azure
+        // provider: GPT-5.x / o-series require the newer field.
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             "temperature": 0.1,
-            "max_tokens": self.max_output_tokens,
         });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
 
         let resp = self
             .client

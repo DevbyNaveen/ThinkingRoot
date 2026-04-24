@@ -17,7 +17,12 @@ REPO_ROOT="$(pwd)"
 ROOT_BIN="${ROOT_BIN:-$REPO_ROOT/target/release/root}"
 WS="$REPO_ROOT/longmemeval-workspace"
 DATASET="$REPO_ROOT/longmemeval-data/longmemeval_s.jsonl"
-OUT_DIR="$REPO_ROOT/benchmarks/ablation/2026-04-24"
+# Output dir tags the run date + deployment from the workspace config so
+# multiple runs with different models do not clobber each other.
+DEPLOY=$(grep -E "^deployment\s*=" "$REPO_ROOT/longmemeval-workspace/.thinkingroot/config.toml" \
+  | head -1 | awk -F'"' '{print $2}')
+TAG_DATE=$(date +%F)
+OUT_DIR="$REPO_ROOT/benchmarks/ablation/${TAG_DATE}-${DEPLOY}"
 mkdir -p "$OUT_DIR"
 
 if [[ ! -x "$ROOT_BIN" ]]; then
@@ -68,8 +73,8 @@ REPORT="$REPO_ROOT/benchmarks/BENCHMARK_ROOTING_ABLATION.md"
 cat > "$REPORT" <<REPORT_EOF
 # Rooting Ablation on LongMemEval-500 — $(date +%Y-%m-%d)
 
-Two full $500$-question LongMemEval-S runs against the same compiled
-workspace (\`longmemeval-workspace/\`, $95{,}584$ claims, $990$ sources,
+Two full 500-question LongMemEval-S runs against the same compiled
+workspace (\`longmemeval-workspace/\`, 95,584 claims, 990 sources,
 Azure gpt-4.1-mini for both synthesis and judging), toggling only
 whether Rooting filters Rejected-tier claims out of retrieval.
 
@@ -80,8 +85,8 @@ Raw logs: \`$OUT_DIR/off.log\`, \`$OUT_DIR/on.log\`
 
 | Mode | Overall | Wall clock |
 |------|---------|------------|
-| off (retrieval sees all $95{,}584$ claims) | $OFF_SCORE | ${OFF_DUR}s |
-| on  (retrieval excludes $1{,}210$ Rejected claims) | $ON_SCORE | ${ON_DUR}s |
+| off (retrieval sees all 95,584 claims) | $OFF_SCORE | ${OFF_DUR}s |
+| on  (retrieval excludes 1,210 Rejected claims) | $ON_SCORE | ${ON_DUR}s |
 
 ## Per-category breakdown
 
@@ -99,7 +104,7 @@ $(grep -E "^\s+[a-z-]+\s+[0-9]+/[0-9]+" "$OUT_DIR/on.log" | tail -20 || true)
 
 This workspace was compiled before predicate extraction was wired into
 the LLM prompts, so the only claims Rooting can reject are those
-flagged by the Contradiction probe ($1{,}210$ of $95{,}584$, $1.27\%$).
+flagged by the Contradiction probe (1,210 of 95,584, 1.27%).
 The ablation therefore measures a narrow but specific question: does
 removing those flagged-contradictory claims change end-to-end
 LongMemEval accuracy?
@@ -109,7 +114,7 @@ demonstrates that Rooting's fatal-probe rejections are at worst benign
 to read-time accuracy, at best a positive signal. A regression would
 indicate the gate is dropping load-bearing claims, which would warrant
 tightening the contradiction-probe confidence floor
-(\`contradiction_floor\`, default $0.85$).
+(\`contradiction_floor\`, default 0.85).
 
 ## Reproduction
 
