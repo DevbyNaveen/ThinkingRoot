@@ -4,11 +4,10 @@
 use tempfile::tempdir;
 
 use thinkingroot_core::{
-    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel,
-    WorkspaceId,
+    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_reflect::{reflect_across_graphs, ReflectConfig};
+use thinkingroot_reflect::{ReflectConfig, reflect_across_graphs};
 
 struct Fx {
     graph: GraphStore,
@@ -124,7 +123,9 @@ fn aggregate_pattern_fires_below_per_workspace_threshold() {
     let p = cross
         .aggregate_patterns
         .iter()
-        .find(|p| p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement")
+        .find(|p| {
+            p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement"
+        })
         .expect("ApiSignature→Requirement pattern must be in aggregate");
     assert_eq!(p.sample_size, 30, "aggregate sample = 15 + 15 = 30");
     assert!(p.source_scope.starts_with("cross:"));
@@ -192,7 +193,9 @@ fn cross_reflect_does_not_touch_local_patterns() {
     // Local pattern must still be present in ws-local after cross reflect.
     let after = fx_local.graph.reflect_load_structural_patterns().unwrap();
     assert!(
-        after.iter().any(|r| r.0 == local_pattern_id && r.10 == "local"),
+        after
+            .iter()
+            .any(|r| r.0 == local_pattern_id && r.10 == "local"),
         "local pattern must survive a cross reflect cycle"
     );
     // And ws-local should ALSO have the cross-scope pattern.
@@ -219,7 +222,9 @@ fn cross_reflect_stability_runs_increment() {
     let target_p = first
         .aggregate_patterns
         .iter()
-        .find(|p| p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement")
+        .find(|p| {
+            p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement"
+        })
         .unwrap();
     assert_eq!(target_p.stability_runs, 1);
 
@@ -231,7 +236,9 @@ fn cross_reflect_stability_runs_increment() {
     let target_p2 = second
         .aggregate_patterns
         .iter()
-        .find(|p| p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement")
+        .find(|p| {
+            p.condition_claim_type == "ApiSignature" && p.expected_claim_type == "Requirement"
+        })
         .unwrap();
     assert_eq!(
         target_p2.stability_runs, 2,

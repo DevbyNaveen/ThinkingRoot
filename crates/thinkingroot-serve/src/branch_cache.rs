@@ -72,8 +72,7 @@ impl BranchEngineCache {
     pub fn new(cfg: &thinkingroot_core::config::BranchCacheConfig) -> Self {
         // NonZeroUsize::new rejects 0; fall back to 1 so the cache is always
         // structurally valid (a zero-cap LRU would misbehave).
-        let cap =
-            NonZeroUsize::new(cfg.max_entries.max(1)).expect("max_entries.max(1) is nonzero");
+        let cap = NonZeroUsize::new(cfg.max_entries.max(1)).expect("max_entries.max(1) is nonzero");
         Self {
             inner: Mutex::new(LruCache::new(cap)),
             ttl: Duration::from_secs(cfg.ttl_secs.max(1)),

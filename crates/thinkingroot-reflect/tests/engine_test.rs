@@ -6,12 +6,11 @@
 use tempfile::tempdir;
 
 use thinkingroot_core::{
-    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel,
-    WorkspaceId,
+    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_reflect::{
-    count_open_gaps, list_open_gaps, GapStatus, ReflectConfig, ReflectEngine,
+    GapStatus, ReflectConfig, ReflectEngine, count_open_gaps, list_open_gaps,
 };
 
 /// Test fixture helpers — seed a workspace with N service entities and
@@ -221,7 +220,11 @@ fn reflect_resolves_gap_after_claim_added() {
 
     // Satisfy one gap by adding a Requirement claim to one of the uncovered.
     let target = &uncovered[0];
-    fx.add_claim(target, "GapService has a requirement spec", ClaimType::Requirement);
+    fx.add_claim(
+        target,
+        "GapService has a requirement spec",
+        ClaimType::Requirement,
+    );
 
     let r2 = engine.reflect(&fx.graph).unwrap();
     assert_eq!(
@@ -379,10 +382,30 @@ fn stability_runs_increments_across_reflect_cycles() {
     // Pick the specific pattern we care about (ApiSignature → Requirement).
     fn find_pattern(
         rows: &[(
-            String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            u32,
+            String,
         )],
     ) -> &(
-        String, String, String, String, f64, usize, f64, usize, f64, u32, String,
+        String,
+        String,
+        String,
+        String,
+        f64,
+        usize,
+        f64,
+        usize,
+        f64,
+        u32,
+        String,
     ) {
         rows.iter()
             .find(|r| r.2 == "ApiSignature" && r.3 == "Requirement")

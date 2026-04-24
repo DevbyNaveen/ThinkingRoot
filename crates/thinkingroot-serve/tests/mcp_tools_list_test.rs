@@ -29,7 +29,12 @@ async fn tools_list_includes_branch_management_tools() {
     }
 
     // Ensure pre-existing tools still advertised (guard against accidental removal).
-    for existing in ["create_branch", "merge_branch", "checkout_branch", "diff_branch"] {
+    for existing in [
+        "create_branch",
+        "merge_branch",
+        "checkout_branch",
+        "diff_branch",
+    ] {
         assert!(
             names.iter().any(|n| n == existing),
             "tools/list regression: '{}' missing. got: {:?}",

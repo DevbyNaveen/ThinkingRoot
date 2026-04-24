@@ -8,7 +8,7 @@ use thinkingroot_core::{
     Claim, ClaimType, ContentHash, Source, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_serve::intelligence::session::{new_session_store, SessionContext};
+use thinkingroot_serve::intelligence::session::{SessionContext, new_session_store};
 use thinkingroot_serve::maintenance::cleanup_once;
 
 fn seed_main(root: &Path) {
@@ -61,7 +61,9 @@ async fn cleanup_abandons_expired_stream_branch_and_keeps_active_one() {
         // No entry for "expired-sess" — cleanup must abandon that branch.
     }
 
-    let stats = cleanup_once(&sessions, &root, 0, "abandon", None).await.unwrap();
+    let stats = cleanup_once(&sessions, &root, 0, "abandon", None)
+        .await
+        .unwrap();
     assert_eq!(stats.branches_scanned, 2);
     // The "active-sess" branch is kept because the session is present and not idle.
     // With idle_secs=0 though, even the active session might be considered idle.
@@ -81,7 +83,10 @@ async fn cleanup_abandons_expired_stream_branch_and_keeps_active_one() {
         .await
         .unwrap();
     assert_eq!(stats.branches_scanned, 2);
-    assert_eq!(stats.abandoned, 1, "only the expired-sess branch should be abandoned");
+    assert_eq!(
+        stats.abandoned, 1,
+        "only the expired-sess branch should be abandoned"
+    );
     assert_eq!(stats.kept, 1, "active-sess branch should be kept");
     assert_eq!(stats.purged, 0);
 
@@ -113,7 +118,9 @@ async fn cleanup_never_purges_branches_with_agent_contributes() {
     let sessions = new_session_store(); // empty — both branches orphaned
 
     // Ask for purge; the with-work branch must be downgraded to abandon.
-    let stats = cleanup_once(&sessions, &root, 3600, "purge", None).await.unwrap();
+    let stats = cleanup_once(&sessions, &root, 3600, "purge", None)
+        .await
+        .unwrap();
     assert_eq!(stats.branches_scanned, 2);
     assert_eq!(
         stats.purged, 1,
@@ -147,7 +154,9 @@ async fn cleanup_ignores_non_stream_branches() {
         .unwrap();
 
     let sessions = new_session_store();
-    let stats = cleanup_once(&sessions, &root, 3600, "abandon", None).await.unwrap();
+    let stats = cleanup_once(&sessions, &root, 3600, "abandon", None)
+        .await
+        .unwrap();
     assert_eq!(
         stats.branches_scanned, 0,
         "feature branches are not stream/* and should not be scanned"

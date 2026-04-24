@@ -38,10 +38,7 @@ impl Probe for TemporalProbe {
                     detail: if passed {
                         "valid_from is not in the future".into()
                     } else {
-                        format!(
-                            "valid_from {} is after now {}",
-                            claim_valid_from, now
-                        )
+                        format!("valid_from {} is after now {}", claim_valid_from, now)
                     },
                 });
             }

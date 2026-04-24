@@ -325,10 +325,14 @@ mod inner {
             let norm_x: f32 = base_x.iter().map(|v| v * v).sum::<f32>().sqrt();
             let norm_y: f32 = base_y.iter().map(|v| v * v).sum::<f32>().sqrt();
             if norm_x > 0.0 {
-                for v in base_x.iter_mut() { *v /= norm_x; }
+                for v in base_x.iter_mut() {
+                    *v /= norm_x;
+                }
             }
             if norm_y > 0.0 {
-                for v in base_y.iter_mut() { *v /= norm_y; }
+                for v in base_y.iter_mut() {
+                    *v /= norm_y;
+                }
             }
 
             let mut min_x = f32::MAX;

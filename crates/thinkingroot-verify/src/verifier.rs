@@ -100,8 +100,7 @@ impl Verifier {
         // Backward compat: when no Rooted claims exist yet (a pack that pre-dates
         // Rooting or one whose Phase 6.5 is disabled), we fall back to the legacy
         // binary check so existing tests + dashboards don't regress to 0%.
-        let (rooted, attested, quarantined, rejected) =
-            graph.count_claims_by_admission_tier()?;
+        let (rooted, attested, quarantined, rejected) = graph.count_claims_by_admission_tier()?;
         let tier_total = rooted + attested + quarantined + rejected;
         let provenance = if tier_total == 0 {
             // No claims at all.

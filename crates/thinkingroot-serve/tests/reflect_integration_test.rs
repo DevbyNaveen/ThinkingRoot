@@ -8,8 +8,7 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 
 use thinkingroot_core::{
-    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel,
-    WorkspaceId,
+    Claim, ClaimType, ContentHash, Entity, EntityType, Source, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_serve::engine::QueryEngine;
@@ -49,7 +48,9 @@ async fn setup_ws_with_pattern() -> (tempfile::TempDir, PathBuf) {
         );
         let cid = c.id.to_string();
         graph.insert_claim(&c).unwrap();
-        graph.link_claim_to_source(&cid, &source_id.to_string()).unwrap();
+        graph
+            .link_claim_to_source(&cid, &source_id.to_string())
+            .unwrap();
         graph.link_claim_to_entity(&cid, &eid).unwrap();
 
         if i < 37 {
@@ -161,7 +162,10 @@ async fn reflect_and_gaps_are_advertised_in_mcp_tools_list() {
 async fn reflect_branched_runs_against_branch_graph() {
     let (_dir, root) = setup_ws_with_pattern().await;
     let mut engine = QueryEngine::new();
-    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
 
     // Reflect on main — establishes 3 gaps.
     let main_result = engine.reflect_branched("demo", None).await.unwrap();
@@ -297,7 +301,9 @@ async fn setup_small_ws(prefix: &str) -> (tempfile::TempDir, PathBuf) {
         );
         let c1_id = c1.id.to_string();
         graph.insert_claim(&c1).unwrap();
-        graph.link_claim_to_source(&c1_id, &source_id.to_string()).unwrap();
+        graph
+            .link_claim_to_source(&c1_id, &source_id.to_string())
+            .unwrap();
         graph.link_claim_to_entity(&c1_id, &eid).unwrap();
         if i < 13 {
             let c2 = Claim::new(
@@ -308,7 +314,9 @@ async fn setup_small_ws(prefix: &str) -> (tempfile::TempDir, PathBuf) {
             );
             let c2_id = c2.id.to_string();
             graph.insert_claim(&c2).unwrap();
-            graph.link_claim_to_source(&c2_id, &source_id.to_string()).unwrap();
+            graph
+                .link_claim_to_source(&c2_id, &source_id.to_string())
+                .unwrap();
             graph.link_claim_to_entity(&c2_id, &eid).unwrap();
         }
     }
@@ -402,10 +410,7 @@ async fn dismiss_gap_via_engine_suppresses_gap() {
 
     // Re-running reflect must not re-raise the dismissed gap.
     let r2 = engine.reflect("demo").await.unwrap();
-    assert_eq!(
-        r2.gaps_created, 0,
-        "reflect must respect prior dismissal"
-    );
+    assert_eq!(r2.gaps_created, 0, "reflect must respect prior dismissal");
     let after_r2 = engine.list_gaps("demo", None, 0.0).await.unwrap();
     assert_eq!(after_r2.len(), 2);
 }

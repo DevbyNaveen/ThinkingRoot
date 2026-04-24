@@ -41,9 +41,8 @@ impl Probe for TopologyProbe {
         }
 
         // Collect each parent's entity set from claim_entity_edges.
-        let mut parent_entity_sets: Vec<HashSet<String>> = Vec::with_capacity(
-            derivation.parent_claim_ids.len(),
-        );
+        let mut parent_entity_sets: Vec<HashSet<String>> =
+            Vec::with_capacity(derivation.parent_claim_ids.len());
         for parent_id in &derivation.parent_claim_ids {
             let entities = ctx
                 .graph
@@ -179,7 +178,10 @@ mod tests {
         let parent_a = seed_parent(
             &graph,
             "parent a",
-            &[&service_entity.id.to_string(), &library_entity.id.to_string()],
+            &[
+                &service_entity.id.to_string(),
+                &library_entity.id.to_string(),
+            ],
         );
         let parent_b = seed_parent(
             &graph,

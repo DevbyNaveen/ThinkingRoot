@@ -57,7 +57,10 @@ async fn merge_branch_reloads_cache_without_compile() {
         .expect("create branch");
 
     // ── 3. Add a new claim to the branch only ────────────────────────────
-    let branch_data_dir = root.join(".thinkingroot").join("branches").join("feature-oauth");
+    let branch_data_dir = root
+        .join(".thinkingroot")
+        .join("branches")
+        .join("feature-oauth");
     let branch_claim_id = {
         let branch_graph =
             GraphStore::init(&branch_data_dir.join("graph")).expect("init branch graph");
@@ -157,7 +160,10 @@ async fn rollback_merge_restores_pre_merge_cache() {
     }
 
     let mut engine = QueryEngine::new();
-    engine.mount("demo".to_string(), root.clone()).await.unwrap();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
 
     // Merge: main now has 2 claims.
     engine
@@ -183,7 +189,10 @@ async fn rollback_merge_restores_pre_merge_cache() {
 
     // Rollback: main returns to 1 claim, AND cache reflects it.
     engine.rollback_merge(&root, "feature/x").await.unwrap();
-    let post = engine.list_claims("demo", ClaimFilter::default()).await.unwrap();
+    let post = engine
+        .list_claims("demo", ClaimFilter::default())
+        .await
+        .unwrap();
     assert_eq!(
         post.len(),
         1,
