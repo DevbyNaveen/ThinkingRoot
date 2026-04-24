@@ -193,6 +193,27 @@ struct WorkspaceHandle {
 // Artifact type <-> filename mapping
 // ---------------------------------------------------------------------------
 
+/// Run a blocking closure from within an async context.
+///
+/// On the multi-threaded tokio runtime (production server) this defers to
+/// `block_in_place`, telling the scheduler that this worker is about to
+/// block so it can repark other tasks onto other workers — preventing a
+/// reactor stall under concurrent load (the 10K-VU scenario).
+///
+/// On the single-threaded runtime (the default for `#[tokio::test]`) there
+/// are no other workers to repark onto, so the closure is just invoked
+/// directly. `block_in_place` cannot be used there — it panics.
+#[inline]
+fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => run_blocking(f),
+        _ => f(),
+    }
+}
+
 fn artifact_filename(artifact_type: &str) -> Option<&'static str> {
     match artifact_type {
         "architecture-map" => Some("architecture-map.md"),
@@ -1016,9 +1037,12 @@ impl QueryEngine {
         let handle = self.get_workspace(ws)?;
 
         // Phase 1: Vector search — brief storage lock, released immediately after.
+        // block_in_place: .search() runs synchronous ONNX inference (can take
+        // 1–100ms). Without this wrap the tokio reactor stalls under concurrent
+        // load — regresses the 10K-VU p95 claim.
         let vector_results = {
             let mut storage = handle.storage.lock().await;
-            storage.vector.search(query, top_k * 2)?
+            run_blocking(|| storage.vector.search(query, top_k * 2))?
             // storage Mutex drops here
         };
 
@@ -1148,9 +1172,12 @@ impl QueryEngine {
         } else {
             Some(allowed_source_ids)
         };
+        // block_in_place: see rationale on `search` above.
         let vector_results = {
             let mut storage = handle.storage.lock().await;
-            storage.vector.search_scoped(query, top_k * 3, scope)?
+            run_blocking(|| {
+                storage.vector.search_scoped(query, top_k * 3, scope)
+            })?
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -1340,7 +1367,8 @@ impl QueryEngine {
         // ── 1. Search branch vector index ─────────────────────────────────────
         let branch_vector_hits: Vec<(String, String, f32)> = if branch_data_dir.exists() {
             match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
-                Ok(mut bv) => bv.search(query, top_k * 2).unwrap_or_default(),
+                Ok(mut bv) => run_blocking(|| bv.search(query, top_k * 2))
+                    .unwrap_or_default(),
                 Err(_) => vec![],
             }
         } else {
@@ -1864,11 +1892,15 @@ Rules: \
                                 )
                             })
                             .collect();
-                        if let Err(e) = branch_vector.upsert_batch(&items) {
-                            tracing::warn!("branch vector upsert failed (non-fatal): {e}");
-                        } else if let Err(e) = branch_vector.save() {
-                            tracing::warn!("branch vector save failed (non-fatal): {e}");
-                        }
+                        // block_in_place: upsert_batch runs batched ONNX
+                        // embedding (most expensive sync call in the crate).
+                        run_blocking(|| {
+                            if let Err(e) = branch_vector.upsert_batch(&items) {
+                                tracing::warn!("branch vector upsert failed (non-fatal): {e}");
+                            } else if let Err(e) = branch_vector.save() {
+                                tracing::warn!("branch vector save failed (non-fatal): {e}");
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::warn!("branch vector init failed (non-fatal): {e}");
