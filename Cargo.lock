@@ -4559,6 +4559,7 @@ dependencies = [
  "thinkingroot-ground",
  "thinkingroot-link",
  "thinkingroot-parse",
+ "thinkingroot-reflect",
  "thinkingroot-rooting",
  "thinkingroot-serve",
  "thinkingroot-verify",

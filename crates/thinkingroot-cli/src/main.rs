@@ -12,6 +12,7 @@ mod mcp_config;
 mod pipeline;
 mod progress;
 mod provider_cmd;
+mod reflect_cmd;
 mod rooting_cmd;
 mod serve;
 mod setup;
@@ -279,6 +280,19 @@ enum Commands {
         /// `off` as the ablation pair.
         #[arg(long, value_parser = ["on", "off", "advisory"])]
         rooting_mode: Option<String>,
+    },
+    /// Run a Reflect cycle over the compiled graph and surface
+    /// known-unknowns. Use `--json <path>` to write a stable artifact
+    /// the cloud's compile-worker ingests into the federation
+    /// `pack_reflect_gaps` table.
+    Reflect {
+        /// Path to the compiled workspace
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Write the open-gap list as JSON to this path. Output schema
+        /// is documented in `reflect_cmd.rs`.
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
     },
 }
 
@@ -655,6 +669,9 @@ async fn main() -> anyhow::Result<()> {
                 rooting_mode.as_deref(),
             )
             .await?;
+        }
+        Some(Commands::Reflect { path, json }) => {
+            reflect_cmd::run(&path, json.as_ref())?;
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
