@@ -1,0 +1,20 @@
+[package]
+name = "tr-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure-Rust renderer producing human-readable previews of TR-1 .tr packs."
+
+[lib]
+name = "tr_render"
+path = "src/lib.rs"
+
+[dependencies]
+tr-format = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+semver = { version = "1", features = ["serde"] }

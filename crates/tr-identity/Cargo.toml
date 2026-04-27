@@ -1,0 +1,30 @@
+[package]
+name = "tr-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ed25519 keypair + on-disk keystore + DID-method resolution shared by tr-verify, root publish, and the desktop install sheet."
+
+[lib]
+name = "tr_identity"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+base64 = { workspace = true }
+rand = { workspace = true }
+url = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }

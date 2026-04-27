@@ -1,0 +1,30 @@
+[package]
+name = "tr-transparency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Append-only Merkle-tree transparency log for .tr pack publications (Sigstore Rekor-style)."
+
+[lib]
+name = "tr_transparency"
+path = "src/lib.rs"
+
+[dependencies]
+tr-format   = { workspace = true }
+tr-identity = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+tracing     = { workspace = true }
+
+# Direct deps — SHA-256 keeps the log compatible with Sigstore Rekor;
+# blake3 is workspace-default but Rekor proofs are SHA-256-only.
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+sha2 = "0.10"

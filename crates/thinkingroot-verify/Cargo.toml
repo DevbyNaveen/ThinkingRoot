@@ -1,6 +1,6 @@
 [package]
-name = "thinkingroot-verify"
-description = "Stage 5: Knowledge verification and health scoring for ThinkingRoot"
+name = "thinkingroot-verify-internal"
+description = "Stage 5: knowledge-health verifier for the engine pipeline (internal). The OSS-public trust-verification API for `.tr` packs lives in the `tr-verify` crate."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

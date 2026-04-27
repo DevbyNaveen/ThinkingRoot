@@ -1,0 +1,38 @@
+[package]
+name = "tr-c2pa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "C2PA Content Credentials interop — ingest, emit, and extract claims from .tr packs."
+
+[lib]
+name = "tr_c2pa"
+path = "src/lib.rs"
+
+[dependencies]
+tr-format   = { workspace = true }
+tr-identity = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+tracing     = { workspace = true }
+
+# Real C2PA support is opt-in. The upstream `c2pa` crate has a heavy
+# native dep stack (libxml2, openssl, …); gating it keeps the
+# default workspace `cargo test` runtime bounded — see Phase F design
+# §11 risk R4.
+c2pa = { version = "0.59", optional = true }
+
+[features]
+default = []
+## Enable real `c2pa` interop. When off, the public surface still
+## compiles but every call returns `Error::FeatureDisabled`.
+c2pa-impl = ["dep:c2pa"]
+
+[dev-dependencies]
+tempfile = "3"
+semver = { version = "1", features = ["serde"] }

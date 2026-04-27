@@ -12,8 +12,26 @@ use thinkingroot_graph::StorageEngine;
 /// The CLI bar-driver task consumes these and renders indicatif bars.
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
+    /// Parsing is about to begin. Emitted immediately before `parse_directory`
+    /// so the bar driver can start its clock at the same instant the pipeline
+    /// does — config load and data-dir setup are NOT counted as parse time.
+    ParseStart,
     /// Parsing finished. `files` = number of documents parsed.
     ParseComplete { files: usize },
+    /// Diff phase is starting — comparing parsed docs against the stored graph
+    /// to identify changed/unchanged/deleted sources, and loading graph-primed
+    /// context for extraction. Bar driver shows a "Diffing" spinner here so
+    /// users see real progress instead of a misleading "waiting for LLM" while
+    /// CozoDB queries run.
+    DiffStart,
+    /// Diff phase finished. Counts let the driver render an honest summary
+    /// (e.g. "12 changed · 188 unchanged · 0 deleted") and decide whether to
+    /// expect any later phases at all.
+    DiffComplete {
+        changed: usize,
+        unchanged: usize,
+        deleted: usize,
+    },
     /// Extraction is starting. Includes batch sizing so the UI can explain
     /// what work is about to happen before the first batch returns.
     ExtractionStart {
@@ -92,6 +110,11 @@ pub enum ProgressEvent {
         quarantined: usize,
         rejected: usize,
     },
+    /// The pipeline returned `Err(_)`. Emitted by the public `run_pipeline`
+    /// wrapper before the channel closes, so the bar driver can finalise any
+    /// in-flight bars with a failure style instead of the ambiguous "skipped"
+    /// dim dash.
+    PipelineFailed { error: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -117,6 +140,22 @@ pub async fn run_pipeline(
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<PipelineResult> {
+    let result = run_pipeline_inner(root_path, branch, progress.clone()).await;
+    if let Err(ref e) = result
+        && let Some(ref tx) = progress
+    {
+        let _ = tx.send(ProgressEvent::PipelineFailed {
+            error: e.to_string(),
+        });
+    }
+    result
+}
+
+async fn run_pipeline_inner(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<PipelineResult> {
     macro_rules! emit {
         ($event:expr) => {
             if let Some(ref tx) = progress {
@@ -129,12 +168,20 @@ pub async fn run_pipeline(
     let data_dir = thinkingroot_branch::snapshot::resolve_data_dir(root_path, branch);
     std::fs::create_dir_all(&data_dir)?;
 
+    // ParseStart fires *here*, after config/data-dir setup but immediately
+    // before the actual parse, so the displayed "Parsing" elapsed reflects
+    // only the cost of `parse_directory` itself.
+    emit!(ProgressEvent::ParseStart);
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
     emit!(ProgressEvent::ParseComplete {
         files: files_parsed
     });
 
+    // ─── Diff phase: compare against the stored graph ──────────────────
+    // Storage open + fingerprint load + content-hash scan + deletion detect
+    // + graph-primed context load all live under one user-visible bar.
+    emit!(ProgressEvent::DiffStart);
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
 
@@ -164,6 +211,14 @@ pub async fn run_pipeline(
             deleted_sources.push((source_id, uri));
         }
     }
+
+    // Diff phase ends here — emit summary so the bar driver can finalise the
+    // Diffing bar with concrete counts and decide whether to expect later phases.
+    emit!(ProgressEvent::DiffComplete {
+        changed: potentially_changed.len(),
+        unchanged: skipped,
+        deleted: deleted_sources.len(),
+    });
 
     // ─── Early exit: nothing to process ────────────────────────────────
     if potentially_changed.is_empty() && deleted_sources.is_empty() {
@@ -593,7 +648,7 @@ pub async fn run_pipeline(
             artifacts: artifacts.len()
         });
 
-        let verifier = thinkingroot_verify::Verifier::new(&config);
+        let verifier = thinkingroot_verify_internal::Verifier::new(&config);
         let verification = verifier.verify(&storage.graph)?;
         emit!(ProgressEvent::VerificationDone {
             health: verification.health_score.as_percentage(),
@@ -1014,7 +1069,7 @@ pub async fn run_pipeline(
     });
 
     // ─── Phase 11: Verify + persist ─────────────────────────────────────
-    let verifier = thinkingroot_verify::Verifier::new(&config);
+    let verifier = thinkingroot_verify_internal::Verifier::new(&config);
     let verification = verifier.verify(&storage.graph)?;
     emit!(ProgressEvent::VerificationDone {
         health: verification.health_score.as_percentage(),
