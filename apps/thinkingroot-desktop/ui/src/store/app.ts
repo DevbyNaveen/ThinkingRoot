@@ -2,15 +2,23 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type {
   ChatMessage,
-  ConversationSummary,
-  LiveCapsule,
   StreamState,
   Surface,
   Theme,
   TrustFilter,
 } from "@/types";
 
-/** App-wide store. Persists theme + surface selection to localStorage. */
+/**
+ * App-wide UI store.
+ *
+ * Conversations + messages are persisted on disk (per-workspace
+ * `.thinkingroot/conversations/`). The store keeps:
+ *   - in-flight UI state (current surface, active workspace, etc.)
+ *   - per-conversation message *cache* keyed by `${workspace}:${id}`,
+ *     hydrated lazily from `conversations_get`.
+ * That keeps localStorage small and lets the disk be the source of
+ * truth — no fixture data, no MOCK_*.
+ */
 interface AppStore {
   // UI
   surface: Surface;
@@ -24,57 +32,53 @@ interface AppStore {
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
 
-  // Conversations
-  conversations: ConversationSummary[];
+  // Active selection
+  activeWorkspace: string | null;
+  setActiveWorkspace: (name: string | null) => void;
   activeConversationId: string | null;
   setActiveConversationId: (id: string | null) => void;
-  /** Insert or refresh a conversation entry. Used by the chat surface
-   * on every submit so the sidebar history reflects what the main pane
-   * already shows. The first user message becomes the initial title;
-   * subsequent calls only refresh `lastMessageAt`. */
-  upsertConversation: (id: string, title: string, lastMessageAt: Date) => void;
 
-  // Chat
+  // Cached chat messages: key = `${workspace}::${conversationId}`
   messages: Record<string, ChatMessage[]>;
-  appendMessage: (conversationId: string, msg: ChatMessage) => void;
+  appendMessage: (workspace: string, conversationId: string, msg: ChatMessage) => void;
   updateMessage: (
+    workspace: string,
     conversationId: string,
     messageId: string,
     patch: Partial<ChatMessage>,
   ) => void;
+  setMessages: (workspace: string, conversationId: string, msgs: ChatMessage[]) => void;
   streaming: StreamState | null;
   setStreaming: (s: StreamState | null) => void;
   appendStreamingDelta: (delta: string) => void;
 
-  // Filters
+  // Trust filter (used by Brain table)
   trust: TrustFilter;
   setTrust: (t: TrustFilter) => void;
 
-  // Selected provenance pill (for the right-rail drawer)
+  // Right-rail provenance pill
   selectedClaimId: string | null;
   setSelectedClaimId: (id: string | null) => void;
 
-  // Recent command palette invocations (LRU, max 8)
+  // Command palette LRU
   recentCommandIds: string[];
   recordCommand: (id: string) => void;
 
-  covenantOpen: boolean;
-  setCovenantOpen: (open: boolean) => void;
-
+  // Onboarding overlay
   onboardingOpen: boolean;
   setOnboardingOpen: (open: boolean) => void;
   onboardingDismissed: boolean;
   setOnboardingDismissed: (dismissed: boolean) => void;
 
-  // Moat
-  liveCapsules: LiveCapsule[];
-  setLiveCapsules: (c: LiveCapsule[]) => void;
-
-  // Cost / token totals for the status bar
+  // Status-bar usage totals
   totalCostUsd: number;
   totalTokensIn: number;
   totalTokensOut: number;
   addTurnUsage: (inTok: number, outTok: number, costUsd: number) => void;
+}
+
+function key(workspace: string, conversationId: string): string {
+  return `${workspace}::${conversationId}`;
 }
 
 export const useApp = create<AppStore>()(
@@ -101,50 +105,41 @@ export const useApp = create<AppStore>()(
       commandPaletteOpen: false,
       setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
 
-      conversations: [],
+      activeWorkspace: null,
+      setActiveWorkspace: (activeWorkspace) =>
+        set({
+          activeWorkspace,
+          activeConversationId: null,
+          streaming: null,
+        }),
       activeConversationId: null,
       setActiveConversationId: (activeConversationId) =>
-        set({ activeConversationId }),
-      upsertConversation: (id, title, lastMessageAt) =>
-        set((s) => {
-          const existing = s.conversations.find((c) => c.id === id);
-          if (existing) {
-            return {
-              conversations: s.conversations.map((c) =>
-                c.id === id ? { ...c, lastMessageAt } : c,
-              ),
-            };
-          }
-          // New conversation: keep the first user line (truncated) as
-          // the sidebar title — matches how every chat product titles
-          // an unnamed conversation. The user can rename later.
-          const fallbackTitle = title.trim().slice(0, 60) || "Untitled";
-          return {
-            conversations: [
-              { id, title: fallbackTitle, lastMessageAt },
-              ...s.conversations,
-            ],
-          };
-        }),
+        set({ activeConversationId, streaming: null }),
 
       messages: {},
-      appendMessage: (conversationId, msg) =>
-        set((s) => ({
-          messages: {
-            ...s.messages,
-            [conversationId]: [...(s.messages[conversationId] ?? []), msg],
-          },
-        })),
-      updateMessage: (conversationId, messageId, patch) =>
+      appendMessage: (workspace, conversationId, msg) =>
         set((s) => {
-          const current = s.messages[conversationId] ?? [];
+          const k = key(workspace, conversationId);
+          return {
+            messages: {
+              ...s.messages,
+              [k]: [...(s.messages[k] ?? []), msg],
+            },
+          };
+        }),
+      updateMessage: (workspace, conversationId, messageId, patch) =>
+        set((s) => {
+          const k = key(workspace, conversationId);
+          const current = s.messages[k] ?? [];
           const next = current.map((m) =>
             m.id === messageId ? { ...m, ...patch } : m,
           );
-          return {
-            messages: { ...s.messages, [conversationId]: next },
-          };
+          return { messages: { ...s.messages, [k]: next } };
         }),
+      setMessages: (workspace, conversationId, msgs) =>
+        set((s) => ({
+          messages: { ...s.messages, [key(workspace, conversationId)]: msgs },
+        })),
       streaming: null,
       setStreaming: (streaming) => set({ streaming }),
       appendStreamingDelta: (delta) =>
@@ -173,16 +168,10 @@ export const useApp = create<AppStore>()(
           ].slice(0, 8),
         })),
 
-      covenantOpen: false,
-      setCovenantOpen: (covenantOpen) => set({ covenantOpen }),
-
       onboardingOpen: false,
       setOnboardingOpen: (onboardingOpen) => set({ onboardingOpen }),
       onboardingDismissed: false,
       setOnboardingDismissed: (onboardingDismissed) => set({ onboardingDismissed }),
-
-      liveCapsules: [],
-      setLiveCapsules: (liveCapsules) => set({ liveCapsules }),
 
       totalCostUsd: 0,
       totalTokensIn: 0,
@@ -204,6 +193,7 @@ export const useApp = create<AppStore>()(
         trust: s.trust,
         recentCommandIds: s.recentCommandIds,
         onboardingDismissed: s.onboardingDismissed,
+        activeWorkspace: s.activeWorkspace,
       }),
     },
   ),

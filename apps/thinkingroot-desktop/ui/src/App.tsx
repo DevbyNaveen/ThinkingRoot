@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { IconRail } from "@/components/shell/IconRail";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { MainPane } from "@/components/shell/MainPane";
 import { RightRail } from "@/components/shell/RightRail";
@@ -87,7 +86,6 @@ export default function App() {
     <TooltipProvider delayDuration={250} skipDelayDuration={120}>
       <div className="flex h-full w-full flex-col bg-background text-foreground">
         <div className="flex min-h-0 flex-1">
-          <IconRail />
           <Sidebar />
           <MainPane />
           <RightRail />

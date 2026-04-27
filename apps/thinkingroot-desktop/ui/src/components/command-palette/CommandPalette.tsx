@@ -34,12 +34,11 @@ export function CommandPalette() {
     setOpen(!open);
   });
 
-  // ⌘1..⌘4 / ⌘, — surface navigation (work even when palette closed)
+  // ⌘1..⌘3 / ⌘, — surface navigation (work even when palette closed)
   const surfaceShortcuts: Array<[string, Surface]> = [
     ["mod+1", "chats"],
     ["mod+2", "brain"],
-    ["mod+3", "satellites"],
-    ["mod+4", "trace"],
+    ["mod+3", "privacy"],
   ];
   for (const [combo, s] of surfaceShortcuts) {
     // eslint-disable-next-line react-hooks/rules-of-hooks

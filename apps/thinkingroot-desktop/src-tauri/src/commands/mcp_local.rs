@@ -162,3 +162,101 @@ fn workspace_path() -> Option<String> {
     let cfg = AppConfig::load().ok()?;
     cfg.env_or("THINKINGROOT_WORKSPACE")
 }
+
+// ─── MCP server list (sidebar "MCP TOOLS") ───────────────────────────
+//
+// One row per server the sidecar exposes. The sidecar is the OSS
+// engine's `root serve` — we read its `/.well-known/mcp` manifest to
+// avoid hard-coding the tool catalog here. If the sidecar is down we
+// surface that honestly rather than fabricating a list.
+
+#[derive(Debug, Serialize, Clone)]
+pub struct McpServerRow {
+    pub name: String,
+    pub transport: String,
+    pub status: String,
+    pub description: Option<String>,
+}
+
+#[tauri::command]
+pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, String> {
+    let state = app.state::<AppState>();
+    let handle = state.sidecar.lock().await.clone();
+    let Some(sidecar) = handle else {
+        return Ok(Vec::new());
+    };
+
+    let url = format!(
+        "http://{}:{}/.well-known/mcp",
+        sidecar.host, sidecar.port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => {
+            // Manifest may not exist on the engine yet; fall back to
+            // the single self-row we know is true: the sidecar is up.
+            return Ok(vec![McpServerRow {
+                name: "thinkingroot".to_string(),
+                transport: "sse".to_string(),
+                status: "running".to_string(),
+                description: Some(format!(
+                    "Local sidecar at {}:{}",
+                    sidecar.host, sidecar.port
+                )),
+            }]);
+        }
+    };
+    if !resp.status().is_success() {
+        return Ok(vec![McpServerRow {
+            name: "thinkingroot".to_string(),
+            transport: "sse".to_string(),
+            status: "running".to_string(),
+            description: Some(format!(
+                "Local sidecar at {}:{}",
+                sidecar.host, sidecar.port
+            )),
+        }]);
+    }
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut rows = vec![McpServerRow {
+        name: "thinkingroot".to_string(),
+        transport: "sse".to_string(),
+        status: "running".to_string(),
+        description: body
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(Some(format!("Local sidecar at {}:{}", sidecar.host, sidecar.port))),
+    }];
+
+    if let Some(servers) = body.get("servers").and_then(Value::as_array) {
+        for srv in servers {
+            let name = srv
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)")
+                .to_string();
+            let transport = srv
+                .get("transport")
+                .and_then(Value::as_str)
+                .unwrap_or("stdio")
+                .to_string();
+            let description = srv
+                .get("description")
+                .and_then(Value::as_str)
+                .map(String::from);
+            rows.push(McpServerRow {
+                name,
+                transport,
+                status: "running".to_string(),
+                description,
+            });
+        }
+    }
+    Ok(rows)
+}

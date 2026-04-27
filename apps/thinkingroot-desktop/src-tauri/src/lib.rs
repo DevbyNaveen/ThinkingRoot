@@ -94,8 +94,23 @@ pub fn run() {
             commands::install_tr::install_tr_file,
             commands::mcp_local::mcp_status,
             commands::mcp_local::mcp_get_config_snippet,
+            commands::mcp_local::mcp_list_connected,
             commands::privacy::privacy_summary,
             commands::privacy::privacy_forget,
+            commands::scan::workspace_scan,
+            commands::auth::auth_state,
+            commands::conversations::conversations_list,
+            commands::conversations::conversations_create,
+            commands::conversations::conversations_get,
+            commands::conversations::conversations_append_message,
+            commands::conversations::conversations_delete,
+            commands::conversations::conversations_rename,
+            commands::chat::chat_send_stream,
+            commands::branch::branch_list,
+            commands::branch::branch_create,
+            commands::branch::branch_checkout,
+            commands::branch::branch_merge,
+            commands::branch::branch_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

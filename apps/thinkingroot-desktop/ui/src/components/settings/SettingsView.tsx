@@ -6,10 +6,8 @@ import {
   Paintbrush,
   Bell,
   Plug,
-  ShieldCheck,
   Save,
   AlertTriangle,
-  FileText,
   Check,
   Copy,
 } from "lucide-react";
@@ -78,13 +76,13 @@ const THEMES: Array<{ id: Theme; label: string; note?: string }> = [
 export function SettingsView() {
   const theme = useApp((s) => s.theme);
   const setTheme = useApp((s) => s.setTheme);
-  const setCovenantOpen = useApp((s) => s.setCovenantOpen);
 
   const [cfg, setCfg] = useState<ConfigRead | null>(null);
   const [provider, setProvider] = useState<ProviderKey>("azure");
   const [pending, setPending] = useState<Record<string, string>>({});
   const [workspace, setWorkspace] = useState("");
   const [workspaceName, setWorkspaceName] = useState("main");
+  const [scanRoots, setScanRoots] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -105,6 +103,7 @@ export function SettingsView() {
         // Hydrate workspace fields.
         setWorkspace(c.entries.THINKINGROOT_WORKSPACE ?? "");
         setWorkspaceName(c.entries.THINKINGROOT_WORKSPACE_NAME ?? "main");
+        setScanRoots(c.entries.TR_SCAN_ROOTS ?? "");
       } catch (e) {
         toast("Could not load settings", {
           kind: "error",
@@ -277,6 +276,23 @@ export function SettingsView() {
                 />
               </Field>
             </div>
+            <div className="mt-3">
+              <Field
+                label="Auto-scan roots"
+                hint="Comma-separated list of folders the sidebar will walk for `.thinkingroot/` markers. Leave blank to use defaults (~/Desktop, ~/Documents, ~/code, ~/dev, ~/projects)."
+              >
+                <input
+                  type="text"
+                  value={scanRoots}
+                  placeholder="~/Desktop, ~/code"
+                  onChange={(e) => {
+                    setScanRoots(e.target.value);
+                    updateField("TR_SCAN_ROOTS", e.target.value);
+                  }}
+                  className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                />
+              </Field>
+            </div>
           </Section>
 
           <Section
@@ -351,33 +367,6 @@ export function SettingsView() {
             </div>
           </Section>
 
-          <Section
-            Icon={ShieldCheck}
-            title="Covenant"
-            body="The five-commitment contract between you and every ThinkingRoot agent. Ed25519-signed; the fingerprint is embedded in every trace record."
-          >
-            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-xs">
-              <div className="flex items-center gap-2">
-                <FileText className="size-3.5 text-accent" />
-                <span className="font-mono text-[11px] text-foreground">
-                  covenant-0.1
-                </span>
-                {cfg.entries.THINKINGROOT_VERIFYING_KEY ? (
-                  <span className="text-success">signed</span>
-                ) : (
-                  <span className="text-warn">not signed yet</span>
-                )}
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setCovenantOpen(true)}
-                className="h-7 text-[11px]"
-              >
-                View covenant
-              </Button>
-            </div>
-          </Section>
         </div>
       </div>
     </div>
