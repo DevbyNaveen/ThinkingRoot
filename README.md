@@ -432,6 +432,68 @@ root merge experiment-v2 --resolve 0=keep-branch
 
 ---
 
+## Share & Install — `.tr` Knowledge Packs
+
+Compiled knowledge is portable. Any `.thinkingroot/` workspace can be packaged into a single `.tr` file (a `tar+zstd` archive with a TR-1 manifest at root) and installed back into any other ThinkingRoot host — laptop, server, air-gapped enterprise mirror, or a hosted registry.
+
+### Pack a workspace
+
+```bash
+# Reads metadata from ./Pack.toml; CLI flags override individual fields.
+root pack . --name alice/cool-pack --version 0.1.0 --license MIT
+# → packed alice/cool-pack 0.1.0 (3703 files, 8.3 MB) -> ./alice-cool-pack-0.1.0.tr
+```
+
+`Pack.toml` (optional, repo-rooted):
+
+```toml
+[pack]
+name = "alice/cool-pack"
+version = "0.1.0"
+license = "MIT"
+description = "One-line listing description."
+```
+
+The packer skips three local-only entries that don't survive transport (`cache/`, `config.toml`, `fingerprints.json`) and identity-maps everything else under `.thinkingroot/`. Output is content-addressed by BLAKE3 of the manifest's canonical bytes.
+
+### Install a `.tr`
+
+`root install` accepts three reference shapes through one entry point:
+
+```bash
+# Local file (USB / email / S3 dump)
+root install ./alice-cool-pack-0.1.0.tr
+
+# Direct URL
+root install https://example.com/path/cool-pack.tr
+
+# Registry coordinate (resolved via discovery doc)
+root install alice/cool-pack@1.2.3
+root install alice/cool-pack@latest
+```
+
+Default install target: `~/.thinkingroot/packs/<owner>/<slug>/<version>/` (Cargo-style cache layout). Override with `--target <dir>`.
+
+Every install verifies the manifest's canonical-bytes hash on read — tampered files are rejected before extraction. Registry installs also cross-check the BLAKE3 of the downloaded body against the registry's `x-tr-content-hash` response header.
+
+### Registry resolution
+
+The registry URL is resolved in this priority order:
+
+1. `--registry <url>` flag (per-invocation override).
+2. `$TR_REGISTRY_URL` environment variable.
+3. `~/.config/thinkingroot/registry.toml` key `default`.
+4. Built-in default: `https://thinkingroot.dev`.
+
+```toml
+# ~/.config/thinkingroot/registry.toml
+default = "https://registry.acmecorp.internal"   # air-gapped enterprise mirror
+```
+
+The client hits `<registry>/.well-known/tr-registry.json` for the discovery doc, validates the format version, then fetches the advertised download URL. Plain `http://` is refused for non-loopback hosts — TLS still protects against a MITM substituting a different validly-hashed pack.
+
+---
+
 ## Benchmark
 
 ### 91.2% on LongMemEval-500

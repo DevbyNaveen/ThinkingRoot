@@ -7,6 +7,128 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+The `.tr` distribution loop closes inside the OSS engine. Users no
+longer need to round-trip through the cloud just to share a compiled
+knowledge pack: any `.thinkingroot/` workspace can be packaged with
+`root pack`, and any `.tr` — local file, direct URL, or registry
+coordinate — can be installed with `root install`.
+
+### Added — `tr-format` crate
+
+- **New crate `tr-format` at `crates/tr-format/`** — reader, writer,
+  manifest schema, BLAKE3 digest helper, and capability set for the
+  TR-1 `.tr` portable knowledge pack format. A `.tr` is a `tar+zstd`
+  archive of a fixed directory layout (`manifest.json`, `graph/`,
+  `vectors/`, `artifacts/`, `provenance/`, `signatures/`, `.mcpb/`).
+  The crate is read-only and write-only — it does **not** execute
+  anything from a `.tr`; mount/execute is the responsibility of the
+  engine itself.
+- **Public re-exports**: `tr_format::{Manifest, TrustTier, Version,
+  Error}` plus `tr_format::reader::{read_file, read_bytes,
+  DEFAULT_SIZE_CAP}` and `tr_format::writer::PackBuilder`.
+- **24 unit tests + 1 doctest** ship with the crate, including a
+  long-paths-round-trip regression test exercising tar `LongLink`
+  extension entries (real engine artifact filenames routinely
+  exceed the 100-byte ustar limit).
+- The crate previously lived in the `thinkingroot-cloud` monorepo
+  under `LicenseRef-Proprietary`. Relocating it to OSS makes it
+  MIT-licensed — appropriate for a wire-format spec that any
+  third-party tool needs to implement.
+
+### Added — `root pack`
+
+- **`root pack [WORKSPACE]`** — packages a compiled workspace
+  (`<WORKSPACE>/.thinkingroot/`) into a portable `.tr` file.
+- Reads metadata from `<WORKSPACE>/Pack.toml`. CLI flags
+  (`--name owner/slug`, `--version`, `--license`, `--description`)
+  override individual fields; eager validate before walking so the
+  user gets feedback before the slow IO.
+- Identity-maps every file under `.thinkingroot/` to the same
+  relative path inside the `.tr`. Skips three local-only top-level
+  entries: `cache/` (recompute artefact, contains workstation
+  paths), `config.toml` (workspace-local overrides, may carry
+  provider keys), `fingerprints.json` (incremental-compile mtime
+  ledger, meaningless on a different host).
+- Symlinks are not followed — `.tr` is content-addressed, so
+  including symlinks would make BLAKE3 depend on filesystem layout
+  outside the workspace.
+- Output defaults to `<WORKSPACE>/<owner>-<slug>-<version>.tr`.
+- Smoke-tested on a real 3 703-file `.thinkingroot/` (8.3 MB packed).
+
+### Added — `root install`
+
+- **`root install <REFERENCE>`** — extracts a `.tr` to a target
+  directory's `.thinkingroot/` so `root query` / `root serve` can
+  mount it. The reference accepts three shapes through one entry
+  point:
+  - **Local path**: `./pack.tr`, `/abs/path.tr`.
+  - **Direct URL**: `https://example.com/pack.tr`.
+  - **Registry coordinate**: `owner/slug@version` (or `@latest`),
+    resolved via the configured registry's discovery doc.
+- Default install target: `~/.thinkingroot/packs/<owner>/<slug>/<version>/`
+  (Cargo-style cache layout). Override with `--target <dir>`.
+- Always verifies the manifest's canonical-bytes hash on read;
+  tampered files are rejected before extraction.
+- For registry installs, also cross-checks the BLAKE3 of the
+  downloaded body against the registry's `x-tr-content-hash`
+  response header before unpacking — defense-in-depth on top of
+  the manifest check.
+
+### Added — registry resolution chain
+
+`root install` resolves the registry URL in priority order:
+
+1. `--registry <url>` flag (per-invocation override).
+2. `$TR_REGISTRY_URL` env var.
+3. `~/.config/thinkingroot/registry.toml` key `default`.
+4. Built-in: `https://thinkingroot.dev`.
+
+The chain hits `<registry>/.well-known/tr-registry.json` for the
+discovery doc, validates `format_version == "tr-registry/1"` and
+`tr_format == "tr/1"` (refuses on mismatch — a format-skewed
+registry must surface as a clear error, never silent corruption),
+then templates the advertised download URL with
+`{owner}/{slug}/{version}` and fetches the body.
+
+### Added — security hardening
+
+- **HTTPS-only for non-loopback hosts.** `http://example.com` is
+  refused; `http://127.0.0.1`, `http://localhost`, `http://[::1]`
+  are allowed for tests + on-host registries. Content-addressed
+  bytes alone don't defend against a MITM substituting a
+  different (validly-hashed) pack — TLS still does.
+- **60s overall timeout, 10s connect timeout** on the HTTPS client.
+- **Stable user-agent**: `thinkingroot/<crate-version>`.
+- **Size cap** — pre-checks `Content-Length` against the
+  registry's advertised `max_pack_bytes`; re-checks the actual
+  body length on read.
+
+### Tests
+
+- `tr-format` crate: 24 unit + 1 doctest.
+- `thinkingroot-cli::pack_cmd`: 20 tests, including
+  - 7 `InstallRef::parse` cases (path / URL / `owner/slug@ver`
+    disambiguation).
+  - 3 insecure-HTTP guard cases.
+  - 3 live in-process axum registry round-trips: happy path,
+    hash-mismatch rejection, foreign `tr-registry/99` rejection.
+  - 4 pack/install round-trip + override-priority cases.
+- `cargo check --workspace` clean (pre-existing
+  `thinkingroot-graph` dead-code warning untouched).
+
+### Cross-repo co-ordination
+
+The `thinkingroot-cloud` monorepo's registry service shipped the
+matching server side: `GET /api/v1/packs/{owner}/{slug}/versions/{version}/download`
+and `GET /.well-known/tr-registry.json`. See cloud commits
+`362242e` (drop tr-format from cloud workspace), `1bda036`
+(download-by-ref + discovery), and the cloud-side
+`docs/2026-04-27-saas-status.md` for the full distribution roadmap.
+
+---
+
 ## [0.1.0-rooting] — 2026-04-24
 
 First publicly-tagged release of the Rooting admission gate. Engine code
