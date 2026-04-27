@@ -1,0 +1,32 @@
+[package]
+name = "tr-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reader/writer for the TR-1 .tr portable knowledge pack format."
+
+[lib]
+name = "tr_format"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# Direct deps — not in the OSS workspace's `[workspace.dependencies]`
+# table today. Kept in sync with the cloud monorepo by version.
+hex = "0.4"
+semver = { version = "1", features = ["serde"] }
+tar = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+[dev-dependencies]
+tempfile = "3"
