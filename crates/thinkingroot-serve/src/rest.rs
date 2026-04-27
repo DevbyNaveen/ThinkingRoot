@@ -131,6 +131,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/artifacts", get(list_artifacts))
             .route("/ws/{ws}/artifacts/{artifact_type}", get(get_artifact))
             .route("/ws/{ws}/health", get(get_health))
+            .route("/ws/{ws}/llm/health", get(llm_health_handler))
             .route("/ws/{ws}/search", get(search))
             .route("/ws/{ws}/ask", post(ask_handler))
             .route("/ws/{ws}/galaxy", get(get_galaxy))
@@ -815,6 +816,74 @@ async fn ask_handler(
         answer: result.answer,
         claims_used: result.claims_used,
         category: result.category,
+    })
+    .into_response()
+}
+
+// ─── LLM Health (pre-flight) ─────────────────────────────────
+
+/// GET /api/v1/ws/{ws}/llm/health
+///
+/// Cheap pre-flight the desktop calls on workspace switch. Tells the user
+/// up-front whether `ask` will produce a real LLM-synthesised answer or fall
+/// back to the top-claim statement, so the chat UI never spins for 120 s on a
+/// silently-unconfigured workspace.
+#[derive(Serialize)]
+struct LlmHealthBody {
+    /// True iff a provider+key resolved at workspace mount time.
+    configured: bool,
+    /// Provider name (e.g. "anthropic", "azure"). `None` when unconfigured.
+    provider: Option<String>,
+    /// Display model name. `None` when unconfigured.
+    model: Option<String>,
+    /// Number of claims compiled into this workspace — `0` means the engine
+    /// will return the "not enough information" fallback regardless of LLM.
+    claim_count: usize,
+    /// Whether the workspace is mounted at all. `false` → 404-equivalent;
+    /// the desktop should refuse to chat against a non-existent workspace.
+    mounted: bool,
+}
+
+async fn llm_health_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+
+    // Use the engine's existing workspace-info call: it returns the claim
+    // count alongside identity, so one call covers `mounted` + `claim_count`.
+    let info = engine
+        .list_workspaces()
+        .await
+        .ok()
+        .and_then(|list| list.into_iter().find(|w| w.name == ws));
+    let Some(info) = info else {
+        return ok_response(LlmHealthBody {
+            configured: false,
+            provider: None,
+            model: None,
+            claim_count: 0,
+            mounted: false,
+        })
+        .into_response();
+    };
+
+    let llm = engine.workspace_llm(&ws);
+    let configured = llm.is_some();
+    let (provider, model) = match llm.as_deref() {
+        Some(c) => (
+            Some(c.provider_name().to_string()),
+            Some(c.model_name().to_string()),
+        ),
+        None => (None, None),
+    };
+
+    ok_response(LlmHealthBody {
+        configured,
+        provider,
+        model,
+        claim_count: info.claim_count,
+        mounted: true,
     })
     .into_response()
 }

@@ -1073,6 +1073,18 @@ impl LlmClient {
         self
     }
 
+    /// The provider name configured on this client (e.g. `"anthropic"`,
+    /// `"azure"`, `"openai"`). Used by surfaces like the desktop's pre-flight
+    /// LLM health endpoint to render which backend a workspace will hit.
+    pub fn provider_name(&self) -> &str {
+        self.provider.provider_name()
+    }
+
+    /// The model name configured on this client (e.g. `"claude-sonnet-4-5"`).
+    pub fn model_name(&self) -> &str {
+        self.provider.model_name()
+    }
+
     /// Extract knowledge from a chunk of text.
     ///
     /// If the provider signals truncation, returns `Error::TruncatedOutput`
