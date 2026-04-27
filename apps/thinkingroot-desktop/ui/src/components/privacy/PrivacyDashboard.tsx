@@ -17,6 +17,7 @@ import {
   type PrivacySummary,
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
+import { useApp } from "@/store/app";
 import { ForgetDialog } from "./ForgetDialog";
 
 /**
@@ -32,6 +33,7 @@ import { ForgetDialog } from "./ForgetDialog";
  * `THINKINGROOT_WORKSPACE` in Settings.
  */
 export function PrivacyDashboard() {
+  const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [state, setState] = useState<
     | { kind: "loading" }
     | { kind: "ready"; summary: PrivacySummary }
@@ -53,9 +55,12 @@ export function PrivacyDashboard() {
     }
   }, []);
 
+  // Re-load whenever the user picks a different workspace from the
+  // sidebar — Privacy is per-workspace and the Rust side reads
+  // `THINKINGROOT_WORKSPACE` lazily.
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+  }, [refresh, activeWorkspace]);
 
   async function confirmForget() {
     if (!pending) return;

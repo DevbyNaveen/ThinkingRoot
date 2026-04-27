@@ -10,18 +10,12 @@ export type Theme =
 /** Trust filter matches `TrustFilter` in thinkingroot-tui. */
 export type TrustFilter = "any" | "rooted" | "attested";
 
-/** Surfaces available in the icon rail. Branches were folded into
- * Satellites (each compiled folder shows its own branches inline)
- * after Phase D-15. `privacy` ships in Step 13 of the OSS v0.1
- * plan — every locally-stored datum is enumerable + redactable
- * from this surface. */
-export type Surface =
-  | "chats"
-  | "brain"
-  | "satellites"
-  | "trace"
-  | "privacy"
-  | "settings";
+/** Surfaces in the new tree-sidebar layout. Conversations is the
+ * home screen — workspaces and their conversations live as nested
+ * tree entries under it. Brain, Privacy, and Settings each get a
+ * full-pane workbench. Trace + Satellites tabs are dropped in
+ * favour of context-aware right rails. */
+export type Surface = "chats" | "brain" | "privacy" | "settings";
 
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {

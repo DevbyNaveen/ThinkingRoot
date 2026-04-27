@@ -7,6 +7,10 @@
 //! re-export here — re-exports would resolve to the visible function
 //! but hide the macro-generated helper.
 
+pub mod auth;
+pub mod branch;
+pub mod chat;
+pub mod conversations;
 pub mod fs;
 pub mod git;
 pub mod install_tr;
@@ -14,5 +18,6 @@ pub mod mcp_local;
 pub mod memory;
 pub mod meta;
 pub mod privacy;
+pub mod scan;
 pub mod settings;
 pub mod workspaces;

@@ -2,13 +2,13 @@ import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { BrainClaim } from "@/lib/tauri";
+import type { ClaimRow } from "@/lib/tauri";
 
 interface Props {
-  claims: BrainClaim[];
+  claims: ClaimRow[];
 }
 
-const TIER_BADGE: Record<BrainClaim["tier"], string> = {
+const TIER_BADGE: Record<ClaimRow["tier"], string> = {
   rooted: "bg-tier-rooted/15 text-tier-rooted border-tier-rooted/30",
   attested: "bg-tier-attested/15 text-tier-attested border-tier-attested/30",
   unknown: "bg-tier-unknown/15 text-tier-unknown border-tier-unknown/30",
@@ -22,7 +22,7 @@ const TIER_BADGE: Record<BrainClaim["tier"], string> = {
 export function BrainTable({ claims }: Props) {
   const [query, setQuery] = useState("");
   const [tierFilter, setTierFilter] = useState<
-    BrainClaim["tier"] | "all"
+    ClaimRow["tier"] | "all"
   >("all");
   const parentRef = useRef<HTMLDivElement | null>(null);
 
@@ -35,7 +35,7 @@ export function BrainTable({ claims }: Props) {
         c.id.toLowerCase().includes(q) ||
         c.statement.toLowerCase().includes(q) ||
         c.source.toLowerCase().includes(q) ||
-        c.claim_type.toLowerCase().includes(q)
+        (c.claim_type ?? "").toLowerCase().includes(q)
       );
     });
   }, [claims, query, tierFilter]);
@@ -151,10 +151,10 @@ function TierSelect({
   value,
   onChange,
 }: {
-  value: BrainClaim["tier"] | "all";
-  onChange: (v: BrainClaim["tier"] | "all") => void;
+  value: ClaimRow["tier"] | "all";
+  onChange: (v: ClaimRow["tier"] | "all") => void;
 }) {
-  const options: Array<BrainClaim["tier"] | "all"> = [
+  const options: Array<ClaimRow["tier"] | "all"> = [
     "all",
     "rooted",
     "attested",

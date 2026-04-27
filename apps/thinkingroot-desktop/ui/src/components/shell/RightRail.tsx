@@ -1,30 +1,44 @@
-import { PanelRight, Link2, Sparkles, FileText, ExternalLink } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
-import { useApp } from "@/store/app";
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import type { ChatMessage, Provenance } from "@/types";
-import { LiveAgentsPanel } from "./LiveAgentsPanel";
-
-const TIER_BADGE: Record<Provenance["tier"], string> = {
-  rooted: "bg-tier-rooted/15 text-tier-rooted border-tier-rooted/30",
-  attested: "bg-tier-attested/15 text-tier-attested border-tier-attested/30",
-  unknown: "bg-tier-unknown/15 text-tier-unknown border-tier-unknown/30",
-};
-
 /**
- * Right inspector rail. Shows the provenance pills belonging to the
- * most recent assistant message in the active conversation, plus a
- * detail drawer for the selected pill.
+ * Right-rail inspector. Body switches by surface:
+ *
+ *   chats    → active workspace card + quick ops (compile, branch,
+ *              merge), recent provenance pills.
+ *   brain    → workspace stats + branch list with checkout.
+ *   privacy  → source detail card for the selected source.
+ *   settings → small "what writes where" cheatsheet.
+ *
+ * Header always shows the current context title (workspace · entity)
+ * so the user can pick up where they left off.
  */
+import { useEffect, useState } from "react";
+import {
+  PanelRight,
+  GitBranch,
+  RefreshCw,
+  Folder,
+  Hammer,
+  GitMerge,
+  ShieldCheck,
+} from "lucide-react";
+
+import { cn } from "@/lib/utils";
+import { useApp } from "@/store/app";
+import { Button } from "@/components/ui/button";
+import { toast } from "@/store/toast";
+import {
+  branchCheckout,
+  branchList,
+  workspaceCompile,
+  workspaceList,
+  type BranchView,
+  type WorkspaceView,
+} from "@/lib/tauri";
+
 export function RightRail() {
   const open = useApp((s) => s.rightRailOpen);
   const toggle = useApp((s) => s.toggleRightRail);
   const surface = useApp((s) => s.surface);
-  const activeConvId = useApp((s) => s.activeConversationId);
-  const messagesByConv = useApp((s) => s.messages);
-  const selectedClaimId = useApp((s) => s.selectedClaimId);
-  const setSelectedClaimId = useApp((s) => s.setSelectedClaimId);
+  const activeWorkspace = useApp((s) => s.activeWorkspace);
 
   if (!open) {
     return (
@@ -44,32 +58,15 @@ export function RightRail() {
     );
   }
 
-  const messages: ChatMessage[] = activeConvId
-    ? (messagesByConv[activeConvId] ?? [])
-    : [];
-  const latestAssistant = [...messages]
-    .reverse()
-    .find((m) => m.kind === "assistant" && (m.provenance?.length ?? 0) > 0);
-  const claims = latestAssistant?.provenance ?? [];
-  const selected = claims.find((c) => c.claimId === selectedClaimId);
-
   return (
     <aside
-      className="flex h-full w-80 shrink-0 flex-col border-l border-border bg-surface"
+      className="flex h-full w-72 shrink-0 flex-col border-l border-border bg-surface"
       aria-label="Inspector"
     >
       <header className="flex h-11 items-center justify-between gap-2 border-b border-border px-3">
-        <div className="flex items-center gap-2">
-          <Link2 className="size-4 text-muted-foreground" />
-          <h2 className="text-sm font-medium tracking-tight">
-            Provenance
-          </h2>
-          {claims.length > 0 && (
-            <span className="text-[10px] text-muted-foreground">
-              {claims.length} claim{claims.length === 1 ? "" : "s"}
-            </span>
-          )}
-        </div>
+        <h2 className="truncate text-sm font-medium tracking-tight">
+          {headerTitle(surface, activeWorkspace)}
+        </h2>
         <Button
           variant="ghost"
           size="icon"
@@ -81,181 +78,222 @@ export function RightRail() {
         </Button>
       </header>
 
-      <div className="flex flex-1 flex-col overflow-y-auto">
-        {surface === "chats" && <LiveAgentsPanel />}
-        {claims.length === 0 ? (
-          <EmptyProvenance />
-        ) : (
-          <>
-            <ClaimList
-              claims={claims}
-              selectedId={selectedClaimId}
-              onSelect={setSelectedClaimId}
-            />
-            <AnimatePresence>
-              {selected && (
-                <ClaimDetail
-                  claim={selected}
-                  onClose={() => setSelectedClaimId(null)}
-                />
-              )}
-            </AnimatePresence>
-          </>
+      <div className="flex flex-1 flex-col gap-3 overflow-y-auto px-3 py-3">
+        {(surface === "chats" || surface === "brain") && (
+          <WorkspaceCard activeWorkspace={activeWorkspace} />
         )}
+        {(surface === "chats" || surface === "brain") && activeWorkspace && (
+          <BranchPanel workspace={activeWorkspace} />
+        )}
+        {surface === "privacy" && <PrivacyHelp />}
+        {surface === "settings" && <SettingsHelp />}
       </div>
     </aside>
   );
 }
 
-function ClaimList({
-  claims,
-  selectedId,
-  onSelect,
-}: {
-  claims: Provenance[];
-  selectedId: string | null;
-  onSelect: (id: string | null) => void;
-}) {
-  return (
-    <div className="flex-1 overflow-y-auto px-3 py-2">
-      <ul className="flex flex-col gap-1">
-        {claims.map((c) => {
-          const active = c.claimId === selectedId;
-          return (
-            <li key={c.claimId}>
-              <button
-                type="button"
-                onClick={() => onSelect(active ? null : c.claimId)}
-                className={cn(
-                  "w-full rounded-md border border-transparent px-2 py-1.5 text-left text-xs transition-colors",
-                  "hover:bg-muted/60",
-                  active && "border-accent/40 bg-accent/5",
-                )}
-              >
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={cn(
-                      "rounded-full border px-1.5 py-px text-[10px] capitalize",
-                      TIER_BADGE[c.tier],
-                    )}
-                  >
-                    {c.tier}
-                  </span>
-                  <span className="font-mono text-[11px] text-foreground">
-                    {c.claimId}
-                  </span>
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    {c.confidence.toFixed(2)}
-                  </span>
-                </div>
-                {c.statement && (
-                  <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground">
-                    {c.statement}
-                  </p>
-                )}
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-    </div>
-  );
+function headerTitle(surface: string, workspace: string | null): string {
+  if (surface === "chats") return workspace ? `${workspace} · context` : "Pick a workspace";
+  if (surface === "brain") return workspace ? `${workspace} · ops` : "No workspace";
+  if (surface === "privacy") return "Privacy detail";
+  if (surface === "settings") return "Settings reference";
+  return "Inspector";
 }
 
-function ClaimDetail({
-  claim,
-  onClose,
-}: {
-  claim: Provenance;
-  onClose: () => void;
-}) {
-  return (
-    <motion.section
-      initial={{ height: 0, opacity: 0 }}
-      animate={{ height: "auto", opacity: 1 }}
-      exit={{ height: 0, opacity: 0 }}
-      transition={{ type: "spring", stiffness: 400, damping: 35 }}
-      className="overflow-hidden border-t border-border bg-surface-elevated"
-      aria-label="Claim detail"
-    >
-      <div className="px-4 py-3">
-        <header className="flex items-center gap-2">
-          <FileText className="size-4 text-accent" />
-          <h3 className="text-xs font-medium tracking-tight">Claim source</h3>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close claim detail"
-            className="ml-auto rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            close
-          </button>
-        </header>
-        <div className="mt-2 flex items-center gap-1.5">
-          <span
-            className={cn(
-              "rounded-full border px-1.5 py-px text-[10px] capitalize",
-              TIER_BADGE[claim.tier],
-            )}
-          >
-            {claim.tier}
-          </span>
-          <span className="font-mono text-[11px] text-foreground">
-            {claim.claimId}
-          </span>
-          <span className="ml-auto text-[10px] text-muted-foreground">
-            confidence {claim.confidence.toFixed(2)}
-          </span>
-        </div>
-        {claim.statement && (
-          <blockquote className="mt-3 border-l-2 border-border pl-3 text-[12px] leading-relaxed text-foreground">
-            {claim.statement}
-          </blockquote>
-        )}
-        {claim.source && (
-          <a
-            href={sourceHref(claim.source)}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-3 inline-flex items-center gap-1.5 text-[11px] text-accent hover:underline"
-          >
-            <ExternalLink className="size-3" />
-            <span className="max-w-[220px] truncate font-mono">
-              {claim.source}
-            </span>
-          </a>
-        )}
-      </div>
-    </motion.section>
-  );
-}
+function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) {
+  const [w, setW] = useState<WorkspaceView | null>(null);
+  const [busy, setBusy] = useState(false);
 
-function sourceHref(source: string): string {
-  // `source` is a URI-ish string from thinkingroot (`file://…` or
-  // `mcp://agent/sid`). Pass through as-is; invalid ones just 404.
-  if (source.startsWith("http") || source.startsWith("file:") || source.startsWith("mcp:")) {
-    return source;
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeWorkspace) {
+      setW(null);
+      return;
+    }
+    workspaceList()
+      .then((list) => {
+        if (cancelled) return;
+        setW(list.find((x) => x.name === activeWorkspace) ?? null);
+      })
+      .catch(() => setW(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace]);
+
+  if (!activeWorkspace) {
+    return (
+      <p className="rounded-md border border-dashed border-border p-3 text-[11px] text-muted-foreground">
+        No workspace selected. Pick one from the sidebar to see ops here.
+      </p>
+    );
   }
-  return `file://${source}`;
+
+  return (
+    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3">
+      <div className="flex items-center gap-1.5 text-xs">
+        <Folder className="size-3.5 text-muted-foreground" />
+        <span className="truncate font-medium">{activeWorkspace}</span>
+        {w?.compiled ? (
+          <span className="ml-auto rounded-full bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-emerald-400">
+            compiled
+          </span>
+        ) : (
+          <span className="ml-auto rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-amber-400">
+            pending
+          </span>
+        )}
+      </div>
+      {w && (
+        <p className="font-mono text-[10px] text-muted-foreground" title={w.path}>
+          {w.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
+        </p>
+      )}
+      <div className="flex items-center gap-1.5 pt-1">
+        <Button
+          variant="outline"
+          size="sm"
+          className="flex-1 gap-1.5 text-xs"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await workspaceCompile({ target: activeWorkspace });
+              toast("Compile queued", {
+                kind: "info",
+                body: "Watch progress on the Brain tab.",
+              });
+            } catch (e) {
+              toast("Compile failed", {
+                kind: "error",
+                body: e instanceof Error ? e.message : String(e),
+              });
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Hammer className="size-3" />
+          {w?.compiled ? "Recompile" : "Compile"}
+        </Button>
+      </div>
+    </section>
+  );
 }
 
-function EmptyProvenance() {
+function BranchPanel({ workspace }: { workspace: string }) {
+  const [branches, setBranches] = useState<BranchView[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const list = await branchList(workspace);
+      setBranches(list);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, [workspace]);
+
   return (
-    <div className="flex flex-1 flex-col gap-6 overflow-y-auto px-4 py-6">
-      <div className="flex flex-col items-start gap-2 rounded-lg border border-dashed border-border/70 p-4">
-        <div className="flex size-8 items-center justify-center rounded-md bg-accent/10 text-accent">
-          <Sparkles className="size-4" />
-        </div>
-        <h3 className="text-sm font-medium">No claims recalled yet</h3>
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          Set{" "}
-          <code className="rounded bg-muted px-1 font-mono text-[10px]">
-            THINKINGROOT_WORKSPACE
-          </code>{" "}
-          to a thinkingroot workspace path. Provenance pills for each recalled
-          claim will appear here once your next message triggers a recall.
+    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3">
+      <header className="flex items-center gap-1.5 text-xs">
+        <GitBranch className="size-3.5 text-muted-foreground" />
+        <h3 className="font-medium">Branches</h3>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="ml-auto h-5 w-5"
+          onClick={load}
+          aria-label="Reload"
+        >
+          <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
+        </Button>
+      </header>
+      {error && (
+        <p className="text-[11px] text-destructive">{error}</p>
+      )}
+      {!error && branches.length === 0 && !loading && (
+        <p className="text-[10px] text-muted-foreground">
+          No branches yet. Use{" "}
+          <code className="font-mono">/branch &lt;name&gt;</code> in chat to fork.
         </p>
-      </div>
-    </div>
+      )}
+      <ul className="flex flex-col">
+        {branches.map((b) => (
+          <li key={b.name}>
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await branchCheckout(workspace, b.name);
+                  toast(`HEAD → ${b.name}`, { kind: "success" });
+                  await load();
+                } catch (e) {
+                  toast("Checkout failed", {
+                    kind: "error",
+                    body: e instanceof Error ? e.message : String(e),
+                  });
+                }
+              }}
+              className={cn(
+                "flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px]",
+                b.current
+                  ? "bg-accent/10 text-accent"
+                  : "text-foreground hover:bg-muted/60",
+              )}
+              title={b.description ?? b.name}
+            >
+              {b.current ? (
+                <GitMerge className="size-3 shrink-0 text-accent" />
+              ) : (
+                <GitBranch className="size-3 shrink-0 text-muted-foreground" />
+              )}
+              <span className="truncate font-mono">{b.name}</span>
+              <span className="ml-auto font-mono text-[9px] uppercase text-muted-foreground/70">
+                {b.status}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function PrivacyHelp() {
+  return (
+    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3 text-[11px] text-muted-foreground">
+      <ShieldCheck className="size-4 text-accent" />
+      <p className="text-foreground">Forget is irreversible.</p>
+      <p>
+        Selecting "Forget" removes the source row plus every claim,
+        relation, and rooted-pin that referenced it. The desktop
+        rebuilds the in-memory cache atomically — `root query` reflects
+        the redaction immediately.
+      </p>
+    </section>
+  );
+}
+
+function SettingsHelp() {
+  return (
+    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3 text-[11px] text-muted-foreground">
+      <p className="text-foreground">Where things live</p>
+      <ul className="list-disc pl-3">
+        <li>Provider keys → ~/.config/thinkingroot/desktop.toml</li>
+        <li>Conversations → &lt;workspace&gt;/.thinkingroot/conversations/</li>
+        <li>Workspace registry → ~/.config/thinkingroot/workspaces.toml</li>
+        <li>Sidecar logs → tracing → stderr (run with RUST_LOG=debug)</li>
+      </ul>
+    </section>
   );
 }

@@ -44,7 +44,6 @@ import {
   PanelRight,
   Paintbrush,
   Pause,
-  Plug,
   Power,
   RefreshCw,
   Rocket,
@@ -76,7 +75,6 @@ import {
   workspaceAdd,
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
-import { useApp } from "@/store/app";
 
 export type CommandGroup =
   | "Navigate"
@@ -114,20 +112,11 @@ export interface CommandDef {
   keywords?: string[];
 }
 
-const SURFACE_IDS: Surface[] = [
-  "chats",
-  "brain",
-  "satellites",
-  "trace",
-  "privacy",
-  "settings",
-];
+const SURFACE_IDS: Surface[] = ["chats", "brain", "privacy", "settings"];
 
 const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   chats: Activity,
   brain: Brain,
-  satellites: Plug,
-  trace: FileClock,
   privacy: ShieldCheck,
   settings: SettingsIcon,
 };
@@ -135,9 +124,7 @@ const SURFACE_ICONS: Record<Surface, LucideIcon> = {
 const SURFACE_HINT: Partial<Record<Surface, string>> = {
   chats: "⌘1",
   brain: "⌘2",
-  satellites: "⌘3",
-  trace: "⌘4",
-  privacy: "⌘5",
+  privacy: "⌘3",
   settings: "⌘,",
 };
 
@@ -225,7 +212,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       argPlaceholder: "s8f3a1…",
       run: (c, arg) => {
         if (!arg) return;
-        c.setSurface("trace");
+        c.setSurface("chats");
         toast(`Resuming ${arg}`, { kind: "info", body: "Jumped to Trace view." });
         c.close();
       },
@@ -275,7 +262,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       Icon: FileClock,
       keywords: ["trace", "audit", "replay"],
       run: (c) => {
-        c.setSurface("trace");
+        c.setSurface("chats");
         c.close();
       },
     },
@@ -343,7 +330,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
               ? "Already compiled — set active to use it for chat."
               : "Run Compile to index it.",
           });
-          c.setSurface("satellites");
+          c.setSurface("brain");
         } catch (e) {
           toast("Add failed", {
             kind: "error",
@@ -359,7 +346,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       group: "Tools",
       Icon: Tag,
       argLabel: "workspace name",
-      argPlaceholder: "name from satellites list",
+      argPlaceholder: "name from sidebar",
       keywords: ["workspace", "active", "switch", "use"],
       run: async (c, arg) => {
         if (!arg) return;
@@ -381,7 +368,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       group: "Tools",
       Icon: RefreshCw,
       argLabel: "workspace name or path",
-      argPlaceholder: "name from satellites list, or absolute path",
+      argPlaceholder: "name from sidebar, or absolute path",
       keywords: ["workspace", "compile", "index", "rebuild"],
       run: async (c, arg) => {
         if (!arg) return;
@@ -391,7 +378,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
             kind: "info",
             body: "Watch progress in the Satellites surface.",
           });
-          c.setSurface("satellites");
+          c.setSurface("brain");
         } catch (e) {
           toast("Compile failed to start", {
             kind: "error",
@@ -589,16 +576,6 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       run: phase("/skills", "D-10"),
     },
     {
-      id: "covenant",
-      label: "View covenant",
-      group: "Info",
-      Icon: ShieldCheck,
-      run: (c) => {
-        useApp.getState().setCovenantOpen(true);
-        c.close();
-      },
-    },
-    {
       id: "env",
       label: "Show environment",
       group: "Info",
@@ -658,7 +635,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       group: "Moat",
       Icon: ShieldCheck,
       run: (c) => {
-        c.setSurface("trace");
+        c.setSurface("chats");
         toast("Open a session to see its verify badge", { kind: "info" });
         c.close();
       },
@@ -701,7 +678,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       group: "Moat",
       Icon: FileClock,
       run: (c) => {
-        c.setSurface("trace");
+        c.setSurface("chats");
         c.close();
       },
     },

@@ -59,6 +59,40 @@ impl AppConfig {
         }
         self.get(key).map(String::from)
     }
+
+    /// Read a string array from the config (e.g. `TR_SCAN_ROOTS = ["~/Desktop", "~/code"]`).
+    /// Falls back to a comma-separated env var of the same name when the
+    /// config has no array entry. Empty result means "use defaults".
+    #[must_use]
+    pub fn string_array(&self, key: &str) -> Vec<String> {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+        match self.entries.get(key) {
+            Some(toml::Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            Some(toml::Value::String(s)) => s
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Resolve the absolute path of the config file for atomic writes
+    /// from non-settings command modules.
+    pub fn resolve_path() -> Option<PathBuf> {
+        resolve_path()
+    }
 }
 
 fn resolve_path() -> Option<PathBuf> {
