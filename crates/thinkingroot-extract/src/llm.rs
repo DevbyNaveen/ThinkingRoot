@@ -298,13 +298,18 @@ impl Provider {
     async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
         match self {
             Provider::Anthropic(p) => p.chat_stream(system, user).await,
-            // B3 / B4: OpenAi + Azure get real SSE in subsequent
-            // commits. Until then they fall through to the one-shot
-            // wrap below.
-            Provider::Bedrock(_)
-            | Provider::Ollama(_)
-            | Provider::OpenAi(_)
-            | Provider::Azure(_) => {
+            Provider::Azure(p) => p.chat_stream(system, user).await,
+            // OpenAi covers 9 providers (openai, groq, deepseek,
+            // openrouter, together, perplexity, litellm, custom, plus
+            // any OpenAI-compatible host) — one SSE parser unlocks
+            // them all.
+            Provider::OpenAi(p) => p.chat_stream(system, user).await,
+            // Bedrock and Ollama fall through to the one-shot wrap —
+            // their native streaming APIs (InvokeModelWithResponseStream
+            // / NDJSON) follow different shapes and aren't load-bearing
+            // for v1; the desktop chat surface routes through Anthropic
+            // / OpenAI / Azure in practice.
+            Provider::Bedrock(_) | Provider::Ollama(_) => {
                 let out = self.chat(system, user).await?;
                 let chunk = ChatChunk {
                     text: out.text,
@@ -578,6 +583,134 @@ impl AzureProvider {
                 message: format!("unexpected response: {json}"),
             })
     }
+
+    /// Real SSE streaming via the Azure deployment's
+    /// `chat/completions` endpoint with `?api-version=...&stream=true`.
+    ///
+    /// Same OpenAI-compatible SSE shape as
+    /// [`OpenAiProvider::chat_stream`], but the deployment is in the
+    /// pre-built endpoint URL (not the body) and auth is via the
+    /// `api-key` header rather than `Authorization: Bearer`.
+    async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        use eventsource_stream::Eventsource;
+        use futures::StreamExt;
+
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            "temperature": 0.1,
+            "stream": true,
+        });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let resp = self
+            .client
+            .post(&self.endpoint_url)
+            .header("api-key", &self.api_key)
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::LlmProvider {
+                provider: "azure".into(),
+                message: format!("connect: {e}"),
+            })?;
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+                .unwrap_or(0);
+            return Err(Error::RateLimited {
+                provider: "azure".into(),
+                retry_after_ms: retry_after,
+            });
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider: "azure".into(),
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+        let mut events = resp.bytes_stream().eventsource();
+
+        let stream = async_stream::stream! {
+            let mut truncated = false;
+            while let Some(item) = events.next().await {
+                match item {
+                    Err(e) => {
+                        yield Err(Error::LlmProvider {
+                            provider: "azure".into(),
+                            message: format!("sse parse: {e}"),
+                        });
+                        return;
+                    }
+                    Ok(ev) => {
+                        if ev.data == "[DONE]" {
+                            yield Ok(ChatChunk {
+                                text: String::new(),
+                                finish: Some(ChatFinish {
+                                    truncated,
+                                    limits: limits.clone(),
+                                }),
+                            });
+                            return;
+                        }
+                        let json: serde_json::Value =
+                            match serde_json::from_str(&ev.data) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    yield Err(Error::LlmProvider {
+                                        provider: "azure".into(),
+                                        message: format!("decode delta: {e}"),
+                                    });
+                                    return;
+                                }
+                            };
+                        let choice = &json["choices"][0];
+                        if let Some(text) =
+                            choice["delta"]["content"].as_str()
+                        {
+                            if !text.is_empty() {
+                                yield Ok(ChatChunk {
+                                    text: text.to_string(),
+                                    finish: None,
+                                });
+                            }
+                        }
+                        if choice["finish_reason"].as_str()
+                            == Some("length")
+                        {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            yield Ok(ChatChunk {
+                text: String::new(),
+                finish: Some(ChatFinish {
+                    truncated,
+                    limits: limits.clone(),
+                }),
+            });
+        };
+
+        Ok(Box::pin(stream))
+    }
 }
 
 // ── OpenAI-compatible Provider ───────────────────────────────────
@@ -691,6 +824,148 @@ impl OpenAiProvider {
                 provider: self.provider_name.clone(),
                 message: format!("unexpected response: {json}"),
             })
+    }
+
+    /// Real SSE streaming via the OpenAI-compatible
+    /// `/v1/chat/completions?stream=true` endpoint.
+    ///
+    /// This impl is shared by **9 providers** the workspace wires
+    /// through `OpenAiProvider`: openai, groq, deepseek, openrouter,
+    /// together, perplexity, litellm, custom, plus any
+    /// OpenAI-compatible host.
+    ///
+    /// SSE shape: each `data:` line carries a JSON object with
+    /// `choices[0].delta.content` for text deltas, terminated by
+    /// `data: [DONE]`. We project deltas into [`ChatChunk`]s and
+    /// surface `finish_reason == "length"` as the
+    /// [`ChatFinish::truncated`] flag.
+    async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        use eventsource_stream::Eventsource;
+        use futures::StreamExt;
+
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+            "stream": true,
+        });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let provider = self.provider_name.clone();
+        let resp = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::LlmProvider {
+                provider: provider.clone(),
+                message: format!("connect: {e}"),
+            })?;
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+                .unwrap_or(0);
+            return Err(Error::RateLimited {
+                provider,
+                retry_after_ms: retry_after,
+            });
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider,
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+        let mut events = resp.bytes_stream().eventsource();
+
+        let stream = async_stream::stream! {
+            let mut truncated = false;
+            while let Some(item) = events.next().await {
+                match item {
+                    Err(e) => {
+                        yield Err(Error::LlmProvider {
+                            provider: provider.clone(),
+                            message: format!("sse parse: {e}"),
+                        });
+                        return;
+                    }
+                    Ok(ev) => {
+                        // OpenAI-compatible SSE uses unnamed events
+                        // (`data:` only, no `event:` line) and signals
+                        // the end with the literal payload `[DONE]`.
+                        if ev.data == "[DONE]" {
+                            yield Ok(ChatChunk {
+                                text: String::new(),
+                                finish: Some(ChatFinish {
+                                    truncated,
+                                    limits: limits.clone(),
+                                }),
+                            });
+                            return;
+                        }
+                        let json: serde_json::Value =
+                            match serde_json::from_str(&ev.data) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    yield Err(Error::LlmProvider {
+                                        provider: provider.clone(),
+                                        message: format!("decode delta: {e}"),
+                                    });
+                                    return;
+                                }
+                            };
+                        let choice = &json["choices"][0];
+                        if let Some(text) =
+                            choice["delta"]["content"].as_str()
+                        {
+                            if !text.is_empty() {
+                                yield Ok(ChatChunk {
+                                    text: text.to_string(),
+                                    finish: None,
+                                });
+                            }
+                        }
+                        if choice["finish_reason"].as_str()
+                            == Some("length")
+                        {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            // Some upstreams close the stream without [DONE]; emit a
+            // best-effort terminal chunk so callers always see a
+            // ChatFinish.
+            yield Ok(ChatChunk {
+                text: String::new(),
+                finish: Some(ChatFinish {
+                    truncated,
+                    limits: limits.clone(),
+                }),
+            });
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 
