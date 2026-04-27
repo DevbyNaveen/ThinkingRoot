@@ -135,7 +135,7 @@ pulldown-cmark = "0.13"
 tree-sitter = "0.26"
 
 # LLM (multi-provider via our own trait)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1"
 
@@ -159,6 +159,14 @@ strsim = "0.11"
 unicode-segmentation = "1.12"
 ordered-float = { version = "5", features = ["serde"] }
 tokio-stream = "0.1"
+
+# Async stream plumbing for LLM SSE streaming. `futures` provides the
+# `Stream` trait; `eventsource-stream` parses `text/event-stream` over
+# `bytes_stream()`; `async-stream` is the macro the providers use to
+# yield chunks idiomatically.
+futures = "0.3"
+eventsource-stream = "0.2"
+async-stream = "0.3"
 
 # Benchmarking
 criterion = { version = "0.6", default-features = false, features = ["html_reports"] }

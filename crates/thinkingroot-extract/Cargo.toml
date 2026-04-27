@@ -18,9 +18,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+futures = { workspace = true }
+eventsource-stream = { workspace = true }
+async-stream = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-bedrockruntime = { workspace = true }
 blake3 = { workspace = true }

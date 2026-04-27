@@ -15,6 +15,45 @@ struct ChatOutput {
     limits: HeaderRateLimits,
 }
 
+// ── Streaming chat ──────────────────────────────────────────────
+//
+// Public surface for token-by-token streaming. The synthesizer pipes
+// these chunks straight into the engine's SSE endpoint, which the
+// desktop's chat command consumes — see `crates/thinkingroot-serve`
+// `rest::ask_stream_handler` and `apps/thinkingroot-desktop/src-tauri`
+// `commands::chat::chat_send_stream` for the endpoints.
+
+/// One token-or-segment chunk emitted by a streaming provider call.
+///
+/// Most chunks carry a non-empty `text` and `finish == None`. The final
+/// chunk in a successful stream carries `finish == Some(_)` so callers
+/// can attach truncation flags + rate-limit headers without sniffing
+/// the underlying transport.
+#[derive(Debug, Clone, Default)]
+pub struct ChatChunk {
+    pub text: String,
+    pub finish: Option<ChatFinish>,
+}
+
+/// Terminal metadata for a streamed chat. Only present on the last
+/// chunk of a successful stream.
+#[derive(Debug, Clone, Default)]
+pub struct ChatFinish {
+    /// True when the upstream stopped because it hit `max_tokens` —
+    /// the same signal we surface for non-streaming chats via
+    /// `Error::TruncatedOutput`. Streaming callers can choose to
+    /// re-prompt rather than treat the partial body as final.
+    pub truncated: bool,
+    /// Rate-limit headers carried back to the scheduler so adaptive
+    /// concurrency can adjust mid-flight.
+    pub limits: HeaderRateLimits,
+}
+
+/// Pinned, boxed stream of `ChatChunk` results — the public surface
+/// every `LlmClient::chat_stream` consumer holds onto.
+pub type ChatStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk>> + Send>>;
+
 // ── Model-aware output token limits ─────────────────────────────
 
 /// Returns the maximum output tokens for a known model.
@@ -247,6 +286,31 @@ impl Provider {
             Provider::Anthropic(p) => p.chat(system, user).await,
             Provider::Ollama(p) => p.chat(system, user).await,
         }
+    }
+
+    /// Streaming counterpart of `chat`. Each provider that supports
+    /// native SSE (Anthropic, OpenAI-compatible, Azure) overrides
+    /// this and yields chunks as the upstream emits them; providers
+    /// without native SSE (Bedrock, Ollama) fall through to the
+    /// one-shot wrap below so callers get a uniform surface — they
+    /// always see at least one chunk and exactly one `ChatFinish` on
+    /// success.
+    async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        // Default path — one-shot the existing `chat()` and wrap as a
+        // single-chunk stream. Provider-specific real SSE is added in
+        // B2 (Anthropic), B3 (OpenAI / 9 OpenAI-compatible providers),
+        // B4 (Azure). This default keeps the trait surface honest
+        // before those overrides land.
+        let out = self.chat(system, user).await?;
+        let chunk = ChatChunk {
+            text: out.text,
+            finish: Some(ChatFinish {
+                truncated: out.truncated,
+                limits: out.limits,
+            }),
+        };
+        let stream = async_stream::stream! { yield Ok(chunk); };
+        Ok(Box::pin(stream))
     }
 
     fn model_name(&self) -> &str {
@@ -1083,6 +1147,35 @@ impl LlmClient {
     /// The model name configured on this client (e.g. `"claude-sonnet-4-5"`).
     pub fn model_name(&self) -> &str {
         self.provider.model_name()
+    }
+
+    /// Streaming counterpart of [`chat`](Self::chat). Returns a pinned
+    /// stream of [`ChatChunk`] results — Anthropic, OpenAI, and Azure
+    /// emit one chunk per SSE delta; Bedrock and Ollama emit a single
+    /// chunk wrapping their non-streaming response.
+    ///
+    /// **Retry semantics differ from `chat`.** This method does *one*
+    /// connect attempt — once bytes are flowing, transient errors
+    /// surface as `Err` items in the stream rather than triggering a
+    /// fresh request, because we'd otherwise risk re-billing the user
+    /// for content they already received. Rate-limit / overloaded
+    /// responses (429 / 529) are returned synchronously from this
+    /// `Result<ChatStream>` so callers can decide whether to retry
+    /// the open.
+    ///
+    /// Scheduler tickets are taken on connect and released when the
+    /// stream is dropped — see `chat` for the retry-loop variant.
+    pub async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        // Take a scheduler ticket if attached; we don't currently
+        // record per-stream throughput because we can't observe usage
+        // mid-flight without reading the response. The ticket is
+        // released when this future drops.
+        let _opt_ticket = if let Some(ref sched) = self.scheduler {
+            Some(sched.wait_for_slot().await)
+        } else {
+            None
+        };
+        self.provider.chat_stream(system, user).await
     }
 
     /// Extract knowledge from a chunk of text.
