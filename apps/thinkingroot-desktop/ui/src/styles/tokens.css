@@ -1,0 +1,181 @@
+/**
+ * Design tokens — HSL triples so Tailwind's `hsl(var(--x))` pattern
+ * works. Palette values are hand-picked to match
+ * `thinkingroot-tui::render::theme` so the TUI and desktop share a
+ * single semantic vocabulary (info/warn/error/success + three
+ * admission tiers + capsule + peer-idle).
+ *
+ * Five palettes ship in v0.1:
+ *   - dark  (default)               — Catppuccin-Mocha inspired
+ *   - light                         — soft, high-contrast
+ *   - daltonized-protanopia         — red-deficient
+ *   - daltonized-deuteranopia       — green-deficient
+ *   - daltonized-tritanopia         — blue-deficient
+ */
+
+:root,
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --radius: 0.625rem;
+
+  --background: 0 0% 12%;             /* Center background (light grey) */
+  --foreground: 0 0% 90%;             /* Crisp white text */
+  --surface: 0 0% 12%;                /* Side panels (matching center) */
+  --surface-elevated: 0 0% 18%;       /* Elevated surfaces */
+
+  --muted: 0 0% 25%;
+  --muted-foreground: 0 0% 65%;
+
+  --border: 0 0% 20%;
+  --input: 0 0% 20%;
+  --ring: 217 92% 76%;                /* blue    */
+
+  --accent: 45 40% 85%;               /* light cream */
+  --accent-muted: 45 30% 75%;         /* muted cream */
+  --accent-foreground: 0 0% 10%;
+
+  --destructive: 343 81% 75%;         /* pink    */
+  --destructive-foreground: 240 21% 12%;
+
+  --info: 217 92% 76%;                /* blue    */
+  --warn: 23 92% 75%;                 /* peach   */
+  --success: 115 54% 76%;             /* green   */
+
+  --tier-rooted: 115 54% 76%;         /* green   */
+  --tier-attested: 23 92% 75%;        /* peach   */
+  --tier-unknown: 228 7% 50%;         /* overlay1 */
+
+  --capsule: 267 84% 81%;             /* mauve   */
+  --peer-idle: 234 10% 48%;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+
+  --background: 220 23% 95%;
+  --foreground: 234 16% 18%;
+  --surface: 220 22% 92%;
+  --surface-elevated: 0 0% 100%;
+
+  --muted: 220 16% 87%;
+  --muted-foreground: 234 11% 38%;
+
+  --border: 225 14% 80%;
+  --input: 225 14% 80%;
+  --ring: 220 91% 54%;
+
+  --accent: 220 91% 54%;
+  --accent-muted: 220 85% 72%;
+  --accent-foreground: 0 0% 100%;
+
+  --destructive: 347 87% 44%;
+  --destructive-foreground: 0 0% 100%;
+
+  --info: 220 91% 54%;
+  --warn: 35 77% 49%;
+  --success: 109 58% 40%;
+
+  --tier-rooted: 109 58% 40%;
+  --tier-attested: 35 77% 49%;
+  --tier-unknown: 228 11% 65%;
+
+  --capsule: 266 85% 58%;
+  --peer-idle: 234 11% 55%;
+}
+
+html[data-theme="daltonized-protanopia"] {
+  color-scheme: dark;
+
+  --background: 240 21% 15%;
+  --foreground: 226 64% 88%;
+  --surface: 240 21% 12%;
+  --surface-elevated: 240 23% 20%;
+  --muted: 237 16% 23%;
+  --muted-foreground: 228 12% 65%;
+  --border: 234 13% 31%;
+  --input: 234 13% 31%;
+  --ring: 202 100% 41%;
+
+  --accent: 202 100% 41%;
+  --accent-muted: 200 87% 65%;
+  --accent-foreground: 240 21% 12%;
+
+  --destructive: 202 100% 41%;
+  --destructive-foreground: 0 0% 100%;
+
+  --info: 202 100% 41%;
+  --warn: 39 100% 45%;
+  --success: 200 87% 65%;
+
+  --tier-rooted: 200 87% 65%;
+  --tier-attested: 39 100% 45%;
+  --tier-unknown: 228 7% 50%;
+
+  --capsule: 267 84% 81%;
+  --peer-idle: 234 10% 48%;
+}
+
+html[data-theme="daltonized-deuteranopia"] {
+  color-scheme: dark;
+
+  --background: 240 21% 15%;
+  --foreground: 226 64% 88%;
+  --surface: 240 21% 12%;
+  --surface-elevated: 240 23% 20%;
+  --muted: 237 16% 23%;
+  --muted-foreground: 228 12% 65%;
+  --border: 234 13% 31%;
+  --input: 234 13% 31%;
+  --ring: 165 100% 31%;
+
+  --accent: 165 100% 31%;
+  --accent-muted: 165 70% 55%;
+  --accent-foreground: 240 21% 12%;
+
+  --destructive: 25 100% 42%;
+  --destructive-foreground: 0 0% 100%;
+
+  --info: 202 100% 41%;
+  --warn: 58 100% 60%;
+  --success: 165 100% 31%;
+
+  --tier-rooted: 165 100% 31%;
+  --tier-attested: 58 100% 60%;
+  --tier-unknown: 228 7% 50%;
+
+  --capsule: 267 84% 81%;
+  --peer-idle: 234 10% 48%;
+}
+
+html[data-theme="daltonized-tritanopia"] {
+  color-scheme: dark;
+
+  --background: 240 21% 15%;
+  --foreground: 226 64% 88%;
+  --surface: 240 21% 12%;
+  --surface-elevated: 240 23% 20%;
+  --muted: 237 16% 23%;
+  --muted-foreground: 228 12% 65%;
+  --border: 234 13% 31%;
+  --input: 234 13% 31%;
+  --ring: 165 100% 31%;
+
+  --accent: 165 100% 31%;
+  --accent-muted: 165 70% 55%;
+  --accent-foreground: 240 21% 12%;
+
+  --destructive: 330 42% 65%;
+  --destructive-foreground: 0 0% 100%;
+
+  --info: 165 100% 31%;
+  --warn: 25 100% 42%;
+  --success: 165 100% 31%;
+
+  --tier-rooted: 165 100% 31%;
+  --tier-attested: 25 100% 42%;
+  --tier-unknown: 228 7% 50%;
+
+  --capsule: 267 84% 81%;
+  --peer-idle: 234 10% 48%;
+}

@@ -1,0 +1,71 @@
+@import "./tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow: hidden;
+  }
+
+  /* Let the user select and copy normally — Tauri defaults to no-select */
+  * {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
+  /* Disable the browser outline everywhere; we paint our own. */
+  :focus { outline: none; }
+  :focus-visible {
+    @apply ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Removed custom webkit scrollbar rules to allow native OS auto-hiding overlay scrollbars. */
+}
+
+@layer utilities {
+  /* Draggable area on top of the window (Tauri titleBarStyle=Overlay). */
+  .window-drag {
+    -webkit-app-region: drag;
+    app-region: drag;
+  }
+  .window-no-drag {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+
+  /* Shimmer used by skeleton loaders while streaming. */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--muted) / 0.6) 0%,
+      hsl(var(--muted) / 0.9) 50%,
+      hsl(var(--muted) / 0.6) 100%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+
+  /* Subtle surface elevation. */
+  .surface {
+    @apply bg-surface;
+  }
+  .surface-elevated {
+    @apply bg-surface-elevated shadow-elevated;
+  }
+}

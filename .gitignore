@@ -62,6 +62,14 @@ include/
 # Node
 node_modules/
 
+# Desktop app build outputs (apps/thinkingroot-desktop/)
+apps/thinkingroot-desktop/ui/dist/
+apps/thinkingroot-desktop/src-tauri/target/
+# Staged sidecar binaries — built fresh per machine via build.rs;
+# the .gitkeep stub keeps the directory present in the tree.
+apps/thinkingroot-desktop/src-tauri/binaries/*
+!apps/thinkingroot-desktop/src-tauri/binaries/.gitkeep
+
 # Internal AI tooling — not for public repo
 .claude/
 .superpowers/

@@ -1,0 +1,65 @@
+[workspace]
+# Stand-alone workspace — this Tauri app intentionally lives outside
+# the parent OSS engine workspace so its build doesn't drag the
+# desktop stack into `cargo test --workspace`. The `path` deps below
+# reach directly into the parent workspace's crates without
+# re-joining them.
+
+[package]
+name = "thinkingroot-desktop-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Tauri 2 desktop app for ThinkingRoot — local-first knowledge workspace."
+publish = false
+
+[lib]
+name = "thinkingroot_desktop_app"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "thinkingroot-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri stack — desktop-side plugins only. Sinks that were
+# helloroot-internal are out of scope here; the agent-runtime
+# sidecar (Step 10) takes over chat / agent orchestration.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-os = "2"
+tauri-plugin-window-state = "2"
+
+# OSS engine path-deps reaching into the parent workspace. The
+# desktop talks directly to the engine's QueryEngine — no helloroot
+# runtime wrapper sits between.
+thinkingroot-core  = { path = "../../../crates/thinkingroot-core" }
+thinkingroot-serve = { path = "../../../crates/thinkingroot-serve", default-features = false }
+
+# Trust + preview surface for the `.tr` file-association flow. Each
+# crate is path-deped because the desktop sits outside the parent
+# workspace (Decision D4 in the v0.1 plan).
+tr-format     = { path = "../../../crates/tr-format" }
+tr-render     = { path = "../../../crates/tr-render" }
+tr-revocation = { path = "../../../crates/tr-revocation" }
+tr-verify     = { path = "../../../crates/tr-verify" }
+url           = "2"
+
+# Standard utility deps.
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"

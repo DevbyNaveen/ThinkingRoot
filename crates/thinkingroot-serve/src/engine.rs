@@ -9,8 +9,8 @@ use crate::graph_cache::{CachedClaim, KnowledgeGraph, RawGraphData};
 pub use crate::pipeline::PipelineResult;
 use thinkingroot_core::{Config, Error, Result};
 use thinkingroot_graph::StorageEngine;
-use thinkingroot_verify::Verifier;
-pub use thinkingroot_verify::verifier::VerificationResult;
+use thinkingroot_verify_internal::Verifier;
+pub use thinkingroot_verify_internal::verifier::VerificationResult;
 
 // ---------------------------------------------------------------------------
 // Public response types
@@ -714,6 +714,42 @@ impl QueryEngine {
                 source_type: s.source_type.clone(),
             })
             .collect())
+    }
+
+    /// Remove every claim, entity edge, vector, and contradiction
+    /// row that descends from `source_uri` in the named workspace, then
+    /// rebuild the in-memory read cache so subsequent queries reflect
+    /// the redaction.
+    ///
+    /// Returns the number of source rows removed (0 if `source_uri`
+    /// did not match any). Idempotent: calling twice with the same
+    /// URI is a no-op the second time.
+    ///
+    /// Used by the desktop privacy dashboard's "Forget" action
+    /// (Phase F Stream H, Step 13). This is the load-bearing API
+    /// behind the user-facing covenant commitment that any datum
+    /// can be removed on demand.
+    pub async fn forget_source(&self, ws: &str, source_uri: &str) -> Result<usize> {
+        let handle = self.get_workspace(ws)?;
+
+        // Phase 1: graph mutation. Hold the storage lock only for the
+        // delete + the raw refetch.
+        let raw_data: RawGraphData = {
+            let storage = handle.storage.lock().await;
+            let removed = storage.graph.remove_source_by_uri(source_uri)?;
+            if removed == 0 {
+                return Ok(0);
+            }
+            KnowledgeGraph::fetch_raw(&storage.graph)?
+        };
+
+        // Phase 2: rebuild the cache off-lock (CPU-only).
+        let new_cache = KnowledgeGraph::build_from_raw(raw_data);
+
+        // Phase 3: atomic cache swap.
+        *handle.cache.write().await = new_cache;
+
+        Ok(1)
     }
 
     /// Read the content of a specific artifact.
