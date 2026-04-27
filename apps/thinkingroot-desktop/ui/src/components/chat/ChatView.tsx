@@ -85,6 +85,13 @@ export function ChatView() {
   }, [activeWorkspace]);
 
   // Hydrate from disk when a new conversation gets selected.
+  //
+  // Race we have to defend against: the user can click "Send" while the
+  // disk read is still in flight. That fires `appendMessage("hy")`
+  // *before* hydration's `setMessages(...)` lands, and the unconditional
+  // overwrite below used to wipe the user bubble. The fix is a merge —
+  // hydration only contributes message ids that aren't already in the
+  // cache, so an in-flight user/assistant turn is preserved verbatim.
   useEffect(() => {
     if (!activeWorkspace || !activeConv) return;
     let cancelled = false;
@@ -92,16 +99,33 @@ export function ChatView() {
       try {
         const c = await conversationsGet(activeWorkspace, activeConv);
         if (cancelled) return;
-        setMessages(
-          activeWorkspace,
-          activeConv,
-          c.messages.map((m) => ({
+        const k = `${activeWorkspace}::${activeConv}`;
+        const existing = useApp.getState().messages[k] ?? [];
+        const existingIds = new Set(existing.map((m) => m.id));
+        const fromDisk: ChatMessage[] = c.messages
+          .filter((m) => !existingIds.has(m.id))
+          .map((m) => ({
             id: m.id,
             kind: m.role === "user" ? "user" : "assistant",
             body: m.content,
             at: new Date(m.created_at),
-          })),
+          }));
+        // Disk-first ordering, then any local-only (in-flight) messages.
+        // Sort by `at` ascending so the disk + local sets interleave
+        // correctly when the user has been mid-turn during a remount.
+        const merged: ChatMessage[] = [...fromDisk, ...existing].sort(
+          (a, b) => a.at.getTime() - b.at.getTime(),
         );
+        // De-dup defensively — if disk already had the message and we
+        // appended it locally, keep the disk copy (it has the canonical
+        // id from the persistence layer).
+        const seen = new Set<string>();
+        const deduped = merged.filter((m) => {
+          if (seen.has(m.id)) return false;
+          seen.add(m.id);
+          return true;
+        });
+        setMessages(activeWorkspace, activeConv, deduped);
       } catch (e) {
         toast("Load conversation failed", {
           kind: "error",
@@ -598,7 +622,7 @@ function Composer({
             }}
             className="w-full resize-none border-0 bg-transparent text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/50 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
           />
-          <div className="flex items-center justify-end">
+          <div className="flex items-center justify-end -mr-2">
             {disabled ? (
               <Button
                 variant="ghost"
