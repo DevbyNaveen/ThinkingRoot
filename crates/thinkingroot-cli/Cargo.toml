@@ -19,7 +19,12 @@ path = "src/main.rs"
 [dependencies]
 # `.tr` reader/writer (Phase A relocation — canonical home for the
 # wire format). Used by `root pack` and `root install`.
-tr-format = { path = "../tr-format" }
+tr-format     = { workspace = true }
+# Trust verification + revocation cache for `root install`.
+tr-verify     = { workspace = true }
+tr-revocation = { workspace = true }
+# Human-readable preview rendering for `root install --dry-run`.
+tr-render     = { workspace = true }
 
 thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
@@ -27,7 +32,7 @@ thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
 thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
-thinkingroot-verify = { workspace = true }
+thinkingroot-verify-internal = { workspace = true }
 thinkingroot-serve = { workspace = true }
 thinkingroot-branch = { workspace = true }
 thinkingroot-ground = { workspace = true }
@@ -47,6 +52,18 @@ dirs = { workspace = true }
 dialoguer = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
+
+# Cloud subcommands (`root login`, `root publish`, `root whoami`,
+# `root init`, `root status`) — Phase G consolidation. Replace the
+# legacy `tr` binary in thinkingroot-cloud/apps/cli.
+walkdir = "2"
+rpassword = "7"
+tar = "0.4"
+zstd = { version = "0.13", default-features = false }
+
+# Pluggable resolvers for `root install` (Phase C).
+async-trait = "0.1"
 notify = { workspace = true }
 notify-debouncer-mini = { workspace = true }
 toml = { workspace = true }
@@ -60,3 +77,6 @@ vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector", "thinkingroo
 
 [dev-dependencies]
 tempfile = "3"
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+semver = { version = "1", features = ["serde"] }

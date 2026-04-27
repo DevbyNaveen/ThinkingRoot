@@ -7,9 +7,11 @@ use console::style;
 use tracing_subscriber::EnvFilter;
 
 mod branch_cmd;
+mod cloud;
 mod eval_cmd;
 mod mcp_config;
 mod pack_cmd;
+mod resolver;
 mod pipeline;
 mod progress;
 mod provider_cmd;
@@ -348,6 +350,84 @@ enum Commands {
         /// default of `https://thinkingroot.dev`.
         #[arg(long, value_name = "URL")]
         registry: Option<String>,
+        /// Allow installing unsigned (T0) packs from remote sources.
+        /// Local installs accept T0 by default; this flag is required
+        /// only for `https://` URLs and `owner/slug@version`.
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// Render a human-readable preview without extracting or
+        /// modifying anything on disk. Skips trust verification —
+        /// the goal is to inspect what a pack contains before
+        /// deciding to install it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    // -------------------------------------------------------------------------
+    // Cloud subcommands (Phase G consolidation — replace legacy `tr` binary).
+    //
+    // All five share an optional `--server <url>` flag and consult
+    // `~/.config/thinkingroot/auth.json` for the API token. Default
+    // server is `https://api.thinkingroot.dev`; override per-command
+    // or via `TR_SERVER` env var.
+    // -------------------------------------------------------------------------
+    /// Save your cloud API token. Replaces the legacy `tr login`.
+    Login {
+        /// API token. If omitted, you'll be prompted to paste.
+        #[arg(long)]
+        token: Option<String>,
+        /// Cloud server URL. Defaults to https://api.thinkingroot.dev.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Print the cloud identity associated with your saved token.
+    /// Replaces the legacy `tr whoami`.
+    Whoami {
+        /// Override the configured cloud server.
+        #[arg(long, env = "TR_SERVER")]
+        server: Option<String>,
+    },
+    /// Scaffold `tr-pack.toml` in the current directory so `root
+    /// publish` can upload the workspace. Replaces `tr init`.
+    PackInit {
+        /// Pack slug (also the published name). Defaults to the
+        /// current directory name.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Owner handle. Defaults to the logged-in user's handle.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Override the configured cloud server.
+        #[arg(long, env = "TR_SERVER")]
+        server: Option<String>,
+    },
+    /// Tarball the current workspace and submit a cloud compile job.
+    /// Replaces the legacy `tr publish`.
+    Publish {
+        /// Path to the workspace root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Don't poll the compile job — return immediately after
+        /// enqueue.
+        #[arg(long)]
+        no_wait: bool,
+        /// Wait timeout in seconds when polling.
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+        /// Override the configured cloud server.
+        #[arg(long, env = "TR_SERVER")]
+        server: Option<String>,
+    },
+    /// List your recent cloud compile jobs. Replaces `tr status` —
+    /// the existing `root status` continues to show local branch
+    /// state.
+    Jobs {
+        /// Maximum jobs to return.
+        #[arg(long, default_value = "10")]
+        limit: u32,
+        /// Override the configured cloud server.
+        #[arg(long, env = "TR_SERVER")]
+        server: Option<String>,
     },
 }
 
@@ -742,8 +822,44 @@ async fn main() -> anyhow::Result<()> {
             reference,
             target,
             registry,
+            allow_unsigned,
+            dry_run,
         }) => {
-            pack_cmd::run_install(&reference, target, registry).await?;
+            if dry_run {
+                pack_cmd::run_install_dry_run(&reference, registry).await?;
+            } else if let Err(e) =
+                pack_cmd::run_install(&reference, target, registry, allow_unsigned).await
+            {
+                if let Some(refused) = e.downcast_ref::<pack_cmd::InstallRefused>() {
+                    eprintln!("{}", refused.message);
+                    std::process::exit(refused.exit_code);
+                }
+                return Err(e);
+            }
+        }
+        Some(Commands::Login { token, server }) => {
+            cloud::login::run(token, server).await?;
+        }
+        Some(Commands::Whoami { server }) => {
+            cloud::whoami::run(server).await?;
+        }
+        Some(Commands::PackInit {
+            slug,
+            owner,
+            server,
+        }) => {
+            cloud::init::run(slug, owner, server).await?;
+        }
+        Some(Commands::Publish {
+            path,
+            no_wait,
+            timeout,
+            server,
+        }) => {
+            cloud::publish::run(path, !no_wait, timeout, server).await?;
+        }
+        Some(Commands::Jobs { limit, server }) => {
+            cloud::status::run(limit, server).await?;
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
@@ -884,7 +1000,7 @@ async fn run_health(path: &PathBuf) -> anyhow::Result<()> {
     let storage = thinkingroot_graph::StorageEngine::init(&data_dir)
         .await
         .context("failed to open storage")?;
-    let verifier = thinkingroot_verify::Verifier::new(&config);
+    let verifier = thinkingroot_verify_internal::Verifier::new(&config);
     let result = verifier.verify(&storage.graph)?;
 
     print_banner();

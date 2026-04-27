@@ -13,6 +13,58 @@ fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"))
 }
 
+/// Resolve the `workspace` tool argument to a mounted workspace name.
+///
+/// Workspaces are mounted by basename (see `cli/src/serve.rs`), but MCP clients
+/// often see only the full `--path` value in their config and forward that as
+/// the `workspace` argument. Without this normalisation a client that passes
+/// `/abs/path/to/foo` instead of `foo` gets `EntityNotFound` even though `foo`
+/// is mounted.
+///
+/// Resolution order:
+///   1. `arg` exactly matches a mounted workspace name → use it.
+///   2. `arg` looks like a path AND its basename is a mounted name → use the basename.
+///   3. `arg` is set but unrecognised → return it unchanged so the downstream
+///      lookup produces a precise `EntityNotFound` (don't silently mask).
+///   4. `arg` is None → fall back to `default_ws`, then to the literal `"default"`.
+///
+/// Note: basename extraction is delegated to `std::path::Path::file_name`,
+/// whose separator semantics are platform-specific. On Unix hosts only `/`
+/// is treated as a separator; backslash-style paths only normalise when the
+/// server is built for Windows.
+fn resolve_workspace_arg(
+    arg: Option<&str>,
+    default_ws: Option<&str>,
+    engine: &QueryEngine,
+) -> String {
+    resolve_workspace_arg_with(arg, default_ws, |name| {
+        engine.workspace_root_path(name).is_some()
+    })
+}
+
+/// Pure variant of [`resolve_workspace_arg`] — separated for unit testing
+/// without constructing a full [`QueryEngine`]. `is_mounted` answers the
+/// question "is `name` a mounted workspace?".
+fn resolve_workspace_arg_with<F: Fn(&str) -> bool>(
+    arg: Option<&str>,
+    default_ws: Option<&str>,
+    is_mounted: F,
+) -> String {
+    match arg {
+        Some(value) if is_mounted(value) => value.to_string(),
+        Some(value) if value.contains('/') || value.contains('\\') => {
+            std::path::Path::new(value)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|name| is_mounted(name))
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        }
+        Some(value) => value.to_string(),
+        None => default_ws.unwrap_or("default").to_string(),
+    }
+}
+
 #[tracing::instrument(name = "mcp.tools.list", skip_all)]
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     let tools = serde_json::json!({
@@ -372,11 +424,12 @@ pub async fn handle_call(
         .get("arguments")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
-    let ws = arguments
-        .get("workspace")
-        .and_then(|v| v.as_str())
-        .or(default_ws)
-        .unwrap_or("default");
+    let ws_owned = resolve_workspace_arg(
+        arguments.get("workspace").and_then(|v| v.as_str()),
+        default_ws,
+        engine,
+    );
+    let ws: &str = &ws_owned;
 
     // Populate the span's pre-declared Empty fields now that we've parsed
     // the params. Lets trace consumers filter by tool + workspace.
@@ -1375,5 +1428,92 @@ pub async fn handle_call(
         }
 
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+    }
+}
+
+#[cfg(test)]
+mod resolve_workspace_arg_tests {
+    use super::resolve_workspace_arg_with;
+    use std::collections::HashSet;
+
+    fn mounted(names: &[&str]) -> impl Fn(&str) -> bool {
+        let set: HashSet<String> = names.iter().map(|s| s.to_string()).collect();
+        move |name: &str| set.contains(name)
+    }
+
+    #[test]
+    fn exact_name_passes_through() {
+        let got = resolve_workspace_arg_with(
+            Some("thinkingroot-cloud"),
+            Some("default"),
+            mounted(&["thinkingroot-cloud"]),
+        );
+        assert_eq!(got, "thinkingroot-cloud");
+    }
+
+    #[test]
+    fn unix_path_falls_back_to_basename_when_basename_is_mounted() {
+        // Reproduces the original bug: client passes the --path value as the
+        // workspace argument; basename is what the engine actually mounted.
+        let got = resolve_workspace_arg_with(
+            Some("/Users/naveen/Desktop/thinkingroot-cloud"),
+            None,
+            mounted(&["thinkingroot-cloud"]),
+        );
+        assert_eq!(got, "thinkingroot-cloud");
+    }
+
+    // `std::path::Path::file_name` only treats `\` as a separator on Windows
+    // hosts, so this normalisation is necessarily platform-specific.
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_falls_back_to_basename_when_basename_is_mounted() {
+        let got = resolve_workspace_arg_with(
+            Some(r"C:\Users\naveen\Desktop\thinkingroot-cloud"),
+            None,
+            mounted(&["thinkingroot-cloud"]),
+        );
+        assert_eq!(got, "thinkingroot-cloud");
+    }
+
+    #[test]
+    fn unknown_path_returns_input_unchanged_so_engine_emits_precise_error() {
+        // We deliberately do NOT silently rewrite to basename when basename is
+        // also unmounted — let the downstream lookup produce a real error
+        // message so users see the value they actually sent.
+        let got = resolve_workspace_arg_with(
+            Some("/some/random/path"),
+            None,
+            mounted(&["thinkingroot-cloud"]),
+        );
+        assert_eq!(got, "/some/random/path");
+    }
+
+    #[test]
+    fn unknown_bare_name_returns_input_unchanged() {
+        let got = resolve_workspace_arg_with(
+            Some("nope"),
+            Some("thinkingroot-cloud"),
+            mounted(&["thinkingroot-cloud"]),
+        );
+        // Unknown bare name does NOT silently rewrite to default — preserve
+        // the value so the caller sees the precise lookup error.
+        assert_eq!(got, "nope");
+    }
+
+    #[test]
+    fn missing_arg_uses_default_ws() {
+        let got = resolve_workspace_arg_with(
+            None,
+            Some("thinkingroot-cloud"),
+            mounted(&["thinkingroot-cloud"]),
+        );
+        assert_eq!(got, "thinkingroot-cloud");
+    }
+
+    #[test]
+    fn missing_arg_and_no_default_falls_back_to_literal_default() {
+        let got = resolve_workspace_arg_with(None, None, mounted(&[]));
+        assert_eq!(got, "default");
     }
 }

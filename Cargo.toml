@@ -16,7 +16,13 @@ members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/tr-c2pa",
     "crates/tr-format",
+    "crates/tr-identity",
+    "crates/tr-render",
+    "crates/tr-revocation",
+    "crates/tr-transparency",
+    "crates/tr-verify",
     "thinkingroot-python",
 ]
 # thinkingroot-python is a PyO3 cdylib that must be built via maturin.
@@ -38,7 +44,13 @@ default-members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/tr-c2pa",
     "crates/tr-format",
+    "crates/tr-identity",
+    "crates/tr-render",
+    "crates/tr-revocation",
+    "crates/tr-transparency",
+    "crates/tr-verify",
 ]
 
 [workspace.package]
@@ -61,13 +73,20 @@ thinkingroot-parse   = { path = "crates/thinkingroot-parse",   version = "0.9.0"
 thinkingroot-extract = { path = "crates/thinkingroot-extract", version = "0.9.0" }
 thinkingroot-link    = { path = "crates/thinkingroot-link",    version = "0.9.0" }
 thinkingroot-compile = { path = "crates/thinkingroot-compile", version = "0.9.0" }
-thinkingroot-verify  = { path = "crates/thinkingroot-verify",  version = "0.9.0" }
+thinkingroot-verify-internal = { path = "crates/thinkingroot-verify", version = "0.9.0" }
 thinkingroot-serve   = { path = "crates/thinkingroot-serve",   version = "0.9.0", default-features = false }
 thinkingroot-safety  = { path = "crates/thinkingroot-safety",  version = "0.9.0" }
 thinkingroot-branch  = { path = "crates/thinkingroot-branch",  version = "0.9.0", default-features = false }
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
 thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }
 thinkingroot-reflect = { path = "crates/thinkingroot-reflect", version = "0.9.0" }
+tr-c2pa              = { path = "crates/tr-c2pa",              version = "0.9.1" }
+tr-format            = { path = "crates/tr-format",            version = "0.9.1" }
+tr-identity          = { path = "crates/tr-identity",          version = "0.9.1" }
+tr-render            = { path = "crates/tr-render",            version = "0.9.1" }
+tr-revocation        = { path = "crates/tr-revocation",        version = "0.9.1" }
+tr-transparency      = { path = "crates/tr-transparency",      version = "0.9.1" }
+tr-verify            = { path = "crates/tr-verify",            version = "0.9.1" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -93,6 +112,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Hashing
 blake3 = "1"
+
+# Cryptography (used by tr-revocation + tr-verify)
+ed25519-dalek = "2"
+base64        = "0.22"
 
 # Config
 toml = "0.8"

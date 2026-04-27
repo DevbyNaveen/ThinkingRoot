@@ -36,6 +36,7 @@ pub struct PackBuilder {
     manifest: Manifest,
     entries: BTreeMap<String, Vec<u8>>,
     zstd_level: i32,
+    keep_generated_at: bool,
 }
 
 impl PackBuilder {
@@ -47,6 +48,7 @@ impl PackBuilder {
             manifest,
             entries: BTreeMap::new(),
             zstd_level: 3,
+            keep_generated_at: false,
         }
     }
 
@@ -54,6 +56,20 @@ impl PackBuilder {
     /// range is `1..=22`. Callers producing benchmarks may want `19`.
     pub fn with_zstd_level(mut self, level: i32) -> Self {
         self.zstd_level = level.clamp(1, 22);
+        self
+    }
+
+    /// Preserve the manifest's existing `generated_at` value instead of
+    /// stamping it to `now()` at build time.
+    ///
+    /// Required for sign-then-pack flows: the canonical manifest bytes
+    /// the signature covers include `generated_at`, so the signer must
+    /// fix that field *before* signing, and the builder must not
+    /// overwrite it. `content_hash` is still recomputed (the canonical
+    /// form blanks it before serialising, so the recomputation is
+    /// stable as long as every other field is fixed).
+    pub fn keep_generated_at(mut self) -> Self {
+        self.keep_generated_at = true;
         self
     }
 
@@ -82,7 +98,9 @@ impl PackBuilder {
     /// payload. Returns the tar+zstd bytes ready to write to disk or
     /// upload.
     pub fn build(mut self) -> Result<Vec<u8>> {
-        self.manifest.generated_at = chrono::Utc::now();
+        if !self.keep_generated_at {
+            self.manifest.generated_at = chrono::Utc::now();
+        }
         // First compute the hash with `content_hash` blanked, then fill
         // it in. `compute_content_hash` already handles the blanking.
         self.manifest.content_hash = self.manifest.compute_content_hash()?;

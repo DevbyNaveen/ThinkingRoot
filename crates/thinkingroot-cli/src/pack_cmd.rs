@@ -36,12 +36,57 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use tr_format::{
-    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, Manifest, Version,
+    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, Manifest, TrustTier, Version,
 };
+use tr_revocation::{CacheConfig, RevocationCache};
+use tr_verify::{
+    AuthorKeyStore, RevokedDetails, TamperedKind, Verdict, Verifier, VerifierConfig,
+};
+
+use crate::resolver::{HttpDirectUrlResolver, HttpRegistryResolver, LocalFsResolver, PackResolver};
+
+// -----------------------------------------------------------------------------
+// Exit codes for `root install` verdict refusals (Phase F design §2.3).
+// -----------------------------------------------------------------------------
+
+/// Pack is unsigned and policy required a signature.
+pub const EXIT_UNSIGNED: i32 = 70;
+/// Manifest hash mismatch, archive corruption, or signature payload
+/// did not verify.
+pub const EXIT_TAMPERED: i32 = 71;
+/// Pack content hash is on the revocation deny-list.
+pub const EXIT_REVOKED: i32 = 72;
+/// T1 author key is not in the local trust store.
+pub const EXIT_KEY_UNKNOWN: i32 = 73;
+/// Revocation cache is past the stale-grace window.
+pub const EXIT_STALE_CACHE: i32 = 74;
+/// Trust tier is recognised but verification not yet implemented
+/// (T2+ Sigstore — Step 4b).
+pub const EXIT_UNSUPPORTED: i32 = 75;
+
+/// Refusal returned by `run_install` when verification rejects the
+/// pack. Carries an exit code so `main.rs` can `process::exit` with the
+/// right number after printing the user-facing message.
+#[derive(Debug)]
+pub struct InstallRefused {
+    /// One of the `EXIT_*` constants above.
+    pub exit_code: i32,
+    /// Pre-formatted user-facing message.
+    pub message: String,
+}
+
+impl std::fmt::Display for InstallRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for InstallRefused {}
 
 /// Directory entries inside `.thinkingroot/` that should never end up
 /// in a `.tr` file.
@@ -274,15 +319,85 @@ where
 /// otherwise the built-in default `https://thinkingroot.dev`.
 /// `--registry <url>` (passed via `registry_override`) overrides all
 /// of the above for one invocation.
+/// Resolve a pack reference, parse its manifest, and print a human-
+/// readable preview to stdout — no verification, no extraction. Used
+/// by `root install --dry-run` and the desktop install sheet path
+/// (which calls into `tr-render` directly via Tauri).
+pub async fn run_install_dry_run(
+    reference: &str,
+    registry_override: Option<String>,
+) -> Result<()> {
+    let install_ref = parse_install_ref(reference)?;
+    let resolver = build_resolver(install_ref, registry_override)?;
+    let bytes = resolver.resolve().await?;
+    let pack = tr_reader::read_bytes(&bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
+    let preview = tr_render::render_preview(&pack.manifest, &bytes)
+        .map_err(|e| anyhow!("render preview: {e}"))?;
+
+    println!("{}", preview.manifest_table);
+    println!();
+    println!("{}", preview.markdown);
+    println!(
+        "(dry-run — nothing extracted; pass without `--dry-run` to install)"
+    );
+    Ok(())
+}
+
 pub async fn run_install(
     reference: &str,
     target: Option<PathBuf>,
     registry_override: Option<String>,
+    allow_unsigned: bool,
 ) -> Result<()> {
-    let bytes = match parse_install_ref(reference)? {
-        InstallRef::Local(path) => fs::read(&path)
-            .with_context(|| format!("read {}", path.display()))?,
-        InstallRef::DirectUrl(url) => fetch_direct_url(&url).await?,
+    let install_ref = parse_install_ref(reference)?;
+    let registry_url_for_verifier = match (&install_ref, &registry_override) {
+        (InstallRef::Registry { .. }, Some(url)) => url.clone(),
+        (InstallRef::Registry { .. }, None) => load_default_registry()?,
+        // Local + direct-URL installs do not have a single canonical
+        // registry URL. Use the built-in default so the revocation
+        // cache lives in a deterministic location across invocations.
+        _ => BUILTIN_DEFAULT_REGISTRY.to_string(),
+    };
+    let is_remote = matches!(
+        install_ref,
+        InstallRef::DirectUrl(_) | InstallRef::Registry { .. }
+    );
+    let verifier =
+        build_default_verifier(&registry_url_for_verifier, is_remote, allow_unsigned)?;
+    install_with_verifier(reference, target, registry_override, &verifier).await
+}
+
+/// Test-friendly entry point that takes a pre-built [`Verifier`].
+///
+/// Production callers use [`run_install`], which constructs a default
+/// verifier from the system cache directory and pinned keys. Tests
+/// pass a fixture-backed verifier so they can exercise revoked /
+/// tampered / unknown-key paths without touching the user's home
+/// directory.
+pub async fn install_with_verifier(
+    reference: &str,
+    target: Option<PathBuf>,
+    registry_override: Option<String>,
+    verifier: &Verifier,
+) -> Result<()> {
+    let install_ref = parse_install_ref(reference)?;
+    let resolver = build_resolver(install_ref, registry_override)?;
+    let bytes = resolver.resolve().await?;
+    install_from_bytes_with_verifier(&bytes, target, verifier).await
+}
+
+/// Dispatch an [`InstallRef`] to the right [`PackResolver`].
+///
+/// The [`crate::resolver::PackResolver`] trait keeps the system open
+/// to future backends (OCI, S3-mirror, IPFS) — adding a new resolver
+/// means a new arm here, not a rewrite of `install_with_verifier`.
+pub(crate) fn build_resolver(
+    install_ref: InstallRef,
+    registry_override: Option<String>,
+) -> Result<Box<dyn PackResolver>> {
+    Ok(match install_ref {
+        InstallRef::Local(path) => Box::new(LocalFsResolver::new(path)),
+        InstallRef::DirectUrl(url) => Box::new(HttpDirectUrlResolver::new(url)),
         InstallRef::Registry {
             owner,
             slug,
@@ -292,16 +407,48 @@ pub async fn run_install(
                 Some(url) => url,
                 None => load_default_registry()?,
             };
-            fetch_via_registry(&registry, &owner, &slug, &version).await?
+            Box::new(HttpRegistryResolver::new(registry, owner, slug, version))
         }
+    })
+}
+
+fn build_default_verifier(
+    registry_url: &str,
+    is_remote: bool,
+    user_allow_unsigned: bool,
+) -> Result<Verifier> {
+    let url = url::Url::parse(registry_url)
+        .with_context(|| format!("parse registry url `{registry_url}`"))?;
+    let cache_dir = tr_revocation::default_cache_dir()
+        .ok_or_else(|| anyhow!("no platform cache directory available"))?;
+    let cache = Arc::new(RevocationCache::new(CacheConfig::defaults_for(
+        url, cache_dir,
+    )));
+
+    // Local installs default to T0 (no signature required); remote
+    // installs require T1 unless the user passes --allow-unsigned.
+    let (require_min_tier, default_allow) = if is_remote {
+        (TrustTier::T1, false)
+    } else {
+        (TrustTier::T0, true)
     };
-    install_from_bytes(&bytes, target)
+    let allow_unsigned = user_allow_unsigned || default_allow;
+
+    Ok(Verifier::new(VerifierConfig {
+        revocation: cache,
+        // v0.1 ships no preconfigured author keys; users opt in by
+        // running `root key trust import <id>` once that subcommand
+        // lands (Step 6 / Phase G CLI consolidation).
+        author_keys: Arc::new(AuthorKeyStore::empty()),
+        require_min_tier,
+        allow_unsigned,
+    }))
 }
 
 /// A user-supplied install target — local file, direct URL, or
 /// registry coordinate.
 #[derive(Debug, PartialEq, Eq)]
-enum InstallRef {
+pub(crate) enum InstallRef {
     Local(PathBuf),
     DirectUrl(String),
     Registry {
@@ -389,7 +536,7 @@ fn registry_config_path() -> Option<PathBuf> {
 
 /// Build the shared HTTPS client used for both registry and direct-URL
 /// fetches. Pinned timeouts and a stable user-agent.
-fn http_client() -> Result<reqwest::Client> {
+pub(crate) fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("thinkingroot/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
@@ -402,7 +549,7 @@ fn http_client() -> Result<reqwest::Client> {
 /// localhost is a downgrade attack vector — the registry serves
 /// content-addressed bytes, but TLS still protects against a MITM
 /// substituting a different (validly-hashed) pack.
-fn refuse_insecure_http(url: &str) -> Result<()> {
+pub(crate) fn refuse_insecure_http(url: &str) -> Result<()> {
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") {
         return Ok(());
@@ -430,147 +577,119 @@ fn refuse_insecure_http(url: &str) -> Result<()> {
     ))
 }
 
-/// Fetch a `.tr` directly from a URL (no registry resolution).
-async fn fetch_direct_url(url: &str) -> Result<Vec<u8>> {
-    refuse_insecure_http(url)?;
-    let client = http_client()?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
-    let resp = resp
-        .error_for_status()
-        .with_context(|| format!("GET {}", url))?;
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("read body from {}", url))?;
-    Ok(bytes.to_vec())
-}
+// `fetch_direct_url` and `fetch_via_registry` were moved into
+// `crate::resolver::http` (Phase C, Step 7). Their bodies now live in
+// `HttpDirectUrlResolver::resolve` and `HttpRegistryResolver::resolve`
+// respectively. Dispatch happens through [`build_resolver`].
 
-/// Fetch the discovery document, then fetch the pack's `.tr` bytes via
-/// the advertised endpoint, verify the content hash, and return.
-async fn fetch_via_registry(
-    registry_url: &str,
-    owner: &str,
-    slug: &str,
-    version: &str,
-) -> Result<Vec<u8>> {
-    refuse_insecure_http(registry_url)?;
-    let registry_url = registry_url.trim_end_matches('/');
-    let client = http_client()?;
-
-    // 1. Discovery doc.
-    let discovery_url = format!("{}/.well-known/tr-registry.json", registry_url);
-    let disco: serde_json::Value = client
-        .get(&discovery_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", discovery_url))?
-        .error_for_status()
-        .with_context(|| format!("GET {}", discovery_url))?
-        .json()
-        .await
-        .with_context(|| format!("parse JSON from {}", discovery_url))?;
-
-    let registry_fmt = disco["format_version"].as_str().unwrap_or("");
-    if registry_fmt != "tr-registry/1" {
-        return Err(anyhow!(
-            "registry at {} advertises unsupported format_version `{}`",
-            registry_url,
-            registry_fmt
-        ));
-    }
-    let advertised_tr_fmt = disco["tr_format"].as_str().unwrap_or("");
-    if advertised_tr_fmt != tr_format::manifest::FORMAT_VERSION {
-        return Err(anyhow!(
-            "registry advertises tr_format `{}` but this client only handles `{}`",
-            advertised_tr_fmt,
-            tr_format::manifest::FORMAT_VERSION
-        ));
-    }
-    let pattern = disco["endpoints"]["download"]
-        .as_str()
-        .ok_or_else(|| anyhow!("registry doc missing endpoints.download"))?;
-    let max_bytes = disco["max_pack_bytes"]
-        .as_u64()
-        .unwrap_or(tr_reader::DEFAULT_SIZE_CAP);
-
-    // 2. Build the download URL by template substitution.
-    let download_path = pattern
-        .replace("{owner}", owner)
-        .replace("{slug}", slug)
-        .replace("{version}", version);
-    let download_url = format!("{}{}", registry_url, download_path);
-
-    // 3. Fetch the bytes.
-    let resp = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", download_url))?
-        .error_for_status()
-        .with_context(|| format!("GET {}", download_url))?;
-
-    if let Some(cl) = resp.content_length() {
-        if cl > max_bytes {
-            return Err(anyhow!(
-                "registry advertised content-length {} exceeds max_pack_bytes {} for {}/{}",
-                cl,
-                max_bytes,
-                owner,
-                slug
-            ));
-        }
-    }
-    // Capture the registry-advertised hash before consuming the body —
-    // this is independent verification on top of the manifest's own
-    // canonical-bytes hash that `tr_format::reader` checks.
-    let advertised_hash: Option<String> = resp
-        .headers()
-        .get("x-tr-content-hash")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let bytes = resp
-        .bytes()
-        .await
-        .with_context(|| format!("read body from {}", download_url))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(anyhow!(
-            "registry returned {} bytes, exceeds max_pack_bytes {}",
-            bytes.len(),
-            max_bytes
-        ));
-    }
-
-    // 4. Defense-in-depth hash check. If the registry put a hash in
-    // the response header, verify the body matches before we even
-    // hand it to `tr_format::reader`.
-    if let Some(expected) = &advertised_hash {
-        let actual = blake3_hex(&bytes);
-        if &actual != expected {
-            return Err(anyhow!(
-                "content hash mismatch for {}/{}@{}: registry advertised `{}`, computed `{}`",
-                owner,
-                slug,
-                version,
-                expected,
-                actual
-            ));
-        }
-    }
-    Ok(bytes.to_vec())
-}
-
-/// Extract a `.tr` byte slice into the target directory's
-/// `.thinkingroot/`. Pulled out so registry-fetched and locally-loaded
-/// bytes share one unpack path.
-fn install_from_bytes(bytes: &[u8], target: Option<PathBuf>) -> Result<()> {
+/// Verify a `.tr` byte slice against the supplied [`Verifier`] and,
+/// on a `Verified` verdict, extract its contents into the target
+/// directory's `.thinkingroot/`. Used by both [`run_install`]
+/// (production) and [`install_with_verifier`] (tests).
+async fn install_from_bytes_with_verifier(
+    bytes: &[u8],
+    target: Option<PathBuf>,
+    verifier: &Verifier,
+) -> Result<()> {
     let pack = tr_reader::read_bytes(bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
-    let manifest = &pack.manifest;
+    let verdict = verifier
+        .verify(&pack)
+        .await
+        .map_err(|e| anyhow!("verifier: {e}"))?;
+    enforce_verdict(&pack, verdict)?;
+    extract_pack_to_target(&pack, target)
+}
 
+/// Map a [`Verdict`] to either `Ok(())` (continue install) or an
+/// [`InstallRefused`] error carrying the right exit code + message.
+fn enforce_verdict(pack: &tr_reader::Pack, verdict: Verdict) -> Result<()> {
+    match verdict {
+        Verdict::Verified(d) => {
+            tracing::info!(
+                tier = ?d.tier,
+                author = ?d.author_id,
+                rekor_log_index = ?d.sigstore_log_index,
+                revocation_freshness_secs = d.revocation_freshness_secs,
+                "verified {} {}",
+                pack.manifest.name,
+                pack.manifest.version
+            );
+            Ok(())
+        }
+        Verdict::Unsigned => Err(InstallRefused {
+            exit_code: EXIT_UNSIGNED,
+            message: format!(
+                "✗ refusing to install unsigned pack `{}` — pass --allow-unsigned to override (https-only)",
+                pack.manifest.name
+            ),
+        }
+        .into()),
+        Verdict::Tampered(kind) => Err(InstallRefused {
+            exit_code: EXIT_TAMPERED,
+            message: format_tampered(&pack.manifest, &kind),
+        }
+        .into()),
+        Verdict::Revoked(d) => Err(InstallRefused {
+            exit_code: EXIT_REVOKED,
+            message: format_revoked(&d),
+        }
+        .into()),
+        Verdict::KeyUnknown { key_id } => Err(InstallRefused {
+            exit_code: EXIT_KEY_UNKNOWN,
+            message: format!(
+                "✗ pack `{}` is signed by author key `{key_id}` which is not in your trust store",
+                pack.manifest.name
+            ),
+        }
+        .into()),
+        Verdict::StaleCache { age_days } => Err(InstallRefused {
+            exit_code: EXIT_STALE_CACHE,
+            message: format!(
+                "✗ revocation cache is {age_days} days old — refusing. Run `root revoked refresh` while online."
+            ),
+        }
+        .into()),
+        Verdict::Unsupported { tier, reason } => Err(InstallRefused {
+            exit_code: EXIT_UNSUPPORTED,
+            message: format!(
+                "✗ this `root` build cannot verify {tier:?} packs yet ({reason}). Upgrade to a release that bundles the Sigstore trust root."
+            ),
+        }
+        .into()),
+    }
+}
+
+fn format_tampered(manifest: &Manifest, kind: &TamperedKind) -> String {
+    let detail = match kind {
+        TamperedKind::ManifestHashMismatch { expected, actual } => format!(
+            "manifest body hash mismatch (expected `{expected}`, computed `{actual}`)"
+        ),
+        TamperedKind::ArchiveCorrupt(msg) => format!("archive corrupt: {msg}"),
+        TamperedKind::SignaturePayloadMismatch => {
+            "signature does not match the pack's contents".to_string()
+        }
+    };
+    format!("✗ pack `{}` failed integrity check: {detail}", manifest.name)
+}
+
+fn format_revoked(d: &RevokedDetails) -> String {
+    format!(
+        "✗ pack `{}@{}` was revoked by {:?} on epoch {} (reason: {:?}) — see {}",
+        d.advisory.pack,
+        d.advisory.version,
+        d.advisory.authority,
+        d.advisory.revoked_at,
+        d.advisory.reason,
+        d.advisory.details_url,
+    )
+}
+
+/// Extract a verified pack's payload + manifest into `target`. Pulled
+/// out of [`install_from_bytes_with_verifier`] for clarity — the unpack
+/// step never produces an [`InstallRefused`] (any failure here is an
+/// I/O error that bubbles via `anyhow`).
+fn extract_pack_to_target(pack: &tr_reader::Pack, target: Option<PathBuf>) -> Result<()> {
+    let manifest = &pack.manifest;
     let target_dir = match target {
         Some(t) => t,
         None => default_install_dir(manifest)?,
@@ -690,7 +809,9 @@ description = "Round-trip test pack."
         // Install into a fresh target via the new string-keyed entry point.
         let install_tmp = tempdir().unwrap();
         let target = install_tmp.path().join("install-here");
-        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None)
+        // T0 unsigned local pack — `allow_unsigned: true` is the local
+        // default but pass explicitly for clarity.
+        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None, true)
             .await
             .unwrap();
 
@@ -807,7 +928,7 @@ description = "Round-trip test pack."
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
-        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None)
+        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None, true)
             .await
             .unwrap();
         assert!(target.join("manifest.json").exists());
@@ -821,16 +942,23 @@ description = "Round-trip test pack."
         let good_tr = workspace.join("good.tr");
         run_pack(&workspace, Some(good_tr.clone()), None, None, None, None).unwrap();
 
-        // Corrupt the file (flip a byte in the middle).
+        // Corrupt the file deterministically: zero out a 64-byte run
+        // in the middle of the zstd stream + truncate the trailing
+        // checksum. Flipping a single byte was probabilistically
+        // recoverable by zstd's error correction.
         let mut bytes = fs::read(&good_tr).unwrap();
         let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
+        let end = (mid + 64).min(bytes.len());
+        for b in &mut bytes[mid..end] {
+            *b = 0;
+        }
+        bytes.truncate(bytes.len().saturating_sub(8));
         let bad_tr = workspace.join("bad.tr");
         fs::write(&bad_tr, &bytes).unwrap();
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
-        let err = run_install(bad_tr.to_str().unwrap(), Some(target), None)
+        let err = run_install(bad_tr.to_str().unwrap(), Some(target), None, true)
             .await
             .expect_err("must reject corrupted .tr");
         let msg = format!("{err}");
@@ -993,10 +1121,14 @@ description = "Round-trip test pack."
         // 3. Drive `root install` against the live test registry.
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("installed");
+        // The fixture pack is T0 (run_pack ships unsigned by default) and
+        // we're installing remotely — pass --allow-unsigned to flip the
+        // remote-default policy.
         run_install(
             "alice/demo@0.1.0",
             Some(target.clone()),
             Some(registry_url.clone()),
+            true,
         )
         .await
         .unwrap();
@@ -1077,6 +1209,7 @@ description = "Round-trip test pack."
             "alice/demo@0.1.0",
             Some(target),
             Some(registry_url),
+            true,
         )
         .await
         .expect_err("hash mismatch must abort install");
@@ -1113,6 +1246,7 @@ description = "Round-trip test pack."
             "alice/demo@0.1.0",
             Some(target),
             Some(registry_url),
+            true,
         )
         .await
         .expect_err("foreign registry format must be refused");
@@ -1121,5 +1255,289 @@ description = "Round-trip test pack."
             format!("{err}").contains("unsupported format_version"),
             "got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Trust-verification integration (Phase F Step 5)
+    //
+    // These tests exercise the policy + extraction layer in
+    // `install_with_verifier`. The verdict semantics themselves are
+    // already covered by `crates/tr-verify/tests/verify_smoke.rs`; these
+    // tests confirm that each verdict maps to the right `InstallRefused`
+    // exit code and that the file extraction step does NOT run on
+    // refusal.
+    // -------------------------------------------------------------------------
+
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tr_format::TrustTier;
+    use tr_revocation::{
+        Advisory, Authority, CacheConfig, PinnedKey, Reason, RevocationCache, Snapshot,
+    };
+    use tr_verify::{AuthorKeyStore, TrustedAuthorKey, Verifier, VerifierConfig};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn fresh_revocation_cache(
+        cache_dir: PathBuf,
+        revocation_key: &SigningKey,
+        revoked_hashes: &[&str],
+    ) -> Arc<RevocationCache> {
+        let mut snap = Snapshot {
+            schema_version: "1.0.0".into(),
+            generated_at: 1_745_100_000,
+            generated_by: "hub.example".into(),
+            full_list: true,
+            entries: revoked_hashes
+                .iter()
+                .map(|h| Advisory {
+                    content_hash: format!("blake3:{h}"),
+                    pack: "alice/thesis".into(),
+                    version: "0.1.0".into(),
+                    reason: Reason::Malware,
+                    revoked_at: 1_745_099_000,
+                    authority: Authority::HubScanner,
+                    details_url: "https://example/advisory".into(),
+                })
+                .collect(),
+            signature: String::new(),
+            signing_key_id: "rev-test".into(),
+            next_poll_hint_sec: 3_600,
+        };
+        let payload = snap.canonical_bytes_for_signing().unwrap();
+        let sig = revocation_key.sign(&payload);
+        snap.signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(
+            cache_dir.join("snapshot.json"),
+            serde_json::to_vec(&snap).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            cache_dir.join("snapshot.fetched_at"),
+            unix_now().to_string(),
+        )
+        .unwrap();
+
+        Arc::new(RevocationCache::new(CacheConfig {
+            registry_url: url::Url::parse("https://hub.example/").unwrap(),
+            cache_dir,
+            fresh_ttl: Duration::from_secs(60 * 60),
+            stale_grace: Duration::from_secs(7 * 24 * 60 * 60),
+            trusted_keys: vec![PinnedKey {
+                key_id: "rev-test".into(),
+                ed25519_public: revocation_key.verifying_key().to_bytes(),
+            }],
+            max_snapshot_bytes: 50 * 1024 * 1024,
+        }))
+    }
+
+    fn build_unsigned_pack(name: &str, tier: TrustTier) -> Vec<u8> {
+        let mut manifest = Manifest::new(name, Version::parse("0.1.0").unwrap(), "Apache-2.0");
+        manifest.trust_tier = tier;
+        let mut pb = PackBuilder::new(manifest);
+        pb.put_text("artifacts/card.md", "# Hello").unwrap();
+        pb.build().unwrap()
+    }
+
+    fn build_t1_signed_pack(name: &str, key: &SigningKey, key_id: &str) -> Vec<u8> {
+        let mut manifest = Manifest::new(name, Version::parse("0.1.0").unwrap(), "Apache-2.0");
+        manifest.trust_tier = TrustTier::T1;
+        manifest.authors = vec![key_id.to_string()];
+
+        let canonical = manifest.canonical_bytes_for_hashing().unwrap();
+        let signature = key.sign(&canonical);
+
+        let mut pb = PackBuilder::new(manifest).keep_generated_at();
+        pb.put_file("signatures/author.sig", &signature.to_bytes())
+            .unwrap();
+        pb.put_text("artifacts/card.md", "# T1 demo").unwrap();
+        pb.build().unwrap()
+    }
+
+    fn write_pack_to_disk(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn refuse_exit_code(err: &anyhow::Error) -> i32 {
+        err.downcast_ref::<InstallRefused>()
+            .map(|r| r.exit_code)
+            .unwrap_or_else(|| panic!("expected InstallRefused, got: {err}"))
+    }
+
+    #[tokio::test]
+    async fn install_succeeds_for_t1_pack_with_trusted_author_key() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(20);
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
+
+        let author = signing_key(21);
+        let pack_bytes = build_t1_signed_pack("alice/thesis", &author, "alice");
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-thesis.tr", &pack_bytes);
+
+        let store = Arc::new(AuthorKeyStore::with_keys([TrustedAuthorKey {
+            key_id: "alice".into(),
+            ed25519_public: author.verifying_key().to_bytes(),
+        }]));
+        let verifier = Verifier::new(VerifierConfig {
+            revocation: cache,
+            author_keys: store,
+            require_min_tier: TrustTier::T1,
+            allow_unsigned: false,
+        });
+
+        let target = tmp.path().join("install");
+        install_with_verifier(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &verifier,
+        )
+        .await
+        .expect("T1 install with trusted key should succeed");
+
+        assert!(target.join("manifest.json").exists());
+        assert!(target.join(".thinkingroot/artifacts/card.md").exists());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_unsigned_pack_with_exit_unsigned() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(22);
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
+
+        let pack_bytes = build_unsigned_pack("alice/demo", TrustTier::T0);
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-demo.tr", &pack_bytes);
+
+        let verifier = Verifier::new(VerifierConfig {
+            revocation: cache,
+            author_keys: Arc::new(AuthorKeyStore::empty()),
+            require_min_tier: TrustTier::T1,
+            allow_unsigned: false,
+        });
+
+        let target = tmp.path().join("install");
+        let err = install_with_verifier(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("unsigned pack should be refused");
+
+        assert_eq!(refuse_exit_code(&err), EXIT_UNSIGNED);
+        // Refusal must NOT extract files.
+        assert!(!target.exists(), "target dir should not exist on refusal");
+    }
+
+    #[tokio::test]
+    async fn install_refuses_revoked_pack_with_exit_revoked() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(23);
+
+        let pack_bytes = build_unsigned_pack("alice/bad", TrustTier::T0);
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-bad.tr", &pack_bytes);
+        let pack = tr_reader::read_bytes(&pack_bytes).unwrap();
+
+        let cache = fresh_revocation_cache(
+            tmp.path().join("rev"),
+            &rev_key,
+            &[&pack.content_bytes_hash],
+        );
+        let verifier = Verifier::new(VerifierConfig {
+            revocation: cache,
+            author_keys: Arc::new(AuthorKeyStore::empty()),
+            require_min_tier: TrustTier::T0,
+            allow_unsigned: true,
+        });
+
+        let target = tmp.path().join("install");
+        let err = install_with_verifier(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("revoked pack should be refused");
+
+        assert_eq!(refuse_exit_code(&err), EXIT_REVOKED);
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_t1_with_unknown_author_key() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(24);
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
+
+        let author = signing_key(25);
+        let pack_bytes = build_t1_signed_pack("alice/thesis", &author, "alice-unknown");
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-unknown.tr", &pack_bytes);
+
+        let verifier = Verifier::new(VerifierConfig {
+            revocation: cache,
+            author_keys: Arc::new(AuthorKeyStore::empty()),
+            require_min_tier: TrustTier::T1,
+            allow_unsigned: false,
+        });
+
+        let target = tmp.path().join("install");
+        let err = install_with_verifier(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("unknown-key T1 pack should be refused");
+
+        assert_eq!(refuse_exit_code(&err), EXIT_KEY_UNKNOWN);
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_t2_pack_with_exit_unsupported() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(26);
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
+
+        let pack_bytes = build_unsigned_pack("alice/sigstore-demo", TrustTier::T2);
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-sigstore.tr", &pack_bytes);
+
+        let verifier = Verifier::new(VerifierConfig {
+            revocation: cache,
+            author_keys: Arc::new(AuthorKeyStore::empty()),
+            require_min_tier: TrustTier::T1,
+            allow_unsigned: false,
+        });
+
+        let target = tmp.path().join("install");
+        let err = install_with_verifier(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("T2 pack should be refused until Step 4b");
+
+        assert_eq!(refuse_exit_code(&err), EXIT_UNSUPPORTED);
+        assert!(!target.exists());
     }
 }

@@ -15,7 +15,7 @@ rust-version.workspace  = true
 [dependencies]
 thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
-thinkingroot-verify = { workspace = true }
+thinkingroot-verify-internal = { workspace = true }
 blake3 = "1"
 fs2 = "0.4"
 chrono = { workspace = true }
