@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use thinkingroot_extract::llm::LlmClient;
+use thinkingroot_extract::llm::{ChatStream, LlmClient};
 
 use crate::engine::ClaimSearchHit;
 use crate::intelligence::augmenter::{extract_relevant_snippets, load_raw_sources};
@@ -222,6 +222,26 @@ pub async fn ask(
 // ---------------------------------------------------------------------------
 
 async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest<'_>) -> String {
+    let user_msg = build_user_message(claims, req);
+    let fut = llm.chat(HYBRID_SYNTHESIS_PROMPT, &user_msg);
+    match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => {
+            tracing::warn!("synthesizer: LLM error: {e}");
+            claims[0].statement.clone()
+        }
+        Err(_) => {
+            tracing::warn!("synthesizer: LLM timeout — using best claim");
+            claims[0].statement.clone()
+        }
+    }
+}
+
+/// Pure helper that assembles the per-question user message that goes
+/// alongside [`HYBRID_SYNTHESIS_PROMPT`] in any chat call. Shared by
+/// [`synthesize`] (one-shot) and [`ask_streaming`] (token-by-token)
+/// so the wire-prompt is identical regardless of transport.
+fn build_user_message(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String {
     let claim_limit = claim_limit(req.category);
 
     // Build claim notes (knowledge-update gets a MOST RECENT / OLDER split)
@@ -236,7 +256,6 @@ async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest
     // Build source section (session-count-adaptive)
     let (source_section, temporal_section) = build_source_section(req, &claim_notes);
 
-    // Assemble user message
     let date_section = if !req.question_date.is_empty() {
         format!("## TODAY (reference date)\n{}\n\n", req.question_date)
     } else {
@@ -245,22 +264,107 @@ async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest
 
     let category_label = category_label(req.category);
 
-    let user_msg = format!(
+    format!(
         "{category_label}\n{temporal_section}{date_section}## EXTRACTED CLAIMS ({} most relevant)\n{claim_notes}\n{source_section}## QUESTION\n{}",
         claims.len().min(claim_limit),
         req.question,
-    );
+    )
+}
 
-    let fut = llm.chat(HYBRID_SYNTHESIS_PROMPT, &user_msg);
-    match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(e)) => {
-            tracing::warn!("synthesizer: LLM error: {e}");
-            claims[0].statement.clone()
-        }
-        Err(_) => {
-            tracing::warn!("synthesizer: LLM timeout — using best claim");
-            claims[0].statement.clone()
+// ---------------------------------------------------------------------------
+// Streaming ask
+// ---------------------------------------------------------------------------
+
+/// Streaming counterpart of [`ask`]. Returns either a static answer
+/// (no claims / no LLM) or an open `ChatStream` the caller forwards
+/// to its transport.
+///
+/// The retrieval step runs identically to `ask` so the body of the
+/// answer is byte-identical between the two transports for the same
+/// input; only the *delivery* differs. This is what lets the engine's
+/// non-streaming `/ask` and streaming `/ask/stream` endpoints share a
+/// single retrieval pass.
+pub enum StreamingAnswer {
+    /// No streaming — either the workspace had no claims, or no LLM
+    /// is configured. The desktop renders this directly as the final
+    /// chunk and skips the SSE setup.
+    Static {
+        answer: String,
+        claims_used: usize,
+        category: String,
+    },
+    /// Live LLM stream. `claims_used` and `category` are emitted by
+    /// the SSE handler as a `meta` event before forwarding chunks.
+    Stream {
+        stream: ChatStream,
+        claims_used: usize,
+        category: String,
+    },
+}
+
+pub async fn ask_streaming(
+    engine: &crate::engine::QueryEngine,
+    llm: Option<Arc<LlmClient>>,
+    req: &AskRequest<'_>,
+) -> StreamingAnswer {
+    use crate::intelligence::retriever::retrieve_claims;
+
+    let mut claims = retrieve_claims(
+        engine,
+        req.workspace,
+        req.question,
+        req.category,
+        req.allowed_sources,
+        req.session_dates,
+        req.answer_sids,
+    )
+    .await;
+
+    if !req.excluded_claim_ids.is_empty() {
+        claims.retain(|c| !req.excluded_claim_ids.contains(&c.id));
+    }
+
+    let claims_used = claims.len();
+    let category = req.category.to_string();
+
+    if claims.is_empty() {
+        return StreamingAnswer::Static {
+            answer: "I don't have enough information to answer that.".to_string(),
+            claims_used: 0,
+            category,
+        };
+    }
+
+    let Some(llm_client) = llm else {
+        return StreamingAnswer::Static {
+            answer: claims[0].statement.clone(),
+            claims_used,
+            category,
+        };
+    };
+
+    let user_msg = build_user_message(&claims, req);
+
+    match llm_client
+        .chat_stream(HYBRID_SYNTHESIS_PROMPT, &user_msg)
+        .await
+    {
+        Ok(stream) => StreamingAnswer::Stream {
+            stream,
+            claims_used,
+            category,
+        },
+        Err(e) => {
+            // Connect-time failure — fall back to the highest-confidence
+            // claim verbatim, the same conservative default `ask` uses
+            // when the one-shot LLM call errors. Logging so operators
+            // can tell streaming from one-shot in metrics.
+            tracing::warn!("synthesizer: chat_stream open failed: {e} — using best claim");
+            StreamingAnswer::Static {
+                answer: claims[0].statement.clone(),
+                claims_used,
+                category,
+            }
         }
     }
 }

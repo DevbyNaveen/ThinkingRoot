@@ -42,7 +42,9 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 uuid = { workspace = true }
-tokio-stream = "0.1"
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
 regex = { workspace = true }
 lru = "0.12"
 

@@ -6,6 +6,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
@@ -134,6 +135,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/llm/health", get(llm_health_handler))
             .route("/ws/{ws}/search", get(search))
             .route("/ws/{ws}/ask", post(ask_handler))
+            .route("/ws/{ws}/ask/stream", post(ask_stream_handler))
             .route("/ws/{ws}/galaxy", get(get_galaxy))
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/verify", post(verify_ws))
@@ -818,6 +820,182 @@ async fn ask_handler(
         category: result.category,
     })
     .into_response()
+}
+
+// ─── Streaming Ask (SSE) ─────────────────────────────────────
+
+/// POST /api/v1/ws/{workspace}/ask/stream
+///
+/// Server-Sent-Events variant of `/ask`. Same retrieval pipeline,
+/// same prompt — but the LLM call goes through `chat_stream` and
+/// chunks are forwarded incrementally so the desktop chat surface
+/// renders tokens as they arrive instead of after the full
+/// synthesis finishes.
+///
+/// Event sequence on the wire (all `data:` is JSON):
+///
+/// ```text
+/// event: meta
+/// data: {"claims_used":12,"category":"single-session-user"}
+///
+/// event: token
+/// data: {"text":"The"}
+///
+/// event: token
+/// data: {"text":" answer"}
+///
+/// event: final
+/// data: {"claims_used":12,"category":"single-session-user","truncated":false}
+///
+/// event: error
+/// data: {"message":"connect: ..."}     # only on failure
+/// ```
+///
+/// Static branch (no claims OR no LLM): emits one `meta` event
+/// then a single `token` carrying the full fallback text plus a
+/// `final` — so the desktop never has to special-case "static
+/// vs streamed" on its end.
+async fn ask_stream_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<AskRequest>,
+) -> impl IntoResponse {
+    use crate::intelligence::synthesizer::{
+        AskRequest as SynthAskRequest, StreamingAnswer, ask_streaming,
+    };
+    use futures::StreamExt;
+    use std::collections::{HashMap, HashSet};
+
+    let engine = state.engine.read().await;
+
+    let sessions_dir = state
+        .workspace_root
+        .as_ref()
+        .cloned()
+        .or_else(|| engine.workspace_root_path(&ws))
+        .map(|p| p.join("sessions"))
+        .unwrap_or_else(|| std::path::PathBuf::from("sessions"));
+
+    let allowed_sources: HashSet<String> = body.session_scope.iter().cloned().collect();
+
+    let category = if !body.category_hint.is_empty() {
+        body.category_hint.clone()
+    } else {
+        let tmp_session = crate::intelligence::session::SessionContext::new("_ask", &ws);
+        match crate::intelligence::router::classify_query(&body.question, &tmp_session) {
+            crate::intelligence::router::QueryPath::Agentic => {
+                let q = body.question.to_lowercase();
+                if q.contains("when")
+                    || q.contains(" ago")
+                    || q.contains("last ")
+                    || q.contains("how many days")
+                {
+                    "temporal-reasoning".to_string()
+                } else {
+                    "multi-session".to_string()
+                }
+            }
+            crate::intelligence::router::QueryPath::Fast => "single-session-user".to_string(),
+        }
+    };
+
+    let llm = engine.workspace_llm(&ws);
+    let answer_sids = body.session_scope.clone();
+
+    let req = SynthAskRequest {
+        workspace: &ws,
+        question: &body.question,
+        category: &category,
+        allowed_sources: &allowed_sources,
+        question_date: &body.question_date,
+        session_dates: &HashMap::new(),
+        answer_sids: &answer_sids,
+        sessions_dir: &sessions_dir,
+        excluded_claim_ids: &HashSet::new(),
+    };
+
+    let outcome = ask_streaming(&engine, llm, &req).await;
+    drop(engine);
+
+    let stream = async_stream::stream! {
+        match outcome {
+            StreamingAnswer::Static { answer, claims_used, category } => {
+                let meta = serde_json::json!({
+                    "claims_used": claims_used,
+                    "category": category,
+                });
+                yield Ok::<Event, std::convert::Infallible>(
+                    Event::default().event("meta").data(meta.to_string())
+                );
+                if !answer.is_empty() {
+                    let payload = serde_json::json!({ "text": answer });
+                    yield Ok(
+                        Event::default().event("token").data(payload.to_string())
+                    );
+                }
+                let final_payload = serde_json::json!({
+                    "claims_used": claims_used,
+                    "category": category,
+                    "truncated": false,
+                });
+                yield Ok(
+                    Event::default().event("final").data(final_payload.to_string())
+                );
+            }
+            StreamingAnswer::Stream { mut stream, claims_used, category } => {
+                let meta = serde_json::json!({
+                    "claims_used": claims_used,
+                    "category": category,
+                });
+                yield Ok(
+                    Event::default().event("meta").data(meta.to_string())
+                );
+                let mut truncated = false;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(chunk) => {
+                            if !chunk.text.is_empty() {
+                                let payload =
+                                    serde_json::json!({ "text": chunk.text });
+                                yield Ok(
+                                    Event::default()
+                                        .event("token")
+                                        .data(payload.to_string())
+                                );
+                            }
+                            if let Some(finish) = chunk.finish {
+                                truncated = finish.truncated;
+                            }
+                        }
+                        Err(e) => {
+                            let payload =
+                                serde_json::json!({ "message": e.to_string() });
+                            yield Ok(
+                                Event::default()
+                                    .event("error")
+                                    .data(payload.to_string())
+                            );
+                            return;
+                        }
+                    }
+                }
+                let final_payload = serde_json::json!({
+                    "claims_used": claims_used,
+                    "category": category,
+                    "truncated": truncated,
+                });
+                yield Ok(
+                    Event::default().event("final").data(final_payload.to_string())
+                );
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 // ─── LLM Health (pre-flight) ─────────────────────────────────
