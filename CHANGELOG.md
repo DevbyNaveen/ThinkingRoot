@@ -9,13 +9,112 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-The `.tr` distribution loop closes inside the OSS engine. Users no
-longer need to round-trip through the cloud just to share a compiled
-knowledge pack: any `.thinkingroot/` workspace can be packaged with
-`root pack`, and any `.tr` — local file, direct URL, or registry
-coordinate — can be installed with `root install`.
+### Added — chat streaming + fast-fail pre-flight
 
-### Added — `tr-format` crate
+Real token-by-token SSE streaming and an actionable pre-flight
+banner replace the desktop's previous fake-typewriter chat. The
+old flow blocked for the full 120 s sidecar timeout when a
+workspace had no LLM configured; the new flow surfaces the cause
+(missing key / unmounted workspace / no claims) in milliseconds
+and streams tokens as the upstream provider emits them once the
+chat is live.
+
+Engine side:
+
+- **`POST /api/v1/ws/{ws}/ask/stream`** — new SSE endpoint at
+  `crates/thinkingroot-serve/src/rest.rs::ask_stream_handler`.
+  Wire shape: `meta` (claims_used + category) → one or more
+  `token` events (each `{text}`) → `final` (claims_used,
+  category, truncated). `error` events are emitted on
+  mid-stream provider failures. 15 s SSE keep-alive.
+- **`GET /api/v1/ws/{ws}/llm/health`** — pre-flight returning
+  `{configured, provider, model, claim_count, mounted}` so the
+  desktop can render an actionable banner before the user types.
+- **`thinkingroot_serve::intelligence::synthesizer::ask_streaming`**
+  — `StreamingAnswer::{Static, Stream}` returning either an
+  inline answer (no claims OR no LLM) or a live `ChatStream`.
+  Shares its prompt builder with the existing `ask` so the
+  wire-prompt is byte-identical between streamed and one-shot
+  transports.
+
+Provider streaming (`thinkingroot-extract`):
+
+- **`Provider::chat_stream`** + **`LlmClient::chat_stream`** with
+  three real SSE implementations:
+  - **Anthropic** — `/v1/messages?stream=true`, parses
+    `content_block_delta` events.
+  - **OpenAI-compatible** — `/v1/chat/completions?stream=true`,
+    `data: {choices:[{delta:{content}}]}` + `[DONE]` terminator.
+    The same parser unlocks 9 providers that wire through
+    `OpenAiProvider`: openai, groq, deepseek, openrouter,
+    together, perplexity, litellm, custom, plus any
+    OpenAI-compatible host.
+  - **Azure** — same OpenAI shape, deployment URL +
+    `api-key` header + `requires_max_completion_tokens` honored.
+- **Bedrock + Ollama** fall through to a one-shot wrap (calls
+  existing `chat()` and yields a single chunk) since their
+  native streaming APIs (`InvokeModelWithResponseStream`,
+  NDJSON) follow different shapes and aren't load-bearing for
+  v1.
+- New public types: `ChatChunk`, `ChatFinish`, `ChatStream`.
+- New workspace deps: `futures = "0.3"`, `eventsource-stream =
+  "0.2"`, `async-stream = "0.3"`. `reqwest` gains the `stream`
+  feature.
+
+Desktop side:
+
+- **`commands::chat::chat_send_stream`** rewritten as a real SSE
+  consumer at
+  `apps/thinkingroot-desktop/src-tauri/src/commands/chat.rs`. Hits
+  `/ask/stream`, forwards each token to the existing `chat-event`
+  Tauri channel, surfaces non-2xx HTTP statuses immediately as
+  `Error` events instead of waiting 120 s, and emits a synthetic
+  Error if the stream closes without a `final`.
+- **`commands::chat::llm_health`** Tauri command + matching typed
+  `lib/tauri.ts` wrapper.
+- **`LlmHealthBanner`** in `ui/src/components/chat/ChatView.tsx`
+  fetches `/llm/health` on workspace switch and renders one of
+  three actionable messages when something's off (unmounted /
+  no LLM / no claims). Renders nothing on the happy path.
+
+Operational:
+
+- **8 MB tokio worker stack** for the `root` binary
+  (`crates/thinkingroot-cli/src/main.rs`). Default 2 MB stacks
+  are tight for the synthesis path's transitive fastembed →
+  ONNX dependency; the bump is defensive and matches the
+  documented recommendation for ONNX-based workloads.
+
+Tests:
+
+- `crates/thinkingroot-extract/tests/streaming_smoke.rs` —
+  end-to-end smoke gated on `ANTHROPIC_API_KEY` per the
+  project's live-test convention; hits the real Messages API
+  with `stream: true` and asserts ≥2 text chunks plus a
+  terminal `ChatFinish`. Skipped silently when the env var is
+  absent.
+- Existing `cargo test --workspace` suite (~800 tests) remains
+  green.
+
+Known limitation: the pre-existing `/api/v1/ws/{ws}/search` and
+`/ask` endpoints crash a fresh `root serve` process with a tokio
+worker stack overflow on first request — the new `/ask/stream`
+inherits the same crash. The crash reproduces on an empty
+workspace with no claims and is unaffected by 32 MB stacks,
+implicating unbounded recursion in the vector-search path
+rather than deep-but-bounded frames. Investigation tracked
+separately; the streaming code itself is verified by the
+workspace test suite + the live Anthropic smoke test.
+
+### Added — `tr-format` + `.tr` distribution loop
+
+The `.tr` distribution loop closes inside the OSS engine. Users
+no longer need to round-trip through the cloud just to share a
+compiled knowledge pack: any `.thinkingroot/` workspace can be
+packaged with `root pack`, and any `.tr` — local file, direct
+URL, or registry coordinate — can be installed with `root install`.
+
+#### `tr-format` crate
 
 - **New crate `tr-format` at `crates/tr-format/`** — reader, writer,
   manifest schema, BLAKE3 digest helper, and capability set for the
