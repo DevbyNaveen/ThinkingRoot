@@ -18,9 +18,13 @@ import {
   configWrite,
   mcpGetConfigSnippet,
   mcpStatus,
+  workspaceList,
+  workspaceLlmConfig,
+  workspaceLlmWrite,
   type ConfigRead,
   type McpStatus,
   type McpToolKey,
+  type WorkspaceLlmConfig,
 } from "@/lib/tauri";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { useApp } from "@/store/app";
@@ -86,6 +90,14 @@ export function SettingsView() {
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  // Per-workspace LLM config — populated from the active workspace's
+  // `.thinkingroot/config.toml`. Replaces the hardcoded placeholders
+  // that used to render in the Provider section.
+  const [wsLlm, setWsLlm] = useState<WorkspaceLlmConfig | null>(null);
+  // Pending edits for the workspace-level fields (deployment, endpoint,
+  // api_version, etc.). Saved via `workspace_llm_write` on Save.
+  const [wsPending, setWsPending] = useState<Record<string, string>>({});
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -94,16 +106,50 @@ export function SettingsView() {
         if (cancelled) return;
         setCfg(c);
 
-        // Infer which provider is already configured and pre-select it.
-        const existing = (Object.keys(PROVIDER_META) as ProviderKey[]).find((p) =>
-          PROVIDER_META[p].keys.some((k) => k.secret && c.entries[k.name]),
-        );
-        if (existing) setProvider(existing);
-
-        // Hydrate workspace fields.
-        setWorkspace(c.entries.THINKINGROOT_WORKSPACE ?? "");
+        // Hydrate workspace fields from the global desktop config.
+        const wsPath = c.entries.THINKINGROOT_WORKSPACE ?? "";
+        setWorkspace(wsPath);
         setWorkspaceName(c.entries.THINKINGROOT_WORKSPACE_NAME ?? "main");
         setScanRoots(c.entries.TR_SCAN_ROOTS ?? "");
+
+        // Resolve a workspace path to source the per-workspace LLM
+        // config from. Order:
+        //   1. THINKINGROOT_WORKSPACE in desktop.toml
+        //   2. First workspace mounted in the registry
+        let activePath = wsPath;
+        if (!activePath) {
+          try {
+            const list = await workspaceList();
+            const first = list[0];
+            if (first) activePath = first.path;
+          } catch {
+            /* fall through — settings still works without workspace */
+          }
+        }
+
+        if (activePath) {
+          try {
+            const llm = await workspaceLlmConfig(activePath);
+            if (cancelled) return;
+            setWsLlm(llm);
+            // Pre-select the provider matching the workspace's actual config.
+            if (llm.provider) {
+              const p = llm.provider as ProviderKey;
+              if ((Object.keys(PROVIDER_META) as ProviderKey[]).includes(p)) {
+                setProvider(p);
+              }
+            }
+          } catch {
+            /* fall through */
+          }
+        } else {
+          // No workspace yet — fall back to global config provider hint
+          // so the section still has a sensible selection.
+          const existing = (Object.keys(PROVIDER_META) as ProviderKey[]).find((p) =>
+            PROVIDER_META[p].keys.some((k) => k.secret && c.entries[k.name]),
+          );
+          if (existing) setProvider(existing);
+        }
       } catch (e) {
         toast("Could not load settings", {
           kind: "error",
@@ -118,7 +164,8 @@ export function SettingsView() {
     };
   }, []);
 
-  const dirty = Object.keys(pending).length > 0;
+  const dirty =
+    Object.keys(pending).length > 0 || Object.keys(wsPending).length > 0;
   const providerMeta = PROVIDER_META[provider];
 
   function updateField(name: string, value: string) {
@@ -147,7 +194,7 @@ export function SettingsView() {
   async function save() {
     setSaving(true);
     try {
-      // Also commit provider choice as the default.
+      // 1. Global desktop config (api keys + active workspace pointers)
       const set: Record<string, string> = { ...pending };
       if (workspace && set.THINKINGROOT_WORKSPACE === undefined) {
         set.THINKINGROOT_WORKSPACE = workspace;
@@ -157,11 +204,47 @@ export function SettingsView() {
       }
       set.THINKINGROOT_PROVIDER = provider;
       const wrote = await configWrite({ set });
-      toast("Settings saved", { kind: "success", body: wrote, durationMs: 3000 });
+
+      // 2. Per-workspace LLM block (deployment, endpoint, api_version,
+      //    extraction/compilation model). Only if the user actually
+      //    edited any of those fields and we know which workspace to
+      //    write to. The workspace-level config is what the engine's
+      //    /ask + /ask/stream endpoints actually read.
+      let wsWrote: string | null = null;
+      if (
+        wsLlm?.workspace_path &&
+        Object.keys(wsPending).length > 0
+      ) {
+        wsWrote = await workspaceLlmWrite({
+          workspace_path: wsLlm.workspace_path,
+          provider: provider,
+          extraction_model: wsPending.extraction_model,
+          compilation_model: wsPending.compilation_model,
+          azure_resource_name: wsPending.azure_resource_name,
+          azure_endpoint_base: wsPending.azure_endpoint_base,
+          azure_deployment: wsPending.azure_deployment,
+          azure_api_version: wsPending.azure_api_version,
+          azure_api_key_env: wsPending.azure_api_key_env,
+        });
+      }
+
+      const body =
+        wsWrote != null
+          ? `${wrote}\n${wsWrote} (workspace config restart sidecar to apply)`
+          : wrote;
+      toast("Settings saved", {
+        kind: "success",
+        body,
+        durationMs: 4000,
+      });
       setPending({});
-      // Re-read so masked keys refresh.
+      setWsPending({});
       const reread = await configRead();
       setCfg(reread);
+      if (wsLlm?.workspace_path) {
+        const fresh = await workspaceLlmConfig(wsLlm.workspace_path);
+        setWsLlm(fresh);
+      }
     } catch (e) {
       toast("Save failed", {
         kind: "error",
@@ -239,6 +322,140 @@ export function SettingsView() {
                 </Field>
               ))}
             </div>
+            {provider === "azure" && wsLlm && (
+              <div className="mt-4 rounded-md border border-border/60 bg-muted/20 p-3">
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="text-xs font-medium text-foreground">
+                    Workspace Azure config
+                    <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                      {wsLlm.workspace_path ?? "—"}
+                    </span>
+                  </div>
+                  <span
+                    className={cn(
+                      "rounded px-1.5 py-0.5 text-[10px]",
+                      wsLlm.azure_api_key_env_present
+                        ? "bg-success/15 text-success"
+                        : "bg-yellow-500/15 text-yellow-300",
+                    )}
+                  >
+                    {wsLlm.azure_api_key_env_present
+                      ? `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} set`
+                      : `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} missing`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <Field
+                    label="Resource name"
+                    hint="Azure OpenAI resource (drives the *.openai.azure.com URL)"
+                  >
+                    <input
+                      type="text"
+                      value={
+                        wsPending.azure_resource_name ??
+                        wsLlm.azure_resource_name ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          azure_resource_name: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                  <Field
+                    label="Endpoint base (override)"
+                    hint="Use only for AIServices/Foundry (cognitiveservices.azure.com)"
+                  >
+                    <input
+                      type="text"
+                      value={
+                        wsPending.azure_endpoint_base ??
+                        wsLlm.azure_endpoint_base ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          azure_endpoint_base: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                  <Field label="Deployment">
+                    <input
+                      type="text"
+                      value={
+                        wsPending.azure_deployment ??
+                        wsLlm.azure_deployment ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          azure_deployment: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                  <Field label="API version">
+                    <input
+                      type="text"
+                      value={
+                        wsPending.azure_api_version ??
+                        wsLlm.azure_api_version ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          azure_api_version: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                  <Field label="Extraction model">
+                    <input
+                      type="text"
+                      value={
+                        wsPending.extraction_model ??
+                        wsLlm.extraction_model ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          extraction_model: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                  <Field label="Compilation model">
+                    <input
+                      type="text"
+                      value={
+                        wsPending.compilation_model ??
+                        wsLlm.compilation_model ??
+                        ""
+                      }
+                      onChange={(e) =>
+                        setWsPending((p) => ({
+                          ...p,
+                          compilation_model: e.target.value,
+                        }))
+                      }
+                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    />
+                  </Field>
+                </div>
+              </div>
+            )}
           </Section>
 
           <Section

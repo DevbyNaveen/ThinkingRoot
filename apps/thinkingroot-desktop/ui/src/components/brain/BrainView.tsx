@@ -3,7 +3,7 @@
  * below. Loads from `brain_load`, which fans out to claims +
  * entities + relations + rooted ids in one Tauri trip.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Folder, RefreshCw, AlertTriangle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,13 @@ export function BrainView() {
   const [snap, setSnap] = useState<BrainSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [topHeight, setTopHeight] = useState(55);
+  const [isDragging, setIsDragging] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [tierFilter, setTierFilter] = useState<"all" | "rooted" | "attested" | "unknown">("all");
 
   async function load() {
     setLoading(true);
@@ -35,6 +42,28 @@ export function BrainView() {
   useEffect(() => {
     if (activeWorkspace) void load();
   }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (!isDragging) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const offset = e.clientY - rect.top;
+      const percent = (offset / rect.height) * 100;
+      // Clamp between 10% and 90%
+      setTopHeight(Math.max(10, Math.min(90, percent)));
+    };
+
+    const handleMouseUp = () => setIsDragging(false);
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isDragging]);
 
   if (!activeWorkspace) {
     return (
@@ -79,20 +108,50 @@ export function BrainView() {
         </div>
       )}
 
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <div className="h-[55%] min-h-[280px] border-b border-border">
-          {snap ? (
-            <BrainGraph entities={snap.entities} relations={snap.relations} />
-          ) : (
-            <Skeleton text="Loading graph…" />
-          )}
+      <div
+        ref={containerRef}
+        className={`relative flex flex-1 flex-col overflow-hidden ${isDragging ? "select-none" : ""}`}
+      >
+        <div
+          className="relative min-h-[100px] border-b border-border"
+          style={{ height: `${topHeight}%` }}
+        >
+          <div className={isDragging ? "pointer-events-none h-full" : "h-full"}>
+            {snap ? (
+              <BrainGraph 
+                entities={snap.entities} 
+                relations={snap.relations} 
+                claims={snap.claims}
+                searchQuery={searchQuery}
+              />
+            ) : (
+              <Skeleton text="Loading graph…" />
+            )}
+          </div>
+
+          {/* Invisible resize handle */}
+          <div
+            className="absolute bottom-[-4px] left-0 right-0 z-50 h-2 cursor-row-resize bg-transparent"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
+            }}
+          />
         </div>
         <div className="flex-1 overflow-hidden">
-          {snap ? (
-            <BrainTable claims={snap.claims} />
-          ) : (
-            <Skeleton text="Loading claims…" />
-          )}
+          <div className={isDragging ? "pointer-events-none h-full" : "h-full"}>
+            {snap ? (
+              <BrainTable 
+                claims={snap.claims}
+                query={searchQuery}
+                setQuery={setSearchQuery}
+                tierFilter={tierFilter}
+                setTierFilter={setTierFilter}
+              />
+            ) : (
+              <Skeleton text="Loading claims…" />
+            )}
+          </div>
         </div>
       </div>
     </div>

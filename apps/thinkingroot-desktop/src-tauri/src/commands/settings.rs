@@ -151,6 +151,212 @@ pub fn onboarding_status() -> Result<OnboardingStatus, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Workspace-scoped LLM config — what the engine actually uses
+// ────────────────────────────────────────────────────────────────────
+
+/// Real LLM configuration for a workspace, projected from its
+/// `.thinkingroot/config.toml`. The settings page renders these values
+/// directly so users see the actual provider / endpoint / deployment
+/// the engine is wired to — no hardcoded placeholders.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct WorkspaceLlmConfig {
+    /// Workspace path (filesystem absolute).
+    pub workspace_path: Option<String>,
+    /// Workspace registry name.
+    pub workspace_name: Option<String>,
+    /// Default provider (e.g. "azure", "anthropic", "openai", "bedrock").
+    pub provider: Option<String>,
+    /// Display model name (e.g. "gpt-5.4", "claude-sonnet-4-5").
+    pub extraction_model: Option<String>,
+    pub compilation_model: Option<String>,
+    /// Azure-specific.
+    pub azure_resource_name: Option<String>,
+    pub azure_endpoint_base: Option<String>,
+    pub azure_deployment: Option<String>,
+    pub azure_api_version: Option<String>,
+    pub azure_api_key_env: Option<String>,
+    /// Whether the resolved api_key env var is currently set in this
+    /// process — surfaces "AZURE_OPENAI_API_KEY missing" cases without
+    /// leaking the value itself.
+    pub azure_api_key_env_present: bool,
+    /// Existence check for the workspace `config.toml` file. False when
+    /// the path doesn't have a `.thinkingroot/config.toml` yet.
+    pub config_exists: bool,
+}
+
+#[tauri::command]
+pub fn workspace_llm_config(workspace_path: String) -> Result<WorkspaceLlmConfig, String> {
+    let root = PathBuf::from(&workspace_path);
+    let cfg_path = root.join(".thinkingroot").join("config.toml");
+
+    if !cfg_path.exists() {
+        return Ok(WorkspaceLlmConfig {
+            workspace_path: Some(workspace_path),
+            config_exists: false,
+            ..Default::default()
+        });
+    }
+
+    let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+    let parsed: toml::Value = toml::from_str(&raw).map_err(|e| e.to_string())?;
+
+    let llm = parsed.get("llm");
+    let provider = llm
+        .and_then(|t| t.get("default_provider"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let extraction_model = llm
+        .and_then(|t| t.get("extraction_model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let compilation_model = llm
+        .and_then(|t| t.get("compilation_model"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let azure = llm
+        .and_then(|t| t.get("providers"))
+        .and_then(|t| t.get("azure"));
+    let azure_resource_name = azure
+        .and_then(|t| t.get("resource_name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let azure_endpoint_base = azure
+        .and_then(|t| t.get("endpoint_base"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let azure_deployment = azure
+        .and_then(|t| t.get("deployment"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let azure_api_version = azure
+        .and_then(|t| t.get("api_version"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let azure_api_key_env = azure
+        .and_then(|t| t.get("api_key_env"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let azure_api_key_env_present = azure_api_key_env
+        .as_deref()
+        .or(Some("AZURE_OPENAI_API_KEY"))
+        .and_then(|name| std::env::var(name).ok())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    Ok(WorkspaceLlmConfig {
+        workspace_path: Some(workspace_path),
+        workspace_name: None,
+        provider,
+        extraction_model,
+        compilation_model,
+        azure_resource_name,
+        azure_endpoint_base,
+        azure_deployment,
+        azure_api_version,
+        azure_api_key_env,
+        azure_api_key_env_present,
+        config_exists: true,
+    })
+}
+
+/// Patch a workspace's `.thinkingroot/config.toml` provider block.
+/// Empty string in any field = "remove this key". The patch is keyed
+/// by workspace path so the user can edit any mounted workspace,
+/// not just the active one.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceLlmWriteArgs {
+    pub workspace_path: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub extraction_model: Option<String>,
+    #[serde(default)]
+    pub compilation_model: Option<String>,
+    // Azure
+    #[serde(default)]
+    pub azure_resource_name: Option<String>,
+    #[serde(default)]
+    pub azure_endpoint_base: Option<String>,
+    #[serde(default)]
+    pub azure_deployment: Option<String>,
+    #[serde(default)]
+    pub azure_api_version: Option<String>,
+    #[serde(default)]
+    pub azure_api_key_env: Option<String>,
+}
+
+#[tauri::command]
+pub fn workspace_llm_write(args: WorkspaceLlmWriteArgs) -> Result<String, String> {
+    let root = PathBuf::from(&args.workspace_path);
+    let cfg_path = root.join(".thinkingroot").join("config.toml");
+
+    let mut doc: toml::Table = if cfg_path.exists() {
+        let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+        toml::from_str(&raw).map_err(|e| e.to_string())?
+    } else {
+        toml::Table::new()
+    };
+
+    // Helper: ensure a nested table exists; return a mutable handle.
+    fn ensure_table<'a>(parent: &'a mut toml::Table, key: &str) -> &'a mut toml::Table {
+        let entry = parent
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Table(toml::Table::new()));
+        if let Value::Table(t) = entry {
+            t
+        } else {
+            *entry = Value::Table(toml::Table::new());
+            if let Value::Table(t) = entry {
+                t
+            } else {
+                unreachable!("just inserted a Table")
+            }
+        }
+    }
+
+    fn set_or_remove(table: &mut toml::Table, key: &str, val: &Option<String>) {
+        match val {
+            Some(s) if !s.trim().is_empty() => {
+                table.insert(key.to_string(), Value::String(s.trim().to_string()));
+            }
+            Some(_) => {
+                table.remove(key);
+            }
+            None => {}
+        }
+    }
+
+    {
+        let llm = ensure_table(&mut doc, "llm");
+        set_or_remove(llm, "default_provider", &args.provider);
+        set_or_remove(llm, "extraction_model", &args.extraction_model);
+        set_or_remove(llm, "compilation_model", &args.compilation_model);
+    }
+
+    {
+        let llm = ensure_table(&mut doc, "llm");
+        let providers = ensure_table(llm, "providers");
+        let azure = ensure_table(providers, "azure");
+        set_or_remove(azure, "resource_name", &args.azure_resource_name);
+        set_or_remove(azure, "endpoint_base", &args.azure_endpoint_base);
+        set_or_remove(azure, "deployment", &args.azure_deployment);
+        set_or_remove(azure, "api_version", &args.azure_api_version);
+        set_or_remove(azure, "api_key_env", &args.azure_api_key_env);
+    }
+
+    let serialized = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = cfg_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, serialized).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &cfg_path).map_err(|e| e.to_string())?;
+    Ok(cfg_path.to_string_lossy().into_owned())
+}
+
+// ────────────────────────────────────────────────────────────────────
 
 fn resolve_default_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("THINKINGROOT_DESKTOP_CONFIG") {

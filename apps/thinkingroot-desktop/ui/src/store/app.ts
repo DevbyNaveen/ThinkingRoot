@@ -52,6 +52,18 @@ interface AppStore {
   setStreaming: (s: StreamState | null) => void;
   appendStreamingDelta: (delta: string) => void;
 
+  // Per-turn routing context. Survives component re-mounts (React
+  // Strict Mode, Vite HMR) so SSE Final/Error events that arrive AFTER
+  // ChatView's useEffect has cleaned up still find the right
+  // workspace+conversation to write the assistant reply to. Without
+  // this, a stale `useRef<Map>` would lose the entry on remount and
+  // the streaming state would never clear — leaving the composer
+  // disabled forever.
+  turnCtx: Record<string, { workspace: string; convId: string }>;
+  registerTurn: (turnId: string, workspace: string, convId: string) => void;
+  resolveTurn: (turnId: string) => { workspace: string; convId: string } | null;
+  clearTurn: (turnId: string) => void;
+
   // Trust filter (used by Brain table)
   trust: TrustFilter;
   setTrust: (t: TrustFilter) => void;
@@ -83,7 +95,7 @@ function key(workspace: string, conversationId: string): string {
 
 export const useApp = create<AppStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       surface: "chats",
       setSurface: (surface) => set({ surface }),
       theme: "dark",
@@ -151,6 +163,20 @@ export const useApp = create<AppStore>()(
               partial: s.streaming.partial + delta,
             },
           };
+        }),
+
+      turnCtx: {},
+      registerTurn: (turnId, workspace, convId) =>
+        set((s) => ({
+          turnCtx: { ...s.turnCtx, [turnId]: { workspace, convId } },
+        })),
+      resolveTurn: (turnId) => get().turnCtx[turnId] ?? null,
+      clearTurn: (turnId) =>
+        set((s) => {
+          if (!s.turnCtx[turnId]) return {};
+          const next = { ...s.turnCtx };
+          delete next[turnId];
+          return { turnCtx: next };
         }),
 
       trust: "any",

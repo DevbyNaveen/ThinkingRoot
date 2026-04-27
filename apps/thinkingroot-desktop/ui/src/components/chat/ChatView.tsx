@@ -50,7 +50,6 @@ export function ChatView() {
   const setActiveConv = useApp((s) => s.setActiveConversationId);
   const messagesByKey = useApp((s) => s.messages);
   const appendMessage = useApp((s) => s.appendMessage);
-  const updateMessage = useApp((s) => s.updateMessage);
   const setMessages = useApp((s) => s.setMessages);
   const streaming = useApp((s) => s.streaming);
   const setStreaming = useApp((s) => s.setStreaming);
@@ -138,74 +137,88 @@ export function ChatView() {
     };
   }, [activeWorkspace, activeConv, setMessages]);
 
-  // Each turn is tagged with the workspace + conversation it
-  // belongs to at send time. Streaming events are routed by *that*
-  // tag, not by the user's current selection — so navigating away
-  // mid-stream still persists the assistant reply to the correct
-  // conversation on disk and never pollutes the new one.
-  const turnCtxRef = useRef<
-    Map<string, { workspace: string; convId: string }>
-  >(new Map());
-
   // Wire the streaming events once.
+  //
+  // Turn-routing context lives in the zustand store (`turnCtx`) — not
+  // a `useRef<Map>` — so SSE Final/Error events that arrive AFTER a
+  // remount (React Strict Mode, Vite HMR, navigation churn) still
+  // resolve to the right workspace+conversation and clear the
+  // streaming state. Without this, a fresh empty Map after remount
+  // would silently drop Final and leave the composer
+  // `disabled={streaming != null}` forever, blocking every
+  // subsequent send.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let running = true;
     onChatEvent((ev: ChatEvent) => {
       if (!running) return;
-      const ctx = turnCtxRef.current.get(ev.turn_id);
-      if (!ctx) return;
 
       const cur = useApp.getState();
-      const userIsViewingThisTurn =
-        cur.activeWorkspace === ctx.workspace &&
-        cur.activeConversationId === ctx.convId;
+      // Resolve the turn's original workspace+conv from the store —
+      // falls back to the active streaming state if the entry was
+      // already cleared. This makes the listener idempotent.
+      const ctx =
+        cur.resolveTurn(ev.turn_id) ??
+        (cur.streaming?.turnId === ev.turn_id && cur.activeWorkspace
+          ? {
+              workspace: cur.activeWorkspace,
+              convId: cur.activeConversationId ?? "",
+            }
+          : null);
+
+      const userIsViewingThisTurn = ctx
+        ? cur.activeWorkspace === ctx.workspace &&
+          cur.activeConversationId === ctx.convId
+        : true;
 
       if (ev.type === "token") {
-        // Visual streaming only when the user is still on this turn.
         if (userIsViewingThisTurn && cur.streaming?.turnId === ev.turn_id) {
           appendDelta(ev.text);
         }
       } else if (ev.type === "final") {
-        // Always persist to the original conversation on disk.
-        conversationsAppendMessage({
-          workspace: ctx.workspace,
-          conversationId: ctx.convId,
-          role: "assistant",
-          content: ev.full_text,
-          claimsUsed: [],
-        }).catch((e) => {
-          toast("Persist message failed", {
-            kind: "warn",
-            body: e instanceof Error ? e.message : String(e),
+        if (ctx && ctx.convId) {
+          conversationsAppendMessage({
+            workspace: ctx.workspace,
+            conversationId: ctx.convId,
+            role: "assistant",
+            content: ev.full_text,
+            claimsUsed: [],
+          }).catch((e) => {
+            toast("Persist message failed", {
+              kind: "warn",
+              body: e instanceof Error ? e.message : String(e),
+            });
           });
-        });
-        // Update UI cache only if the user is still watching.
-        if (userIsViewingThisTurn) {
-          appendMessage(ctx.workspace, ctx.convId, {
-            id: `m-${Date.now()}-a`,
-            kind: "assistant",
-            body: ev.full_text,
-            at: new Date(),
-          });
-          if (cur.streaming?.turnId === ev.turn_id) {
-            setStreaming(null);
+          if (userIsViewingThisTurn) {
+            appendMessage(ctx.workspace, ctx.convId, {
+              id: `m-${Date.now()}-a`,
+              kind: "assistant",
+              body: ev.full_text,
+              at: new Date(),
+            });
           }
         }
-        turnCtxRef.current.delete(ev.turn_id);
+        // Defense in depth: ALWAYS clear streaming if this is the
+        // active turn, even when ctx resolution failed. Otherwise
+        // the composer stays disabled forever.
+        if (cur.streaming?.turnId === ev.turn_id) {
+          setStreaming(null);
+        }
+        cur.clearTurn(ev.turn_id);
       } else if (ev.type === "error") {
-        if (userIsViewingThisTurn) {
+        if (ctx && ctx.convId && userIsViewingThisTurn) {
           appendMessage(ctx.workspace, ctx.convId, {
             id: `m-${Date.now()}-e`,
             kind: "assistant",
             body: `⚠️ ${ev.message}`,
             at: new Date(),
           });
-          if (cur.streaming?.turnId === ev.turn_id) {
-            setStreaming(null);
-          }
         }
-        turnCtxRef.current.delete(ev.turn_id);
+        // Same defense-in-depth: always free the composer.
+        if (cur.streaming?.turnId === ev.turn_id) {
+          setStreaming(null);
+        }
+        cur.clearTurn(ev.turn_id);
       }
     }).then((u) => {
       unlisten = u;
@@ -214,7 +227,7 @@ export function ChatView() {
       running = false;
       unlisten?.();
     };
-  }, [appendDelta, appendMessage, setStreaming, updateMessage]);
+  }, [appendDelta, appendMessage, setStreaming]);
 
   // Auto-scroll on append.
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -293,7 +306,7 @@ export function ChatView() {
                   });
                 }}
                 onStartTurn={(turnId, ws, cid) => {
-                  turnCtxRef.current.set(turnId, { workspace: ws, convId: cid });
+                  useApp.getState().registerTurn(turnId, ws, cid);
                   setStreaming({
                     turnId,
                     partial: "",
@@ -379,7 +392,8 @@ export function ChatView() {
             });
           });
         }}
-        onStartTurn={(turnId) => {
+        onStartTurn={(turnId, ws, cid) => {
+          useApp.getState().registerTurn(turnId, ws, cid);
           setStreaming({
             turnId,
             partial: "",

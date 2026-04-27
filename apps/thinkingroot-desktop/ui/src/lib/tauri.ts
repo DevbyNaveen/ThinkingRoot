@@ -466,6 +466,48 @@ export async function llmHealth(workspace: string): Promise<LlmHealth> {
   return invoke<LlmHealth>("llm_health", { workspace });
 }
 
+/** Per-workspace LLM configuration. Read from
+ *  `<workspace>/.thinkingroot/config.toml` so the settings page shows
+ *  the values the engine actually uses, not a hardcoded placeholder. */
+export interface WorkspaceLlmConfig {
+  workspace_path: string | null;
+  workspace_name: string | null;
+  provider: string | null;
+  extraction_model: string | null;
+  compilation_model: string | null;
+  azure_resource_name: string | null;
+  azure_endpoint_base: string | null;
+  azure_deployment: string | null;
+  azure_api_version: string | null;
+  azure_api_key_env: string | null;
+  azure_api_key_env_present: boolean;
+  config_exists: boolean;
+}
+
+export async function workspaceLlmConfig(
+  workspacePath: string,
+): Promise<WorkspaceLlmConfig> {
+  return invoke<WorkspaceLlmConfig>("workspace_llm_config", { workspacePath });
+}
+
+export interface WorkspaceLlmWriteArgs {
+  workspace_path: string;
+  provider?: string | null;
+  extraction_model?: string | null;
+  compilation_model?: string | null;
+  azure_resource_name?: string | null;
+  azure_endpoint_base?: string | null;
+  azure_deployment?: string | null;
+  azure_api_version?: string | null;
+  azure_api_key_env?: string | null;
+}
+
+export async function workspaceLlmWrite(
+  args: WorkspaceLlmWriteArgs,
+): Promise<string> {
+  return invoke<string>("workspace_llm_write", { args });
+}
+
 // ─── Branch slash commands ───────────────────────────────────────────
 
 export interface BranchView {

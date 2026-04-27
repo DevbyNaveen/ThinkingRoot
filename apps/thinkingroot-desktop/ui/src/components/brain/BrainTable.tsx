@@ -19,11 +19,18 @@ const TIER_BADGE: Record<ClaimRow["tier"], string> = {
  * so the render cost stays constant with 10k+ rows. Header stays
  * pinned via CSS sticky.
  */
-export function BrainTable({ claims }: Props) {
-  const [query, setQuery] = useState("");
-  const [tierFilter, setTierFilter] = useState<
-    ClaimRow["tier"] | "all"
-  >("all");
+export function BrainTable({ 
+  claims,
+  query,
+  setQuery,
+  tierFilter,
+  setTierFilter
+}: Props & {
+  query: string;
+  setQuery: (q: string) => void;
+  tierFilter: ClaimRow["tier"] | "all";
+  setTierFilter: (t: ClaimRow["tier"] | "all") => void;
+}) {
   const parentRef = useRef<HTMLDivElement | null>(null);
 
   const filtered = useMemo(() => {

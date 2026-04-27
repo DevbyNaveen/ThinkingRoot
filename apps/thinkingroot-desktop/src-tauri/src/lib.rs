@@ -84,6 +84,8 @@ pub fn run() {
             commands::settings::config_read,
             commands::settings::config_write,
             commands::settings::onboarding_status,
+            commands::settings::workspace_llm_config,
+            commands::settings::workspace_llm_write,
             commands::workspaces::workspace_list,
             commands::workspaces::workspace_add,
             commands::workspaces::workspace_remove,

@@ -44,10 +44,14 @@
     "copyright": "© 2026 ThinkingRoot contributors",
     "shortDescription": "Local-first AI memory you can audit.",
     "longDescription": "ThinkingRoot Desktop is a local-first companion for the ThinkingRoot OSS engine. Compile any directory of source code, docs, PDFs, or notes into a typed, source-locked knowledge graph; query it through the in-app brain view; and publish or install verified `.tr` knowledge packs from the cloud registry. Your data stays on your machine.",
-    "externalBin": ["binaries/thinkingroot-agent-runtime"],
+    "externalBin": [
+      "binaries/thinkingroot-agent-runtime"
+    ],
     "fileAssociations": [
       {
-        "ext": ["tr"],
+        "ext": [
+          "tr"
+        ],
         "name": "ThinkingRoot Capsule",
         "description": "ThinkingRoot portable knowledge pack",
         "role": "Editor",

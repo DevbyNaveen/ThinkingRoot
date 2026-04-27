@@ -118,6 +118,8 @@ async fn consume_ask_stream(
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
 
+    tracing::info!(turn_id = %turn_id, url = %url, workspace = %args.workspace, "chat: consume_ask_stream start");
+
     // The connect itself is fast — the long wait is the LLM body. A
     // 5s connect-only timeout means a wedged sidecar surfaces as an
     // error in seconds, not minutes. Once bytes flow we let the
@@ -129,6 +131,7 @@ async fn consume_ask_stream(
     {
         Ok(c) => c,
         Err(e) => {
+            tracing::warn!(turn_id = %turn_id, "chat: http client init failed: {e}");
             emit_error(&app, &turn_id, format!("http client init failed: {e}"));
             return;
         }
@@ -141,6 +144,7 @@ async fn consume_ask_stream(
         "category_hint": "",
     });
 
+    tracing::info!(turn_id = %turn_id, "chat: posting to sidecar");
     let resp = match client
         .post(&url)
         .header("accept", "text/event-stream")
@@ -150,14 +154,18 @@ async fn consume_ask_stream(
     {
         Ok(r) => r,
         Err(e) => {
+            tracing::warn!(turn_id = %turn_id, "chat: sidecar unreachable at {url}: {e}");
             emit_error(&app, &turn_id, format!("sidecar unreachable at {url}: {e}"));
             return;
         }
     };
 
+    tracing::info!(turn_id = %turn_id, status = %resp.status(), "chat: sidecar responded");
+
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(turn_id = %turn_id, "chat: sidecar non-2xx {status}: {body}");
         emit_error(&app, &turn_id, format!("sidecar returned {status}: {body}"));
         return;
     }
@@ -166,6 +174,7 @@ async fn consume_ask_stream(
     let mut full_text = String::new();
     let mut claims_used: usize = 0;
     let mut category = String::new();
+    let mut emitted_any = false;
 
     while let Some(item) = events.next().await {
         match item {
@@ -198,6 +207,10 @@ async fn consume_ask_stream(
                         };
                     if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
+                            if !emitted_any {
+                                tracing::info!(turn_id = %turn_id, "chat: first token");
+                                emitted_any = true;
+                            }
                             full_text.push_str(text);
                             let _ = app.emit(
                                 "chat-event",
@@ -222,6 +235,7 @@ async fn consume_ask_stream(
                             category = c.to_string();
                         }
                     }
+                    tracing::info!(turn_id = %turn_id, claims_used, "chat: emitting final");
                     let _ = app.emit(
                         "chat-event",
                         ChatEvent::Final {
