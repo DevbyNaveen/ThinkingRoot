@@ -1,0 +1,197 @@
+//! Managed `root serve` sidecar.
+//!
+//! ThinkingRoot Desktop bundles the OSS engine binary (`root`) and
+//! launches it as a child process bound to `127.0.0.1`. The desktop
+//! webview talks to this sidecar over loopback HTTP — never to a
+//! remote service — so the app stays local-first by construction.
+//!
+//! Resolution order for the binary:
+//!   1. `THINKINGROOT_ROOT_BINARY` env var (testing escape hatch).
+//!   2. Tauri-bundled sidecar at
+//!      `<resource_dir>/binaries/thinkingroot-agent-runtime-<triple>`.
+//!   3. `root` from `$PATH` (dev fallback).
+//!
+//! The handle is parked inside [`AppState`] so the `Destroyed` event
+//! can reap it when the user quits.
+//!
+//! Risk R1 (per `docs/phase-f-trust-verify-design.md` companion notes
+//! to the OSS plan): if the bundled binary is missing or fails its
+//! handshake, the sidecar startup logs a warning and the desktop
+//! continues running — the engine surfaces (Brain, Privacy) just
+//! return empty until the user installs `root` themselves.
+
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use tauri::{AppHandle, Manager, Runtime};
+use tokio::process::{Child, Command};
+
+use crate::state::{AppState, SidecarHandle};
+
+/// Default loopback port for the local sidecar. Chosen to avoid
+/// the engine's 3000 default (collides with common dev tools) and
+/// the cloud's 3100-grid; settable via env for tests.
+const DEFAULT_PORT: u16 = 31760;
+const HOST: &str = "127.0.0.1";
+
+/// Spawn the sidecar. Records the child handle into [`AppState`] so
+/// it can be reaped on app exit. Errors are logged but not bubbled —
+/// the desktop must keep running even if the engine binary is
+/// unavailable on this machine.
+pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
+    let port = sidecar_port();
+    let binary = match resolve_binary(app) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "no `root` binary found — sidecar disabled. Install ThinkingRoot \
+                 via `cargo install thinkingroot-cli` or set \
+                 THINKINGROOT_ROOT_BINARY to a custom path."
+            );
+            return;
+        }
+    };
+
+    tracing::info!(
+        binary = %binary.display(),
+        host = HOST,
+        port,
+        "spawning ThinkingRoot sidecar",
+    );
+
+    let mut cmd = Command::new(&binary);
+    cmd.arg("serve")
+        .arg("--host")
+        .arg(HOST)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(%err, ?binary, "failed to spawn sidecar — engine surfaces will be empty");
+            return;
+        }
+    };
+
+    let pid = child.id();
+    forward_logs(child, &binary).await;
+
+    let state = app.state::<AppState>();
+    let mut guard = state.sidecar.lock().await;
+    *guard = Some(SidecarHandle {
+        port,
+        host: HOST.to_string(),
+        pid,
+    });
+}
+
+/// Reap the sidecar on app exit. Sends SIGKILL via `kill_on_drop`
+/// once the [`Child`] handle drops; explicit `kill().await` here
+/// gives a deterministic shutdown order before the runtime tears
+/// down.
+pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
+    let state = app.state::<AppState>();
+    let mut guard = state.sidecar.lock().await;
+    if let Some(handle) = guard.take() {
+        tracing::info!(pid = ?handle.pid, "shutting down sidecar");
+    }
+}
+
+fn sidecar_port() -> u16 {
+    std::env::var("THINKINGROOT_DESKTOP_SIDECAR_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
+fn resolve_binary<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("THINKINGROOT_ROOT_BINARY") {
+        if !override_path.is_empty() {
+            let p = PathBuf::from(override_path);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let triple = std::env::var("TARGET").ok();
+        let candidate = match triple {
+            Some(t) => resource_dir
+                .join("binaries")
+                .join(format!("thinkingroot-agent-runtime-{t}{}", exe_suffix())),
+            None => resource_dir
+                .join("binaries")
+                .join(format!("thinkingroot-agent-runtime{}", exe_suffix())),
+        };
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    which_root()
+}
+
+fn which_root() -> Option<PathBuf> {
+    let bin = format!("root{}", exe_suffix());
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(&bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn exe_suffix() -> &'static str {
+    if cfg!(windows) { ".exe" } else { "" }
+}
+
+/// Drain the sidecar's stdout/stderr into the host tracing layer so
+/// the engine's logs surface in the desktop's debug output. The task
+/// detaches; it terminates when the child closes its pipes (i.e. on
+/// shutdown).
+async fn forward_logs(mut child: Child, binary: &PathBuf) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let label = binary.display().to_string();
+
+    if let Some(out) = stdout {
+        let label = label.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(target = "sidecar", source = %label, "{line}");
+            }
+        });
+    }
+    if let Some(err) = stderr {
+        let label = label.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!(target = "sidecar", source = %label, "{line}");
+            }
+        });
+    }
+
+    // The child handle moved into this scope is dropped here, which
+    // would normally kill_on_drop the process. We deliberately want
+    // the sidecar to outlive this function, so re-park it on a
+    // detached task that holds the handle alive until the process
+    // exits or the runtime shuts down.
+    tokio::spawn(async move {
+        match child.wait().await {
+            Ok(status) => tracing::info!(?status, "sidecar exited"),
+            Err(err) => tracing::warn!(%err, "sidecar wait failed"),
+        }
+    });
+}

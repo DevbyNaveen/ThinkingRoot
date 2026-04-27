@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ThinkingRoot Desktop",
+  "version": "0.1.0",
+  "identifier": "dev.thinkingroot.desktop",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm --dir ui dev",
+    "beforeBuildCommand": "pnpm --dir ui build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ThinkingRoot Desktop",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560,
+        "decorations": true,
+        "transparent": false,
+        "center": true,
+        "dragDropEnabled": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://localhost:* http://localhost:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Productivity",
+    "copyright": "© 2026 ThinkingRoot contributors",
+    "shortDescription": "Local-first AI memory you can audit.",
+    "longDescription": "ThinkingRoot Desktop is a local-first companion for the ThinkingRoot OSS engine. Compile any directory of source code, docs, PDFs, or notes into a typed, source-locked knowledge graph; query it through the in-app brain view; and publish or install verified `.tr` knowledge packs from the cloud registry. Your data stays on your machine.",
+    "externalBin": ["binaries/thinkingroot-agent-runtime"],
+    "fileAssociations": [
+      {
+        "ext": ["tr"],
+        "name": "ThinkingRoot Capsule",
+        "description": "ThinkingRoot portable knowledge pack",
+        "role": "Editor",
+        "mimeType": "application/vnd.thinkingroot.capsule"
+      }
+    ]
+  },
+  "plugins": {}
+}
