@@ -17,6 +17,10 @@ name = "root"
 path = "src/main.rs"
 
 [dependencies]
+# `.tr` reader/writer (Phase A relocation — canonical home for the
+# wire format). Used by `root pack` and `root install`.
+tr-format = { path = "../tr-format" }
+
 thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-parse = { workspace = true }

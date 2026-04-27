@@ -4609,6 +4609,7 @@ dependencies = [
  "thinkingroot-verify",
  "tokio",
  "toml",
+ "tr-format",
  "tracing",
  "tracing-subscriber",
 ]

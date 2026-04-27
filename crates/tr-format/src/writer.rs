@@ -131,17 +131,24 @@ impl PackBuilder {
 }
 
 fn append_file<W: Write>(builder: &mut Builder<W>, path: &str, contents: &[u8]) -> Result<()> {
+    // Use GNU-format header + `append_data`, which transparently emits
+    // a `LongLink` extension entry when `path` exceeds the 100-byte
+    // ustar limit. Real engine output regularly produces artifact
+    // filenames over the limit (e.g. long task-derived slugs), so we
+    // can't fall back to plain ustar — packs would refuse to build.
+    // `append_data` also fills in checksum and writes the body in one
+    // step, so we don't call `set_cksum`/`append` directly.
     let mut header = Header::new_gnu();
-    header.set_path(path).map_err(|e| Error::Invalid {
-        what: "container",
-        detail: format!("tar path `{path}`: {e}"),
-    })?;
     header.set_size(contents.len() as u64);
     header.set_mode(0o644);
     header.set_mtime(0);
     header.set_entry_type(tar::EntryType::Regular);
-    header.set_cksum();
-    builder.append(&header, &mut Cursor::new(contents))?;
+    builder
+        .append_data(&mut header, path, Cursor::new(contents))
+        .map_err(|e| Error::Invalid {
+            what: "container",
+            detail: format!("tar append `{path}`: {e}"),
+        })?;
     Ok(())
 }
 
@@ -252,5 +259,26 @@ mod tests {
         let eb = read_entries(Cursor::new(&b)).unwrap();
         assert_eq!(ea["a.txt"], eb["a.txt"]);
         assert_eq!(ea["b.txt"], eb["b.txt"]);
+    }
+
+    #[test]
+    fn long_paths_round_trip() {
+        // Real engine artifact paths regularly exceed the 100-byte
+        // ustar limit. `append_file` must emit a GNU `LongLink`
+        // extension entry rather than truncating or failing.
+        let mut pb = PackBuilder::new(sample_manifest());
+        let long = format!(
+            "artifacts/entities/{}.md",
+            "a-very-long-task-derived-slug-that-blows-the-100-byte-ustar-path-limit-and-would-otherwise-truncate-or-fail-1234567890"
+        );
+        assert!(long.len() > 120, "test path must exceed ustar limit");
+        pb.put_text(&long, "hello").unwrap();
+        let bytes = pb.build().unwrap();
+        let entries = read_entries(Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            entries.get(long.as_str()).map(Vec::as_slice),
+            Some(b"hello" as &[u8]),
+            "long path did not round-trip via tar+zstd"
+        );
     }
 }

@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 mod branch_cmd;
 mod eval_cmd;
 mod mcp_config;
+mod pack_cmd;
 mod pipeline;
 mod progress;
 mod provider_cmd;
@@ -293,6 +294,45 @@ enum Commands {
         /// is documented in `reflect_cmd.rs`.
         #[arg(long, value_name = "FILE")]
         json: Option<PathBuf>,
+    },
+    /// Package a compiled workspace into a portable `.tr` knowledge
+    /// pack. Reads metadata from `<workspace>/Pack.toml`; CLI flags
+    /// override individual fields. The output `.tr` is a `tar+zstd`
+    /// archive with a TR-1 manifest at root + every file under
+    /// `<workspace>/.thinkingroot/` (minus `cache/`, `config.toml`,
+    /// `fingerprints.json` which are local-only).
+    Pack {
+        /// Path to the workspace root (must contain `.thinkingroot/`).
+        #[arg(default_value = ".")]
+        workspace: PathBuf,
+        /// Output `.tr` path. Defaults to
+        /// `<workspace>/<owner>-<slug>-<version>.tr`.
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Pack name in `owner/slug` form. Overrides `Pack.toml`.
+        #[arg(long)]
+        name: Option<String>,
+        /// SemVer pack version. Overrides `Pack.toml`.
+        #[arg(long)]
+        version: Option<String>,
+        /// SPDX license expression. Overrides `Pack.toml`.
+        #[arg(long)]
+        license: Option<String>,
+        /// One-line description. Overrides `Pack.toml`.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Install a `.tr` knowledge pack — extract its contents to a
+    /// target directory's `.thinkingroot/` so the engine can mount it
+    /// for `root query` / `root serve`. Verifies the manifest's
+    /// canonical-bytes hash on read; rejects tampered files.
+    Install {
+        /// Path to the `.tr` file on disk.
+        file: PathBuf,
+        /// Target directory. Defaults to
+        /// `~/.thinkingroot/packs/<owner>/<slug>/<version>/`.
+        #[arg(short, long, value_name = "DIR")]
+        target: Option<PathBuf>,
     },
 }
 
@@ -672,6 +712,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Reflect { path, json }) => {
             reflect_cmd::run(&path, json.as_ref())?;
+        }
+        Some(Commands::Pack {
+            workspace,
+            out,
+            name,
+            version,
+            license,
+            description,
+        }) => {
+            pack_cmd::run_pack(&workspace, out, name, version, license, description)?;
+        }
+        Some(Commands::Install { file, target }) => {
+            pack_cmd::run_install(&file, target)?;
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.

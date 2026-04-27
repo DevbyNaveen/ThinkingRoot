@@ -37,3 +37,8 @@ pub mod writer;
 
 pub use error::Error;
 pub use manifest::{Manifest, TrustTier};
+
+// Re-export so consumers don't need a direct `semver` dep just to
+// parse a pack version — `semver::Version` is already on the public
+// surface of `Manifest`.
+pub use semver::Version;
