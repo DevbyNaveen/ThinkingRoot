@@ -296,21 +296,27 @@ impl Provider {
     /// always see at least one chunk and exactly one `ChatFinish` on
     /// success.
     async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
-        // Default path — one-shot the existing `chat()` and wrap as a
-        // single-chunk stream. Provider-specific real SSE is added in
-        // B2 (Anthropic), B3 (OpenAI / 9 OpenAI-compatible providers),
-        // B4 (Azure). This default keeps the trait surface honest
-        // before those overrides land.
-        let out = self.chat(system, user).await?;
-        let chunk = ChatChunk {
-            text: out.text,
-            finish: Some(ChatFinish {
-                truncated: out.truncated,
-                limits: out.limits,
-            }),
-        };
-        let stream = async_stream::stream! { yield Ok(chunk); };
-        Ok(Box::pin(stream))
+        match self {
+            Provider::Anthropic(p) => p.chat_stream(system, user).await,
+            // B3 / B4: OpenAi + Azure get real SSE in subsequent
+            // commits. Until then they fall through to the one-shot
+            // wrap below.
+            Provider::Bedrock(_)
+            | Provider::Ollama(_)
+            | Provider::OpenAi(_)
+            | Provider::Azure(_) => {
+                let out = self.chat(system, user).await?;
+                let chunk = ChatChunk {
+                    text: out.text,
+                    finish: Some(ChatFinish {
+                        truncated: out.truncated,
+                        limits: out.limits,
+                    }),
+                };
+                let stream = async_stream::stream! { yield Ok(chunk); };
+                Ok(Box::pin(stream))
+            }
+        }
     }
 
     fn model_name(&self) -> &str {
@@ -783,6 +789,176 @@ impl AnthropicProvider {
                 provider: "anthropic".into(),
                 message: format!("unexpected response: {json}"),
             })
+    }
+
+    /// Real SSE streaming via the `/v1/messages?stream=true` endpoint.
+    ///
+    /// The wire format is documented at
+    /// <https://docs.anthropic.com/en/api/messages-streaming>. We
+    /// project Anthropic's `content_block_delta` events (the only
+    /// event type that carries text) into [`ChatChunk`]s and surface
+    /// the `stop_reason` from `message_delta` as the
+    /// [`ChatFinish::truncated`] signal on the closing chunk emitted
+    /// at `message_stop`.
+    ///
+    /// Errors:
+    /// - 429 / 529 → `Error::RateLimited` returned synchronously
+    ///   from the open (callers can retry the open).
+    /// - Non-2xx other → `Error::LlmProvider` synchronously.
+    /// - Mid-stream `event: error` → yielded as an `Err` item.
+    /// - Bytes that fail to parse as SSE → yielded as `Err` items
+    ///   so the stream surfaces the failure rather than silently
+    ///   truncating.
+    async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        use eventsource_stream::Eventsource;
+        use futures::StreamExt;
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_output_tokens,
+            "temperature": 0.1,
+            "system": system,
+            "messages": [
+                {"role": "user", "content": user},
+            ],
+            "stream": true,
+        });
+
+        let resp = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::LlmProvider {
+                provider: "anthropic".into(),
+                message: format!("connect: {e}"),
+            })?;
+
+        let status = resp.status().as_u16();
+        if status == 429 || status == 529 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+                .unwrap_or(0);
+            return Err(Error::RateLimited {
+                provider: "anthropic".into(),
+                retry_after_ms: retry_after,
+            });
+        }
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider: "anthropic".into(),
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        // Capture rate-limit headers up-front; we attach them to the
+        // final chunk so the scheduler still sees them on streaming
+        // calls.
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+
+        let mut events = resp.bytes_stream().eventsource();
+
+        let stream = async_stream::stream! {
+            let mut truncated = false;
+            while let Some(item) = events.next().await {
+                match item {
+                    Err(e) => {
+                        yield Err(Error::LlmProvider {
+                            provider: "anthropic".into(),
+                            message: format!("sse parse: {e}"),
+                        });
+                        return;
+                    }
+                    Ok(ev) => {
+                        // `event:` field carries the type; the data
+                        // is JSON. We ignore `ping` (keep-alive) and
+                        // `content_block_start` / `content_block_stop`
+                        // (no payload of interest).
+                        match ev.event.as_str() {
+                            "content_block_delta" => {
+                                let json: serde_json::Value =
+                                    match serde_json::from_str(&ev.data) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            yield Err(Error::LlmProvider {
+                                                provider: "anthropic".into(),
+                                                message: format!("decode delta: {e}"),
+                                            });
+                                            return;
+                                        }
+                                    };
+                                let delta_type =
+                                    json["delta"]["type"].as_str().unwrap_or("");
+                                if delta_type == "text_delta" {
+                                    if let Some(text) =
+                                        json["delta"]["text"].as_str()
+                                    {
+                                        if !text.is_empty() {
+                                            yield Ok(ChatChunk {
+                                                text: text.to_string(),
+                                                finish: None,
+                                            });
+                                        }
+                                    }
+                                }
+                                // `input_json_delta` (tool use) is
+                                // intentionally ignored — chat
+                                // streaming surfaces text only.
+                            }
+                            "message_delta" => {
+                                let json: serde_json::Value =
+                                    serde_json::from_str(&ev.data)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let stop_reason = json["delta"]["stop_reason"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                if stop_reason == "max_tokens" {
+                                    truncated = true;
+                                }
+                            }
+                            "message_stop" => {
+                                yield Ok(ChatChunk {
+                                    text: String::new(),
+                                    finish: Some(ChatFinish {
+                                        truncated,
+                                        limits: limits.clone(),
+                                    }),
+                                });
+                                return;
+                            }
+                            "error" => {
+                                let json: serde_json::Value =
+                                    serde_json::from_str(&ev.data)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let msg = json["error"]["message"]
+                                    .as_str()
+                                    .unwrap_or("(no message)")
+                                    .to_string();
+                                yield Err(Error::LlmProvider {
+                                    provider: "anthropic".into(),
+                                    message: msg,
+                                });
+                                return;
+                            }
+                            _ => { /* ping / message_start / etc. */ }
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 
