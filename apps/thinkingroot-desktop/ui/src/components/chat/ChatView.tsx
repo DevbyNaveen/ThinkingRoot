@@ -35,8 +35,10 @@ import {
   conversationsAppendMessage,
   conversationsCreate,
   conversationsGet,
+  llmHealth,
   onChatEvent,
   type ChatEvent,
+  type LlmHealth,
 } from "@/lib/tauri";
 import type { ChatMessage } from "@/types";
 import { SlashAutocomplete } from "./SlashAutocomplete";
@@ -56,6 +58,31 @@ export function ChatView() {
 
   const key = activeWorkspace && activeConv ? `${activeWorkspace}::${activeConv}` : null;
   const messages = key ? (messagesByKey[key] ?? []) : [];
+
+  // Pre-flight LLM health for the active workspace. We fetch on switch so
+  // a banner appears *before* the user types — no more 120 s "Generating…"
+  // hangs when the workspace has no provider key configured.
+  const [health, setHealth] = useState<LlmHealth | null>(null);
+  useEffect(() => {
+    if (!activeWorkspace) {
+      setHealth(null);
+      return;
+    }
+    let cancelled = false;
+    llmHealth(activeWorkspace)
+      .then((h) => {
+        if (!cancelled) setHealth(h);
+      })
+      .catch(() => {
+        // The banner is best-effort — if the sidecar isn't up yet, the
+        // chat surface still works once it boots; we don't want a fetch
+        // failure to mask the chat input.
+        if (!cancelled) setHealth(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace]);
 
   // Hydrate from disk when a new conversation gets selected.
   useEffect(() => {
@@ -197,6 +224,7 @@ export function ChatView() {
               <code className="rounded bg-muted px-1 py-0.5 font-mono">/</code>{" "}
               for slash commands.
             </p>
+            <LlmHealthBanner health={health} workspace={activeWorkspace} />
             <div className="w-full">
               <Composer
                 workspace={activeWorkspace}
@@ -286,6 +314,9 @@ export function ChatView() {
         </ul>
       </div>
 
+      <div className="mx-auto w-full max-w-3xl px-8">
+        <LlmHealthBanner health={health} workspace={activeWorkspace} />
+      </div>
       <Composer
         workspace={activeWorkspace}
         convId={activeConv}
@@ -336,6 +367,64 @@ export function ChatView() {
       />
     </div>
   );
+}
+
+/**
+ * Pre-flight banner shown above the composer when the active workspace
+ * either has no LLM configured or has no compiled claims. Surfaces the
+ * actionable "you'd be waiting forever" cases up-front instead of
+ * letting the user submit and watch a spinner. Renders nothing on the
+ * happy path (configured + has claims).
+ */
+function LlmHealthBanner({
+  health,
+  workspace,
+}: {
+  health: LlmHealth | null;
+  workspace: string;
+}) {
+  if (!health) return null;
+  if (!health.mounted) {
+    return (
+      <div className="flex w-full items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/5 px-3 py-2 text-xs text-yellow-200">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
+        <div>
+          Workspace <code className="font-mono">{workspace}</code> isn't
+          mounted in the engine yet. Compile it from the Workspaces panel
+          before chatting.
+        </div>
+      </div>
+    );
+  }
+  if (!health.configured) {
+    return (
+      <div className="flex w-full items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-200">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
+        <div>
+          No LLM configured for <code className="font-mono">{workspace}</code>.
+          Set <code className="font-mono">ANTHROPIC_API_KEY</code> (or your
+          provider's key) and restart, or run{" "}
+          <code className="font-mono">root setup</code> in the workspace
+          directory. Without a provider, answers fall back to the
+          highest-confidence claim verbatim.
+        </div>
+      </div>
+    );
+  }
+  if (health.claim_count === 0) {
+    return (
+      <div className="flex w-full items-start gap-2 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs text-blue-100">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
+        <div>
+          No compiled claims in <code className="font-mono">{workspace}</code>{" "}
+          yet. The {health.provider} {health.model} model is wired, but
+          there's nothing to ground answers against — drop sources into the
+          workspace and run <code className="font-mono">root compile</code>.
+        </div>
+      </div>
+    );
+  }
+  return null;
 }
 
 function ChatHeader({
@@ -479,7 +568,7 @@ function Composer({
   return (
     <div className="px-4 py-4">
       <div className="mx-auto max-w-3xl">
-        <div className="group relative flex flex-col gap-2 rounded-3xl border border-border/60 bg-background px-4 pt-3 pb-2 transition-colors focus-within:border-border">
+        <div className="group relative flex flex-col gap-2 rounded-3xl border border-border/60 bg-muted/40 px-4 pt-3 pb-2 transition-colors focus-within:border-border">
           {slashQuery && (
             <SlashAutocomplete
               query={slashQuery}

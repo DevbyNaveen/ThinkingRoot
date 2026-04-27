@@ -216,3 +216,64 @@ pub async fn chat_send_stream(
         port: sidecar.port,
     })
 }
+
+// ─── LLM health (pre-flight) ─────────────────────────────────
+
+/// Mirror of the engine's `LlmHealthBody` so the UI gets one round-trip
+/// and a stable shape when deciding whether to render the
+/// "no LLM configured" banner.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LlmHealth {
+    pub configured: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub claim_count: usize,
+    pub mounted: bool,
+}
+
+/// Tauri command — pre-flight check the chat surface calls on workspace
+/// switch. The desktop never blocks send on the result; it just renders
+/// a banner so users with an unconfigured workspace know *before* they
+/// type 200 chars why the answer won't come.
+#[tauri::command]
+pub async fn llm_health(app: AppHandle, workspace: String) -> Result<LlmHealth, String> {
+    let state = app.state::<AppState>();
+    let sidecar = state.sidecar.lock().await.clone();
+    let Some(sidecar) = sidecar else {
+        // No sidecar yet — treat as "not configured" so the UI can show
+        // the same banner shape rather than spinning.
+        return Ok(LlmHealth {
+            configured: false,
+            provider: None,
+            model: None,
+            claim_count: 0,
+            mounted: false,
+        });
+    };
+
+    let url = format!(
+        "http://{}:{}/api/v1/ws/{}/llm/health",
+        sidecar.host, sidecar.port, workspace
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("http client init failed: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("sidecar unreachable at {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("llm/health returned {}", resp.status()));
+    }
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("decode response: {e}"))?;
+    let data = parsed
+        .get("data")
+        .ok_or_else(|| "malformed response (no `data` field)".to_string())?;
+    serde_json::from_value::<LlmHealth>(data.clone())
+        .map_err(|e| format!("decode llm/health body: {e}"))
+}

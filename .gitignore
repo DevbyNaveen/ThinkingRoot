@@ -59,6 +59,11 @@ lib/
 bin/
 include/
 
+# The desktop UI has its own src/lib/ — re-include it (the global
+# `lib/` rule above is for Python virtualenvs).
+!apps/thinkingroot-desktop/ui/src/lib/
+!apps/thinkingroot-desktop/ui/src/lib/**
+
 # Node
 node_modules/
 

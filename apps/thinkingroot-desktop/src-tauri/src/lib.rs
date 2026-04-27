@@ -106,6 +106,7 @@ pub fn run() {
             commands::conversations::conversations_delete,
             commands::conversations::conversations_rename,
             commands::chat::chat_send_stream,
+            commands::chat::llm_health,
             commands::branch::branch_list,
             commands::branch::branch_create,
             commands::branch::branch_checkout,
