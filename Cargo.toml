@@ -16,6 +16,7 @@ members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/tr-format",
     "thinkingroot-python",
 ]
 # thinkingroot-python is a PyO3 cdylib that must be built via maturin.
@@ -37,6 +38,7 @@ default-members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/tr-format",
 ]
 
 [workspace.package]
