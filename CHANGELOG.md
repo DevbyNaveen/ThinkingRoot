@@ -96,15 +96,47 @@ Tests:
 - Existing `cargo test --workspace` suite (~800 tests) remains
   green.
 
-Known limitation: the pre-existing `/api/v1/ws/{ws}/search` and
-`/ask` endpoints crash a fresh `root serve` process with a tokio
-worker stack overflow on first request — the new `/ask/stream`
-inherits the same crash. The crash reproduces on an empty
-workspace with no claims and is unaffected by 32 MB stacks,
-implicating unbounded recursion in the vector-search path
-rather than deep-but-bounded frames. Investigation tracked
-separately; the streaming code itself is verified by the
-workspace test suite + the live Anthropic smoke test.
+### Fixed — pre-existing infinite recursion in `run_blocking`
+
+`crates/thinkingroot-serve/src/engine.rs::run_blocking` (added in
+e115307 as a "wrap sync ONNX in `block_in_place`" helper) had a
+typo — its `MultiThread` arm called `run_blocking(f)` instead of
+`tokio::task::block_in_place(f)`. That tail-recursed without bound
+on production multi-thread runtimes, blowing the tokio worker
+stack on the first `/api/v1/ws/{ws}/search`, `/ask`, or
+`/ask/stream` request. Tests didn't catch it because
+`#[tokio::test]` defaults to the single-thread flavor and falls
+through to the `_ => f()` branch. Fix swaps in
+`tokio::task::block_in_place(f)`, the original intent.
+
+This was the root cause of the user's "AI not replying / 120 s
+spinner" experience — chat was reaching the engine, hitting the
+recursion, killing the worker, and surfacing as a hung response.
+
+### Live verification (post-fix)
+
+```
+$ curl -s http://127.0.0.1:31760/api/v1/ws/thinkingroot-cloud/llm/health
+{"ok":true,"data":{"configured":true,"provider":"azure","model":"gpt-5.4",
+                   "claim_count":1253,"mounted":true},"error":null}
+
+$ curl -N -X POST .../ask/stream -d '{"question":"what is thinkingroot?"}'
+event: meta   data: {category:..., claims_used:116}
+event: token  data: {text:"Thinking"}
+event: token  data: {text:"Root"}
+event: token  data: {text:" is"}
+… (14 chunks total)
+event: final  data: {category:..., claims_used:116, truncated:false}
+```
+
+Fronted by **Azure gpt-5.4** (deployment `gpt-5.4` on resource
+`openai-gpt-mini`, api-version `2025-01-01-preview`) — same model
+configured in `.thinkingroot/config.toml` for every workspace.
+
+Live `azure_real_sse_streams_multiple_chunks` test added to
+`crates/thinkingroot-extract/tests/streaming_smoke.rs` exercises
+the same wire path against `gpt-5.4`; gated on
+`AZURE_OPENAI_API_KEY` per project convention.
 
 ### Added — `tr-format` + `.tr` distribution loop
 
