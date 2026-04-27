@@ -21,8 +21,8 @@ async fn anthropic_real_sse_streams_multiple_chunks() {
         _ => {
             eprintln!(
                 "[skip] ANTHROPIC_API_KEY not set — anthropic streaming \
-                 smoke test requires a live key. The default one-shot \
-                 path is still covered by `fallback_one_shot_yields_single_chunk`."
+                 smoke test requires a live key. Re-run with the env var \
+                 set to exercise the real /v1/messages?stream=true path."
             );
             return;
         }

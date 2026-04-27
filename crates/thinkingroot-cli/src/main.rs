@@ -550,8 +550,22 @@ enum WorkspaceAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Worker stack of 8 MB. Default is 2 MB but the synthesis path
+    // transitively pulls in fastembed → ONNX Runtime, which can blow
+    // a 2 MB tokio worker stack on first model load —
+    // `/api/v1/ws/{ws}/ask` (and the new `/ask/stream`) both reproduce
+    // this on a fresh process without the bump. `#[tokio::main]`
+    // doesn't expose `thread_stack_size`, so we build the runtime
+    // manually.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Detect TTY *before* initialising the subscriber — the filter depends on it.
