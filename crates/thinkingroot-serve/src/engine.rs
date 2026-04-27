@@ -209,7 +209,16 @@ where
     F: FnOnce() -> R,
 {
     match tokio::runtime::Handle::current().runtime_flavor() {
-        tokio::runtime::RuntimeFlavor::MultiThread => run_blocking(f),
+        // The original commit (e115307) had `run_blocking(f)` here —
+        // a recursive self-call instead of `block_in_place(f)`. That
+        // tail-recurses without bound on the multi-thread runtime
+        // (production `root serve`), blowing the tokio worker stack
+        // on the very first `search` / `search_scoped` call. Tests
+        // are unaffected because `#[tokio::test]` defaults to the
+        // single-thread flavor and falls through to the `_ => f()`
+        // arm. Reproduces with `curl /api/v1/ws/{ws}/ask` against
+        // any workspace, including empty ones.
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
         _ => f(),
     }
 }
