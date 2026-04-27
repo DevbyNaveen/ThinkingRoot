@@ -324,15 +324,30 @@ enum Commands {
     },
     /// Install a `.tr` knowledge pack — extract its contents to a
     /// target directory's `.thinkingroot/` so the engine can mount it
-    /// for `root query` / `root serve`. Verifies the manifest's
-    /// canonical-bytes hash on read; rejects tampered files.
+    /// for `root query` / `root serve`. The reference may be:
+    ///
+    /// • a local path: `./pack.tr`, `/abs/path.tr`
+    /// • a direct URL: `https://example.com/pack.tr`
+    /// • a registry coordinate: `owner/slug@version` (or `@latest`),
+    ///   resolved via the configured registry's discovery doc.
+    ///
+    /// Always verifies the manifest's canonical-bytes hash on read;
+    /// for registry installs, also cross-checks the BLAKE3 of the
+    /// downloaded body against the `x-tr-content-hash` response
+    /// header before unpacking.
     Install {
-        /// Path to the `.tr` file on disk.
-        file: PathBuf,
+        /// Local path, https URL, or `owner/slug@version` coordinate.
+        reference: String,
         /// Target directory. Defaults to
         /// `~/.thinkingroot/packs/<owner>/<slug>/<version>/`.
         #[arg(short, long, value_name = "DIR")]
         target: Option<PathBuf>,
+        /// Override the configured registry for this invocation.
+        /// Otherwise resolved via `$TR_REGISTRY_URL`, then
+        /// `~/.config/thinkingroot/registry.toml`, then a built-in
+        /// default of `https://thinkingroot.dev`.
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
     },
 }
 
@@ -723,8 +738,12 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             pack_cmd::run_pack(&workspace, out, name, version, license, description)?;
         }
-        Some(Commands::Install { file, target }) => {
-            pack_cmd::run_install(&file, target)?;
+        Some(Commands::Install {
+            reference,
+            target,
+            registry,
+        }) => {
+            pack_cmd::run_install(&reference, target, registry).await?;
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
