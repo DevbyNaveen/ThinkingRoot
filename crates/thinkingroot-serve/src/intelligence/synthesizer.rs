@@ -226,6 +226,47 @@ pub fn build_system_prompt(chat: ResolvedChat) -> &'static str {
     }
 }
 
+/// Compose the final system prompt by layering:
+///
+///   1. The resolved persona prompt (Memory or Conversational).
+///   2. Optional output style fragment (appended after the persona,
+///      under a `## ACTIVE STYLE: <name>` header). Memory persona is
+///      the LongMemEval contract and ignores any style — passing one
+///      while persona == Memory is a no-op.
+///   3. Optional skill manifest — one line per available skill —
+///      appended at the end so the LLM knows what `use_skill` will
+///      load. Memory persona ignores the manifest for the same
+///      contract-preservation reason.
+///
+/// All three layers are independently optional, so callers can
+/// gradually opt in to skills/styles without changing the
+/// LongMemEval bench harness's wire prompt.
+pub fn compose_full_system_prompt(
+    chat: ResolvedChat,
+    style: Option<&crate::intelligence::styles::OutputStyle>,
+    skills: Option<&crate::intelligence::skills::SkillRegistry>,
+) -> String {
+    let persona = build_system_prompt(chat);
+
+    // Memory persona = LongMemEval contract. Skip style + skills so the
+    // bench wire prompt stays byte-identical to v0.9.0.
+    if chat.persona == ChatPersona::Memory {
+        return persona.to_string();
+    }
+
+    let composed = crate::intelligence::styles::compose_system_prompt(persona, style);
+
+    let manifest = skills
+        .map(|s| s.manifest_for_prompt())
+        .unwrap_or_default();
+
+    if manifest.trim().is_empty() {
+        composed
+    } else {
+        format!("{}\n\n{}", composed.trim_end(), manifest.trim_end())
+    }
+}
+
 /// Convenience for callers that want a `Cow` (e.g. when an upstream layer
 /// might one day prepend per-deployment text).
 #[inline]
@@ -1668,5 +1709,112 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
     #[test]
     fn no_history_constant_is_empty() {
         assert!(NO_HISTORY.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // S4 — compose_full_system_prompt: persona × style × skills layering
+    // ─────────────────────────────────────────────────────────────────
+
+    use crate::intelligence::skills::{Skill, SkillRegistry};
+    use crate::intelligence::styles::OutputStyle;
+
+    fn fixture_style() -> OutputStyle {
+        OutputStyle {
+            name: "explanatory".to_string(),
+            description: "Educational insights".to_string(),
+            system_fragment: "Include educational insights as you go.".to_string(),
+            source_path: PathBuf::from("/tmp/explanatory.md"),
+        }
+    }
+
+    fn fixture_skills() -> SkillRegistry {
+        SkillRegistry::from_skills(vec![Skill {
+            name: "refactor-rust".to_string(),
+            description: "When refactoring Rust".to_string(),
+            body: "Step 1...".to_string(),
+            source_path: PathBuf::from("/tmp/refactor.md"),
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn compose_full_no_style_no_skills_returns_persona_unchanged() {
+        let chat = ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let composed = compose_full_system_prompt(chat, None, None);
+        assert_eq!(composed, CONVERSATIONAL_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn compose_full_with_style_appends_active_style_header() {
+        let chat = ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let style = fixture_style();
+        let composed = compose_full_system_prompt(chat, Some(&style), None);
+        assert!(composed.starts_with("You are ThinkingRoot"));
+        assert!(composed.contains("## ACTIVE STYLE: explanatory"));
+        assert!(composed.contains("Include educational insights"));
+    }
+
+    #[test]
+    fn compose_full_with_skills_appends_manifest() {
+        let chat = ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let skills = fixture_skills();
+        let composed = compose_full_system_prompt(chat, None, Some(&skills));
+        assert!(composed.starts_with("You are ThinkingRoot"));
+        assert!(composed.contains("## AVAILABLE SKILLS"));
+        assert!(composed.contains("refactor-rust"));
+        assert!(composed.contains("use_skill"));
+    }
+
+    #[test]
+    fn compose_full_with_style_and_skills_layers_in_order() {
+        let chat = ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let style = fixture_style();
+        let skills = fixture_skills();
+        let composed = compose_full_system_prompt(chat, Some(&style), Some(&skills));
+
+        let persona_idx = composed.find("You are ThinkingRoot").unwrap();
+        let style_idx = composed.find("## ACTIVE STYLE").unwrap();
+        let skills_idx = composed.find("## AVAILABLE SKILLS").unwrap();
+
+        // Layered top-to-bottom: persona → style → skill manifest.
+        assert!(persona_idx < style_idx);
+        assert!(style_idx < skills_idx);
+    }
+
+    #[test]
+    fn compose_full_memory_persona_ignores_style_and_skills() {
+        // LongMemEval contract: Memory persona produces byte-identical
+        // wire prompt regardless of style/skills passed in.
+        let chat = AskRequest::legacy_chat();
+        let with_extras = compose_full_system_prompt(
+            chat,
+            Some(&fixture_style()),
+            Some(&fixture_skills()),
+        );
+        assert_eq!(with_extras, MEMORY_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn compose_full_empty_skills_registry_does_not_emit_manifest_header() {
+        let chat = ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let empty_skills = SkillRegistry::empty();
+        let composed = compose_full_system_prompt(chat, None, Some(&empty_skills));
+        assert!(!composed.contains("AVAILABLE SKILLS"));
+        assert_eq!(composed, CONVERSATIONAL_SYSTEM_PROMPT);
     }
 }

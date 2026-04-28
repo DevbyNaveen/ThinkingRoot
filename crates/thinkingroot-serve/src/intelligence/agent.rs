@@ -40,6 +40,7 @@ use thinkingroot_core::{Error, Result};
 use crate::intelligence::approval::{ApprovalDecision, ApprovalGate};
 use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
 use crate::intelligence::tools::ToolRegistry;
+use crate::intelligence::trace::{SharedTraceLog, event_to_trace};
 
 /// The narrow LLM surface the agent loop needs. Production wires
 /// `Arc<LlmClient>` (the trait is implemented for it via the impl
@@ -164,6 +165,12 @@ pub struct Agent {
     llm: Arc<dyn LlmBackend>,
     registry: ToolRegistry,
     approval: Arc<dyn ApprovalGate>,
+    /// Optional signed trace log. When set, every [`AgentEvent`] is
+    /// also appended (kind + payload) to the log. The log writes
+    /// asynchronously; failures are logged via `tracing::warn` and
+    /// do NOT abort the agent — an audit log being unreachable
+    /// shouldn't kill a live conversation.
+    trace_log: Option<SharedTraceLog>,
     max_iterations: usize,
 }
 
@@ -186,8 +193,16 @@ impl Agent {
             llm,
             registry,
             approval,
+            trace_log: None,
             max_iterations: config.max_iterations,
         }
+    }
+
+    /// Builder-style setter to attach a [`SharedTraceLog`]. Pass an
+    /// `InMemoryTraceLog` for tests, a `FileTraceLog` for production.
+    pub fn with_trace_log(mut self, trace_log: SharedTraceLog) -> Self {
+        self.trace_log = Some(trace_log);
+        self
     }
 
     /// Tools registered for this agent. Surfaced for the synthesizer /
@@ -230,9 +245,13 @@ impl Agent {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    out.push(AgentEvent::Error {
-                        message: format!("LLM call failed on iteration {iterations}: {e}"),
-                    });
+                    self.emit(
+                        out,
+                        AgentEvent::Error {
+                            message: format!("LLM call failed on iteration {iterations}: {e}"),
+                        },
+                    )
+                    .await;
                     return;
                 }
             };
@@ -241,22 +260,28 @@ impl Agent {
                 ToolUseResponse::Text { text, truncated, .. } => {
                     if !text.is_empty() {
                         accumulated_text.push_str(&text);
-                        out.push(AgentEvent::Text {
-                            content: text.clone(),
-                        });
+                        self.emit(out, AgentEvent::Text { content: text.clone() }).await;
                     }
                     if truncated {
-                        out.push(AgentEvent::Error {
-                            message: format!(
-                                "model output truncated at iteration {iterations} \
-                                 (hit max_tokens)"
-                            ),
-                        });
+                        self.emit(
+                            out,
+                            AgentEvent::Error {
+                                message: format!(
+                                    "model output truncated at iteration {iterations} \
+                                     (hit max_tokens)"
+                                ),
+                            },
+                        )
+                        .await;
                     }
-                    out.push(AgentEvent::Done {
-                        final_text: accumulated_text,
-                        iterations,
-                    });
+                    self.emit(
+                        out,
+                        AgentEvent::Done {
+                            final_text: accumulated_text,
+                            iterations,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 ToolUseResponse::ToolCalls {
@@ -266,9 +291,13 @@ impl Agent {
                 } => {
                     if !text_preamble.is_empty() {
                         accumulated_text.push_str(&text_preamble);
-                        out.push(AgentEvent::Text {
-                            content: text_preamble.clone(),
-                        });
+                        self.emit(
+                            out,
+                            AgentEvent::Text {
+                                content: text_preamble.clone(),
+                            },
+                        )
+                        .await;
                     }
                     // Append the assistant's tool_use turn so the
                     // next call sees the conversation in shape.
@@ -283,17 +312,40 @@ impl Agent {
         }
 
         // Fell off the iteration ceiling.
-        out.push(AgentEvent::Error {
-            message: format!(
-                "agent stopped at iteration ceiling ({}). Partial text length: {}",
-                self.max_iterations,
-                accumulated_text.len()
-            ),
-        });
-        out.push(AgentEvent::Done {
-            final_text: accumulated_text,
-            iterations,
-        });
+        self.emit(
+            out,
+            AgentEvent::Error {
+                message: format!(
+                    "agent stopped at iteration ceiling ({}). Partial text length: {}",
+                    self.max_iterations,
+                    accumulated_text.len()
+                ),
+            },
+        )
+        .await;
+        self.emit(
+            out,
+            AgentEvent::Done {
+                final_text: accumulated_text,
+                iterations,
+            },
+        )
+        .await;
+    }
+
+    /// Emit one event: append to the events buffer AND, when a trace
+    /// log is configured, record the event in the signed trace.
+    /// Trace-write failures are logged via `tracing::warn` rather
+    /// than crashing the conversation — an unreachable audit log
+    /// shouldn't break a live chat.
+    async fn emit(&self, out: &mut Vec<AgentEvent>, event: AgentEvent) {
+        if let Some(log) = &self.trace_log {
+            let (kind, payload) = event_to_trace(&event);
+            if let Err(e) = log.append(kind, payload).await {
+                tracing::warn!("agent trace log append failed: {e}");
+            }
+        }
+        out.push(event);
     }
 
     /// Dispatch one batch of tool calls. Each call:
@@ -317,21 +369,29 @@ impl Agent {
         let mut results: Vec<ToolResult> = Vec::with_capacity(calls.len());
         for call in calls {
             let is_write = self.registry.is_write(&call.name);
-            out.push(AgentEvent::ToolCallProposed {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                input: call.input.clone(),
-                is_write,
-            });
+            self.emit(
+                out,
+                AgentEvent::ToolCallProposed {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call.input.clone(),
+                    is_write,
+                },
+            )
+            .await;
 
             if is_write {
                 let decision = self.approval.check(&call.name, &call.input).await;
                 if let ApprovalDecision::Rejected { reason } = decision {
-                    out.push(AgentEvent::ToolCallRejected {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        reason: reason.clone(),
-                    });
+                    self.emit(
+                        out,
+                        AgentEvent::ToolCallRejected {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await;
                     // Feed rejection back to the model as a tool
                     // error so it can adapt (apologise, ask, etc.)
                     // rather than crashing.
@@ -344,17 +404,25 @@ impl Agent {
                 }
             }
 
-            out.push(AgentEvent::ToolCallExecuting {
-                id: call.id.clone(),
-                name: call.name.clone(),
-            });
+            self.emit(
+                out,
+                AgentEvent::ToolCallExecuting {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                },
+            )
+            .await;
             let res = self.registry.dispatch(&call.name, call.input.clone()).await;
-            out.push(AgentEvent::ToolCallFinished {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                content: res.content.clone(),
-                is_error: res.is_error,
-            });
+            self.emit(
+                out,
+                AgentEvent::ToolCallFinished {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    content: res.content.clone(),
+                    is_error: res.is_error,
+                },
+            )
+            .await;
             results.push(ToolResult {
                 tool_use_id: call.id.clone(),
                 content: res.content,
@@ -963,5 +1031,154 @@ mod tests {
             reply: String::new(),
             is_error: false,
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // S4 — trace log integration
+    // ─────────────────────────────────────────────────────────────────
+
+    use crate::intelligence::trace::{InMemoryTraceLog, kind, verify_chain};
+
+    #[tokio::test]
+    async fn agent_writes_signed_trace_for_text_only_run() {
+        let llm = Arc::new(ScriptedLlm::new(vec![ToolUseResponse::Text {
+            text: "Three providers.".to_string(),
+            truncated: false,
+            limits: empty_limits(),
+        }]));
+        let trace = Arc::new(InMemoryTraceLog::new());
+        let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove))
+            .with_trace_log(trace.clone());
+
+        let req = AgentRequest {
+            system: "sys".to_string(),
+            history: vec![ChatMessage::user("how many providers")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let _ = agent.run_collected(req).await;
+
+        let entries = trace.entries().await;
+        // Two events for a clean text-only run: Text + Done.
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, kind::AGENT_TEXT);
+        assert_eq!(entries[1].kind, kind::AGENT_RUN_DONE);
+        verify_chain(&entries).expect("trace must verify");
+    }
+
+    #[tokio::test]
+    async fn agent_writes_signed_trace_for_full_tool_call_round_trip() {
+        let registry = ToolRegistry::new().register_read(
+            fixture_tool("search"),
+            Arc::new(CapturingHandler {
+                name: "search",
+                captured: Arc::new(Mutex::new(Vec::new())),
+                reply: "hit".to_string(),
+                is_error: false,
+            }),
+        );
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "Done.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let trace = Arc::new(InMemoryTraceLog::new());
+        let agent = Agent::new(llm, registry, Arc::new(AutoApprove))
+            .with_trace_log(trace.clone());
+
+        let req = AgentRequest {
+            system: "sys".to_string(),
+            history: vec![ChatMessage::user("look it up")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let _ = agent.run_collected(req).await;
+
+        let entries = trace.entries().await;
+        // Sequence: ToolCallProposed → ToolCallExecuting → ToolCallFinished
+        // → Text → Done.
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].kind, kind::AGENT_TOOL_PROPOSED);
+        assert_eq!(entries[1].kind, kind::AGENT_TOOL_EXECUTING);
+        assert_eq!(entries[2].kind, kind::AGENT_TOOL_FINISHED);
+        assert_eq!(entries[3].kind, kind::AGENT_TEXT);
+        assert_eq!(entries[4].kind, kind::AGENT_RUN_DONE);
+        verify_chain(&entries).expect("full-flow trace must verify");
+    }
+
+    #[tokio::test]
+    async fn agent_traces_rejection_for_write_tool() {
+        let registry = ToolRegistry::new().register_write(
+            fixture_tool("create_branch"),
+            Arc::new(CapturingHandler {
+                name: "create_branch",
+                captured: Arc::new(Mutex::new(Vec::new())),
+                reply: "should not run".to_string(),
+                is_error: false,
+            }),
+        );
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "w".to_string(),
+                    name: "create_branch".to_string(),
+                    input: serde_json::json!({"name": "exp"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "Got it.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let trace = Arc::new(InMemoryTraceLog::new());
+        let agent =
+            Agent::new(llm, registry, Arc::new(DenyAll)).with_trace_log(trace.clone());
+
+        let req = AgentRequest {
+            system: "sys".to_string(),
+            history: vec![ChatMessage::user("create one")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let _ = agent.run_collected(req).await;
+
+        let entries = trace.entries().await;
+        // Proposed → Rejected → Text → Done. No Executing / Finished.
+        let kinds: Vec<&str> = entries.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&kind::AGENT_TOOL_PROPOSED));
+        assert!(kinds.contains(&kind::AGENT_TOOL_REJECTED));
+        assert!(!kinds.contains(&kind::AGENT_TOOL_EXECUTING));
+        assert!(!kinds.contains(&kind::AGENT_TOOL_FINISHED));
+        verify_chain(&entries).expect("rejection trace must verify");
+    }
+
+    #[tokio::test]
+    async fn agent_with_no_trace_log_still_works() {
+        // Sanity: omitting with_trace_log keeps every behaviour identical.
+        let llm = Arc::new(ScriptedLlm::new(vec![ToolUseResponse::Text {
+            text: "ok".to_string(),
+            truncated: false,
+            limits: empty_limits(),
+        }]));
+        let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove));
+        let req = AgentRequest {
+            system: "sys".to_string(),
+            history: vec![ChatMessage::user("hi")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+        assert_eq!(run.final_text().as_deref(), Some("ok"));
+        assert!(run.first_error().is_none());
     }
 }

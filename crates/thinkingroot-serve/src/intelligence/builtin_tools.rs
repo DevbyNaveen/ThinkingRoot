@@ -37,6 +37,7 @@ use tokio::sync::RwLock;
 
 use crate::engine::{ClaimFilter, QueryEngine};
 use crate::intelligence::session::SessionStore;
+use crate::intelligence::skills::SkillRegistry;
 use crate::intelligence::tools::{ToolHandler, ToolHandlerResult, ToolRegistry};
 
 /// State the tool handlers need to do their work. Cloned cheaply (all
@@ -60,6 +61,10 @@ pub struct ToolContext {
     /// when the agent merges. "thinkingroot" for the default chat
     /// surface; tests use synthetic ids.
     pub agent_id: String,
+    /// Catalogue of skills (`.thinkingroot/skills/*.md`) the agent
+    /// can load via `use_skill`. Empty means no skills are wired —
+    /// `use_skill` returns "no such skill" for any name.
+    pub skills: Arc<SkillRegistry>,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -327,6 +332,58 @@ impl ToolHandler for WorkspaceInfoTool {
                 ToolHandlerResult::ok(out)
             }
             Err(e) => ToolHandlerResult::error(format!("workspace_info failed: {e}")),
+        }
+    }
+}
+
+pub struct UseSkillTool {
+    ctx: ToolContext,
+}
+
+impl UseSkillTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "use_skill",
+            "Load the full instructions for a registered skill by name. Skills are workspace-specific playbooks (e.g. 'refactor-rust', 'explain-architecture') the user has authored to teach the agent how to do specific tasks well. Use the available skill list shown in the system prompt to pick one.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact skill name as listed in the AVAILABLE SKILLS section."
+                    }
+                },
+                "required": ["name"]
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for UseSkillTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let Some(name) = input.get("name").and_then(|v| v.as_str()) else {
+            return ToolHandlerResult::error("missing required field: name");
+        };
+        match self.ctx.skills.get(name) {
+            Some(skill) => ToolHandlerResult::ok(format!(
+                "## Skill: {} ({})\n\n{}",
+                skill.name, skill.description, skill.body
+            )),
+            None => {
+                let available = self.ctx.skills.names().join(", ");
+                ToolHandlerResult::error(format!(
+                    "no such skill: '{name}'. Available: {}",
+                    if available.is_empty() {
+                        "(none)"
+                    } else {
+                        available.as_str()
+                    }
+                ))
+            }
         }
     }
 }
@@ -674,10 +731,15 @@ impl ToolHandler for AbandonBranchTool {
 // Wire-up
 // ─────────────────────────────────────────────────────────────────
 
-/// Register all eight built-in tools on a fresh registry. Caller is
-/// expected to share this registry with the [`crate::intelligence::agent::Agent`]
-/// it constructs. Cheap and idempotent: every call returns a fresh
-/// registry with its own dispatch table.
+/// Register all built-in tools on a fresh registry. The set is:
+///
+///   read:  search, list_branches, list_claims, workspace_info, use_skill
+///   write: create_branch, contribute_claim, merge_branch, abandon_branch
+///
+/// Caller is expected to share this registry with the
+/// [`crate::intelligence::agent::Agent`] it constructs. Cheap and
+/// idempotent: every call returns a fresh registry with its own
+/// dispatch table.
 pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
     ToolRegistry::new()
         .register_read(SearchTool::spec(), Arc::new(SearchTool::new(ctx.clone())))
@@ -692,6 +754,10 @@ pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
         .register_read(
             WorkspaceInfoTool::spec(),
             Arc::new(WorkspaceInfoTool::new(ctx.clone())),
+        )
+        .register_read(
+            UseSkillTool::spec(),
+            Arc::new(UseSkillTool::new(ctx.clone())),
         )
         .register_write(
             CreateBranchTool::spec(),
@@ -801,11 +867,12 @@ mod tests {
             session_id: "sess".to_string(),
             sessions: crate::intelligence::session::new_session_store(),
             agent_id: "test-agent".to_string(),
+            skills: Arc::new(SkillRegistry::empty()),
         }
     }
 
     #[test]
-    fn register_builtin_tools_produces_eight_tools() {
+    fn register_builtin_tools_produces_nine_tools() {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx);
         let mut names = registry.tool_names();
@@ -820,6 +887,7 @@ mod tests {
                 "list_claims",
                 "merge_branch",
                 "search",
+                "use_skill",
                 "workspace_info",
             ]
         );
@@ -830,7 +898,13 @@ mod tests {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx);
         // Reads.
-        for name in ["search", "list_branches", "list_claims", "workspace_info"] {
+        for name in [
+            "search",
+            "list_branches",
+            "list_claims",
+            "workspace_info",
+            "use_skill",
+        ] {
             assert!(!registry.is_write(name), "{name} should be a read");
         }
         // Writes.
@@ -842,5 +916,42 @@ mod tests {
         ] {
             assert!(registry.is_write(name), "{name} should be a write");
         }
+    }
+
+    #[tokio::test]
+    async fn use_skill_returns_skill_body() {
+        use crate::intelligence::skills::Skill;
+        let skills = SkillRegistry::from_skills(vec![Skill {
+            name: "explain-architecture".to_string(),
+            description: "How X works".to_string(),
+            body: "Step 1...\nStep 2...".to_string(),
+            source_path: PathBuf::from("/tmp/x.md"),
+        }])
+        .unwrap();
+        let mut ctx = fixture_ctx();
+        ctx.skills = Arc::new(skills);
+        let tool = UseSkillTool::new(ctx);
+        let res = tool
+            .handle(serde_json::json!({"name": "explain-architecture"}))
+            .await;
+        assert!(!res.is_error);
+        assert!(res.content.contains("Step 1"));
+        assert!(res.content.contains("explain-architecture"));
+    }
+
+    #[tokio::test]
+    async fn use_skill_errors_on_unknown_name() {
+        let tool = UseSkillTool::new(fixture_ctx());
+        let res = tool.handle(serde_json::json!({"name": "nonexistent"})).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("no such skill"));
+    }
+
+    #[tokio::test]
+    async fn use_skill_errors_on_missing_name_field() {
+        let tool = UseSkillTool::new(fixture_ctx());
+        let res = tool.handle(serde_json::json!({})).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("missing required field"));
     }
 }
