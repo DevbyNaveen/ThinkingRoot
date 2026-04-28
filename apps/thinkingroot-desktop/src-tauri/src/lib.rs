@@ -112,6 +112,7 @@ pub fn run() {
             commands::conversations::conversations_delete,
             commands::conversations::conversations_rename,
             commands::chat::chat_send_stream,
+            commands::chat::chat_approve,
             commands::chat::llm_health,
             commands::branch::branch_list,
             commands::branch::branch_create,

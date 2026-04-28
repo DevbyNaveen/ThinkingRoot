@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type {
+  AgentStep,
   ChatMessage,
   StreamState,
   Surface,
@@ -51,6 +52,12 @@ interface AppStore {
   streaming: StreamState | null;
   setStreaming: (s: StreamState | null) => void;
   appendStreamingDelta: (delta: string) => void;
+  /** Append a fresh agent step in `proposed` state. Idempotent on
+   *  duplicate id (e.g. if the SSE handler retries). */
+  upsertAgentStep: (step: AgentStep) => void;
+  /** Patch an existing agent step (status/output/isError). No-op if
+   *  the step id isn't tracked yet. */
+  patchAgentStep: (id: string, patch: Partial<AgentStep>) => void;
 
   // Per-turn routing context. Survives component re-mounts (React
   // Strict Mode, Vite HMR) so SSE Final/Error events that arrive AFTER
@@ -163,6 +170,32 @@ export const useApp = create<AppStore>()(
               partial: s.streaming.partial + delta,
             },
           };
+        }),
+      upsertAgentStep: (step) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          const existingIdx = s.streaming.agentSteps.findIndex(
+            (a) => a.id === step.id,
+          );
+          const next = [...s.streaming.agentSteps];
+          const prior = existingIdx >= 0 ? next[existingIdx] : undefined;
+          if (prior) {
+            next[existingIdx] = { ...prior, ...step };
+          } else {
+            next.push(step);
+          }
+          return { streaming: { ...s.streaming, agentSteps: next } };
+        }),
+      patchAgentStep: (id, patch) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          const idx = s.streaming.agentSteps.findIndex((a) => a.id === id);
+          if (idx < 0) return {};
+          const prior = s.streaming.agentSteps[idx];
+          if (!prior) return {};
+          const next = [...s.streaming.agentSteps];
+          next[idx] = { ...prior, ...patch };
+          return { streaming: { ...s.streaming, agentSteps: next } };
         }),
 
       turnCtx: {},

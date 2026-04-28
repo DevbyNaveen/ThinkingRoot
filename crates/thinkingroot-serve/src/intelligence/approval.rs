@@ -24,6 +24,7 @@
 //                        oneshot reply channel. This is the production
 //                        default for the desktop chat surface.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -160,6 +161,111 @@ impl ApprovalGate for ChannelApprovalGate {
     }
 }
 
+// ─── HTTP-bridge approval gate ──────────────────────────────────
+//
+// The streaming `/ask/stream` handler can't use `ChannelApprovalGate`
+// directly because the approval reply arrives over a separate HTTP
+// POST (`/ask/approval/{id}`) — there is no in-process consumer to
+// pump the mpsc receiver. Instead the handler stores a
+// `oneshot::Sender<ApprovalDecision>` keyed by tool_use_id in
+// [`PendingApprovalMap`], emits an SSE `approval_requested` event,
+// and the approval POST looks up the sender and fires it.
+
+/// Map keyed by tool_use_id → reply oneshot. Lives on `AppState`.
+pub type PendingApprovalMap =
+    Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
+
+pub fn new_pending_approval_map() -> PendingApprovalMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Approval gate that registers each pending request in a shared
+/// [`PendingApprovalMap`] and waits for the corresponding entry to
+/// fire. Used by the streaming agent path so the desktop UI / CLI
+/// prompt / external client can post the decision back over HTTP.
+///
+/// Each tool call routes through one `ToolApprovalRouter::check`. The
+/// router keys the oneshot by `tool_use_id` (passed via
+/// `with_tool_use_id`) — without one, the gate auto-rejects with a
+/// reason rather than risk a missing key.
+pub struct ToolApprovalRouter {
+    pending: PendingApprovalMap,
+    /// Per-call tool_use_id, scoped to the agent invocation. Set by
+    /// `with_tool_use_id` before each `check` so the gate can correlate
+    /// the request with the SSE event the streaming handler emitted.
+    tool_use_id: Mutex<Option<String>>,
+}
+
+impl ToolApprovalRouter {
+    pub fn new(pending: PendingApprovalMap) -> Self {
+        Self {
+            pending,
+            tool_use_id: Mutex::new(None),
+        }
+    }
+
+    /// Set the tool_use_id the next `check` will use to register the
+    /// pending oneshot. The streaming handler calls this immediately
+    /// before the agent dispatches the corresponding write call.
+    pub async fn set_pending_id(&self, id: String) {
+        *self.tool_use_id.lock().await = Some(id);
+    }
+
+    /// Resolve a pending approval — used by the
+    /// `/ask/approval/{id}` HTTP handler. Returns `true` when an entry
+    /// existed and was fired, `false` otherwise (e.g. the agent
+    /// already timed out, or the id is wrong).
+    pub async fn resolve(
+        pending: &PendingApprovalMap,
+        id: &str,
+        decision: ApprovalDecision,
+    ) -> bool {
+        let mut guard = pending.lock().await;
+        match guard.remove(id) {
+            Some(tx) => tx.send(decision).is_ok(),
+            None => false,
+        }
+    }
+}
+
+const NO_PENDING_ID_REASON: &str =
+    "internal: ToolApprovalRouter::check called without a tool_use_id";
+
+#[async_trait]
+impl ApprovalGate for ToolApprovalRouter {
+    async fn check(&self, _tool_name: &str, _input: &serde_json::Value) -> ApprovalDecision {
+        let id = {
+            let mut guard = self.tool_use_id.lock().await;
+            guard.take()
+        };
+        let Some(id) = id else {
+            return ApprovalDecision::Rejected {
+                reason: NO_PENDING_ID_REASON.to_string(),
+            };
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut guard = self.pending.lock().await;
+            guard.insert(id.clone(), reply_tx);
+        }
+
+        match reply_rx.await {
+            Ok(decision) => decision,
+            Err(_) => {
+                // Sender dropped without firing — most often because
+                // the user closed the conversation before answering.
+                // Clean the stale entry and report a rejection.
+                let mut guard = self.pending.lock().await;
+                guard.remove(&id);
+                ApprovalDecision::Rejected {
+                    reason: "approval channel closed before decision".to_string(),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +352,94 @@ mod tests {
         });
         let d = gate.check("create_branch", &json!({"name": "x"})).await;
         assert!(!d.is_approved());
+    }
+
+    // ─── ToolApprovalRouter (HTTP bridge) ────────────────────────
+
+    #[tokio::test]
+    async fn router_resolve_unblocks_pending_check() {
+        let pending = new_pending_approval_map();
+        let router = ToolApprovalRouter::new(pending.clone());
+        router.set_pending_id("call-1".into()).await;
+
+        let pending_for_resolver = pending.clone();
+        tokio::spawn(async move {
+            // Wait until the entry is registered, then resolve it.
+            for _ in 0..50 {
+                if pending_for_resolver.lock().await.contains_key("call-1") {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+            let resolved = ToolApprovalRouter::resolve(
+                &pending_for_resolver,
+                "call-1",
+                ApprovalDecision::Approved,
+            )
+            .await;
+            assert!(resolved);
+        });
+
+        let d = router.check("create_branch", &json!({"name": "x"})).await;
+        assert!(d.is_approved());
+        // Sender removed from the map.
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn router_resolve_with_rejection_round_trips_reason() {
+        let pending = new_pending_approval_map();
+        let router = ToolApprovalRouter::new(pending.clone());
+        router.set_pending_id("call-2".into()).await;
+
+        let p2 = pending.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                if p2.lock().await.contains_key("call-2") {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+            ToolApprovalRouter::resolve(
+                &p2,
+                "call-2",
+                ApprovalDecision::Rejected {
+                    reason: "user clicked Reject".to_string(),
+                },
+            )
+            .await;
+        });
+
+        match router.check("create_branch", &json!({})).await {
+            ApprovalDecision::Rejected { reason } => assert_eq!(reason, "user clicked Reject"),
+            _ => panic!("expected rejection"),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_check_without_pending_id_rejects_safely() {
+        let pending = new_pending_approval_map();
+        let router = ToolApprovalRouter::new(pending);
+        // No set_pending_id call → gate must reject with a recognisable
+        // reason rather than panic or hang.
+        let d = router.check("any", &json!({})).await;
+        match d {
+            ApprovalDecision::Rejected { reason } => {
+                assert_eq!(reason, NO_PENDING_ID_REASON);
+            }
+            _ => panic!("expected rejection on missing id"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_id_is_a_noop() {
+        let pending = new_pending_approval_map();
+        let resolved = ToolApprovalRouter::resolve(
+            &pending,
+            "nonexistent",
+            ApprovalDecision::Approved,
+        )
+        .await;
+        assert!(!resolved);
     }
 }

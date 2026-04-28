@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_streaming;
 pub mod approval;
 pub mod augmenter;
 pub mod builtin_tools;

@@ -36,11 +36,42 @@ use thinkingroot_extract::llm::{
     ChatMessage, LlmClient, Tool, ToolCall, ToolChoice, ToolResult, ToolUseResponse,
 };
 use thinkingroot_core::{Error, Result};
+use tokio::sync::mpsc;
 
 use crate::intelligence::approval::{ApprovalDecision, ApprovalGate};
 use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
 use crate::intelligence::tools::ToolRegistry;
 use crate::intelligence::trace::{SharedTraceLog, event_to_trace};
+
+/// Where the agent loop pushes its events. Two production transports:
+///
+///   * `Buf` — append to a `Vec<AgentEvent>`. Used by `run_collected`
+///     and tests; everything is collected before the caller sees it.
+///   * `Channel` — send into an `mpsc::Sender<AgentEvent>`. Used by
+///     the streaming HTTP / Tauri path so the desktop sees each event
+///     the moment the agent emits it.
+///
+/// Both transports surface the same observable behaviour — the agent
+/// loop is unaware of which is in use.
+pub enum EventSink<'a> {
+    Buf(&'a mut Vec<AgentEvent>),
+    Channel(&'a mpsc::Sender<AgentEvent>),
+}
+
+impl EventSink<'_> {
+    async fn push(&mut self, event: AgentEvent) {
+        match self {
+            EventSink::Buf(v) => v.push(event),
+            EventSink::Channel(tx) => {
+                // Receiver dropped just means the consumer has gone
+                // away (e.g. SSE client disconnected). The agent
+                // can't recover from that — stop emitting and let
+                // the loop wind down naturally.
+                let _ = tx.send(event).await;
+            }
+        }
+    }
+}
 
 /// The narrow LLM surface the agent loop needs. Production wires
 /// `Arc<LlmClient>` (the trait is implemented for it via the impl
@@ -214,18 +245,37 @@ impl Agent {
 
     /// Run the loop, collecting every event into a `Vec`. Convenient
     /// for tests and CLI surfaces that don't need streaming.
-    /// Production HTTP / Tauri callers will use the streaming variant
-    /// in S5.
     pub async fn run_collected(&self, req: AgentRequest) -> Vec<AgentEvent> {
         let mut events: Vec<AgentEvent> = Vec::new();
         self.run_into(req, &mut events).await;
         events
     }
 
-    /// Run the loop, pushing every event into `out`. Shared core
-    /// between the sync `run_collected` and the streaming variant
-    /// (S5) — the streaming wrapper turns `out` into an mpsc sender.
+    /// Run the loop, pushing every event into the supplied `Vec`.
+    /// Equivalent to `run_collected` but lets the caller pre-allocate
+    /// or post-process the buffer.
     pub async fn run_into(&self, req: AgentRequest, out: &mut Vec<AgentEvent>) {
+        let mut sink = EventSink::Buf(out);
+        self.drive(req, &mut sink).await;
+    }
+
+    /// Run the loop, sending every event into the mpsc channel as
+    /// soon as it is emitted. Used by the HTTP / Tauri streaming
+    /// path so the desktop sees `ToolCallProposed` /
+    /// `ToolCallExecuting` etc. live, not at the end.
+    ///
+    /// Returns once the agent terminates. The caller is responsible
+    /// for closing the channel (drop the `Sender`) when the
+    /// conversation ends.
+    pub async fn run_streaming(&self, req: AgentRequest, tx: mpsc::Sender<AgentEvent>) {
+        let mut sink = EventSink::Channel(&tx);
+        self.drive(req, &mut sink).await;
+    }
+
+    /// The actual loop. Shared between `run_into` and `run_streaming`
+    /// via the `EventSink` abstraction; a single source of truth so
+    /// the two transports can never diverge in observable behaviour.
+    async fn drive(&self, req: AgentRequest, sink: &mut EventSink<'_>) {
         let tools = self.registry.specs();
         let mut history = req.history;
         let mut iterations: usize = 0;
@@ -246,7 +296,7 @@ impl Agent {
                 Ok(r) => r,
                 Err(e) => {
                     self.emit(
-                        out,
+                        sink,
                         AgentEvent::Error {
                             message: format!("LLM call failed on iteration {iterations}: {e}"),
                         },
@@ -260,11 +310,12 @@ impl Agent {
                 ToolUseResponse::Text { text, truncated, .. } => {
                     if !text.is_empty() {
                         accumulated_text.push_str(&text);
-                        self.emit(out, AgentEvent::Text { content: text.clone() }).await;
+                        self.emit(sink, AgentEvent::Text { content: text.clone() })
+                            .await;
                     }
                     if truncated {
                         self.emit(
-                            out,
+                            sink,
                             AgentEvent::Error {
                                 message: format!(
                                     "model output truncated at iteration {iterations} \
@@ -275,7 +326,7 @@ impl Agent {
                         .await;
                     }
                     self.emit(
-                        out,
+                        sink,
                         AgentEvent::Done {
                             final_text: accumulated_text,
                             iterations,
@@ -292,7 +343,7 @@ impl Agent {
                     if !text_preamble.is_empty() {
                         accumulated_text.push_str(&text_preamble);
                         self.emit(
-                            out,
+                            sink,
                             AgentEvent::Text {
                                 content: text_preamble.clone(),
                             },
@@ -302,7 +353,7 @@ impl Agent {
                     // Append the assistant's tool_use turn so the
                     // next call sees the conversation in shape.
                     history.push(ChatMessage::AssistantToolCalls(calls.clone()));
-                    let results = self.dispatch_calls(&calls, out).await;
+                    let results = self.dispatch_calls(&calls, sink).await;
                     history.push(ChatMessage::ToolResults(results));
                     // Subsequent iterations always use Auto: forcing
                     // tools again would create an infinite loop.
@@ -313,7 +364,7 @@ impl Agent {
 
         // Fell off the iteration ceiling.
         self.emit(
-            out,
+            sink,
             AgentEvent::Error {
                 message: format!(
                     "agent stopped at iteration ceiling ({}). Partial text length: {}",
@@ -324,7 +375,7 @@ impl Agent {
         )
         .await;
         self.emit(
-            out,
+            sink,
             AgentEvent::Done {
                 final_text: accumulated_text,
                 iterations,
@@ -333,19 +384,19 @@ impl Agent {
         .await;
     }
 
-    /// Emit one event: append to the events buffer AND, when a trace
-    /// log is configured, record the event in the signed trace.
+    /// Emit one event: push through the [`EventSink`] AND, when a
+    /// trace log is configured, record the event in the signed trace.
     /// Trace-write failures are logged via `tracing::warn` rather
     /// than crashing the conversation — an unreachable audit log
     /// shouldn't break a live chat.
-    async fn emit(&self, out: &mut Vec<AgentEvent>, event: AgentEvent) {
+    async fn emit(&self, sink: &mut EventSink<'_>, event: AgentEvent) {
         if let Some(log) = &self.trace_log {
             let (kind, payload) = event_to_trace(&event);
             if let Err(e) = log.append(kind, payload).await {
                 tracing::warn!("agent trace log append failed: {e}");
             }
         }
-        out.push(event);
+        sink.push(event).await;
     }
 
     /// Dispatch one batch of tool calls. Each call:
@@ -364,13 +415,13 @@ impl Agent {
     async fn dispatch_calls(
         &self,
         calls: &[ToolCall],
-        out: &mut Vec<AgentEvent>,
+        sink: &mut EventSink<'_>,
     ) -> Vec<ToolResult> {
         let mut results: Vec<ToolResult> = Vec::with_capacity(calls.len());
         for call in calls {
             let is_write = self.registry.is_write(&call.name);
             self.emit(
-                out,
+                sink,
                 AgentEvent::ToolCallProposed {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -384,7 +435,7 @@ impl Agent {
                 let decision = self.approval.check(&call.name, &call.input).await;
                 if let ApprovalDecision::Rejected { reason } = decision {
                     self.emit(
-                        out,
+                        sink,
                         AgentEvent::ToolCallRejected {
                             id: call.id.clone(),
                             name: call.name.clone(),
@@ -405,7 +456,7 @@ impl Agent {
             }
 
             self.emit(
-                out,
+                sink,
                 AgentEvent::ToolCallExecuting {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -414,7 +465,7 @@ impl Agent {
             .await;
             let res = self.registry.dispatch(&call.name, call.input.clone()).await;
             self.emit(
-                out,
+                sink,
                 AgentEvent::ToolCallFinished {
                     id: call.id.clone(),
                     name: call.name.clone(),

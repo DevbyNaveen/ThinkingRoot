@@ -481,11 +481,24 @@ export async function conversationsRename(
 
 // ─── Chat (sidecar /ask bridge) ──────────────────────────────────────
 
+export interface ChatTurnPayload {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface ChatStreamArgs {
   workspace: string;
   question: string;
   conversationId?: string | null;
   sessionScope?: string[];
+  /** When true, the engine routes this turn through the multi-turn
+   *  tool-using agent (S3) — emits tool_call_* + approval_requested
+   *  events the UI must handle. The desktop chat surface flips this
+   *  on once claim cards are wired. */
+  useAgent?: boolean;
+  /** Last 6-8 turns of this conversation, oldest-first. Empty =
+   *  single-shot. */
+  history?: ChatTurnPayload[];
 }
 
 export interface ChatStreamAck {
@@ -504,7 +517,43 @@ export type ChatEvent =
       category: string;
       conversation_id: string | null;
     }
-  | { type: "error"; turn_id: string; message: string };
+  | { type: "error"; turn_id: string; message: string }
+  | {
+      type: "tool_call_proposed";
+      turn_id: string;
+      id: string;
+      name: string;
+      input: unknown;
+      is_write: boolean;
+    }
+  | {
+      type: "approval_requested";
+      turn_id: string;
+      id: string;
+      name: string;
+      input: unknown;
+    }
+  | {
+      type: "tool_call_executing";
+      turn_id: string;
+      id: string;
+      name: string;
+    }
+  | {
+      type: "tool_call_finished";
+      turn_id: string;
+      id: string;
+      name: string;
+      content: string;
+      is_error: boolean;
+    }
+  | {
+      type: "tool_call_rejected";
+      turn_id: string;
+      id: string;
+      name: string;
+      reason: string;
+    };
 
 export async function chatSendStream(args: ChatStreamArgs): Promise<ChatStreamAck> {
   return invoke<ChatStreamAck>("chat_send_stream", {
@@ -513,12 +562,33 @@ export async function chatSendStream(args: ChatStreamArgs): Promise<ChatStreamAc
       question: args.question,
       conversation_id: args.conversationId ?? null,
       session_scope: args.sessionScope ?? [],
+      use_agent: args.useAgent ?? false,
+      history: args.history ?? [],
     },
   });
 }
 
 export function onChatEvent(handler: (e: ChatEvent) => void): Promise<UnlistenFn> {
   return listen<ChatEvent>("chat-event", (ev) => handler(ev.payload));
+}
+
+/** Approve or reject a pending agent write tool call. Resolves the
+ *  matching pending oneshot in the engine's `pending_approvals` map
+ *  and unblocks the agent's `ToolApprovalRouter::check`. */
+export async function chatApprove(args: {
+  workspace: string;
+  toolUseId: string;
+  approve: boolean;
+  reason?: string;
+}): Promise<void> {
+  return invoke<void>("chat_approve", {
+    args: {
+      workspace: args.workspace,
+      tool_use_id: args.toolUseId,
+      approve: args.approve,
+      reason: args.reason ?? null,
+    },
+  });
 }
 
 // ─── LLM health (pre-flight) ─────────────────────────────────────────
