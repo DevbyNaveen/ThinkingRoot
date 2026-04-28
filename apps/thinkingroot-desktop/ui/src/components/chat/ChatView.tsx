@@ -38,6 +38,7 @@ import {
   llmHealth,
   onChatEvent,
   type ChatEvent,
+  type ChatTurnPayload,
   type LlmHealth,
 } from "@/lib/tauri";
 import type { ChatMessage } from "@/types";
@@ -54,6 +55,30 @@ function prettyJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/** Maximum chat turns we forward to the engine as history. The
+ *  conversational system prompt's "treat history as memory" rule
+ *  caps usefully around 6-8 turns; longer windows blow context
+ *  budget without improving recall. */
+const MAX_HISTORY_TURNS = 8;
+
+/** Project the local message cache into the wire-format history
+ *  the engine's `/ask/stream` endpoint accepts. Only `user` and
+ *  `assistant` kinds map to chat turns — every other UI-only
+ *  message kind (tool-use, memory-recall, compact-boundary, …) is
+ *  dropped because the LLM never produced them as chat turns and
+ *  shouldn't see them as such on the next turn. */
+function buildHistoryPayload(messages: ChatMessage[]): ChatTurnPayload[] {
+  const turns: ChatTurnPayload[] = [];
+  for (const m of messages) {
+    if (m.kind === "user") {
+      turns.push({ role: "user", content: m.body });
+    } else if (m.kind === "assistant") {
+      turns.push({ role: "assistant", content: m.body });
+    }
+  }
+  return turns.slice(-MAX_HISTORY_TURNS);
 }
 
 export function ChatView() {
@@ -362,6 +387,7 @@ export function ChatView() {
                 convId={activeConv}
                 disabled={streaming != null}
                 autoFocus
+                recentHistory={buildHistoryPayload(messages)}
                 onCancel={() => {
                   setStreaming(null);
                   toast("Cancelled — partial message kept.", { kind: "warn" });
@@ -478,6 +504,7 @@ export function ChatView() {
         workspace={activeWorkspace}
         convId={activeConv}
         disabled={streaming != null}
+        recentHistory={buildHistoryPayload(messages)}
         onCancel={() => {
           setStreaming(null);
           toast("Cancelled — partial message kept.", { kind: "warn" });
@@ -624,34 +651,14 @@ function NoWorkspace() {
 function ThinkingLoader() {
   return (
     <div className="flex h-12 items-center justify-start px-2">
-      <div className="relative h-6 w-6">
-        {/* The logo mask container */}
-        <div 
-          className="absolute inset-0 z-10"
-          style={{
-            WebkitMaskImage: 'url(/logo_white.png)',
-            maskImage: 'url(/logo_white.png)',
-            WebkitMaskSize: 'contain',
-            maskSize: 'contain',
-            WebkitMaskRepeat: 'no-repeat',
-            maskRepeat: 'no-repeat',
-            backgroundColor: 'hsl(var(--accent) / 0.4)',
-          }}
-        >
-          {/* Internal light sweep */}
-          <div 
-            className="absolute inset-0 bg-gradient-to-r from-transparent via-white/40 to-transparent animate-shimmer"
-            style={{
-              backgroundSize: '200% 100%',
-            }}
-          />
-        </div>
-        
-        {/* Subtle base logo for structure */}
+      <div className="relative h-6 w-6 animate-scale-pulse">
         <img
           src="/logo_white.png"
           alt="Thinking"
-          className="h-full w-full object-contain opacity-20"
+          className="h-full w-full object-contain opacity-80"
+          style={{
+            filter: 'drop-shadow(0 0 8px hsl(var(--accent) / 0.5))'
+          }}
         />
       </div>
     </div>
@@ -691,6 +698,7 @@ function Composer({
   convId,
   disabled,
   autoFocus,
+  recentHistory,
   onCancel,
   onCreateConvIfNeeded,
   onUserMessage,
@@ -700,6 +708,10 @@ function Composer({
   convId: string | null;
   disabled: boolean;
   autoFocus?: boolean;
+  /** Last ~8 user/assistant turns of this conversation, oldest-first.
+   *  Forwarded to the engine so the agent can treat them as memory.
+   *  Empty for fresh conversations. */
+  recentHistory: ChatTurnPayload[];
   onCancel: () => void;
   onCreateConvIfNeeded: (firstUserText: string) => Promise<string>;
   onUserMessage: (content: string) => void;
@@ -757,6 +769,8 @@ function Composer({
         workspace,
         question: trimmed,
         conversationId: cid,
+        useAgent: true,
+        history: recentHistory,
       });
       onStartTurn(ack.turn_id, workspace, cid);
     } catch (e) {
