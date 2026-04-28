@@ -1,5 +1,6 @@
 pub mod augmenter;
 pub mod compressor;
+pub mod identity;
 pub mod planner;
 pub mod react;
 pub mod reranker;

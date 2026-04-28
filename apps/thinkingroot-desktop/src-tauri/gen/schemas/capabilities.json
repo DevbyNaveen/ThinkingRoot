@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Permissions for the main ThinkingRoot Desktop window. Without an explicit capability file Tauri 2 generates an empty ACL, which silently denies `event.listen('chat-event', …)` and breaks streaming chat.","local":true,"windows":["main"],"permissions":["core:default","dialog:default","clipboard-manager:allow-write-text","opener:default","notification:default","os:default","window-state:default"]}}

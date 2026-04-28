@@ -15,7 +15,7 @@
 
 use serde::Serialize;
 
-use crate::config::AppConfig;
+use crate::config::DesktopState;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct AuthState {
@@ -44,10 +44,23 @@ pub struct StorageSummary {
 
 #[tauri::command]
 pub fn auth_state() -> Result<AuthState, String> {
-    let cfg = AppConfig::load().map_err(|e| e.to_string())?;
-    let token = cfg.env_or("TR_CLOUD_TOKEN").unwrap_or_default();
-    let base = cfg.env_or("TR_CLOUD_API_BASE");
-    let handle = cfg.env_or("TR_CLOUD_HANDLE");
+    // Process env wins over persisted state — same precedence the engine
+    // uses for credentials, so an operator's transient `export
+    // TR_CLOUD_TOKEN=…` always overrides whatever is on disk.
+    let state = DesktopState::load().map_err(|e| e.to_string())?;
+    let token = std::env::var("TR_CLOUD_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(state.cloud_token)
+        .unwrap_or_default();
+    let base = std::env::var("TR_CLOUD_API_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(state.cloud_api_base);
+    let handle = std::env::var("TR_CLOUD_HANDLE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(state.cloud_handle);
     let signed_in = !token.is_empty() && base.as_ref().is_some_and(|b| !b.is_empty());
     Ok(AuthState {
         signed_in,

@@ -22,8 +22,6 @@ use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 use thinkingroot_serve::pipeline::{ProgressEvent, run_pipeline};
 use tokio::sync::mpsc;
 
-use crate::config::AppConfig;
-
 /// One workspace as the UI sees it. Mirrors [`WorkspaceEntry`] plus
 /// derived fields the surface uses to colour the row (compiled badge,
 /// active marker).
@@ -43,8 +41,7 @@ pub struct WorkspaceView {
 #[tauri::command]
 pub fn workspace_list() -> Result<Vec<WorkspaceView>, String> {
     let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    let cfg = AppConfig::load().map_err(|e| e.to_string())?;
-    let active_path = cfg.env_or("THINKINGROOT_WORKSPACE");
+    let active_name = registry.active.as_deref();
     Ok(registry
         .workspaces
         .iter()
@@ -53,10 +50,7 @@ pub fn workspace_list() -> Result<Vec<WorkspaceView>, String> {
             path: w.path.display().to_string(),
             port: w.port,
             compiled: w.path.join(".thinkingroot").join("graph.db").exists(),
-            active: active_path
-                .as_ref()
-                .map(|p| PathBuf::from(p) == w.path)
-                .unwrap_or(false),
+            active: active_name == Some(w.name.as_str()),
         })
         .collect())
 }
@@ -86,17 +80,13 @@ pub fn workspace_add(args: WorkspaceAddArgs) -> Result<WorkspaceView, String> {
     });
     registry.save().map_err(|e| e.to_string())?;
 
-    let cfg = AppConfig::load().map_err(|e| e.to_string())?;
-    let active_path = cfg.env_or("THINKINGROOT_WORKSPACE");
+    let active = registry.active.as_deref() == Some(name.as_str());
     Ok(WorkspaceView {
         name,
         path: abs.display().to_string(),
         port,
         compiled: abs.join(".thinkingroot").join("graph.db").exists(),
-        active: active_path
-            .as_ref()
-            .map(|p| PathBuf::from(p) == abs)
-            .unwrap_or(false),
+        active,
     })
 }
 
@@ -120,23 +110,22 @@ pub struct WorkspaceSetActiveArgs {
     pub name: String,
 }
 
-/// Mark a registered workspace as the one `chat_send` recalls from by
-/// writing `THINKINGROOT_WORKSPACE` + `THINKINGROOT_WORKSPACE_NAME` into the
-/// config file. Returns the resolved absolute path.
+/// Mark a registered workspace as the one chat / brain / privacy commands
+/// resolve to. Persists into the shared `WorkspaceRegistry.active` pointer
+/// — single source of truth.
 #[tauri::command]
 pub fn workspace_set_active(args: WorkspaceSetActiveArgs) -> Result<String, String> {
-    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    let entry = registry
+    let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
+    let abs = registry
         .workspaces
         .iter()
         .find(|w| w.name == args.name)
+        .map(|e| e.path.display().to_string())
         .ok_or_else(|| format!("workspace `{}` not found", args.name))?;
-    let abs = entry.path.display().to_string();
-
-    write_config_keys(&[
-        ("THINKINGROOT_WORKSPACE", &abs),
-        ("THINKINGROOT_WORKSPACE_NAME", &entry.name),
-    ])?;
+    registry
+        .set_active(&args.name)
+        .map_err(|e| e.to_string())?;
+    registry.save().map_err(|e| e.to_string())?;
     Ok(abs)
 }
 
@@ -323,50 +312,3 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
     }
 }
 
-/// Append/replace keys in the config file via the same path
-/// `commands::settings::config_write` uses, but without going through
-/// the Tauri IPC boundary. The settings module owns the canonical
-/// implementation; we duplicate the minimal write logic here only to
-/// avoid a circular module dep when settings::config_write itself
-/// would call back into us in the future.
-fn write_config_keys(pairs: &[(&str, &str)]) -> Result<(), String> {
-    use std::fs;
-    let path = resolve_config_path().ok_or_else(|| "no HOME directory set".to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
-    }
-    let mut entries: std::collections::BTreeMap<String, toml::Value> = if path.exists() {
-        let raw = fs::read_to_string(&path).map_err(|e| format!("read config: {e}"))?;
-        toml::from_str(&raw).map_err(|e| format!("parse config: {e}"))?
-    } else {
-        Default::default()
-    };
-    for (k, v) in pairs {
-        entries.insert((*k).to_string(), toml::Value::String((*v).to_string()));
-    }
-    let serialized = toml::to_string_pretty(&entries).map_err(|e| format!("serialize: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, serialized).map_err(|e| format!("write tmp: {e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
-    Ok(())
-}
-
-fn resolve_config_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("THINKINGROOT_DESKTOP_CONFIG") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("thinkingroot").join("desktop.toml"));
-        }
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("thinkingroot")
-            .join("desktop.toml"),
-    )
-}

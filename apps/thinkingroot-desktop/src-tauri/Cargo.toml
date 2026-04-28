@@ -59,6 +59,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Match the engine's `dirs` major to keep Cargo.lock stable across the
+# stand-alone desktop workspace and the OSS engine workspace.
+dirs = "5"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -235,6 +235,11 @@ impl Default for ServeConfig {
 /// Registry of known workspaces, stored at `~/.config/thinkingroot/workspaces.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkspaceRegistry {
+    /// Name of the workspace selected as "active" by the desktop UI / CLI default.
+    /// One source of truth — supersedes the older `THINKINGROOT_WORKSPACE` env-var
+    /// hack the desktop used to keep in `desktop.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
     /// TOML key is `workspace` (plural via `Vec`) rendered as `[[workspace]]` array.
     #[serde(default, rename = "workspace")]
     pub workspaces: Vec<WorkspaceEntry>,
@@ -300,6 +305,32 @@ impl WorkspaceRegistry {
         }
         port
     }
+
+    /// Return the active workspace entry, if any. The active name is matched
+    /// against `workspaces[].name`; a stale pointer (entry was removed) is
+    /// treated as no active workspace, never as an error.
+    #[must_use]
+    pub fn active_entry(&self) -> Option<&WorkspaceEntry> {
+        let name = self.active.as_deref()?;
+        self.workspaces.iter().find(|w| w.name == name)
+    }
+
+    /// Set the active workspace by name. Errors if `name` isn't registered —
+    /// callers should `add()` first if they're creating a new workspace.
+    pub fn set_active(&mut self, name: &str) -> Result<()> {
+        if !self.workspaces.iter().any(|w| w.name == name) {
+            return Err(Error::EntityNotFound(format!(
+                "workspace '{name}' is not registered"
+            )));
+        }
+        self.active = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Clear the active-workspace pointer.
+    pub fn clear_active(&mut self) {
+        self.active = None;
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +375,34 @@ mod tests {
     fn next_available_port_starts_at_3000() {
         let reg = WorkspaceRegistry::default();
         assert_eq!(reg.next_available_port(), 3000);
+    }
+
+    #[test]
+    fn active_pointer_round_trips_and_handles_stale_names() {
+        let mut reg = WorkspaceRegistry::default();
+        reg.add(WorkspaceEntry {
+            name: "alpha".to_string(),
+            path: PathBuf::from("/a"),
+            port: 3000,
+        });
+
+        // Empty registry → no active.
+        assert!(reg.active_entry().is_none());
+
+        // Setting an unknown name fails loudly.
+        assert!(reg.set_active("ghost").is_err());
+
+        // Set + read.
+        reg.set_active("alpha").unwrap();
+        assert_eq!(reg.active_entry().map(|e| e.name.as_str()), Some("alpha"));
+
+        // Removing the active workspace leaves a stale pointer; the helper
+        // resolves it as None rather than panicking.
+        reg.remove("alpha");
+        assert!(reg.active_entry().is_none());
+
+        reg.clear_active();
+        assert!(reg.active.is_none());
     }
 
     #[test]

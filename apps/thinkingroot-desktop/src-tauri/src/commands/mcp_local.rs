@@ -16,7 +16,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 
-use crate::config::AppConfig;
 use crate::state::AppState;
 
 /// Snapshot of sidecar lifecycle state, plus the URL the user can
@@ -159,8 +158,15 @@ fn resolve_root_binary() -> Option<String> {
 }
 
 fn workspace_path() -> Option<String> {
-    let cfg = AppConfig::load().ok()?;
-    cfg.env_or("THINKINGROOT_WORKSPACE")
+    if let Ok(p) = std::env::var("THINKINGROOT_WORKSPACE") {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    let registry = thinkingroot_core::WorkspaceRegistry::load().ok()?;
+    registry
+        .active_entry()
+        .map(|e| e.path.display().to_string())
 }
 
 // ─── MCP server list (sidebar "MCP TOOLS") ───────────────────────────

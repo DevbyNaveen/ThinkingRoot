@@ -139,82 +139,90 @@ export function ChatView() {
 
   // Wire the streaming events once.
   //
-  // Turn-routing context lives in the zustand store (`turnCtx`) — not
-  // a `useRef<Map>` — so SSE Final/Error events that arrive AFTER a
-  // remount (React Strict Mode, Vite HMR, navigation churn) still
-  // resolve to the right workspace+conversation and clear the
-  // streaming state. Without this, a fresh empty Map after remount
-  // would silently drop Final and leave the composer
-  // `disabled={streaming != null}` forever, blocking every
-  // subsequent send.
+  // Listener invariants — every code path here HAS to:
+  //   1. visibly progress the bubble for token events, even if the
+  //      user navigated away from the conversation (we render on
+  //      partial; if they're elsewhere, just keep accumulating).
+  //   2. ALWAYS clear `streaming` for the active turn on `final` /
+  //      `error`. The composer is `disabled={streaming != null}` so
+  //      a leak here wedges the chat input forever.
+  //   3. ALWAYS append the assistant message to disk + cache when
+  //      Final arrives. We resolve the target conversation in this
+  //      order: turnCtx (registered in onStartTurn) → active
+  //      streaming.turnId match → active workspace + conv. The last
+  //      fallback covers the React-remount edge case where turnCtx
+  //      lost the entry but the user is still on the right screen.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let running = true;
     onChatEvent((ev: ChatEvent) => {
       if (!running) return;
+      // eslint-disable-next-line no-console
+      console.log("[chat-event]", ev.type, ev.turn_id, ev);
 
       const cur = useApp.getState();
-      // Resolve the turn's original workspace+conv from the store —
-      // falls back to the active streaming state if the entry was
-      // already cleared. This makes the listener idempotent.
-      const ctx =
-        cur.resolveTurn(ev.turn_id) ??
-        (cur.streaming?.turnId === ev.turn_id && cur.activeWorkspace
+      const fromMap = cur.turnCtx[ev.turn_id];
+      const fromActive =
+        cur.streaming?.turnId === ev.turn_id && cur.activeWorkspace
           ? {
-              workspace: cur.activeWorkspace,
-              convId: cur.activeConversationId ?? "",
-            }
-          : null);
-
-      const userIsViewingThisTurn = ctx
-        ? cur.activeWorkspace === ctx.workspace &&
-          cur.activeConversationId === ctx.convId
-        : true;
+            workspace: cur.activeWorkspace,
+            convId: cur.activeConversationId ?? "",
+          }
+          : null;
+      const ctx = fromMap ?? fromActive;
 
       if (ev.type === "token") {
-        if (userIsViewingThisTurn && cur.streaming?.turnId === ev.turn_id) {
+        // Always keep the visible bubble in sync. The streaming-state
+        // turnId match is the only gate — it stays set from the
+        // moment onStartTurn fired until Final/Error.
+        if (cur.streaming?.turnId === ev.turn_id) {
           appendDelta(ev.text);
+        } else {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[chat-event] dropped token — streaming.turnId mismatch",
+            { event: ev.turn_id, streaming: cur.streaming?.turnId },
+          );
         }
-      } else if (ev.type === "final") {
+        return;
+      }
+
+      if (ev.type === "final" || ev.type === "error") {
+        const msgBody =
+          ev.type === "final" ? ev.full_text : `⚠️ ${ev.message}`;
+
+        // Persist to disk + UI cache when we know which conversation
+        // to write to. The on-disk write is fire-and-forget; UI cache
+        // is what makes the bubble appear.
         if (ctx && ctx.convId) {
-          conversationsAppendMessage({
-            workspace: ctx.workspace,
-            conversationId: ctx.convId,
-            role: "assistant",
-            content: ev.full_text,
-            claimsUsed: [],
-          }).catch((e) => {
-            toast("Persist message failed", {
-              kind: "warn",
-              body: e instanceof Error ? e.message : String(e),
-            });
-          });
-          if (userIsViewingThisTurn) {
-            appendMessage(ctx.workspace, ctx.convId, {
-              id: `m-${Date.now()}-a`,
-              kind: "assistant",
-              body: ev.full_text,
-              at: new Date(),
+          if (ev.type === "final") {
+            conversationsAppendMessage({
+              workspace: ctx.workspace,
+              conversationId: ctx.convId,
+              role: "assistant",
+              content: ev.full_text,
+              claimsUsed: [],
+            }).catch((e) => {
+              toast("Persist message failed", {
+                kind: "warn",
+                body: e instanceof Error ? e.message : String(e),
+              });
             });
           }
-        }
-        // Defense in depth: ALWAYS clear streaming if this is the
-        // active turn, even when ctx resolution failed. Otherwise
-        // the composer stays disabled forever.
-        if (cur.streaming?.turnId === ev.turn_id) {
-          setStreaming(null);
-        }
-        cur.clearTurn(ev.turn_id);
-      } else if (ev.type === "error") {
-        if (ctx && ctx.convId && userIsViewingThisTurn) {
           appendMessage(ctx.workspace, ctx.convId, {
-            id: `m-${Date.now()}-e`,
+            id: `m-${Date.now()}-${ev.type === "final" ? "a" : "e"}`,
             kind: "assistant",
-            body: `⚠️ ${ev.message}`,
+            body: msgBody,
             at: new Date(),
           });
+        } else {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[chat-event] no ctx for final/error — bubble suppressed but state cleared",
+            { turn_id: ev.turn_id, fromMap, fromActive },
+          );
         }
-        // Same defense-in-depth: always free the composer.
+
         if (cur.streaming?.turnId === ev.turn_id) {
           setStreaming(null);
         }
@@ -222,12 +230,40 @@ export function ChatView() {
       }
     }).then((u) => {
       unlisten = u;
+      // eslint-disable-next-line no-console
+      console.log("[chat-event] listener registered");
     });
     return () => {
       running = false;
       unlisten?.();
     };
   }, [appendDelta, appendMessage, setStreaming]);
+
+  // Watchdog: if streaming has been pending for > 60 s with no
+  // tokens arriving (partial still empty), surface a clear error
+  // and free the composer. Belt-and-braces against any future
+  // Tauri-event delivery regression.
+  useEffect(() => {
+    if (!streaming) return;
+    const stuckAt = streaming.startedAt.getTime();
+    const id = window.setInterval(() => {
+      const cur = useApp.getState();
+      if (!cur.streaming || cur.streaming.turnId !== streaming.turnId) {
+        window.clearInterval(id);
+        return;
+      }
+      const elapsed = Date.now() - stuckAt;
+      if (elapsed > 60_000 && !cur.streaming.partial) {
+        window.clearInterval(id);
+        toast("No response in 60 s", {
+          kind: "error",
+          body: "Check the sidecar log; the request reached the backend but no tokens came back.",
+        });
+        cur.setStreaming(null);
+      }
+    }, 5_000);
+    return () => window.clearInterval(id);
+  }, [streaming]);
 
   // Auto-scroll on append.
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -250,7 +286,7 @@ export function ChatView() {
     return (
       <div className="flex h-full flex-col bg-background">
         <ChatHeader workspace={activeWorkspace} convTitle="New conversation" />
-        <div className="flex flex-1 flex-col items-center px-8 pt-[18vh]">
+        <div className="flex flex-1 flex-col items-center px-8 pt-[24vh]">
           <div className="flex w-full max-w-2xl flex-col items-center gap-4">
             <h2 className="text-center text-lg font-medium">
               New conversation in{" "}
@@ -500,21 +536,66 @@ function NoWorkspace() {
   );
 }
 
+function ThinkingLoader() {
+  return (
+    <div className="flex h-12 items-center justify-start px-2">
+      <div className="relative h-6 w-6">
+        {/* The logo mask container */}
+        <div 
+          className="absolute inset-0 z-10"
+          style={{
+            WebkitMaskImage: 'url(/logo_white.png)',
+            maskImage: 'url(/logo_white.png)',
+            WebkitMaskSize: 'contain',
+            maskSize: 'contain',
+            WebkitMaskRepeat: 'no-repeat',
+            maskRepeat: 'no-repeat',
+            backgroundColor: 'hsl(var(--accent) / 0.4)',
+          }}
+        >
+          {/* Internal light sweep */}
+          <div 
+            className="absolute inset-0 bg-gradient-to-r from-transparent via-white/40 to-transparent animate-shimmer"
+            style={{
+              backgroundSize: '200% 100%',
+            }}
+          />
+        </div>
+        
+        {/* Subtle base logo for structure */}
+        <img
+          src="/logo_white.png"
+          alt="Thinking"
+          className="h-full w-full object-contain opacity-20"
+        />
+      </div>
+    </div>
+  );
+}
+
 function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }) {
   const isUser = msg.kind === "user";
+  const isThinking = pending && !msg.body && !isUser;
+
+  if (isThinking) {
+    return <ThinkingLoader />;
+  }
+
   return (
     <div className={cn("flex w-full", isUser && "justify-end")}>
       <div
         className={cn(
-          "max-w-2xl whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm",
+          "max-w-2xl whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm transition-all duration-300",
           isUser
             ? "bg-accent/15 text-foreground"
-            : "bg-surface text-foreground",
-          pending && "opacity-90",
+            : "bg-surface text-foreground shadow-sm border border-border/40",
+          pending && "opacity-90"
         )}
       >
-        {msg.body || (pending ? "…" : "")}
-        {pending && <span className="ml-1 inline-block animate-pulse">▌</span>}
+        {msg.body}
+        {pending && !isUser && (
+          <span className="ml-1 inline-block h-3.5 w-1 translate-y-0.5 bg-accent/60 animate-pulse" />
+        )}
       </div>
     </div>
   );

@@ -70,6 +70,34 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // Forward provider keys from the shared credentials.toml into the
+    // sidecar's process env. Without this, a user who configures Azure
+    // (or any other provider) from the desktop Settings UI would have
+    // their key written to credentials.toml but never reach the engine,
+    // because the engine resolves keys via `std::env::var(api_key_env)`
+    // first. Process env still wins when both are set — operators who
+    // launch the desktop from a shell with `export AZURE_OPENAI_API_KEY=…`
+    // see no behaviour change.
+    match thinkingroot_core::Credentials::load() {
+        Ok(creds) => {
+            let mut count = 0usize;
+            for (k, v) in creds.as_env_map() {
+                // Process env wins. Only seed values the desktop process
+                // didn't already inherit.
+                if std::env::var(&k).ok().filter(|s| !s.is_empty()).is_none() {
+                    cmd.env(&k, &v);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                tracing::info!(injected = count, "seeded sidecar with credentials from credentials.toml");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(?e, "credentials.toml unreadable; sidecar inherits desktop env only");
+        }
+    }
+
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {

@@ -1242,6 +1242,20 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
 
     let sessions_dir = path.join("sessions");
 
+    // Workspace identity / persona for the `root ask` CLI surface — same
+    // pattern as the HTTP /ask handler so the CLI and the desktop chat
+    // get the same workspace-grounded answers. The engine has only one
+    // workspace mounted here ("default"), so the snapshot is cheap.
+    let snapshot = engine.workspace_chat_snapshot("default").await;
+    let chat = snapshot
+        .as_ref()
+        .map(|s| s.config.chat.resolve(&s.source_kinds))
+        .unwrap_or_else(AskRequest::legacy_chat);
+    let identity_owned = snapshot.as_ref().map(|s| {
+        thinkingroot_serve::intelligence::identity::build_workspace_identity(s, &s.config.chat)
+    });
+    let today_iso = chrono::Local::now().format("%Y-%m-%d").to_string();
+
     let req = AskRequest {
         workspace: "default",
         question: query,
@@ -1252,6 +1266,9 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
         answer_sids: &[],
         sessions_dir: &sessions_dir,
         excluded_claim_ids: &HashSet::new(),
+        chat,
+        identity: identity_owned.as_ref(),
+        today: Some(&today_iso),
     };
 
     let spinner_msg = format!(

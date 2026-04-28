@@ -23,7 +23,6 @@ use tauri::{AppHandle, Manager};
 use thinkingroot_serve::engine::{ClaimFilter, QueryEngine};
 use tokio::sync::RwLock;
 
-use crate::config::AppConfig;
 use crate::state::{AppState, MountedMemory};
 
 /// One source listed in the dashboard. Mirrors
@@ -108,14 +107,13 @@ pub async fn privacy_forget(app: AppHandle, source_uri: String) -> Result<usize,
 async fn mount_engine(
     app: &AppHandle,
 ) -> anyhow::Result<(Arc<RwLock<QueryEngine>>, String)> {
-    let cfg = AppConfig::load()?;
-    let root_path = cfg
-        .env_or("THINKINGROOT_WORKSPACE")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("THINKINGROOT_WORKSPACE not set"))?;
-    let workspace = cfg
-        .env_or("THINKINGROOT_WORKSPACE_NAME")
-        .unwrap_or_else(|| "main".to_string());
+    let registry = thinkingroot_core::WorkspaceRegistry::load()
+        .map_err(|e| anyhow::anyhow!("load workspace registry: {e}"))?;
+    let entry = registry
+        .active_entry()
+        .ok_or_else(|| anyhow::anyhow!("no active workspace selected"))?;
+    let root_path: PathBuf = entry.path.clone();
+    let workspace = entry.name.clone();
 
     let state = app.state::<AppState>();
     let mut guard = state.memory.lock().await;

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 
-use crate::config::AppConfig;
+use crate::config::DesktopState;
 
 /// Maximum directory depth we descend when looking for `.thinkingroot/`.
 /// Scanning is best-effort; users with deeply-nested project trees can
@@ -112,14 +112,27 @@ fn resolve_scan_roots(explicit: Vec<String>) -> Vec<PathBuf> {
             .filter_map(|s| expand_tilde(&s))
             .collect();
     }
-    let cfg = AppConfig::load().unwrap_or_default();
-    let from_cfg: Vec<PathBuf> = cfg
-        .string_array("TR_SCAN_ROOTS")
+    // `TR_SCAN_ROOTS` env var (comma-separated) wins over persisted state —
+    // matches the credential / cloud-token precedence used elsewhere.
+    if let Ok(from_env) = std::env::var("TR_SCAN_ROOTS") {
+        let parsed: Vec<PathBuf> = from_env
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(expand_tilde)
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let from_state: Vec<PathBuf> = DesktopState::load()
+        .unwrap_or_default()
+        .scan_roots
         .into_iter()
-        .filter_map(|s| expand_tilde(&s))
+        .filter_map(|p| expand_tilde(p.to_string_lossy().as_ref()))
         .collect();
-    if !from_cfg.is_empty() {
-        return from_cfg;
+    if !from_state.is_empty() {
+        return from_state;
     }
     default_roots()
 }

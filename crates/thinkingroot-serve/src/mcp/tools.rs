@@ -498,7 +498,19 @@ pub async fn handle_call(
             let sessions_dir = sessions_dir_for(engine, ws);
             let llm = engine.workspace_llm(ws);
 
+            use crate::intelligence::identity::build_workspace_identity;
             use crate::intelligence::synthesizer::{AskRequest, ask as synth_ask};
+
+            let snapshot = engine.workspace_chat_snapshot(ws).await;
+            let chat = snapshot
+                .as_ref()
+                .map(|s| s.config.chat.resolve(&s.source_kinds))
+                .unwrap_or_else(AskRequest::legacy_chat);
+            let identity_owned = snapshot
+                .as_ref()
+                .map(|s| build_workspace_identity(s, &s.config.chat));
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
             let req = AskRequest {
                 workspace: ws,
                 question: &question,
@@ -509,6 +521,9 @@ pub async fn handle_call(
                 answer_sids: &session_scope,
                 sessions_dir: &sessions_dir,
                 excluded_claim_ids: &std::collections::HashSet::new(),
+                chat,
+                identity: identity_owned.as_ref(),
+                today: Some(&today),
             };
             let result = synth_ask(engine, llm, &req).await;
             let text = format!(

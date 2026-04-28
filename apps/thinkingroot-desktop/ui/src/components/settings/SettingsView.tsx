@@ -10,21 +10,29 @@ import {
   AlertTriangle,
   Check,
   Copy,
+  X,
 } from "lucide-react";
 import { motion } from "framer-motion";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  configRead,
-  configWrite,
+  configPaths,
+  credentialsRemove,
+  credentialsSet,
+  credentialsStatus,
+  globalConfigRead,
+  globalConfigWrite,
   mcpGetConfigSnippet,
   mcpStatus,
   workspaceList,
   workspaceLlmConfig,
   workspaceLlmWrite,
-  type ConfigRead,
+  workspaceSetActive,
+  type ConfigPaths,
+  type CredentialRow,
+  type GlobalLlmConfig,
   type McpStatus,
   type McpToolKey,
   type WorkspaceLlmConfig,
+  type WorkspaceView,
 } from "@/lib/tauri";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { useApp } from "@/store/app";
@@ -33,34 +41,22 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Theme } from "@/types";
 
-type ProviderKey = "azure" | "anthropic" | "openai" | "gemini";
-
-const PROVIDER_META: Record<ProviderKey, {
+/** Provider keys the Settings UI surfaces. The `env_var` matches the
+ *  canonical env-var name the engine looks up — single source of truth
+ *  with `crates/thinkingroot-extract/src/llm.rs::resolve_key`. */
+const PROVIDER_META: Array<{
+  id: "azure" | "anthropic" | "openai" | "openrouter" | "groq" | "deepseek";
   label: string;
-  keys: Array<{ name: string; label: string; secret?: boolean; placeholder?: string }>;
-}> = {
-  azure: {
-    label: "Azure OpenAI",
-    keys: [
-      { name: "AZURE_OPENAI_KEY", label: "API key", secret: true, placeholder: "sk-…" },
-      { name: "AZURE_OPENAI_ENDPOINT", label: "Endpoint", placeholder: "https://myres.openai.azure.com" },
-      { name: "AZURE_OPENAI_DEPLOYMENT", label: "Deployment", placeholder: "gpt-4.1-mini" },
-      { name: "AZURE_OPENAI_API_VERSION", label: "API version", placeholder: "2024-10-21" },
-    ],
-  },
-  anthropic: {
-    label: "Anthropic",
-    keys: [{ name: "ANTHROPIC_API_KEY", label: "API key", secret: true, placeholder: "sk-ant-…" }],
-  },
-  openai: {
-    label: "OpenAI",
-    keys: [{ name: "OPENAI_API_KEY", label: "API key", secret: true, placeholder: "sk-…" }],
-  },
-  gemini: {
-    label: "Google Gemini",
-    keys: [{ name: "GEMINI_API_KEY", label: "API key", secret: true, placeholder: "AIza…" }],
-  },
-};
+  env_var: string;
+  placeholder: string;
+}> = [
+  { id: "azure", label: "Azure OpenAI", env_var: "AZURE_OPENAI_API_KEY", placeholder: "Azure subscription key" },
+  { id: "anthropic", label: "Anthropic", env_var: "ANTHROPIC_API_KEY", placeholder: "sk-ant-…" },
+  { id: "openai", label: "OpenAI", env_var: "OPENAI_API_KEY", placeholder: "sk-…" },
+  { id: "openrouter", label: "OpenRouter", env_var: "OPENROUTER_API_KEY", placeholder: "sk-or-…" },
+  { id: "groq", label: "Groq", env_var: "GROQ_API_KEY", placeholder: "gsk_…" },
+  { id: "deepseek", label: "DeepSeek", env_var: "DEEPSEEK_API_KEY", placeholder: "sk-…" },
+];
 
 const THEMES: Array<{ id: Theme; label: string; note?: string }> = [
   { id: "dark", label: "Dark", note: "Catppuccin Mocha" },
@@ -72,83 +68,70 @@ const THEMES: Array<{ id: Theme; label: string; note?: string }> = [
 ];
 
 /**
- * Settings surface. Single scrollable pane with 5 sections: Provider,
- * Workspace, Appearance, Channels (stub), Covenant. Writes go to the
- * same `~/.config/thinkingroot/config.toml` the CLI uses, atomically,
- * chmod 0600.
+ * Settings surface. Reads / writes the same files the CLI does:
+ *
+ *   ~/<config_dir>/thinkingroot/credentials.toml   ← provider keys
+ *   ~/<config_dir>/thinkingroot/config.toml        ← provider/model defaults
+ *   ~/<config_dir>/thinkingroot/workspaces.toml    ← workspace registry + active
+ *   <workspace>/.thinkingroot/config.toml          ← per-workspace LLM overrides
  */
 export function SettingsView() {
   const theme = useApp((s) => s.theme);
   const setTheme = useApp((s) => s.setTheme);
 
-  const [cfg, setCfg] = useState<ConfigRead | null>(null);
-  const [provider, setProvider] = useState<ProviderKey>("azure");
-  const [pending, setPending] = useState<Record<string, string>>({});
-  const [workspace, setWorkspace] = useState("");
-  const [workspaceName, setWorkspaceName] = useState("main");
-  const [scanRoots, setScanRoots] = useState("");
+  const [paths, setPaths] = useState<ConfigPaths | null>(null);
+  const [globalCfg, setGlobalCfg] = useState<GlobalLlmConfig | null>(null);
+  const [credentials, setCredentials] = useState<CredentialRow[]>([]);
+  const [provider, setProvider] = useState<typeof PROVIDER_META[number]["id"]>("azure");
+  const [keyDraft, setKeyDraft] = useState<Record<string, string>>({});
+  const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([]);
+  const [activeWorkspace, setActiveWorkspaceLocal] = useState<string | null>(null);
+  const [wsLlm, setWsLlm] = useState<WorkspaceLlmConfig | null>(null);
+  const [wsPending, setWsPending] = useState<Record<string, string>>({});
+  const [globalPending, setGlobalPending] = useState<{
+    default_provider?: string;
+    extraction_model?: string;
+    compilation_model?: string;
+    azure?: {
+      resource_name?: string;
+      endpoint_base?: string;
+      deployment?: string;
+      api_version?: string;
+    };
+  }>({});
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  // Per-workspace LLM config — populated from the active workspace's
-  // `.thinkingroot/config.toml`. Replaces the hardcoded placeholders
-  // that used to render in the Provider section.
-  const [wsLlm, setWsLlm] = useState<WorkspaceLlmConfig | null>(null);
-  // Pending edits for the workspace-level fields (deployment, endpoint,
-  // api_version, etc.). Saved via `workspace_llm_write` on Save.
-  const [wsPending, setWsPending] = useState<Record<string, string>>({});
-
+  // Initial load — every config source in parallel.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const c = await configRead();
+        const [pathsRes, cfgRes, credsRes, wsRes] = await Promise.all([
+          configPaths(),
+          globalConfigRead(),
+          credentialsStatus(),
+          workspaceList(),
+        ]);
         if (cancelled) return;
-        setCfg(c);
-
-        // Hydrate workspace fields from the global desktop config.
-        const wsPath = c.entries.THINKINGROOT_WORKSPACE ?? "";
-        setWorkspace(wsPath);
-        setWorkspaceName(c.entries.THINKINGROOT_WORKSPACE_NAME ?? "main");
-        setScanRoots(c.entries.TR_SCAN_ROOTS ?? "");
-
-        // Resolve a workspace path to source the per-workspace LLM
-        // config from. Order:
-        //   1. THINKINGROOT_WORKSPACE in desktop.toml
-        //   2. First workspace mounted in the registry
-        let activePath = wsPath;
-        if (!activePath) {
-          try {
-            const list = await workspaceList();
-            const first = list[0];
-            if (first) activePath = first.path;
-          } catch {
-            /* fall through — settings still works without workspace */
-          }
+        setPaths(pathsRes);
+        setGlobalCfg(cfgRes);
+        setCredentials(credsRes);
+        setWorkspaces(wsRes);
+        const active: WorkspaceView | undefined =
+          wsRes.find((w) => w.active) ?? wsRes[0];
+        setActiveWorkspaceLocal(active?.name ?? null);
+        if (cfgRes.default_provider) {
+          const known = PROVIDER_META.find((p) => p.id === cfgRes.default_provider);
+          if (known) setProvider(known.id);
         }
-
-        if (activePath) {
+        if (active) {
           try {
-            const llm = await workspaceLlmConfig(activePath);
-            if (cancelled) return;
-            setWsLlm(llm);
-            // Pre-select the provider matching the workspace's actual config.
-            if (llm.provider) {
-              const p = llm.provider as ProviderKey;
-              if ((Object.keys(PROVIDER_META) as ProviderKey[]).includes(p)) {
-                setProvider(p);
-              }
-            }
+            const llm = await workspaceLlmConfig(active.path);
+            if (!cancelled) setWsLlm(llm);
           } catch {
-            /* fall through */
+            /* leave wsLlm null — section just hides */
           }
-        } else {
-          // No workspace yet — fall back to global config provider hint
-          // so the section still has a sensible selection.
-          const existing = (Object.keys(PROVIDER_META) as ProviderKey[]).find((p) =>
-            PROVIDER_META[p].keys.some((k) => k.secret && c.entries[k.name]),
-          );
-          if (existing) setProvider(existing);
         }
       } catch (e) {
         toast("Could not load settings", {
@@ -165,59 +148,42 @@ export function SettingsView() {
   }, []);
 
   const dirty =
-    Object.keys(pending).length > 0 || Object.keys(wsPending).length > 0;
-  const providerMeta = PROVIDER_META[provider];
-
-  function updateField(name: string, value: string) {
-    setPending((p) => ({ ...p, [name]: value }));
-  }
-
-  async function pickWorkspace() {
-    try {
-      const picked = await openDialog({
-        directory: true,
-        multiple: false,
-        title: "Choose workspace root",
-      });
-      if (typeof picked === "string" && picked.length > 0) {
-        setWorkspace(picked);
-        setPending((p) => ({ ...p, THINKINGROOT_WORKSPACE: picked }));
-      }
-    } catch (e) {
-      toast("Folder picker failed", {
-        kind: "error",
-        body: e instanceof Error ? e.message : String(e),
-      });
-    }
-  }
+    Object.values(keyDraft).some((v) => (v ?? "").length > 0) ||
+    Object.keys(wsPending).length > 0 ||
+    Object.keys(globalPending).length > 0;
 
   async function save() {
     setSaving(true);
     try {
-      // 1. Global desktop config (api keys + active workspace pointers)
-      const set: Record<string, string> = { ...pending };
-      if (workspace && set.THINKINGROOT_WORKSPACE === undefined) {
-        set.THINKINGROOT_WORKSPACE = workspace;
+      // 1. Credentials — write each non-empty draft, clear nothing
+      //    automatically (use the explicit "Remove" button for that).
+      for (const [envVar, value] of Object.entries(keyDraft)) {
+        if (value.trim().length > 0) {
+          await credentialsSet(envVar, value.trim());
+        }
       }
-      if (workspaceName) {
-        set.THINKINGROOT_WORKSPACE_NAME = workspaceName;
-      }
-      set.THINKINGROOT_PROVIDER = provider;
-      const wrote = await configWrite({ set });
 
-      // 2. Per-workspace LLM block (deployment, endpoint, api_version,
-      //    extraction/compilation model). Only if the user actually
-      //    edited any of those fields and we know which workspace to
-      //    write to. The workspace-level config is what the engine's
-      //    /ask + /ask/stream endpoints actually read.
-      let wsWrote: string | null = null;
+      // 2. Global LLM config patch.
+      if (Object.keys(globalPending).length > 0) {
+        const patch = { ...globalPending };
+        // Always tag the active provider when the user edited any
+        // global field — so picking a card updates `default_provider`.
+        if (patch.default_provider === undefined) {
+          patch.default_provider = provider;
+        }
+        await globalConfigWrite(patch);
+      }
+
+      // 3. Per-workspace LLM patch (deployment, endpoint, api_version,
+      //    extraction/compilation model). Only if we actually have a
+      //    workspace and the user touched a workspace-scoped field.
       if (
         wsLlm?.workspace_path &&
         Object.keys(wsPending).length > 0
       ) {
-        wsWrote = await workspaceLlmWrite({
+        await workspaceLlmWrite({
           workspace_path: wsLlm.workspace_path,
-          provider: provider,
+          provider,
           extraction_model: wsPending.extraction_model,
           compilation_model: wsPending.compilation_model,
           azure_resource_name: wsPending.azure_resource_name,
@@ -228,19 +194,22 @@ export function SettingsView() {
         });
       }
 
-      const body =
-        wsWrote != null
-          ? `${wrote}\n${wsWrote} (workspace config restart sidecar to apply)`
-          : wrote;
       toast("Settings saved", {
         kind: "success",
-        body,
-        durationMs: 4000,
+        body:
+          "Restart the app to push new credentials into the running sidecar.",
+        durationMs: 5000,
       });
-      setPending({});
+      // Re-read everything so indicators reflect the new state.
+      const [cfgRes, credsRes] = await Promise.all([
+        globalConfigRead(),
+        credentialsStatus(),
+      ]);
+      setGlobalCfg(cfgRes);
+      setCredentials(credsRes);
+      setKeyDraft({});
+      setGlobalPending({});
       setWsPending({});
-      const reread = await configRead();
-      setCfg(reread);
       if (wsLlm?.workspace_path) {
         const fresh = await workspaceLlmConfig(wsLlm.workspace_path);
         setWsLlm(fresh);
@@ -255,7 +224,40 @@ export function SettingsView() {
     }
   }
 
-  if (loading || !cfg) {
+  async function clearKey(envVar: string) {
+    try {
+      await credentialsRemove(envVar);
+      const credsRes = await credentialsStatus();
+      setCredentials(credsRes);
+      toast(`Removed ${envVar}`, { kind: "success" });
+    } catch (e) {
+      toast("Remove failed", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function changeActiveWorkspace(name: string) {
+    try {
+      await workspaceSetActive(name);
+      setActiveWorkspaceLocal(name);
+      const wsRes = await workspaceList();
+      setWorkspaces(wsRes);
+      const ws = wsRes.find((w) => w.name === name);
+      if (ws) {
+        const llm = await workspaceLlmConfig(ws.path);
+        setWsLlm(llm);
+      }
+    } catch (e) {
+      toast("Activate workspace failed", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  if (loading || !paths || !globalCfg) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         Loading settings…
@@ -263,27 +265,39 @@ export function SettingsView() {
     );
   }
 
+  const providerMeta = PROVIDER_META.find((p) => p.id === provider)!;
+  const credForActive = credentials.find((c) => c.env_var === providerMeta.env_var);
+
   return (
     <div className="flex h-full flex-col">
-      <Header dirty={dirty} saving={saving} onSave={save} path={cfg.path} />
+      <Header
+        dirty={dirty}
+        saving={saving}
+        onSave={save}
+        configPath={paths.config_path ?? undefined}
+        credentialsPath={paths.credentials_path ?? undefined}
+      />
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-8">
           <Section
             Icon={KeyRound}
             title="Provider"
-            body="Pick the LLM backend ThinkingRoot talks to. API keys live only on this machine, chmod 0600, never uploaded."
+            body="Pick the LLM backend ThinkingRoot talks to. API keys live in credentials.toml on this machine, chmod 0600, never uploaded. The CLI reads the same file."
           >
             <div className="flex flex-wrap gap-2">
-              {(Object.keys(PROVIDER_META) as ProviderKey[]).map((p) => {
-                const active = provider === p;
-                const configured = PROVIDER_META[p].keys.some(
-                  (k) => k.secret && cfg.entries[k.name],
-                );
+              {PROVIDER_META.map((p) => {
+                const active = provider === p.id;
+                const cred = credentials.find((c) => c.env_var === p.env_var);
+                const configured =
+                  cred?.persisted === true || cred?.in_process_env === true;
                 return (
                   <button
-                    key={p}
+                    key={p.id}
                     type="button"
-                    onClick={() => setProvider(p)}
+                    onClick={() => {
+                      setProvider(p.id);
+                      setGlobalPending((g) => ({ ...g, default_provider: p.id }));
+                    }}
                     className={cn(
                       "flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors",
                       active
@@ -292,224 +306,114 @@ export function SettingsView() {
                     )}
                   >
                     {configured && <Check className="size-3 text-success" />}
-                    {PROVIDER_META[p].label}
+                    {p.label}
                   </button>
                 );
               })}
             </div>
-            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
-              {providerMeta.keys.map((field) => (
-                <Field
-                  key={field.name}
-                  label={field.label}
-                  hint={
-                    field.secret && cfg.entries[field.name]
-                      ? `stored: ${cfg.entries[field.name]}`
-                      : undefined
-                  }
-                >
+
+            <div className="mt-4 grid grid-cols-1 gap-3">
+              <Field
+                label={`${providerMeta.label} API key`}
+                hint={
+                  credForActive?.persisted
+                    ? `Stored in credentials.toml${credForActive.in_process_env ? " · also in process env" : ""}`
+                    : credForActive?.in_process_env
+                      ? "Set in process env (not persisted to file)"
+                      : "Not configured"
+                }
+              >
+                <div className="flex gap-2">
                   <input
-                    type={field.secret ? "password" : "text"}
-                    placeholder={
-                      (field.secret && cfg.entries[field.name]) ||
-                      field.placeholder ||
-                      field.label
+                    type="password"
+                    placeholder={providerMeta.placeholder}
+                    value={keyDraft[providerMeta.env_var] ?? ""}
+                    onChange={(e) =>
+                      setKeyDraft((d) => ({
+                        ...d,
+                        [providerMeta.env_var]: e.target.value,
+                      }))
                     }
-                    value={pending[field.name] ?? ""}
-                    onChange={(e) => updateField(field.name, e.target.value)}
-                    className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    autoComplete="off"
+                    className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
                   />
-                </Field>
-              ))}
+                  {credForActive?.persisted && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void clearKey(providerMeta.env_var)}
+                      className="h-8 gap-1 text-[11px]"
+                    >
+                      <X className="size-3" /> Clear
+                    </Button>
+                  )}
+                </div>
+              </Field>
+              <p className="text-[10px] text-muted-foreground">
+                Engine env-var name:{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  {providerMeta.env_var}
+                </code>
+              </p>
             </div>
-            {provider === "azure" && wsLlm && (
-              <div className="mt-4 rounded-md border border-border/60 bg-muted/20 p-3">
-                <div className="mb-3 flex items-center justify-between">
-                  <div className="text-xs font-medium text-foreground">
-                    Workspace Azure config
-                    <span className="ml-2 font-mono text-[10px] text-muted-foreground">
-                      {wsLlm.workspace_path ?? "—"}
-                    </span>
-                  </div>
-                  <span
-                    className={cn(
-                      "rounded px-1.5 py-0.5 text-[10px]",
-                      wsLlm.azure_api_key_env_present
-                        ? "bg-success/15 text-success"
-                        : "bg-yellow-500/15 text-yellow-300",
-                    )}
-                  >
-                    {wsLlm.azure_api_key_env_present
-                      ? `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} set`
-                      : `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} missing`}
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                  <Field
-                    label="Resource name"
-                    hint="Azure OpenAI resource (drives the *.openai.azure.com URL)"
-                  >
-                    <input
-                      type="text"
-                      value={
-                        wsPending.azure_resource_name ??
-                        wsLlm.azure_resource_name ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          azure_resource_name: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                  <Field
-                    label="Endpoint base (override)"
-                    hint="Use only for AIServices/Foundry (cognitiveservices.azure.com)"
-                  >
-                    <input
-                      type="text"
-                      value={
-                        wsPending.azure_endpoint_base ??
-                        wsLlm.azure_endpoint_base ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          azure_endpoint_base: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                  <Field label="Deployment">
-                    <input
-                      type="text"
-                      value={
-                        wsPending.azure_deployment ??
-                        wsLlm.azure_deployment ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          azure_deployment: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                  <Field label="API version">
-                    <input
-                      type="text"
-                      value={
-                        wsPending.azure_api_version ??
-                        wsLlm.azure_api_version ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          azure_api_version: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                  <Field label="Extraction model">
-                    <input
-                      type="text"
-                      value={
-                        wsPending.extraction_model ??
-                        wsLlm.extraction_model ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          extraction_model: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                  <Field label="Compilation model">
-                    <input
-                      type="text"
-                      value={
-                        wsPending.compilation_model ??
-                        wsLlm.compilation_model ??
-                        ""
-                      }
-                      onChange={(e) =>
-                        setWsPending((p) => ({
-                          ...p,
-                          compilation_model: e.target.value,
-                        }))
-                      }
-                      className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                    />
-                  </Field>
-                </div>
-              </div>
+
+            {provider === "azure" && (
+              <AzureWorkspaceCard
+                wsLlm={wsLlm}
+                wsPending={wsPending}
+                setWsPending={setWsPending}
+                globalAzure={globalCfg.azure}
+                globalPending={globalPending}
+                setGlobalPending={setGlobalPending}
+              />
             )}
           </Section>
 
           <Section
             Icon={FolderOpen}
             title="Workspace"
-            body="Your mounted ThinkingRoot workspace — the compiled KG that provenance pills and Brain view read from."
+            body="The mounted ThinkingRoot workspace — every chat answer is grounded in claims compiled here. Switch via the sidebar, or pick a different one below."
           >
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_200px]">
-              <Field label="Workspace path">
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={workspace}
-                    placeholder="/Users/you/Desktop/thinkingroot/.thinkingroot-workspace"
-                    onChange={(e) => {
-                      setWorkspace(e.target.value);
-                      updateField("THINKINGROOT_WORKSPACE", e.target.value);
-                    }}
-                    className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                  />
-                  <Button variant="outline" size="sm" onClick={pickWorkspace} className="h-8 gap-1 text-xs">
-                    <FolderOpen className="size-3" /> Pick
-                  </Button>
-                </div>
-              </Field>
-              <Field label="Workspace name">
-                <input
-                  type="text"
-                  value={workspaceName}
-                  onChange={(e) => {
-                    setWorkspaceName(e.target.value);
-                    updateField("THINKINGROOT_WORKSPACE_NAME", e.target.value);
-                  }}
-                  className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                />
-              </Field>
-            </div>
-            <div className="mt-3">
-              <Field
-                label="Auto-scan roots"
-                hint="Comma-separated list of folders the sidebar will walk for `.thinkingroot/` markers. Leave blank to use defaults (~/Desktop, ~/Documents, ~/code, ~/dev, ~/projects)."
-              >
-                <input
-                  type="text"
-                  value={scanRoots}
-                  placeholder="~/Desktop, ~/code"
-                  onChange={(e) => {
-                    setScanRoots(e.target.value);
-                    updateField("TR_SCAN_ROOTS", e.target.value);
-                  }}
-                  className="h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
-                />
-              </Field>
-            </div>
+            {workspaces.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No workspaces registered yet. Add one from the sidebar.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {workspaces.map((w) => {
+                  const isActive = activeWorkspace === w.name;
+                  return (
+                    <button
+                      key={w.name}
+                      type="button"
+                      onClick={() => void changeActiveWorkspace(w.name)}
+                      className={cn(
+                        "flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left text-xs transition-colors",
+                        isActive
+                          ? "border-accent bg-accent/10"
+                          : "border-border hover:border-accent/60 hover:bg-muted/40",
+                      )}
+                    >
+                      <div className="flex min-w-0 flex-col">
+                        <span className="font-medium text-foreground">
+                          {w.name}
+                          {w.compiled && (
+                            <span className="ml-2 rounded bg-success/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-success">
+                              compiled
+                            </span>
+                          )}
+                        </span>
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {w.path}
+                        </span>
+                      </div>
+                      {isActive && <Check className="size-3.5 text-accent" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </Section>
 
           <Section
@@ -568,24 +472,229 @@ export function SettingsView() {
             body="Optional mobile surfaces — reach ThinkingRoot from Telegram, Slack, or Discord. Adapter wiring lands when the channel messaging crate ships the MCP bridge."
           >
             <div className="rounded-lg border border-dashed border-border/70 p-3 text-[11px] text-muted-foreground">
-              Channel adapters arrive in a follow-on phase. Until then, set{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[10px]">
-                TELEGRAM_BOT_TOKEN
-              </code>
-              ,{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[10px]">
-                SLACK_BOT_TOKEN
-              </code>
-              , and{" "}
-              <code className="rounded bg-muted px-1 font-mono text-[10px]">
-                DISCORD_BOT_TOKEN
-              </code>{" "}
-              in config.toml and the CLI picks them up.
+              Channel adapters arrive in a follow-on phase.
             </div>
           </Section>
-
         </div>
       </div>
+    </div>
+  );
+}
+
+function AzureWorkspaceCard({
+  wsLlm,
+  wsPending,
+  setWsPending,
+  globalAzure,
+  globalPending,
+  setGlobalPending,
+}: {
+  wsLlm: WorkspaceLlmConfig | null;
+  wsPending: Record<string, string>;
+  setWsPending: (
+    f: (prev: Record<string, string>) => Record<string, string>,
+  ) => void;
+  globalAzure: GlobalLlmConfig["azure"];
+  globalPending: {
+    azure?: {
+      resource_name?: string;
+      endpoint_base?: string;
+      deployment?: string;
+      api_version?: string;
+    };
+  };
+  setGlobalPending: (
+    f: (
+      prev: {
+        azure?: {
+          resource_name?: string;
+          endpoint_base?: string;
+          deployment?: string;
+          api_version?: string;
+        };
+      },
+    ) => {
+      azure?: {
+        resource_name?: string;
+        endpoint_base?: string;
+        deployment?: string;
+        api_version?: string;
+      };
+    },
+  ) => void;
+}) {
+  // The workspace block edits THIS workspace's `.thinkingroot/config.toml`.
+  // The global block edits the shared config the engine falls back to when
+  // a workspace doesn't define its own LLM section.
+  const wsField = (k: keyof typeof wsPending) => wsPending[k];
+
+  function patchGlobalAzure(field: "resource_name" | "endpoint_base" | "deployment" | "api_version", value: string) {
+    setGlobalPending((g) => ({
+      ...g,
+      azure: { ...(g.azure ?? {}), [field]: value },
+    }));
+  }
+
+  return (
+    <div className="mt-4 space-y-3">
+      <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="text-xs font-medium text-foreground">Global Azure config</div>
+          <span
+            className={cn(
+              "rounded px-1.5 py-0.5 text-[10px]",
+              globalAzure.api_key_env_present
+                ? "bg-success/15 text-success"
+                : "bg-yellow-500/15 text-yellow-300",
+            )}
+          >
+            {globalAzure.api_key_env_present
+              ? `${globalAzure.api_key_env ?? "AZURE_OPENAI_API_KEY"} live`
+              : `${globalAzure.api_key_env ?? "AZURE_OPENAI_API_KEY"} not in env`}
+          </span>
+        </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <Field label="Resource name">
+            <input
+              type="text"
+              value={
+                globalPending.azure?.resource_name ??
+                globalAzure.resource_name ??
+                ""
+              }
+              onChange={(e) => patchGlobalAzure("resource_name", e.target.value)}
+              className={fieldClass}
+              placeholder="my-company-openai"
+            />
+          </Field>
+          <Field label="Endpoint base (override)">
+            <input
+              type="text"
+              value={
+                globalPending.azure?.endpoint_base ??
+                globalAzure.endpoint_base ??
+                ""
+              }
+              onChange={(e) => patchGlobalAzure("endpoint_base", e.target.value)}
+              className={fieldClass}
+              placeholder="https://*.cognitiveservices.azure.com"
+            />
+          </Field>
+          <Field label="Deployment">
+            <input
+              type="text"
+              value={
+                globalPending.azure?.deployment ??
+                globalAzure.deployment ??
+                ""
+              }
+              onChange={(e) => patchGlobalAzure("deployment", e.target.value)}
+              className={fieldClass}
+              placeholder="gpt-4.1-mini"
+            />
+          </Field>
+          <Field label="API version">
+            <input
+              type="text"
+              value={
+                globalPending.azure?.api_version ??
+                globalAzure.api_version ??
+                ""
+              }
+              onChange={(e) => patchGlobalAzure("api_version", e.target.value)}
+              className={fieldClass}
+              placeholder="2024-12-01-preview"
+            />
+          </Field>
+        </div>
+      </div>
+
+      {wsLlm?.config_exists && (
+        <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-xs font-medium text-foreground">
+              Workspace override
+              <span className="ml-2 font-mono text-[10px] text-muted-foreground">
+                {wsLlm.workspace_path ?? "—"}
+              </span>
+            </div>
+            <span
+              className={cn(
+                "rounded px-1.5 py-0.5 text-[10px]",
+                wsLlm.azure_api_key_env_present
+                  ? "bg-success/15 text-success"
+                  : "bg-yellow-500/15 text-yellow-300",
+              )}
+            >
+              {wsLlm.azure_api_key_env_present
+                ? `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} live`
+                : `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} not in env`}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <Field label="Resource name">
+              <input
+                type="text"
+                value={wsField("azure_resource_name") ?? wsLlm.azure_resource_name ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, azure_resource_name: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+            <Field label="Endpoint base (override)">
+              <input
+                type="text"
+                value={wsField("azure_endpoint_base") ?? wsLlm.azure_endpoint_base ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, azure_endpoint_base: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+            <Field label="Deployment">
+              <input
+                type="text"
+                value={wsField("azure_deployment") ?? wsLlm.azure_deployment ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, azure_deployment: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+            <Field label="API version">
+              <input
+                type="text"
+                value={wsField("azure_api_version") ?? wsLlm.azure_api_version ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, azure_api_version: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+            <Field label="Extraction model">
+              <input
+                type="text"
+                value={wsField("extraction_model") ?? wsLlm.extraction_model ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, extraction_model: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+            <Field label="Compilation model">
+              <input
+                type="text"
+                value={wsField("compilation_model") ?? wsLlm.compilation_model ?? ""}
+                onChange={(e) =>
+                  setWsPending((p) => ({ ...p, compilation_model: e.target.value }))
+                }
+                className={fieldClass}
+              />
+            </Field>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -594,21 +703,26 @@ function Header({
   dirty,
   saving,
   onSave,
-  path,
+  configPath,
+  credentialsPath,
 }: {
   dirty: boolean;
   saving: boolean;
   onSave: () => void;
-  path?: string | null;
+  configPath?: string;
+  credentialsPath?: string;
 }) {
   return (
     <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2">
       <div className="flex items-center gap-2">
         <SettingsIcon className="size-4 text-accent" />
         <h2 className="text-sm font-medium tracking-tight">Settings</h2>
-        {path && (
-          <span className="font-mono text-[10px] text-muted-foreground" title={path}>
-            {path}
+        {configPath && (
+          <span
+            className="font-mono text-[10px] text-muted-foreground"
+            title={`config: ${configPath}\ncredentials: ${credentialsPath ?? "—"}`}
+          >
+            {configPath}
           </span>
         )}
       </div>
@@ -818,7 +932,6 @@ function Field({
   hint?: string;
   children: React.ReactNode;
 }) {
-  // `useMemo` keeps the label-id stable across renders.
   const id = useMemo(() => `f-${label.replace(/\s+/g, "-").toLowerCase()}`, [label]);
   return (
     <label htmlFor={id} className="flex flex-col gap-1">
@@ -830,3 +943,6 @@ function Field({
     </label>
   );
 }
+
+const fieldClass =
+  "h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40";

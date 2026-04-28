@@ -2490,6 +2490,113 @@ Rules: \
     pub fn workspace_root_path(&self, ws: &str) -> Option<PathBuf> {
         self.workspaces.get(ws).map(|h| h.root_path.clone())
     }
+
+    /// Return the merged workspace `Config` for a mounted workspace. Used by
+    /// the synthesizer to read the per-workspace `[chat]` block without
+    /// re-loading TOML on every request.
+    pub fn workspace_config(&self, ws: &str) -> Option<Config> {
+        self.workspaces.get(ws).map(|h| h.config.clone())
+    }
+
+    /// Snapshot of the inputs needed to build a `WorkspaceIdentity` for
+    /// chat-time prompt assembly. Reads the in-memory cache only — no disk
+    /// I/O. `source_kinds` is sorted descending by count.
+    ///
+    /// Returns `None` when the workspace is not mounted.
+    pub async fn workspace_chat_snapshot(&self, ws: &str) -> Option<WorkspaceChatSnapshot> {
+        let h = self.workspaces.get(ws)?;
+        let cache = h.cache.read().await;
+        let (_source_count, claim_count, _entity_count) = cache.counts();
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for s in cache.all_sources() {
+            let kind = source_kind_from_uri(&s.uri, &s.source_type);
+            *counts.entry(kind).or_default() += 1;
+        }
+        let mut source_kinds: Vec<(String, usize)> = counts.into_iter().collect();
+        source_kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        Some(WorkspaceChatSnapshot {
+            name: h.name.clone(),
+            root_path: h.root_path.clone(),
+            config: h.config.clone(),
+            claim_count,
+            source_kinds,
+        })
+    }
+}
+
+/// Snapshot of workspace state used by the chat synthesizer to build the
+/// `<system-reminder>` context block. Cheap to construct (in-memory cache
+/// reads only) so the SSE handler can call it once per request.
+#[derive(Debug, Clone)]
+pub struct WorkspaceChatSnapshot {
+    pub name: String,
+    pub root_path: PathBuf,
+    pub config: Config,
+    pub claim_count: usize,
+    /// `(kind_label, count)` pairs sorted descending. The label is the
+    /// lowercase file extension when one is available, otherwise the
+    /// source's declared `source_type`, otherwise `"other"`.
+    pub source_kinds: Vec<(String, usize)>,
+}
+
+/// Derive a stable, lowercase kind label for a source. Prefers the file
+/// extension because that's what the synthesizer's auto-detect rules
+/// match against. Falls back to the source's declared `source_type` when
+/// the URI has no extension (e.g. database / API connectors).
+fn source_kind_from_uri(uri: &str, source_type: &str) -> String {
+    // file://path/to/foo.rs → "rs"
+    let path_part = uri.split_once("://").map(|(_, p)| p).unwrap_or(uri);
+    let stripped = path_part.split(['?', '#']).next().unwrap_or(path_part);
+    if let Some(ext) = std::path::Path::new(stripped)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        let lower = ext.to_ascii_lowercase();
+        if !lower.is_empty() {
+            return lower;
+        }
+    }
+    let st = source_type.trim();
+    if st.is_empty() {
+        "other".to_string()
+    } else {
+        st.to_ascii_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod source_kind_tests {
+    use super::source_kind_from_uri;
+
+    #[test]
+    fn extracts_extension_from_file_uri() {
+        assert_eq!(source_kind_from_uri("file:///x/y/foo.rs", "code"), "rs");
+        assert_eq!(source_kind_from_uri("/abs/path/bar.ts", "code"), "ts");
+        assert_eq!(source_kind_from_uri("rel/baz.MD", "doc"), "md");
+    }
+
+    #[test]
+    fn falls_back_to_source_type_when_no_extension() {
+        assert_eq!(
+            source_kind_from_uri("postgres://server/db", "database"),
+            "database"
+        );
+        assert_eq!(source_kind_from_uri("plain-name", ""), "other");
+    }
+
+    #[test]
+    fn ignores_query_string_and_fragment() {
+        assert_eq!(
+            source_kind_from_uri("https://x.com/foo.json?token=abc", "api"),
+            "json"
+        );
+        assert_eq!(
+            source_kind_from_uri("file:///doc.md#anchor", "doc"),
+            "md"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

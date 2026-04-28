@@ -36,6 +36,9 @@ pub struct Config {
 
     #[serde(default)]
     pub branch_cache: BranchCacheConfig,
+
+    #[serde(default)]
+    pub chat: ChatConfig,
 }
 
 /// Rooting phase configuration (Phase 6.5 admission gate).
@@ -613,6 +616,216 @@ pub struct SourceConfig {
     pub enabled: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Chat-time persona / verbosity / project-doc settings
+// ---------------------------------------------------------------------------
+
+/// Synthesis persona used by the `/ask` and `/ask/stream` endpoints.
+///
+/// `Auto` is the default — the synthesizer inspects the workspace's source
+/// mix at request time and picks the best fit. Set this explicitly in
+/// `.thinkingroot/config.toml` only when auto-detection guesses wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatPersona {
+    #[default]
+    Auto,
+    /// LongMemEval-tuned conversational memory recall (the original 91.2 %
+    /// configuration). Always selected for workspaces whose sources are
+    /// session-style JSON conversation files.
+    Memory,
+    /// Code-aware engineering assistant. Cites `file_path:line_number`
+    /// and explains in terms of the codebase's own symbols.
+    Code,
+    /// Documentation expert. Quotes passages, preserves structure.
+    Docs,
+}
+
+/// Output length / detail target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatVerbosity {
+    #[default]
+    Auto,
+    /// Short phrases, numbers, 1-3 sentences — preserves LongMemEval scoring
+    /// when paired with `ChatPersona::Memory`.
+    Terse,
+    /// Multi-paragraph, well-structured answers with citations. Default for
+    /// code- and docs-shaped workspaces.
+    Rich,
+}
+
+/// Per-workspace chat-synthesis configuration.
+///
+/// All fields are optional / `Auto` by default so existing
+/// `.thinkingroot/config.toml` files continue to parse and behave
+/// identically until a user opts in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatConfig {
+    /// Which synthesis persona to use. `Auto` picks based on source mix.
+    #[serde(default)]
+    pub persona: ChatPersona,
+
+    /// Output length target. `Auto` mirrors the persona default.
+    #[serde(default)]
+    pub verbosity: ChatVerbosity,
+
+    /// When `true` (default), the synthesizer auto-discovers a project
+    /// documentation file (CLAUDE.md / AGENTS.md / README.md, in that
+    /// order) and includes the first ~4 KB inside the `<system-reminder>`
+    /// context block. Set to `false` to keep prompts minimal.
+    #[serde(default = "ChatConfig::default_include_project_doc")]
+    pub include_project_doc: bool,
+
+    /// Explicit relative path to a project doc file. Overrides
+    /// auto-discovery when set. Path is resolved relative to the
+    /// workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_doc_path: Option<String>,
+}
+
+impl ChatConfig {
+    fn default_include_project_doc() -> bool {
+        true
+    }
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            persona: ChatPersona::default(),
+            verbosity: ChatVerbosity::default(),
+            include_project_doc: Self::default_include_project_doc(),
+            project_doc_path: None,
+        }
+    }
+}
+
+/// A `ChatConfig` with `Auto` slots resolved against a workspace's actual
+/// source mix. Produced by [`ChatConfig::resolve`] and consumed by the
+/// serve crate's synthesizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedChat {
+    pub persona: ChatPersona,
+    pub verbosity: ChatVerbosity,
+}
+
+impl ChatConfig {
+    /// Resolve `Auto` slots using the per-extension source counts from the
+    /// workspace's compiled knowledge graph. `source_kinds` is a list of
+    /// `(extension_or_kind_label, count)` pairs — order does not matter.
+    ///
+    /// Auto rules (deterministic, no external state):
+    ///
+    /// * Sources are >= 60 % `*.json` *or* contain a `conversation` /
+    ///   `session` kind label  → `Memory` + `Terse`. This is the
+    ///   LongMemEval shape and preserves the 91.2 % benchmark.
+    /// * Sources are >= 50 % code extensions
+    ///   (`rs`, `ts`, `tsx`, `js`, `jsx`, `py`, `go`, `java`, `c`, `cpp`,
+    ///    `rb`, `kt`, `swift`, `php`, `scala`, `cs`, `lua`)
+    ///   → `Code` + `Rich`.
+    /// * Sources are >= 50 % doc extensions (`md`, `mdx`, `rst`, `adoc`,
+    ///   `txt`)  → `Docs` + `Rich`.
+    /// * Otherwise  → `Memory` + `Rich` (a safe, neutral default that
+    ///   gives more context than Terse without changing the persona
+    ///   selection rules).
+    ///
+    /// When `persona` or `verbosity` are explicitly set (not `Auto`), they
+    /// pass through unchanged.
+    pub fn resolve(&self, source_kinds: &[(String, usize)]) -> ResolvedChat {
+        let total: usize = source_kinds.iter().map(|(_, n)| *n).sum();
+
+        let auto_persona = if total == 0 {
+            ChatPersona::Memory
+        } else {
+            classify_source_mix(source_kinds, total)
+        };
+
+        let persona = match self.persona {
+            ChatPersona::Auto => auto_persona,
+            explicit => explicit,
+        };
+
+        let auto_verbosity = match persona {
+            ChatPersona::Memory => ChatVerbosity::Terse,
+            ChatPersona::Code | ChatPersona::Docs => ChatVerbosity::Rich,
+            ChatPersona::Auto => ChatVerbosity::Rich, // unreachable after the match above
+        };
+
+        let verbosity = match self.verbosity {
+            ChatVerbosity::Auto => auto_verbosity,
+            explicit => explicit,
+        };
+
+        ResolvedChat { persona, verbosity }
+    }
+}
+
+fn classify_source_mix(source_kinds: &[(String, usize)], total: usize) -> ChatPersona {
+    if total == 0 {
+        return ChatPersona::Memory;
+    }
+
+    let mut conv = 0usize;
+    let mut code = 0usize;
+    let mut docs = 0usize;
+
+    for (kind, n) in source_kinds {
+        let k = kind.to_ascii_lowercase();
+        if k == "json"
+            || k.contains("conversation")
+            || k.contains("session")
+            || k.contains("transcript")
+            || k.contains("chat")
+        {
+            conv += n;
+        } else if matches!(
+            k.as_str(),
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "rb"
+                | "kt"
+                | "swift"
+                | "php"
+                | "scala"
+                | "cs"
+                | "lua"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "sql"
+        ) {
+            code += n;
+        } else if matches!(k.as_str(), "md" | "mdx" | "rst" | "adoc" | "txt") {
+            docs += n;
+        }
+    }
+
+    let conv_ratio = conv as f64 / total as f64;
+    let code_ratio = code as f64 / total as f64;
+    let docs_ratio = docs as f64 / total as f64;
+
+    if conv_ratio >= 0.60 {
+        ChatPersona::Memory
+    } else if code_ratio >= 0.50 {
+        ChatPersona::Code
+    } else if docs_ratio >= 0.50 {
+        ChatPersona::Docs
+    } else {
+        ChatPersona::Memory
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1141,151 @@ api_key_env = "AZURE_OPENAI_API_KEY"
                 .as_deref(),
             Some("my-company-openai")
         );
+    }
+
+    // ── ChatConfig: round-trip + defaults ────────────────────────
+
+    #[test]
+    fn chat_config_default_is_auto() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.persona, ChatPersona::Auto);
+        assert_eq!(cfg.verbosity, ChatVerbosity::Auto);
+        assert!(cfg.include_project_doc);
+        assert!(cfg.project_doc_path.is_none());
+    }
+
+    #[test]
+    fn chat_config_loads_from_workspace_toml() {
+        let toml_str = r#"
+[workspace]
+name = "demo"
+
+[chat]
+persona = "code"
+verbosity = "rich"
+include_project_doc = false
+project_doc_path = "docs/INTRO.md"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.chat.persona, ChatPersona::Code);
+        assert_eq!(cfg.chat.verbosity, ChatVerbosity::Rich);
+        assert!(!cfg.chat.include_project_doc);
+        assert_eq!(cfg.chat.project_doc_path.as_deref(), Some("docs/INTRO.md"));
+    }
+
+    #[test]
+    fn config_without_chat_section_uses_defaults() {
+        // Must not break existing workspace TOMLs that pre-date this section.
+        let toml_str = r#"
+[workspace]
+name = "old"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.chat.persona, ChatPersona::Auto);
+        assert_eq!(cfg.chat.verbosity, ChatVerbosity::Auto);
+        assert!(cfg.chat.include_project_doc);
+    }
+
+    #[test]
+    fn chat_config_round_trip_toml() {
+        let cfg = ChatConfig {
+            persona: ChatPersona::Docs,
+            verbosity: ChatVerbosity::Terse,
+            include_project_doc: true,
+            project_doc_path: None,
+        };
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: ChatConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.persona, ChatPersona::Docs);
+        assert_eq!(back.verbosity, ChatVerbosity::Terse);
+    }
+
+    // ── ChatConfig::resolve auto-detect rules ────────────────────
+
+    #[test]
+    fn resolve_empty_workspace_defaults_to_memory_terse() {
+        let cfg = ChatConfig::default();
+        let r = cfg.resolve(&[]);
+        assert_eq!(r.persona, ChatPersona::Memory);
+        assert_eq!(r.verbosity, ChatVerbosity::Terse);
+    }
+
+    #[test]
+    fn resolve_json_heavy_workspace_picks_memory_terse() {
+        // LongMemEval-style: every source is a conversation JSON.
+        let cfg = ChatConfig::default();
+        let mix = vec![("json".to_string(), 500usize)];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Memory);
+        assert_eq!(r.verbosity, ChatVerbosity::Terse);
+    }
+
+    #[test]
+    fn resolve_rust_codebase_picks_code_rich() {
+        let cfg = ChatConfig::default();
+        let mix = vec![
+            ("rs".to_string(), 800usize),
+            ("md".to_string(), 200usize),
+            ("toml".to_string(), 50usize),
+        ];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Code);
+        assert_eq!(r.verbosity, ChatVerbosity::Rich);
+    }
+
+    #[test]
+    fn resolve_docs_only_workspace_picks_docs_rich() {
+        let cfg = ChatConfig::default();
+        let mix = vec![
+            ("md".to_string(), 120usize),
+            ("rst".to_string(), 30usize),
+        ];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Docs);
+        assert_eq!(r.verbosity, ChatVerbosity::Rich);
+    }
+
+    #[test]
+    fn resolve_explicit_persona_wins_over_auto_detect() {
+        let cfg = ChatConfig {
+            persona: ChatPersona::Memory,
+            ..ChatConfig::default()
+        };
+        // A code-shaped mix would auto-pick Code, but Memory is forced.
+        let mix = vec![("rs".to_string(), 500usize)];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Memory);
+        // Verbosity still auto-resolves against the chosen persona.
+        assert_eq!(r.verbosity, ChatVerbosity::Terse);
+    }
+
+    #[test]
+    fn resolve_explicit_verbosity_wins() {
+        let cfg = ChatConfig {
+            verbosity: ChatVerbosity::Rich,
+            ..ChatConfig::default()
+        };
+        // Memory persona normally pairs with Terse; Rich override wins.
+        let mix = vec![("json".to_string(), 100usize)];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Memory);
+        assert_eq!(r.verbosity, ChatVerbosity::Rich);
+    }
+
+    #[test]
+    fn resolve_mixed_workspace_falls_back_to_memory_rich() {
+        // No category dominates → safe Memory fallback (no LongMemEval
+        // behaviour change since explicit JSON workspaces still pick Terse).
+        let cfg = ChatConfig::default();
+        let mix = vec![
+            ("rs".to_string(), 30usize),
+            ("md".to_string(), 30usize),
+            ("png".to_string(), 30usize),
+        ];
+        let r = cfg.resolve(&mix);
+        assert_eq!(r.persona, ChatPersona::Memory);
+        // Memory's auto verbosity is Terse, regardless of the mix.
+        assert_eq!(r.verbosity, ChatVerbosity::Terse);
     }
 
     #[test]

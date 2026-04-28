@@ -755,6 +755,7 @@ async fn ask_handler(
     Path(ws): Path<String>,
     Json(body): Json<AskRequest>,
 ) -> Response {
+    use crate::intelligence::identity::build_workspace_identity;
     use crate::intelligence::synthesizer::{AskRequest as SynthAskRequest, ask};
     use std::collections::HashMap;
     use std::collections::HashSet;
@@ -800,6 +801,20 @@ async fn ask_handler(
     // Retrieve the LLM client from the engine's workspace config
     let llm = engine.workspace_llm(&ws);
 
+    // Workspace identity / persona — the chat-time prompt structure that
+    // anchors the model to *this* workspace. Falls back to the legacy
+    // (Memory/Terse, identity=None) shape when the workspace isn't
+    // mounted, preserving the v0.9.0 wire prompt for tests / harnesses.
+    let snapshot = engine.workspace_chat_snapshot(&ws).await;
+    let chat = snapshot
+        .as_ref()
+        .map(|s| s.config.chat.resolve(&s.source_kinds))
+        .unwrap_or_else(SynthAskRequest::legacy_chat);
+    let identity_owned = snapshot
+        .as_ref()
+        .map(|s| build_workspace_identity(s, &s.config.chat));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -810,6 +825,9 @@ async fn ask_handler(
         answer_sids: &body.session_scope,
         sessions_dir: &sessions_dir,
         excluded_claim_ids: &HashSet::new(),
+        chat,
+        identity: identity_owned.as_ref(),
+        today: Some(&today),
     };
 
     let result = ask(&engine, llm, &req).await;
@@ -860,6 +878,7 @@ async fn ask_stream_handler(
     Path(ws): Path<String>,
     Json(body): Json<AskRequest>,
 ) -> impl IntoResponse {
+    use crate::intelligence::identity::build_workspace_identity;
     use crate::intelligence::synthesizer::{
         AskRequest as SynthAskRequest, StreamingAnswer, ask_streaming,
     };
@@ -902,6 +921,16 @@ async fn ask_stream_handler(
     let llm = engine.workspace_llm(&ws);
     let answer_sids = body.session_scope.clone();
 
+    let snapshot = engine.workspace_chat_snapshot(&ws).await;
+    let chat = snapshot
+        .as_ref()
+        .map(|s| s.config.chat.resolve(&s.source_kinds))
+        .unwrap_or_else(SynthAskRequest::legacy_chat);
+    let identity_owned = snapshot
+        .as_ref()
+        .map(|s| build_workspace_identity(s, &s.config.chat));
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -912,6 +941,9 @@ async fn ask_stream_handler(
         answer_sids: &answer_sids,
         sessions_dir: &sessions_dir,
         excluded_claim_ids: &HashSet::new(),
+        chat,
+        identity: identity_owned.as_ref(),
+        today: Some(&today),
     };
 
     let outcome = ask_streaming(&engine, llm, &req).await;

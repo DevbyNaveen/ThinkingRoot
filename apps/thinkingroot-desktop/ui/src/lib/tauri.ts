@@ -64,32 +64,107 @@ export async function brainLoad(): Promise<BrainSnapshot> {
   return invoke<BrainSnapshot>("brain_load");
 }
 
-// ─── Settings / config ───────────────────────────────────────────────
+// ─── Settings / config (typed, shared with the CLI) ─────────────────
+//
+// One config home, structured schemas, no flat env-var soup. See
+// `apps/.../src-tauri/src/commands/settings.rs` for the Rust mirror.
 
-export interface ConfigRead {
-  path?: string | null;
-  exists: boolean;
-  entries: Record<string, string>;
-  masked_keys: string[];
+/** Where each config file lives on disk. */
+export interface ConfigPaths {
+  config_path?: string | null;
+  credentials_path?: string | null;
+  workspaces_path?: string | null;
+  desktop_path?: string | null;
 }
 
-export async function configRead(): Promise<ConfigRead> {
-  return invoke<ConfigRead>("config_read");
+export async function configPaths(): Promise<ConfigPaths> {
+  return invoke<ConfigPaths>("config_paths");
 }
 
-export interface ConfigWriteArgs {
-  set?: Record<string, string>;
-  remove?: string[];
+export interface AzureProviderView {
+  configured: boolean;
+  resource_name?: string | null;
+  endpoint_base?: string | null;
+  deployment?: string | null;
+  api_version?: string | null;
+  api_key_env?: string | null;
+  api_key_env_present: boolean;
 }
 
-export async function configWrite(args: ConfigWriteArgs): Promise<string> {
-  return invoke<string>("config_write", { args });
+export interface GenericProviderView {
+  configured: boolean;
+  api_key_env?: string | null;
+  api_key_env_present: boolean;
+  base_url?: string | null;
+  default_model?: string | null;
+}
+
+export interface GlobalLlmConfig {
+  default_provider: string;
+  extraction_model: string;
+  compilation_model: string;
+  max_concurrent_requests: number;
+  request_timeout_secs: number;
+  azure: AzureProviderView;
+  /** Keyed by provider name — e.g. "openai", "anthropic". */
+  providers: Record<string, GenericProviderView>;
+}
+
+export async function globalConfigRead(): Promise<GlobalLlmConfig> {
+  return invoke<GlobalLlmConfig>("global_config_read");
+}
+
+export interface GlobalLlmWriteArgs {
+  default_provider?: string | null;
+  extraction_model?: string | null;
+  compilation_model?: string | null;
+  max_concurrent_requests?: number | null;
+  request_timeout_secs?: number | null;
+  azure?: {
+    resource_name?: string | null;
+    endpoint_base?: string | null;
+    deployment?: string | null;
+    api_version?: string | null;
+    api_key_env?: string | null;
+  } | null;
+}
+
+export async function globalConfigWrite(
+  args: GlobalLlmWriteArgs,
+): Promise<string> {
+  return invoke<string>("global_config_write", { args });
+}
+
+/** One credential slot. The value never crosses the IPC boundary —
+ *  the UI only learns whether it is set or not. */
+export interface CredentialRow {
+  env_var: string;
+  persisted: boolean;
+  in_process_env: boolean;
+}
+
+export async function credentialsStatus(): Promise<CredentialRow[]> {
+  return invoke<CredentialRow[]>("credentials_status");
+}
+
+export async function credentialsSet(
+  envVar: string,
+  value: string,
+): Promise<void> {
+  return invoke<void>("credentials_set", {
+    args: { env_var: envVar, value },
+  });
+}
+
+export async function credentialsRemove(envVar: string): Promise<void> {
+  return invoke<void>("credentials_remove", { args: { env_var: envVar } });
 }
 
 export interface OnboardingStatusRead {
-  config_path?: string | null;
-  config_exists: boolean;
+  paths: ConfigPaths;
   has_any_provider_key: boolean;
+  workspace_count: number;
+  active_workspace?: string | null;
   missing: string[];
 }
 
