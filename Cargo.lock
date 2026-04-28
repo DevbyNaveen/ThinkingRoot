@@ -6040,6 +6040,7 @@ dependencies = [
  "async-stream",
  "aws-config",
  "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
  "blake3",
  "chrono",
  "eventsource-stream",
