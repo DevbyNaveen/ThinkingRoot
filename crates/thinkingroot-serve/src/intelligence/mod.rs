@@ -1,4 +1,7 @@
+pub mod agent;
+pub mod approval;
 pub mod augmenter;
+pub mod builtin_tools;
 pub mod compressor;
 pub mod identity;
 pub mod planner;
@@ -9,3 +12,4 @@ pub mod router;
 pub mod session;
 pub mod synthesizer;
 pub mod temporal;
+pub mod tools;

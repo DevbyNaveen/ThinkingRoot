@@ -6217,6 +6217,7 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "blake3",
  "chrono",
