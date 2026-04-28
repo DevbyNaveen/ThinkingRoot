@@ -30,15 +30,36 @@ use crate::state::AppState;
 pub struct ChatStreamArgs {
     pub workspace: String,
     pub question: String,
-    /// Optional conversation id — present so we can cross-reference
-    /// turns once chat history is fed into retrieval. Today the ask
-    /// endpoint is single-turn so this is only used as an event tag.
+    /// Stable conversation id. Threaded through to the engine as the
+    /// MCP session id so `contribute_claim` writes scope to the
+    /// active branch this conversation has set.
     #[serde(default)]
     pub conversation_id: Option<String>,
     /// Optional list of source URIs to scope retrieval to. Empty =
     /// no scoping (engine considers all claims).
     #[serde(default)]
     pub session_scope: Vec<String>,
+    /// When true, route through the multi-turn tool-using agent
+    /// (S3) — the desktop chat surface flips this to `true` once
+    /// claim cards are wired in [`ChatView.tsx`]. Defaults to
+    /// `false` so any older UI build keeps getting the legacy
+    /// retrieve-and-synthesise stream.
+    #[serde(default)]
+    pub use_agent: bool,
+    /// Recent turns of this conversation (oldest-first), used by
+    /// the synthesizer's history threading (S1) and the agent loop
+    /// (S3) to maintain conversation memory. Empty = single-shot
+    /// mode.
+    #[serde(default)]
+    pub history: Vec<ChatTurnPayload>,
+}
+
+/// Wire-format conversation turn — mirrors the engine's REST shape
+/// so the JSON travels through unchanged.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChatTurnPayload {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -65,6 +86,51 @@ pub enum ChatEvent {
     Error {
         turn_id: String,
         message: String,
+    },
+    /// Agent has decided to call a tool. UI renders an inline
+    /// "claim card" showing the tool name + input. For write tools
+    /// (`is_write: true`), the card sits in a "pending approval"
+    /// state until either the user clicks Approve/Reject or the
+    /// matching `tool_call_executing` arrives (auto-approved gate).
+    ToolCallProposed {
+        turn_id: String,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        is_write: bool,
+    },
+    /// Approval is needed for this write tool call. The UI is
+    /// expected to surface Approve/Reject buttons that call the
+    /// `chat_approve` Tauri command with the same `id`.
+    ApprovalRequested {
+        turn_id: String,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool dispatch started (after approval, if write).
+    ToolCallExecuting {
+        turn_id: String,
+        id: String,
+        name: String,
+    },
+    /// Tool dispatch finished. `is_error` mirrors the registry
+    /// flag so the UI can colour the card.
+    ToolCallFinished {
+        turn_id: String,
+        id: String,
+        name: String,
+        content: String,
+        is_error: bool,
+    },
+    /// Approval declined or auto-rejected. The agent gets the
+    /// rejection back as a tool error and may continue with a
+    /// different approach.
+    ToolCallRejected {
+        turn_id: String,
+        id: String,
+        name: String,
+        reason: String,
     },
 }
 
@@ -142,6 +208,9 @@ async fn consume_ask_stream(
         "session_scope": args.session_scope,
         "question_date": chrono::Utc::now().to_rfc3339(),
         "category_hint": "",
+        "use_agent": args.use_agent,
+        "conversation_id": args.conversation_id,
+        "history": args.history,
     });
 
     tracing::info!(turn_id = %turn_id, "chat: posting to sidecar");
@@ -261,6 +330,158 @@ async fn consume_ask_stream(
                     emit_error(&app, &turn_id, msg);
                     return;
                 }
+                "tool_call_proposed" => {
+                    if let Ok(json) =
+                        serde_json::from_str::<serde_json::Value>(&ev.data)
+                    {
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = json
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = json
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let is_write = json
+                            .get("is_write")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::ToolCallProposed {
+                                turn_id: turn_id.clone(),
+                                id,
+                                name,
+                                input,
+                                is_write,
+                            },
+                        );
+                    }
+                }
+                "approval_requested" => {
+                    if let Ok(json) =
+                        serde_json::from_str::<serde_json::Value>(&ev.data)
+                    {
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = json
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = json
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::ApprovalRequested {
+                                turn_id: turn_id.clone(),
+                                id,
+                                name,
+                                input,
+                            },
+                        );
+                    }
+                }
+                "tool_call_executing" => {
+                    if let Ok(json) =
+                        serde_json::from_str::<serde_json::Value>(&ev.data)
+                    {
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = json
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::ToolCallExecuting {
+                                turn_id: turn_id.clone(),
+                                id,
+                                name,
+                            },
+                        );
+                    }
+                }
+                "tool_call_finished" => {
+                    if let Ok(json) =
+                        serde_json::from_str::<serde_json::Value>(&ev.data)
+                    {
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = json
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let content = json
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let is_error = json
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::ToolCallFinished {
+                                turn_id: turn_id.clone(),
+                                id,
+                                name,
+                                content,
+                                is_error,
+                            },
+                        );
+                    }
+                }
+                "tool_call_rejected" => {
+                    if let Ok(json) =
+                        serde_json::from_str::<serde_json::Value>(&ev.data)
+                    {
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = json
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let reason = json
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::ToolCallRejected {
+                                turn_id: turn_id.clone(),
+                                id,
+                                name,
+                                reason,
+                            },
+                        );
+                    }
+                }
                 _ => { /* keep-alive comments / unknown events: ignore */ }
             },
         }
@@ -345,4 +566,63 @@ pub async fn llm_health(app: AppHandle, workspace: String) -> Result<LlmHealth, 
         .ok_or_else(|| "malformed response (no `data` field)".to_string())?;
     serde_json::from_value::<LlmHealth>(data.clone())
         .map_err(|e| format!("decode llm/health body: {e}"))
+}
+
+// ─── Approval round-trip (S5) ─────────────────────────────────
+
+/// Inputs to the `chat_approve` Tauri command. The UI calls this
+/// when the user clicks Approve / Reject on a pending claim card.
+#[derive(Debug, Deserialize)]
+pub struct ChatApproveArgs {
+    pub workspace: String,
+    /// Tool-use id from the matching `ApprovalRequested` event.
+    pub tool_use_id: String,
+    /// `true` to approve, `false` to reject.
+    pub approve: bool,
+    /// Optional reason; surfaced to the LLM via the
+    /// `tool_call_rejected` event when approve is false.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST the user's decision back to the engine's
+/// `/ask/approval/{tool_use_id}` endpoint, which resolves the
+/// matching pending oneshot in `state.pending_approvals` and
+/// unblocks the agent's `ToolApprovalRouter::check`.
+#[tauri::command]
+pub async fn chat_approve(
+    app: AppHandle,
+    args: ChatApproveArgs,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let sidecar = state.sidecar.lock().await.clone();
+    let Some(sidecar) = sidecar else {
+        return Err("agent runtime sidecar is not running".to_string());
+    };
+
+    let url = format!(
+        "http://{}:{}/api/v1/ws/{}/ask/approval/{}",
+        sidecar.host, sidecar.port, args.workspace, args.tool_use_id
+    );
+    let body = serde_json::json!({
+        "decision": if args.approve { "approve" } else { "reject" },
+        "reason": args.reason,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("http client init failed: {e}"))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("sidecar unreachable at {url}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("approval endpoint returned {status}: {body}"));
+    }
+    Ok(())
 }

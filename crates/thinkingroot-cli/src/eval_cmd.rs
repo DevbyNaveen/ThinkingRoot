@@ -316,10 +316,11 @@ pub async fn run_eval(
         // Use the production intelligence pipeline (same code that powers /ask endpoint).
         //
         // NOTE: this harness is the LongMemEval contract. We pass
-        // `chat = legacy_chat()` (Memory + Terse) and `identity = None`
-        // so the wire prompt is byte-identical to the v0.9.0 prompt
-        // that scored 91.2 % on LME-500. Do not switch on the persona
-        // registry here without re-running the full benchmark.
+        // `chat = legacy_chat()` (Memory + Terse), `identity = None`,
+        // and `history = NO_HISTORY` so the wire prompt is byte-identical
+        // to the v0.9.0 prompt that scored 91.2 % on LME-500. Do not
+        // switch on the persona registry, opt into history threading,
+        // or pass identity here without re-running the full benchmark.
         let ask_req = AskRequest {
             workspace: "eval",
             question: &q.question,
@@ -333,6 +334,7 @@ pub async fn run_eval(
             chat: AskRequest::legacy_chat(),
             identity: None,
             today: None,
+            history: thinkingroot_serve::intelligence::synthesizer::NO_HISTORY,
         };
         let response = ask(&engine, synthesis_llm.clone(), &ask_req).await;
         let predicted = response.answer;

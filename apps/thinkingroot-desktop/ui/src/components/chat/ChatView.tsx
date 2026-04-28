@@ -41,8 +41,20 @@ import {
   type LlmHealth,
 } from "@/lib/tauri";
 import type { ChatMessage } from "@/types";
+import { ClaimCard } from "./ClaimCard";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { runSlashCommand } from "./slashCommands";
+
+/** Stable pretty-print of a tool-call input for display in a claim
+ *  card. Errors fall back to the original .toString() so the card
+ *  always renders something rather than crashing. */
+function prettyJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
 
 export function ChatView() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
@@ -184,6 +196,52 @@ export function ChatView() {
             { event: ev.turn_id, streaming: cur.streaming?.turnId },
           );
         }
+        return;
+      }
+
+      // ── S5 — agent tool-call lifecycle events ───────────────
+      if (ev.type === "tool_call_proposed") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.upsertAgentStep({
+          id: ev.id,
+          name: ev.name,
+          input: prettyJson(ev.input),
+          isWrite: ev.is_write,
+          status: "proposed",
+        });
+        return;
+      }
+      if (ev.type === "approval_requested") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.upsertAgentStep({
+          id: ev.id,
+          name: ev.name,
+          input: prettyJson(ev.input),
+          isWrite: true,
+          status: "awaiting_approval",
+        });
+        return;
+      }
+      if (ev.type === "tool_call_executing") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.patchAgentStep(ev.id, { status: "executing" });
+        return;
+      }
+      if (ev.type === "tool_call_finished") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.patchAgentStep(ev.id, {
+          status: "finished",
+          output: ev.content,
+          isError: ev.is_error,
+        });
+        return;
+      }
+      if (ev.type === "tool_call_rejected") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.patchAgentStep(ev.id, {
+          status: "rejected",
+          output: ev.reason,
+        });
         return;
       }
 
@@ -349,6 +407,7 @@ export function ChatView() {
                     startedAt: new Date(),
                     tokensIn: 0,
                     tokensOut: 0,
+                    agentSteps: [],
                   });
                 }}
               />
@@ -371,16 +430,41 @@ export function ChatView() {
             </li>
           ))}
           {streaming && (
-            <li>
-              <MessageBubble
-                msg={{
-                  id: streaming.turnId,
-                  kind: "assistant",
-                  body: streaming.partial,
-                  at: streaming.startedAt,
-                }}
-                pending
-              />
+            <li className="space-y-3">
+              {streaming.agentSteps.length > 0 && (
+                <div className="mx-auto max-w-3xl space-y-2">
+                  {streaming.agentSteps.map((step) => (
+                    <ClaimCard
+                      key={step.id}
+                      step={step}
+                      workspace={activeWorkspace}
+                    />
+                  ))}
+                </div>
+              )}
+              {streaming.partial.length > 0 && (
+                <MessageBubble
+                  msg={{
+                    id: streaming.turnId,
+                    kind: "assistant",
+                    body: streaming.partial,
+                    at: streaming.startedAt,
+                  }}
+                  pending
+                />
+              )}
+              {streaming.partial.length === 0 &&
+                streaming.agentSteps.length === 0 && (
+                  <MessageBubble
+                    msg={{
+                      id: streaming.turnId,
+                      kind: "assistant",
+                      body: streaming.partial,
+                      at: streaming.startedAt,
+                    }}
+                    pending
+                  />
+                )}
             </li>
           )}
           <div ref={bottomRef} />
@@ -436,6 +520,7 @@ export function ChatView() {
             startedAt: new Date(),
             tokensIn: 0,
             tokensOut: 0,
+            agentSteps: [],
           });
         }}
       />

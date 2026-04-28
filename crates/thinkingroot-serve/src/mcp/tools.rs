@@ -524,6 +524,10 @@ pub async fn handle_call(
                 chat,
                 identity: identity_owned.as_ref(),
                 today: Some(&today),
+                // MCP `ask` is a stateless tool call — each invocation
+                // is single-shot. Multi-turn memory comes from the
+                // calling agent's own context, not from us.
+                history: crate::intelligence::synthesizer::NO_HISTORY,
             };
             let result = synth_ask(engine, llm, &req).await;
             let text = format!(

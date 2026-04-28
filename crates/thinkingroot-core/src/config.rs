@@ -625,6 +625,19 @@ pub struct SourceConfig {
 /// `Auto` is the default — the synthesizer inspects the workspace's source
 /// mix at request time and picks the best fit. Set this explicitly in
 /// `.thinkingroot/config.toml` only when auto-detection guesses wrong.
+///
+/// Two real personas exist at the prompt-selection layer:
+///
+/// * `Memory` — the LongMemEval-tuned, byte-identical v0.9.0 prompt that
+///   scored 91.2 % on LME-500. Selected automatically for conversation/
+///   session-style workspaces, and forced for the bench harness.
+/// * `Conversational` — the world-class warm-voice prompt that adapts to
+///   any surface (code, docs, research, transcripts, PDFs). The default
+///   for everything that is not a memory workspace.
+///
+/// `Code` and `Docs` are kept as legacy variants so older
+/// `.thinkingroot/config.toml` files continue to parse without errors;
+/// they fold into `Conversational` at prompt-selection time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatPersona {
@@ -634,10 +647,15 @@ pub enum ChatPersona {
     /// configuration). Always selected for workspaces whose sources are
     /// session-style JSON conversation files.
     Memory,
-    /// Code-aware engineering assistant. Cites `file_path:line_number`
-    /// and explains in terms of the codebase's own symbols.
+    /// World-class warm-voice conversational prompt. The default for
+    /// every workspace shape that is not a memory workspace — code,
+    /// docs, research notes, study material, mixed corpora, PDFs.
+    Conversational,
+    /// Legacy alias kept for backwards-compatible TOML parsing. Folds
+    /// into [`ChatPersona::Conversational`] at prompt-selection time.
     Code,
-    /// Documentation expert. Quotes passages, preserves structure.
+    /// Legacy alias kept for backwards-compatible TOML parsing. Folds
+    /// into [`ChatPersona::Conversational`] at prompt-selection time.
     Docs,
 }
 
@@ -720,15 +738,10 @@ impl ChatConfig {
     /// * Sources are >= 60 % `*.json` *or* contain a `conversation` /
     ///   `session` kind label  → `Memory` + `Terse`. This is the
     ///   LongMemEval shape and preserves the 91.2 % benchmark.
-    /// * Sources are >= 50 % code extensions
-    ///   (`rs`, `ts`, `tsx`, `js`, `jsx`, `py`, `go`, `java`, `c`, `cpp`,
-    ///    `rb`, `kt`, `swift`, `php`, `scala`, `cs`, `lua`)
-    ///   → `Code` + `Rich`.
-    /// * Sources are >= 50 % doc extensions (`md`, `mdx`, `rst`, `adoc`,
-    ///   `txt`)  → `Docs` + `Rich`.
-    /// * Otherwise  → `Memory` + `Rich` (a safe, neutral default that
-    ///   gives more context than Terse without changing the persona
-    ///   selection rules).
+    /// * Otherwise — code-heavy, docs-heavy, mixed, or sparse — →
+    ///   `Conversational` + `Rich`. The conversational prompt adapts
+    ///   to the surface naturally (cites `path:line` for code, quotes
+    ///   passages for docs, recalls sessions for transcripts).
     ///
     /// When `persona` or `verbosity` are explicitly set (not `Auto`), they
     /// pass through unchanged.
@@ -748,7 +761,9 @@ impl ChatConfig {
 
         let auto_verbosity = match persona {
             ChatPersona::Memory => ChatVerbosity::Terse,
-            ChatPersona::Code | ChatPersona::Docs => ChatVerbosity::Rich,
+            ChatPersona::Code
+            | ChatPersona::Docs
+            | ChatPersona::Conversational => ChatVerbosity::Rich,
             ChatPersona::Auto => ChatVerbosity::Rich, // unreachable after the match above
         };
 
@@ -767,8 +782,6 @@ fn classify_source_mix(source_kinds: &[(String, usize)], total: usize) -> ChatPe
     }
 
     let mut conv = 0usize;
-    let mut code = 0usize;
-    let mut docs = 0usize;
 
     for (kind, n) in source_kinds {
         let k = kind.to_ascii_lowercase();
@@ -779,50 +792,15 @@ fn classify_source_mix(source_kinds: &[(String, usize)], total: usize) -> ChatPe
             || k.contains("chat")
         {
             conv += n;
-        } else if matches!(
-            k.as_str(),
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "java"
-                | "c"
-                | "cc"
-                | "cpp"
-                | "h"
-                | "hpp"
-                | "rb"
-                | "kt"
-                | "swift"
-                | "php"
-                | "scala"
-                | "cs"
-                | "lua"
-                | "toml"
-                | "yaml"
-                | "yml"
-                | "sql"
-        ) {
-            code += n;
-        } else if matches!(k.as_str(), "md" | "mdx" | "rst" | "adoc" | "txt") {
-            docs += n;
         }
     }
 
     let conv_ratio = conv as f64 / total as f64;
-    let code_ratio = code as f64 / total as f64;
-    let docs_ratio = docs as f64 / total as f64;
 
     if conv_ratio >= 0.60 {
         ChatPersona::Memory
-    } else if code_ratio >= 0.50 {
-        ChatPersona::Code
-    } else if docs_ratio >= 0.50 {
-        ChatPersona::Docs
     } else {
-        ChatPersona::Memory
+        ChatPersona::Conversational
     }
 }
 
@@ -1221,7 +1199,11 @@ name = "old"
     }
 
     #[test]
-    fn resolve_rust_codebase_picks_code_rich() {
+    fn resolve_rust_codebase_picks_conversational_rich() {
+        // Code-heavy auto-detection now folds into the single warm
+        // `Conversational` persona — the prompt itself adapts to the
+        // surface (cites `path:line`, fenced blocks, etc.) rather than
+        // forking into a separate persona.
         let cfg = ChatConfig::default();
         let mix = vec![
             ("rs".to_string(), 800usize),
@@ -1229,19 +1211,19 @@ name = "old"
             ("toml".to_string(), 50usize),
         ];
         let r = cfg.resolve(&mix);
-        assert_eq!(r.persona, ChatPersona::Code);
+        assert_eq!(r.persona, ChatPersona::Conversational);
         assert_eq!(r.verbosity, ChatVerbosity::Rich);
     }
 
     #[test]
-    fn resolve_docs_only_workspace_picks_docs_rich() {
+    fn resolve_docs_only_workspace_picks_conversational_rich() {
         let cfg = ChatConfig::default();
         let mix = vec![
             ("md".to_string(), 120usize),
             ("rst".to_string(), 30usize),
         ];
         let r = cfg.resolve(&mix);
-        assert_eq!(r.persona, ChatPersona::Docs);
+        assert_eq!(r.persona, ChatPersona::Conversational);
         assert_eq!(r.verbosity, ChatVerbosity::Rich);
     }
 
@@ -1273,9 +1255,10 @@ name = "old"
     }
 
     #[test]
-    fn resolve_mixed_workspace_falls_back_to_memory_rich() {
-        // No category dominates → safe Memory fallback (no LongMemEval
-        // behaviour change since explicit JSON workspaces still pick Terse).
+    fn resolve_mixed_workspace_falls_back_to_conversational_rich() {
+        // No conversation-shape dominance → Conversational. The
+        // LongMemEval contract is unaffected because that bench
+        // workspace is JSON-heavy and still routes to Memory.
         let cfg = ChatConfig::default();
         let mix = vec![
             ("rs".to_string(), 30usize),
@@ -1283,9 +1266,8 @@ name = "old"
             ("png".to_string(), 30usize),
         ];
         let r = cfg.resolve(&mix);
-        assert_eq!(r.persona, ChatPersona::Memory);
-        // Memory's auto verbosity is Terse, regardless of the mix.
-        assert_eq!(r.verbosity, ChatVerbosity::Terse);
+        assert_eq!(r.persona, ChatPersona::Conversational);
+        assert_eq!(r.verbosity, ChatVerbosity::Rich);
     }
 
     #[test]

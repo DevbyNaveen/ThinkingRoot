@@ -56,6 +56,35 @@ export interface Provenance {
   statement?: string;
 }
 
+/** One agent tool-call rendered as an inline claim card during a
+ *  streaming agent turn. The card transitions:
+ *
+ *    proposed → executing → finished | rejected
+ *
+ *  `awaiting_approval` is a synthetic UI state set when a write
+ *  tool's `approval_requested` event arrives — Approve / Reject
+ *  buttons are surfaced and the card stays in this state until the
+ *  user clicks one (which triggers `chat_approve` and the next
+ *  event).
+ */
+export interface AgentStep {
+  id: string;
+  name: string;
+  /** JSON.stringified tool input, pretty-printed for the card. */
+  input: string;
+  isWrite: boolean;
+  status:
+    | "proposed"
+    | "awaiting_approval"
+    | "executing"
+    | "finished"
+    | "rejected";
+  /** Tool output (when finished) or rejection reason (when rejected). */
+  output?: string;
+  /** True when the tool reported a runtime error. */
+  isError?: boolean;
+}
+
 /** In-flight streaming state. */
 export interface StreamState {
   turnId: string;
@@ -63,6 +92,9 @@ export interface StreamState {
   startedAt: Date;
   tokensIn: number;
   tokensOut: number;
+  /** Agent tool-call steps emitted during this turn. Empty for
+   *  legacy non-agent streams. */
+  agentSteps: AgentStep[];
 }
 
 /** Live capsule rendered in the footer + toast deck. */

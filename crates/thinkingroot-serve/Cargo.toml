@@ -45,8 +45,13 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
+async-trait = "0.1"
 regex = { workspace = true }
 lru = "0.12"
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand = { workspace = true }
+hex = "0.4"
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

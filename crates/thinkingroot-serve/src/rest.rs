@@ -18,13 +18,26 @@ use crate::engine::{ClaimFilter, QueryEngine};
 // ─── App State ───────────────────────────────────────────────
 
 pub struct AppState {
-    pub engine: RwLock<QueryEngine>,
+    /// Shared engine handle. Wrapped in `Arc<RwLock<…>>` (rather than the
+    /// older bare `RwLock<…>`) so the agent loop's `ToolContext` can
+    /// clone the same handle into multiple tool handlers without
+    /// hopping through `Arc<AppState>`. All existing call sites that
+    /// did `state.engine.read().await` keep working unchanged because
+    /// `Arc<RwLock<T>>` derefs to `RwLock<T>`.
+    pub engine: Arc<RwLock<QueryEngine>>,
     pub api_key: Option<String>,
     pub mcp_sessions: crate::mcp::sse::SseSessionMap,
     /// Per-agent session state for the intelligent serve layer.
     pub sessions: crate::intelligence::session::SessionStore,
     /// Workspace root path for branch operations (None when multiple workspaces are mounted).
     pub workspace_root: Option<PathBuf>,
+    /// Pending agent-tool approvals, keyed by `tool_use_id`. The
+    /// streaming `/ask/stream` handler inserts one entry per write
+    /// tool the agent proposes; the `/ask/approval/{id}` POST handler
+    /// looks up and fires the matching `oneshot::Sender` so the
+    /// agent's `ChannelApprovalGate` unblocks. Both sides bound this
+    /// shared map; nothing else writes to it.
+    pub pending_approvals: crate::intelligence::approval::PendingApprovalMap,
 }
 
 impl AppState {
@@ -41,11 +54,12 @@ impl AppState {
         workspace_root: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            engine: RwLock::new(engine),
+            engine: Arc::new(RwLock::new(engine)),
             api_key,
             mcp_sessions: crate::mcp::sse::new_session_map(),
             sessions: crate::intelligence::session::new_session_store(),
             workspace_root,
+            pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
         })
     }
 }
@@ -136,6 +150,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/search", get(search))
             .route("/ws/{ws}/ask", post(ask_handler))
             .route("/ws/{ws}/ask/stream", post(ask_stream_handler))
+            .route(
+                "/ws/{ws}/ask/approval/{tool_use_id}",
+                post(ask_approval_handler),
+            )
             .route("/ws/{ws}/galaxy", get(get_galaxy))
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/verify", post(verify_ws))
@@ -741,6 +759,72 @@ struct AskRequest {
     question_date: String,
     #[serde(default)]
     category_hint: String,
+    /// Recent conversation turns (oldest-first) the synthesizer should
+    /// treat as memory. Empty = single-shot mode and the wire prompt is
+    /// byte-identical to v0.9.0. The desktop chat surface pins the last
+    /// 6-8 turns here once Sprint S5 wires it through; the LongMemEval
+    /// bench harness leaves it empty so the contract holds.
+    #[serde(default)]
+    history: Vec<ChatTurnPayload>,
+    /// When `true`, route the chat through the multi-turn tool-using
+    /// agent (S3) instead of one-shot retrieval-and-synthesise. Only
+    /// honoured by `/ask/stream` and only when the workspace has a
+    /// `Conversational` persona resolved. Defaults to `false` so
+    /// existing CLI / API clients keep their byte-stable behaviour;
+    /// the desktop chat surface flips it to `true` once the UI is
+    /// wired to render `tool_call_*` SSE events.
+    #[serde(default)]
+    use_agent: bool,
+    /// Stable identifier for this conversation. Used by the agent
+    /// path as the MCP session id (which scopes
+    /// `contribute_claim`'s active branch and provenance). When
+    /// missing, the streaming handler synthesises a fresh UUID per
+    /// request, which means each turn looks like a brand-new
+    /// session — fine for stateless flows, breaks per-conversation
+    /// active-branch tracking, so callers that want continuity
+    /// must pass this.
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+/// Wire-format conversation turn. Mirrors the OpenAI Chat Completions /
+/// Anthropic Messages role string so the JSON travels through any
+/// front-end without translation. Unknown roles (i.e. `tool`, `system`)
+/// are silently dropped — the synthesizer is a strict 2-role consumer.
+#[derive(Deserialize)]
+struct ChatTurnPayload {
+    role: String,
+    content: String,
+}
+
+/// Translate the wire-format `[{role, content}, ...]` history into the
+/// synthesizer's internal `Vec<ChatTurn>`. Unknown roles are skipped
+/// (rather than failing the request) so a misbehaving client cannot
+/// take down the chat surface — the worst case is the synthesizer sees
+/// fewer turns than the client thought it sent. Empty `content` strings
+/// are also dropped to keep the prompt tight.
+fn decode_history(
+    payload: &[ChatTurnPayload],
+) -> Vec<crate::intelligence::synthesizer::ChatTurn> {
+    use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
+    payload
+        .iter()
+        .filter_map(|t| {
+            let role = match t.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => return None,
+            };
+            let content = t.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(ChatTurn {
+                role,
+                content: content.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -815,6 +899,8 @@ async fn ask_handler(
         .map(|s| build_workspace_identity(s, &s.config.chat));
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+    let history = decode_history(&body.history);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -828,6 +914,7 @@ async fn ask_handler(
         chat,
         identity: identity_owned.as_ref(),
         today: Some(&today),
+        history: &history,
     };
 
     let result = ask(&engine, llm, &req).await;
@@ -885,6 +972,13 @@ async fn ask_stream_handler(
     use futures::StreamExt;
     use std::collections::{HashMap, HashSet};
 
+    // Agent path branches off as early as possible: it has its own
+    // event stream (tool_call_* + token + final + error) and reuses
+    // none of the one-shot retrieval scaffolding below.
+    if body.use_agent {
+        return agent_stream_response(state.clone(), ws, body).await;
+    }
+
     let engine = state.engine.read().await;
 
     let sessions_dir = state
@@ -931,6 +1025,8 @@ async fn ask_stream_handler(
         .map(|s| build_workspace_identity(s, &s.config.chat));
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+    let history = decode_history(&body.history);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -944,6 +1040,7 @@ async fn ask_stream_handler(
         chat,
         identity: identity_owned.as_ref(),
         today: Some(&today),
+        history: &history,
     };
 
     let outcome = ask_streaming(&engine, llm, &req).await;
@@ -1023,11 +1120,280 @@ async fn ask_stream_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("keep-alive"),
-    )
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+// ─── Agent streaming response (S5) ───────────────────────────
+//
+// When the request body sets `use_agent: true`, the streaming
+// handler routes here instead of the one-shot retrieve-and-synthesise
+// path above. The agent (S3) drives a multi-turn loop calling tools,
+// gating writes through `ToolApprovalRouter` (which suspends on a
+// oneshot until `/ask/approval/{id}` resolves it), and emitting
+// `AgentEvent`s through an mpsc channel.
+//
+// Wire shape on the SSE stream — every `AgentEvent` becomes one
+// `event:` line:
+//
+//   event: token                  # AgentEvent::Text
+//   event: tool_call_proposed     # incl. {id, name, input, is_write}
+//   event: tool_call_executing    # incl. {id, name}
+//   event: tool_call_finished     # incl. {id, name, content, is_error}
+//   event: tool_call_rejected     # incl. {id, name, reason}
+//   event: final                  # AgentEvent::Done
+//   event: error                  # AgentEvent::Error
+//
+// In addition, when the agent emits `tool_call_proposed` with
+// `is_write: true`, the handler registers a oneshot in
+// `state.pending_approvals` keyed by the tool_use_id and emits an
+// `approval_requested` SSE event so the desktop UI can render its
+// claim card. The UI then POSTs the decision to
+// `/ask/approval/{tool_use_id}`.
+async fn agent_stream_response(
+    state: Arc<AppState>,
+    ws: String,
+    body: AskRequest,
+) -> Response {
+    use crate::intelligence::agent::AgentEvent;
+    use crate::intelligence::agent_streaming::{
+        StreamAgentDeps, StreamAgentRequest, agent_event_to_sse, spawn_agent_run,
+    };
+    use crate::intelligence::skills::SkillRegistry;
+    use crate::intelligence::synthesizer::{
+        AskRequest as SynthAskRequest, ChatRole, ChatTurn, build_system_prompt,
+        compose_full_system_prompt,
+    };
+
+    // Snapshot engine state we need before releasing the read lock —
+    // the agent path goes async via spawn() and can't hold a guard
+    // across .await without serialising every concurrent agent.
+    let engine = state.engine.read().await;
+    let llm = match engine.workspace_llm(&ws) {
+        Some(c) => c,
+        None => {
+            let payload = serde_json::json!({
+                "message": format!("workspace '{ws}' has no LLM configured")
+            });
+            let stream = async_stream::stream! {
+                yield Ok::<Event, std::convert::Infallible>(
+                    Event::default().event("error").data(payload.to_string())
+                );
+            };
+            return Sse::new(stream)
+                .keep_alive(KeepAlive::new().text("keep-alive"))
+                .into_response();
+        }
+    };
+    let workspace_root = state
+        .workspace_root
+        .as_ref()
+        .cloned()
+        .or_else(|| engine.workspace_root_path(&ws));
+    let snapshot = engine.workspace_chat_snapshot(&ws).await;
+    let chat = snapshot
+        .as_ref()
+        .map(|s| s.config.chat.resolve(&s.source_kinds))
+        .unwrap_or_else(SynthAskRequest::legacy_chat);
+    drop(engine);
+
+    let Some(workspace_root) = workspace_root else {
+        let payload = serde_json::json!({
+            "message": format!("workspace '{ws}' has no on-disk root mounted; agent path requires one")
+        });
+        let stream = async_stream::stream! {
+            yield Ok::<Event, std::convert::Infallible>(
+                Event::default().event("error").data(payload.to_string())
+            );
+        };
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().text("keep-alive"))
+            .into_response();
+    };
+
+    // Skills live at <workspace_root>/.thinkingroot/skills/. Empty
+    // dir or missing dir → empty registry; skill manifest will not
+    // be appended to the system prompt.
+    let skill_dir = workspace_root.join(".thinkingroot/skills");
+    let skills = match SkillRegistry::load_from_dir(&skill_dir) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            tracing::warn!("agent: skill load failed at {}: {e}", skill_dir.display());
+            Arc::new(SkillRegistry::empty())
+        }
+    };
+
+    // Compose the full system prompt: persona + (no style — styles
+    // are resolved server-side from `[chat]` config in a future
+    // sprint) + skill manifest.
+    let system_prompt = compose_full_system_prompt(chat, None, Some(&skills));
+    let _ = build_system_prompt; // re-export for callers that want raw
+
+    // Translate wire-format history into ChatTurn → ChatMessage.
+    let chat_history: Vec<ChatTurn> = body
+        .history
+        .iter()
+        .filter_map(|t| {
+            let role = match t.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => return None,
+            };
+            let content = t.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(ChatTurn {
+                role,
+                content: content.to_string(),
+            })
+        })
+        .collect();
+    let agent_messages =
+        crate::intelligence::agent::chat_turns_to_messages(&chat_history);
+
+    let conversation_id = body
+        .conversation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let req = StreamAgentRequest {
+        workspace: ws.clone(),
+        workspace_root,
+        session_id: conversation_id,
+        agent_id: "thinkingroot".to_string(),
+        system_prompt,
+        user_question: body.question.clone(),
+        history: agent_messages,
+        skills,
+    };
+    let deps = StreamAgentDeps {
+        engine: state.engine.clone(),
+        llm,
+        sessions: state.sessions.clone(),
+        pending_approvals: state.pending_approvals.clone(),
+        trace: None,
+    };
+
+    let (mut rx, router) = spawn_agent_run(req, deps);
+
+    // The streaming task watches the event channel. For every
+    // `tool_call_proposed` with `is_write: true`, it (1) tells the
+    // ToolApprovalRouter to register a pending oneshot under the
+    // tool_use_id, and (2) emits an `approval_requested` SSE event
+    // so the desktop UI can render its claim card. The matching
+    // POST to `/ask/approval/{id}` resolves the oneshot and the
+    // agent unblocks.
+    let stream = async_stream::stream! {
+        // Surface a cheap meta event up front so UIs that show a
+        // "category" header have something to render before tokens
+        // start flowing. claims_used is unknown from the agent
+        // (tools may produce many results), so we report 0 for now.
+        let meta = serde_json::json!({
+            "claims_used": 0,
+            "category": "agentic",
+        });
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default().event("meta").data(meta.to_string())
+        );
+
+        while let Some(event) = rx.recv().await {
+            // Side effect: write proposals need a pending-id
+            // registration BEFORE the agent's gate.check fires.
+            // The agent emits ToolCallProposed before calling the
+            // gate, so we have a small window to set this up.
+            if let AgentEvent::ToolCallProposed { id, is_write, name, input } = &event {
+                if *is_write {
+                    router.set_pending_id(id.clone()).await;
+                    let payload = serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "input": input,
+                    });
+                    yield Ok(
+                        Event::default()
+                            .event("approval_requested")
+                            .data(payload.to_string())
+                    );
+                }
+            }
+
+            let (kind, payload) = agent_event_to_sse(&event);
+            yield Ok(
+                Event::default().event(kind).data(payload.to_string())
+            );
+
+            // Terminal events end the stream.
+            if matches!(event, AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+// ─── Approval POST handler (S5) ──────────────────────────────
+//
+// POST /api/v1/ws/{ws}/ask/approval/{tool_use_id}
+// Body: {"decision": "approve" | "reject", "reason": "..."}
+//
+// Resolves the matching pending oneshot in `state.pending_approvals`,
+// unblocking the agent's `ToolApprovalRouter::check`. The `ws` path
+// param is currently unused (every tool_use_id is globally unique
+// across workspaces) but kept in the URL so future per-workspace
+// scoping is a non-breaking change.
+
+#[derive(Deserialize)]
+struct ApprovalRequestBody {
+    /// Either "approve" or "reject". Anything else is treated as
+    /// rejection so a malformed client can't sneak through.
+    decision: String,
+    /// Optional human-readable reason. Surfaced to the LLM via the
+    /// `tool_call_rejected` event when the decision is "reject".
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn ask_approval_handler(
+    State(state): State<Arc<AppState>>,
+    Path((_ws, tool_use_id)): Path<(String, String)>,
+    Json(body): Json<ApprovalRequestBody>,
+) -> Response {
+    use crate::intelligence::approval::{ApprovalDecision, ToolApprovalRouter};
+
+    let decision = match body.decision.as_str() {
+        "approve" | "approved" => ApprovalDecision::Approved,
+        _ => ApprovalDecision::Rejected {
+            reason: body
+                .reason
+                .unwrap_or_else(|| "user declined".to_string()),
+        },
+    };
+
+    let resolved =
+        ToolApprovalRouter::resolve(&state.pending_approvals, &tool_use_id, decision).await;
+
+    if resolved {
+        ok_response(serde_json::json!({"resolved": true})).into_response()
+    } else {
+        err_response(
+            StatusCode::NOT_FOUND,
+            "NO_PENDING_APPROVAL",
+            &format!("no pending approval for tool_use_id '{tool_use_id}'"),
+        )
+    }
 }
 
 // ─── LLM Health (pre-flight) ─────────────────────────────────

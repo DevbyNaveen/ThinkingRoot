@@ -1,4 +1,8 @@
+pub mod agent;
+pub mod agent_streaming;
+pub mod approval;
 pub mod augmenter;
+pub mod builtin_tools;
 pub mod compressor;
 pub mod identity;
 pub mod planner;
@@ -7,5 +11,9 @@ pub mod reranker;
 pub mod retriever;
 pub mod router;
 pub mod session;
+pub mod skills;
+pub mod styles;
 pub mod synthesizer;
 pub mod temporal;
+pub mod tools;
+pub mod trace;
