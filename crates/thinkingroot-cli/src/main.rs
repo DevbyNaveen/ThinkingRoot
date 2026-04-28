@@ -1269,6 +1269,7 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
         chat,
         identity: identity_owned.as_ref(),
         today: Some(&today_iso),
+        history: thinkingroot_serve::intelligence::synthesizer::NO_HISTORY,
     };
 
     let spinner_msg = format!(

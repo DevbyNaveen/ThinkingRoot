@@ -741,6 +741,53 @@ struct AskRequest {
     question_date: String,
     #[serde(default)]
     category_hint: String,
+    /// Recent conversation turns (oldest-first) the synthesizer should
+    /// treat as memory. Empty = single-shot mode and the wire prompt is
+    /// byte-identical to v0.9.0. The desktop chat surface pins the last
+    /// 6-8 turns here once Sprint S5 wires it through; the LongMemEval
+    /// bench harness leaves it empty so the contract holds.
+    #[serde(default)]
+    history: Vec<ChatTurnPayload>,
+}
+
+/// Wire-format conversation turn. Mirrors the OpenAI Chat Completions /
+/// Anthropic Messages role string so the JSON travels through any
+/// front-end without translation. Unknown roles (i.e. `tool`, `system`)
+/// are silently dropped — the synthesizer is a strict 2-role consumer.
+#[derive(Deserialize)]
+struct ChatTurnPayload {
+    role: String,
+    content: String,
+}
+
+/// Translate the wire-format `[{role, content}, ...]` history into the
+/// synthesizer's internal `Vec<ChatTurn>`. Unknown roles are skipped
+/// (rather than failing the request) so a misbehaving client cannot
+/// take down the chat surface — the worst case is the synthesizer sees
+/// fewer turns than the client thought it sent. Empty `content` strings
+/// are also dropped to keep the prompt tight.
+fn decode_history(
+    payload: &[ChatTurnPayload],
+) -> Vec<crate::intelligence::synthesizer::ChatTurn> {
+    use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
+    payload
+        .iter()
+        .filter_map(|t| {
+            let role = match t.role.as_str() {
+                "user" => ChatRole::User,
+                "assistant" => ChatRole::Assistant,
+                _ => return None,
+            };
+            let content = t.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(ChatTurn {
+                role,
+                content: content.to_string(),
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -815,6 +862,8 @@ async fn ask_handler(
         .map(|s| build_workspace_identity(s, &s.config.chat));
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+    let history = decode_history(&body.history);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -828,6 +877,7 @@ async fn ask_handler(
         chat,
         identity: identity_owned.as_ref(),
         today: Some(&today),
+        history: &history,
     };
 
     let result = ask(&engine, llm, &req).await;
@@ -931,6 +981,8 @@ async fn ask_stream_handler(
         .map(|s| build_workspace_identity(s, &s.config.chat));
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+    let history = decode_history(&body.history);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -944,6 +996,7 @@ async fn ask_stream_handler(
         chat,
         identity: identity_owned.as_ref(),
         today: Some(&today),
+        history: &history,
     };
 
     let outcome = ask_streaming(&engine, llm, &req).await;
