@@ -114,7 +114,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 calls.retain(|c| !c.is_empty() && *c != func_name_str);
 
                 let mut chunk = Chunk::new(text, ChunkType::FunctionDef, start_line, end_line)
-                    .with_language(language);
+                    .with_language(language)
+                    .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                 chunk.metadata = ChunkMetadata {
                     function_name: name,
                     parameters: params.map(|p| vec![p]),
@@ -152,7 +153,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 };
 
                 let mut chunk = Chunk::new(text, ChunkType::TypeDef, start_line, end_line)
-                    .with_language(language);
+                    .with_language(language)
+                    .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                 chunk.metadata = ChunkMetadata {
                     type_name,
                     trait_name,
@@ -201,7 +203,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 let field_types = extract_field_types(source, &child);
 
                 let mut chunk = Chunk::new(text, ChunkType::TypeDef, start_line, end_line)
-                    .with_language(language);
+                    .with_language(language)
+                    .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                 chunk.metadata = ChunkMetadata {
                     type_name: name,
                     field_types,
@@ -229,7 +232,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             // PHP
             | "namespace_use_declaration" => {
                 let chunk = Chunk::new(text, ChunkType::Import, start_line, end_line)
-                    .with_language(language);
+                    .with_language(language)
+                    .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                 doc.add_chunk(chunk);
             }
 
@@ -238,7 +242,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                 if text.len() > 20 {
                     // Only include substantial comments.
                     let chunk = Chunk::new(text, ChunkType::Comment, start_line, end_line)
-                        .with_language(language);
+                        .with_language(language)
+                        .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                     doc.add_chunk(chunk);
                 }
             }
@@ -246,7 +251,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             // Module-level doc attributes in Rust
             "inner_attribute_item" if text.starts_with("#![doc") || text.starts_with("//!") => {
                 let chunk = Chunk::new(text, ChunkType::ModuleDoc, start_line, end_line)
-                    .with_language(language);
+                    .with_language(language)
+                    .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                 doc.add_chunk(chunk);
             }
 
@@ -275,7 +281,8 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
                             let end_line = child.end_position().row as u32 + 1;
                             let text = &source[child.byte_range()];
                             let mut chunk = Chunk::new(text, ChunkType::FunctionDef, start_line, end_line)
-                                .with_language(language);
+                                .with_language(language)
+                                .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
                             chunk.metadata = ChunkMetadata {
                                 function_name: name,
                                 visibility: Some(if head_text.ends_with('p') { "private".to_string() } else { "public".to_string() }),

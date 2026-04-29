@@ -38,6 +38,10 @@ pub fn parse(path: &Path) -> Result<DocumentIR> {
     for chunk in chunks {
         doc.add_chunk(chunk);
     }
+    // Manifest dep chunks store the raw line (e.g. `serde = "1"`) without
+    // the original byte offset. Substring search backfills the byte range
+    // by walking `content` once.
+    doc.fill_byte_ranges(&content);
     Ok(doc)
 }
 

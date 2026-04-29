@@ -45,6 +45,45 @@ impl DocumentIR {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Backfill `byte_start`/`byte_end` on every chunk that still has the
+    /// `(0, 0)` "unknown" sentinel by searching for the chunk's content in
+    /// `source`. Walks the source linearly with a cursor so equal-content
+    /// chunks (e.g., two paragraphs containing the same text) get distinct
+    /// ranges.
+    ///
+    /// Parsers that already populate authoritative byte ranges from a
+    /// tree-sitter `Node::byte_range()` or another byte-aware mechanism
+    /// are unaffected — chunks with non-zero ranges are skipped. Markdown,
+    /// manifest, PDF, and git parsers should call this at the end of
+    /// `parse_*` so v3 pack writes never emit a claim citing `(0, 0)`.
+    ///
+    /// The match is substring-based and tolerant of trimmed content
+    /// (markdown's `flush_prose` trims the chunk before storing). When the
+    /// content cannot be found at-or-after the cursor (e.g., the chunk was
+    /// transformed beyond a substring search), the chunk is left unchanged
+    /// and the cursor stays put — downstream consumers treat `(0, 0)` as
+    /// "unknown" and fall back to line-based positioning.
+    pub fn fill_byte_ranges(&mut self, source: &str) {
+        let mut cursor = 0usize;
+        for chunk in &mut self.chunks {
+            if chunk.byte_start != 0 || chunk.byte_end != 0 {
+                // Authoritative range already present — preserve it.
+                continue;
+            }
+            let needle = chunk.content.trim();
+            if needle.is_empty() {
+                continue;
+            }
+            if let Some(found) = source[cursor..].find(needle) {
+                let abs_start = cursor + found;
+                let abs_end = abs_start + needle.len();
+                chunk.byte_start = abs_start as u64;
+                chunk.byte_end = abs_end as u64;
+                cursor = abs_end;
+            }
+        }
+    }
 }
 
 /// A chunk is a semantically meaningful segment of the document.
