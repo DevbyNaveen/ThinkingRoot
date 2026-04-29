@@ -43,6 +43,9 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+pub mod trust_root;
+pub use trust_root::{TrustedCertificate, TrustedRoot, verify_cert_chain};
+
 /// DSSE statement type for v3 packs. Locked by spec §3.4 — never
 /// changes for the `tr/3` format. A future `tr/4` would mint a new
 /// media type; readers/verifiers refusing on mismatch surfaces
@@ -126,6 +129,19 @@ pub enum Error {
     /// are corrupt or use a third encoding we don't handle.
     #[error("ECDSA signature format unrecognised (expected DER or 64-byte raw)")]
     EcdsaSignatureFormat,
+    /// A cert in the chain (or in the trust root) has a validity
+    /// window that does not include the `signed_at` timestamp the
+    /// caller supplied. Sigstore-public-good's leaf certs are valid
+    /// for ~10 minutes; a 5-minute clock skew tolerance is applied
+    /// by the chain validator before this error fires.
+    #[error("certificate not valid at signing time: {0}")]
+    CertValidity(String),
+    /// The topmost cert in the chain was not signed by any of the
+    /// trusted root CAs. The chain is internally consistent (cert i
+    /// signed by cert i+1) but the chain doesn't terminate at a
+    /// recognised root.
+    #[error("chain does not reach trust root: {0}")]
+    ChainDoesNotReachTrustRoot(String),
 }
 
 /// Result alias for sigstore operations.
@@ -550,6 +566,50 @@ fn verify_dsse_with_ecdsa_cert(
         .map_err(|_| Error::SignatureMismatch)
 }
 
+/// Bundle verification with full trust-root chain validation.
+///
+/// This is the function callers should use when they want both
+/// cryptographic provenance AND identity binding (i.e., "this pack was
+/// signed by someone whose ephemeral cert was issued by the Sigstore
+/// public-good Fulcio CA at signing time").
+///
+/// Steps:
+///
+/// 1. [`verify_bundle_offline`] — re-derives the DSSE PAE, validates the
+///    signature, and asserts the in-toto statement's subject digest
+///    matches `expected_pack_hash`.
+/// 2. [`verify_cert_chain`] — walks the bundle's
+///    `x509CertificateChain` toward a root CA in `trust_root`. Each
+///    cert's validity window must include `signed_at` (5-minute clock
+///    skew tolerance applied).
+///
+/// On success, returns the in-toto statement (so callers can pluck out
+/// the `signed_at` predicate) along with the index of the trust-root
+/// CA that terminated the chain (useful for logging "signed under
+/// Sigstore-public-good v1").
+///
+/// Self-signed bundles (no cert chain) are rejected here with
+/// [`Error::MissingVerificationKey`] — callers that want to permit
+/// self-signed bundles should use [`verify_bundle_offline`] directly.
+pub fn verify_bundle_with_trust_root(
+    bundle: &SigstoreBundle,
+    expected_pack_hash: &str,
+    trust_root: &TrustedRoot,
+    signed_at: SystemTime,
+) -> Result<(InTotoStatement, usize)> {
+    // Cryptographic verification first — short-circuits on signature
+    // mismatch, subject digest mismatch, etc.
+    let statement = verify_bundle_offline(bundle, expected_pack_hash)?;
+
+    let chain = bundle
+        .verification_material
+        .x509_certificate_chain
+        .as_ref()
+        .ok_or(Error::MissingVerificationKey)?;
+    let root_idx = verify_cert_chain(chain, trust_root, signed_at)?;
+    Ok((statement, root_idx))
+}
+
 /// Try DER-encoded ECDSA signature first, fall back to raw 64-byte
 /// IEEE P1363 r ‖ s. Documented input contract on
 /// [`verify_dsse_with_ecdsa_cert`].
@@ -949,6 +1009,153 @@ mod tests {
         // dispatcher considers an empty chain "not set" and falls
         // through to checking public_key).
         let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
+        assert!(matches!(err, Error::MissingVerificationKey));
+    }
+
+    /// Build a 3-cert synthetic chain (root CA → intermediate → leaf)
+    /// using the same hand-rolled approach as `trust_root::tests`. The
+    /// leaf signs the DSSE PAE; the bundle ships [leaf, intermediate].
+    /// Returns the assembled bundle, the root cert (trust-root input),
+    /// and the leaf signing key (so callers can produce signatures
+    /// against the same key in additional tests).
+    fn build_full_synthetic_bundle(
+        pack_hash: &str,
+        pack_filename: &str,
+    ) -> (SigstoreBundle, Vec<u8>) {
+        use crate::trust_root::test_helpers as tr_tests;
+
+        let root_signer = tr_tests::p256_key(0xC1);
+        let int_signer = tr_tests::p256_key(0xC2);
+        let leaf_signer = tr_tests::p256_key(0xC3);
+
+        let (root_cert, root_name) =
+            tr_tests::build_self_signed_root(&root_signer, "Synthetic Root");
+        let (int_cert, int_name) = tr_tests::build_intermediate(
+            &root_signer,
+            &root_name,
+            &int_signer,
+            "Synthetic Intermediate",
+        );
+        let leaf_cert =
+            tr_tests::build_leaf(&int_signer, &int_name, &leaf_signer, "leaf");
+
+        // Sign the DSSE PAE with the leaf.
+        let bare = strip_blake3_prefix(pack_hash);
+        let statement = InTotoStatement {
+            statement_type: IN_TOTO_STATEMENT_V1.to_string(),
+            subject: vec![Subject {
+                name: pack_filename.to_string(),
+                digest: {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "blake3".to_string(),
+                        serde_json::Value::String(bare.to_string()),
+                    );
+                    m
+                },
+            }],
+            predicate_type: DSSE_STATEMENT_TYPE.to_string(),
+            predicate: PackPredicate {
+                format_version: "tr/3".to_string(),
+                signed_at: format_rfc3339(SystemTime::now()),
+            },
+        };
+        let payload_bytes = serde_json::to_vec(&statement).unwrap();
+        let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes);
+        let sig: P256Signature = leaf_signer.sign(&pae);
+        let sig_der = sig.to_der();
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let leaf_der = ::der::Encode::to_der(&leaf_cert).unwrap();
+        let int_der = ::der::Encode::to_der(&int_cert).unwrap();
+        let root_der = ::der::Encode::to_der(&root_cert).unwrap();
+
+        let bundle = SigstoreBundle {
+            media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
+            verification_material: VerificationMaterial {
+                public_key: None,
+                x509_certificate_chain: Some(X509CertificateChain {
+                    certificates: vec![
+                        X509Certificate {
+                            raw_bytes: b64.encode(&leaf_der),
+                        },
+                        X509Certificate {
+                            raw_bytes: b64.encode(&int_der),
+                        },
+                    ],
+                }),
+                tlog_entries: Vec::new(),
+            },
+            dsse_envelope: DsseEnvelope {
+                payload: b64.encode(&payload_bytes),
+                payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+                signatures: vec![DsseSignature {
+                    sig: b64.encode(sig_der.as_bytes()),
+                }],
+            },
+        };
+        (bundle, root_der)
+    }
+
+    #[test]
+    fn full_chain_bundle_verifies_against_synthetic_trust_root() {
+        let (bundle, root_der) =
+            build_full_synthetic_bundle(fixture_hash(), "full-chain.tr");
+        let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
+        let (stmt, root_idx) = verify_bundle_with_trust_root(
+            &bundle,
+            fixture_hash(),
+            &trust_root,
+            SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(root_idx, 0);
+        assert_eq!(stmt.predicate.format_version, "tr/3");
+        assert_eq!(stmt.subject[0].name, "full-chain.tr");
+    }
+
+    #[test]
+    fn full_chain_bundle_with_no_chain_errors_missing_key() {
+        let (mut bundle, root_der) =
+            build_full_synthetic_bundle(fixture_hash(), "p.tr");
+        bundle.verification_material.x509_certificate_chain = None;
+        bundle.verification_material.public_key = None;
+        let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
+        let err = verify_bundle_with_trust_root(
+            &bundle,
+            fixture_hash(),
+            &trust_root,
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::MissingVerificationKey));
+    }
+
+    #[test]
+    fn full_chain_bundle_with_self_signed_only_rejected_by_trust_root_path() {
+        // verify_bundle_with_trust_root does not accept self-signed
+        // bundles. The user-facing pattern is: callers that want to
+        // permit both self-signed AND Sigstore-signed bundles run
+        // verify_bundle_offline first, then conditionally run trust-
+        // root validation only if a chain is present.
+        let key = generate_signing_key(0xD0);
+        let bundle = sign_pack(fixture_hash(), "p.tr", &key, SystemTime::now()).unwrap();
+        // Build a trust root with one bogus root CA — the check should
+        // fail with MissingVerificationKey before chain validation runs.
+        let bogus_root = deterministic_p256_key(0xD1);
+        let (root_cert, _) = crate::trust_root::test_helpers::build_self_signed_root(
+            &bogus_root,
+            "Bogus",
+        );
+        let root_der = ::der::Encode::to_der(&root_cert).unwrap();
+        let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
+        let err = verify_bundle_with_trust_root(
+            &bundle,
+            fixture_hash(),
+            &trust_root,
+            SystemTime::now(),
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
     }
 

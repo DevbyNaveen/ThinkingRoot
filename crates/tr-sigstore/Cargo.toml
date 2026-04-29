@@ -41,16 +41,17 @@ p256       = { version = "0.13", default-features = false, features = ["ecdsa", 
 ecdsa      = { version = "0.16", default-features = false, features = ["der", "pkcs8", "std"] }
 x509-cert  = { version = "0.2",  default-features = false, features = ["std"] }
 spki       = { version = "0.7",  default-features = false, features = ["std"] }
-der        = { version = "0.7",  default-features = false, features = ["std", "oid"] }
+der        = { version = "0.7",  default-features = false, features = ["std", "oid", "pem"] }
 signature  = { version = "2",    default-features = false, features = ["std"] }
+# SHA-256 hashing for TBS-cert signature verification during chain
+# validation. Sigstore's Fulcio chain is exclusively ECDSA-with-SHA256;
+# adding other hash variants is straightforward when needed.
+sha2       = { version = "0.10", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
-# Tests construct a minimal X.509 leaf cert (valid DER, dummy issuer signature)
-# wrapping a freshly-generated ECDSA P-256 keypair so we can round-trip the
-# Fulcio-style bundle path without contacting the network. The `builder`
-# feature pulls in `rsa` only behind the cert-builder code-path, which our
-# offline tests never exercise; runtime cost is zero.
-x509-cert  = { version = "0.2",  default-features = false, features = ["std", "builder"] }
-# Time arithmetic for cert validity windows in tests.
-time       = { version = "0.3",  default-features = false, features = ["std"] }
+# Tests hand-roll syntactically valid X.509 certs (TBS + signature)
+# rather than going through `x509-cert::builder`, because the builder's
+# `Builder` trait bounds aren't satisfied for our exact ecdsa+pkcs8
+# feature set. Hand-rolling keeps the test deps minimal and gives the
+# chain-validation tests precise control over each cert's TBS bytes.
