@@ -117,7 +117,7 @@ pub fn verify_inclusion_proof_offline(
 
     while size > 1 {
         let last_node_at_level = size - 1;
-        if idx == last_node_at_level && idx % 2 == 0 {
+        if idx == last_node_at_level && idx.is_multiple_of(2) {
             // Lone right-most leaf at this level: it's promoted to
             // the next level without hashing (RFC 6962). No sibling
             // consumed.
@@ -127,14 +127,14 @@ pub fn verify_inclusion_proof_offline(
                     "rekor audit path is too short for the given tree shape".into(),
                 )
             })?;
-            running = if idx % 2 == 0 {
+            running = if idx.is_multiple_of(2) {
                 hash_node(&running, sibling)
             } else {
                 hash_node(sibling, &running)
             };
         }
         idx /= 2;
-        size = (size + 1) / 2;
+        size = size.div_ceil(2);
     }
 
     if sibling_iter.next().is_some() {
@@ -295,7 +295,7 @@ mod tests {
         let mut layer: Vec<[u8; 32]> = leaves.to_vec();
         while layer.len() > 1 {
             let last_node = (layer.len() as u64) - 1;
-            if !(idx == last_node && idx % 2 == 0) {
+            if !(idx == last_node && idx.is_multiple_of(2)) {
                 let pair = (idx ^ 1) as usize;
                 siblings.push(layer[pair]);
             }
