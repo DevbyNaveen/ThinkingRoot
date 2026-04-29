@@ -904,6 +904,8 @@ mod tiered_tests {
             chunk_type: ChunkType::FunctionDef,
             start_line: 1,
             end_line: 1,
+            byte_start: 0,
+            byte_end: 0,
             heading: None,
             language: Some("rust".to_string()),
             metadata: ChunkMetadata {
@@ -945,6 +947,8 @@ mod tiered_tests {
                 chunk_type: ChunkType::FunctionDef,
                 start_line: 1,
                 end_line: 1,
+                byte_start: 0,
+                byte_end: 0,
                 heading: None,
                 language: Some("rust".to_string()),
                 metadata: ChunkMetadata {
@@ -957,6 +961,8 @@ mod tiered_tests {
                 chunk_type: ChunkType::Prose,
                 start_line: 5,
                 end_line: 5,
+                byte_start: 0,
+                byte_end: 0,
                 heading: None,
                 language: None,
                 metadata: ChunkMetadata::default(),
@@ -966,6 +972,8 @@ mod tiered_tests {
                 chunk_type: ChunkType::Import,
                 start_line: 1,
                 end_line: 1,
+                byte_start: 0,
+                byte_end: 0,
                 heading: None,
                 language: Some("rust".to_string()),
                 metadata: ChunkMetadata {

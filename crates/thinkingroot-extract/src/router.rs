@@ -119,6 +119,8 @@ mod tests {
             chunk_type,
             start_line: 1,
             end_line: 1,
+            byte_start: 0,
+            byte_end: 4,
             heading: None,
             language: None,
             metadata: meta,

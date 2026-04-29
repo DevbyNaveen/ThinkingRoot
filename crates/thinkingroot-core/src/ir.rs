@@ -54,6 +54,20 @@ pub struct Chunk {
     pub chunk_type: ChunkType,
     pub start_line: u32,
     pub end_line: u32,
+    /// Byte offset (inclusive) of this chunk within its source file.
+    /// Populated by parsers that have access to byte-level positioning
+    /// (tree-sitter `node.byte_range()`, markdown chunker offset tracker).
+    /// Defaults to 0 for parsers that have not been upgraded yet — the
+    /// structural and LLM extractors copy whatever value is here onto the
+    /// emitted [`ExtractedClaim::byte_start`].
+    #[serde(default)]
+    pub byte_start: u64,
+    /// Byte offset (exclusive) of this chunk within its source file.
+    /// Defaults to 0 alongside [`Chunk::byte_start`]; the pair `(0, 0)` is
+    /// the sentinel for "parser has not yet been upgraded to track byte
+    /// offsets". Use [`Chunk::with_byte_range`] to set authoritative values.
+    #[serde(default)]
+    pub byte_end: u64,
     pub heading: Option<String>,
     pub language: Option<String>,
     pub metadata: ChunkMetadata,
@@ -71,6 +85,8 @@ impl Chunk {
             chunk_type,
             start_line,
             end_line,
+            byte_start: 0,
+            byte_end: 0,
             heading: None,
             language: None,
             metadata: ChunkMetadata::default(),
@@ -84,6 +100,16 @@ impl Chunk {
 
     pub fn with_language(mut self, lang: impl Into<String>) -> Self {
         self.language = Some(lang.into());
+        self
+    }
+
+    /// Set the chunk's byte range within its source file. Parsers should
+    /// call this whenever they have authoritative byte offsets (tree-sitter
+    /// `node.byte_range()`, markdown chunker byte cursor) so downstream
+    /// extractors can emit verifiable byte-range citations on every claim.
+    pub fn with_byte_range(mut self, byte_start: u64, byte_end: u64) -> Self {
+        self.byte_start = byte_start;
+        self.byte_end = byte_end;
         self
     }
 }

@@ -90,6 +90,9 @@ fn extract_manifest_dep(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -129,6 +132,9 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -140,6 +146,9 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -239,6 +248,9 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -291,6 +303,9 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
             source_quote: Some(chunk.content.lines().next().unwrap_or("").to_string()),
             extraction_tier: ExtractionTier::Structural,
             event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
             predicate: None,
         };
         result.claims.push(impl_claim);
@@ -360,6 +375,9 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -430,6 +448,9 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         source_quote: None,
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -504,6 +525,9 @@ fn extract_git_commit(chunk: &Chunk, source_uri: &str, author: &str) -> Extracti
             source_quote: None,
             extraction_tier: ExtractionTier::Structural,
             event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
             predicate: None,
         };
         result.entities.push(file_entity);
@@ -562,7 +586,7 @@ fn extract_prose_links(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
 }
 
 /// Comment/ModuleDoc → Claim(definition) if a parent is present, empty otherwise.
-fn extract_doc_comment(chunk: &Chunk, _source_uri: &str) -> ExtractionResult {
+fn extract_doc_comment(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
     let parent = match &chunk.metadata.parent {
         Some(p) if !p.is_empty() => p.clone(),
         _ => return ExtractionResult::empty(),
@@ -586,6 +610,9 @@ fn extract_doc_comment(chunk: &Chunk, _source_uri: &str) -> ExtractionResult {
         source_quote: Some(chunk.content.trim().to_string()),
         extraction_tier: ExtractionTier::Structural,
         event_date: None,
+        source_path: source_uri.to_string(),
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
         predicate: None,
     };
 
@@ -646,11 +673,15 @@ mod tests {
     use super::*;
 
     fn make_chunk(chunk_type: ChunkType, content: &str, meta: ChunkMetadata) -> Chunk {
+        let content = content.to_string();
+        let byte_end = content.len() as u64;
         Chunk {
-            content: content.to_string(),
+            content,
             chunk_type,
             start_line: 1,
             end_line: 10,
+            byte_start: 0,
+            byte_end,
             heading: None,
             language: Some("rust".to_string()),
             metadata: meta,
