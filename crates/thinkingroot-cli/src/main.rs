@@ -16,6 +16,7 @@ mod pipeline;
 mod progress;
 mod provider_cmd;
 mod reflect_cmd;
+mod render_cmd;
 mod rooting_cmd;
 mod serve;
 mod setup;
@@ -293,10 +294,26 @@ enum Commands {
         #[arg(long, value_parser = ["on", "off", "advisory"])]
         rooting_mode: Option<String>,
     },
+    /// Render markdown artifacts (entity pages, architecture map,
+    /// decision log, agent brief, runbook, health report) from the
+    /// compiled CozoDB graph. Per v3 spec §11, the build pipeline no
+    /// longer runs Compile Artifacts by default — agents synthesise
+    /// on demand from claims + source. Users wanting pre-rendered
+    /// markdown invoke this explicitly.
+    Render {
+        /// Path to the compiled workspace.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Run a Reflect cycle over the compiled graph and surface
     /// known-unknowns. Use `--json <path>` to write a stable artifact
     /// the cloud's compile-worker ingests into the federation
     /// `pack_reflect_gaps` table.
+    ///
+    /// Aliased as `root audit` per the v3 spec §11 — the v3 build
+    /// pipeline doesn't run reflect by default; users invoke it
+    /// explicitly via either name.
+    #[command(alias = "audit")]
     Reflect {
         /// Path to the compiled workspace
         #[arg(default_value = ".")]
@@ -853,6 +870,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Reflect { path, json }) => {
             reflect_cmd::run(&path, json.as_ref())?;
+        }
+        Some(Commands::Render { path }) => {
+            render_cmd::run(&path)?;
         }
         Some(Commands::Pack {
             workspace,
