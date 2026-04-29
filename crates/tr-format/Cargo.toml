@@ -20,6 +20,11 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# v3 manifest is TOML; reader uses serde-toml for parse, writer emits a
+# manually-canonicalized TOML body so the byte ordering is locked at our
+# source-of-truth function (D7 from the v3 implementation plan) rather
+# than depending on upstream toml crate ordering decisions.
+toml = { workspace = true }
 
 # Direct deps — not in the OSS workspace's `[workspace.dependencies]`
 # table today. Kept in sync with the cloud monorepo by version.
