@@ -205,9 +205,16 @@ impl Extractor {
             /// AST-extracted anchor section injected into the LLM prompt.
             /// Empty string when the chunk has no AST metadata (prose, headings, etc.).
             ast_anchor: String,
+            /// Byte offsets of the originating chunk within its source file.
+            /// Backfilled onto every ExtractedClaim coming back from the LLM
+            /// so v3 packs always cite a verifiable byte range. (0, 0) is
+            /// the "parser hasn't been upgraded" sentinel — claims keep
+            /// (0, 0) and downstream consumers fall back to file scope.
+            chunk_byte_start: u64,
+            chunk_byte_end: u64,
         }
 
-        let mut cache_hits_data: Vec<(SourceId, String, ExtractionResult)> = Vec::new();
+        let mut cache_hits_data: Vec<(SourceId, String, u64, u64, ExtractionResult)> = Vec::new();
         let mut llm_work: Vec<ChunkWork> = Vec::new();
         let mut structural_results: Vec<(SourceId, String, ExtractionResult)> = Vec::new();
 
@@ -231,7 +238,13 @@ impl Extractor {
                     && let Some(cached) = cache.get(&chunk.content)
                 {
                     tracing::debug!("extraction cache hit for chunk in {}", doc.uri);
-                    cache_hits_data.push((doc.source_id, doc.uri.clone(), cached));
+                    cache_hits_data.push((
+                        doc.source_id,
+                        doc.uri.clone(),
+                        chunk.byte_start,
+                        chunk.byte_end,
+                        cached,
+                    ));
                     continue;
                 }
 
@@ -256,6 +269,8 @@ impl Extractor {
                         chunk.heading.as_deref(),
                     ),
                     ast_anchor: prompts::build_ast_anchor_section(&chunk.metadata),
+                    chunk_byte_start: chunk.byte_start,
+                    chunk_byte_end: chunk.byte_end,
                 });
             }
         }
@@ -284,7 +299,19 @@ impl Extractor {
 
         // ── Process cache hits (instant, no LLM) ───────────────────────
         output.cache_hits = cache_hits_count;
-        for (source_id, source_uri, cached_result) in cache_hits_data {
+        for (source_id, source_uri, chunk_byte_start, chunk_byte_end, mut cached_result) in
+            cache_hits_data
+        {
+            // Cached entries from before W1 byte-range work carry empty
+            // source_path / (0, 0) byte ranges. Backfill from the chunk so
+            // every claim flowing into convert_result_static carries the v3
+            // citation triple even on warm-cache runs.
+            backfill_chunk_origin(
+                &mut cached_result,
+                &source_uri,
+                chunk_byte_start,
+                chunk_byte_end,
+            );
             let converted =
                 Self::convert_result_static(cached_result, source_id, workspace_id, min_confidence);
             output.merge(converted);
@@ -395,7 +422,19 @@ impl Extractor {
                         continue;
                     }
                     let work = &batch_work[chunk_result.id];
-                    let extraction_result = chunk_result.result;
+                    let mut extraction_result = chunk_result.result;
+
+                    // The LLM does not yet emit byte ranges per claim (Week
+                    // 1.5 will teach the prompt + parser to do so). Until
+                    // then, every claim from this chunk inherits the
+                    // chunk's byte range — coarse but always verifiable
+                    // against source bytes.
+                    backfill_chunk_origin(
+                        &mut extraction_result,
+                        &work.source_uri,
+                        work.chunk_byte_start,
+                        work.chunk_byte_end,
+                    );
 
                     // Write per-chunk cache entries.
                     if let Some(ref cache) = self.cache {
@@ -500,6 +539,16 @@ impl Extractor {
             let mut claim = Claim::new(&ext_claim.statement, claim_type, source_id, workspace_id)
                 .with_confidence(ext_claim.confidence)
                 .with_extraction_tier(ext_claim.extraction_tier);
+            // Propagate v3 byte-range citation onto the claim's source_span
+            // when present. (0, 0) is the "unknown" sentinel from chunks
+            // whose parser hasn't been upgraded yet — leave source_span
+            // unset so downstream consumers fall back to whole-file scope.
+            if ext_claim.byte_end > ext_claim.byte_start {
+                claim = claim.with_span(SourceSpan::bytes(
+                    ext_claim.byte_start,
+                    ext_claim.byte_end,
+                ));
+            }
             // Wire event_date: convert ISO string → DateTime<Utc>.
             if let Some(ref date_str) = ext_claim.event_date
                 && let Ok(nd) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
@@ -569,6 +618,37 @@ impl Extractor {
         }
 
         output
+    }
+}
+
+/// Backfill the v3 byte-range citation triple onto every claim in
+/// `result` that doesn't already carry one. Called from both the
+/// cache-hit path and the LLM-batch path of `Extractor::extract` so the
+/// downstream `convert_result_static` always sees a populated
+/// `(source_path, byte_start, byte_end)` triple — even when the cached
+/// entry pre-dates the v3 schema or the LLM hasn't been taught to emit
+/// per-claim byte spans yet.
+///
+/// `chunk_byte_start == chunk_byte_end == 0` is the "parser hasn't been
+/// upgraded" sentinel; in that case byte ranges are left at (0, 0) and
+/// the v3 pack writer + provenance probe fall back to file-level scope.
+fn backfill_chunk_origin(
+    result: &mut ExtractionResult,
+    source_uri: &str,
+    chunk_byte_start: u64,
+    chunk_byte_end: u64,
+) {
+    for claim in &mut result.claims {
+        if claim.source_path.is_empty() {
+            claim.source_path = source_uri.to_string();
+        }
+        if claim.byte_start == 0
+            && claim.byte_end == 0
+            && chunk_byte_end > chunk_byte_start
+        {
+            claim.byte_start = chunk_byte_start;
+            claim.byte_end = chunk_byte_end;
+        }
     }
 }
 
