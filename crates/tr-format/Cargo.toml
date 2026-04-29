@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # source-of-truth function (D7 from the v3 implementation plan) rather
 # than depending on upstream toml crate ordering decisions.
 toml = { workspace = true }
+# Sigstore bundle types and offline DSSE verification — used by the v3
+# writer's `build_signed` and the v3 reader to expose a parsed
+# `SigstoreBundle` to consumers.
+tr-sigstore = { workspace = true }
 
 # Direct deps — not in the OSS workspace's `[workspace.dependencies]`
 # table today. Kept in sync with the cloud monorepo by version.
@@ -32,6 +36,10 @@ hex = "0.4"
 semver = { version = "1", features = ["serde"] }
 tar = "0.4"
 zstd = { version = "0.13", features = ["zstdmt"] }
+# Used by `V3PackBuilder::build_signed` — the signing key type comes
+# in pre-loaded by the caller; tr-format never persists or generates
+# keys itself.
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

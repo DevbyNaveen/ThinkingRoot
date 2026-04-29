@@ -6606,6 +6606,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "chrono",
+ "ed25519-dalek",
  "hex",
  "semver",
  "serde",
@@ -6614,6 +6615,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "tr-sigstore",
  "tracing",
  "zstd",
 ]
@@ -6667,7 +6669,10 @@ dependencies = [
 name = "tr-sigstore"
 version = "0.9.1"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
+ "chrono",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -6704,6 +6709,7 @@ dependencies = [
  "tokio",
  "tr-format",
  "tr-revocation",
+ "tr-sigstore",
  "tracing",
  "url",
 ]

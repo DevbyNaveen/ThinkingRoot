@@ -331,6 +331,21 @@ enum Commands {
         #[arg(long, default_value = "tr/1")]
         format: String,
     },
+    /// Verify a v3 `.tr` pack's integrity and signature without
+    /// installing it. Runs the offline verification chain from spec
+    /// §7.6: recompute the pack hash, check it matches the manifest's
+    /// declared `pack_hash`, then verify the embedded Sigstore bundle
+    /// (DSSE signature + in-toto statement subject digest). Exit codes
+    /// match the install verification surface (0 verified, 1 tampered,
+    /// 2 unsigned, 3 unsupported).
+    Verify {
+        /// Path to the `.tr` pack file.
+        pack: PathBuf,
+        /// Accept Unsigned packs as success. Without this flag, an
+        /// unsigned pack exits 2.
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
     /// Install a `.tr` knowledge pack — extract its contents to a
     /// target directory's `.thinkingroot/` so the engine can mount it
     /// for `root query` / `root serve`. The reference may be:
@@ -839,6 +854,15 @@ async fn async_main() -> anyhow::Result<()> {
             format,
         }) => {
             pack_cmd::run_pack(&workspace, out, name, version, license, description, &format)?;
+        }
+        Some(Commands::Verify {
+            pack,
+            allow_unsigned,
+        }) => {
+            let exit_code = pack_cmd::run_verify(&pack, allow_unsigned)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Some(Commands::Install {
             reference,

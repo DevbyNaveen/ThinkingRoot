@@ -43,9 +43,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use thinkingroot_core::types::ContentHash;
 use tr_format::{
-    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, ClaimRecord, Manifest,
-    ManifestV3, TrustTier, V3PackBuilder, Version,
+    digest::blake3_hex, reader as tr_reader, read_v3_pack, writer::PackBuilder, ClaimRecord,
+    Manifest, ManifestV3, TrustTier, V3PackBuilder, Version,
 };
+use tr_verify::{V3TamperedKind, V3Verdict, verify_v3_pack};
 use tr_revocation::{CacheConfig, RevocationCache};
 use tr_verify::{
     AuthorKeyStore, RevokedDetails, TamperedKind, Verdict, Verifier, VerifierConfig,
@@ -378,6 +379,89 @@ fn run_pack_v3(
         out_path.display()
     );
     Ok(())
+}
+
+/// Run `root verify <pack>`. Reads the pack from disk, parses the
+/// outer tar, and invokes the v3 verification pipeline. Returns a
+/// process exit code per the v3 spec §10.3 mapping:
+///
+/// - `0` — Verified.
+/// - `1` — Tampered (recomputed hash ≠ declared hash, or signature
+///   mismatch).
+/// - `2` — Unsigned + `--allow-unsigned` not passed.
+/// - `4` — Unsupported (reserved; today's free-fn verify never returns
+///   this — placeholder for the `sigstore-impl` follow-up which adds
+///   trust-root validation for Fulcio-issued certs).
+///
+/// Revocation is intentionally not consulted yet — `tr_revocation` is
+/// async and the CLI's verify path is sync. The follow-up
+/// `sigstore-impl` work wires the cache through with the same
+/// short-circuit semantics as the existing v1 `Verifier::verify`.
+pub fn run_verify(pack_path: &Path, allow_unsigned: bool) -> Result<i32> {
+    let bytes = fs::read(pack_path)
+        .with_context(|| format!("read {}", pack_path.display()))?;
+    let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("parse {}: {e}", pack_path.display()))?;
+    let verdict = verify_v3_pack(&pack);
+
+    match &verdict {
+        V3Verdict::Verified {
+            identity,
+            rekor_log_index,
+            signed_at,
+        } => {
+            println!(
+                "  verified {} {} ({} files, {} claims)",
+                pack.manifest.name,
+                pack.manifest.version,
+                pack.manifest.source_files.unwrap_or(0),
+                pack.manifest.claim_count.unwrap_or(0),
+            );
+            println!("  pack hash: {}", pack.manifest.pack_hash);
+            println!("  signed at: {signed_at}");
+            match identity {
+                Some(id) => println!("  signer: {id}"),
+                None => println!("  signer: self-signed (Ed25519 public key bundled)"),
+            }
+            if let Some(idx) = rekor_log_index {
+                println!("  rekor log index: {idx}");
+            } else {
+                println!("  rekor: not witnessed (self-signed)");
+            }
+            Ok(0)
+        }
+        V3Verdict::Unsigned => {
+            if allow_unsigned {
+                println!(
+                    "  unsigned {} {} (no signature.sig in pack — accepted via --allow-unsigned)",
+                    pack.manifest.name, pack.manifest.version,
+                );
+                Ok(0)
+            } else {
+                eprintln!(
+                    "  unsigned: {} has no signature.sig (use --allow-unsigned to accept)",
+                    pack_path.display()
+                );
+                Ok(EXIT_UNSIGNED)
+            }
+        }
+        V3Verdict::Tampered(kind) => {
+            match kind {
+                V3TamperedKind::PackHashMismatch {
+                    declared,
+                    recomputed,
+                } => {
+                    eprintln!(
+                        "  tampered: pack hash mismatch — manifest declares {declared}, \
+                         recomputed {recomputed}"
+                    );
+                }
+                V3TamperedKind::SignatureFailed { reason } => {
+                    eprintln!("  tampered: signature failed — {reason}");
+                }
+            }
+            Ok(EXIT_TAMPERED)
+        }
+    }
 }
 
 /// Map a stored source URI back to the workspace-relative POSIX path

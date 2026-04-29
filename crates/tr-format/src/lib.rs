@@ -34,12 +34,14 @@ pub mod digest;
 pub mod error;
 pub mod manifest;
 pub mod reader;
+pub mod reader_v3;
 pub mod writer;
 pub mod writer_v3;
 
 pub use claims::ClaimRecord;
 pub use error::Error;
 pub use manifest::{FORMAT_VERSION_V3, Manifest, ManifestV3, TrustTier};
+pub use reader_v3::{V3Pack, read_v3_pack};
 pub use writer_v3::V3PackBuilder;
 
 // Re-export so consumers don't need a direct `semver` dep just to

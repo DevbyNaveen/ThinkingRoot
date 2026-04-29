@@ -37,7 +37,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
+use std::time::SystemTime;
 
+use ed25519_dalek::SigningKey;
 use tar::{Builder, Header, HeaderMode};
 use zstd::stream::write::Encoder as ZstdEncoder;
 
@@ -49,11 +51,14 @@ use crate::{
 };
 
 /// Path of the inner source bundle inside the outer `.tr` tar.
-const SOURCE_BUNDLE_NAME: &str = "source.tar.zst";
+pub const SOURCE_BUNDLE_NAME: &str = "source.tar.zst";
 /// Path of the manifest inside the outer `.tr` tar.
-const MANIFEST_NAME: &str = "manifest.toml";
+pub const MANIFEST_NAME: &str = "manifest.toml";
 /// Path of the claim journal inside the outer `.tr` tar.
-const CLAIMS_NAME: &str = "claims.jsonl";
+pub const CLAIMS_NAME: &str = "claims.jsonl";
+/// Path of the Sigstore bundle inside the outer `.tr` tar — present
+/// when the pack was built via [`V3PackBuilder::build_signed`].
+pub const SIGNATURE_NAME: &str = "signature.sig";
 
 /// Programmatic builder for a v3 `.tr` pack. Cheaply constructed; build
 /// via [`V3PackBuilder::build`] when ready.
@@ -166,19 +171,79 @@ impl V3PackBuilder {
         let manifest_toml = self.manifest.to_canonical_toml();
 
         // 6. Outer tar (uncompressed).
-        let mut outer = Vec::with_capacity(
-            manifest_toml.len() + source_tar_zst.len() + claims_jsonl.len() + 4096,
+        emit_outer_tar(&manifest_toml, &source_tar_zst, &claims_jsonl, None)
+    }
+
+    /// Build a signed pack. Same as [`build`] except the supplied
+    /// Ed25519 signing key authenticates a Sigstore Bundle which is
+    /// emitted as the 4th outer-tar entry `signature.sig`.
+    ///
+    /// The signing key is ephemeral from this function's perspective —
+    /// it's never persisted by `tr-format`. Production callers wire
+    /// `root pack --sign` to a Fulcio-issued ephemeral keypair (Week
+    /// 3.5 work, behind the `sigstore-impl` feature on `tr-verify`);
+    /// today's tests + power users supply their own [`SigningKey`] via
+    /// `SigningKey::generate(&mut rand::rngs::OsRng)`.
+    ///
+    /// `pack_filename` lands in the bundle's in-toto statement
+    /// (`subject[0].name`) so verifiers can sanity-check the bundle is
+    /// signing the expected file.
+    pub fn build_signed(
+        mut self,
+        signing_key: &SigningKey,
+        pack_filename: &str,
+    ) -> Result<Vec<u8>> {
+        // 1–5: same as `build` up to the manifest-with-pack_hash step.
+        let source_tar_zst = self.build_inner_source_archive()?;
+        let source_hash = format!("blake3:{}", blake3_hex(&source_tar_zst));
+        self.claims.sort_by(|a, b| a.id.cmp(&b.id));
+        let claims_jsonl = self.serialize_claims_jsonl()?;
+        let claims_hash = format!("blake3:{}", blake3_hex(&claims_jsonl));
+        self.manifest.source_hash = source_hash;
+        self.manifest.claims_hash = claims_hash;
+        self.manifest.source_files = Some(self.source_files.len() as u64);
+        self.manifest.source_bytes = Some(
+            self.source_files
+                .values()
+                .map(|b| b.len() as u64)
+                .sum::<u64>(),
         );
-        {
-            let cursor = Cursor::new(&mut outer);
-            let mut tar_builder = Builder::new(cursor);
-            tar_builder.mode(HeaderMode::Deterministic);
-            append_file(&mut tar_builder, MANIFEST_NAME, &manifest_toml)?;
-            append_file(&mut tar_builder, SOURCE_BUNDLE_NAME, &source_tar_zst)?;
-            append_file(&mut tar_builder, CLAIMS_NAME, &claims_jsonl)?;
-            tar_builder.finish()?;
-        }
-        Ok(outer)
+        self.manifest.claim_count = Some(self.claims.len() as u64);
+
+        let canonical_manifest = self.manifest.canonical_bytes_for_hashing();
+        let mut hash_input = Vec::with_capacity(
+            canonical_manifest.len() + 1 + source_tar_zst.len() + 1 + claims_jsonl.len(),
+        );
+        hash_input.extend_from_slice(&canonical_manifest);
+        hash_input.push(0);
+        hash_input.extend_from_slice(&source_tar_zst);
+        hash_input.push(0);
+        hash_input.extend_from_slice(&claims_jsonl);
+        let pack_hash = format!("blake3:{}", blake3_hex(&hash_input));
+        self.manifest.pack_hash = pack_hash.clone();
+
+        let manifest_toml = self.manifest.to_canonical_toml();
+
+        // 6. Sigstore bundle over the canonical pack hash. The bundle
+        //    binds the BLAKE3 digest into a DSSE-signed in-toto
+        //    statement; a verifier replays the chain offline to prove
+        //    (a) the bundle's signature is valid for the declared key
+        //    and (b) the statement's subject digest matches the pack
+        //    hash recomputed from the outer tar's bytes.
+        let bundle =
+            tr_sigstore::sign_pack(&pack_hash, pack_filename, signing_key, SystemTime::now())
+                .map_err(|e| Error::Invalid {
+                    what: "signature.sig",
+                    detail: format!("sigstore sign: {e}"),
+                })?;
+        let bundle_bytes = serde_json::to_vec(&bundle)?;
+
+        emit_outer_tar(
+            &manifest_toml,
+            &source_tar_zst,
+            &claims_jsonl,
+            Some(&bundle_bytes),
+        )
     }
 
     fn build_inner_source_archive(&self) -> Result<Vec<u8>> {
@@ -222,6 +287,36 @@ impl V3PackBuilder {
         }
         Ok(out)
     }
+}
+
+/// Emit the outer tar for a v3 pack. Used by both `build` (no
+/// signature) and `build_signed` (4th entry `signature.sig`).
+fn emit_outer_tar(
+    manifest_toml: &[u8],
+    source_tar_zst: &[u8],
+    claims_jsonl: &[u8],
+    signature_sig: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let mut outer = Vec::with_capacity(
+        manifest_toml.len()
+            + source_tar_zst.len()
+            + claims_jsonl.len()
+            + signature_sig.map(<[u8]>::len).unwrap_or(0)
+            + 4096,
+    );
+    {
+        let cursor = Cursor::new(&mut outer);
+        let mut tar_builder = Builder::new(cursor);
+        tar_builder.mode(HeaderMode::Deterministic);
+        append_file(&mut tar_builder, MANIFEST_NAME, manifest_toml)?;
+        append_file(&mut tar_builder, SOURCE_BUNDLE_NAME, source_tar_zst)?;
+        append_file(&mut tar_builder, CLAIMS_NAME, claims_jsonl)?;
+        if let Some(sig) = signature_sig {
+            append_file(&mut tar_builder, SIGNATURE_NAME, sig)?;
+        }
+        tar_builder.finish()?;
+    }
+    Ok(outer)
 }
 
 fn append_file<W: Write>(builder: &mut Builder<W>, path: &str, bytes: &[u8]) -> Result<()> {
