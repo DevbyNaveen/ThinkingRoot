@@ -48,6 +48,31 @@ signature  = { version = "2",    default-features = false, features = ["std"] }
 # adding other hash variants is straightforward when needed.
 sha2       = { version = "0.10", default-features = false, features = ["std"] }
 
+# ─── `live` feature deps (optional) ──────────────────────────────
+# These pull in the Sigstore Rust SDK and its async / TLS / OAuth
+# transitive dependencies. They are gated behind the `live` feature
+# so consumers that only verify (default) never compile them.
+#
+# The `sign` feature on sigstore-rs activates Fulcio cert request +
+# Rekor witness submission. `rustls-tls` matches our workspace TLS
+# stack (the workspace `reqwest` config also uses `rustls-tls`, so
+# we don't end up with two competing TLS impls in the same binary).
+sigstore   = { version = "0.13", optional = true, default-features = false, features = ["sign", "verify", "rustls-tls"] }
+tokio      = { workspace = true, optional = true }
+# `webbrowser` opens the Sigstore-public-good OIDC issuer in the
+# user's default browser when `live::sign_via_browser_flow` is
+# called. Headless / SSH consumers use the lower-level
+# `live::sign_with_token` and supply an id_token themselves.
+webbrowser = { version = "1", optional = true }
+
+[features]
+default = []
+# Enable the live keyless-signing flow against Sigstore-public-good.
+# Heavy dep tree (sigstore-rs, tokio, rustls); not needed by anyone
+# who only verifies bundles. The CLI (`thinkingroot-cli`) is the only
+# crate today that turns this on; everything else stays lean.
+live = ["dep:sigstore", "dep:tokio", "dep:webbrowser"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 # Tests hand-roll syntactically valid X.509 certs (TBS + signature)

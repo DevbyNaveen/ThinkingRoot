@@ -43,6 +43,8 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "live")]
+pub mod live;
 pub mod rekor;
 pub mod trust_root;
 pub use rekor::{
