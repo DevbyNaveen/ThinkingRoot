@@ -502,6 +502,67 @@ pub fn verify_bundle_offline(
     bundle: &SigstoreBundle,
     expected_pack_hash: &str,
 ) -> Result<InTotoStatement> {
+    let payload = verify_dsse_signature_only(bundle)?;
+    // Self-signed Ed25519 bundles store their digest under the
+    // `blake3` key (matching the manifest's pack_hash format). The
+    // `expected_pack_hash` parameter accepts both `blake3:<hex>`
+    // (with prefix) and bare hex; we normalize and compare against
+    // the bundle's blake3 entry only.
+    let bare_expected = strip_blake3_prefix(expected_pack_hash);
+    verify_statement_semantics(&payload, |algo, hex| {
+        algo == "blake3" && hex == bare_expected
+    })
+}
+
+/// Verify a bundle against the v3 pack's canonical bytes, accepting
+/// either a `blake3` (self-signed v3 bundle) or `sha256` (Sigstore-
+/// keyless bundle) subject digest. Recomputes both hashes from
+/// `canonical_bytes` and dispatches to whichever the bundle uses;
+/// fails if the bundle's digest map has neither key.
+///
+/// Use this in the v3 verifier when you don't know in advance whether
+/// the bundle was self-signed or Sigstore-keyless. For self-signed
+/// bundles where you already have the BLAKE3 hash from the manifest,
+/// [`verify_bundle_offline`] is more direct and avoids the SHA-256
+/// computation.
+pub fn verify_bundle_against_canonical_bytes(
+    bundle: &SigstoreBundle,
+    canonical_bytes: &[u8],
+) -> Result<InTotoStatement> {
+    let payload = verify_dsse_signature_only(bundle)?;
+
+    // Compute both digests up front. They're cheap relative to ECDSA
+    // verification and let us match whichever digest the bundle
+    // happens to carry.
+    let blake3_hex = blake3::hash(canonical_bytes).to_hex();
+    let sha256_hex = {
+        use sha2::Digest as _;
+        let bytes = sha2::Sha256::digest(canonical_bytes);
+        // Lowercase hex without an extra dep — same convention the
+        // Sigstore in-toto subject digest uses.
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes.iter() {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    };
+
+    verify_statement_semantics(&payload, |algo, hex| match algo {
+        "blake3" => hex == blake3_hex.as_str(),
+        "sha256" => hex == sha256_hex.as_str(),
+        _ => false,
+    })
+}
+
+/// Run only the DSSE-signature half of bundle verification: dispatch
+/// on cert chain vs raw public key, verify the PAE signature, return
+/// the verified payload bytes for downstream semantic checks.
+///
+/// Shared between [`verify_bundle_offline`] (compares against a
+/// caller-supplied expected hash) and
+/// [`verify_bundle_against_canonical_bytes`] (recomputes both hashes
+/// from canonical bytes). Both build on the same crypto verification.
+fn verify_dsse_signature_only(bundle: &SigstoreBundle) -> Result<Vec<u8>> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let payload = b64.decode(&bundle.dsse_envelope.payload)?;
     let pae = dsse_pae(&bundle.dsse_envelope.payload_type, &payload);
@@ -520,8 +581,7 @@ pub fn verify_bundle_offline(
         .verification_material
         .x509_certificate_chain
         .as_ref()
-        .map(|c| !c.certificates.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|c| !c.certificates.is_empty());
 
     if cert_chain_set {
         verify_dsse_with_ecdsa_cert(
@@ -539,19 +599,23 @@ pub fn verify_bundle_offline(
         return Err(Error::MissingVerificationKey);
     }
 
-    // Statement now has cryptographic provenance — verify the
-    // semantic claims it carries.
-    verify_statement_semantics(&payload, expected_pack_hash)
+    Ok(payload)
 }
 
 /// Decode the in-toto statement, check its predicate type matches the
-/// locked v3 statement type, and check its subject digest matches the
-/// expected pack hash. Shared between the Ed25519 and ECDSA paths
-/// because the wire-level statement layout is the same regardless of
-/// who signed it.
+/// locked v3 statement type, and ask the caller's `digest_matcher`
+/// closure whether each `(algo, hex)` entry in the subject digest
+/// map is acceptable. Returns success on the first match; surfaces
+/// `SubjectMismatch` listing all tried entries if none match.
+///
+/// The closure-based design lets [`verify_bundle_offline`] match
+/// against a caller-supplied expected hash, while
+/// [`verify_bundle_against_canonical_bytes`] matches against either
+/// `blake3(canonical)` or `sha256(canonical)` recomputed from the
+/// pack contents — same dispatch path, different acceptance rule.
 fn verify_statement_semantics(
     payload: &[u8],
-    expected_pack_hash: &str,
+    digest_matcher: impl Fn(&str, &str) -> bool,
 ) -> Result<InTotoStatement> {
     let statement: InTotoStatement = serde_json::from_slice(payload)?;
     if statement.predicate_type != DSSE_STATEMENT_TYPE {
@@ -561,22 +625,25 @@ fn verify_statement_semantics(
         });
     }
 
-    let bare_expected = strip_blake3_prefix(expected_pack_hash);
-    let payload_digest = statement
-        .subject
-        .first()
-        .and_then(|s| s.digest.get("blake3"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let subject = statement.subject.first().ok_or_else(|| Error::SubjectMismatch {
+        expected: "any matching digest".into(),
+        payload: "statement has no subjects".into(),
+    })?;
 
-    if payload_digest != bare_expected {
-        return Err(Error::SubjectMismatch {
-            expected: bare_expected.to_string(),
-            payload: payload_digest,
-        });
+    let mut tried = Vec::with_capacity(subject.digest.len());
+    for (algo, value) in subject.digest.iter() {
+        if let Some(hex) = value.as_str()
+            && digest_matcher(algo, hex)
+        {
+            return Ok(statement);
+        }
+        tried.push(format!("{algo}={}", value.as_str().unwrap_or("?")));
     }
-    Ok(statement)
+
+    Err(Error::SubjectMismatch {
+        expected: "matching digest".into(),
+        payload: tried.join(", "),
+    })
 }
 
 /// Verify the DSSE signature with a raw Ed25519 public key from the
@@ -1253,6 +1320,148 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
+    }
+
+    /// Build a self-signed Ed25519 bundle whose subject carries a
+    /// `sha256` digest of the supplied canonical bytes (i.e. mimics
+    /// what sigstore-rs's high-level signer produces, but without the
+    /// network). Used to exercise the dual-digest verification path.
+    fn build_self_signed_bundle_with_sha256_subject(
+        canonical_bytes: &[u8],
+        signing_key: &SigningKey,
+    ) -> SigstoreBundle {
+        use sha2::Digest as _;
+        let sha = sha2::Sha256::digest(canonical_bytes);
+        let mut sha_hex = String::with_capacity(sha.len() * 2);
+        for b in sha.iter() {
+            sha_hex.push_str(&format!("{b:02x}"));
+        }
+
+        let statement = InTotoStatement {
+            statement_type: IN_TOTO_STATEMENT_V1.to_string(),
+            subject: vec![Subject {
+                name: "package.tr".to_string(),
+                digest: {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "sha256".to_string(),
+                        serde_json::Value::String(sha_hex),
+                    );
+                    m
+                },
+            }],
+            predicate_type: DSSE_STATEMENT_TYPE.to_string(),
+            predicate: PackPredicate {
+                format_version: "tr/3".to_string(),
+                signed_at: format_rfc3339(SystemTime::UNIX_EPOCH),
+            },
+        };
+
+        let payload_bytes = serde_json::to_vec(&statement).unwrap();
+        let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes);
+        let signature = signing_key.sign(&pae);
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        SigstoreBundle {
+            media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
+            verification_material: VerificationMaterial {
+                public_key: Some(PublicKeyMaterial {
+                    raw_bytes: b64.encode(signing_key.verifying_key().to_bytes()),
+                }),
+                x509_certificate_chain: None,
+                tlog_entries: Vec::new(),
+            },
+            dsse_envelope: DsseEnvelope {
+                payload: b64.encode(&payload_bytes),
+                payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+                signatures: vec![DsseSignature {
+                    sig: b64.encode(signature.to_bytes()),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn dual_digest_verifier_accepts_blake3_subject() {
+        // Self-signed bundle produced by `sign_pack` carries a blake3
+        // subject digest. `verify_bundle_against_canonical_bytes`
+        // recomputes blake3(canonical_bytes) and matches.
+        let canonical_bytes: &[u8] = b"some canonical pack bytes";
+        let blake3_hex = blake3::hash(canonical_bytes).to_hex();
+        let pack_hash = format!("blake3:{}", blake3_hex.as_str());
+
+        let key = generate_signing_key(0xE1);
+        let bundle = sign_pack(&pack_hash, "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
+
+        let stmt = verify_bundle_against_canonical_bytes(&bundle, canonical_bytes).unwrap();
+        assert_eq!(stmt.predicate.format_version, "tr/3");
+    }
+
+    #[test]
+    fn dual_digest_verifier_accepts_sha256_subject() {
+        // Sigstore-keyless-style bundle has a sha256 digest. The new
+        // path recomputes sha256(canonical_bytes) and matches.
+        let canonical_bytes: &[u8] = b"some canonical pack bytes for sha256";
+        let key = generate_signing_key(0xE2);
+        let bundle = build_self_signed_bundle_with_sha256_subject(canonical_bytes, &key);
+
+        let stmt = verify_bundle_against_canonical_bytes(&bundle, canonical_bytes).unwrap();
+        assert_eq!(stmt.predicate.format_version, "tr/3");
+    }
+
+    #[test]
+    fn dual_digest_verifier_rejects_modified_canonical_bytes() {
+        let canonical_bytes: &[u8] = b"original";
+        let key = generate_signing_key(0xE3);
+        let bundle = build_self_signed_bundle_with_sha256_subject(canonical_bytes, &key);
+
+        // Verify against tampered bytes — sha256 won't match and there
+        // is no blake3 entry to fall through to.
+        let err = verify_bundle_against_canonical_bytes(&bundle, b"tampered").unwrap_err();
+        assert!(matches!(err, Error::SubjectMismatch { .. }));
+    }
+
+    #[test]
+    fn dual_digest_verifier_rejects_unknown_digest_algorithm() {
+        // Build a bundle whose subject digest uses an algorithm we
+        // don't recognise (e.g. md5 or a hypothetical xxh3). The
+        // dual-digest path must reject — we never silently accept
+        // unknown algorithms.
+        let canonical_bytes: &[u8] = b"some bytes";
+        let key = generate_signing_key(0xE4);
+        let mut bundle =
+            build_self_signed_bundle_with_sha256_subject(canonical_bytes, &key);
+
+        // Re-sign with a payload that uses an unknown digest algo.
+        let mut new_statement = InTotoStatement {
+            statement_type: IN_TOTO_STATEMENT_V1.to_string(),
+            subject: vec![Subject {
+                name: "p.tr".to_string(),
+                digest: {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "xxh3".to_string(),
+                        serde_json::Value::String("deadbeef".to_string()),
+                    );
+                    m
+                },
+            }],
+            predicate_type: DSSE_STATEMENT_TYPE.to_string(),
+            predicate: PackPredicate {
+                format_version: "tr/3".to_string(),
+                signed_at: format_rfc3339(SystemTime::UNIX_EPOCH),
+            },
+        };
+        let _ = &mut new_statement; // silence unused-mut lint if any
+        let new_payload = serde_json::to_vec(&new_statement).unwrap();
+        let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &new_payload);
+        let sig = key.sign(&pae);
+        let b64 = base64::engine::general_purpose::STANDARD;
+        bundle.dsse_envelope.payload = b64.encode(&new_payload);
+        bundle.dsse_envelope.signatures[0].sig = b64.encode(sig.to_bytes());
+
+        let err = verify_bundle_against_canonical_bytes(&bundle, canonical_bytes).unwrap_err();
+        assert!(matches!(err, Error::SubjectMismatch { .. }));
     }
 
     #[test]
