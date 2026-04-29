@@ -57,7 +57,7 @@ sha2       = { version = "0.10", default-features = false, features = ["std"] }
 # Rekor witness submission. `rustls-tls` matches our workspace TLS
 # stack (the workspace `reqwest` config also uses `rustls-tls`, so
 # we don't end up with two competing TLS impls in the same binary).
-sigstore   = { version = "0.13", optional = true, default-features = false, features = ["sign", "verify", "rustls-tls"] }
+sigstore   = { version = "0.13", optional = true, default-features = false, features = ["sign", "verify", "rustls-tls", "sigstore-trust-root"] }
 tokio      = { workspace = true, optional = true }
 # `webbrowser` opens the Sigstore-public-good OIDC issuer in the
 # user's default browser when `live::sign_via_browser_flow` is

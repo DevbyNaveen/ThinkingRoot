@@ -29,6 +29,9 @@
 
 #![allow(missing_docs)] // re-exported sigstore types document themselves
 
+use std::io::Cursor;
+
+use sigstore::bundle::sign::SigningContext;
 use sigstore::oauth::IdentityToken as SigstoreIdentityToken;
 
 use crate::Error;
@@ -104,6 +107,56 @@ pub fn browser_oidc_flow(
     .map_err(|e| Error::CertParse(format!("OIDC redirect listener: {e}")))?;
 
     Ok(IdentityToken::from(raw_token))
+}
+
+/// Sign v3 pack canonical bytes via the Sigstore-public-good keyless
+/// flow. Drives the full chain: ephemeral ECDSA P-256 keypair →
+/// Fulcio cert request (with the supplied OIDC token) → DSSE
+/// signature → Rekor witness submission → assembled bundle. Returns
+/// the canonical JSON bytes of the resulting Sigstore Bundle, ready
+/// to drop into a v3 pack as the `signature.sig` outer-tar entry.
+///
+/// **Network access required.** This function makes live HTTPS calls
+/// to `fulcio.sigstore.dev` (cert) and `rekor.sigstore.dev` (witness)
+/// — both Sigstore-public-good instances. There is no offline /
+/// mocked variant; consumers who want to test the verify side
+/// without driving the live signing path should use one of the
+/// synthetic-bundle test helpers in the tr-sigstore test module.
+///
+/// **Subject digest is SHA-256, not BLAKE3.** sigstore-rs's
+/// high-level signer auto-builds an in-toto statement whose subject
+/// digest is `sha256(canonical_bytes)`. Self-signed bundles via
+/// `root pack --sign <key>` keep their `blake3:<hex>` subject; the
+/// verifier dispatches on which key is present in the digest map.
+/// Both hashes are derivable from the same canonical bytes, so no
+/// extra storage cost — verifying just runs the appropriate
+/// recompute.
+///
+/// The bundle's in-toto statement uses a content-addressed subject
+/// name (sigstore-rs picks `sha256:<hex>`). Verifier identity policy
+/// matches on the cert SAN (e.g. the OIDC subject email), not on the
+/// bundle's subject name — so v3 doesn't need to override that field.
+pub fn sign_canonical_bytes_keyless(
+    token: IdentityToken,
+    canonical_bytes: &[u8],
+) -> Result<Vec<u8>, Error> {
+    // sigstore-rs's default flow is async (tokio). The blocking_signer
+    // variant runs the same flow but synchronously — sufficient for
+    // the CLI's `root pack --sign-keyless` path.
+    let ctx = SigningContext::production()
+        .map_err(|e| Error::CertParse(format!("sigstore production context: {e}")))?;
+
+    let session = ctx
+        .blocking_signer(token)
+        .map_err(|e| Error::CertParse(format!("sigstore blocking_signer: {e}")))?;
+
+    let mut cursor = Cursor::new(canonical_bytes);
+    let signing_artifact = session
+        .sign(&mut cursor)
+        .map_err(|e| Error::CertParse(format!("sigstore sign: {e}")))?;
+
+    let bundle = signing_artifact.to_bundle();
+    serde_json::to_vec(&bundle).map_err(Error::BundleParse)
 }
 
 #[cfg(test)]
