@@ -43,7 +43,12 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+pub mod rekor;
 pub mod trust_root;
+pub use rekor::{
+    RFC6962_LEAF_PREFIX, leaf_hash_from_canonical_body, verify_inclusion_proof_offline,
+    verify_set_signature,
+};
 pub use trust_root::{TrustedCertificate, TrustedRoot, verify_cert_chain};
 
 /// DSSE statement type for v3 packs. Locked by spec §3.4 — never
@@ -223,21 +228,110 @@ pub struct X509Certificate {
     pub raw_bytes: String,
 }
 
-/// Rekor inclusion proof witnessing the signing event. Populated by
-/// the live `sigstore-impl` flow.
+/// One transparency-log witness for a signed bundle. Each entry binds
+/// the bundle to a specific append-only log (Rekor for Sigstore
+/// public-good) at a specific log index, witnessed at a specific time.
+///
+/// Wire shape matches Sigstore Bundle v0.3's `TransparencyLogEntry`
+/// protobuf message — see <https://github.com/sigstore/protobuf-specs>.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TlogEntry {
     /// The Rekor log index this entry occupies.
     #[serde(rename = "logIndex")]
     pub log_index: i64,
-    /// The integrated time (Unix seconds) Rekor recorded the entry at.
+    /// Identifies which transparency log witnessed this entry.
+    /// `keyId` is base64 of SHA-256 of the log's public key.
+    #[serde(rename = "logId", default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<LogId>,
+    /// E.g. `"hashedrekord"` + `"0.0.1"`. Identifies which Rekor entry
+    /// kind generated `canonicalized_body`.
+    #[serde(rename = "kindVersion", default, skip_serializing_if = "Option::is_none")]
+    pub kind_version: Option<KindVersion>,
+    /// Unix-seconds timestamp Rekor recorded for this entry.
     #[serde(rename = "integratedTime")]
     pub integrated_time: i64,
-    /// Inclusion-proof Merkle audit path + tree size + checkpoint.
-    /// Verifiers replay this against the Rekor public key without
-    /// network access.
-    #[serde(rename = "inclusionProof", default)]
-    pub inclusion_proof: serde_json::Value,
+    /// SignedEntryTimestamp — Rekor's signature over the canonical
+    /// (logIndex, logId, integratedTime, body-hash) tuple. Optional
+    /// because some Rekor versions emit only the inclusion proof; if
+    /// present, it's the load-bearing piece that ties this entry to
+    /// the Rekor key without recomputing the Merkle root.
+    #[serde(rename = "inclusionPromise", default, skip_serializing_if = "Option::is_none")]
+    pub inclusion_promise: Option<InclusionPromise>,
+    /// Inclusion-proof Merkle audit path + tree size + signed
+    /// checkpoint. Verifiers replay this against the Rekor public key
+    /// without network access.
+    #[serde(rename = "inclusionProof", default, skip_serializing_if = "Option::is_none")]
+    pub inclusion_proof: Option<RekorInclusionProof>,
+    /// Canonicalized JSON of the original Rekor entry body. The leaf
+    /// hash is `SHA-256(0x00 || canonical_body)`. Stored base64 on
+    /// the wire; consumers that just want to verify the inclusion
+    /// proof against a leaf hash they computed externally can ignore
+    /// this field.
+    #[serde(rename = "canonicalizedBody", default, skip_serializing_if = "Option::is_none")]
+    pub canonicalized_body: Option<String>,
+}
+
+/// Rekor's identifier — `keyId` is base64 of SHA-256 of the Rekor
+/// public key, useful for distinguishing Sigstore-public-good Rekor
+/// from a private deployment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogId {
+    #[serde(rename = "keyId")]
+    pub key_id: String,
+}
+
+/// Identifies which Rekor entry kind generated `canonicalized_body`.
+/// Sigstore-public-good emits `kind="hashedrekord", version="0.0.1"`
+/// for code-signing entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KindVersion {
+    pub kind: String,
+    pub version: String,
+}
+
+/// Rekor SignedEntryTimestamp — base64-encoded ECDSA-with-SHA256
+/// signature by Rekor's public key over the canonical
+/// `(integratedTime, logIndex, logID, body-hash)` tuple.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InclusionPromise {
+    #[serde(rename = "signedEntryTimestamp")]
+    pub signed_entry_timestamp: String,
+}
+
+/// Merkle inclusion proof — the audit path from `leaf_hash` to the
+/// log's root at `tree_size`, plus an optional signed checkpoint that
+/// binds the root to Rekor's signing key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RekorInclusionProof {
+    /// Position of the witnessed entry in the log.
+    #[serde(rename = "logIndex")]
+    pub log_index: i64,
+    /// Total leaves in the log at the time the proof was generated.
+    #[serde(rename = "treeSize")]
+    pub tree_size: i64,
+    /// The log's root hash at `tree_size` — base64 of 32 bytes.
+    #[serde(rename = "rootHash")]
+    pub root_hash: String,
+    /// Audit-path siblings, leaf-up. Each entry is base64 of 32
+    /// bytes. Length is `ceil(log2(tree_size))` for a complete tree.
+    #[serde(rename = "hashes", default)]
+    pub hashes: Vec<String>,
+    /// Signed checkpoint envelope — Rekor signs the root hash and
+    /// log size as a textual "checkpoint" envelope per the C2SP
+    /// signed-checkpoint format. Optional; when absent, callers
+    /// must rely on `inclusion_promise.signed_entry_timestamp`
+    /// instead.
+    #[serde(rename = "checkpoint", default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<RekorCheckpoint>,
+}
+
+/// Signed checkpoint envelope, per the C2SP spec
+/// (<https://github.com/C2SP/C2SP/blob/main/signed-note.md>). The
+/// `envelope` field is the textual envelope; verifiers split it on
+/// the `\n\n` separator to recover the body and the signatures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RekorCheckpoint {
+    pub envelope: String,
 }
 
 /// DSSE envelope — the signed payload + signature(s).

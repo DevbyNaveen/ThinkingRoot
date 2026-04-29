@@ -417,7 +417,6 @@ fn check_cert_validity(cert: &X509Cert, signed_at: SystemTime) -> Result<(), Str
 /// verification.
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::*;
     use ::der::Encode as _;
     use ::der::asn1::BitString;
     pub use p256::ecdsa::{
