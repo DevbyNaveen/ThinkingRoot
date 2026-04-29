@@ -71,7 +71,8 @@ pub enum Error {
     /// The DSSE payload could not be base64-decoded.
     #[error("bundle base64: {0}")]
     Base64(#[from] base64::DecodeError),
-    /// The bundle's signature failed Ed25519 verification.
+    /// The bundle's signature failed verification (algorithm-agnostic
+    /// — both Ed25519 and ECDSA P-256 paths funnel here on a bad sig).
     #[error("signature verification failed")]
     SignatureMismatch,
     /// The DSSE payload's subject digest does not match the pack hash
@@ -93,12 +94,10 @@ pub enum Error {
         /// What the bundle's predicateType field actually contains.
         got: String,
     },
-    /// The bundle's verification material doesn't carry an Ed25519
-    /// public key in a shape we recognise. Self-signed bundles use
-    /// `verificationMaterial.publicKey.rawBytes`; Fulcio-signed bundles
-    /// use `verificationMaterial.x509CertificateChain` (handled by the
-    /// follow-up `sigstore-impl` feature).
-    #[error("no Ed25519 verification key in bundle")]
+    /// The bundle's verification material is empty — neither a
+    /// self-signed `publicKey` nor a Fulcio `x509CertificateChain`
+    /// is set.
+    #[error("no verification key or cert chain in bundle")]
     MissingVerificationKey,
     /// The Ed25519 key bytes in the bundle were the wrong length.
     #[error("Ed25519 key length: expected 32 bytes, got {0}")]
@@ -106,6 +105,27 @@ pub enum Error {
     /// The Ed25519 signature bytes were the wrong length.
     #[error("Ed25519 signature length: expected 64 bytes, got {0}")]
     InvalidSignatureLength(usize),
+    /// The leaf cert in the bundle's `x509CertificateChain` could not
+    /// be parsed as DER X.509.
+    #[error("leaf certificate parse: {0}")]
+    CertParse(String),
+    /// The leaf cert's `x509CertificateChain.certificates` array was
+    /// empty.
+    #[error("certificate chain has no leaf cert")]
+    EmptyCertChain,
+    /// The leaf cert's SubjectPublicKeyInfo declared a key algorithm we
+    /// don't support. Today the verifier handles ECDSA P-256 (Fulcio's
+    /// default) and Ed25519 (self-signed); other curves error out so
+    /// callers can surface a clean "unsupported" verdict instead of
+    /// silently failing the signature check.
+    #[error("unsupported public key algorithm: {0}")]
+    UnsupportedKeyAlgorithm(String),
+    /// The DSSE signature bytes could not be parsed as either DER-
+    /// encoded ASN.1 ECDSA (sigstore-rs / cosign default) or raw
+    /// 64-byte IEEE P1363 r||s (some non-Sigstore signers). The bytes
+    /// are corrupt or use a third encoding we don't handle.
+    #[error("ECDSA signature format unrecognised (expected DER or 64-byte raw)")]
+    EcdsaSignatureFormat,
 }
 
 /// Result alias for sigstore operations.
@@ -344,38 +364,33 @@ pub fn sign_pack(
 ///
 /// Verification chain (v3 spec §7.6, locked):
 ///
-/// 1. Pull the public key out of `verification_material` (self-signed
-///    today; `sigstore-impl` adds Fulcio cert chain validation).
+/// 1. Pick the verification material: prefer
+///    `verification_material.x509_certificate_chain` (Fulcio-issued
+///    bundles) over `verification_material.public_key` (self-signed
+///    bundles). Fail clean if neither is set.
 /// 2. Re-derive the DSSE PAE from `(payloadType, payload)` and verify
-///    the signature against the public key.
+///    the signature against the public key recovered in step 1
+///    (Ed25519 raw or ECDSA P-256 from leaf cert SPKI).
 /// 3. Decode the in-toto statement; assert `predicateType` matches the
 ///    locked v3 statement type.
 /// 4. Assert the statement's first subject digest matches
 ///    `expected_pack_hash`.
 ///
-/// Step 5 (Rekor inclusion proof) is no-op for self-signed bundles
-/// (`tlog_entries` is empty); the `sigstore-impl` follow-up adds the
-/// Merkle audit-path replay against the bundled Rekor public key.
+/// Steps 5+ — cert chain validation against the Sigstore trust root
+/// and Rekor inclusion-proof replay — are layered on top by
+/// [`tr_verify::verify_v3_pack`] (chain validation lands in the next
+/// commit; Rekor replay is a Phase F §4.1 step 5 follow-up).
+///
+/// Self-signed bundles (`tlog_entries` empty, `public_key` set) and
+/// Fulcio-signed bundles (`tlog_entries` populated, `cert_chain` set)
+/// share the same return type: a successful in-toto statement carrying
+/// the predicate the caller should trust ONLY after layering identity
+/// verification on top.
 pub fn verify_bundle_offline(
     bundle: &SigstoreBundle,
     expected_pack_hash: &str,
 ) -> Result<InTotoStatement> {
-    let pubkey_bytes = bundle
-        .verification_material
-        .public_key
-        .as_ref()
-        .ok_or(Error::MissingVerificationKey)?;
     let b64 = base64::engine::general_purpose::STANDARD;
-
-    let raw = b64.decode(&pubkey_bytes.raw_bytes)?;
-    if raw.len() != 32 {
-        return Err(Error::InvalidKeyLength(raw.len()));
-    }
-    let mut key_array = [0u8; 32];
-    key_array.copy_from_slice(&raw);
-    let verifying = VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| Error::InvalidKeyLength(32))?;
-
     let payload = b64.decode(&bundle.dsse_envelope.payload)?;
     let pae = dsse_pae(&bundle.dsse_envelope.payload_type, &payload);
 
@@ -385,20 +400,48 @@ pub fn verify_bundle_offline(
         .first()
         .ok_or(Error::SignatureMismatch)?;
     let sig_bytes = b64.decode(&sig_b64.sig)?;
-    if sig_bytes.len() != 64 {
-        return Err(Error::InvalidSignatureLength(sig_bytes.len()));
-    }
-    let mut sig_array = [0u8; 64];
-    sig_array.copy_from_slice(&sig_bytes);
-    let signature = Signature::from_bytes(&sig_array);
 
-    verifying
-        .verify(&pae, &signature)
-        .map_err(|_| Error::SignatureMismatch)?;
+    // Dispatch based on verification material. Prefer cert chain
+    // (Fulcio bundles always carry one — empty cert chain is a malformed
+    // Fulcio bundle, not a fallback to self-signed).
+    let cert_chain_set = bundle
+        .verification_material
+        .x509_certificate_chain
+        .as_ref()
+        .map(|c| !c.certificates.is_empty())
+        .unwrap_or(false);
+
+    if cert_chain_set {
+        verify_dsse_with_ecdsa_cert(
+            bundle
+                .verification_material
+                .x509_certificate_chain
+                .as_ref()
+                .unwrap(),
+            &pae,
+            &sig_bytes,
+        )?;
+    } else if let Some(pk) = bundle.verification_material.public_key.as_ref() {
+        verify_dsse_with_ed25519(pk, &pae, &sig_bytes)?;
+    } else {
+        return Err(Error::MissingVerificationKey);
+    }
 
     // Statement now has cryptographic provenance — verify the
     // semantic claims it carries.
-    let statement: InTotoStatement = serde_json::from_slice(&payload)?;
+    verify_statement_semantics(&payload, expected_pack_hash)
+}
+
+/// Decode the in-toto statement, check its predicate type matches the
+/// locked v3 statement type, and check its subject digest matches the
+/// expected pack hash. Shared between the Ed25519 and ECDSA paths
+/// because the wire-level statement layout is the same regardless of
+/// who signed it.
+fn verify_statement_semantics(
+    payload: &[u8],
+    expected_pack_hash: &str,
+) -> Result<InTotoStatement> {
+    let statement: InTotoStatement = serde_json::from_slice(payload)?;
     if statement.predicate_type != DSSE_STATEMENT_TYPE {
         return Err(Error::StatementTypeMismatch {
             expected: DSSE_STATEMENT_TYPE,
@@ -421,8 +464,105 @@ pub fn verify_bundle_offline(
             payload: payload_digest,
         });
     }
-
     Ok(statement)
+}
+
+/// Verify the DSSE signature with a raw Ed25519 public key from the
+/// bundle's `verification_material.public_key.raw_bytes`. Used for
+/// self-signed bundles (`root pack --sign <key-file>`).
+fn verify_dsse_with_ed25519(
+    pk: &PublicKeyMaterial,
+    pae: &[u8],
+    sig_bytes: &[u8],
+) -> Result<()> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let raw = b64.decode(&pk.raw_bytes)?;
+    if raw.len() != 32 {
+        return Err(Error::InvalidKeyLength(raw.len()));
+    }
+    let mut key_array = [0u8; 32];
+    key_array.copy_from_slice(&raw);
+    let verifying = VerifyingKey::from_bytes(&key_array)
+        .map_err(|_| Error::InvalidKeyLength(32))?;
+
+    if sig_bytes.len() != 64 {
+        return Err(Error::InvalidSignatureLength(sig_bytes.len()));
+    }
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(sig_bytes);
+    let signature = Signature::from_bytes(&sig_array);
+
+    verifying
+        .verify(pae, &signature)
+        .map_err(|_| Error::SignatureMismatch)
+}
+
+/// Verify the DSSE signature against the leaf cert's ECDSA P-256
+/// public key, recovered from the cert's SubjectPublicKeyInfo. Does
+/// **not** validate the cert chain itself — that is the
+/// trust-root-aware step layered on top by `tr-verify` (next commit).
+///
+/// Both common DSSE-ECDSA wire formats are accepted on input:
+/// 1. **DER-encoded ASN.1 SEQUENCE { r INTEGER, s INTEGER }** — what
+///    sigstore-rs and cosign emit. This is the de-facto standard.
+/// 2. **Raw 64-byte fixed-length r ‖ s (IEEE P1363)** — emitted by some
+///    Sigstore-adjacent signers and by direct uses of `p256::ecdsa`
+///    without explicit DER-encode.
+///
+/// We try DER first (matches Sigstore's de-facto), fall through to
+/// raw on parse failure. Anything else surfaces as
+/// [`Error::EcdsaSignatureFormat`].
+fn verify_dsse_with_ecdsa_cert(
+    chain: &X509CertificateChain,
+    pae: &[u8],
+    sig_bytes: &[u8],
+) -> Result<()> {
+    use signature::Verifier as _;
+    use x509_cert::Certificate;
+    use x509_cert::der::{Decode, Encode};
+
+    let leaf = chain.certificates.first().ok_or(Error::EmptyCertChain)?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let cert_der = b64.decode(&leaf.raw_bytes)?;
+
+    let cert = Certificate::from_der(&cert_der)
+        .map_err(|e| Error::CertParse(format!("DER decode: {e}")))?;
+
+    let spki_der = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| Error::CertParse(format!("SPKI re-encode: {e}")))?;
+
+    // p256's `from_public_key_der` validates that the SPKI carries the
+    // ecPublicKey OID with secp256r1 / P-256 parameters. Mismatched
+    // curves (P-384, P-521, RSA, Ed25519-in-cert) surface here as a
+    // clean unsupported-algorithm error.
+    use p256::pkcs8::DecodePublicKey as _;
+    let verifying = p256::ecdsa::VerifyingKey::from_public_key_der(&spki_der)
+        .map_err(|e| Error::UnsupportedKeyAlgorithm(format!("P-256 SPKI: {e}")))?;
+
+    let signature = parse_ecdsa_p256_signature(sig_bytes)?;
+
+    verifying
+        .verify(pae, &signature)
+        .map_err(|_| Error::SignatureMismatch)
+}
+
+/// Try DER-encoded ECDSA signature first, fall back to raw 64-byte
+/// IEEE P1363 r ‖ s. Documented input contract on
+/// [`verify_dsse_with_ecdsa_cert`].
+fn parse_ecdsa_p256_signature(bytes: &[u8]) -> Result<p256::ecdsa::Signature> {
+    if let Ok(s) = p256::ecdsa::Signature::from_der(bytes) {
+        return Ok(s);
+    }
+    if bytes.len() == 64
+        && let Ok(s) = p256::ecdsa::Signature::from_slice(bytes)
+    {
+        return Ok(s);
+    }
+    Err(Error::EcdsaSignatureFormat)
 }
 
 /// DSSE Pre-Authentication Encoding (PAE) per the DSSE spec.
@@ -587,5 +727,247 @@ mod tests {
         bundle.verification_material.public_key = None;
         let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // ECDSA P-256 cert-bundle path — Fulcio-style bundles. These
+    // tests exercise the verifier's cryptographic-validation path
+    // without contacting Fulcio: we build a syntactically valid X.509
+    // leaf cert wrapping a freshly-generated ECDSA P-256 keypair, sign
+    // a DSSE envelope with that key, and assemble a bundle with the
+    // `x509CertificateChain` field set instead of `publicKey`. Cert
+    // chain validation against a trust root is the next commit's job;
+    // these tests prove the signature-verification path itself works.
+    // ─────────────────────────────────────────────────────────────
+
+    use ::der::Encode as _;
+    use ::der::asn1::BitString;
+    // `Signer::sign` is already in scope via the top-of-file
+    // `ed25519_dalek::Signer` import (which is a re-export of
+    // `signature::Signer`); no need to bring it in again.
+    use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
+    use spki::{EncodePublicKey as _, SubjectPublicKeyInfoOwned};
+    use std::str::FromStr;
+    use x509_cert::Certificate as X509Cert;
+    use x509_cert::TbsCertificate;
+    use x509_cert::Version;
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::spki::AlgorithmIdentifierOwned;
+    use x509_cert::time::Validity;
+
+    /// Build a syntactically valid X.509 leaf cert wrapping the given
+    /// ECDSA P-256 verifying key. The cert's issuer signature field is
+    /// dummy bytes — fine here because Task #52 only verifies the DSSE
+    /// signature (chain-of-trust validation is the next commit's job).
+    fn build_minimal_p256_leaf_cert(verifying: &p256::ecdsa::VerifyingKey) -> Vec<u8> {
+        // SubjectPublicKeyInfo: convert through `p256::PublicKey`
+        // (whose `EncodePublicKey` impl is what the elliptic-curve crate
+        // ships). `ecdsa::VerifyingKey<NistP256>` doesn't carry that
+        // trait directly in this version, so we go via `From`.
+        let pk = p256::PublicKey::from(verifying);
+        let spki_der = pk.to_public_key_der().expect("encode SPKI");
+        let spki = SubjectPublicKeyInfoOwned::try_from(spki_der.as_bytes())
+            .expect("parse SPKI");
+
+        // ecdsa-with-SHA256 — the algorithm OID Sigstore-issued certs
+        // use for the issuer signature.
+        let ecdsa_with_sha256 =
+            ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let sig_alg = AlgorithmIdentifierOwned {
+            oid: ecdsa_with_sha256,
+            parameters: None,
+        };
+
+        let tbs = TbsCertificate {
+            version: Version::V3,
+            serial_number: SerialNumber::from(1u32),
+            signature: sig_alg.clone(),
+            issuer: Name::from_str("CN=test-issuer").expect("parse issuer"),
+            validity: Validity::from_now(std::time::Duration::from_secs(86400))
+                .expect("validity window"),
+            subject: Name::from_str("CN=test-subject").expect("parse subject"),
+            subject_public_key_info: spki,
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: None,
+        };
+
+        let cert = X509Cert {
+            tbs_certificate: tbs,
+            signature_algorithm: sig_alg,
+            // A real Fulcio-issued cert carries the issuer's ECDSA
+            // signature here; our test cert carries dummy zero bytes
+            // because Task #52's verifier doesn't validate the cert
+            // chain. The next commit's `verify_v3_pack_with_trust_root`
+            // is what notices a bogus issuer signature.
+            signature: BitString::from_bytes(&[0u8; 64]).expect("dummy bitstring"),
+        };
+
+        cert.to_der().expect("encode cert")
+    }
+
+    fn deterministic_p256_key(seed: u8) -> P256SigningKey {
+        let mut bytes = [0u8; 32];
+        bytes[31] = seed.max(1); // avoid 0
+        P256SigningKey::from_slice(&bytes).expect("p256 from slice")
+    }
+
+    /// Sign a v3 bundle with an ECDSA P-256 key (as Fulcio would) and
+    /// return the assembled bundle ready for `verify_bundle_offline`.
+    fn build_ecdsa_signed_bundle(
+        signing: &P256SigningKey,
+        pack_hash: &str,
+        pack_filename: &str,
+    ) -> SigstoreBundle {
+        let bare = strip_blake3_prefix(pack_hash);
+        let statement = InTotoStatement {
+            statement_type: IN_TOTO_STATEMENT_V1.to_string(),
+            subject: vec![Subject {
+                name: pack_filename.to_string(),
+                digest: {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "blake3".to_string(),
+                        serde_json::Value::String(bare.to_string()),
+                    );
+                    m
+                },
+            }],
+            predicate_type: DSSE_STATEMENT_TYPE.to_string(),
+            predicate: PackPredicate {
+                format_version: "tr/3".to_string(),
+                signed_at: format_rfc3339(SystemTime::UNIX_EPOCH),
+            },
+        };
+
+        let payload_bytes = serde_json::to_vec(&statement).expect("encode statement");
+        let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes);
+
+        // Sigstore-rs / cosign convention: DER-encoded ECDSA signature.
+        let sig: P256Signature = signing.sign(&pae);
+        let sig_der = sig.to_der();
+        let sig_bytes = sig_der.as_bytes();
+
+        let cert_der = build_minimal_p256_leaf_cert(signing.verifying_key());
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        SigstoreBundle {
+            media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
+            verification_material: VerificationMaterial {
+                public_key: None,
+                x509_certificate_chain: Some(X509CertificateChain {
+                    certificates: vec![X509Certificate {
+                        raw_bytes: b64.encode(&cert_der),
+                    }],
+                }),
+                tlog_entries: Vec::new(),
+            },
+            dsse_envelope: DsseEnvelope {
+                payload: b64.encode(&payload_bytes),
+                payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+                signatures: vec![DsseSignature {
+                    sig: b64.encode(sig_bytes),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn ecdsa_p256_cert_bundle_round_trips_through_verify() {
+        let signing = deterministic_p256_key(0x42);
+        let bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "fulcio-style.tr");
+        let stmt = verify_bundle_offline(&bundle, fixture_hash()).unwrap();
+        assert_eq!(stmt.predicate_type, DSSE_STATEMENT_TYPE);
+        assert_eq!(stmt.predicate.format_version, "tr/3");
+        assert_eq!(stmt.subject[0].name, "fulcio-style.tr");
+    }
+
+    #[test]
+    fn ecdsa_p256_round_trip_with_raw_64_byte_signature() {
+        // Some non-Sigstore signers emit raw IEEE P1363 (r ‖ s) instead
+        // of DER-encoded signatures. The verifier must accept both;
+        // build a bundle whose `sig` field is the 64-byte raw form.
+        let signing = deterministic_p256_key(0x55);
+        let mut bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "raw-sig.tr");
+
+        // Re-sign the same PAE with the raw fixed-length encoding.
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let payload = b64.decode(&bundle.dsse_envelope.payload).unwrap();
+        let pae = dsse_pae(&bundle.dsse_envelope.payload_type, &payload);
+        let sig: P256Signature = signing.sign(&pae);
+        let raw_bytes = sig.to_bytes(); // 64 bytes
+        assert_eq!(raw_bytes.len(), 64);
+        bundle.dsse_envelope.signatures[0].sig = b64.encode(raw_bytes);
+
+        verify_bundle_offline(&bundle, fixture_hash()).unwrap();
+    }
+
+    #[test]
+    fn ecdsa_p256_rejects_tampered_signature() {
+        let signing = deterministic_p256_key(0x77);
+        let mut bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "tampered.tr");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut sig_bytes = b64.decode(&bundle.dsse_envelope.signatures[0].sig).unwrap();
+        // Flip a bit deep in the DER body — past the SEQUENCE header,
+        // landing inside one of the INTEGERs. Result is still parseable
+        // DER but the underlying r/s no longer satisfies the signature
+        // equation.
+        let target = sig_bytes.len() - 1;
+        sig_bytes[target] ^= 0x01;
+        bundle.dsse_envelope.signatures[0].sig = b64.encode(&sig_bytes);
+        let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
+        assert!(
+            matches!(err, Error::SignatureMismatch | Error::EcdsaSignatureFormat),
+            "expected SignatureMismatch or EcdsaSignatureFormat, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ecdsa_p256_rejects_wrong_subject_digest() {
+        let signing = deterministic_p256_key(0x99);
+        let bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "p.tr");
+        let other =
+            "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_bundle_offline(&bundle, other).unwrap_err();
+        assert!(matches!(err, Error::SubjectMismatch { .. }));
+    }
+
+    #[test]
+    fn empty_cert_chain_errors_cleanly() {
+        let signing = deterministic_p256_key(0xAA);
+        let mut bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "p.tr");
+        bundle
+            .verification_material
+            .x509_certificate_chain
+            .as_mut()
+            .unwrap()
+            .certificates
+            .clear();
+        bundle.verification_material.public_key = None;
+        // Empty chain + no public key → MissingVerificationKey (the
+        // dispatcher considers an empty chain "not set" and falls
+        // through to checking public_key).
+        let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
+        assert!(matches!(err, Error::MissingVerificationKey));
+    }
+
+    #[test]
+    fn corrupt_leaf_cert_der_errors_cleanly() {
+        let signing = deterministic_p256_key(0xBB);
+        let mut bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "p.tr");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        bundle
+            .verification_material
+            .x509_certificate_chain
+            .as_mut()
+            .unwrap()
+            .certificates[0]
+            .raw_bytes = b64.encode([0xDE, 0xAD, 0xBE, 0xEF]);
+        let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
+        assert!(
+            matches!(err, Error::CertParse(_)),
+            "expected CertParse, got {err:?}"
+        );
     }
 }

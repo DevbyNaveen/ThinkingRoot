@@ -12,11 +12,13 @@ description = "Sigstore keyless OIDC signing + offline DSSE verification for v3 
 name = "tr_sigstore"
 path = "src/lib.rs"
 
-# Week 0 scaffold: no sigstore-rs dep yet. Week 3 adds sigstore = "0.10"
-# (or whatever is current on crates.io at the start of W3) along with the
-# Fulcio + Rekor client integrations. The crate exists at this stage so that
-# tr-verify can declare it as an optional dependency behind the
-# `sigstore-impl` feature without needing a follow-up workspace edit.
+# Default feature set is offline-first: pure Rust, no async runtime, no TLS.
+# It supports BOTH self-signed Ed25519 bundles (default `verify_bundle_offline`
+# path) AND Sigstore Fulcio-issued ECDSA P-256 cert bundles (cryptographic
+# verification only — chain validation against a trust root lands in the
+# follow-up commit). The `live` feature (W3.5) bolts on `sigstore-rs` +
+# `tokio` + `reqwest` for the keyless OIDC sign flow; consumers that only
+# verify never compile that surface.
 
 [dependencies]
 serde = { workspace = true }
@@ -28,5 +30,27 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 
+# ECDSA P-256 verification path — Fulcio issues ECDSA P-256 ephemeral certs
+# by default, so any Sigstore-signed bundle the verifier consumes carries an
+# ECDSA P-256 leaf cert. `p256` is the RustCrypto curve impl; `ecdsa` provides
+# the DER-encoded signature parser; `x509-cert` parses the leaf cert's
+# SubjectPublicKeyInfo so we can reconstruct the verifying key. All three
+# track the same `signature 2` + `der 0.7` + `spki 0.7` ecosystem versions
+# already in our workspace lockfile (via tr-revocation + ed25519-dalek).
+p256       = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+ecdsa      = { version = "0.16", default-features = false, features = ["der", "pkcs8", "std"] }
+x509-cert  = { version = "0.2",  default-features = false, features = ["std"] }
+spki       = { version = "0.7",  default-features = false, features = ["std"] }
+der        = { version = "0.7",  default-features = false, features = ["std", "oid"] }
+signature  = { version = "2",    default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
+# Tests construct a minimal X.509 leaf cert (valid DER, dummy issuer signature)
+# wrapping a freshly-generated ECDSA P-256 keypair so we can round-trip the
+# Fulcio-style bundle path without contacting the network. The `builder`
+# feature pulls in `rsa` only behind the cert-builder code-path, which our
+# offline tests never exercise; runtime cost is zero.
+x509-cert  = { version = "0.2",  default-features = false, features = ["std", "builder"] }
+# Time arithmetic for cert validity windows in tests.
+time       = { version = "0.3",  default-features = false, features = ["std"] }
