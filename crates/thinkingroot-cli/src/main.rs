@@ -323,6 +323,13 @@ enum Commands {
         /// One-line description. Overrides `Pack.toml`.
         #[arg(long)]
         description: Option<String>,
+        /// Pack format: `tr/1` (default, multi-directory tar+zstd
+        /// matching the v1 wire format) or `tr/3` (the 3-file
+        /// `[manifest.toml, source.tar.zst, claims.jsonl]` layout from
+        /// the v3 spec). Default flips to `tr/3` after the v3
+        /// transition lands per `~/.claude/plans/zippy-wiggling-pelican.md`.
+        #[arg(long, default_value = "tr/1")]
+        format: String,
     },
     /// Install a `.tr` knowledge pack — extract its contents to a
     /// target directory's `.thinkingroot/` so the engine can mount it
@@ -829,8 +836,9 @@ async fn async_main() -> anyhow::Result<()> {
             version,
             license,
             description,
+            format,
         }) => {
-            pack_cmd::run_pack(&workspace, out, name, version, license, description)?;
+            pack_cmd::run_pack(&workspace, out, name, version, license, description, &format)?;
         }
         Some(Commands::Install {
             reference,

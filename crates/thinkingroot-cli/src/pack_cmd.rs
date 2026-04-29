@@ -34,14 +34,17 @@
 //! canonical bytes (that check is part of [`tr_format::reader`]
 //! itself), so a corrupted or tampered `.tr` is rejected at install.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use thinkingroot_core::types::ContentHash;
 use tr_format::{
-    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, Manifest, TrustTier, Version,
+    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, ClaimRecord, Manifest,
+    ManifestV3, TrustTier, V3PackBuilder, Version,
 };
 use tr_revocation::{CacheConfig, RevocationCache};
 use tr_verify::{
@@ -119,8 +122,43 @@ struct PackTomlInner {
     description: Option<String>,
 }
 
-/// Run `root pack`. See module-level docs for behaviour.
+/// Run `root pack`. Dispatches to the v1 (multi-directory tar+zstd) or
+/// v3 (3-file `[manifest.toml, source.tar.zst, claims.jsonl]`) writer
+/// based on `format`. See module-level docs for v1 behaviour and
+/// `crates/tr-format/src/writer_v3.rs` for v3.
 pub fn run_pack(
+    workspace: &Path,
+    out: Option<PathBuf>,
+    name_override: Option<String>,
+    version_override: Option<String>,
+    license_override: Option<String>,
+    description_override: Option<String>,
+    format: &str,
+) -> Result<()> {
+    match format {
+        "tr/1" => run_pack_v1(
+            workspace,
+            out,
+            name_override,
+            version_override,
+            license_override,
+            description_override,
+        ),
+        "tr/3" => run_pack_v3(
+            workspace,
+            out,
+            name_override,
+            version_override,
+            license_override,
+            description_override,
+        ),
+        other => Err(anyhow!(
+            "unknown pack format `{other}`; supported: tr/1, tr/3"
+        )),
+    }
+}
+
+fn run_pack_v1(
     workspace: &Path,
     out: Option<PathBuf>,
     name_override: Option<String>,
@@ -179,6 +217,191 @@ pub fn run_pack(
         out_path.display()
     );
     Ok(())
+}
+
+/// Build a v3 `package.tr` from a compiled workspace.
+///
+/// The flow:
+///
+///  1. Open the workspace's CozoDB at `.thinkingroot/graph.db` and the
+///     [`thinkingroot_rooting::FileSystemSourceStore`] at
+///     `.thinkingroot/rooting/sources/`.
+///  2. Walk every `(uri, content_hash)` source row. For each non-empty
+///     hash, fetch the source bytes from the byte store and stage them
+///     under a workspace-relative POSIX path inside the V3 builder's
+///     source bundle.
+///  3. Walk every claim row joined with its source — populates
+///     `(file, byte_start, byte_end)` from the v3 byte-range columns
+///     persisted by the W1 migration.
+///  4. Walk every `claim_id → entity_name` edge to populate `ents`.
+///  5. Hand off to `V3PackBuilder::build` which seals the manifest with
+///     the three BLAKE3 hashes per spec §3.1.
+fn run_pack_v3(
+    workspace: &Path,
+    out: Option<PathBuf>,
+    name_override: Option<String>,
+    version_override: Option<String>,
+    license_override: Option<String>,
+    description_override: Option<String>,
+) -> Result<()> {
+    use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+
+    let engine_dir = workspace.join(".thinkingroot");
+    if !engine_dir.exists() {
+        return Err(anyhow!(
+            "no engine output at `{}`; run `root compile {}` first",
+            engine_dir.display(),
+            workspace.display()
+        ));
+    }
+
+    // 1. Manifest scaffolding from Pack.toml + CLI overrides. The v1
+    //    `build_manifest` already does the merge logic; we lift its
+    //    fields onto a fresh ManifestV3 to avoid duplicating the
+    //    Pack.toml plumbing.
+    let v1_manifest = build_manifest(
+        workspace,
+        name_override,
+        version_override,
+        license_override,
+        description_override,
+    )?;
+    let mut manifest = ManifestV3::new(&v1_manifest.name, v1_manifest.version.clone());
+    if !v1_manifest.license.is_empty() {
+        manifest.license = Some(v1_manifest.license.clone());
+    }
+    if !v1_manifest.description.is_empty() {
+        manifest.description = Some(v1_manifest.description.clone());
+    }
+    manifest.authors = v1_manifest.authors.clone();
+    manifest.extracted_at = Some(chrono::Utc::now());
+    manifest.extractor = Some(format!(
+        "thinkingroot/extract@{}",
+        env!("CARGO_PKG_VERSION")
+    ));
+
+    // 2. Open the workspace stores. CozoDB hands us joined claim+source
+    //    rows; FileSystemSourceStore hands us source bytes by hash.
+    let graph = thinkingroot_graph::graph::GraphStore::init(&engine_dir)
+        .with_context(|| format!("open graph at {}", engine_dir.display()))?;
+    let source_store = FileSystemSourceStore::new(&engine_dir)
+        .with_context(|| format!("open source store at {}", engine_dir.display()))?;
+
+    let mut builder = V3PackBuilder::new(manifest);
+    let workspace_abs = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    // 3. Stage source files. We dedupe by pack path because two source
+    //    rows may legitimately share a URI (e.g. a re-extract that
+    //    produced a fresh row before the prior was GC'd) — the v3 pack
+    //    layout has at most one entry per path.
+    let sources = graph.get_sources_with_hashes()?;
+    let mut packed_paths: HashSet<String> = HashSet::new();
+    let mut source_bytes_added = 0u64;
+    for (uri, content_hash) in &sources {
+        if content_hash.is_empty() {
+            continue;
+        }
+        let hash = ContentHash(content_hash.clone());
+        let bytes = match source_store
+            .get(&hash)
+            .map_err(|e| anyhow!("source store read for {}: {e}", hash.0))?
+        {
+            Some(b) => b,
+            None => continue,
+        };
+        let pack_path = workspace_relative_pack_path(uri, &workspace_abs);
+        if packed_paths.insert(pack_path.clone()) {
+            source_bytes_added += bytes.bytes.len() as u64;
+            builder
+                .add_source_file(&pack_path, &bytes.bytes)
+                .with_context(|| format!("stage source {pack_path}"))?;
+        }
+    }
+
+    // 4. Build claim records. Skip any claim whose owning source isn't
+    //    in the pack (synthetic agent contributions, GC'd sources) so
+    //    every emitted claim has a resolvable `file` field.
+    let claim_rows = graph.get_v3_claim_export()?;
+    let entity_names = graph.get_claim_entity_names()?;
+    let mut claim_count = 0usize;
+    for row in &claim_rows {
+        if row.content_hash.is_empty() {
+            continue;
+        }
+        let pack_path = workspace_relative_pack_path(&row.source_uri, &workspace_abs);
+        if !packed_paths.contains(&pack_path) {
+            continue;
+        }
+        let ents = entity_names.get(&row.id).cloned().unwrap_or_default();
+        let mut record = ClaimRecord::new(
+            row.id.clone(),
+            row.statement.clone(),
+            ents,
+            pack_path,
+            row.byte_start,
+            row.byte_end,
+        );
+        if !row.claim_type.is_empty() {
+            record = record.with_claim_type(row.claim_type.clone());
+        }
+        record = record.with_confidence(row.confidence);
+        if !row.admission_tier.is_empty() {
+            record = record.with_admission_tier(row.admission_tier.clone());
+        }
+        builder.add_claim(record);
+        claim_count += 1;
+    }
+
+    // 5. Seal the pack and write to disk.
+    let bytes = builder.build().map_err(|e| anyhow!("build .tr: {e}"))?;
+    let out_path = out.unwrap_or_else(|| {
+        let owner_slug = v1_manifest.name.replace('/', "-");
+        workspace.join(format!("{owner_slug}-{}.tr", v1_manifest.version))
+    });
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&out_path, &bytes).with_context(|| format!("write {}", out_path.display()))?;
+
+    println!(
+        "  packed {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
+        v1_manifest.name,
+        v1_manifest.version,
+        packed_paths.len(),
+        source_bytes_added,
+        claim_count,
+        bytes.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Map a stored source URI back to the workspace-relative POSIX path
+/// the v3 pack writer stages it under.
+///
+/// Cases handled:
+/// - `file:///abs/path/to/file.rs` inside `workspace_abs` → relative.
+/// - `file:///abs/elsewhere.rs` outside the workspace → strip
+///   `file://` and the leading slash (path lives at top level).
+/// - Other schemes (`git://`, `mcp://agent/...`) — pass through; the
+///   v3 pack treats them as opaque path strings. Reader-side tooling
+///   can decide how to resolve them.
+fn workspace_relative_pack_path(uri: &str, workspace_abs: &Path) -> String {
+    if let Some(stripped) = uri.strip_prefix("file://") {
+        let abs = Path::new(stripped);
+        if let Ok(rel) = abs.strip_prefix(workspace_abs) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+        // Outside workspace — emit as a top-level path with leading
+        // slashes stripped so the v3 writer's safe-path check accepts
+        // it.
+        return stripped.trim_start_matches('/').to_string();
+    }
+    uri.to_string()
 }
 
 /// Resolve the manifest by combining `Pack.toml` (if present) with CLI
@@ -799,7 +1022,7 @@ description = "Round-trip test pack."
         let workspace = fake_engine_workspace(src_tmp.path());
 
         let out_tr = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
         assert!(out_tr.exists(), ".tr file not produced");
         assert!(
             fs::metadata(&out_tr).unwrap().len() > 0,
@@ -868,6 +1091,7 @@ description = "Round-trip test pack."
             Some("2.5.0".to_string()),
             Some("Apache-2.0".to_string()),
             Some("Bob's fork.".to_string()),
+            "tr/1",
         )
         .unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
@@ -880,7 +1104,7 @@ description = "Round-trip test pack."
     #[test]
     fn pack_errors_when_engine_dir_absent() {
         let tmp = tempdir().unwrap();
-        let err = run_pack(tmp.path(), None, None, None, None, None).unwrap_err();
+        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no engine output"), "got: {msg}");
     }
@@ -892,7 +1116,7 @@ description = "Round-trip test pack."
         // Engine dir present, no Pack.toml, no overrides → error mentions `name`.
         fs::create_dir_all(workspace.join(".thinkingroot/artifacts")).unwrap();
         fs::write(workspace.join(".thinkingroot/artifacts/x.md"), b"x").unwrap();
-        let err = run_pack(workspace, None, None, None, None, None).unwrap_err();
+        let err = run_pack(workspace, None, None, None, None, None, "tr/1").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("name"), "got: {msg}");
     }
@@ -902,7 +1126,7 @@ description = "Round-trip test pack."
         let tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(tmp.path());
         let out_tr = workspace.join("paths.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
         let paths: HashSet<&str> = pack
             .paths()
@@ -924,7 +1148,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let out_tr = workspace.join("explicit.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
@@ -940,7 +1164,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let good_tr = workspace.join("good.tr");
-        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1").unwrap();
 
         // Corrupt the file deterministically: zero out a 64-byte run
         // in the middle of the zstd stream + truncate the trailing
@@ -1065,7 +1289,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1").unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
         let advertised_hash = blake3_hex(&tr_bytes);
 
@@ -1153,7 +1377,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1").unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
 
         struct AppState {

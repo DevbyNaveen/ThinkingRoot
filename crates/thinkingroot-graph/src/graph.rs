@@ -7,6 +7,34 @@ use serde::Serialize;
 use thinkingroot_core::types::{Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
+/// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
+/// adjacent shape: every field maps directly onto the v3 spec §3.3
+/// `ClaimRecord` apart from `ents` which is loaded separately via
+/// [`GraphStore::get_claim_entity_names`].
+#[derive(Debug, Clone)]
+pub struct V3ClaimExportRow {
+    /// CozoDB claim id — the wire-format `id` field.
+    pub id: String,
+    /// Atomic claim statement.
+    pub statement: String,
+    /// Claim taxonomy tag.
+    pub claim_type: String,
+    /// Extractor confidence in [0.0, 1.0].
+    pub confidence: f64,
+    /// Rooting admission tier.
+    pub admission_tier: String,
+    /// Inclusive byte offset within the source file.
+    pub byte_start: u64,
+    /// Exclusive byte offset within the source file.
+    pub byte_end: u64,
+    /// Source row id (UUID-ish).
+    pub source_id: String,
+    /// Source URI (e.g. `file:///abs/path/to/file.rs`).
+    pub source_uri: String,
+    /// BLAKE3 hex of the source bytes — opens the FileSystemSourceStore.
+    pub content_hash: String,
+}
+
 /// Graph storage backed by CozoDB — an embedded Datalog database.
 /// Datalog gives us recursive graph queries, pattern matching, and built-in
 /// graph algorithms (PageRank, shortest path) out of the box.
@@ -2671,6 +2699,67 @@ impl GraphStore {
             .iter()
             .map(|row| (dv_to_string(&row[0]), dv_to_string(&row[1])))
             .collect())
+    }
+
+    /// Return every claim joined with its source row — the input shape
+    /// the v3 pack writer needs. See [`V3ClaimExportRow`] for field-by-
+    /// field semantics. Empty `content_hash` means the source
+    /// has no byte-level body (e.g. synthetic agent contributions);
+    /// the caller decides whether to skip those claims when building a
+    /// v3 pack.
+    pub fn get_v3_claim_export(&self) -> Result<Vec<V3ClaimExportRow>> {
+        let q = r#"?[id, statement, claim_type, confidence, admission_tier, byte_start, byte_end, source_id, source_uri, content_hash] :=
+            *claims{id, statement, claim_type, confidence, admission_tier, byte_start, byte_end, source_id},
+            *sources{id: source_id, uri: source_uri, content_hash}
+        "#;
+        let result = self.query_read(q)?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| V3ClaimExportRow {
+                id: dv_to_string(&row[0]),
+                statement: dv_to_string(&row[1]),
+                claim_type: dv_to_string(&row[2]),
+                confidence: match &row[3] {
+                    DataValue::Num(Num::Float(f)) => *f,
+                    DataValue::Num(Num::Int(i)) => *i as f64,
+                    _ => 0.8,
+                },
+                admission_tier: dv_to_string(&row[4]),
+                byte_start: match &row[5] {
+                    DataValue::Num(Num::Int(i)) => (*i).max(0) as u64,
+                    _ => 0,
+                },
+                byte_end: match &row[6] {
+                    DataValue::Num(Num::Int(i)) => (*i).max(0) as u64,
+                    _ => 0,
+                },
+                source_id: dv_to_string(&row[7]),
+                source_uri: dv_to_string(&row[8]),
+                content_hash: dv_to_string(&row[9]),
+            })
+            .collect())
+    }
+
+    /// Return a `claim_id → [entity_name]` map. Used alongside
+    /// [`Self::get_v3_claim_export`] by the v3 pack writer to populate
+    /// the `ents` field on each emitted `ClaimRecord`.
+    pub fn get_claim_entity_names(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let q = r#"?[claim_id, entity_name] :=
+            *claim_entity_edges{claim_id, entity_id},
+            *entities{id: entity_id, canonical_name: entity_name}
+        "#;
+        let result = self.query_read(q)?;
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &result.rows {
+            map.entry(dv_to_string(&row[0]))
+                .or_default()
+                .push(dv_to_string(&row[1]));
+        }
+        Ok(map)
     }
 
     pub fn get_all_sources(&self) -> Result<Vec<(String, String, String)>> {
