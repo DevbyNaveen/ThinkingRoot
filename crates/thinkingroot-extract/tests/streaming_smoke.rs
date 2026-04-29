@@ -25,6 +25,7 @@ use thinkingroot_core::config::{AzureConfig, LlmConfig, ProviderConfig, Provider
 use thinkingroot_extract::llm::LlmClient;
 
 #[tokio::test]
+#[ignore = "live API call — requires ANTHROPIC_API_KEY; run with `cargo test -- --ignored`"]
 async fn anthropic_real_sse_streams_multiple_chunks() {
     let key = match std::env::var("ANTHROPIC_API_KEY") {
         Ok(k) if !k.is_empty() => k,
@@ -90,6 +91,7 @@ async fn anthropic_real_sse_streams_multiple_chunks() {
 }
 
 #[tokio::test]
+#[ignore = "live API call — requires AZURE_OPENAI_API_KEY; run with `cargo test -- --ignored`"]
 async fn azure_real_sse_streams_multiple_chunks() {
     let key = match std::env::var("AZURE_OPENAI_API_KEY") {
         Ok(k) if !k.is_empty() => k,
