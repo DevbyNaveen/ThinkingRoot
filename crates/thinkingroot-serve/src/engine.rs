@@ -121,6 +121,28 @@ pub struct ArtifactContent {
     pub content: String,
 }
 
+/// Result of [`QueryEngine::read_source`]. Returns the exact source bytes a
+/// claim cites — the round-trip the v3 `read_source` MCP tool exposes
+/// (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §8.5). `text` is the
+/// UTF-8 decoding of `bytes` when valid; consumers needing the raw bytes
+/// can inspect `bytes` directly.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadSourceResult {
+    /// URI of the source the claim was extracted from (e.g. `src/lib.rs`).
+    pub file: String,
+    /// Inclusive byte offset inside `file`.
+    pub byte_start: u64,
+    /// Exclusive byte offset inside `file`.
+    pub byte_end: u64,
+    /// UTF-8 decoding of the cited bytes when valid; empty when the byte
+    /// range is unknown ((0, 0) sentinel) or the source bytes can't be
+    /// decoded as UTF-8.
+    pub text: String,
+    /// Raw bytes the claim cites. Same byte range as `(byte_start, byte_end)`.
+    #[serde(skip)]
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceInfo {
     pub id: String,
@@ -961,6 +983,97 @@ impl QueryEngine {
         let storage = handle.storage.lock().await;
         let verifier = Verifier::new(&handle.config);
         verifier.verify(&storage.graph)
+    }
+
+    /// Read the exact source bytes a claim cites. Powers the v3 MCP
+    /// `read_source` tool: given a claim id, resolve the claim → source
+    /// row → on-disk content_hash, then slice the source bytes by the
+    /// claim's persisted byte range. Returns `Err(NotFound)` when the
+    /// claim id is unknown; returns a `ReadSourceResult` with empty `text`
+    /// + `bytes` when the claim has no byte range or the source bytes
+    /// were never persisted (older workspaces).
+    pub async fn read_source(&self, ws: &str, claim_id: &str) -> Result<ReadSourceResult> {
+        use thinkingroot_core::Error;
+        use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+
+        // 1. Look up the claim by id. Missing → propagate as ClaimNotFound
+        //    so the MCP tool can return a clean error to the model.
+        let claim = storage
+            .graph
+            .get_claim_by_id(claim_id)?
+            .ok_or_else(|| Error::ClaimNotFound(claim_id.to_string()))?;
+
+        // 2. Resolve the source row (uri + content_hash). The claim's
+        //    `source` field is the SourceId; the URI we surface to the
+        //    caller is the Source.uri so v3 packs cite by file path.
+        let source = storage
+            .graph
+            .get_source_by_id(&claim.source.to_string())?
+            .ok_or_else(|| {
+                Error::GraphStorage(format!(
+                    "claim {} cites source {} which is not in the graph",
+                    claim_id, claim.source
+                ))
+            })?;
+
+        // 3. Determine byte range. Pre-v3 claims (no source_span or
+        //    line-only) have unknown byte ranges; return an empty result
+        //    rather than an error so the caller can fall back to
+        //    `read_file` for the same source.
+        let (byte_start, byte_end) = match claim.source_span {
+            Some(span) => match (span.byte_start, span.byte_end) {
+                (Some(bs), Some(be)) if be > bs => (bs, be),
+                _ => {
+                    return Ok(ReadSourceResult {
+                        file: source.uri.clone(),
+                        byte_start: 0,
+                        byte_end: 0,
+                        text: String::new(),
+                        bytes: Vec::new(),
+                    });
+                }
+            },
+            None => {
+                return Ok(ReadSourceResult {
+                    file: source.uri.clone(),
+                    byte_start: 0,
+                    byte_end: 0,
+                    text: String::new(),
+                    bytes: Vec::new(),
+                });
+            }
+        };
+
+        // 4. Read the bytes from the FileSystemSourceStore. Sources
+        //    without a content_hash (synthetic agent contributions) or
+        //    whose bytes were never persisted return an empty result.
+        if source.content_hash.is_empty() {
+            return Ok(ReadSourceResult {
+                file: source.uri.clone(),
+                byte_start,
+                byte_end,
+                text: String::new(),
+                bytes: Vec::new(),
+            });
+        }
+        let store = FileSystemSourceStore::new(&handle.root_path.join(".thinkingroot"))
+            .map_err(|e| Error::GraphStorage(format!("source store init: {e}")))?;
+        let bytes = store
+            .get_range(&source.content_hash, byte_start as usize, byte_end as usize)
+            .map_err(|e| Error::GraphStorage(format!("source read: {e}")))?
+            .unwrap_or_default();
+        let text = String::from_utf8(bytes.clone()).unwrap_or_default();
+
+        Ok(ReadSourceResult {
+            file: source.uri,
+            byte_start,
+            byte_end,
+            text,
+            bytes,
+        })
     }
 
     /// Return Rooting admission-tier counts for a workspace.

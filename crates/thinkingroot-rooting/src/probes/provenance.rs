@@ -62,9 +62,17 @@ impl Probe for ProvenanceProbe {
         };
 
         // If the claim has a source_span, narrow to that region for a cheaper
-        // and more focused match. Otherwise score against the whole document.
+        // and more focused match. v3 byte-range citations are preferred when
+        // present (claim cites exact source bytes); pre-v3 line spans
+        // continue to work as the fallback. No span at all → score against
+        // the whole document.
         let scoped_text = match ctx.claim.source_span {
-            Some(span) => extract_line_range(&source_text, span.start_line, span.end_line),
+            Some(span) => match (span.byte_start, span.byte_end) {
+                (Some(bs), Some(be)) if be > bs => {
+                    extract_byte_range(&source_text, bs as usize, be as usize)
+                }
+                _ => extract_line_range(&source_text, span.start_line, span.end_line),
+            },
             None => source_text.clone(),
         };
 
@@ -103,6 +111,35 @@ fn extract_line_range(text: &str, start_line: u32, end_line: u32) -> String {
         .take(end_idx.saturating_sub(start_idx))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Return the substring of `text` spanning `[byte_start, byte_end)`. Out-of-
+/// range or non-UTF-8-aligned indices yield an empty string — the probe
+/// then scores against an empty slice and rejects the claim, which is the
+/// correct outcome (an unverifiable byte range fails P1 by design). Indices
+/// that point partway into a multi-byte codepoint are not aligned to
+/// `char_indices()` boundaries and would panic the standard slicing
+/// operator, so we walk to the nearest safe boundary instead.
+fn extract_byte_range(text: &str, byte_start: usize, byte_end: usize) -> String {
+    if byte_end > text.len() || byte_start >= byte_end {
+        return String::new();
+    }
+    // Walk to the nearest valid char boundary at or after byte_start, and
+    // at or before byte_end. is_char_boundary returns true for valid UTF-8
+    // boundaries; for byte indices that already align (the vast majority
+    // for ASCII source files) this is a single check.
+    let mut start = byte_start;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = byte_end;
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if start >= end {
+        return String::new();
+    }
+    text[start..end].to_string()
 }
 
 #[cfg(test)]

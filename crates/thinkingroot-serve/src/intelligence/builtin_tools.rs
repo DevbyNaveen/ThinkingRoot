@@ -388,6 +388,65 @@ impl ToolHandler for UseSkillTool {
     }
 }
 
+/// `read_source` — fetch the exact source bytes a claim cites.
+///
+/// One of the three v3 MCP tools per the v3 spec §8.5
+/// (`docs/2026-04-29-thinkingroot-v3-final-plan.md`). Closes the
+/// "verifiable byte range" loop: every claim emitted by extract carries
+/// `(file, byte_start, byte_end)`; this tool reads the bytes back so an
+/// agent can quote source verbatim instead of paraphrasing.
+pub struct ReadSourceTool {
+    ctx: ToolContext,
+}
+
+impl ReadSourceTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "read_source",
+            "Fetch the exact source bytes a claim cites. Pass the claim id (from search or list_claims results) and the tool returns the verbatim text from the source file at the byte range the claim was extracted from. Use this to quote source rather than paraphrase, or to verify a claim's grounding.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "claim_id": {
+                        "type": "string",
+                        "description": "The claim id to read source bytes for."
+                    }
+                },
+                "required": ["claim_id"]
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadSourceTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let Some(claim_id) = input.get("claim_id").and_then(|v| v.as_str()) else {
+            return ToolHandlerResult::error("missing required field: claim_id");
+        };
+        let engine = self.ctx.engine.read().await;
+        match engine.read_source(&self.ctx.workspace, claim_id).await {
+            Ok(result) => {
+                if result.bytes.is_empty() {
+                    ToolHandlerResult::ok(format!(
+                        "claim {} has no byte-range citation yet (file: {}). Use read_file({:?}) to fetch the whole file.",
+                        claim_id, result.file, result.file
+                    ))
+                } else {
+                    ToolHandlerResult::ok(format!(
+                        "Source: {} (bytes {}–{})\n\n{}",
+                        result.file, result.byte_start, result.byte_end, result.text
+                    ))
+                }
+            }
+            Err(e) => ToolHandlerResult::error(format!("read_source failed: {e}")),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Write tools (route through ApprovalGate)
 // ─────────────────────────────────────────────────────────────────
@@ -759,6 +818,10 @@ pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
             UseSkillTool::spec(),
             Arc::new(UseSkillTool::new(ctx.clone())),
         )
+        .register_read(
+            ReadSourceTool::spec(),
+            Arc::new(ReadSourceTool::new(ctx.clone())),
+        )
         .register_write(
             CreateBranchTool::spec(),
             Arc::new(CreateBranchTool::new(ctx.clone())),
@@ -872,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_tools_produces_nine_tools() {
+    fn register_builtin_tools_produces_ten_tools() {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx);
         let mut names = registry.tool_names();
@@ -886,6 +949,7 @@ mod tests {
                 "list_branches",
                 "list_claims",
                 "merge_branch",
+                "read_source",
                 "search",
                 "use_skill",
                 "workspace_info",
