@@ -246,6 +246,89 @@ impl V3PackBuilder {
         )
     }
 
+    /// Build a pack signed by a caller-supplied external signing
+    /// flow. Same steps 1-6 as [`build_signed`] except the signature
+    /// bytes come from the supplied `signer` closure rather than from
+    /// in-process Ed25519 signing.
+    ///
+    /// The closure receives the canonical bytes the verifier will
+    /// later reconstruct from the pack contents:
+    ///
+    /// ```text
+    /// canonical_manifest_with_pack_hash_blanked
+    ///   || NUL
+    ///   || source.tar.zst
+    ///   || NUL
+    ///   || claims.jsonl
+    /// ```
+    ///
+    /// and returns the bytes to drop into the outer tar as
+    /// `signature.sig`. This is the seam used by `root pack
+    /// --sign-keyless`: the CLI runs the Sigstore-public-good keyless
+    /// flow against these canonical bytes (see
+    /// `tr_sigstore::live::sign_canonical_bytes_keyless`) and hands the
+    /// resulting Sigstore Bundle JSON back through this closure.
+    ///
+    /// The signer's error type bounds on `Display` (not `Error`) so
+    /// callers can pass back any string-stringifiable failure without
+    /// committing to a specific error hierarchy.
+    pub fn build_with_signer<F, E>(mut self, signer: F) -> Result<Vec<u8>>
+    where
+        F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, E>,
+        E: std::fmt::Display,
+    {
+        // 1-3: same opening as build / build_signed.
+        let source_tar_zst = self.build_inner_source_archive()?;
+        let source_hash = format!("blake3:{}", blake3_hex(&source_tar_zst));
+        self.claims.sort_by(|a, b| a.id.cmp(&b.id));
+        let claims_jsonl = self.serialize_claims_jsonl()?;
+        let claims_hash = format!("blake3:{}", blake3_hex(&claims_jsonl));
+        self.manifest.source_hash = source_hash;
+        self.manifest.claims_hash = claims_hash;
+        self.manifest.source_files = Some(self.source_files.len() as u64);
+        self.manifest.source_bytes = Some(
+            self.source_files
+                .values()
+                .map(|b| b.len() as u64)
+                .sum::<u64>(),
+        );
+        self.manifest.claim_count = Some(self.claims.len() as u64);
+
+        // 4: canonical hash input (manifest with pack_hash BLANKED).
+        let canonical_manifest = self.manifest.canonical_bytes_for_hashing();
+        let mut hash_input = Vec::with_capacity(
+            canonical_manifest.len() + 1 + source_tar_zst.len() + 1 + claims_jsonl.len(),
+        );
+        hash_input.extend_from_slice(&canonical_manifest);
+        hash_input.push(0);
+        hash_input.extend_from_slice(&source_tar_zst);
+        hash_input.push(0);
+        hash_input.extend_from_slice(&claims_jsonl);
+
+        // External sign step. Run before populating `pack_hash` because
+        // the closure may want to recompute it from the canonical
+        // bytes itself (Ed25519 self-sign path), or sign the raw bytes
+        // and let the verifier dispatch on whichever digest the bundle
+        // ends up carrying (Sigstore-keyless path — sigstore-rs builds
+        // a sha256 subject digest internally).
+        let signature_bytes =
+            signer(&hash_input).map_err(|e| Error::Invalid {
+                what: "signature.sig",
+                detail: format!("external signer: {e}"),
+            })?;
+
+        // 5: populate pack_hash and re-emit manifest.
+        self.manifest.pack_hash = format!("blake3:{}", blake3_hex(&hash_input));
+        let manifest_toml = self.manifest.to_canonical_toml();
+
+        emit_outer_tar(
+            &manifest_toml,
+            &source_tar_zst,
+            &claims_jsonl,
+            Some(&signature_bytes),
+        )
+    }
+
     fn build_inner_source_archive(&self) -> Result<Vec<u8>> {
         let mut tar_bytes = Vec::with_capacity(4096);
         {
@@ -401,6 +484,90 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec![MANIFEST_NAME, SOURCE_BUNDLE_NAME, CLAIMS_NAME]);
+    }
+
+    #[test]
+    fn build_with_signer_round_trips_external_signature() {
+        // Verifies (a) the closure receives the canonical hash input
+        // (manifest with pack_hash blanked || NUL || source || NUL ||
+        // claims), (b) the closure's returned bytes land in the outer
+        // tar as `signature.sig`, and (c) BLAKE3 of the closure's
+        // input equals what the manifest's pack_hash field becomes
+        // after build.
+        let mut b = V3PackBuilder::new(fixture_manifest());
+        b.add_source_file("hello.md", b"# Hello\n").unwrap();
+        b.add_claim(ClaimRecord::new(
+            "c-1",
+            "G",
+            vec![],
+            "hello.md",
+            0,
+            8,
+        ));
+
+        let captured_canonical: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(Vec::new());
+        let bytes = b
+            .build_with_signer(|canonical| {
+                captured_canonical.borrow_mut().extend_from_slice(canonical);
+                Ok::<_, std::convert::Infallible>(b"<external-sig-bytes>".to_vec())
+            })
+            .unwrap();
+
+        // Outer tar must contain all 4 entries in the expected order.
+        let mut archive = tar::Archive::new(Cursor::new(&bytes));
+        let mut found_sig: Option<Vec<u8>> = None;
+        let mut found_manifest: Option<Vec<u8>> = None;
+        let mut names: Vec<String> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+            if path == SIGNATURE_NAME {
+                found_sig = Some(data);
+            } else if path == MANIFEST_NAME {
+                found_manifest = Some(data);
+            }
+            names.push(path);
+        }
+        assert_eq!(
+            names,
+            vec![
+                MANIFEST_NAME,
+                SOURCE_BUNDLE_NAME,
+                CLAIMS_NAME,
+                SIGNATURE_NAME
+            ],
+        );
+        assert_eq!(found_sig.unwrap(), b"<external-sig-bytes>");
+
+        // The pack_hash recorded in the final manifest must equal
+        // BLAKE3 of the canonical bytes the closure received.
+        let manifest_str = String::from_utf8(found_manifest.unwrap()).unwrap();
+        let parsed: ManifestV3 = toml::from_str(&manifest_str).unwrap();
+        let expected_hash = format!(
+            "blake3:{}",
+            crate::digest::blake3_hex(&captured_canonical.borrow()),
+        );
+        assert_eq!(parsed.pack_hash, expected_hash);
+    }
+
+    #[test]
+    fn build_with_signer_propagates_callback_error() {
+        let mut b = V3PackBuilder::new(fixture_manifest());
+        b.add_source_file("a.md", b"alpha").unwrap();
+        let result = b.build_with_signer(
+            |_canonical| -> std::result::Result<Vec<u8>, &str> {
+                Err("simulated OIDC failure")
+            },
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("simulated OIDC failure"),
+            "expected wrapped signer error, got: {msg}",
+        );
     }
 
     #[test]

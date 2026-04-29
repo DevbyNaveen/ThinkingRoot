@@ -20,6 +20,10 @@ path = "src/main.rs"
 # `.tr` reader/writer (Phase A relocation — canonical home for the
 # wire format). Used by `root pack` and `root install`.
 tr-format     = { workspace = true }
+# tr-sigstore is needed even without --features live — `root verify`
+# uses its offline verification primitives. The `live` feature on
+# this crate flips on `tr-sigstore/live` for the keyless signing flow.
+tr-sigstore   = { workspace = true }
 # Trust verification + revocation cache for `root install`.
 tr-verify     = { workspace = true }
 tr-revocation = { workspace = true }
@@ -77,6 +81,11 @@ ed25519-dalek = { workspace = true }
 ## --no-default-features for faster test builds that skip ONNX Runtime linking.
 default = ["vector"]
 vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector", "thinkingroot-branch/vector", "thinkingroot-ground/vector"]
+## Enable `root pack --sign-keyless` (Sigstore-public-good keyless flow).
+## Pulls in sigstore-rs + tokio + rustls + oauth2 transitively. The default
+## build of `root` stays lean and offline — keyless signing is opt-in for
+## users who actually want to publish to Sigstore-public-good.
+live = ["tr-sigstore/live"]
 
 [dev-dependencies]
 tempfile = "3"

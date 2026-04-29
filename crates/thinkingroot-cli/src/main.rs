@@ -360,11 +360,18 @@ enum Commands {
         /// and `--format=tr/3`, the pack is signed inline and emitted
         /// with `signature.sig` as the 4th outer-tar entry. The Phase
         /// F design (`docs/2026-04-29-phase-f-trust-verify-spec.md`)
-        /// covers the wire format. Live Fulcio keyless-OIDC signing
-        /// is the W3.5 follow-up; today's `--sign` is the air-gapped
-        /// / self-signed path.
-        #[arg(long, value_name = "KEY_FILE")]
+        /// covers the wire format. This is the air-gapped /
+        /// self-signed path; for Fulcio-keyless OIDC signing pass
+        /// `--sign-keyless` instead.
+        #[arg(long, value_name = "KEY_FILE", conflicts_with = "sign_keyless")]
         sign: Option<PathBuf>,
+        /// Sign the pack via the Sigstore-public-good keyless flow:
+        /// browser-driven OIDC, Fulcio-issued ephemeral cert, Rekor
+        /// witness submission. Requires the binary to be built with
+        /// `--features live` (otherwise this flag exits with a clear
+        /// "rebuild required" message). Implies `--format=tr/3`.
+        #[arg(long, conflicts_with = "sign")]
+        sign_keyless: bool,
     },
     /// Verify a v3 `.tr` pack's integrity and signature without
     /// installing it. Runs the offline verification chain from spec
@@ -892,6 +899,7 @@ async fn async_main() -> anyhow::Result<()> {
             description,
             format,
             sign,
+            sign_keyless,
         }) => {
             pack_cmd::run_pack(
                 &workspace,
@@ -902,6 +910,7 @@ async fn async_main() -> anyhow::Result<()> {
                 description,
                 &format,
                 sign.as_deref(),
+                sign_keyless,
             )?;
         }
         Some(Commands::Verify {

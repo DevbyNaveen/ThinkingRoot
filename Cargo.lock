@@ -7080,6 +7080,7 @@ dependencies = [
  "tr-format",
  "tr-render",
  "tr-revocation",
+ "tr-sigstore",
  "tr-verify",
  "tracing",
  "tracing-subscriber",

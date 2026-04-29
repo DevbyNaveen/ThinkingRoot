@@ -271,7 +271,7 @@ fn is_excluded(rel: &Path, excludes: &[String]) -> bool {
         rel.components()
             .any(|c| c.as_os_str().to_string_lossy() == *e)
             || s.starts_with(&format!("{e}/"))
-            || s.as_ref() == e.as_str()
+            || AsRef::<str>::as_ref(&s) == e.as_str()
     })
 }
 
