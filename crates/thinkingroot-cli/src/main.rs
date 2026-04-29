@@ -56,6 +56,15 @@ enum Commands {
         /// stay in the `attested` tier — same as pre-Rooting behavior.
         #[arg(long)]
         no_rooting: bool,
+        /// Run the v3 minimum 3-phase pipeline: Parse → Extract+Ground+
+        /// Rooting+Link+SVO → CozoDB persist. Skips vector index,
+        /// markdown artifacts, and post-compile health verification —
+        /// products that don't ship inside a v3 `.tr` pack anyway.
+        /// Use with `root pack --format=tr/3` for the fastest v3
+        /// build path. Without this flag, `root compile` runs the full
+        /// 11-phase v1 pipeline (back-compat default).
+        #[arg(long)]
+        v3_minimal: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -633,8 +642,9 @@ async fn async_main() -> anyhow::Result<()> {
             path,
             branch,
             no_rooting,
+            v3_minimal,
         }) => {
-            run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
+            run_compile(&path, branch.as_deref(), use_progress, no_rooting, v3_minimal).await?;
         }
         Some(Commands::Health { path }) => {
             run_health(&path).await?;
@@ -910,10 +920,10 @@ async fn async_main() -> anyhow::Result<()> {
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
-                run_compile(&path, None, use_progress, false).await?;
+                run_compile(&path, None, use_progress, false, false).await?;
             } else {
                 // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None, use_progress, false).await?;
+                run_compile(&PathBuf::from("."), None, use_progress, false, false).await?;
             }
         }
     }
@@ -926,6 +936,7 @@ async fn run_compile(
     branch: Option<&str>,
     use_progress: bool,
     no_rooting: bool,
+    v3_minimal: bool,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
@@ -955,7 +966,13 @@ async fn run_compile(
 
     let start = Instant::now();
 
-    let result = if use_progress {
+    let result = if v3_minimal {
+        // V3Minimal skips the heavy post-extract steps (vector,
+        // artifacts, verify). Progress UI assumes the full pipeline,
+        // so v3_minimal disables the indicatif bars and uses the
+        // plain async path. CozoDB output is identical either way.
+        pipeline::run_pipeline_v3_minimal(&path, branch, None).await?
+    } else if use_progress {
         progress::run_compile_progress(&path, branch).await?
     } else {
         pipeline::run_pipeline(&path, branch, None).await?

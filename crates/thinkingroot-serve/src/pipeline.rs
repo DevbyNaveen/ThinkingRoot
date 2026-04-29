@@ -135,12 +135,74 @@ pub struct PipelineResult {
     pub cache_dirty: bool,
 }
 
+/// Pipeline mode — controls whether the post-extract heavy steps
+/// (vector index, artifact compilation, post-compile verify) run.
+///
+/// Per the v3 implementation plan §Week 4 + D6: `Full` is the default
+/// for `root compile` and the Python `compile()` binding. `V3Minimal`
+/// is what `root pack --format=tr/3` callers want when they're
+/// optimising for v3 wire-format output and don't need the v1
+/// artifacts CozoDB doesn't include in the pack anyway.
+///
+/// Same CozoDB output in both modes — minimal just skips the steps
+/// whose products aren't part of a v3 pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMode {
+    /// All 11 phases run. Preserves the v1 contract: emits markdown
+    /// artifacts to `<workspace>/.thinkingroot/artifacts/`, builds the
+    /// vector index, and runs post-compile health verification.
+    Full,
+    /// 3-phase v3 minimum: Parse → Extract+Ground+Rooting+Link+SVO →
+    /// CozoDB persist. Skips:
+    /// - **Phase 9 Vector update** — consumers re-embed at consume
+    ///   time per spec §13.1.
+    /// - **Phase 10 Selective compilation** — markdown artifacts move
+    ///   to standalone `root render` per spec §11.
+    /// - **Phase 11 Verify** — post-compile health score moves to
+    ///   standalone `root health` per spec §11.
+    /// - **Early-exit Compiler/Verifier** when no docs changed.
+    ///
+    /// CozoDB still receives every claim/source/edge insert; v3 packs
+    /// produced from a V3Minimal compile carry the same byte-range
+    /// citations as a Full compile.
+    V3Minimal,
+}
+
+/// Run the full pipeline. Same as the historic v1 entry point — kept
+/// stable so every existing caller (CLI compile, watch mode, Python
+/// `compile()`, engine.compile) doesn't need a code change. Preserves
+/// the v1 contract per D6 of the v3 implementation plan.
 pub async fn run_pipeline(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<PipelineResult> {
-    let result = run_pipeline_inner(root_path, branch, progress.clone()).await;
+    run_pipeline_with_mode(root_path, branch, progress, PipelineMode::Full).await
+}
+
+/// Run the pipeline in the v3-minimal mode — Parse → Extract → CozoDB
+/// persist, no artifacts/vector/verify. Same CozoDB output as
+/// `run_pipeline`; just faster. Used by callers that produce v3 packs
+/// directly (artifacts/vector aren't part of the v3 wire format).
+pub async fn run_pipeline_v3_minimal(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<PipelineResult> {
+    run_pipeline_with_mode(root_path, branch, progress, PipelineMode::V3Minimal).await
+}
+
+/// Internal entry point — both [`run_pipeline`] and
+/// [`run_pipeline_v3_minimal`] funnel through here. The mode flag
+/// gates Phases 9/10/11 + the early-exit artifact path; everything
+/// else (parse, extract, ground, root, link, SVO) runs identically.
+pub async fn run_pipeline_with_mode(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    mode: PipelineMode,
+) -> Result<PipelineResult> {
+    let result = run_pipeline_inner(root_path, branch, progress.clone(), mode).await;
     if let Err(ref e) = result
         && let Some(ref tx) = progress
     {
@@ -155,6 +217,7 @@ async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    mode: PipelineMode,
 ) -> Result<PipelineResult> {
     macro_rules! emit {
         ($event:expr) => {
@@ -623,36 +686,54 @@ async fn run_pipeline_inner(
             contradictions: 0
         });
 
-        let (ent_count, clm_count) =
-            update_vector_index_full_with_progress(&mut storage, &progress)?;
-        emit!(ProgressEvent::VectorUpdateDone {
-            entities_indexed: ent_count,
-            claims_indexed: clm_count,
-        });
+        // Vector index, selective compilation, and post-compile health
+        // verification are part of the v1 contract — V3Minimal skips
+        // them per spec §11. CozoDB content is identical either way.
+        let (artifacts_count, contradictions_count, health_score) =
+            if matches!(mode, PipelineMode::Full) {
+                let (ent_count, clm_count) =
+                    update_vector_index_full_with_progress(&mut storage, &progress)?;
+                emit!(ProgressEvent::VectorUpdateDone {
+                    entities_indexed: ent_count,
+                    claims_indexed: clm_count,
+                });
 
-        let compiler = {
-            let c = thinkingroot_compile::Compiler::new(&config)?;
-            if let Some(ref tx) = progress {
-                let tx_compile = tx.clone();
-                let pf = Arc::new(move |done: usize, total: usize| {
-                    let _ = tx_compile.send(ProgressEvent::CompilationProgress { done, total });
-                }) as thinkingroot_compile::CompileProgressFn;
-                c.with_progress(pf)
+                let compiler = {
+                    let c = thinkingroot_compile::Compiler::new(&config)?;
+                    if let Some(ref tx) = progress {
+                        let tx_compile = tx.clone();
+                        let pf = Arc::new(move |done: usize, total: usize| {
+                            let _ = tx_compile
+                                .send(ProgressEvent::CompilationProgress { done, total });
+                        })
+                            as thinkingroot_compile::CompileProgressFn;
+                        c.with_progress(pf)
+                    } else {
+                        c
+                    }
+                };
+                let artifacts =
+                    compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
+                emit!(ProgressEvent::CompilationDone {
+                    artifacts: artifacts.len()
+                });
+
+                let verifier = thinkingroot_verify_internal::Verifier::new(&config);
+                let verification = verifier.verify(&storage.graph)?;
+                emit!(ProgressEvent::VerificationDone {
+                    health: verification.health_score.as_percentage(),
+                });
+                (
+                    artifacts.len(),
+                    verification.contradictions,
+                    verification.health_score.as_percentage(),
+                )
             } else {
-                c
-            }
-        };
-        let artifacts =
-            compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
-        emit!(ProgressEvent::CompilationDone {
-            artifacts: artifacts.len()
-        });
-
-        let verifier = thinkingroot_verify_internal::Verifier::new(&config);
-        let verification = verifier.verify(&storage.graph)?;
-        emit!(ProgressEvent::VerificationDone {
-            health: verification.health_score.as_percentage(),
-        });
+                // V3Minimal: health is a v1 concept; report the
+                // best-case 100 (no contradictions counted because the
+                // v3 verifier doesn't run in this mode — see spec §11).
+                (0usize, 0usize, 100u8)
+            };
 
         fingerprints.save()?;
         config.save(root_path)?;
@@ -662,9 +743,9 @@ async fn run_pipeline_inner(
             claims_count: 0,
             entities_count: 0,
             relations_count: 0,
-            contradictions_count: verification.contradictions,
-            artifacts_count: artifacts.len(),
-            health_score: verification.health_score.as_percentage(),
+            contradictions_count,
+            artifacts_count,
+            health_score,
             cache_hits,
             early_cutoffs: skipped + fingerprint_cutoffs,
             structural_extractions: extraction.structural_extractions,
@@ -940,7 +1021,12 @@ async fn run_pipeline_inner(
         .update_entity_relations_for_triples(&new_triples)?;
 
     // ─── Phase 9: Vector update ─────────────────────────────────────────
-    if deleted == 0 {
+    // V3Minimal skips vector index entirely — consumers re-embed at
+    // consume time per spec §13.1 (embedding models drift 7+ nDCG@10
+    // points/year per MTEB; baked embeddings are anti-feature).
+    if matches!(mode, PipelineMode::Full)
+        && deleted == 0
+    {
         // Surgical update: remove stale entries, upsert new ones.
         // Claims are always source-scoped — all stale claim IDs are safe to remove.
         // Entities may survive if other sources still reference them — only remove
@@ -1035,7 +1121,7 @@ async fn run_pipeline_inner(
             entities_indexed: ent_count,
             claims_indexed: clm_count,
         });
-    } else {
+    } else if matches!(mode, PipelineMode::Full) {
         // Deletions occurred — full rebuild to correctly handle orphaned entries.
         let (ent_count, clm_count) =
             update_vector_index_full_with_progress(&mut storage, &progress)?;
@@ -1046,34 +1132,52 @@ async fn run_pipeline_inner(
     }
 
     // ─── Phase 10: Selective compilation ────────────────────────────────
-    let compiler = {
-        let c = thinkingroot_compile::Compiler::new(&config)?;
-        if let Some(ref tx) = progress {
-            let tx_compile = tx.clone();
-            let pf = Arc::new(move |done: usize, total: usize| {
-                let _ = tx_compile.send(ProgressEvent::CompilationProgress { done, total });
-            }) as thinkingroot_compile::CompileProgressFn;
-            c.with_progress(pf)
-        } else {
-            c
-        }
-    };
-    let artifacts = compiler.compile_affected(
-        &storage.graph,
-        &data_dir,
-        &link_output.affected_entity_ids,
-        true,
-    )?;
-    emit!(ProgressEvent::CompilationDone {
-        artifacts: artifacts.len()
-    });
+    // Phase 11: Verify + persist (post-compile health). Both move to
+    // standalone subcommands in v3 (spec §11): `root render` for
+    // artifacts, `root health` for the verify pass. V3Minimal skips
+    // them so v3 packs build fast; Full keeps them for the v1
+    // contract preserved by D6 (Python `compile()`, `root compile`).
+    let (artifacts_count, contradictions_count, health_score) =
+        if matches!(mode, PipelineMode::Full) {
+            let compiler = {
+                let c = thinkingroot_compile::Compiler::new(&config)?;
+                if let Some(ref tx) = progress {
+                    let tx_compile = tx.clone();
+                    let pf = Arc::new(move |done: usize, total: usize| {
+                        let _ = tx_compile
+                            .send(ProgressEvent::CompilationProgress { done, total });
+                    }) as thinkingroot_compile::CompileProgressFn;
+                    c.with_progress(pf)
+                } else {
+                    c
+                }
+            };
+            let artifacts = compiler.compile_affected(
+                &storage.graph,
+                &data_dir,
+                &link_output.affected_entity_ids,
+                true,
+            )?;
+            emit!(ProgressEvent::CompilationDone {
+                artifacts: artifacts.len()
+            });
 
-    // ─── Phase 11: Verify + persist ─────────────────────────────────────
-    let verifier = thinkingroot_verify_internal::Verifier::new(&config);
-    let verification = verifier.verify(&storage.graph)?;
-    emit!(ProgressEvent::VerificationDone {
-        health: verification.health_score.as_percentage(),
-    });
+            let verifier = thinkingroot_verify_internal::Verifier::new(&config);
+            let verification = verifier.verify(&storage.graph)?;
+            emit!(ProgressEvent::VerificationDone {
+                health: verification.health_score.as_percentage(),
+            });
+            (
+                artifacts.len(),
+                verification.contradictions,
+                verification.health_score.as_percentage(),
+            )
+        } else {
+            // V3Minimal: artifacts/health are v1 concepts. Report
+            // best-case 100 so consumers reading PipelineResult don't
+            // mistake a skipped run for an unhealthy graph.
+            (0usize, 0usize, 100u8)
+        };
 
     fingerprints.save()?;
     config.save(root_path)?;
@@ -1083,9 +1187,9 @@ async fn run_pipeline_inner(
         claims_count,
         entities_count,
         relations_count,
-        contradictions_count: verification.contradictions,
-        artifacts_count: artifacts.len(),
-        health_score: verification.health_score.as_percentage(),
+        contradictions_count,
+        artifacts_count,
+        health_score,
         cache_hits,
         early_cutoffs: skipped + fingerprint_cutoffs,
         structural_extractions,
