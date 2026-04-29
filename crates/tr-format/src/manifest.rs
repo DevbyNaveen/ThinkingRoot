@@ -404,10 +404,14 @@ impl ManifestV3 {
             out.push_str("\"\n");
         }
         if let Some(e) = &self.extracted_at {
-            // RFC 3339 with seconds precision and a literal `Z` suffix —
-            // TOML's native datetime literal is bare (no surrounding quotes).
+            // RFC 3339 with seconds precision and a literal `Z` suffix.
+            // Emitted as a quoted basic string (not TOML's native
+            // datetime literal) so chrono's `DateTime<Utc>` serde
+            // adapter — which expects a string — round-trips through
+            // `ManifestV3::parse`. TOML native datetime would require
+            // a custom deserializer in every consumer.
             out.push_str(&format!(
-                "extracted_at = {}\n",
+                "extracted_at = \"{}\"\n",
                 e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             ));
         }

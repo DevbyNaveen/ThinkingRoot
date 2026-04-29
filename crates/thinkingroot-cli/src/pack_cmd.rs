@@ -1060,6 +1060,179 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::tempdir;
 
+    /// Build a fake v3-shape compiled workspace with a real CozoDB +
+    /// source-byte store. Returns the workspace root.
+    ///
+    /// The shape this produces matches what `root compile` leaves
+    /// behind:
+    /// - `.thinkingroot/graph.db` — CozoDB with one source + one claim
+    ///   carrying a non-zero `(byte_start, byte_end)` triple (W1
+    ///   contract).
+    /// - `.thinkingroot/rooting/sources/...` — durable source-byte
+    ///   store entry the v3 pack writer reads from.
+    /// - `Pack.toml` at workspace root.
+    fn fake_v3_workspace(dir: &Path) -> PathBuf {
+        use thinkingroot_core::types::{ContentHash, SourceSpan, SourceType, WorkspaceId};
+        use thinkingroot_core::{Claim, ClaimType, Source};
+        use thinkingroot_graph::graph::GraphStore;
+        use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+
+        let workspace = dir.to_path_buf();
+        let engine = workspace.join(".thinkingroot");
+        fs::create_dir_all(&engine).unwrap();
+
+        let graph = GraphStore::init(&engine).unwrap();
+        let source_store = FileSystemSourceStore::new(&engine).unwrap();
+
+        // Synthetic source — a small Rust file. The `file://` URI is
+        // what the workspace_relative_pack_path mapping consumes.
+        let source_text = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let abs_path = workspace.join("src").join("lib.rs");
+        fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+        fs::write(&abs_path, source_text).unwrap();
+        let uri = format!("file://{}", abs_path.display());
+        let content_hash = ContentHash::from_bytes(source_text.as_bytes());
+        let source = Source::new(uri.clone(), SourceType::File).with_hash(content_hash.clone());
+        graph.insert_source(&source).unwrap();
+        source_store
+            .put(source.id, &content_hash, source_text.as_bytes())
+            .unwrap();
+
+        // One claim with byte ranges into the source. The byte slice
+        // `[3, 35)` covers `add(a: i32, b: i32) -> i32` — the
+        // function signature.
+        let claim = Claim::new(
+            "add takes two i32 and returns their sum",
+            ClaimType::Definition,
+            source.id,
+            WorkspaceId::new(),
+        )
+        .with_span(SourceSpan::bytes(3, 35));
+        graph.insert_claim(&claim).unwrap();
+
+        fs::write(
+            workspace.join("Pack.toml"),
+            r#"[pack]
+name = "alice/v3-e2e"
+version = "1.0.0"
+license = "MIT"
+description = "v3 lifecycle round-trip test."
+"#,
+        )
+        .unwrap();
+        workspace
+    }
+
+    #[tokio::test]
+    async fn v3_pack_lifecycle_round_trips_byte_ranges() {
+        use tr_format::read_v3_pack;
+
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        // 1. Run pack — same code path as `root pack --format=tr/3`.
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+        )
+        .unwrap();
+        assert!(out_tr.exists(), "v3 pack file not produced");
+
+        // 2. Read back via the v3 reader (same code path as
+        //    `root verify` parses with).
+        let bytes = fs::read(&out_tr).unwrap();
+        let pack = read_v3_pack(&bytes).expect("v3 pack must parse");
+
+        // 3. Manifest invariants.
+        assert_eq!(pack.manifest.name, "alice/v3-e2e");
+        assert_eq!(pack.manifest.format_version, "tr/3");
+        assert!(
+            pack.manifest.pack_hash.starts_with("blake3:"),
+            "pack_hash must be set: {:?}",
+            pack.manifest.pack_hash
+        );
+        assert!(pack.manifest.source_hash.starts_with("blake3:"));
+        assert!(pack.manifest.claims_hash.starts_with("blake3:"));
+        assert_eq!(pack.manifest.source_files, Some(1));
+        assert_eq!(pack.manifest.claim_count, Some(1));
+        assert_eq!(pack.manifest.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            pack.manifest.description.as_deref(),
+            Some("v3 lifecycle round-trip test.")
+        );
+        assert!(pack.signature.is_none(), "unsigned pack today");
+
+        // 4. Pack-hash chain. The verifier's first-line defence —
+        //    catches any tampering between sign-time and verify-time.
+        assert_eq!(
+            pack.recompute_pack_hash(),
+            pack.manifest.pack_hash,
+            "recipe-recomputed hash must match manifest's declared hash"
+        );
+
+        // 5. Claims body sanity. JSONL with stable field order, byte
+        //    ranges populated.
+        let claims_text =
+            std::str::from_utf8(&pack.claims_jsonl).expect("claims.jsonl is UTF-8");
+        let lines: Vec<&str> = claims_text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one claim emitted");
+        let line: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("claims.jsonl line parses");
+        assert_eq!(line["start"], 3);
+        assert_eq!(line["end"], 35);
+        assert_eq!(
+            line["stmt"],
+            "add takes two i32 and returns their sum"
+        );
+        assert!(
+            line["file"].as_str().unwrap().ends_with("src/lib.rs"),
+            "file should resolve to a workspace-relative path"
+        );
+
+        // 6. Verify (unsigned path) — confirms the pack itself is
+        //    well-formed even before W3.5 wires Fulcio signing.
+        use tr_verify::{V3Verdict, verify_v3_pack};
+        let verdict = verify_v3_pack(&pack);
+        assert!(
+            matches!(verdict, V3Verdict::Unsigned),
+            "unsigned pack should report Unsigned verdict, got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_pack_then_verify_via_run_verify_cli_path() {
+        // Variant that goes through the `root verify` CLI exit-code
+        // surface end-to-end.
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+        )
+        .unwrap();
+
+        // Without --allow-unsigned, exit code is EXIT_UNSIGNED = 70.
+        let code = run_verify(&out_tr, false).unwrap();
+        assert_eq!(code, EXIT_UNSIGNED);
+
+        // With --allow-unsigned, exit code is 0.
+        let code = run_verify(&out_tr, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
     /// Set up a fake compiled workspace in `dir`. Returns the workspace
     /// root (parent of `.thinkingroot/`).
     fn fake_engine_workspace(dir: &Path) -> PathBuf {
