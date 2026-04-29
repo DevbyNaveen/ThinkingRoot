@@ -1,0 +1,29 @@
+[package]
+name = "tr-sigstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sigstore keyless OIDC signing + offline DSSE verification for v3 packs."
+
+[lib]
+name = "tr_sigstore"
+path = "src/lib.rs"
+
+# Week 0 scaffold: no sigstore-rs dep yet. Week 3 adds sigstore = "0.10"
+# (or whatever is current on crates.io at the start of W3) along with the
+# Fulcio + Rekor client integrations. The crate exists at this stage so that
+# tr-verify can declare it as an optional dependency behind the
+# `sigstore-impl` feature without needing a follow-up workspace edit.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

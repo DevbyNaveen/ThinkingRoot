@@ -21,6 +21,7 @@ members = [
     "crates/tr-identity",
     "crates/tr-render",
     "crates/tr-revocation",
+    "crates/tr-sigstore",
     "crates/tr-transparency",
     "crates/tr-verify",
     "thinkingroot-python",
@@ -49,6 +50,7 @@ default-members = [
     "crates/tr-identity",
     "crates/tr-render",
     "crates/tr-revocation",
+    "crates/tr-sigstore",
     "crates/tr-transparency",
     "crates/tr-verify",
 ]
@@ -85,6 +87,7 @@ tr-format            = { path = "crates/tr-format",            version = "0.9.1"
 tr-identity          = { path = "crates/tr-identity",          version = "0.9.1" }
 tr-render            = { path = "crates/tr-render",            version = "0.9.1" }
 tr-revocation        = { path = "crates/tr-revocation",        version = "0.9.1" }
+tr-sigstore          = { path = "crates/tr-sigstore",          version = "0.9.1" }
 tr-transparency      = { path = "crates/tr-transparency",      version = "0.9.1" }
 tr-verify            = { path = "crates/tr-verify",            version = "0.9.1" }
 

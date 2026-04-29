@@ -6663,6 +6663,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tr-sigstore"
+version = "0.9.1"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tr-transparency"
 version = "0.9.1"
 dependencies = [
