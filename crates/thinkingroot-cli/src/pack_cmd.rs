@@ -135,16 +135,25 @@ pub fn run_pack(
     license_override: Option<String>,
     description_override: Option<String>,
     format: &str,
+    sign_key_path: Option<&Path>,
 ) -> Result<()> {
     match format {
-        "tr/1" => run_pack_v1(
-            workspace,
-            out,
-            name_override,
-            version_override,
-            license_override,
-            description_override,
-        ),
+        "tr/1" => {
+            if sign_key_path.is_some() {
+                return Err(anyhow!(
+                    "`--sign` is only supported with `--format=tr/3`; \
+                     v1 packs use a different signature mechanism (see Phase F design)"
+                ));
+            }
+            run_pack_v1(
+                workspace,
+                out,
+                name_override,
+                version_override,
+                license_override,
+                description_override,
+            )
+        }
         "tr/3" => run_pack_v3(
             workspace,
             out,
@@ -152,6 +161,7 @@ pub fn run_pack(
             version_override,
             license_override,
             description_override,
+            sign_key_path,
         ),
         other => Err(anyhow!(
             "unknown pack format `{other}`; supported: tr/1, tr/3"
@@ -244,7 +254,9 @@ fn run_pack_v3(
     version_override: Option<String>,
     license_override: Option<String>,
     description_override: Option<String>,
+    sign_key_path: Option<&Path>,
 ) -> Result<()> {
+    use ed25519_dalek::SigningKey;
     use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
 
     let engine_dir = workspace.join(".thinkingroot");
@@ -355,12 +367,28 @@ fn run_pack_v3(
         claim_count += 1;
     }
 
-    // 5. Seal the pack and write to disk.
-    let bytes = builder.build().map_err(|e| anyhow!("build .tr: {e}"))?;
+    // 5. Seal the pack. If a signing key was supplied, drive
+    //    `build_signed` so a Sigstore Bundle is appended as the 4th
+    //    outer-tar entry. Otherwise emit unsigned — `root verify`
+    //    reports the Unsigned verdict for these.
     let out_path = out.unwrap_or_else(|| {
         let owner_slug = v1_manifest.name.replace('/', "-");
         workspace.join(format!("{owner_slug}-{}.tr", v1_manifest.version))
     });
+    let pack_filename = out_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("package.tr")
+        .to_string();
+    let bytes = if let Some(key_path) = sign_key_path {
+        let key = load_signing_key(key_path)
+            .with_context(|| format!("load signing key from {}", key_path.display()))?;
+        builder
+            .build_signed(&key, &pack_filename)
+            .map_err(|e| anyhow!("build signed .tr: {e}"))?
+    } else {
+        builder.build().map_err(|e| anyhow!("build .tr: {e}"))?
+    };
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -368,8 +396,14 @@ fn run_pack_v3(
     }
     fs::write(&out_path, &bytes).with_context(|| format!("write {}", out_path.display()))?;
 
+    let signed_label = if sign_key_path.is_some() {
+        " signed"
+    } else {
+        ""
+    };
     println!(
-        "  packed {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
+        "  packed{} {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
+        signed_label,
         v1_manifest.name,
         v1_manifest.version,
         packed_paths.len(),
@@ -379,6 +413,41 @@ fn run_pack_v3(
         out_path.display()
     );
     Ok(())
+}
+
+/// Load an Ed25519 signing key from disk. Two file formats accepted:
+/// - 32 raw bytes (the most compact form; `dd if=/dev/urandom bs=32
+///   count=1 of=key.bin` produces one).
+/// - 64 hex chars on a single line (with optional trailing newline) —
+///   easier to inspect and to commit-checkable for test fixtures.
+///
+/// Returns a clear error when neither shape matches so the user can
+/// regenerate without guessing.
+fn load_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    use ed25519_dalek::SigningKey;
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        return Ok(SigningKey::from_bytes(&arr));
+    }
+    // Try hex with possible trailing newline.
+    let trimmed = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow!("key file is neither 32 raw bytes nor UTF-8 hex"))?
+        .trim();
+    if trimmed.len() == 64 {
+        let mut arr = [0u8; 32];
+        for i in 0..32 {
+            let byte_str = &trimmed[i * 2..i * 2 + 2];
+            arr[i] = u8::from_str_radix(byte_str, 16)
+                .map_err(|_| anyhow!("key file has invalid hex at byte {i}"))?;
+        }
+        return Ok(SigningKey::from_bytes(&arr));
+    }
+    Err(anyhow!(
+        "signing key must be 32 raw bytes or 64 hex chars; got {} bytes",
+        bytes.len()
+    ))
 }
 
 /// Run `root verify <pack>`. Reads the pack from disk, parses the
@@ -1140,6 +1209,7 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             "tr/3",
+            None,
         )
         .unwrap();
         assert!(out_tr.exists(), "v3 pack file not produced");
@@ -1206,6 +1276,81 @@ description = "v3 lifecycle round-trip test."
     }
 
     #[tokio::test]
+    async fn v3_pack_signed_round_trips_through_verify() {
+        use tr_format::read_v3_pack;
+        use tr_verify::{V3Verdict, verify_v3_pack};
+
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        // Write a deterministic Ed25519 key as 64 hex chars.
+        let key_path = tmp.path().join("signing.key");
+        let hex_key: String = (0..32).map(|i| format!("{:02x}", i + 1)).collect();
+        fs::write(&key_path, &hex_key).unwrap();
+
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+            Some(&key_path),
+        )
+        .unwrap();
+
+        // Read back: the pack now carries a signature.sig.
+        let bytes = fs::read(&out_tr).unwrap();
+        let pack = read_v3_pack(&bytes).expect("signed pack must parse");
+        assert!(pack.signature.is_some(), "signed pack must carry signature.sig");
+
+        // Library-level verify: should be Verified (self-signed).
+        let verdict = verify_v3_pack(&pack);
+        match verdict {
+            V3Verdict::Verified {
+                identity,
+                rekor_log_index,
+                ..
+            } => {
+                assert!(identity.is_none(), "self-signed has no Sigstore identity");
+                assert!(rekor_log_index.is_none(), "self-signed has no Rekor entry");
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+
+        // CLI exit-code path: signed pack returns 0 without --allow-unsigned.
+        let code = run_verify(&out_tr, false).unwrap();
+        assert_eq!(code, 0, "signed pack should exit 0");
+    }
+
+    #[tokio::test]
+    async fn signing_key_loader_accepts_raw_and_hex() {
+        let tmp = tempdir().unwrap();
+        // Raw 32 bytes.
+        let raw_path = tmp.path().join("raw.key");
+        let raw: Vec<u8> = (0u8..32u8).collect();
+        fs::write(&raw_path, &raw).unwrap();
+        let raw_key = load_signing_key(&raw_path).expect("raw bytes accepted");
+        // Hex form of same bytes.
+        let hex_path = tmp.path().join("hex.key");
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&hex_path, &hex).unwrap();
+        let hex_key = load_signing_key(&hex_path).expect("hex accepted");
+        assert_eq!(
+            raw_key.verifying_key().to_bytes(),
+            hex_key.verifying_key().to_bytes(),
+            "raw and hex of same bytes must produce the same key"
+        );
+
+        // Wrong length is a clean error.
+        let bad_path = tmp.path().join("bad.key");
+        fs::write(&bad_path, b"short").unwrap();
+        assert!(load_signing_key(&bad_path).is_err());
+    }
+
+    #[tokio::test]
     async fn v3_pack_then_verify_via_run_verify_cli_path() {
         // Variant that goes through the `root verify` CLI exit-code
         // surface end-to-end.
@@ -1221,6 +1366,7 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             "tr/3",
+            None,
         )
         .unwrap();
 
@@ -1279,7 +1425,7 @@ description = "Round-trip test pack."
         let workspace = fake_engine_workspace(src_tmp.path());
 
         let out_tr = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
         assert!(out_tr.exists(), ".tr file not produced");
         assert!(
             fs::metadata(&out_tr).unwrap().len() > 0,
@@ -1349,6 +1495,7 @@ description = "Round-trip test pack."
             Some("Apache-2.0".to_string()),
             Some("Bob's fork.".to_string()),
             "tr/1",
+            None,
         )
         .unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
@@ -1361,7 +1508,7 @@ description = "Round-trip test pack."
     #[test]
     fn pack_errors_when_engine_dir_absent() {
         let tmp = tempdir().unwrap();
-        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1").unwrap_err();
+        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no engine output"), "got: {msg}");
     }
@@ -1373,7 +1520,7 @@ description = "Round-trip test pack."
         // Engine dir present, no Pack.toml, no overrides → error mentions `name`.
         fs::create_dir_all(workspace.join(".thinkingroot/artifacts")).unwrap();
         fs::write(workspace.join(".thinkingroot/artifacts/x.md"), b"x").unwrap();
-        let err = run_pack(workspace, None, None, None, None, None, "tr/1").unwrap_err();
+        let err = run_pack(workspace, None, None, None, None, None, "tr/1", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("name"), "got: {msg}");
     }
@@ -1383,7 +1530,7 @@ description = "Round-trip test pack."
         let tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(tmp.path());
         let out_tr = workspace.join("paths.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
         let paths: HashSet<&str> = pack
             .paths()
@@ -1405,7 +1552,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let out_tr = workspace.join("explicit.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
@@ -1421,7 +1568,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let good_tr = workspace.join("good.tr");
-        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
 
         // Corrupt the file deterministically: zero out a 64-byte run
         // in the middle of the zstd stream + truncate the trailing
@@ -1546,7 +1693,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
         let advertised_hash = blake3_hex(&tr_bytes);
 
@@ -1634,7 +1781,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1").unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
 
         struct AppState {

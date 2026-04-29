@@ -356,6 +356,15 @@ enum Commands {
         /// transition lands per `~/.claude/plans/zippy-wiggling-pelican.md`.
         #[arg(long, default_value = "tr/1")]
         format: String,
+        /// Path to an Ed25519 signing key (32 raw bytes). When set
+        /// and `--format=tr/3`, the pack is signed inline and emitted
+        /// with `signature.sig` as the 4th outer-tar entry. The Phase
+        /// F design (`docs/2026-04-29-phase-f-trust-verify-spec.md`)
+        /// covers the wire format. Live Fulcio keyless-OIDC signing
+        /// is the W3.5 follow-up; today's `--sign` is the air-gapped
+        /// / self-signed path.
+        #[arg(long, value_name = "KEY_FILE")]
+        sign: Option<PathBuf>,
     },
     /// Verify a v3 `.tr` pack's integrity and signature without
     /// installing it. Runs the offline verification chain from spec
@@ -882,8 +891,18 @@ async fn async_main() -> anyhow::Result<()> {
             license,
             description,
             format,
+            sign,
         }) => {
-            pack_cmd::run_pack(&workspace, out, name, version, license, description, &format)?;
+            pack_cmd::run_pack(
+                &workspace,
+                out,
+                name,
+                version,
+                license,
+                description,
+                &format,
+                sign.as_deref(),
+            )?;
         }
         Some(Commands::Verify {
             pack,
