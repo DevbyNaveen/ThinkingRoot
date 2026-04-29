@@ -447,6 +447,158 @@ impl ToolHandler for ReadSourceTool {
     }
 }
 
+/// `search_claims` — v3 spec §8.5 MCP tool. Returns matching claims as
+/// `(id, stmt, file, byte_range)` so the agent can pivot directly into
+/// `read_source(claim_id)` for the verbatim text. Output is JSON for
+/// the agent's parser; deliberately distinct from the v1 `search`
+/// tool's prose-formatted output (which mixes claims + entities for
+/// human-readable debugging).
+pub struct SearchClaimsTool {
+    ctx: ToolContext,
+}
+
+impl SearchClaimsTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "search_claims",
+            "Find atomic claims in the mounted workspace matching a free-text query. Returns each match as a structured record: id, statement, file path, byte range. Pivot from a result into read_source(claim_id) to fetch the verbatim source bytes the claim cites.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Free-text search query."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of claims to return. Default 10, max 50.",
+                        "minimum": 1,
+                        "maximum": 50
+                    }
+                },
+                "required": ["query"]
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SearchClaimsTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let Some(query) = input.get("query").and_then(|v| v.as_str()) else {
+            return ToolHandlerResult::error("missing required field: query");
+        };
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(10)
+            .min(50);
+        let engine = self.ctx.engine.read().await;
+        let result = match engine.search(&self.ctx.workspace, query, limit).await {
+            Ok(r) => r,
+            Err(e) => return ToolHandlerResult::error(format!("search_claims failed: {e}")),
+        };
+
+        // For each claim hit, look up its source span via the v3 byte-
+        // range columns CozoDB persists (W1). Falls back to (file: "",
+        // byte_start: 0, byte_end: 0) when read_source can't resolve —
+        // the agent then knows to use list_claims for richer metadata.
+        let mut records: Vec<serde_json::Value> = Vec::with_capacity(result.claims.len());
+        for c in result.claims.iter().take(limit) {
+            let (file, byte_start, byte_end) =
+                match engine.read_source(&self.ctx.workspace, &c.id).await {
+                    Ok(rs) => (rs.file, rs.byte_start, rs.byte_end),
+                    Err(_) => (String::new(), 0, 0),
+                };
+            records.push(json!({
+                "id": c.id,
+                "stmt": c.statement,
+                "file": file,
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+            }));
+        }
+        match serde_json::to_string(&json!({ "claims": records })) {
+            Ok(s) => ToolHandlerResult::ok(s),
+            Err(e) => ToolHandlerResult::error(format!("serialize search_claims: {e}")),
+        }
+    }
+}
+
+/// `read_file` — v3 spec §8.5 MCP tool. Returns the full bytes of a
+/// source file inside the mounted workspace. Path validation rejects
+/// absolute paths and `..` traversal so the tool can never escape the
+/// workspace root.
+pub struct ReadFileTool {
+    ctx: ToolContext,
+}
+
+impl ReadFileTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "read_file",
+            "Fetch the full contents of a source file the workspace knows about. Pass a workspace-relative POSIX path. Use this when read_source(claim_id) returns just a small span and broader file context is needed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace-relative POSIX path. No leading `/`, no `..`."
+                    }
+                },
+                "required": ["path"]
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReadFileTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let Some(path) = input.get("path").and_then(|v| v.as_str()) else {
+            return ToolHandlerResult::error("missing required field: path");
+        };
+        if let Err(e) = validate_workspace_relative_path(path) {
+            return ToolHandlerResult::error(e);
+        }
+        let abs = self.ctx.workspace_root.join(path);
+        match tokio::fs::read(&abs).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => ToolHandlerResult::ok(format!("File: {path}\n\n{text}")),
+                Err(_) => ToolHandlerResult::error(format!(
+                    "file `{path}` is not valid UTF-8; binary file reads are not supported"
+                )),
+            },
+            Err(e) => ToolHandlerResult::error(format!("read_file `{path}`: {e}")),
+        }
+    }
+}
+
+/// Reject path inputs that would escape `workspace_root`. Mirrors the
+/// `tr_format::writer_v3::assert_safe_path` contract — relative POSIX
+/// only, no `..`, no leading `/`.
+fn validate_workspace_relative_path(path: &str) -> std::result::Result<(), String> {
+    if path.is_empty() {
+        return Err("path is empty".into());
+    }
+    if path.starts_with('/') {
+        return Err(format!("path `{path}` must be workspace-relative, not absolute"));
+    }
+    for component in path.split('/') {
+        if component == ".." {
+            return Err(format!("path `{path}` contains `..` (traversal not allowed)"));
+        }
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Write tools (route through ApprovalGate)
 // ─────────────────────────────────────────────────────────────────
@@ -822,6 +974,14 @@ pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
             ReadSourceTool::spec(),
             Arc::new(ReadSourceTool::new(ctx.clone())),
         )
+        .register_read(
+            SearchClaimsTool::spec(),
+            Arc::new(SearchClaimsTool::new(ctx.clone())),
+        )
+        .register_read(
+            ReadFileTool::spec(),
+            Arc::new(ReadFileTool::new(ctx.clone())),
+        )
         .register_write(
             CreateBranchTool::spec(),
             Arc::new(CreateBranchTool::new(ctx.clone())),
@@ -935,7 +1095,42 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_tools_produces_ten_tools() {
+    fn search_claims_spec_required_fields() {
+        let spec = SearchClaimsTool::spec();
+        assert_eq!(spec.name, "search_claims");
+        let required = spec.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "query"));
+        // limit is optional with explicit min/max bounds.
+        let limit = &spec.input_schema["properties"]["limit"];
+        assert_eq!(limit["minimum"], 1);
+        assert_eq!(limit["maximum"], 50);
+    }
+
+    #[test]
+    fn read_file_spec_requires_path() {
+        let spec = ReadFileTool::spec();
+        assert_eq!(spec.name, "read_file");
+        let required = spec.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "path"));
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_accepts_normal_paths() {
+        assert!(validate_workspace_relative_path("src/lib.rs").is_ok());
+        assert!(validate_workspace_relative_path("a.md").is_ok());
+        assert!(validate_workspace_relative_path("a/b/c").is_ok());
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_rejects_traversal() {
+        assert!(validate_workspace_relative_path("").is_err());
+        assert!(validate_workspace_relative_path("/abs").is_err());
+        assert!(validate_workspace_relative_path("../escape").is_err());
+        assert!(validate_workspace_relative_path("a/../b").is_err());
+    }
+
+    #[test]
+    fn register_builtin_tools_produces_twelve_tools() {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx);
         let mut names = registry.tool_names();
@@ -949,8 +1144,10 @@ mod tests {
                 "list_branches",
                 "list_claims",
                 "merge_branch",
+                "read_file",
                 "read_source",
                 "search",
+                "search_claims",
                 "use_skill",
                 "workspace_info",
             ]
@@ -964,10 +1161,13 @@ mod tests {
         // Reads.
         for name in [
             "search",
+            "search_claims",
             "list_branches",
             "list_claims",
             "workspace_info",
             "use_skill",
+            "read_source",
+            "read_file",
         ] {
             assert!(!registry.is_write(name), "{name} should be a read");
         }
