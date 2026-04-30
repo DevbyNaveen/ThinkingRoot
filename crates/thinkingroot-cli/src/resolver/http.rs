@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use tr_format::{digest::blake3_hex, reader as tr_reader};
+use tr_format::digest::blake3_hex;
 
 use super::PackResolver;
 use crate::pack_cmd::{http_client, refuse_insecure_http};
@@ -119,19 +119,19 @@ impl PackResolver for HttpRegistryResolver {
             ));
         }
         let advertised_tr_fmt = disco["tr_format"].as_str().unwrap_or("");
-        if advertised_tr_fmt != tr_format::manifest::FORMAT_VERSION {
+        if advertised_tr_fmt != tr_format::FORMAT_VERSION_V3 {
             return Err(anyhow!(
                 "registry advertises tr_format `{}` but this client only handles `{}`",
                 advertised_tr_fmt,
-                tr_format::manifest::FORMAT_VERSION
+                tr_format::FORMAT_VERSION_V3
             ));
         }
         let pattern = disco["endpoints"]["download"]
             .as_str()
             .ok_or_else(|| anyhow!("registry doc missing endpoints.download"))?;
-        let max_bytes = disco["max_pack_bytes"]
-            .as_u64()
-            .unwrap_or(tr_reader::DEFAULT_SIZE_CAP);
+        // Default max-pack-bytes when the discovery doc doesn't override.
+        // 100 MiB matches the v3 spec §6.4 single-pack ceiling.
+        let max_bytes = disco["max_pack_bytes"].as_u64().unwrap_or(100 * 1024 * 1024);
 
         // 2. Build the download URL by template substitution.
         let download_path = pattern

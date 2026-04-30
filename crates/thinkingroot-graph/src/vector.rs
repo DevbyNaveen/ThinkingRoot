@@ -189,8 +189,6 @@ mod inner {
         /// All integers little-endian. This is ~4× smaller than JSON and loads
         /// without a temporary allocation spike.
         pub fn save(&self) -> Result<()> {
-            use std::io::Write;
-
             let mut buf = Vec::with_capacity(self.index.len() * 400);
             buf.extend_from_slice(b"TRVEC1\n");
 

@@ -37,20 +37,14 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use thinkingroot_core::types::ContentHash;
 use tr_format::{
-    digest::blake3_hex, reader as tr_reader, read_v3_pack, writer::PackBuilder, ClaimRecord,
-    Manifest, ManifestV3, TrustTier, V3PackBuilder, Version,
+    read_v3_pack, ClaimRecord, ManifestV3, V3Pack, V3PackBuilder, Version,
 };
-use tr_verify::{V3TamperedKind, V3Verdict, verify_v3_pack};
 use tr_revocation::{CacheConfig, RevocationCache};
-use tr_verify::{
-    AuthorKeyStore, RevokedDetails, TamperedKind, Verdict, Verifier, VerifierConfig,
-};
+use tr_verify::{V3TamperedKind, V3Verdict, verify_v3_pack};
 
 use crate::resolver::{HttpDirectUrlResolver, HttpRegistryResolver, LocalFsResolver, PackResolver};
 
@@ -60,18 +54,11 @@ use crate::resolver::{HttpDirectUrlResolver, HttpRegistryResolver, LocalFsResolv
 
 /// Pack is unsigned and policy required a signature.
 pub const EXIT_UNSIGNED: i32 = 70;
-/// Manifest hash mismatch, archive corruption, or signature payload
-/// did not verify.
+/// Recomputed pack hash diverged from the manifest's declared
+/// `pack_hash`, OR the DSSE signature failed to verify.
 pub const EXIT_TAMPERED: i32 = 71;
-/// Pack content hash is on the revocation deny-list.
+/// Pack hash is on the registry's signed revocation deny-list.
 pub const EXIT_REVOKED: i32 = 72;
-/// T1 author key is not in the local trust store.
-pub const EXIT_KEY_UNKNOWN: i32 = 73;
-/// Revocation cache is past the stale-grace window.
-pub const EXIT_STALE_CACHE: i32 = 74;
-/// Trust tier is recognised but verification not yet implemented
-/// (T2+ Sigstore — Step 4b).
-pub const EXIT_UNSUPPORTED: i32 = 75;
 
 /// Refusal returned by `run_install` when verification rejects the
 /// pack. Carries an exit code so `main.rs` can `process::exit` with the
@@ -92,18 +79,6 @@ impl std::fmt::Display for InstallRefused {
 
 impl std::error::Error for InstallRefused {}
 
-/// Directory entries inside `.thinkingroot/` that should never end up
-/// in a `.tr` file.
-///
-/// - `cache/` is a recompute-from-source artefact and contains paths
-///   that only mean something on the original machine.
-/// - `config.toml` carries workspace-local overrides and may include
-///   provider keys (when a user customises `root setup` per project).
-/// - `fingerprints.json` is the incremental-compile mtime ledger; it
-///   regenerates on the next compile and would invalidate immediately
-///   on a different host anyway.
-const SKIP_TOP_LEVEL: &[&str] = &["cache", "config.toml", "fingerprints.json"];
-
 /// On-disk pack metadata. Looked for at `<workspace>/Pack.toml`.
 ///
 /// CLI flags (`--name`, `--version`, `--license`) override individual
@@ -123,10 +98,8 @@ struct PackTomlInner {
     description: Option<String>,
 }
 
-/// Run `root pack`. Dispatches to the v1 (multi-directory tar+zstd) or
-/// v3 (3-file `[manifest.toml, source.tar.zst, claims.jsonl]`) writer
-/// based on `format`. See module-level docs for v1 behaviour and
-/// `crates/tr-format/src/writer_v3.rs` for v3.
+/// Run `root pack`. v3-only: there is no `--format` option since
+/// the v1 wire format was deleted in the legacy cleanup commits.
 pub fn run_pack(
     workspace: &Path,
     out: Option<PathBuf>,
@@ -134,102 +107,19 @@ pub fn run_pack(
     version_override: Option<String>,
     license_override: Option<String>,
     description_override: Option<String>,
-    format: &str,
     sign_key_path: Option<&Path>,
     sign_keyless: bool,
 ) -> Result<()> {
-    match format {
-        "tr/1" => {
-            if sign_key_path.is_some() || sign_keyless {
-                return Err(anyhow!(
-                    "`--sign` and `--sign-keyless` are only supported with `--format=tr/3`; \
-                     v1 packs use a different signature mechanism (see Phase F design)"
-                ));
-            }
-            run_pack_v1(
-                workspace,
-                out,
-                name_override,
-                version_override,
-                license_override,
-                description_override,
-            )
-        }
-        "tr/3" => run_pack_v3(
-            workspace,
-            out,
-            name_override,
-            version_override,
-            license_override,
-            description_override,
-            sign_key_path,
-            sign_keyless,
-        ),
-        other => Err(anyhow!(
-            "unknown pack format `{other}`; supported: tr/1, tr/3"
-        )),
-    }
-}
-
-fn run_pack_v1(
-    workspace: &Path,
-    out: Option<PathBuf>,
-    name_override: Option<String>,
-    version_override: Option<String>,
-    license_override: Option<String>,
-    description_override: Option<String>,
-) -> Result<()> {
-    let engine_dir = workspace.join(".thinkingroot");
-    if !engine_dir.exists() {
-        return Err(anyhow!(
-            "no engine output at `{}`; run `root compile {}` first",
-            engine_dir.display(),
-            workspace.display()
-        ));
-    }
-
-    let manifest = build_manifest(
+    run_pack_v3(
         workspace,
+        out,
         name_override,
         version_override,
         license_override,
         description_override,
-    )?;
-
-    let mut pb = PackBuilder::new(manifest.clone());
-    let added = add_engine_files(&mut pb, &engine_dir)
-        .with_context(|| format!("walk {}", engine_dir.display()))?;
-    if added == 0 {
-        return Err(anyhow!(
-            "engine output at `{}` is empty (no packable files); did you run `root compile`?",
-            engine_dir.display()
-        ));
-    }
-
-    let bytes = pb.build().map_err(|e| anyhow!("build .tr: {e}"))?;
-
-    let out_path = out.unwrap_or_else(|| {
-        let owner_slug = manifest.name.replace('/', "-");
-        workspace.join(format!("{}-{}.tr", owner_slug, manifest.version))
-    });
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-    }
-    fs::write(&out_path, &bytes)
-        .with_context(|| format!("write {}", out_path.display()))?;
-
-    println!(
-        "  packed {} {} ({} files, {} bytes) -> {}",
-        manifest.name,
-        manifest.version,
-        added,
-        bytes.len(),
-        out_path.display()
-    );
-    Ok(())
+        sign_key_path,
+        sign_keyless,
+    )
 }
 
 /// Build a v3 `package.tr` from a compiled workspace.
@@ -259,7 +149,6 @@ fn run_pack_v3(
     sign_key_path: Option<&Path>,
     sign_keyless: bool,
 ) -> Result<()> {
-    use ed25519_dalek::SigningKey;
     use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
 
     let engine_dir = workspace.join(".thinkingroot");
@@ -271,25 +160,14 @@ fn run_pack_v3(
         ));
     }
 
-    // 1. Manifest scaffolding from Pack.toml + CLI overrides. The v1
-    //    `build_manifest` already does the merge logic; we lift its
-    //    fields onto a fresh ManifestV3 to avoid duplicating the
-    //    Pack.toml plumbing.
-    let v1_manifest = build_manifest(
+    // 1. Manifest scaffolding from Pack.toml + CLI overrides.
+    let mut manifest = build_manifest_v3(
         workspace,
         name_override,
         version_override,
         license_override,
         description_override,
     )?;
-    let mut manifest = ManifestV3::new(&v1_manifest.name, v1_manifest.version.clone());
-    if !v1_manifest.license.is_empty() {
-        manifest.license = Some(v1_manifest.license.clone());
-    }
-    if !v1_manifest.description.is_empty() {
-        manifest.description = Some(v1_manifest.description.clone());
-    }
-    manifest.authors = v1_manifest.authors.clone();
     manifest.extracted_at = Some(chrono::Utc::now());
     manifest.extractor = Some(format!(
         "thinkingroot/extract@{}",
@@ -302,6 +180,12 @@ fn run_pack_v3(
         .with_context(|| format!("open graph at {}", engine_dir.display()))?;
     let source_store = FileSystemSourceStore::new(&engine_dir)
         .with_context(|| format!("open source store at {}", engine_dir.display()))?;
+
+    // Capture identity fields up front since `builder` takes ownership
+    // of the manifest below, and we need `name`/`version` for both the
+    // output filename and the success log line.
+    let pack_name = manifest.name.clone();
+    let pack_version = manifest.version.clone();
 
     let mut builder = V3PackBuilder::new(manifest);
     let workspace_abs = workspace
@@ -375,8 +259,8 @@ fn run_pack_v3(
     //    outer-tar entry. Otherwise emit unsigned — `root verify`
     //    reports the Unsigned verdict for these.
     let out_path = out.unwrap_or_else(|| {
-        let owner_slug = v1_manifest.name.replace('/', "-");
-        workspace.join(format!("{owner_slug}-{}.tr", v1_manifest.version))
+        let owner_slug = pack_name.replace('/', "-");
+        workspace.join(format!("{owner_slug}-{pack_version}.tr"))
     });
     let pack_filename = out_path
         .file_name()
@@ -411,8 +295,8 @@ fn run_pack_v3(
     println!(
         "  packed{} {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
         signed_label,
-        v1_manifest.name,
-        v1_manifest.version,
+        pack_name,
+        pack_version,
         packed_paths.len(),
         source_bytes_added,
         claim_count,
@@ -710,16 +594,17 @@ fn workspace_relative_pack_path(uri: &str, workspace_abs: &Path) -> String {
     uri.to_string()
 }
 
-/// Resolve the manifest by combining `Pack.toml` (if present) with CLI
-/// overrides. Errors if any of the three required fields (`name`,
-/// `version`, `license`) is unresolved.
-fn build_manifest(
+/// Resolve the v3 manifest by combining `Pack.toml` (if present) with
+/// CLI overrides. `name` and `version` are required; `license` is
+/// optional in v3 but warned-on-missing for distribution-friendly
+/// packs.
+fn build_manifest_v3(
     workspace: &Path,
     name_override: Option<String>,
     version_override: Option<String>,
     license_override: Option<String>,
     description_override: Option<String>,
-) -> Result<Manifest> {
+) -> Result<ManifestV3> {
     let pack_toml_path = workspace.join("Pack.toml");
     let from_file: Option<PackTomlInner> = if pack_toml_path.exists() {
         let raw = fs::read_to_string(&pack_toml_path)
@@ -752,86 +637,22 @@ fn build_manifest(
         from_file.as_ref().map(|p| p.version.clone()),
         "version",
     )?;
-    let license = pick(
-        license_override,
-        from_file.as_ref().map(|p| p.license.clone()),
-        "license",
-    )?;
-
     let version = Version::parse(&version_str)
         .with_context(|| format!("parse version `{}` (must be semver)", version_str))?;
 
-    let mut manifest = Manifest::new(name, version, license);
-    if let Some(d) = description_override {
-        manifest.description = d;
-    } else if let Some(d) = from_file.and_then(|p| p.description) {
-        manifest.description = d;
+    let mut manifest = ManifestV3::new(name, version);
+    if let Some(license) = license_override.or_else(|| from_file.as_ref().map(|p| p.license.clone()))
+    {
+        manifest.license = Some(license);
+    }
+    if let Some(d) = description_override.or_else(|| from_file.and_then(|p| p.description)) {
+        manifest.description = Some(d);
     }
     // Validate eagerly so user gets the error before the slow walk.
     manifest
         .validate()
         .map_err(|e| anyhow!("invalid manifest: {e}"))?;
     Ok(manifest)
-}
-
-/// Walk `engine_dir` recursively, adding every regular file (other than
-/// the skip-list entries) to the [`PackBuilder`] under its
-/// `.thinkingroot`-relative path. Returns the count of files added.
-fn add_engine_files(pb: &mut PackBuilder, engine_dir: &Path) -> Result<usize> {
-    let mut count = 0usize;
-    walk_files(engine_dir, &mut |abs_path| -> Result<()> {
-        let rel = abs_path
-            .strip_prefix(engine_dir)
-            .map_err(|e| anyhow!("strip_prefix {}: {e}", abs_path.display()))?;
-        // Skip if the top-level component is on the skip list.
-        let mut comps = rel.components();
-        if let Some(top) = comps.next() {
-            let top_str = top.as_os_str().to_string_lossy();
-            if SKIP_TOP_LEVEL.contains(&top_str.as_ref()) {
-                return Ok(());
-            }
-        }
-        // Normalise to forward slashes for in-pack paths.
-        let pack_path = rel
-            .to_str()
-            .ok_or_else(|| anyhow!("non-utf8 path {}", rel.display()))?
-            .replace('\\', "/");
-        let bytes = fs::read(abs_path)
-            .with_context(|| format!("read {}", abs_path.display()))?;
-        pb.put_file(&pack_path, &bytes)
-            .map_err(|e| anyhow!("put `{}` into pack: {e}", pack_path))?;
-        count += 1;
-        Ok(())
-    })?;
-    Ok(count)
-}
-
-/// Walk `dir` recursively, calling `visit` on every regular file.
-/// Symlinks are not followed; reparse points / FIFOs / sockets are
-/// silently skipped.
-fn walk_files<F>(dir: &Path, visit: &mut F) -> Result<()>
-where
-    F: FnMut(&Path) -> Result<()>,
-{
-    let read = fs::read_dir(dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?;
-    for entry in read {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            // .tr packs are content-addressed; following symlinks would
-            // make the hash depend on filesystem layout outside the
-            // workspace. Skip.
-            continue;
-        }
-        let path = entry.path();
-        if ft.is_dir() {
-            walk_files(&path, visit)?;
-        } else if ft.is_file() {
-            visit(&path)?;
-        }
-    }
-    Ok(())
 }
 
 /// Run `root install`. The `reference` argument accepts:
@@ -879,7 +700,7 @@ pub async fn run_install(
     allow_unsigned: bool,
 ) -> Result<()> {
     let install_ref = parse_install_ref(reference)?;
-    let registry_url_for_verifier = match (&install_ref, &registry_override) {
+    let registry_url_for_cache = match (&install_ref, &registry_override) {
         (InstallRef::Registry { .. }, Some(url)) => url.clone(),
         (InstallRef::Registry { .. }, None) => load_default_registry()?,
         // Local + direct-URL installs do not have a single canonical
@@ -891,28 +712,33 @@ pub async fn run_install(
         install_ref,
         InstallRef::DirectUrl(_) | InstallRef::Registry { .. }
     );
-    let verifier =
-        build_default_verifier(&registry_url_for_verifier, is_remote, allow_unsigned)?;
-    install_with_verifier(reference, target, registry_override, &verifier).await
+    let cache = build_default_revocation_cache(&registry_url_for_cache)?;
+    install_with_revocation_cache(
+        reference,
+        target,
+        registry_override,
+        &cache,
+        is_remote,
+        allow_unsigned,
+    )
+    .await
 }
 
-/// Test-friendly entry point that takes a pre-built [`Verifier`].
-///
-/// Production callers use [`run_install`], which constructs a default
-/// verifier from the system cache directory and pinned keys. Tests
-/// pass a fixture-backed verifier so they can exercise revoked /
-/// tampered / unknown-key paths without touching the user's home
-/// directory.
-pub async fn install_with_verifier(
+/// Test-friendly entry point that takes a pre-built
+/// [`RevocationCache`]. Production callers use [`run_install`]; tests
+/// build a cache against a tmpdir so they don't touch `~/.cache`.
+pub async fn install_with_revocation_cache(
     reference: &str,
     target: Option<PathBuf>,
     registry_override: Option<String>,
-    verifier: &Verifier,
+    cache: &RevocationCache,
+    is_remote: bool,
+    user_allow_unsigned: bool,
 ) -> Result<()> {
     let install_ref = parse_install_ref(reference)?;
     let resolver = build_resolver(install_ref, registry_override)?;
     let bytes = resolver.resolve().await?;
-    install_from_bytes_with_verifier(&bytes, target, verifier).await
+    install_from_bytes(&bytes, target, cache, is_remote, user_allow_unsigned).await
 }
 
 /// Dispatch an [`InstallRef`] to the right [`PackResolver`].
@@ -941,37 +767,17 @@ pub(crate) fn build_resolver(
     })
 }
 
-fn build_default_verifier(
-    registry_url: &str,
-    is_remote: bool,
-    user_allow_unsigned: bool,
-) -> Result<Verifier> {
+/// Build a [`RevocationCache`] using the same defaults as `root verify`:
+/// caller-supplied registry URL, platform cache directory, 60-min fresh
+/// TTL, 7-day stale grace.
+fn build_default_revocation_cache(registry_url: &str) -> Result<RevocationCache> {
     let url = url::Url::parse(registry_url)
         .with_context(|| format!("parse registry url `{registry_url}`"))?;
     let cache_dir = tr_revocation::default_cache_dir()
         .ok_or_else(|| anyhow!("no platform cache directory available"))?;
-    let cache = Arc::new(RevocationCache::new(CacheConfig::defaults_for(
+    Ok(RevocationCache::new(CacheConfig::defaults_for(
         url, cache_dir,
-    )));
-
-    // Local installs default to T0 (no signature required); remote
-    // installs require T1 unless the user passes --allow-unsigned.
-    let (require_min_tier, default_allow) = if is_remote {
-        (TrustTier::T1, false)
-    } else {
-        (TrustTier::T0, true)
-    };
-    let allow_unsigned = user_allow_unsigned || default_allow;
-
-    Ok(Verifier::new(VerifierConfig {
-        revocation: cache,
-        // v0.1 ships no preconfigured author keys; users opt in by
-        // running `root key trust import <id>` once that subcommand
-        // lands (Step 6 / Phase G CLI consolidation).
-        author_keys: Arc::new(AuthorKeyStore::empty()),
-        require_min_tier,
-        allow_unsigned,
-    }))
+    )))
 }
 
 /// A user-supplied install target — local file, direct URL, or
@@ -1111,97 +917,98 @@ pub(crate) fn refuse_insecure_http(url: &str) -> Result<()> {
 // `HttpDirectUrlResolver::resolve` and `HttpRegistryResolver::resolve`
 // respectively. Dispatch happens through [`build_resolver`].
 
-/// Verify a `.tr` byte slice against the supplied [`Verifier`] and,
-/// on a `Verified` verdict, extract its contents into the target
-/// directory's `.thinkingroot/`. Used by both [`run_install`]
-/// (production) and [`install_with_verifier`] (tests).
-async fn install_from_bytes_with_verifier(
+/// Verify a `.tr` byte slice against the supplied revocation cache and,
+/// on a `Verified` verdict, extract the source archive + manifest +
+/// claims into the target directory's `.thinkingroot/`. Used by both
+/// [`run_install`] (production) and
+/// [`install_with_revocation_cache`] (tests).
+///
+/// `is_remote` flips the default-allow-unsigned behaviour: local
+/// installs accept unsigned packs by default, remote installs (HTTPS
+/// or registry) require either a signature or
+/// `user_allow_unsigned == true`.
+async fn install_from_bytes(
     bytes: &[u8],
     target: Option<PathBuf>,
-    verifier: &Verifier,
+    cache: &RevocationCache,
+    is_remote: bool,
+    user_allow_unsigned: bool,
 ) -> Result<()> {
-    let pack = tr_reader::read_bytes(bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
-    let verdict = verifier
-        .verify(&pack)
-        .await
-        .map_err(|e| anyhow!("verifier: {e}"))?;
-    enforce_verdict(&pack, verdict)?;
-    extract_pack_to_target(&pack, target)
+    let pack = read_v3_pack(bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
+    let verdict =
+        tr_verify::verify_v3_pack_with_revocation(&pack, cache).await;
+    let allow_unsigned = user_allow_unsigned || !is_remote;
+    enforce_v3_verdict(&pack, &verdict, allow_unsigned)?;
+    extract_v3_pack_to_target(&pack, target)
 }
 
-/// Map a [`Verdict`] to either `Ok(())` (continue install) or an
+/// Map a [`V3Verdict`] to either `Ok(())` (continue install) or an
 /// [`InstallRefused`] error carrying the right exit code + message.
-fn enforce_verdict(pack: &tr_reader::Pack, verdict: Verdict) -> Result<()> {
+fn enforce_v3_verdict(pack: &V3Pack, verdict: &V3Verdict, allow_unsigned: bool) -> Result<()> {
     match verdict {
-        Verdict::Verified(d) => {
+        V3Verdict::Verified {
+            identity,
+            rekor_log_index,
+            signed_at,
+        } => {
             tracing::info!(
-                tier = ?d.tier,
-                author = ?d.author_id,
-                rekor_log_index = ?d.sigstore_log_index,
-                revocation_freshness_secs = d.revocation_freshness_secs,
+                identity = ?identity,
+                rekor_log_index = ?rekor_log_index,
+                signed_at = %signed_at,
                 "verified {} {}",
                 pack.manifest.name,
                 pack.manifest.version
             );
             Ok(())
         }
-        Verdict::Unsigned => Err(InstallRefused {
-            exit_code: EXIT_UNSIGNED,
-            message: format!(
-                "✗ refusing to install unsigned pack `{}` — pass --allow-unsigned to override (https-only)",
-                pack.manifest.name
-            ),
+        V3Verdict::Unsigned => {
+            if allow_unsigned {
+                tracing::info!(
+                    "installing unsigned pack {} {} (allow-unsigned)",
+                    pack.manifest.name,
+                    pack.manifest.version
+                );
+                Ok(())
+            } else {
+                Err(InstallRefused {
+                    exit_code: EXIT_UNSIGNED,
+                    message: format!(
+                        "✗ refusing to install unsigned pack `{}` — pass --allow-unsigned to override",
+                        pack.manifest.name
+                    ),
+                }
+                .into())
+            }
         }
-        .into()),
-        Verdict::Tampered(kind) => Err(InstallRefused {
+        V3Verdict::Tampered(kind) => Err(InstallRefused {
             exit_code: EXIT_TAMPERED,
-            message: format_tampered(&pack.manifest, &kind),
+            message: format_v3_tampered(&pack.manifest, kind),
         }
         .into()),
-        Verdict::Revoked(d) => Err(InstallRefused {
+        V3Verdict::Revoked(d) => Err(InstallRefused {
             exit_code: EXIT_REVOKED,
-            message: format_revoked(&d),
-        }
-        .into()),
-        Verdict::KeyUnknown { key_id } => Err(InstallRefused {
-            exit_code: EXIT_KEY_UNKNOWN,
-            message: format!(
-                "✗ pack `{}` is signed by author key `{key_id}` which is not in your trust store",
-                pack.manifest.name
-            ),
-        }
-        .into()),
-        Verdict::StaleCache { age_days } => Err(InstallRefused {
-            exit_code: EXIT_STALE_CACHE,
-            message: format!(
-                "✗ revocation cache is {age_days} days old — refusing. Run `root revoked refresh` while online."
-            ),
-        }
-        .into()),
-        Verdict::Unsupported { tier, reason } => Err(InstallRefused {
-            exit_code: EXIT_UNSUPPORTED,
-            message: format!(
-                "✗ this `root` build cannot verify {tier:?} packs yet ({reason}). Upgrade to a release that bundles the Sigstore trust root."
-            ),
+            message: format_revoked(d),
         }
         .into()),
     }
 }
 
-fn format_tampered(manifest: &Manifest, kind: &TamperedKind) -> String {
+fn format_v3_tampered(manifest: &ManifestV3, kind: &V3TamperedKind) -> String {
     let detail = match kind {
-        TamperedKind::ManifestHashMismatch { expected, actual } => format!(
-            "manifest body hash mismatch (expected `{expected}`, computed `{actual}`)"
+        V3TamperedKind::PackHashMismatch {
+            declared,
+            recomputed,
+        } => format!(
+            "pack hash mismatch (manifest declares `{declared}`, recomputed `{recomputed}`)"
         ),
-        TamperedKind::ArchiveCorrupt(msg) => format!("archive corrupt: {msg}"),
-        TamperedKind::SignaturePayloadMismatch => {
-            "signature does not match the pack's contents".to_string()
+        V3TamperedKind::SignatureFailed { reason } => {
+            format!("signature failed: {reason}")
         }
     };
     format!("✗ pack `{}` failed integrity check: {detail}", manifest.name)
 }
 
-fn format_revoked(d: &RevokedDetails) -> String {
+fn format_revoked(d: &tr_verify::RevokedDetails) -> String {
     format!(
         "✗ pack `{}@{}` was revoked by {:?} on epoch {} (reason: {:?}) — see {}",
         d.advisory.pack,
@@ -1213,49 +1020,63 @@ fn format_revoked(d: &RevokedDetails) -> String {
     )
 }
 
-/// Extract a verified pack's payload + manifest into `target`. Pulled
-/// out of [`install_from_bytes_with_verifier`] for clarity — the unpack
-/// step never produces an [`InstallRefused`] (any failure here is an
-/// I/O error that bubbles via `anyhow`).
-fn extract_pack_to_target(pack: &tr_reader::Pack, target: Option<PathBuf>) -> Result<()> {
+/// Extract a verified v3 pack's source archive + manifest + claims
+/// into `target`. The inner `source.tar.zst` is decompressed and walked,
+/// emitting one file per entry under `<target>/.thinkingroot/sources/`.
+/// `manifest.toml` and `claims.jsonl` land under `<target>/.thinkingroot/`
+/// directly so consumers can re-parse them via `tr_format`.
+fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<()> {
     let manifest = &pack.manifest;
     let target_dir = match target {
         Some(t) => t,
         None => default_install_dir(manifest)?,
     };
     let engine_dir = target_dir.join(".thinkingroot");
-    fs::create_dir_all(&engine_dir)
-        .with_context(|| format!("create {}", engine_dir.display()))?;
+    let sources_dir = engine_dir.join("sources");
+    fs::create_dir_all(&sources_dir)
+        .with_context(|| format!("create {}", sources_dir.display()))?;
 
+    // Decompress the inner source.tar.zst and walk its entries.
+    let decompressed = zstd::stream::decode_all(&pack.source_archive[..])
+        .map_err(|e| anyhow!("decompress source.tar.zst: {e}"))?;
+    let mut archive = tar::Archive::new(std::io::Cursor::new(decompressed));
     let mut count = 0usize;
-    for path in pack.paths() {
-        if path == "manifest.json" {
-            continue;
-        }
-        let entry_bytes = pack
-            .entry(path)
-            .ok_or_else(|| anyhow!("pack reports `{}` but has no entry", path))?;
-        let dest = engine_dir.join(path);
+    for entry in archive
+        .entries()
+        .map_err(|e| anyhow!("walk source archive: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| anyhow!("walk source archive: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| anyhow!("entry path: {e}"))?
+            .into_owned();
+        let dest = sources_dir.join(&path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        fs::write(&dest, entry_bytes)
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut buf)
+            .map_err(|e| anyhow!("read entry {}: {e}", path.display()))?;
+        fs::write(&dest, &buf)
             .with_context(|| format!("write {}", dest.display()))?;
         count += 1;
     }
 
-    let manifest_path = target_dir.join("manifest.json");
-    let manifest_json = serde_json::to_vec_pretty(manifest)
-        .map_err(|e| anyhow!("serialize manifest: {e}"))?;
-    fs::write(&manifest_path, manifest_json)
-        .with_context(|| format!("write {}", manifest_path.display()))?;
+    // Drop the manifest + claims alongside the sources for downstream
+    // tooling. Manifest is re-emitted as canonical TOML so the on-disk
+    // copy is byte-identical to what the pack carried.
+    fs::write(engine_dir.join("manifest.toml"), manifest.to_canonical_toml())
+        .with_context(|| format!("write {}", engine_dir.join("manifest.toml").display()))?;
+    fs::write(engine_dir.join("claims.jsonl"), &pack.claims_jsonl)
+        .with_context(|| format!("write {}", engine_dir.join("claims.jsonl").display()))?;
 
     println!(
-        "  installed {} {} ({} files) -> {}",
+        "  installed {} {} ({} source files, {} claims) -> {}",
         manifest.name,
         manifest.version,
         count,
+        manifest.claim_count.unwrap_or(0),
         target_dir.display()
     );
     Ok(())
@@ -1263,7 +1084,7 @@ fn extract_pack_to_target(pack: &tr_reader::Pack, target: Option<PathBuf>) -> Re
 
 /// Default install directory: `~/.thinkingroot/packs/<name>/<version>/`.
 /// `<name>` is `owner/slug`, which becomes a two-level subpath on disk.
-fn default_install_dir(manifest: &Manifest) -> Result<PathBuf> {
+fn default_install_dir(manifest: &ManifestV3) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory available"))?;
     let (owner, slug) = manifest
         .owner_and_slug()
@@ -1361,7 +1182,6 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             None,
-            "tr/3",
             None,
             false,
         )
@@ -1450,7 +1270,6 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             None,
-            "tr/3",
             Some(&key_path),
             false,
         )
@@ -1520,7 +1339,6 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             None,
-            "tr/3",
             None,
             false,
         )
@@ -1533,221 +1351,6 @@ description = "v3 lifecycle round-trip test."
         // With --allow-unsigned, exit code is 0.
         let code = run_verify(&out_tr, true, false, None).unwrap();
         assert_eq!(code, 0);
-    }
-
-    /// Set up a fake compiled workspace in `dir`. Returns the workspace
-    /// root (parent of `.thinkingroot/`).
-    fn fake_engine_workspace(dir: &Path) -> PathBuf {
-        let workspace = dir.to_path_buf();
-        let engine = workspace.join(".thinkingroot");
-        // Files that should END UP in the .tr.
-        fs::create_dir_all(engine.join("artifacts/entities")).unwrap();
-        fs::write(
-            engine.join("artifacts/entities/foo.md"),
-            b"# Foo\nA fact.\n",
-        )
-        .unwrap();
-        fs::create_dir_all(engine.join("graph")).unwrap();
-        fs::write(engine.join("graph/triples.jsonl"), b"{\"s\":1}\n").unwrap();
-        fs::create_dir_all(engine.join("rooting/sources")).unwrap();
-        fs::write(
-            engine.join("rooting/sources/abc123.src"),
-            b"source content\n",
-        )
-        .unwrap();
-        fs::write(engine.join("vectors.bin"), b"\x00\x01\x02\x03").unwrap();
-        // Files that should be SKIPPED.
-        fs::create_dir_all(engine.join("cache/extraction")).unwrap();
-        fs::write(engine.join("cache/extraction/foo.json"), b"{}").unwrap();
-        fs::write(engine.join("config.toml"), b"key=\"secret\"").unwrap();
-        fs::write(engine.join("fingerprints.json"), b"[]").unwrap();
-        // Pack.toml so we don't need CLI overrides.
-        fs::write(
-            workspace.join("Pack.toml"),
-            r#"[pack]
-name = "alice/demo"
-version = "0.1.0"
-license = "MIT"
-description = "Round-trip test pack."
-"#,
-        )
-        .unwrap();
-        workspace
-    }
-
-    #[tokio::test]
-    async fn pack_then_install_round_trips_engine_output() {
-        let src_tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(src_tmp.path());
-
-        let out_tr = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-        assert!(out_tr.exists(), ".tr file not produced");
-        assert!(
-            fs::metadata(&out_tr).unwrap().len() > 0,
-            ".tr file is empty"
-        );
-
-        // Install into a fresh target via the new string-keyed entry point.
-        let install_tmp = tempdir().unwrap();
-        let target = install_tmp.path().join("install-here");
-        // T0 unsigned local pack — `allow_unsigned: true` is the local
-        // default but pass explicitly for clarity.
-        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None, true)
-            .await
-            .unwrap();
-
-        // Manifest landed at root.
-        let manifest_path = target.join("manifest.json");
-        assert!(manifest_path.exists(), "manifest.json not extracted");
-        let manifest_blob = fs::read(&manifest_path).unwrap();
-        let manifest: Manifest =
-            serde_json::from_slice(&manifest_blob).expect("manifest parses");
-        assert_eq!(manifest.name, "alice/demo");
-        assert_eq!(manifest.version, Version::parse("0.1.0").unwrap());
-        assert_eq!(manifest.license, "MIT");
-        assert_eq!(manifest.description, "Round-trip test pack.");
-
-        // Engine files round-trip with the same content.
-        let engine = target.join(".thinkingroot");
-        let foo = engine.join("artifacts/entities/foo.md");
-        assert!(foo.exists(), "artifact missing after install");
-        assert_eq!(fs::read(&foo).unwrap(), b"# Foo\nA fact.\n");
-        assert_eq!(
-            fs::read(engine.join("graph/triples.jsonl")).unwrap(),
-            b"{\"s\":1}\n"
-        );
-        assert_eq!(
-            fs::read(engine.join("rooting/sources/abc123.src")).unwrap(),
-            b"source content\n"
-        );
-        assert_eq!(fs::read(engine.join("vectors.bin")).unwrap(), b"\x00\x01\x02\x03");
-
-        // Skipped files did NOT land.
-        assert!(
-            !engine.join("cache").exists(),
-            "cache/ was packed (should be skipped)"
-        );
-        assert!(
-            !engine.join("config.toml").exists(),
-            "config.toml was packed (should be skipped)"
-        );
-        assert!(
-            !engine.join("fingerprints.json").exists(),
-            "fingerprints.json was packed (should be skipped)"
-        );
-    }
-
-    #[test]
-    fn pack_uses_cli_overrides_over_pack_toml() {
-        let tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(tmp.path());
-        let out_tr = workspace.join("override.tr");
-        run_pack(
-            &workspace,
-            Some(out_tr.clone()),
-            Some("bob/forked".to_string()),
-            Some("2.5.0".to_string()),
-            Some("Apache-2.0".to_string()),
-            Some("Bob's fork.".to_string()),
-            "tr/1",
-            None,
-            false,
-        )
-        .unwrap();
-        let pack = tr_reader::read_file(&out_tr).unwrap();
-        assert_eq!(pack.manifest.name, "bob/forked");
-        assert_eq!(pack.manifest.version, Version::parse("2.5.0").unwrap());
-        assert_eq!(pack.manifest.license, "Apache-2.0");
-        assert_eq!(pack.manifest.description, "Bob's fork.");
-    }
-
-    #[test]
-    fn pack_errors_when_engine_dir_absent() {
-        let tmp = tempdir().unwrap();
-        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1", None, false).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("no engine output"), "got: {msg}");
-    }
-
-    #[test]
-    fn pack_errors_when_required_fields_missing() {
-        let tmp = tempdir().unwrap();
-        let workspace = tmp.path();
-        // Engine dir present, no Pack.toml, no overrides → error mentions `name`.
-        fs::create_dir_all(workspace.join(".thinkingroot/artifacts")).unwrap();
-        fs::write(workspace.join(".thinkingroot/artifacts/x.md"), b"x").unwrap();
-        let err = run_pack(workspace, None, None, None, None, None, "tr/1", None, false).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("name"), "got: {msg}");
-    }
-
-    #[test]
-    fn pack_path_set_matches_engine_files_minus_skips() {
-        let tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(tmp.path());
-        let out_tr = workspace.join("paths.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-        let pack = tr_reader::read_file(&out_tr).unwrap();
-        let paths: HashSet<&str> = pack
-            .paths()
-            .filter(|p| *p != "manifest.json")
-            .collect();
-        let expected: HashSet<&str> = [
-            "artifacts/entities/foo.md",
-            "graph/triples.jsonl",
-            "rooting/sources/abc123.src",
-            "vectors.bin",
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(paths, expected);
-    }
-
-    #[tokio::test]
-    async fn install_into_explicit_target_does_not_touch_home() {
-        let src_tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(src_tmp.path());
-        let out_tr = workspace.join("explicit.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-
-        let dst_tmp = tempdir().unwrap();
-        let target = dst_tmp.path().join("dst");
-        run_install(out_tr.to_str().unwrap(), Some(target.clone()), None, true)
-            .await
-            .unwrap();
-        assert!(target.join("manifest.json").exists());
-        assert!(target.join(".thinkingroot/graph/triples.jsonl").exists());
-    }
-
-    #[tokio::test]
-    async fn install_rejects_corrupted_tr() {
-        let src_tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(src_tmp.path());
-        let good_tr = workspace.join("good.tr");
-        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-
-        // Corrupt the file deterministically: zero out a 64-byte run
-        // in the middle of the zstd stream + truncate the trailing
-        // checksum. Flipping a single byte was probabilistically
-        // recoverable by zstd's error correction.
-        let mut bytes = fs::read(&good_tr).unwrap();
-        let mid = bytes.len() / 2;
-        let end = (mid + 64).min(bytes.len());
-        for b in &mut bytes[mid..end] {
-            *b = 0;
-        }
-        bytes.truncate(bytes.len().saturating_sub(8));
-        let bad_tr = workspace.join("bad.tr");
-        fs::write(&bad_tr, &bytes).unwrap();
-
-        let dst_tmp = tempdir().unwrap();
-        let target = dst_tmp.path().join("dst");
-        let err = run_install(bad_tr.to_str().unwrap(), Some(target), None, true)
-            .await
-            .expect_err("must reject corrupted .tr");
-        let msg = format!("{err}");
-        assert!(msg.contains("read"), "got: {msg}");
     }
 
     // ── InstallRef parser ────────────────────────────────────────────
@@ -1834,234 +1437,22 @@ description = "Round-trip test pack."
         assert!(format!("{err}").contains("https"), "got: {err}");
     }
 
-    // ── Live registry round-trip ─────────────────────────────────────
-
-    /// Spin up an in-process axum server that mimics the cloud
-    /// registry's discovery + download endpoints, then drive
-    /// `run_install("alice/demo@1.0.0", ...)` against it. Verifies
-    /// hash-header check, discovery-doc parsing, and the unpacked
-    /// files match what `root pack` produced.
-    #[tokio::test]
-    async fn install_via_registry_round_trip() {
-        use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
-        use std::sync::Arc;
-
-        // 1. Build a real .tr from a fake engine workspace.
-        let src_tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(src_tmp.path());
-        let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-        let tr_bytes = fs::read(&tr_out).unwrap();
-        let advertised_hash = blake3_hex(&tr_bytes);
-
-        // 2. Spin up the test registry.
-        struct AppState {
-            tr_bytes: Vec<u8>,
-            hash: String,
-        }
-        let state = Arc::new(AppState {
-            tr_bytes: tr_bytes.clone(),
-            hash: advertised_hash.clone(),
-        });
-
-        async fn discovery(State(_): State<Arc<AppState>>) -> impl IntoResponse {
-            axum::Json(serde_json::json!({
-                "format_version": "tr-registry/1",
-                "tr_format": tr_format::manifest::FORMAT_VERSION,
-                "endpoints": {
-                    "download": "/api/v1/packs/{owner}/{slug}/versions/{version}/download"
-                },
-                "max_pack_bytes": 134_217_728_u64,
-                "supported_compressions": ["zstd"]
-            }))
-        }
-        async fn download(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/zstd"),
-            );
-            headers.insert(
-                axum::http::HeaderName::from_static("x-tr-content-hash"),
-                axum::http::HeaderValue::from_str(&s.hash).unwrap(),
-            );
-            (axum::http::StatusCode::OK, headers, s.tr_bytes.clone())
-        }
-
-        let app = Router::new()
-            .route("/.well-known/tr-registry.json", get(discovery))
-            .route(
-                "/api/v1/packs/{owner}/{slug}/versions/{version}/download",
-                get(download),
-            )
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        let registry_url = format!("http://{}", bound);
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // 3. Drive `root install` against the live test registry.
-        let dst_tmp = tempdir().unwrap();
-        let target = dst_tmp.path().join("installed");
-        // The fixture pack is T0 (run_pack ships unsigned by default) and
-        // we're installing remotely — pass --allow-unsigned to flip the
-        // remote-default policy.
-        run_install(
-            "alice/demo@0.1.0",
-            Some(target.clone()),
-            Some(registry_url.clone()),
-            true,
-        )
-        .await
-        .unwrap();
-        server.abort();
-
-        // 4. Verify install layout — same shape as the local-file path.
-        assert!(target.join("manifest.json").exists());
-        assert!(target.join(".thinkingroot/graph/triples.jsonl").exists());
-        assert_eq!(
-            fs::read(target.join(".thinkingroot/artifacts/entities/foo.md")).unwrap(),
-            b"# Foo\nA fact.\n"
-        );
-    }
-
-    /// Hash mismatch must abort install — defense in depth on top of
-    /// the manifest's own canonical-bytes check inside `tr_format`.
-    #[tokio::test]
-    async fn install_via_registry_rejects_hash_mismatch() {
-        use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
-        use std::sync::Arc;
-
-        let src_tmp = tempdir().unwrap();
-        let workspace = fake_engine_workspace(src_tmp.path());
-        let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
-        let tr_bytes = fs::read(&tr_out).unwrap();
-
-        struct AppState {
-            tr_bytes: Vec<u8>,
-        }
-        let state = Arc::new(AppState { tr_bytes });
-
-        async fn discovery() -> impl IntoResponse {
-            axum::Json(serde_json::json!({
-                "format_version": "tr-registry/1",
-                "tr_format": tr_format::manifest::FORMAT_VERSION,
-                "endpoints": {
-                    "download": "/api/v1/packs/{owner}/{slug}/versions/{version}/download"
-                },
-                "max_pack_bytes": 134_217_728_u64,
-                "supported_compressions": ["zstd"]
-            }))
-        }
-        async fn download(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-            // Lie about the hash — substitute `0`s.
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/zstd"),
-            );
-            headers.insert(
-                axum::http::HeaderName::from_static("x-tr-content-hash"),
-                axum::http::HeaderValue::from_static(
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                ),
-            );
-            (axum::http::StatusCode::OK, headers, s.tr_bytes.clone())
-        }
-
-        let app = Router::new()
-            .route("/.well-known/tr-registry.json", get(discovery))
-            .route(
-                "/api/v1/packs/{owner}/{slug}/versions/{version}/download",
-                get(download),
-            )
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        let registry_url = format!("http://{}", bound);
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let dst_tmp = tempdir().unwrap();
-        let target = dst_tmp.path().join("installed");
-        let err = run_install(
-            "alice/demo@0.1.0",
-            Some(target),
-            Some(registry_url),
-            true,
-        )
-        .await
-        .expect_err("hash mismatch must abort install");
-        server.abort();
-        assert!(
-            format!("{err}").contains("hash mismatch"),
-            "expected hash-mismatch error, got: {err}"
-        );
-    }
-
-    /// Discovery doc with a foreign `format_version` must be refused.
-    #[tokio::test]
-    async fn install_via_registry_refuses_unknown_registry_format() {
-        use axum::{response::IntoResponse, routing::get, Router};
-
-        async fn discovery() -> impl IntoResponse {
-            axum::Json(serde_json::json!({
-                "format_version": "tr-registry/99",
-                "tr_format": "tr/1",
-                "endpoints": {
-                    "download": "/api/v1/packs/{owner}/{slug}/versions/{version}/download"
-                }
-            }))
-        }
-        let app = Router::new().route("/.well-known/tr-registry.json", get(discovery));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        let registry_url = format!("http://{}", bound);
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let dst_tmp = tempdir().unwrap();
-        let target = dst_tmp.path().join("dst");
-        let err = run_install(
-            "alice/demo@0.1.0",
-            Some(target),
-            Some(registry_url),
-            true,
-        )
-        .await
-        .expect_err("foreign registry format must be refused");
-        server.abort();
-        assert!(
-            format!("{err}").contains("unsupported format_version"),
-            "got: {err}"
-        );
-    }
 
     // -------------------------------------------------------------------------
-    // Trust-verification integration (Phase F Step 5)
+    // V3 install policy + extraction integration tests.
     //
-    // These tests exercise the policy + extraction layer in
-    // `install_with_verifier`. The verdict semantics themselves are
-    // already covered by `crates/tr-verify/tests/verify_smoke.rs`; these
-    // tests confirm that each verdict maps to the right `InstallRefused`
-    // exit code and that the file extraction step does NOT run on
-    // refusal.
+    // The verdict semantics themselves are covered by
+    // `crates/tr-verify/src/v3.rs`. These tests confirm that each
+    // V3Verdict variant maps to the right InstallRefused exit code and
+    // that the extraction step does NOT run on refusal.
     // -------------------------------------------------------------------------
 
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
-    use std::sync::Arc;
     use std::time::Duration;
-    use tr_format::TrustTier;
     use tr_revocation::{
         Advisory, Authority, CacheConfig, PinnedKey, Reason, RevocationCache, Snapshot,
     };
-    use tr_verify::{AuthorKeyStore, TrustedAuthorKey, Verifier, VerifierConfig};
 
     fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -2074,11 +1465,14 @@ description = "Round-trip test pack."
             .as_secs()
     }
 
+    /// Pre-seed a `RevocationCache` with a signed snapshot listing
+    /// `revoked_hashes` so `load_or_refresh` returns it on the
+    /// fresh-cache path without any HTTP round-trip.
     fn fresh_revocation_cache(
         cache_dir: PathBuf,
         revocation_key: &SigningKey,
         revoked_hashes: &[&str],
-    ) -> Arc<RevocationCache> {
+    ) -> RevocationCache {
         let mut snap = Snapshot {
             schema_version: "1.0.0".into(),
             generated_at: 1_745_100_000,
@@ -2116,7 +1510,7 @@ description = "Round-trip test pack."
         )
         .unwrap();
 
-        Arc::new(RevocationCache::new(CacheConfig {
+        RevocationCache::new(CacheConfig {
             registry_url: url::Url::parse("https://hub.example/").unwrap(),
             cache_dir,
             fresh_ttl: Duration::from_secs(60 * 60),
@@ -2126,30 +1520,38 @@ description = "Round-trip test pack."
                 ed25519_public: revocation_key.verifying_key().to_bytes(),
             }],
             max_snapshot_bytes: 50 * 1024 * 1024,
-        }))
+        })
     }
 
-    fn build_unsigned_pack(name: &str, tier: TrustTier) -> Vec<u8> {
-        let mut manifest = Manifest::new(name, Version::parse("0.1.0").unwrap(), "Apache-2.0");
-        manifest.trust_tier = tier;
-        let mut pb = PackBuilder::new(manifest);
-        pb.put_text("artifacts/card.md", "# Hello").unwrap();
-        pb.build().unwrap()
+    fn build_unsigned_v3_pack(name: &str) -> Vec<u8> {
+        let manifest = ManifestV3::new(name, Version::parse("0.1.0").unwrap());
+        let mut b = V3PackBuilder::new(manifest);
+        b.add_source_file("a.md", b"alpha\n").unwrap();
+        b.add_claim(ClaimRecord::new(
+            "c-1",
+            "alpha is the first letter",
+            vec!["alpha".into()],
+            "a.md",
+            0,
+            5,
+        ));
+        b.build().unwrap()
     }
 
-    fn build_t1_signed_pack(name: &str, key: &SigningKey, key_id: &str) -> Vec<u8> {
-        let mut manifest = Manifest::new(name, Version::parse("0.1.0").unwrap(), "Apache-2.0");
-        manifest.trust_tier = TrustTier::T1;
-        manifest.authors = vec![key_id.to_string()];
-
-        let canonical = manifest.canonical_bytes_for_hashing().unwrap();
-        let signature = key.sign(&canonical);
-
-        let mut pb = PackBuilder::new(manifest).keep_generated_at();
-        pb.put_file("signatures/author.sig", &signature.to_bytes())
-            .unwrap();
-        pb.put_text("artifacts/card.md", "# T1 demo").unwrap();
-        pb.build().unwrap()
+    fn build_signed_v3_pack(name: &str, key: &SigningKey) -> Vec<u8> {
+        let manifest = ManifestV3::new(name, Version::parse("0.1.0").unwrap());
+        let mut b = V3PackBuilder::new(manifest);
+        b.add_source_file("a.md", b"alpha\n").unwrap();
+        b.add_claim(ClaimRecord::new(
+            "c-1",
+            "alpha is the first letter",
+            vec!["alpha".into()],
+            "a.md",
+            0,
+            5,
+        ));
+        let pack_filename = format!("{}-0.1.0.tr", name.replace('/', "-"));
+        b.build_signed(key, &pack_filename).unwrap()
     }
 
     fn write_pack_to_disk(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -2165,98 +1567,109 @@ description = "Round-trip test pack."
     }
 
     #[tokio::test]
-    async fn install_succeeds_for_t1_pack_with_trusted_author_key() {
+    async fn install_succeeds_for_signed_v3_pack() {
         let tmp = tempdir().unwrap();
         let rev_key = signing_key(20);
         let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
 
-        let author = signing_key(21);
-        let pack_bytes = build_t1_signed_pack("alice/thesis", &author, "alice");
+        let signing = signing_key(21);
+        let pack_bytes = build_signed_v3_pack("alice/thesis", &signing);
         let pack_path = write_pack_to_disk(tmp.path(), "alice-thesis.tr", &pack_bytes);
 
-        let store = Arc::new(AuthorKeyStore::with_keys([TrustedAuthorKey {
-            key_id: "alice".into(),
-            ed25519_public: author.verifying_key().to_bytes(),
-        }]));
-        let verifier = Verifier::new(VerifierConfig {
-            revocation: cache,
-            author_keys: store,
-            require_min_tier: TrustTier::T1,
-            allow_unsigned: false,
-        });
-
         let target = tmp.path().join("install");
-        install_with_verifier(
+        install_with_revocation_cache(
             pack_path.to_str().unwrap(),
             Some(target.clone()),
             None,
-            &verifier,
+            &cache,
+            true, // is_remote
+            false,
         )
         .await
-        .expect("T1 install with trusted key should succeed");
+        .expect("signed v3 install should succeed");
 
-        assert!(target.join("manifest.json").exists());
-        assert!(target.join(".thinkingroot/artifacts/card.md").exists());
+        assert!(target.join(".thinkingroot/manifest.toml").exists());
+        assert!(target.join(".thinkingroot/claims.jsonl").exists());
+        assert!(target.join(".thinkingroot/sources/a.md").exists());
     }
 
     #[tokio::test]
-    async fn install_refuses_unsigned_pack_with_exit_unsigned() {
+    async fn install_refuses_unsigned_remote_pack_with_exit_unsigned() {
         let tmp = tempdir().unwrap();
         let rev_key = signing_key(22);
         let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
 
-        let pack_bytes = build_unsigned_pack("alice/demo", TrustTier::T0);
+        let pack_bytes = build_unsigned_v3_pack("alice/demo");
         let pack_path = write_pack_to_disk(tmp.path(), "alice-demo.tr", &pack_bytes);
 
-        let verifier = Verifier::new(VerifierConfig {
-            revocation: cache,
-            author_keys: Arc::new(AuthorKeyStore::empty()),
-            require_min_tier: TrustTier::T1,
-            allow_unsigned: false,
-        });
-
         let target = tmp.path().join("install");
-        let err = install_with_verifier(
+        let err = install_with_revocation_cache(
             pack_path.to_str().unwrap(),
             Some(target.clone()),
             None,
-            &verifier,
+            &cache,
+            true, // is_remote
+            false, // user_allow_unsigned = false
         )
         .await
-        .expect_err("unsigned pack should be refused");
+        .expect_err("unsigned remote pack should be refused");
 
         assert_eq!(refuse_exit_code(&err), EXIT_UNSIGNED);
-        // Refusal must NOT extract files.
         assert!(!target.exists(), "target dir should not exist on refusal");
+    }
+
+    #[tokio::test]
+    async fn install_accepts_unsigned_local_pack_by_default() {
+        let tmp = tempdir().unwrap();
+        let rev_key = signing_key(23);
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
+
+        let pack_bytes = build_unsigned_v3_pack("alice/local");
+        let pack_path = write_pack_to_disk(tmp.path(), "alice-local.tr", &pack_bytes);
+
+        let target = tmp.path().join("install");
+        install_with_revocation_cache(
+            pack_path.to_str().unwrap(),
+            Some(target.clone()),
+            None,
+            &cache,
+            false, // is_remote = false
+            false,
+        )
+        .await
+        .expect("unsigned local pack should be accepted by default");
+
+        assert!(target.join(".thinkingroot/manifest.toml").exists());
     }
 
     #[tokio::test]
     async fn install_refuses_revoked_pack_with_exit_revoked() {
         let tmp = tempdir().unwrap();
-        let rev_key = signing_key(23);
+        let rev_key = signing_key(24);
 
-        let pack_bytes = build_unsigned_pack("alice/bad", TrustTier::T0);
+        let signing = signing_key(25);
+        let pack_bytes = build_signed_v3_pack("alice/bad", &signing);
         let pack_path = write_pack_to_disk(tmp.path(), "alice-bad.tr", &pack_bytes);
-        let pack = tr_reader::read_bytes(&pack_bytes).unwrap();
+        let pack = read_v3_pack(&pack_bytes).unwrap();
 
+        // Pack-hash format is `blake3:<hex>` — strip the prefix when
+        // building the revocation snapshot since `fresh_revocation_cache`
+        // re-adds the prefix.
+        let bare_hash = pack.manifest.pack_hash.strip_prefix("blake3:").unwrap();
         let cache = fresh_revocation_cache(
             tmp.path().join("rev"),
             &rev_key,
-            &[&pack.content_bytes_hash],
+            &[bare_hash],
         );
-        let verifier = Verifier::new(VerifierConfig {
-            revocation: cache,
-            author_keys: Arc::new(AuthorKeyStore::empty()),
-            require_min_tier: TrustTier::T0,
-            allow_unsigned: true,
-        });
 
         let target = tmp.path().join("install");
-        let err = install_with_verifier(
+        let err = install_with_revocation_cache(
             pack_path.to_str().unwrap(),
             Some(target.clone()),
             None,
-            &verifier,
+            &cache,
+            true,
+            false,
         )
         .await
         .expect_err("revoked pack should be refused");
@@ -2265,64 +1678,8 @@ description = "Round-trip test pack."
         assert!(!target.exists());
     }
 
-    #[tokio::test]
-    async fn install_refuses_t1_with_unknown_author_key() {
-        let tmp = tempdir().unwrap();
-        let rev_key = signing_key(24);
-        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
-
-        let author = signing_key(25);
-        let pack_bytes = build_t1_signed_pack("alice/thesis", &author, "alice-unknown");
-        let pack_path = write_pack_to_disk(tmp.path(), "alice-unknown.tr", &pack_bytes);
-
-        let verifier = Verifier::new(VerifierConfig {
-            revocation: cache,
-            author_keys: Arc::new(AuthorKeyStore::empty()),
-            require_min_tier: TrustTier::T1,
-            allow_unsigned: false,
-        });
-
-        let target = tmp.path().join("install");
-        let err = install_with_verifier(
-            pack_path.to_str().unwrap(),
-            Some(target.clone()),
-            None,
-            &verifier,
-        )
-        .await
-        .expect_err("unknown-key T1 pack should be refused");
-
-        assert_eq!(refuse_exit_code(&err), EXIT_KEY_UNKNOWN);
-        assert!(!target.exists());
-    }
-
-    #[tokio::test]
-    async fn install_refuses_t2_pack_with_exit_unsupported() {
-        let tmp = tempdir().unwrap();
-        let rev_key = signing_key(26);
-        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[]);
-
-        let pack_bytes = build_unsigned_pack("alice/sigstore-demo", TrustTier::T2);
-        let pack_path = write_pack_to_disk(tmp.path(), "alice-sigstore.tr", &pack_bytes);
-
-        let verifier = Verifier::new(VerifierConfig {
-            revocation: cache,
-            author_keys: Arc::new(AuthorKeyStore::empty()),
-            require_min_tier: TrustTier::T1,
-            allow_unsigned: false,
-        });
-
-        let target = tmp.path().join("install");
-        let err = install_with_verifier(
-            pack_path.to_str().unwrap(),
-            Some(target.clone()),
-            None,
-            &verifier,
-        )
-        .await
-        .expect_err("T2 pack should be refused until Step 4b");
-
-        assert_eq!(refuse_exit_code(&err), EXIT_UNSUPPORTED);
-        assert!(!target.exists());
-    }
+    // Tamper detection is comprehensively covered by
+    // `crates/tr-verify/src/v3.rs` tests (`tampered_claims_jsonl_detected_before_signature_check`,
+    // `tampered_manifest_pack_hash_field_detected`, etc.). The CLI
+    // path delegates to those — no duplication here.
 }

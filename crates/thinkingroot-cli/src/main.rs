@@ -349,38 +349,24 @@ enum Commands {
         /// One-line description. Overrides `Pack.toml`.
         #[arg(long)]
         description: Option<String>,
-        /// Pack format: `tr/3` (default — the 3-file
-        /// `[manifest.toml, source.tar.zst, claims.jsonl,
-        /// signature.sig?]` layout from the v3 spec, with byte-range
-        /// citations on every claim, BLAKE3 canonicalization, and
-        /// optional Sigstore-keyless DSSE signing) or `tr/1` (the
-        /// legacy multi-directory tar+zstd format kept for back-compat
-        /// with consumers that haven't migrated to v3 readers yet).
-        ///
-        /// The v3.0 release flipped the default per the plan
-        /// (`~/.claude/plans/zippy-wiggling-pelican.md`); the legacy
-        /// path stays alive for tr/1 readers.
-        #[arg(long, default_value = "tr/3")]
-        format: String,
-        /// Path to an Ed25519 signing key (32 raw bytes). When set
-        /// and `--format=tr/3`, the pack is signed inline and emitted
-        /// with `signature.sig` as the 4th outer-tar entry. The Phase
-        /// F design (`docs/2026-04-29-phase-f-trust-verify-spec.md`)
-        /// covers the wire format. This is the air-gapped /
-        /// self-signed path; Sigstore-public-good keyless signing
-        /// uses `--sign-keyless` instead.
+        /// Path to an Ed25519 signing key (32 raw bytes). When set,
+        /// the pack is signed inline and emitted with `signature.sig`
+        /// as the 4th outer-tar entry. The Phase F design
+        /// (`docs/2026-04-29-phase-f-trust-verify-spec.md`) covers
+        /// the wire format. This is the air-gapped / self-signed
+        /// path; Sigstore-public-good keyless signing uses
+        /// `--sign-keyless` instead.
         #[arg(long, value_name = "KEY_FILE", conflicts_with = "sign_keyless")]
         sign: Option<PathBuf>,
-        /// Sign the pack via Sigstore-public-good keyless DSSE
-        /// (`--format=tr/3` only). The CLI obtains an OIDC id_token
-        /// (preferring `$TR_OIDC_TOKEN` if set; otherwise opening the
-        /// default browser to `https://oauth2.sigstore.dev/auth`),
-        /// requests an ephemeral ECDSA P-256 cert from Fulcio, signs
-        /// the DSSE PAE with the ephemeral key, submits the entry to
-        /// Rekor, and embeds the resulting Sigstore Bundle as
-        /// `signature.sig` in the outer tar. The signing key never
-        /// touches disk. See `crates/tr-sigstore/src/live.rs` for the
-        /// flow.
+        /// Sign the pack via Sigstore-public-good keyless DSSE.
+        /// The CLI obtains an OIDC id_token (preferring `$TR_OIDC_TOKEN`
+        /// if set; otherwise opening the default browser to
+        /// `https://oauth2.sigstore.dev/auth`), requests an ephemeral
+        /// ECDSA P-256 cert from Fulcio, signs the DSSE PAE with the
+        /// ephemeral key, submits the entry to Rekor, and embeds the
+        /// resulting Sigstore Bundle as `signature.sig` in the outer
+        /// tar. The signing key never touches disk. See
+        /// `crates/tr-sigstore/src/live.rs` for the flow.
         #[arg(long, conflicts_with = "sign")]
         sign_keyless: bool,
     },
@@ -921,7 +907,6 @@ async fn async_main() -> anyhow::Result<()> {
             version,
             license,
             description,
-            format,
             sign,
             sign_keyless,
         }) => {
@@ -932,7 +917,6 @@ async fn async_main() -> anyhow::Result<()> {
                 version,
                 license,
                 description,
-                &format,
                 sign.as_deref(),
                 sign_keyless,
             )?;
