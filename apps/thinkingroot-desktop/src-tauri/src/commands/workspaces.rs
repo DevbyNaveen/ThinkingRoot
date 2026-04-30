@@ -164,6 +164,14 @@ pub enum CompileProgress {
         claims: usize,
         entities: usize,
     },
+    /// Emitted when one or more LLM batches failed permanently during
+    /// extraction.  React renders a non-fatal toast — the compile is
+    /// still moving forward but the chunks in `failed_chunk_ranges`
+    /// have no claims.  Pre-fix these failures were silently dropped.
+    ExtractionPartial {
+        failed_batches: usize,
+        failed_chunk_ranges: Vec<(usize, usize)>,
+    },
     GroundingProgress {
         done: usize,
         total: usize,
@@ -188,7 +196,20 @@ pub enum CompileProgress {
         artifacts: usize,
         health_score: u8,
         cache_dirty: bool,
+        /// Carried through from PipelineResult so the React side can
+        /// render a "compile finished but N batches failed" warning
+        /// without listening to a separate ExtractionPartial event.
+        #[serde(default)]
+        failed_batches: usize,
+        #[serde(default)]
+        failed_chunk_ranges: Vec<(usize, usize)>,
     },
+    /// Caller-initiated stop via `workspace_compile_stop`.  Distinct
+    /// from `Failed` so the UI can render a neutral "stopped" state
+    /// instead of a red error toast.  Per-source state already
+    /// persisted by Phase 4 / per-batch checkpoint flushes is
+    /// preserved on disk.
+    Cancelled,
     Failed {
         error: String,
     },
@@ -257,8 +278,14 @@ pub async fn workspace_compile(
                         artifacts: result.artifacts_count,
                         health_score: result.health_score,
                         cache_dirty: result.cache_dirty,
+                        failed_batches: result.failed_batches,
+                        failed_chunk_ranges: result.failed_chunk_ranges.clone(),
                     },
                 );
+            }
+            Err(e) if e.is_cancelled() => {
+                let _ = app_for_task
+                    .emit("workspace_compile_progress", CompileProgress::Cancelled);
             }
             Err(e) => {
                 let _ = app_for_task.emit(
@@ -291,6 +318,13 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
         ProgressEvent::ExtractionComplete {
             claims, entities, ..
         } => Some(CompileProgress::ExtractionComplete { claims, entities }),
+        ProgressEvent::ExtractionPartial {
+            failed_batches,
+            failed_chunk_ranges,
+        } => Some(CompileProgress::ExtractionPartial {
+            failed_batches,
+            failed_chunk_ranges,
+        }),
         ProgressEvent::GroundingProgress { done, total } => {
             Some(CompileProgress::GroundingProgress { done, total })
         }

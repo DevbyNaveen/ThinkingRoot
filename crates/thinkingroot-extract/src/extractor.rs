@@ -93,6 +93,19 @@ pub struct ExtractionOutput {
     /// Maps ClaimId → the LLM's cited source_quote for that claim.
     /// Used by Judge 2 (span attribution) in the grounding system.
     pub claim_source_quotes: HashMap<ClaimId, String>,
+    /// Number of LLM batches that exhausted retries and produced no
+    /// claims.  Pre-fix these failures were silently dropped: the
+    /// orchestrator reported "extraction complete" with claims missing.
+    /// Surfaced to callers so the CLI / desktop can render a partial-
+    /// failure warning, and so the next compile knows which chunks to
+    /// re-target.
+    pub failed_batches: usize,
+    /// `(range_start, range_end)` chunk-index ranges (1-indexed,
+    /// inclusive) of every batch that failed permanently.  Mirrors the
+    /// shape of `ProgressEvent::ExtractionBatchStart::range_*` so a
+    /// single user-visible vocabulary describes both states.  Empty
+    /// when `failed_batches == 0`.
+    pub failed_batch_ranges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +398,22 @@ impl Extractor {
             let batch_chunks = batch_work.len();
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.ok()?;
+                // Spawn return type carries `Err((range_start, range_end))`
+                // on permanent failure so the collect loop can attribute the
+                // affected chunk range to the user.  Pre-fix this was an
+                // `Option<...>` whose `None` was silently dropped — the user
+                // saw "extraction complete" with claims missing.
+                type BatchOk = (Vec<ChunkWork>, Vec<crate::batch::BatchChunkResult>);
+                type BatchFail = (usize, usize);
+                let permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Semaphore closed (normally only on shutdown).
+                        // Treat as a permanent failure so the caller knows.
+                        return Err::<BatchOk, BatchFail>((range_start, range_end));
+                    }
+                };
+                let _permit = permit;
 
                 if let Some(ref pf) = progress {
                     pf(ExtractionProgressEvent::BatchStart {
@@ -423,11 +451,15 @@ impl Extractor {
                     Ok(raw_response) => {
                         let batch_results =
                             crate::batch::parse_batch_response(&raw_response, &expected_ids);
-                        Some((batch_work, batch_results))
+                        Ok((batch_work, batch_results))
                     }
                     Err(e) => {
-                        tracing::warn!("batch extraction failed: {e}");
-                        None
+                        tracing::warn!(
+                            range_start,
+                            range_end,
+                            "batch extraction failed permanently: {e}"
+                        );
+                        Err((range_start, range_end))
                     }
                 }
             });
@@ -448,7 +480,25 @@ impl Extractor {
                 join_set.shutdown().await;
                 return Err(thinkingroot_core::Error::Cancelled);
             }
-            if let Ok(Some((batch_work, batch_results))) = join_result {
+            let batch_outcome = match join_result {
+                Ok(inner) => inner,
+                Err(join_err) => {
+                    // Tokio task panic — count as a permanent failure
+                    // but with no range information available.
+                    tracing::error!("batch task panicked: {join_err}");
+                    output.failed_batches += 1;
+                    continue;
+                }
+            };
+            let (batch_work, batch_results) = match batch_outcome {
+                Ok(pair) => pair,
+                Err((rs, re)) => {
+                    output.failed_batches += 1;
+                    output.failed_batch_ranges.push((rs, re));
+                    continue;
+                }
+            };
+            {
                 for chunk_result in batch_results {
                     if chunk_result.id >= batch_work.len() {
                         continue;
@@ -782,6 +832,8 @@ impl ExtractionOutput {
         self.structural_extractions += other.structural_extractions;
         self.source_texts.extend(other.source_texts);
         self.claim_source_quotes.extend(other.claim_source_quotes);
+        self.failed_batches += other.failed_batches;
+        self.failed_batch_ranges.extend(other.failed_batch_ranges);
     }
 }
 
@@ -1001,6 +1053,39 @@ mod tests {
             parse_relation_type("related_to"),
             Some(RelationType::RelatedTo)
         );
+    }
+
+    #[test]
+    fn extraction_output_default_has_no_failed_batches() {
+        // Regression for C4: pre-fix the partial-failure counter didn't
+        // exist; failed batches were silently dropped.  A fresh
+        // ExtractionOutput must start clean so the merge accumulator
+        // produces 0 in the no-failures case.
+        let out = ExtractionOutput::default();
+        assert_eq!(out.failed_batches, 0);
+        assert!(out.failed_batch_ranges.is_empty());
+    }
+
+    #[test]
+    fn extraction_output_merge_accumulates_failed_batches() {
+        // The pipeline calls `output.merge(converted)` for every chunk
+        // result; failed_batches must roll forward end-to-end so the
+        // CLI summary + ProgressEvent::ExtractionPartial see the right
+        // total.  Mirrors how the merge of cache_hits / chunks_processed
+        // already works.
+        let mut a = ExtractionOutput {
+            failed_batches: 1,
+            failed_batch_ranges: vec![(1, 6)],
+            ..Default::default()
+        };
+        let b = ExtractionOutput {
+            failed_batches: 2,
+            failed_batch_ranges: vec![(13, 18), (25, 30)],
+            ..Default::default()
+        };
+        a.merge(b);
+        assert_eq!(a.failed_batches, 3);
+        assert_eq!(a.failed_batch_ranges, vec![(1, 6), (13, 18), (25, 30)]);
     }
 }
 

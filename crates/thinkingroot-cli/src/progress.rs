@@ -691,6 +691,12 @@ pub async fn run_compile_progress(
                         }
                     }
 
+                    ProgressEvent::ExtractionPartial { failed_batches: _, failed_chunk_ranges: _ } => {
+                        // Pipeline summary at the end of run_compile already
+                        // prints the warning unconditionally.  No mid-bar
+                        // render here — keeping the bar layout clean.
+                    }
+
                     ProgressEvent::PipelineFailed { error: _ } => {
                         // Don't render here — the cleanup loop after the channel
                         // closes will paint every unfinished bar with

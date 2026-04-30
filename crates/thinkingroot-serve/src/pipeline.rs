@@ -60,6 +60,15 @@ pub enum ProgressEvent {
         entities: usize,
         cache_hits: usize,
     },
+    /// Some LLM batches failed permanently (retries exhausted) and the
+    /// claims they would have produced are missing.  Emitted after
+    /// `ExtractionComplete` only when `failed_batches > 0`.  Pre-fix
+    /// these failures were silently dropped — the user only saw "ok"
+    /// even though their compile was incomplete.
+    ExtractionPartial {
+        failed_batches: usize,
+        failed_chunk_ranges: Vec<(usize, usize)>,
+    },
     /// Grounding tribunal is starting (runs between extraction and linking).
     GroundingStart {
         llm_claims: usize,
@@ -134,6 +143,18 @@ pub struct PipelineResult {
     /// `false` means all files were fingerprint-identical — the cache is still
     /// current and the caller should skip the reload entirely.
     pub cache_dirty: bool,
+    /// LLM batches that exhausted retries during extraction.  Non-zero
+    /// means the compile is partial — claims are missing for chunks in
+    /// `failed_chunk_ranges`.  Surfaced so the CLI can print a yellow
+    /// warning and the desktop can render a non-fatal toast.
+    #[serde(default)]
+    pub failed_batches: usize,
+    /// `(range_start, range_end)` chunk ranges (inclusive, 1-indexed) of
+    /// every batch that failed permanently.  Identical wire shape to
+    /// `ProgressEvent::ExtractionBatchStart::range_*` so callers don't
+    /// need a second vocabulary.
+    #[serde(default)]
+    pub failed_chunk_ranges: Vec<(usize, usize)>,
 }
 
 /// Run the v3 pipeline: Parse → Extract+Ground+Rooting+Link+SVO →
@@ -281,6 +302,8 @@ async fn run_pipeline_inner(
             structural_extractions: 0,
             // All files were content-hash identical — CozoDB was not touched.
             cache_dirty: false,
+            failed_batches: 0,
+            failed_chunk_ranges: Vec::new(),
         });
     }
 
@@ -399,6 +422,16 @@ async fn run_pipeline_inner(
             entities: raw.entities.len(),
             cache_hits: raw.cache_hits,
         });
+        if raw.failed_batches > 0 {
+            tracing::warn!(
+                failed_batches = raw.failed_batches,
+                "extraction completed with permanent batch failures — emitting partial event"
+            );
+            emit!(ProgressEvent::ExtractionPartial {
+                failed_batches: raw.failed_batches,
+                failed_chunk_ranges: raw.failed_batch_ranges.clone(),
+            });
+        }
         cache_hits = raw.cache_hits;
         extraction = raw;
     }
@@ -656,6 +689,8 @@ async fn run_pipeline_inner(
             structural_extractions: extraction.structural_extractions,
             // Deletions or fingerprint cutoffs mutated CozoDB — cache is stale.
             cache_dirty: true,
+            failed_batches: extraction.failed_batches,
+            failed_chunk_ranges: extraction.failed_batch_ranges.clone(),
         });
     }
 
@@ -714,6 +749,11 @@ async fn run_pipeline_inner(
         structural_extractions: extraction.structural_extractions,
         source_texts: extraction.source_texts,
         claim_source_quotes: extraction.claim_source_quotes,
+        // Carry partial-failure attribution forward so consumers downstream
+        // (currently the pipeline summary; soon the desktop UI per C4)
+        // can render an honest "N batches failed" warning.
+        failed_batches: extraction.failed_batches,
+        failed_batch_ranges: extraction.failed_batch_ranges,
     };
 
     // ─── Phase 6.5: Rooting ────────────────────────────────────────────
@@ -834,6 +874,11 @@ async fn run_pipeline_inner(
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();
     let relations_count = filtered_extraction.relations.len();
+    // Snapshot failed-batch attribution before Linker moves the
+    // extraction.  The PipelineResult needs them at the very end so
+    // the CLI/desktop can render an honest partial-failure summary.
+    let failed_batches = filtered_extraction.failed_batches;
+    let failed_chunk_ranges = filtered_extraction.failed_batch_ranges.clone();
 
     // Retain a lightweight clone of the filtered claims for Phase 2c-post-link
     // (SVO event extraction).  We clone before the linker takes ownership so that
@@ -951,6 +996,8 @@ async fn run_pipeline_inner(
         structural_extractions,
         // v3 pipeline ran — CozoDB has new data.
         cache_dirty: true,
+        failed_batches,
+        failed_chunk_ranges,
     })
 }
 

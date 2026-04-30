@@ -1097,6 +1097,24 @@ async fn run_compile(
             style(result.early_cutoffs).green()
         ));
     }
+    if result.failed_batches > 0 {
+        // Pre-fix these failures were silently dropped — the user only
+        // saw "ok" while their compile was incomplete.  Always print
+        // unconditionally (regardless of TTY filter) so users notice.
+        let ranges = result
+            .failed_chunk_ranges
+            .iter()
+            .map(|(s, e)| format!("{s}–{e}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out(format!(
+            "  {} {} batch{} failed permanently (chunks {}) — claims for those chunks are missing; re-run to retry",
+            style("  ⚠").yellow().bold(),
+            style(result.failed_batches).yellow().bold(),
+            if result.failed_batches == 1 { "" } else { "es" },
+            style(ranges).yellow()
+        ));
+    }
     out(String::new());
 
     Ok(())
