@@ -1,5 +1,5 @@
 //! `tr-render` — pure-Rust renderer producing human-readable previews
-//! of TR-1 `.tr` packs.
+//! of v3 `.tr` packs.
 //!
 //! Both `root install --dry-run` and the desktop install sheet
 //! consume [`render_preview`] to show the user what they're about to
@@ -9,9 +9,10 @@
 //! here: we emit Markdown text and a monospace-friendly ASCII table;
 //! the caller decides how to display them.
 //!
-//! The crate intentionally has no async, no I/O beyond reading the
-//! supplied byte slice, and no dependency on `tokio` — the preview
-//! must be cheap to compute even from inside a Tauri command handler.
+//! The crate intentionally has no async, no I/O beyond the
+//! already-parsed [`V3Pack`], and no dependency on `tokio` — the
+//! preview must be cheap to compute even from inside a Tauri command
+//! handler.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -19,63 +20,53 @@
 mod manifest_table;
 mod markdown;
 
-use tr_format::{reader, Manifest};
+use tr_format::V3Pack;
 
 /// Output bundle returned by [`render_preview`].
 #[derive(Debug, Clone)]
 pub struct RenderedPreview {
     /// Markdown summary of the pack — name, version, license,
-    /// trust tier, capabilities, archive stats, and the manifest's
-    /// readme inlined.
+    /// signature status, archive stats, extractor identity.
     pub markdown: String,
     /// Monospace-friendly ASCII table of the load-bearing manifest
     /// fields, suitable for terminal display.
     pub manifest_table: String,
-    /// Count of in-archive source-byte references (entries under
-    /// `provenance/`).
-    pub source_count: usize,
-    /// Total payload entries (excludes `manifest.json`).
-    pub entry_count: usize,
-    /// Sum of payload-entry sizes in bytes.
-    pub payload_bytes: u64,
+    /// Number of source files declared in the manifest, when present.
+    pub source_count: u64,
+    /// Number of claims declared in the manifest, when present.
+    pub claim_count: u64,
+    /// Total source-archive payload bytes (`source.tar.zst` size).
+    pub source_archive_bytes: u64,
 }
 
-/// Errors surfaced by [`render_preview`].
+/// Errors surfaced by [`render_preview`]. Today none — the renderer
+/// is infallible given a parsed [`V3Pack`] — but kept as a stable
+/// surface for forward-compat with future fallible inspection.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum Error {
-    /// Failure reading the underlying `.tr` archive.
-    #[error(transparent)]
-    Format(#[from] tr_format::Error),
-}
+pub enum Error {}
 
 /// Convenience alias used across the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Render a preview of a `.tr` pack.
+/// Render a preview of a v3 `.tr` pack.
 ///
-/// `manifest` is taken explicitly so the caller can avoid re-parsing
-/// the same blob twice — `tr-verify` and the install pipeline both
-/// already own a parsed [`Manifest`] by the time the preview is
-/// requested. The supplied bytes are still walked so the function
-/// can populate archive-level stats (entry / source / payload sizes).
-pub fn render_preview(manifest: &Manifest, archive_bytes: &[u8]) -> Result<RenderedPreview> {
-    let pack = reader::read_bytes(archive_bytes)?;
+/// The caller is expected to have already parsed the pack via
+/// [`tr_format::read_v3_pack`] — the renderer pulls everything it
+/// needs out of the parsed structure and never re-walks the archive
+/// bytes.
+pub fn render_preview(pack: &V3Pack) -> Result<RenderedPreview> {
+    let source_count = pack.manifest.source_files.unwrap_or(0);
+    let claim_count = pack.manifest.claim_count.unwrap_or(0);
+    let source_archive_bytes = pack.source_archive.len() as u64;
 
-    let source_count = pack
-        .paths()
-        .filter(|p| p.starts_with("provenance/") && !p.ends_with('/'))
-        .count();
-    let entry_count = pack.len().saturating_sub(1);
-    let payload_bytes = pack.payload_bytes();
-
-    let manifest_table = manifest_table::format(manifest);
+    let manifest_table = manifest_table::format(pack);
     let markdown = markdown::summary(
-        manifest,
+        pack,
         ArchiveStats {
             source_count,
-            entry_count,
-            payload_bytes,
+            claim_count,
+            source_archive_bytes,
         },
     );
 
@@ -83,8 +74,8 @@ pub fn render_preview(manifest: &Manifest, archive_bytes: &[u8]) -> Result<Rende
         markdown,
         manifest_table,
         source_count,
-        entry_count,
-        payload_bytes,
+        claim_count,
+        source_archive_bytes,
     })
 }
 
@@ -92,7 +83,7 @@ pub fn render_preview(manifest: &Manifest, archive_bytes: &[u8]) -> Result<Rende
 /// the public surface minimal.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ArchiveStats {
-    pub source_count: usize,
-    pub entry_count: usize,
-    pub payload_bytes: u64,
+    pub source_count: u64,
+    pub claim_count: u64,
+    pub source_archive_bytes: u64,
 }

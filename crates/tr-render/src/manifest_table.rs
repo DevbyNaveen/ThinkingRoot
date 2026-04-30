@@ -4,34 +4,49 @@
 
 use std::fmt::Write as _;
 
-use tr_format::Manifest;
+use tr_format::V3Pack;
 
-pub(crate) fn format(manifest: &Manifest) -> String {
+pub(crate) fn format(pack: &V3Pack) -> String {
+    let m = &pack.manifest;
     let rows: Vec<(&str, String)> = vec![
-        ("name", manifest.name.clone()),
-        ("version", manifest.version.to_string()),
-        ("license", manifest.license.clone()),
-        ("trust_tier", trust_tier_str(manifest.trust_tier)),
-        ("content_hash", short_hash(&manifest.content_hash)),
-        ("generated_at", manifest.generated_at.to_rfc3339()),
-        ("description", truncate(&manifest.description, 60)),
-        ("authors", join_or_dash(&manifest.authors)),
-        ("tags", join_or_dash(&manifest.tags)),
+        ("name", m.name.clone()),
+        ("version", m.version.to_string()),
+        ("format", m.format_version.clone()),
         (
-            "claim_count",
-            manifest
-                .claim_count
+            "license",
+            m.license.clone().unwrap_or_else(|| "-".into()),
+        ),
+        ("pack_hash", short_hash(&m.pack_hash)),
+        ("source_hash", short_hash(&m.source_hash)),
+        ("claims_hash", short_hash(&m.claims_hash)),
+        (
+            "extracted_at",
+            m.extracted_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "extractor",
+            m.extractor.clone().unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "description",
+            truncate(m.description.as_deref().unwrap_or(""), 60),
+        ),
+        ("authors", join_or_dash(&m.authors)),
+        (
+            "source_files",
+            m.source_files
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".into()),
         ),
         (
-            "rooted_pct",
-            manifest
-                .rooted_pct
-                .map(|p| format!("{p:.1}%"))
+            "claim_count",
+            m.claim_count
+                .map(|c| c.to_string())
                 .unwrap_or_else(|| "-".into()),
         ),
-        ("capabilities", manifest.capabilities.summary()),
+        ("signature", signature_label(pack).to_string()),
     ];
 
     let key_width = rows
@@ -73,21 +88,24 @@ pub(crate) fn format(manifest: &Manifest) -> String {
     out
 }
 
-fn trust_tier_str(tier: tr_format::TrustTier) -> String {
-    use tr_format::TrustTier::*;
-    match tier {
-        T0 => "T0",
-        T1 => "T1",
-        T2 => "T2",
-        T3 => "T3",
-        T4 => "T4",
+fn signature_label(pack: &V3Pack) -> &'static str {
+    match &pack.signature {
+        None => "unsigned",
+        Some(b) => match (
+            b.verification_material.public_key.as_ref(),
+            b.verification_material.x509_certificate_chain.as_ref(),
+        ) {
+            (None, Some(_)) => "sigstore-keyless",
+            (Some(_), None) => "self-signed (ed25519)",
+            (Some(_), Some(_)) => "self-signed+sigstore",
+            (None, None) => "signed (empty)",
+        },
     }
-    .to_string()
 }
 
 fn short_hash(s: &str) -> String {
-    if s.chars().count() > 16 {
-        let prefix: String = s.chars().take(16).collect();
+    if s.chars().count() > 24 {
+        let prefix: String = s.chars().take(24).collect();
         format!("{prefix}…")
     } else if s.is_empty() {
         "-".into()

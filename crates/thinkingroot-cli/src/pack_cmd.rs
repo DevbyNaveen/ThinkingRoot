@@ -859,9 +859,9 @@ pub async fn run_install_dry_run(
     let install_ref = parse_install_ref(reference)?;
     let resolver = build_resolver(install_ref, registry_override)?;
     let bytes = resolver.resolve().await?;
-    let pack = tr_reader::read_bytes(&bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
-    let preview = tr_render::render_preview(&pack.manifest, &bytes)
-        .map_err(|e| anyhow!("render preview: {e}"))?;
+    let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
+    let preview =
+        tr_render::render_preview(&pack).map_err(|e| anyhow!("render preview: {e}"))?;
 
     println!("{}", preview.manifest_table);
     println!();

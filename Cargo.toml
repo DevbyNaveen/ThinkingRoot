@@ -16,7 +16,6 @@ members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
-    "crates/tr-c2pa",
     "crates/tr-format",
     "crates/tr-identity",
     "crates/tr-render",
@@ -45,7 +44,6 @@ default-members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
-    "crates/tr-c2pa",
     "crates/tr-format",
     "crates/tr-identity",
     "crates/tr-render",
@@ -82,7 +80,6 @@ thinkingroot-branch  = { path = "crates/thinkingroot-branch",  version = "0.9.0"
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
 thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }
 thinkingroot-reflect = { path = "crates/thinkingroot-reflect", version = "0.9.0" }
-tr-c2pa              = { path = "crates/tr-c2pa",              version = "0.9.1" }
 tr-format            = { path = "crates/tr-format",            version = "0.9.1" }
 tr-identity          = { path = "crates/tr-identity",          version = "0.9.1" }
 tr-render            = { path = "crates/tr-render",            version = "0.9.1" }

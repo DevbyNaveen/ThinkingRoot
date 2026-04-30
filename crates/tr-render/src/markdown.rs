@@ -6,106 +6,64 @@
 
 use std::fmt::Write as _;
 
-use tr_format::{Manifest, TrustTier};
+use tr_format::V3Pack;
 
 use crate::ArchiveStats;
 
-pub(crate) fn summary(manifest: &Manifest, stats: ArchiveStats) -> String {
+pub(crate) fn summary(pack: &V3Pack, stats: ArchiveStats) -> String {
+    let m = &pack.manifest;
     let mut out = String::new();
 
-    let _ = writeln!(out, "# {} {}", manifest.name, manifest.version);
+    let _ = writeln!(out, "# {} {}", m.name, m.version);
     out.push('\n');
-    if !manifest.description.is_empty() {
-        let _ = writeln!(out, "> {}", manifest.description);
+    if let Some(desc) = m.description.as_deref().filter(|d| !d.is_empty()) {
+        let _ = writeln!(out, "> {desc}");
         out.push('\n');
     }
 
     out.push_str("## Overview\n\n");
-    let _ = writeln!(out, "- **License** — `{}`", manifest.license);
-    let _ = writeln!(
-        out,
-        "- **Trust tier** — {}",
-        trust_tier_label(manifest.trust_tier)
-    );
-    if !manifest.authors.is_empty() {
-        let _ = writeln!(out, "- **Authors** — {}", manifest.authors.join(", "));
+    if let Some(license) = m.license.as_deref().filter(|l| !l.is_empty()) {
+        let _ = writeln!(out, "- **License** — `{license}`");
     }
-    if !manifest.tags.is_empty() {
-        let tags = manifest
-            .tags
-            .iter()
-            .map(|t| format!("`{t}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(out, "- **Tags** — {tags}");
+    let _ = writeln!(out, "- **Format** — `{}`", m.format_version);
+    let _ = writeln!(out, "- **Signature** — {}", signature_label(pack));
+    if !m.authors.is_empty() {
+        let _ = writeln!(out, "- **Authors** — {}", m.authors.join(", "));
     }
-    if let Some(claims) = manifest.claim_count {
-        let _ = writeln!(out, "- **Claims** — {claims}");
+    if let Some(extractor) = m.extractor.as_deref().filter(|e| !e.is_empty()) {
+        let _ = writeln!(out, "- **Extractor** — `{extractor}`");
     }
-    if let Some(rooted) = manifest.rooted_pct {
-        let _ = writeln!(out, "- **Rooted** — {rooted:.1}%");
-    }
-
-    out.push_str("\n## Capabilities\n\n");
-    let caps = &manifest.capabilities;
-    let any_declared = caps.is_privileged()
-        || !caps.mcp_tools.is_empty()
-        || !caps.mcp_resources.is_empty();
-    if any_declared {
-        if caps.network {
-            out.push_str("- **Outbound network** required\n");
-        }
-        if caps.filesystem {
-            out.push_str("- **Filesystem access** outside the pack sandbox required\n");
-        }
-        if caps.exec {
-            out.push_str("- **Subprocess execution** required\n");
-        }
-        if !caps.mcp_tools.is_empty() {
-            let tools = caps
-                .mcp_tools
-                .iter()
-                .map(|t| format!("`{t}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(out, "- MCP tools: {tools}");
-        }
-        if !caps.mcp_resources.is_empty() {
-            let res = caps
-                .mcp_resources
-                .iter()
-                .map(|r| format!("`{r}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(out, "- MCP resources: {res}");
-        }
-    } else {
-        out.push_str("- _none declared_\n");
+    if let Some(extracted_at) = m.extracted_at {
+        let _ = writeln!(out, "- **Extracted** — {}", extracted_at.to_rfc3339());
     }
 
     out.push_str("\n## Archive\n\n");
-    let _ = writeln!(out, "- Entries: {}", stats.entry_count);
-    let _ = writeln!(out, "- Sources: {}", stats.source_count);
-    let _ = writeln!(out, "- Payload: {}", format_bytes(stats.payload_bytes));
-
-    if let Some(readme) = manifest.readme.as_deref().filter(|r| !r.is_empty()) {
-        out.push_str("\n## README\n\n");
-        out.push_str(readme);
-        if !readme.ends_with('\n') {
-            out.push('\n');
-        }
-    }
+    let _ = writeln!(out, "- Source files: {}", stats.source_count);
+    let _ = writeln!(out, "- Claims: {}", stats.claim_count);
+    let _ = writeln!(
+        out,
+        "- Source archive: {}",
+        format_bytes(stats.source_archive_bytes)
+    );
 
     out
 }
 
-fn trust_tier_label(tier: TrustTier) -> &'static str {
-    match tier {
-        TrustTier::T0 => "T0 — unsigned",
-        TrustTier::T1 => "T1 — author-signed",
-        TrustTier::T2 => "T2 — Sigstore-attested",
-        TrustTier::T3 => "T3 — per-claim certificates",
-        TrustTier::T4 => "T4 — re-rootable from embedded sources",
+/// Human-readable signature status. The full bundle (cert chain,
+/// Rekor witness) is not inspected here — that's the verifier's job.
+/// This is just a one-liner for the preview.
+fn signature_label(pack: &V3Pack) -> &'static str {
+    match &pack.signature {
+        None => "unsigned",
+        Some(b) => match (
+            b.verification_material.public_key.as_ref(),
+            b.verification_material.x509_certificate_chain.as_ref(),
+        ) {
+            (None, Some(_)) => "Sigstore-keyless (Fulcio cert chain)",
+            (Some(_), None) => "self-signed (Ed25519 public key embedded)",
+            (Some(_), Some(_)) => "self-signed + Sigstore (transition shape)",
+            (None, None) => "signed (verification material empty)",
+        },
     }
 }
 

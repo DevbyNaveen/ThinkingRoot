@@ -4,62 +4,53 @@
 //! information, not to lock the precise wording in place.
 
 use semver::Version;
-use tr_format::capabilities::Capabilities;
-use tr_format::manifest::Manifest;
-use tr_format::writer::PackBuilder;
-use tr_format::TrustTier;
+use tr_format::{ClaimRecord, ManifestV3, V3PackBuilder, read_v3_pack};
 use tr_render::render_preview;
 
-fn make_pack() -> (Manifest, Vec<u8>) {
-    let mut manifest = Manifest::new(
-        "alice/demo",
-        Version::parse("0.1.0").unwrap(),
-        "Apache-2.0",
-    );
-    manifest.description = "A small demo pack.".into();
+fn make_pack() -> Vec<u8> {
+    let mut manifest = ManifestV3::new("alice/demo", Version::parse("0.1.0").unwrap());
+    manifest.description = Some("A small demo pack.".into());
     manifest.authors = vec!["alice".into(), "bob".into()];
-    manifest.tags = vec!["demo".into(), "test".into()];
-    manifest.trust_tier = TrustTier::T1;
-    manifest.claim_count = Some(7);
-    manifest.rooted_pct = Some(80.0);
-    manifest.capabilities = Capabilities {
-        network: true,
-        mcp_tools: vec!["query_claims".into()],
-        ..Capabilities::default()
-    };
-    manifest.readme = Some("# Demo\n\nThis is a demo readme.".into());
+    manifest.license = Some("Apache-2.0".into());
+    manifest.extractor = Some("thinkingroot/extract@0.9.1".into());
 
-    let mut pb = PackBuilder::new(manifest.clone());
-    pb.put_text("artifacts/card.md", "# Hello").unwrap();
-    pb.put_text("provenance/sources/a.src", "src 1").unwrap();
-    pb.put_text("provenance/sources/b.src", "src 2").unwrap();
-    let bytes = pb.build().unwrap();
-
-    let final_manifest = tr_format::reader::read_bytes(&bytes).unwrap().manifest;
-    (final_manifest, bytes)
+    let mut b = V3PackBuilder::new(manifest);
+    b.add_source_file("a.md", b"alpha\n").unwrap();
+    b.add_source_file("b.md", b"beta\n").unwrap();
+    b.add_claim(ClaimRecord::new(
+        "c-1",
+        "alpha is the first letter",
+        vec!["alpha".into()],
+        "a.md",
+        0,
+        5,
+    ));
+    b.build().unwrap()
 }
 
 #[test]
 fn markdown_summary_includes_essentials() {
-    let (m, bytes) = make_pack();
-    let preview = render_preview(&m, &bytes).unwrap();
+    let bytes = make_pack();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
     let md = &preview.markdown;
 
     assert!(md.contains("alice/demo"), "missing name in markdown");
     assert!(md.contains("0.1.0"), "missing version");
     assert!(md.contains("Apache-2.0"), "missing license");
-    assert!(md.contains("T1"), "missing trust tier");
-    assert!(md.contains("80.0%"), "missing rooted_pct");
-    assert!(md.contains("Outbound network"), "missing network capability");
-    assert!(md.contains("query_claims"), "missing mcp_tools entry");
-    assert!(md.contains("README"), "readme heading missing");
-    assert!(md.contains("This is a demo readme"), "readme body missing");
+    assert!(md.contains("tr/3"), "missing format version");
+    assert!(md.contains("alice"), "missing first author");
+    assert!(md.contains("bob"), "missing second author");
+    assert!(md.contains("unsigned"), "missing signature label");
+    assert!(md.contains("Source files: 2"), "missing source file count");
+    assert!(md.contains("Claims: 1"), "missing claim count");
 }
 
 #[test]
 fn manifest_table_aligns_key_value_pairs() {
-    let (m, bytes) = make_pack();
-    let preview = render_preview(&m, &bytes).unwrap();
+    let bytes = make_pack();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
     let table = &preview.manifest_table;
 
     assert!(table.starts_with("key"));
@@ -70,35 +61,49 @@ fn manifest_table_aligns_key_value_pairs() {
 
     assert!(table.contains("alice/demo"));
     assert!(table.contains("Apache-2.0"));
-    assert!(table.contains("T1"));
+    assert!(table.contains("tr/3"));
+    assert!(table.contains("blake3:"), "pack_hash should appear");
 }
 
 #[test]
 fn archive_stats_are_populated() {
-    let (m, bytes) = make_pack();
-    let preview = render_preview(&m, &bytes).unwrap();
+    let bytes = make_pack();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
 
-    assert_eq!(preview.source_count, 2, "two provenance/ entries expected");
-    assert!(
-        preview.entry_count >= 3,
-        "expected at least the three payload files (got {})",
-        preview.entry_count
-    );
-    assert!(preview.payload_bytes > 0);
+    assert_eq!(preview.source_count, 2);
+    assert_eq!(preview.claim_count, 1);
+    assert!(preview.source_archive_bytes > 0);
 }
 
 #[test]
-fn empty_capabilities_renders_none_marker() {
-    let manifest = Manifest::new(
-        "alice/empty",
-        Version::parse("0.1.0").unwrap(),
-        "MIT",
-    );
-    let mut pb = PackBuilder::new(manifest.clone());
-    pb.put_text("artifacts/x.md", "x").unwrap();
-    let bytes = pb.build().unwrap();
-    let final_manifest = tr_format::reader::read_bytes(&bytes).unwrap().manifest;
+fn unsigned_pack_renders_unsigned_label() {
+    let bytes = make_pack();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
+    assert!(preview.markdown.contains("unsigned"));
+    assert!(preview.manifest_table.contains("unsigned"));
+}
 
-    let preview = render_preview(&final_manifest, &bytes).unwrap();
-    assert!(preview.markdown.contains("_none declared_"));
+#[test]
+fn signed_pack_renders_self_signed_label() {
+    use ed25519_dalek::SigningKey;
+    let mut manifest = ManifestV3::new("alice/signed", Version::parse("0.1.0").unwrap());
+    manifest.license = Some("MIT".into());
+
+    let mut b = V3PackBuilder::new(manifest);
+    b.add_source_file("a.md", b"hello\n").unwrap();
+
+    let key_bytes = [42u8; 32];
+    let key = SigningKey::from_bytes(&key_bytes);
+    let bytes = b.build_signed(&key, "alice-signed-0.1.0.tr").unwrap();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
+
+    assert!(
+        preview.markdown.contains("self-signed"),
+        "expected self-signed label in markdown, got:\n{}",
+        preview.markdown
+    );
+    assert!(preview.manifest_table.contains("ed25519"));
 }

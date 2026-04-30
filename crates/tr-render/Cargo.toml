@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Pure-Rust renderer producing human-readable previews of TR-1 .tr packs."
+description = "Pure-Rust renderer producing human-readable previews of v3 .tr packs."
 
 [lib]
 name = "tr_render"
@@ -18,3 +18,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 semver = { version = "1", features = ["serde"] }
+ed25519-dalek = { workspace = true }
