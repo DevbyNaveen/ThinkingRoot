@@ -79,6 +79,11 @@ pub struct Extractor {
     progress: Option<ChunkProgressFn>,
     /// Known entities from the existing graph, injected into LLM prompts.
     known_entities: crate::graph_context::GraphPrimedContext,
+    /// When `true` (default), structural-classified chunks ALSO go to
+    /// the LLM for semantic extraction.  Set to `false` for code-heavy
+    /// repos where the LLM rarely adds value over the structural
+    /// metadata.  Sourced from `config.extraction.structural_plus_llm`.
+    structural_plus_llm: bool,
     /// Cancellation token consulted between batches in `extract_all`.
     /// `None` (the default) means cancellation is opt-out — existing
     /// callers retain pre-fix behaviour.  The pipeline orchestrator
@@ -172,6 +177,7 @@ impl Extractor {
             cache: None,
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
+            structural_plus_llm: config.extraction.structural_plus_llm,
             cancel: None,
             checkpoint: None,
             completed_batches: crate::checkpoint::CompletedBatches::default(),
@@ -304,16 +310,21 @@ impl Extractor {
         for doc in documents {
             for chunk in &doc.chunks {
                 // ── Tier Router: structural or LLM? ──
-                if crate::router::classify(chunk) == crate::router::Tier::Structural {
+                let is_structural = crate::router::classify(chunk) == crate::router::Tier::Structural;
+                if is_structural {
                     let result = crate::structural::extract_structural(chunk, &doc.uri);
-                    if !result.claims.is_empty()
+                    let produced = !result.claims.is_empty()
                         || !result.entities.is_empty()
-                        || !result.relations.is_empty()
-                    {
+                        || !result.relations.is_empty();
+                    if produced {
                         structural_results.push((doc.source_id, doc.uri.clone(), result));
-                        // No `continue` — chunk also queued for LLM below so both run additively.
-                        // Structural provides graph topology at 0.99 confidence;
-                        // LLM provides semantic meaning — they are complementary, not redundant.
+                    }
+                    // M4: when `structural_plus_llm` is disabled, code-heavy
+                    // chunks skip the LLM entirely once the structural pass
+                    // produced something useful.  Default-true preserves
+                    // pre-fix behaviour (additive structural + LLM).
+                    if produced && !self.structural_plus_llm {
+                        continue;
                     }
                 }
 

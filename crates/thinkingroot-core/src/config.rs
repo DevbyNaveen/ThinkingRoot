@@ -405,6 +405,19 @@ pub struct ExtractionConfig {
     /// Set to 1 to disable batching entirely.
     #[serde(default)]
     pub extraction_batch_size: Option<usize>,
+    /// When `true` (default), structural-classified chunks (function
+    /// definitions, imports, manifest deps) ALSO go to the LLM for
+    /// semantic extraction, in addition to the zero-LLM structural
+    /// pass.  Set to `false` for code-heavy repos where the LLM rarely
+    /// adds value over the structural metadata — typical 30-50% LLM
+    /// cost reduction at the price of slightly thinner prose-claim
+    /// coverage on code chunks.
+    #[serde(default = "default_structural_plus_llm")]
+    pub structural_plus_llm: bool,
+}
+
+fn default_structural_plus_llm() -> bool {
+    true
 }
 
 impl Default for ExtractionConfig {
@@ -415,6 +428,7 @@ impl Default for ExtractionConfig {
             extract_relations: true,
             max_retries: 3,
             extraction_batch_size: None,
+            structural_plus_llm: true,
         }
     }
 }

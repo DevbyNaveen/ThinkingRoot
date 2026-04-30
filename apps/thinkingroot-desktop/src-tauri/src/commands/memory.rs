@@ -118,11 +118,23 @@ pub async fn brain_load(app: AppHandle) -> Result<BrainSnapshot, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    let rooted = engine_guard
+    // M2: surface rooted-claims fetch failures to the UI rather than
+    // silently misclassifying every rooted claim as "attested" or
+    // "unknown".  Pre-fix `unwrap_or_default()` swallowed transient
+    // CozoDB errors and the user had no way to know their tier badges
+    // were wrong.
+    let rooted: Vec<String> = match engine_guard
         .list_rooted_claims(&ws, None, None, None)
         .await
-        .map(|rr| rr.into_iter().map(|c| c.id).collect::<Vec<_>>())
-        .unwrap_or_default();
+    {
+        Ok(rr) => rr.into_iter().map(|c| c.id).collect(),
+        Err(e) => {
+            tracing::error!(workspace = %ws, "list_rooted_claims failed: {e}");
+            return Err(format!(
+                "rooted-tier load failed for {ws}: {e}"
+            ));
+        }
+    };
     drop(engine_guard);
 
     let rooted_set: std::collections::HashSet<&str> =

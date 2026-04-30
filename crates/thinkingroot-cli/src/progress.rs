@@ -32,7 +32,7 @@ use anyhow::Context as _;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::pipeline::{PipelineResult, ProgressEvent, run_pipeline};
+use crate::pipeline::{PipelineResult, ProgressEvent, run_pipeline_with_options, PipelineOptions};
 
 #[derive(Debug, Clone)]
 struct ActiveExtractionBatch {
@@ -50,6 +50,7 @@ struct ActiveExtractionBatch {
 pub async fn run_compile_progress(
     root_path: &Path,
     branch: Option<&str>,
+    no_rooting: bool,
 ) -> anyhow::Result<PipelineResult> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
 
@@ -756,7 +757,16 @@ pub async fn run_compile_progress(
     // spawn() makes bar_driver a fully independent task scheduled on any free thread,
     // so it keeps draining the channel even while the pipeline thread is blocked.
     let driver_handle = tokio::task::spawn(bar_driver);
-    let pipeline_result = run_pipeline(root_path, branch, Some(tx)).await;
+    let pipeline_result = run_pipeline_with_options(
+        root_path,
+        branch,
+        Some(tx),
+        PipelineOptions {
+            no_rooting,
+            ..Default::default()
+        },
+    )
+    .await;
     // tx drops here → channel closes → driver's rx.recv() returns None → driver exits.
     let _ = driver_handle.await;
 

@@ -1010,15 +1010,6 @@ async fn run_compile(
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("failed to canonicalize path: {}", path.display()))?;
 
-    // `--no-rooting` sets a process-scoped env flag the pipeline reads just
-    // before Phase 6.5. This avoids plumbing another bool through every
-    // intermediate call site.
-    if no_rooting {
-        unsafe {
-            std::env::set_var("TR_ROOTING_DISABLED", "1");
-        }
-    }
-
     print_banner();
     println!(
         "  {} {}\n",
@@ -1028,10 +1019,24 @@ async fn run_compile(
 
     let start = Instant::now();
 
+    // M3: `--no-rooting` is plumbed through PipelineOptions instead of
+    // an `unsafe { std::env::set_var(...) }`.  The pipeline reads the
+    // option directly before Phase 6.5; the deprecated env-var
+    // fallback (`TR_ROOTING_DISABLED=1`) is still honoured for
+    // external scripts but no longer set by this CLI.
     let result = if use_progress {
-        progress::run_compile_progress(&path, branch).await?
+        progress::run_compile_progress(&path, branch, no_rooting).await?
     } else {
-        pipeline::run_pipeline(&path, branch, None).await?
+        pipeline::run_pipeline_with_options(
+            &path,
+            branch,
+            None,
+            pipeline::PipelineOptions {
+                no_rooting,
+                ..Default::default()
+            },
+        )
+        .await?
     };
 
     let elapsed = start.elapsed();

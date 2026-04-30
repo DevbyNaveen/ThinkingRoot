@@ -556,6 +556,17 @@ impl GraphStore {
     /// Idempotent — re-running against an already-migrated DB is a fast
     /// probe-and-return.
     ///
+    /// `source_path` is a denormalised copy of the `sources.uri` for a
+    /// claim's `source_id`.  Hot-path readers (v3 pack writer, agent
+    /// brief synthesis) use it to skip the JOIN against `sources`.
+    /// Pre-C2 this column was always written empty (`""`) by both
+    /// `insert_claim` and `insert_claims_batch`, making the column
+    /// dead despite the migration that added it; it is now populated
+    /// at insert time via `find_source_uri_by_id` / `fetch_source_uris`.
+    /// Backfilled rows from this migration retain `""` until their
+    /// owning source is re-compiled (a fresh extract triggers the
+    /// fixed insert path).
+    ///
     /// Like the rooting migration above, `:replace` fails while indexes
     /// are attached; `create_indexes()` (called next in `init`) recreates
     /// them atop the new schema.

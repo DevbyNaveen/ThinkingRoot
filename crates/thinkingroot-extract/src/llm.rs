@@ -2832,6 +2832,13 @@ impl LlmClient {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
+                Err(e) if e.is_permanent() => {
+                    // M5: 401/403/404/missing-config short-circuit.
+                    // Pre-fix retried max_retries times, eating quota
+                    // and wall-time on a stale API key.
+                    tracing::error!("batch LLM permanent error, not retrying: {e}");
+                    return Err(e);
+                }
                 Err(e) => {
                     normal_attempts += 1;
                     tracing::warn!(
@@ -2928,6 +2935,11 @@ impl LlmClient {
                     };
                     last_error = Some(e);
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+                Err(e) if e.is_permanent() => {
+                    // M5: short-circuit auth/missing-config errors.
+                    tracing::error!("LLM chat permanent error, not retrying: {e}");
+                    return Err(e);
                 }
                 Err(e) => {
                     normal_attempts += 1;
@@ -3058,6 +3070,11 @@ impl LlmClient {
                     };
                     last_error = Some(e);
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+                Err(e) if e.is_permanent() => {
+                    // M5: short-circuit auth/missing-config errors.
+                    tracing::error!("LLM chat_with_tools permanent error, not retrying: {e}");
+                    return Err(e);
                 }
                 Err(e) => {
                     normal_attempts += 1;
@@ -3211,6 +3228,11 @@ impl LlmClient {
                     }
 
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Err(e) if e.is_permanent() => {
+                    // M5: short-circuit auth/missing-config errors.
+                    tracing::error!("LLM extract permanent error, not retrying: {e}");
+                    return Err(e);
                 }
                 Err(e) => {
                     normal_attempts += 1;

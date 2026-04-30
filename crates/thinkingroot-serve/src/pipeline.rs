@@ -175,25 +175,74 @@ pub async fn run_pipeline(
 ) -> Result<PipelineResult> {
     // Existing callers (CLI, MCP stdio, integration tests) get a token
     // that is never tripped — same behaviour as before this fix.  The
-    // desktop calls `run_pipeline_with_cancel` directly with its own
+    // desktop calls `run_pipeline_with_options` directly with its own
     // token so it can implement the Stop button.
-    run_pipeline_with_cancel(root_path, branch, progress, CancellationToken::new()).await
+    run_pipeline_with_options(root_path, branch, progress, PipelineOptions::default()).await
 }
 
-/// Cancel-aware variant of [`run_pipeline`].  When the supplied
-/// `CancellationToken` is tripped mid-run, the pipeline stops at the
-/// next checkpoint, surfaces `Error::Cancelled`, and emits a
-/// `ProgressEvent::PipelineFailed { error: "pipeline cancelled by caller" }`
-/// so subscribed bar drivers can finalise cleanly.  Partial state
-/// already persisted by Phase 4 (changed-source removal) is preserved
-/// — the next compile picks it up via the fingerprint check.
+/// Cancel-aware variant of [`run_pipeline`].  Equivalent to
+/// `run_pipeline_with_options(.., PipelineOptions { cancel, ..Default::default() })`.
+/// Kept for callers that only need cancellation and don't want to
+/// construct an options struct.
 pub async fn run_pipeline_with_cancel(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
     cancel: CancellationToken,
 ) -> Result<PipelineResult> {
-    let result = run_pipeline_inner(root_path, branch, progress.clone(), cancel).await;
+    run_pipeline_with_options(
+        root_path,
+        branch,
+        progress,
+        PipelineOptions {
+            cancel,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Per-invocation knobs.  Adding fields here is the supported way to
+/// extend the pipeline without forking another `run_pipeline_*`
+/// function for every flag.  The `Default` impl produces the
+/// behaviour of the un-tripped, full-rooting compile that
+/// [`run_pipeline`] uses for backwards-compat.
+#[derive(Debug, Clone)]
+pub struct PipelineOptions {
+    /// Cancellation token consulted at every phase boundary.  When
+    /// tripped mid-run, the pipeline stops at the next checkpoint,
+    /// surfaces `Error::Cancelled`, and emits
+    /// `ProgressEvent::PipelineFailed`.  Partial state already
+    /// persisted by Phase 4 (changed-source removal) is preserved.
+    pub cancel: CancellationToken,
+    /// Skip Phase 6.5 (Rooting admission gate).  All admitted claims
+    /// stay in the `attested` tier — same as pre-Rooting behaviour.
+    /// Pre-fix this was driven by an env var
+    /// (`TR_ROOTING_DISABLED=1`) that the CLI set via
+    /// `unsafe { std::env::set_var(...) }`; this field replaces that
+    /// hazard with explicit plumbing.
+    pub no_rooting: bool,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            no_rooting: false,
+        }
+    }
+}
+
+/// Full-surface variant.  The other run_pipeline functions delegate
+/// here.  Adding a new pipeline knob means adding a field to
+/// [`PipelineOptions`] — no new public function required.
+pub async fn run_pipeline_with_options(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    options: PipelineOptions,
+) -> Result<PipelineResult> {
+    let result = run_pipeline_inner(root_path, branch, progress.clone(), options).await;
     if let Err(ref e) = result
         && let Some(ref tx) = progress
     {
@@ -208,8 +257,9 @@ async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-    cancel: CancellationToken,
+    options: PipelineOptions,
 ) -> Result<PipelineResult> {
+    let PipelineOptions { cancel, no_rooting } = options;
     // Helper macro — every long-running phase boundary checks this so
     // Stop / Ctrl-C never has to wait for the next batch to finish.
     macro_rules! bail_if_cancelled {
@@ -595,7 +645,16 @@ async fn run_pipeline_inner(
             .iter()
             .filter(|c| c.source == doc.source_id)
             .collect();
-        let fp_bytes = serde_json::to_vec(&source_claims).unwrap_or_default();
+        // M1: propagate the serialize error rather than silently
+        // computing a fingerprint of empty bytes.  Pre-fix a serialize
+        // failure made every run see the source as "fingerprint-
+        // matched empty" which then short-circuited as unchanged —
+        // claims for that source would never persist.
+        let fp_bytes = serde_json::to_vec(&source_claims)
+            .map_err(|e| thinkingroot_core::Error::Config(format!(
+                "fingerprint serialize for {}: {e}",
+                doc.uri
+            )))?;
         let fp = crate::fingerprint::FingerprintStore::compute(&fp_bytes);
 
         if fingerprints.is_unchanged(&doc.uri, &fp) {
@@ -769,12 +828,16 @@ async fn run_pipeline_inner(
     // claims are removed from the extraction before Link sees them.
     //
     // Disabled when either the workspace config opts out
-    // (`config.rooting.disabled`) or the per-invocation env flag is set
-    // (`TR_ROOTING_DISABLED=1`, populated by `root compile --no-rooting`).
+    // (`config.rooting.disabled`) or the caller passed `no_rooting`
+    // (M3 — pre-fix this was an `unsafe { std::env::set_var(...) }`
+    // hazard; the env var is honoured here as a deprecated fallback
+    // so any external script that still sets `TR_ROOTING_DISABLED=1`
+    // keeps working unchanged).
     let rooting_disabled_env = std::env::var("TR_ROOTING_DISABLED")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if !config.rooting.disabled && !rooting_disabled_env && !filtered_extraction.claims.is_empty() {
+    let rooting_skipped = no_rooting || rooting_disabled_env;
+    if !config.rooting.disabled && !rooting_skipped && !filtered_extraction.claims.is_empty() {
         let rooting_cfg = thinkingroot_rooting::RootingConfig {
             disabled: config.rooting.disabled,
             provenance_threshold: config.rooting.provenance_threshold,

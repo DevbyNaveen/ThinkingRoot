@@ -81,16 +81,39 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     match thinkingroot_core::Credentials::load() {
         Ok(creds) => {
             let mut count = 0usize;
-            for (k, v) in creds.as_env_map() {
-                // Process env wins. Only seed values the desktop process
-                // didn't already inherit.
-                if std::env::var(&k).ok().filter(|s| !s.is_empty()).is_none() {
-                    cmd.env(&k, &v);
-                    count += 1;
+            for (k, v_creds) in creds.as_env_map() {
+                // Process env wins (kept as-is for backwards-compat with
+                // operators who launch the desktop from a shell with
+                // `export X=…`).  M9: when both an env var and a
+                // credentials.toml entry exist for the same key but
+                // disagree, log a warning so a stale shell-export
+                // value doesn't silently shadow a freshly-rotated
+                // credential — exactly the trap that bit our Azure
+                // flow this session.
+                match std::env::var(&k) {
+                    Ok(v_env) if !v_env.is_empty() => {
+                        if v_env != v_creds {
+                            tracing::warn!(
+                                env = %k,
+                                "process env var differs from credentials.toml \
+                                 — env wins.  If auth fails, run `unset {}` and \
+                                 rely on credentials.toml.",
+                                k
+                            );
+                        }
+                        // env wins; nothing to inject.
+                    }
+                    _ => {
+                        cmd.env(&k, &v_creds);
+                        count += 1;
+                    }
                 }
             }
             if count > 0 {
-                tracing::info!(injected = count, "seeded sidecar with credentials from credentials.toml");
+                tracing::info!(
+                    injected = count,
+                    "seeded sidecar with credentials from credentials.toml"
+                );
             }
         }
         Err(e) => {
