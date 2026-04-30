@@ -534,22 +534,12 @@ pub fn verify_bundle_against_canonical_bytes(
     // Compute both digests up front. They're cheap relative to ECDSA
     // verification and let us match whichever digest the bundle
     // happens to carry.
-    let blake3_hex = blake3::hash(canonical_bytes).to_hex();
-    let sha256_hex = {
-        use sha2::Digest as _;
-        let bytes = sha2::Sha256::digest(canonical_bytes);
-        // Lowercase hex without an extra dep — same convention the
-        // Sigstore in-toto subject digest uses.
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes.iter() {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
-    };
+    let blake3_digest = blake3::hash(canonical_bytes).to_hex();
+    let sha256_digest = sha256_hex(canonical_bytes);
 
     verify_statement_semantics(&payload, |algo, hex| match algo {
-        "blake3" => hex == blake3_hex.as_str(),
-        "sha256" => hex == sha256_hex.as_str(),
+        "blake3" => hex == blake3_digest.as_str(),
+        "sha256" => hex == sha256_digest.as_str(),
         _ => false,
     })
 }
@@ -795,7 +785,7 @@ fn parse_ecdsa_p256_signature(bytes: &[u8]) -> Result<p256::ecdsa::Signature> {
 ///
 /// Lengths are decimal ASCII. Same encoding sigstore-rs and
 /// every conformant DSSE library produces.
-fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     let mut pae = Vec::with_capacity(64 + payload_type.len() + payload.len());
     pae.extend_from_slice(b"DSSEv1 ");
     pae.extend_from_slice(payload_type.len().to_string().as_bytes());
@@ -819,9 +809,22 @@ fn strip_blake3_prefix(hash: &str) -> &str {
 /// Format a SystemTime as RFC 3339 with seconds precision and a
 /// trailing `Z`. Matches the format the v3 manifest's `extracted_at`
 /// emits, so consumers see consistent timestamp syntax.
-fn format_rfc3339(t: SystemTime) -> String {
+pub(crate) fn format_rfc3339(t: SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Utc> = t.into();
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Lowercase hex SHA-256 of `bytes`. Used by the verifier's dual-
+/// algorithm digest check and by the keyless signing flow to emit a
+/// `sha256` entry in the in-toto subject digest map.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 #[cfg(test)]

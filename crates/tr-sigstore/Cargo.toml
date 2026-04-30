@@ -64,6 +64,18 @@ tokio      = { workspace = true, optional = true }
 # called. Headless / SSH consumers use the lower-level
 # `live::sign_with_token` and supply an id_token themselves.
 webbrowser = { version = "1", optional = true }
+# Direct Rekor REST submission. `sigstore-rs 0.13`'s built-in Rekor
+# client only knows how to assemble bundles of `kind="hashedrekord"`
+# (its `TryFrom<RekorLogEntry> for TransparencyLogEntry` hardcodes the
+# kind/version, and the bundle layer surfaces `DsseUnsupported` on the
+# verify side) — useless for our DSSE-intoto v0.0.2 flow. We POST
+# straight to `/api/v1/log/entries` instead, ~30 lines of HTTP.
+reqwest    = { workspace = true, optional = true }
+# `openidconnect::core::CoreIdToken` is what `sigstore::fulcio::TokenProvider::Static`
+# wraps. Pinned to `4.0.1` to match what `sigstore 0.13` itself pulls
+# in transitively — keeping versions identical avoids parallel-version
+# duplication of a sizeable async/oauth crate tree.
+openidconnect = { version = "4.0.1", optional = true, default-features = false }
 
 [features]
 default = []
@@ -71,7 +83,7 @@ default = []
 # Heavy dep tree (sigstore-rs, tokio, rustls); not needed by anyone
 # who only verifies bundles. The CLI (`thinkingroot-cli`) is the only
 # crate today that turns this on; everything else stays lean.
-live = ["dep:sigstore", "dep:tokio", "dep:webbrowser"]
+live = ["dep:sigstore", "dep:tokio", "dep:webbrowser", "dep:reqwest", "dep:openidconnect"]
 
 [dev-dependencies]
 tokio = { workspace = true }
