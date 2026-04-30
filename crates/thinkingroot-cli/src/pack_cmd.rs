@@ -28,11 +28,10 @@
 //! either contain workstation paths, secrets, or rebuilt-from-source
 //! caches that bloat the archive without adding value.
 //!
-//! Trust verification (signatures, revocation) is **out of scope** for
-//! this module; it lives behind a follow-up `--require-tier` flag in a
-//! later phase. The reader still verifies BLAKE3 of the manifest's
-//! canonical bytes (that check is part of [`tr_format::reader`]
-//! itself), so a corrupted or tampered `.tr` is rejected at install.
+//! Trust verification is wired through [`tr_verify::verify_v3_pack_with_revocation`]:
+//! every `root install` checks the pack hash, DSSE signature, in-toto
+//! subject digest, and revocation deny-list before extracting any
+//! source files.
 
 use std::collections::HashSet;
 use std::fs;

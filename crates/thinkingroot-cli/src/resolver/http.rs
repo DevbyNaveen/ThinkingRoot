@@ -163,8 +163,8 @@ impl PackResolver for HttpRegistryResolver {
 
         // Capture the registry-advertised hash before consuming the
         // body — this is independent verification on top of the
-        // manifest's own canonical-bytes hash that `tr_format::reader`
-        // checks.
+        // pack-hash check `tr_format::read_v3_pack` performs against
+        // the manifest's declared `pack_hash`.
         let advertised_hash: Option<String> = resp
             .headers()
             .get("x-tr-content-hash")
@@ -185,7 +185,7 @@ impl PackResolver for HttpRegistryResolver {
 
         // 4. Defense-in-depth hash check. If the registry put a hash
         // in the response header, verify the body matches before we
-        // even hand it to `tr_format::reader`.
+        // even hand it to `tr_format::read_v3_pack`.
         if let Some(expected) = &advertised_hash {
             let actual = blake3_hex(&bytes);
             if &actual != expected {

@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use super::PackResolver;
 
 /// Read a `.tr` from a local filesystem path. Performs no integrity
-/// check beyond what [`tr_format::reader`] does on parse — local
-/// installs implicitly trust the user's filesystem.
+/// check beyond what [`tr_format::read_v3_pack`] does on parse —
+/// local installs implicitly trust the user's filesystem.
 pub struct LocalFsResolver {
     path: PathBuf,
 }

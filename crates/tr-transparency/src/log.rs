@@ -26,7 +26,7 @@ pub struct LogEntry {
     pub kind: LogEntryKind,
     /// Pack reference, e.g. `alice/thesis@0.1.0`.
     pub pack_ref: String,
-    /// Hex-encoded manifest content hash from `tr_format::Manifest`.
+    /// Hex-encoded pack hash from `tr_format::ManifestV3::pack_hash`.
     pub manifest_hash: String,
     /// DID of the publishing identity, e.g. `did:web:alice.example`.
     pub author_did: String,
