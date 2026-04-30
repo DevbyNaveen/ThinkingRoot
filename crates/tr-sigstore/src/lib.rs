@@ -51,7 +51,11 @@ pub use rekor::{
     RFC6962_LEAF_PREFIX, leaf_hash_from_canonical_body, verify_inclusion_proof_offline,
     verify_set_signature,
 };
-pub use trust_root::{TrustedCertificate, TrustedRoot, verify_cert_chain};
+pub use trust_root::{
+    SIGSTORE_PUBLIC_GOOD_FULCIO_V1_ROOT_SHA256_HEX, SIGSTORE_PUBLIC_GOOD_REKOR_LOG_ID_HEX,
+    TrustedCertificate, TrustedRoot, parse_rekor_pubkey_pem, sigstore_public_good_rekor_pubkey,
+    verify_cert_chain,
+};
 
 /// DSSE statement type for v3 packs. Locked by spec §3.4 — never
 /// changes for the `tr/3` format. A future `tr/4` would mint a new

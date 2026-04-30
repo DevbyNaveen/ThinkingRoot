@@ -20,6 +20,7 @@
 use std::time::SystemTime;
 
 use ::der::Decode as _;
+use base64::Engine as _;
 use x509_cert::Certificate as X509Cert;
 
 use crate::Error;
@@ -106,11 +107,115 @@ impl TrustedRoot {
         self.fulcio_roots.len()
     }
 
+    /// The trust root for **Sigstore-public-good**, the production
+    /// instance Fulcio + Rekor run at `*.sigstore.dev`. The vendored
+    /// material lives under
+    /// `crates/tr-sigstore/src/trusted_roots/sigstore_public_good/`
+    /// — see `PROVENANCE.md` there for source / fingerprint chain of
+    /// custody.
+    ///
+    /// Includes both the v1 root (`CN=sigstore`, valid through 2031)
+    /// and the v1 intermediate (`CN=sigstore-intermediate`, valid
+    /// through 2031). End-entity certs Fulcio issues today chain leaf
+    /// → intermediate → root; mounting both locally lets the verifier
+    /// validate even if the bundle's `x509CertificateChain` omits the
+    /// intermediate.
+    ///
+    /// Infallible at runtime — the embedded PEM bytes are validated
+    /// at compile time by `tests::sigstore_public_good_constructor_validates`.
+    pub fn sigstore_public_good() -> Self {
+        Self::from_root_pems(SIGSTORE_PUBLIC_GOOD_FULCIO_BUNDLE)
+            .expect("vendored Sigstore-public-good Fulcio bundle is valid")
+    }
+
     /// Iterate over the parsed root certs. Used by `verify_cert_chain`
     /// to find the issuer of the topmost intermediate.
     pub(crate) fn roots(&self) -> impl Iterator<Item = &TrustedCertificate> {
         self.fulcio_roots.iter()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Vendored Sigstore-public-good trust material.
+//
+// Files are committed verbatim from `sigstore/root-signing` (TUF-
+// signed authoritative source) under
+// `src/trusted_roots/sigstore_public_good/`. Embedding them with
+// `include_bytes!()` means the trust root ships in the binary and
+// the verifier works fully offline.
+// ─────────────────────────────────────────────────────────────────
+
+/// Fulcio v1 root + v1 intermediate, concatenated for
+/// [`TrustedRoot::from_root_pems`].
+const SIGSTORE_PUBLIC_GOOD_FULCIO_BUNDLE: &str = concat!(
+    include_str!("trusted_roots/sigstore_public_good/fulcio_v1.crt.pem"),
+    include_str!("trusted_roots/sigstore_public_good/fulcio_intermediate_v1.crt.pem"),
+);
+
+/// Sigstore-public-good Rekor transparency log public key (PEM).
+/// Used by [`sigstore_public_good_rekor_pubkey`] to construct a
+/// [`p256::ecdsa::VerifyingKey`] for SignedEntryTimestamp /
+/// checkpoint signature verification.
+const SIGSTORE_PUBLIC_GOOD_REKOR_PUBKEY_PEM: &str =
+    include_str!("trusted_roots/sigstore_public_good/rekor.pub");
+
+/// The published Rekor logID for Sigstore-public-good, in lowercase
+/// hex (no `sha256:` prefix). Equals `SHA-256(DER(SPKI))` of the
+/// public key embedded in `rekor.pub`. Pinned at compile-time so a
+/// silent upstream rotation is caught by
+/// `tests::rekor_log_id_matches_published_value`.
+pub const SIGSTORE_PUBLIC_GOOD_REKOR_LOG_ID_HEX: &str =
+    "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d";
+
+/// The published SHA-256 fingerprint of Fulcio v1 root, lowercase hex
+/// (no separators) — same value `openssl x509 -fingerprint -sha256`
+/// emits, sans the `sha256 Fingerprint=AA:BB:…` packaging.
+pub const SIGSTORE_PUBLIC_GOOD_FULCIO_V1_ROOT_SHA256_HEX: &str =
+    "3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1";
+
+/// Parse the vendored Sigstore-public-good Rekor public key into a
+/// `p256::ecdsa::VerifyingKey`. The key is ECDSA P-256; consumers use
+/// it with [`crate::rekor::verify_set_signature`] to validate
+/// SignedEntryTimestamps / checkpoint signatures offline.
+///
+/// Infallible at runtime; the embedded PEM is validated at compile
+/// time by `tests::sigstore_public_good_rekor_pubkey_parses`.
+pub fn sigstore_public_good_rekor_pubkey() -> p256::ecdsa::VerifyingKey {
+    parse_rekor_pubkey_pem(SIGSTORE_PUBLIC_GOOD_REKOR_PUBKEY_PEM)
+        .expect("vendored Sigstore-public-good Rekor pubkey parses")
+}
+
+/// Parse a PEM-encoded ECDSA P-256 SubjectPublicKeyInfo into a
+/// verifying key. Used by both the public-good preset and any caller
+/// constructing a custom Rekor key (private deployments, tests).
+pub fn parse_rekor_pubkey_pem(pem: &str) -> Result<p256::ecdsa::VerifyingKey, Error> {
+    use p256::pkcs8::DecodePublicKey as _;
+    // Strip the PEM headers + base64-decode → raw DER SPKI bytes.
+    let mut der = Vec::new();
+    let mut in_block = false;
+    for line in pem.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN PUBLIC KEY-----" {
+            in_block = true;
+            continue;
+        }
+        if line == "-----END PUBLIC KEY-----" {
+            break;
+        }
+        if in_block && !line.is_empty() {
+            der.extend_from_slice(line.as_bytes());
+        }
+    }
+    if der.is_empty() {
+        return Err(Error::CertParse(
+            "Rekor pubkey PEM has no PUBLIC KEY block".into(),
+        ));
+    }
+    let der_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&der)
+        .map_err(|e| Error::CertParse(format!("Rekor pubkey base64: {e}")))?;
+    p256::ecdsa::VerifyingKey::from_public_key_der(&der_bytes)
+        .map_err(|e| Error::UnsupportedKeyAlgorithm(format!("Rekor pubkey SPKI: {e}")))
 }
 
 impl TrustedCertificate {
@@ -693,5 +798,107 @@ mod tests {
         );
         let trust_root = TrustedRoot::from_root_pems(&pem).unwrap();
         assert_eq!(trust_root.root_count(), 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sigstore-public-good vendored material — pinning tests. If the
+    // upstream `sigstore/root-signing` repo silently rotates a key,
+    // these tests fail loudly so the rotation is acknowledged by a
+    // human (re-vendoring + re-running the bundle round-trip suite)
+    // rather than absorbed silently.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sigstore_public_good_constructor_validates() {
+        // Both the v1 root + v1 intermediate are recognised PEM and
+        // parsed as syntactically valid X.509.
+        let trust_root = TrustedRoot::sigstore_public_good();
+        assert_eq!(
+            trust_root.root_count(),
+            2,
+            "Sigstore-public-good vendor bundle must hold root + intermediate"
+        );
+    }
+
+    #[test]
+    fn fulcio_v1_fingerprint_matches_published_value() {
+        use sha2::{Digest as _, Sha256};
+
+        let trust_root = TrustedRoot::sigstore_public_good();
+        // First entry of the bundle is `fulcio_v1.crt.pem` (root).
+        let root = trust_root.roots().next().expect("root present");
+
+        let digest = Sha256::digest(root.der_bytes());
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest.iter() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+
+        assert_eq!(
+            hex,
+            super::SIGSTORE_PUBLIC_GOOD_FULCIO_V1_ROOT_SHA256_HEX,
+            "Fulcio v1 root fingerprint mismatch — upstream rotation? \
+             Re-vendor PEM from sigstore/root-signing@main and update the constant"
+        );
+    }
+
+    #[test]
+    fn rekor_log_id_matches_published_value() {
+        use p256::pkcs8::EncodePublicKey as _;
+        use sha2::{Digest as _, Sha256};
+
+        let pubkey = super::sigstore_public_good_rekor_pubkey();
+        // `ecdsa::VerifyingKey<NistP256>` doesn't directly impl
+        // `EncodePublicKey` in this version — convert through
+        // `p256::PublicKey` (the elliptic-curve crate's general
+        // public-key type) which does.
+        let spki_der = p256::PublicKey::from(&pubkey)
+            .to_public_key_der()
+            .expect("Rekor verifying key re-encodes to SPKI DER");
+        let digest = Sha256::digest(spki_der.as_bytes());
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for b in digest.iter() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+
+        assert_eq!(
+            hex,
+            super::SIGSTORE_PUBLIC_GOOD_REKOR_LOG_ID_HEX,
+            "Rekor logID mismatch — upstream rotation? \
+             Re-vendor rekor.pub from sigstore/root-signing@main and update the constant"
+        );
+    }
+
+    #[test]
+    fn sigstore_public_good_rekor_pubkey_parses() {
+        // Constructor would panic on malformed PEM; reaching this
+        // assert proves the embedded bytes round-trip through PEM →
+        // base64 → DER SPKI → p256 verifying-key.
+        let _key = super::sigstore_public_good_rekor_pubkey();
+    }
+
+    #[test]
+    fn parse_rekor_pubkey_pem_rejects_garbage() {
+        let err = super::parse_rekor_pubkey_pem("not a PEM file").unwrap_err();
+        assert!(
+            matches!(err, Error::CertParse(_)),
+            "garbage input must surface as CertParse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rekor_pubkey_pem_rejects_wrong_curve() {
+        // Self-generated Ed25519 SPKI — wrong algorithm OID, must
+        // fail with UnsupportedKeyAlgorithm rather than crash.
+        // (Constructed by `openssl genpkey -algorithm Ed25519 -out
+        // /tmp/ed.key && openssl pkey -in /tmp/ed.key -pubout`.)
+        let ed25519_pem = "-----BEGIN PUBLIC KEY-----\n\
+             MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n\
+             -----END PUBLIC KEY-----\n";
+        let err = super::parse_rekor_pubkey_pem(ed25519_pem).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedKeyAlgorithm(_)),
+            "Ed25519 SPKI must surface as UnsupportedKeyAlgorithm, got {err:?}"
+        );
     }
 }
