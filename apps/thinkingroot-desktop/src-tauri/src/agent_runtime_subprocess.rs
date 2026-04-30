@@ -98,7 +98,7 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         }
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(%err, ?binary, "failed to spawn sidecar — engine surfaces will be empty");
@@ -107,7 +107,13 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     };
 
     let pid = child.id();
-    forward_logs(child, &binary).await;
+    // Detach stdout/stderr line readers but keep ownership of `child`
+    // here so `shutdown()` can drive a graceful stop.  Pre-fix this
+    // function moved `child` into a detached `wait().await` task and
+    // the SidecarHandle held only metadata, so `shutdown()` was a
+    // no-op (the comment claimed kill_on_drop but the Child had
+    // already been moved away from the parent's reach).
+    spawn_log_forwarders(&mut child, &binary);
 
     let state = app.state::<AppState>();
     let mut guard = state.sidecar.lock().await;
@@ -115,18 +121,60 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         port,
         host: HOST.to_string(),
         pid,
+        child: std::sync::Arc::new(tokio::sync::Mutex::new(Some(child))),
     });
 }
 
-/// Reap the sidecar on app exit. Sends SIGKILL via `kill_on_drop`
-/// once the [`Child`] handle drops; explicit `kill().await` here
-/// gives a deterministic shutdown order before the runtime tears
-/// down.
+/// Reap the sidecar on app exit.  Tries a graceful stop first
+/// (drop stdin → wait up to 2 s) and escalates to SIGKILL if the
+/// child is still running.  Idempotent: calling `shutdown` after
+/// the child has already exited is a no-op.
+///
+/// Pre-fix this function logged "shutting down" and did literally
+/// nothing else — the sidecar died only because tokio runtime
+/// tear-down dropped detached tasks, which in turn dropped the
+/// Child and triggered `kill_on_drop`.  That's fast on Unix but
+/// gives the engine zero chance to flush a CozoDB checkpoint.
 pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     let state = app.state::<AppState>();
-    let mut guard = state.sidecar.lock().await;
-    if let Some(handle) = guard.take() {
-        tracing::info!(pid = ?handle.pid, "shutting down sidecar");
+    let handle = {
+        let mut guard = state.sidecar.lock().await;
+        guard.take()
+    };
+    let Some(handle) = handle else {
+        return;
+    };
+    tracing::info!(pid = ?handle.pid, "shutting down sidecar");
+    let mut child_guard = handle.child.lock().await;
+    let Some(mut child) = child_guard.take() else {
+        // Already exited or already shut down; nothing to do.
+        return;
+    };
+    // Drop stdin so the engine's stdin reader (when any) sees EOF
+    // and can finish draining cleanly.  `root serve` doesn't read
+    // stdin today but the close is harmless and future-proof.
+    drop(child.stdin.take());
+
+    match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => {
+            tracing::info!(?status, "sidecar exited gracefully");
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "sidecar wait failed during shutdown; sending SIGKILL");
+            let _ = child.kill().await;
+        }
+        Err(_) => {
+            tracing::warn!("sidecar did not exit within 2s; sending SIGKILL");
+            // SIGKILL.  Tokio's start_kill is non-blocking; the
+            // following short wait reaps the child so we don't leak
+            // a zombie.
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                child.wait(),
+            )
+            .await;
+        }
     }
 }
 
@@ -182,17 +230,16 @@ fn exe_suffix() -> &'static str {
 }
 
 /// Drain the sidecar's stdout/stderr into the host tracing layer so
-/// the engine's logs surface in the desktop's debug output. The task
-/// detaches; it terminates when the child closes its pipes (i.e. on
-/// shutdown).
-async fn forward_logs(mut child: Child, binary: &PathBuf) {
+/// the engine's logs surface in the desktop's debug output.  Unlike
+/// the pre-fix shape, this does NOT consume the [`Child`] — it only
+/// takes the line readers.  The Child stays in [`SidecarHandle`] so
+/// [`shutdown`] can drive a graceful stop.
+fn spawn_log_forwarders(child: &mut Child, binary: &PathBuf) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     let label = binary.display().to_string();
 
-    if let Some(out) = stdout {
+    if let Some(out) = child.stdout.take() {
         let label = label.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(out).lines();
@@ -201,7 +248,7 @@ async fn forward_logs(mut child: Child, binary: &PathBuf) {
             }
         });
     }
-    if let Some(err) = stderr {
+    if let Some(err) = child.stderr.take() {
         let label = label.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
@@ -210,16 +257,4 @@ async fn forward_logs(mut child: Child, binary: &PathBuf) {
             }
         });
     }
-
-    // The child handle moved into this scope is dropped here, which
-    // would normally kill_on_drop the process. We deliberately want
-    // the sidecar to outlive this function, so re-park it on a
-    // detached task that holds the handle alive until the process
-    // exits or the runtime shuts down.
-    tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) => tracing::info!(?status, "sidecar exited"),
-            Err(err) => tracing::warn!(%err, "sidecar wait failed"),
-        }
-    });
 }

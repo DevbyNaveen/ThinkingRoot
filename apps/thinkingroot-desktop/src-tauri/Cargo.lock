@@ -7688,6 +7688,7 @@ dependencies = [
  "ignore",
  "pdf-extract",
  "pulldown-cmark",
+ "rayon",
  "serde",
  "serde_json",
  "thinkingroot-core",

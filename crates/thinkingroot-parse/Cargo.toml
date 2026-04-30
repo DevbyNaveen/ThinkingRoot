@@ -50,6 +50,10 @@ tree-sitter-haskell    = "0.23.1"
 tree-sitter-r          = "1.2.0"
 
 pdf-extract = "0.7"
+# Rayon for parallelising parse_directory across all CPU cores.  Single-
+# threaded parse on a 200-file workspace was an avoidable wall-clock
+# loss; tree-sitter parsing is pure CPU and embarrassingly parallel.
+rayon = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -51,12 +51,18 @@ pub struct CompileHandle {
 ///
 /// Read by the Step 14 `mcp_status` Tauri command so the Settings
 /// pane can show the loopback host/port plus the OS pid that owns
-/// the process.
+/// the process.  The `child` field carries the actual `tokio::process::Child`
+/// so [`crate::agent_runtime_subprocess::shutdown`] can stage a graceful
+/// stdin close + wait + SIGKILL escalation rather than relying on
+/// `kill_on_drop`.  Wrapped in `Arc<Mutex<Option<...>>>` so the Clone
+/// derive still works for the metadata-read paths (`mcp_status`,
+/// `chat::*`) which only care about host/port/pid.
 #[derive(Debug, Clone)]
 pub struct SidecarHandle {
     pub host: String,
     pub port: u16,
     pub pid: Option<u32>,
+    pub child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
 /// One mounted [`QueryEngine`] paired with the workspace it was
