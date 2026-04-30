@@ -349,12 +349,18 @@ enum Commands {
         /// One-line description. Overrides `Pack.toml`.
         #[arg(long)]
         description: Option<String>,
-        /// Pack format: `tr/1` (default, multi-directory tar+zstd
-        /// matching the v1 wire format) or `tr/3` (the 3-file
-        /// `[manifest.toml, source.tar.zst, claims.jsonl]` layout from
-        /// the v3 spec). Default flips to `tr/3` after the v3
-        /// transition lands per `~/.claude/plans/zippy-wiggling-pelican.md`.
-        #[arg(long, default_value = "tr/1")]
+        /// Pack format: `tr/3` (default — the 3-file
+        /// `[manifest.toml, source.tar.zst, claims.jsonl,
+        /// signature.sig?]` layout from the v3 spec, with byte-range
+        /// citations on every claim, BLAKE3 canonicalization, and
+        /// optional Sigstore-keyless DSSE signing) or `tr/1` (the
+        /// legacy multi-directory tar+zstd format kept for back-compat
+        /// with consumers that haven't migrated to v3 readers yet).
+        ///
+        /// The v3.0 release flipped the default per the plan
+        /// (`~/.claude/plans/zippy-wiggling-pelican.md`); the legacy
+        /// path stays alive for tr/1 readers.
+        #[arg(long, default_value = "tr/3")]
         format: String,
         /// Path to an Ed25519 signing key (32 raw bytes). When set
         /// and `--format=tr/3`, the pack is signed inline and emitted
