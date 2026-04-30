@@ -404,7 +404,15 @@ pub fn model_batch_size(provider: &str, model: &str, max_chunk_tokens: usize) ->
 
     let output_safe_n = max_output / OUTPUT_PER_CHUNK;
 
-    let n = input_safe_n.min(output_safe_n).clamp(1, HARD_MAX);
+    let mut n = input_safe_n.min(output_safe_n).clamp(1, HARD_MAX);
+
+    // Bedrock has account-level throughput caps that make >128K-token
+    // batches stall under default quotas (TCP open, 0% CPU, no progress
+    // for >5min). Cap at 8 so a single batch is ≤16K input tokens —
+    // sub-second on the converse API in our smoke tests.
+    if provider == "bedrock" {
+        n = n.min(8);
+    }
 
     tracing::debug!(
         "batch_size for {provider}/{model}: context={context} output={max_output} \
@@ -2689,7 +2697,7 @@ impl LlmClient {
             };
 
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(120),
+                tokio::time::Duration::from_secs(600),
                 self.provider.chat(prompts::SYSTEM_PROMPT, batch_prompt),
             )
             .await;
@@ -2701,7 +2709,7 @@ impl LlmClient {
                     tracing::warn!(
                         attempt = normal_attempts,
                         max = self.max_retries,
-                        "batch LLM call timed out after 120s, retrying..."
+                        "batch LLM call timed out after 600s, retrying..."
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
@@ -3022,7 +3030,7 @@ impl LlmClient {
             };
 
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(120),
+                tokio::time::Duration::from_secs(600),
                 self.provider.chat(prompts::SYSTEM_PROMPT, &user_prompt),
             )
             .await;
@@ -3034,7 +3042,7 @@ impl LlmClient {
                     tracing::warn!(
                         attempt = normal_attempts,
                         max = self.max_retries,
-                        "LLM extraction call timed out after 120s, retrying..."
+                        "LLM extraction call timed out after 600s, retrying..."
                     );
                     if normal_attempts >= self.max_retries {
                         break;
@@ -3536,11 +3544,15 @@ mod tests {
     }
 
     #[test]
-    fn batch_size_nova_micro_output_capped() {
+    fn batch_size_nova_micro_bedrock_capped() {
         // Nova micro: context=128K, output=5120, chunk=2000
         // output_safe = 5120/500 = 10
+        // input_safe = (102400-700)/2000 = 50
+        // min(50, 10) = 10, then bedrock cap (n.min(8)) drops to 8.
+        // The bedrock cap exists because >128K-token batches stall under
+        // default account-level throughput (TCP open, 0% CPU, no progress).
         let n = model_batch_size("bedrock", "amazon.nova-micro-v1:0", 2000);
-        assert_eq!(n, 10, "nova-micro must be output-capped at 10");
+        assert_eq!(n, 8, "bedrock cap must clamp nova-micro batch to 8");
     }
 
     #[test]

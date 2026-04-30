@@ -270,34 +270,36 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     return () => ro.disconnect();
   }, []);
 
-  // 5. Smooth Pan/Zoom
+  // 5. Smooth Pan/Zoom — keyed on nodes.length so the effect re-runs when
+  // the canvas finally mounts after the empty-state branch falls through.
+  // Guarded by the ref so we never re-attach behavior on data refreshes.
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || zoomBehaviorRef.current) return;
 
     const z = zoom<HTMLCanvasElement, unknown>()
-      .scaleExtent([0.02, 10]) 
+      .scaleExtent([0.02, 10])
       .on("zoom", (event) => {
         transformRef.current = event.transform;
       });
 
     zoomBehaviorRef.current = z;
     select(canvas).call(z);
-  }, []);
+  }, [nodes.length]);
 
   // Center Graph on initial load
   const centeredRef = useRef(false);
   useEffect(() => {
     if (centeredRef.current || size.w === 0 || nodes.length === 0) return;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || !zoomBehaviorRef.current) return;
 
     const initialScale = Math.min(1, 400 / Math.max(200, Math.sqrt(nodes.length) * 30));
     const initialTransform = zoomIdentity
       .translate(size.w / 2, size.h / 2)
       .scale(initialScale);
-    
-    select(canvas).call(zoomBehaviorRef.current!.transform as any, initialTransform);
+
+    select(canvas).call(zoomBehaviorRef.current.transform as any, initialTransform);
     transformRef.current = initialTransform;
     centeredRef.current = true;
   }, [size, nodes.length]);
