@@ -17,10 +17,13 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
-use thinkingroot_serve::pipeline::{ProgressEvent, run_pipeline};
+use thinkingroot_serve::pipeline::{ProgressEvent, run_pipeline_with_cancel};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::state::{AppState, CompileHandle};
 
 /// One workspace as the UI sees it. Mirrors [`WorkspaceEntry`] plus
 /// derived fields the surface uses to colour the row (compiled badge,
@@ -219,6 +222,11 @@ pub enum CompileProgress {
 /// progress flows via `workspace_compile_progress` Tauri events keyed
 /// to the workspace path so the UI can correlate when multiple compiles
 /// run concurrently.
+///
+/// The compile is cancellable via `workspace_compile_stop` — the
+/// `CancellationToken` lives in `AppState.active_compile` for the
+/// lifetime of the run.  Pre-fix the only way to stop a compile was
+/// to kill the desktop process, which discarded all extraction work.
 #[tauri::command]
 pub async fn workspace_compile(
     app: AppHandle,
@@ -233,9 +241,37 @@ pub async fn workspace_compile(
     let workspace_label = path.display().to_string();
     let branch = args.branch;
 
+    // Refuse to start a second compile on top of an active one — the
+    // pipeline doesn't itself coordinate two runs against the same
+    // workspace, so racing CozoDB writes would just confuse the user.
+    {
+        let state = app.state::<AppState>();
+        let guard = state.active_compile.lock().await;
+        if let Some(handle) = guard.as_ref() {
+            return Err(format!(
+                "compile already in progress for {}; call workspace_compile_stop first",
+                handle.workspace_label
+            ));
+        }
+    }
+
+    // Register the compile so workspace_compile_stop can find the
+    // cancellation token.  Must be in place BEFORE we spawn the task
+    // so a fast UI Stop click can't miss the registration.
+    let cancel = CancellationToken::new();
+    {
+        let state = app.state::<AppState>();
+        let mut guard = state.active_compile.lock().await;
+        *guard = Some(CompileHandle {
+            workspace_label: workspace_label.clone(),
+            cancel: cancel.clone(),
+        });
+    }
+
     let app_for_task = app.clone();
     let path_for_task = path.clone();
     let label_for_task = workspace_label.clone();
+    let cancel_for_task = cancel.clone();
 
     tokio::spawn(async move {
         let _ = app_for_task.emit(
@@ -257,7 +293,13 @@ pub async fn workspace_compile(
             }
         });
 
-        let outcome = run_pipeline(&path_for_task, branch.as_deref(), Some(tx)).await;
+        let outcome = run_pipeline_with_cancel(
+            &path_for_task,
+            branch.as_deref(),
+            Some(tx),
+            cancel_for_task,
+        )
+        .await;
 
         // Drop the sender side by waiting for the pump to drain — we
         // already moved `tx` into `run_pipeline`, so the channel closes
@@ -296,9 +338,65 @@ pub async fn workspace_compile(
                 );
             }
         }
+
+        // Compile is over — clear the active-compile slot so a
+        // subsequent click of "Compile" can start fresh.  Done in a
+        // separate scope so the lock is held only while taking the
+        // handle.
+        let state = app_for_task.state::<AppState>();
+        let mut guard = state.active_compile.lock().await;
+        *guard = None;
     });
 
     Ok(workspace_label)
+}
+
+/// Stop an in-progress compile.  Returns `true` when a compile was
+/// active and the cancellation token was tripped; `false` when no
+/// compile is running.  The actual abort happens at the next phase
+/// boundary in the pipeline (typically <1 s) — the spawned task then
+/// emits `CompileProgress::Cancelled` and clears `active_compile`.
+#[tauri::command]
+pub async fn workspace_compile_stop(app: AppHandle) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let guard = state.active_compile.lock().await;
+    match guard.as_ref() {
+        Some(handle) => {
+            tracing::info!(
+                workspace = %handle.workspace_label,
+                "user requested compile stop — tripping cancellation token"
+            );
+            handle.cancel.cancel();
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Lightweight read-only status: which workspace (if any) is being
+/// compiled right now.  React polls this from a long-lived "Compile"
+/// modal so the Stop button can stay disabled when nothing is running
+/// without depending on event ordering.
+#[derive(Debug, Serialize)]
+pub struct CompileStatus {
+    pub active: bool,
+    pub workspace: Option<String>,
+}
+
+#[tauri::command]
+pub async fn workspace_compile_status(app: AppHandle) -> Result<CompileStatus, String> {
+    let state = app.state::<AppState>();
+    let guard = state.active_compile.lock().await;
+    Ok(match guard.as_ref() {
+        Some(h) => CompileStatus {
+            active: true,
+            workspace: Some(h.workspace_label.clone()),
+        },
+        None => CompileStatus {
+            active: false,
+            workspace: None,
+        },
+    })
 }
 
 fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgress> {

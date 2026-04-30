@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use thinkingroot_serve::engine::QueryEngine;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 /// All process-wide state owned by Tauri's `app.manage(...)`.
 #[derive(Default)]
@@ -26,6 +27,24 @@ pub struct AppState {
     /// outlives this struct; what we keep here is the metadata the
     /// commands and shutdown hook need.
     pub sidecar: AsyncMutex<Option<SidecarHandle>>,
+    /// Currently-running compile, if any.  Populated by
+    /// `workspace_compile` and consumed by `workspace_compile_stop`
+    /// or by the compile task itself on completion.  Holding the
+    /// `CancellationToken` here is what makes the desktop "Stop"
+    /// button possible — `cancel.cancel()` propagates through the
+    /// pipeline orchestrator and aborts in-flight LLM batches.
+    pub active_compile: AsyncMutex<Option<CompileHandle>>,
+}
+
+/// Live handle for an in-progress workspace compile.
+#[derive(Debug, Clone)]
+pub struct CompileHandle {
+    /// Workspace path being compiled — surfaced by `compile_status`
+    /// so the UI can render which workspace is busy.
+    pub workspace_label: String,
+    /// Tripping this aborts the pipeline at the next phase boundary
+    /// (see `thinkingroot_serve::pipeline::run_pipeline_with_cancel`).
+    pub cancel: CancellationToken,
 }
 
 /// Live metadata for the running sidecar.

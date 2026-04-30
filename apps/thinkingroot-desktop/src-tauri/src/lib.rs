@@ -95,6 +95,8 @@ pub fn run() {
             commands::workspaces::workspace_remove,
             commands::workspaces::workspace_set_active,
             commands::workspaces::workspace_compile,
+            commands::workspaces::workspace_compile_stop,
+            commands::workspaces::workspace_compile_status,
             commands::fs::fs_list_dir,
             commands::git::git_branches,
             commands::install_tr::install_tr_file,
