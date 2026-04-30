@@ -835,7 +835,7 @@ struct AzureProvider {
 }
 
 impl AzureProvider {
-    fn new(api_key: &str, model: &str, cfg: &AzureConfig) -> Result<Self> {
+    fn new(api_key: &str, model: &str, cfg: &AzureConfig, timeout_secs: u64) -> Result<Self> {
         let deployment = cfg.deployment.as_deref().ok_or_else(|| {
             Error::MissingConfig("set [llm.providers.azure].deployment in your config".into())
         })?;
@@ -862,7 +862,7 @@ impl AzureProvider {
 
         Ok(Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .unwrap_or_default(),
             api_key: api_key.to_string(),
@@ -1161,7 +1161,13 @@ struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    fn new(api_key: &str, model: &str, base_url: &str, provider_name: &str) -> Self {
+    fn new(
+        api_key: &str,
+        model: &str,
+        base_url: &str,
+        provider_name: &str,
+        timeout_secs: u64,
+    ) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         // Strip trailing /v1 so providers that store "https://host/v1" in config
         // don't end up with a double /v1 when chat() appends /v1/chat/completions.
@@ -1172,7 +1178,7 @@ impl OpenAiProvider {
             .to_string();
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .unwrap_or_default(),
             api_key: api_key.to_string(),
@@ -1487,11 +1493,11 @@ struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    fn new(api_key: &str, model: &str) -> Self {
+    fn new(api_key: &str, model: &str, timeout_secs: u64) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .unwrap_or_default(),
             api_key: api_key.to_string(),
@@ -1821,11 +1827,11 @@ struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    fn new(model: &str, base_url: &str) -> Self {
+    fn new(model: &str, base_url: &str, timeout_secs: u64) -> Self {
         let max_output_tokens = model_max_output_tokens(model);
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(90))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .build()
                 .unwrap_or_default(),
             model: model.to_string(),
@@ -2392,8 +2398,26 @@ fn document_to_json(doc: &aws_smithy_types::Document) -> serde_json::Value {
 pub struct LlmClient {
     provider: Provider,
     max_retries: u32,
+    /// Per-request reqwest timeout (seconds).  Sourced from
+    /// `LlmConfig::request_timeout_secs` at construction time and applied to
+    /// the inner reqwest::Client built for each provider.  The outer
+    /// `tokio::time::timeout` wrappers around `provider.chat(...)` use
+    /// `outer_timeout_secs(self.timeout_secs)` (= 2× inner, floored at 60s)
+    /// so the inner timeout always fires first.  Pre-fix this was a hard-
+    /// coded 90s on every reqwest client and the user's
+    /// `request_timeout_secs` field was a dead config option.
+    timeout_secs: u64,
     /// Pre-emptive throughput scheduler — gates every send to stay under provider limits.
     pub(crate) scheduler: Option<Arc<ThroughputScheduler>>,
+}
+
+/// Compute the safety-net outer timeout from the configured per-request
+/// inner timeout.  Always strictly larger than `inner` so the reqwest layer
+/// fires first (and we get a well-typed transport error rather than the
+/// ambiguous `tokio::time::timeout` Elapsed).  Floor of 60s so a misconfig
+/// like `request_timeout_secs = 1` doesn't make the outer fire at 2s.
+fn outer_timeout_secs(inner: u64) -> u64 {
+    inner.saturating_mul(2).max(60)
 }
 
 impl LlmClient {
@@ -2404,6 +2428,14 @@ impl LlmClient {
                 "No LLM provider configured.\n  Run `root setup` to get started (takes ~2 minutes).".into(),
             ));
         }
+        // Treat `request_timeout_secs = 0` (uninitialised default in older
+        // configs) as "fall back to 120" so existing on-disk configs work
+        // unchanged.  Anything explicit from the user wins.
+        let timeout_secs = if config.request_timeout_secs == 0 {
+            120
+        } else {
+            config.request_timeout_secs
+        };
         let provider = match config.default_provider.as_str() {
             "bedrock" => {
                 let region = config
@@ -2423,6 +2455,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "openai",
+                    timeout_secs,
                 ))
             }
             "azure" => {
@@ -2450,16 +2483,25 @@ impl LlmClient {
                     &key,
                     &config.extraction_model,
                     azure_cfg,
+                    timeout_secs,
                 )?)
             }
             "anthropic" => {
                 let key = resolve_key(config.providers.anthropic.as_ref(), "ANTHROPIC_API_KEY")?;
-                Provider::Anthropic(AnthropicProvider::new(&key, &config.extraction_model))
+                Provider::Anthropic(AnthropicProvider::new(
+                    &key,
+                    &config.extraction_model,
+                    timeout_secs,
+                ))
             }
             "ollama" => {
                 let base_url =
                     resolve_base_url(config.providers.ollama.as_ref(), "http://localhost:11434");
-                Provider::Ollama(OllamaProvider::new(&config.extraction_model, &base_url))
+                Provider::Ollama(OllamaProvider::new(
+                    &config.extraction_model,
+                    &base_url,
+                    timeout_secs,
+                ))
             }
             "groq" => {
                 let key = resolve_key(config.providers.groq.as_ref(), "GROQ_API_KEY")?;
@@ -2472,6 +2514,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "groq",
+                    timeout_secs,
                 ))
             }
             "deepseek" => {
@@ -2485,6 +2528,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "deepseek",
+                    timeout_secs,
                 ))
             }
             "openrouter" => {
@@ -2498,6 +2542,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "openrouter",
+                    timeout_secs,
                 ))
             }
             "together" => {
@@ -2511,6 +2556,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "together",
+                    timeout_secs,
                 ))
             }
             "perplexity" => {
@@ -2524,6 +2570,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "perplexity",
+                    timeout_secs,
                 ))
             }
             "litellm" => {
@@ -2535,6 +2582,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "litellm",
+                    timeout_secs,
                 ))
             }
             "custom" => {
@@ -2546,6 +2594,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     "custom",
+                    timeout_secs,
                 ))
             }
             other => {
@@ -2556,17 +2605,25 @@ impl LlmClient {
         };
 
         tracing::info!(
-            "LLM provider: {} / {} (max_output_tokens={})",
+            "LLM provider: {} / {} (max_output_tokens={}, timeout={}s)",
             config.default_provider,
             config.extraction_model,
             model_max_output_tokens(&config.extraction_model),
+            timeout_secs,
         );
 
         Ok(Self {
             provider,
             max_retries: 3,
+            timeout_secs,
             scheduler: None,
         })
+    }
+
+    /// Per-request reqwest timeout currently in effect.  Returns the
+    /// effective value (default 120 if the config left it at 0).
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     /// Create an LlmClient pointed at a specific Azure deployment, bypassing LlmConfig.
@@ -2579,10 +2636,19 @@ impl LlmClient {
         display_model: &str,
         azure_cfg: &AzureConfig,
     ) -> Result<Self> {
-        let provider = Provider::Azure(AzureProvider::new(api_key, display_model, azure_cfg)?);
+        // Eval-runner / one-off Azure deployments don't carry a full
+        // LlmConfig; use the same 120s default as a fresh `LlmConfig::default()`.
+        let timeout_secs = 120u64;
+        let provider = Provider::Azure(AzureProvider::new(
+            api_key,
+            display_model,
+            azure_cfg,
+            timeout_secs,
+        )?);
         Ok(Self {
             provider,
             max_retries: 3,
+            timeout_secs,
             scheduler: None,
         })
     }
@@ -2696,8 +2762,9 @@ impl LlmClient {
                 None
             };
 
+            let outer = outer_timeout_secs(self.timeout_secs);
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(600),
+                tokio::time::Duration::from_secs(outer),
                 self.provider.chat(prompts::SYSTEM_PROMPT, batch_prompt),
             )
             .await;
@@ -2709,7 +2776,8 @@ impl LlmClient {
                     tracing::warn!(
                         attempt = normal_attempts,
                         max = self.max_retries,
-                        "batch LLM call timed out after 600s, retrying..."
+                        outer_secs = outer,
+                        "batch LLM call exceeded outer safety-net timeout, retrying..."
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
@@ -2811,8 +2879,9 @@ impl LlmClient {
                 None
             };
 
+            let outer = outer_timeout_secs(self.timeout_secs);
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(45),
+                tokio::time::Duration::from_secs(outer),
                 self.provider.chat(system, user),
             )
             .await;
@@ -2823,7 +2892,8 @@ impl LlmClient {
                     // Timed out — count as a transient error and retry.
                     normal_attempts += 1;
                     tracing::warn!(
-                        "LLM chat timed out after 45s, retrying ({normal_attempts}/{})...",
+                        outer_secs = outer,
+                        "LLM chat exceeded outer safety-net timeout, retrying ({normal_attempts}/{})...",
                         self.max_retries
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2922,8 +2992,9 @@ impl LlmClient {
                 None
             };
 
+            let outer = outer_timeout_secs(self.timeout_secs);
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(60),
+                tokio::time::Duration::from_secs(outer),
                 self.provider
                     .chat_with_tools(system, messages, tools, tool_choice),
             )
@@ -2934,7 +3005,8 @@ impl LlmClient {
                 Err(_) => {
                     normal_attempts += 1;
                     tracing::warn!(
-                        "LLM chat_with_tools timed out after 60s, retrying ({normal_attempts}/{})...",
+                        outer_secs = outer,
+                        "LLM chat_with_tools exceeded outer safety-net timeout, retrying ({normal_attempts}/{})...",
                         self.max_retries
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3029,8 +3101,9 @@ impl LlmClient {
                 None
             };
 
+            let outer = outer_timeout_secs(self.timeout_secs);
             let chat_result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(600),
+                tokio::time::Duration::from_secs(outer),
                 self.provider.chat(prompts::SYSTEM_PROMPT, &user_prompt),
             )
             .await;
@@ -3042,7 +3115,8 @@ impl LlmClient {
                     tracing::warn!(
                         attempt = normal_attempts,
                         max = self.max_retries,
-                        "LLM extraction call timed out after 600s, retrying..."
+                        outer_secs = outer,
+                        "LLM extraction call exceeded outer safety-net timeout, retrying..."
                     );
                     if normal_attempts >= self.max_retries {
                         break;
@@ -3645,18 +3719,18 @@ mod tests {
     fn openai_provider_strips_trailing_v1_from_base_url() {
         // Providers like OpenRouter store "https://host/api/v1" in config.
         // OpenAiProvider must strip the /v1 so chat() doesn't produce a double /v1.
-        let p = OpenAiProvider::new("key", "model", "https://openrouter.ai/api/v1", "openrouter");
+        let p = OpenAiProvider::new("key", "model", "https://openrouter.ai/api/v1", "openrouter", 120);
         assert_eq!(p.base_url, "https://openrouter.ai/api");
 
-        let p2 = OpenAiProvider::new("key", "model", "https://api.together.xyz/v1", "together");
+        let p2 = OpenAiProvider::new("key", "model", "https://api.together.xyz/v1", "together", 120);
         assert_eq!(p2.base_url, "https://api.together.xyz");
 
         // Providers without /v1 suffix must be unchanged.
-        let p3 = OpenAiProvider::new("key", "model", "https://api.openai.com", "openai");
+        let p3 = OpenAiProvider::new("key", "model", "https://api.openai.com", "openai", 120);
         assert_eq!(p3.base_url, "https://api.openai.com");
 
         // Groq's /openai path must not be stripped.
-        let p4 = OpenAiProvider::new("key", "model", "https://api.groq.com/openai", "groq");
+        let p4 = OpenAiProvider::new("key", "model", "https://api.groq.com/openai", "groq", 120);
         assert_eq!(p4.base_url, "https://api.groq.com/openai");
     }
 
@@ -4348,5 +4422,88 @@ mod tests {
             is_error: false,
         }]);
         assert!(estimated_message_chars(&m4) >= "result text".len());
+    }
+
+    #[test]
+    fn outer_timeout_is_strictly_larger_than_inner_with_60s_floor() {
+        // Pre-fix the per-provider reqwest timeout was hard-coded to 90s
+        // and the user's request_timeout_secs config field was dead.  The
+        // outer safety-net timeout must always be strictly greater than
+        // the inner so reqwest's well-typed transport error fires first.
+        // Floor of 60s prevents a misconfig like `request_timeout_secs = 1`
+        // from collapsing the outer to 2s.
+        assert_eq!(outer_timeout_secs(120), 240);
+        assert_eq!(outer_timeout_secs(600), 1200);
+        assert_eq!(outer_timeout_secs(30), 60, "floor must clamp to 60");
+        assert_eq!(outer_timeout_secs(1), 60, "tiny inner timeouts still get >= 60s outer");
+        // Saturating multiplication: u64::MAX / 2 + 1 doubled would
+        // overflow, so saturating_mul must clamp.
+        assert_eq!(outer_timeout_secs(u64::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_secs_propagates_into_llm_client() {
+        // Regression for C3: previously the per-provider reqwest::Client
+        // timeout was hard-coded to 90s regardless of LlmConfig.
+        // Verify the value flows from the config into LlmClient.timeout_secs.
+        use thinkingroot_core::config::{
+            LlmConfig, ProviderConfig, ProvidersConfig,
+        };
+        // Use ollama because it doesn't require an API key — picking a
+        // fake base_url is fine; we never make a real request.
+        let cfg = LlmConfig {
+            default_provider: "ollama".into(),
+            extraction_model: "llama3".into(),
+            compilation_model: "llama3".into(),
+            max_concurrent_requests: 1,
+            request_timeout_secs: 333,
+            providers: ProvidersConfig {
+                ollama: Some(ProviderConfig {
+                    api_key_env: None,
+                    api_key: None,
+                    base_url: Some("http://127.0.0.1:65000".into()),
+                    default_model: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let client = LlmClient::new(&cfg).await.expect("ollama client builds without auth");
+        assert_eq!(
+            client.timeout_secs(),
+            333,
+            "request_timeout_secs must flow into the client's effective timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_secs_zero_falls_back_to_120() {
+        // Older on-disk configs may have request_timeout_secs == 0 (the
+        // serde default for u64).  Treat that as "unset" rather than a
+        // 0-second timeout that would fail every call.
+        use thinkingroot_core::config::{
+            LlmConfig, ProviderConfig, ProvidersConfig,
+        };
+        let cfg = LlmConfig {
+            default_provider: "ollama".into(),
+            extraction_model: "llama3".into(),
+            compilation_model: "llama3".into(),
+            max_concurrent_requests: 1,
+            request_timeout_secs: 0,
+            providers: ProvidersConfig {
+                ollama: Some(ProviderConfig {
+                    api_key_env: None,
+                    api_key: None,
+                    base_url: Some("http://127.0.0.1:65000".into()),
+                    default_model: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let client = LlmClient::new(&cfg).await.expect("ollama client builds");
+        assert_eq!(
+            client.timeout_secs(),
+            120,
+            "0 in config must fall back to the 120s default"
+        );
     }
 }
