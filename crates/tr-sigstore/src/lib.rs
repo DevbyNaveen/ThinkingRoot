@@ -1277,6 +1277,215 @@ mod tests {
         assert_eq!(stmt.subject[0].name, "full-chain.tr");
     }
 
+    /// Offline replay regression test — the load-bearing assertion
+    /// per Phase F doc §9.2. Builds a synthetic Sigstore-style bundle
+    /// that exercises **every** verification layer in one round-trip:
+    ///
+    /// 1. ECDSA P-256 cert chain (root → intermediate → leaf).
+    /// 2. DSSE envelope signed by the leaf with sha256-subject digest
+    ///    (matches the wire format sigstore-rs produces).
+    /// 3. Rekor inclusion proof — synthetic 4-leaf tree.
+    /// 4. Rekor SignedEntryTimestamp signed by a synthetic Rekor key.
+    ///
+    /// Runs every CI run (no env-var gate). If any of the verification
+    /// layers regresses, this fires before live tests catch it.
+    /// Vendoring a real Sigstore-public-good bundle on top of this is
+    /// a follow-up commit — capturing one requires running the live
+    /// flow once and committing the resulting JSON as a fixture.
+    #[test]
+    fn offline_replay_full_sigstore_style_bundle_verifies() {
+        use crate::rekor::{leaf_hash_from_canonical_body, verify_inclusion_proof_offline, verify_set_signature};
+        use crate::trust_root::test_helpers::*;
+        use sha2::Digest as _;
+
+        // ─── Build the synthetic cert chain ─────────────────────────
+        let root_signer = p256_key(0xF1);
+        let int_signer = p256_key(0xF2);
+        let leaf_signer = p256_key(0xF3);
+        let rekor_signer = p256_key(0xF4);
+
+        let (root_cert, root_name) = build_self_signed_root(&root_signer, "Synth Root");
+        let (int_cert, int_name) =
+            build_intermediate(&root_signer, &root_name, &int_signer, "Synth Int");
+        let leaf_cert = build_leaf(&int_signer, &int_name, &leaf_signer, "leaf");
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let leaf_der = ::der::Encode::to_der(&leaf_cert).unwrap();
+        let int_der = ::der::Encode::to_der(&int_cert).unwrap();
+        let root_der = ::der::Encode::to_der(&root_cert).unwrap();
+
+        // ─── Build the DSSE envelope (sha256 subject — Sigstore-style) ──
+        let canonical_bytes: &[u8] = b"v3 pack canonical bytes for offline replay";
+        let mut sha256_hex = String::with_capacity(64);
+        for b in sha2::Sha256::digest(canonical_bytes).iter() {
+            sha256_hex.push_str(&format!("{b:02x}"));
+        }
+        let statement = InTotoStatement {
+            statement_type: IN_TOTO_STATEMENT_V1.to_string(),
+            subject: vec![Subject {
+                name: "package.tr".to_string(),
+                digest: {
+                    let mut m = serde_json::Map::new();
+                    m.insert(
+                        "sha256".to_string(),
+                        serde_json::Value::String(sha256_hex),
+                    );
+                    m
+                },
+            }],
+            predicate_type: DSSE_STATEMENT_TYPE.to_string(),
+            predicate: PackPredicate {
+                format_version: "tr/3".to_string(),
+                signed_at: format_rfc3339(SystemTime::UNIX_EPOCH),
+            },
+        };
+        let payload_bytes = serde_json::to_vec(&statement).unwrap();
+        let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes);
+        let dsse_sig: P256Signature = leaf_signer.sign(&pae);
+        let dsse_sig_der = dsse_sig.to_der();
+
+        // ─── Build the Rekor witness ────────────────────────────────
+        // 4-leaf synthetic tree. The bundle's tlog entry sits at index
+        // 1 (so we can exercise both a non-trivial Merkle path and a
+        // non-zero leaf index).
+        let canonical_body = b"{\"apiVersion\":\"0.0.1\",\"kind\":\"hashedrekord\",\"spec\":{}}";
+        let our_leaf = leaf_hash_from_canonical_body(canonical_body);
+        let other_leaves: Vec<[u8; 32]> = (0u8..3)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[31] = 0x10 + i;
+                let mut h = sha2::Sha256::new();
+                h.update([0x00]);
+                h.update(b);
+                h.finalize().into()
+            })
+            .collect();
+        let leaves: Vec<[u8; 32]> = vec![other_leaves[0], our_leaf, other_leaves[1], other_leaves[2]];
+
+        // Compute the Merkle root from the 4-leaf tree (RFC 6962).
+        let level1_left: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update([0x01]);
+            h.update(leaves[0]);
+            h.update(leaves[1]);
+            h.finalize().into()
+        };
+        let level1_right: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update([0x01]);
+            h.update(leaves[2]);
+            h.update(leaves[3]);
+            h.finalize().into()
+        };
+        let merkle_root: [u8; 32] = {
+            let mut h = sha2::Sha256::new();
+            h.update([0x01]);
+            h.update(level1_left);
+            h.update(level1_right);
+            h.finalize().into()
+        };
+
+        // Audit path for leaf at index 1: sibling at level 0 is
+        // `leaves[0]`, sibling at level 1 is `level1_right`.
+        let audit_path = vec![leaves[0], level1_right];
+
+        let inclusion_proof = RekorInclusionProof {
+            log_index: 1,
+            tree_size: 4,
+            root_hash: b64.encode(merkle_root),
+            hashes: audit_path.iter().map(|h| b64.encode(h)).collect(),
+            checkpoint: None,
+        };
+
+        // SET signature over the canonical (integratedTime, logIndex,
+        // logID, body) tuple.
+        let log_id_bytes = [0x99u8; 32];
+        let integrated_time = 1_700_000_000i64;
+        let log_index = 1i64;
+        let set_payload = format!(
+            "{{\"body\":\"{}\",\"integratedTime\":{},\"logID\":\"{}\",\"logIndex\":{}}}",
+            b64.encode(canonical_body),
+            integrated_time,
+            log_id_bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            log_index,
+        );
+        let set_sig: P256Signature = rekor_signer.sign(set_payload.as_bytes());
+        let set_sig_der = set_sig.to_der();
+
+        let tlog_entry = TlogEntry {
+            log_index,
+            log_id: Some(LogId {
+                key_id: b64.encode(log_id_bytes),
+            }),
+            kind_version: Some(KindVersion {
+                kind: "hashedrekord".to_string(),
+                version: "0.0.1".to_string(),
+            }),
+            integrated_time,
+            inclusion_promise: Some(InclusionPromise {
+                signed_entry_timestamp: b64.encode(set_sig_der.as_bytes()),
+            }),
+            inclusion_proof: Some(inclusion_proof),
+            canonicalized_body: Some(b64.encode(canonical_body)),
+        };
+
+        // ─── Assemble the full bundle ───────────────────────────────
+        let bundle = SigstoreBundle {
+            media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
+            verification_material: VerificationMaterial {
+                public_key: None,
+                x509_certificate_chain: Some(X509CertificateChain {
+                    certificates: vec![
+                        X509Certificate { raw_bytes: b64.encode(&leaf_der) },
+                        X509Certificate { raw_bytes: b64.encode(&int_der) },
+                    ],
+                }),
+                tlog_entries: vec![tlog_entry.clone()],
+            },
+            dsse_envelope: DsseEnvelope {
+                payload: b64.encode(&payload_bytes),
+                payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+                signatures: vec![DsseSignature {
+                    sig: b64.encode(dsse_sig_der.as_bytes()),
+                }],
+            },
+        };
+
+        // ─── Verify, layer by layer ─────────────────────────────────
+
+        // Layer 1: dual-digest verifier — accepts the sha256 subject
+        // digest and validates DSSE crypto + cert chain (this is the
+        // path the v3 verifier takes for Sigstore-style bundles).
+        let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
+        let stmt = verify_bundle_against_canonical_bytes(&bundle, canonical_bytes).unwrap();
+        assert_eq!(stmt.predicate.format_version, "tr/3");
+
+        // Layer 1 (alt): cert chain validates against trust root.
+        let chain = bundle
+            .verification_material
+            .x509_certificate_chain
+            .as_ref()
+            .unwrap();
+        let root_idx = verify_cert_chain(chain, &trust_root, SystemTime::now()).unwrap();
+        assert_eq!(root_idx, 0, "chain should terminate at our synthetic root");
+
+        // Layer 2: Rekor inclusion proof against claimed root.
+        let proof = bundle
+            .verification_material
+            .tlog_entries[0]
+            .inclusion_proof
+            .as_ref()
+            .unwrap();
+        verify_inclusion_proof_offline(&our_leaf, proof).unwrap();
+
+        // Layer 3: Rekor SET signature against synthetic Rekor key.
+        let rekor_vk = *rekor_signer.verifying_key();
+        verify_set_signature(&tlog_entry, canonical_body, &log_id_bytes, &rekor_vk).unwrap();
+    }
+
     #[test]
     fn full_chain_bundle_with_no_chain_errors_missing_key() {
         let (mut bundle, root_der) =
