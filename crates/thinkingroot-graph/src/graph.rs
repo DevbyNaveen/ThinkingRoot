@@ -697,6 +697,93 @@ impl GraphStore {
             .collect())
     }
 
+    /// Look up a single source's URI by id.  Returns `Ok(String::new())`
+    /// when no row exists (the row hasn't been inserted yet, or is from
+    /// another workspace).  Used at claim-insert time to populate the
+    /// denormalised `claims.source_path` column so v3 byte-range citations
+    /// resolve without a join.
+    pub fn find_source_uri_by_id(&self, id: &str) -> Result<String> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        let result = self
+            .db
+            .run_script(
+                "?[uri] := *sources{id: $id, uri}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_to_string)
+            .unwrap_or_default())
+    }
+
+    /// Read the `source_path` column directly for a single claim.  Used
+    /// by hot-path readers that don't need a `sources` JOIN, and by the
+    /// regression test for the C2 byte-range citation fix.  Returns
+    /// `Ok(String::new())` when the claim does not exist.
+    pub fn get_claim_source_path(&self, claim_id: &str) -> Result<String> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(claim_id.into()));
+        let result = self
+            .db
+            .run_script(
+                "?[source_path] := *claims{id: $id, source_path}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(dv_to_string)
+            .unwrap_or_default())
+    }
+
+    /// Bulk-fetch source URIs for a slice of source ids.  Returns
+    /// `id -> uri` only for ids that resolve.  Used by `insert_claims_batch`
+    /// to avoid N round-trips when populating `claims.source_path`.
+    pub fn fetch_source_uris<S: AsRef<str>>(
+        &self,
+        ids: &[S],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<DataValue> = ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_ref().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        let result = self
+            .db
+            .run_script(
+                // Inline-relation join: pin candidate ids to a unary
+                // pseudo-relation, then probe `sources` once per row.
+                // CozoDB rewrites this to an indexed lookup.
+                "candidate[id] <- $ids
+                 ?[id, uri] := candidate[id], *sources{id, uri}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                if row.len() < 2 {
+                    return None;
+                }
+                Some((dv_to_string(&row[0]), dv_to_string(&row[1])))
+            })
+            .collect())
+    }
+
     /// Insert a claim node.
     pub fn insert_claim(&self, claim: &thinkingroot_core::Claim) -> Result<()> {
         let mut params = BTreeMap::new();
@@ -804,10 +891,14 @@ impl GraphStore {
             ),
             None => (0, 0),
         };
-        params.insert(
-            "source_path".into(),
-            DataValue::Str(String::new().into()),
-        );
+        // v3 byte-range citation requires `source_path` populated alongside
+        // `byte_start` / `byte_end`.  We resolve the URI through the
+        // `sources` table at insert time so the denormalised column never
+        // ships empty (pre-fix every row carried "").
+        let source_path = self
+            .find_source_uri_by_id(&claim.source.to_string())
+            .unwrap_or_default();
+        params.insert("source_path".into(), DataValue::Str(source_path.into()));
         params.insert("byte_start".into(), DataValue::Num(Num::Int(byte_start_val)));
         params.insert("byte_end".into(), DataValue::Num(Num::Int(byte_end_val)));
 
@@ -914,6 +1005,14 @@ impl GraphStore {
     /// Chunks into groups of 500 to stay within CozoDB parameter limits.
     pub fn insert_claims_batch(&self, claims: &[thinkingroot_core::Claim]) -> Result<()> {
         const CHUNK: usize = 500;
+        // Resolve `source_id -> source_uri` once per call so the
+        // denormalised `claims.source_path` column is populated for
+        // every row.  Pre-fix this column was always written as "" and
+        // v3 byte-range citations had to fall back to a JOIN.  The
+        // sources rows are inserted by Phase 6 of the pipeline, before
+        // Linker calls this method, so every `c.source` should resolve.
+        let source_id_strings: Vec<String> = claims.iter().map(|c| c.source.to_string()).collect();
+        let uri_by_id = self.fetch_source_uris(&source_id_strings)?;
         for chunk in claims.chunks(CHUNK) {
             let rows: Vec<DataValue> = chunk
                 .iter()
@@ -942,11 +1041,16 @@ impl GraphStore {
                         ),
                         None => (0, 0),
                     };
+                    let source_id_str = c.source.to_string();
+                    let source_path = uri_by_id
+                        .get(&source_id_str)
+                        .cloned()
+                        .unwrap_or_default();
                     DataValue::List(vec![
                         DataValue::Str(c.id.to_string().into()),
                         DataValue::Str(c.statement.clone().into()),
                         DataValue::Str(format!("{:?}", c.claim_type).into()),
-                        DataValue::Str(c.source.to_string().into()),
+                        DataValue::Str(source_id_str.into()),
                         DataValue::Num(Num::Float(c.confidence.value())),
                         DataValue::Str(format!("{:?}", c.sensitivity).into()),
                         DataValue::Str(c.workspace.to_string().into()),
@@ -970,7 +1074,7 @@ impl GraphStore {
                                 .map(|d| d.timestamp() as f64)
                                 .unwrap_or(0.0),
                         )),
-                        DataValue::Str(String::new().into()),
+                        DataValue::Str(source_path.into()),
                         DataValue::Num(Num::Int(byte_start_val)),
                         DataValue::Num(Num::Int(byte_end_val)),
                     ])
@@ -5157,5 +5261,102 @@ mod tests {
                 p,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn insert_claim_populates_source_path_from_sources_table() {
+        // Regression for C2: pre-fix every claim landed with
+        // source_path = "" because insert_claim hardcoded an empty
+        // string instead of resolving from the sources table.
+        use thinkingroot_core::types::{Claim, ClaimType, Source, SourceType, WorkspaceId};
+        let store = mem_store();
+        let src = Source::new(
+            "file:///tmp/foo.rs".to_string(),
+            SourceType::File,
+        );
+        let src_id = src.id;
+        store.insert_source(&src).unwrap();
+
+        let claim = Claim::new("foo claims bar", ClaimType::Fact, src_id, WorkspaceId::new());
+        let claim_id = claim.id;
+        store.insert_claim(&claim).unwrap();
+
+        let written = store
+            .get_claim_source_path(&claim_id.to_string())
+            .unwrap();
+        assert_eq!(
+            written, "file:///tmp/foo.rs",
+            "single-row insert must populate source_path from sources, got {written:?}"
+        );
+    }
+
+    #[test]
+    fn insert_claims_batch_populates_source_path_from_sources_table() {
+        // Regression for C2: pre-fix the batch path (used by Linker on
+        // every compile) hardcoded source_path = "" for every row.
+        use thinkingroot_core::types::{Claim, ClaimType, Source, SourceType, WorkspaceId};
+        let store = mem_store();
+
+        let src_a = Source::new("file:///abs/a.rs".to_string(), SourceType::File);
+        let src_b = Source::new("file:///abs/b.rs".to_string(), SourceType::File);
+        store.insert_source(&src_a).unwrap();
+        store.insert_source(&src_b).unwrap();
+        let ws = WorkspaceId::new();
+
+        let claims = vec![
+            Claim::new("alpha", ClaimType::Fact, src_a.id, ws),
+            Claim::new("beta", ClaimType::Fact, src_b.id, ws),
+            Claim::new("gamma", ClaimType::Fact, src_a.id, ws),
+        ];
+        let ids: Vec<String> = claims.iter().map(|c| c.id.to_string()).collect();
+        store.insert_claims_batch(&claims).unwrap();
+
+        let p0 = store.get_claim_source_path(&ids[0]).unwrap();
+        let p1 = store.get_claim_source_path(&ids[1]).unwrap();
+        let p2 = store.get_claim_source_path(&ids[2]).unwrap();
+        assert_eq!(p0, "file:///abs/a.rs", "claim[0] source_path");
+        assert_eq!(p1, "file:///abs/b.rs", "claim[1] source_path");
+        assert_eq!(p2, "file:///abs/a.rs", "claim[2] source_path");
+    }
+
+    #[test]
+    fn insert_claims_batch_with_missing_source_falls_back_to_empty() {
+        // If the sources row hasn't been inserted yet (a misuse pattern
+        // outside the v3 pipeline order), the column lands empty rather
+        // than the batch failing.  The pipeline's contract is to insert
+        // sources in Phase 6 before claims in Phase 7, so this branch is
+        // a defensive fallback, not a hot path.
+        use thinkingroot_core::types::{Claim, ClaimType, SourceId, WorkspaceId};
+        let store = mem_store();
+        let synthetic_source = SourceId::new(); // never inserted into sources
+        let claims = vec![Claim::new(
+            "ghost",
+            ClaimType::Fact,
+            synthetic_source,
+            WorkspaceId::new(),
+        )];
+        let id = claims[0].id.to_string();
+        store.insert_claims_batch(&claims).unwrap();
+        assert_eq!(
+            store.get_claim_source_path(&id).unwrap(),
+            "",
+            "missing source_id must produce empty source_path, not an error"
+        );
+    }
+
+    #[test]
+    fn fetch_source_uris_returns_known_only() {
+        use thinkingroot_core::types::{Source, SourceType};
+        let store = mem_store();
+        let a = Source::new("file:///x/a.rs".to_string(), SourceType::File);
+        let b = Source::new("file:///x/b.rs".to_string(), SourceType::File);
+        store.insert_source(&a).unwrap();
+        store.insert_source(&b).unwrap();
+
+        let ids = vec![a.id.to_string(), b.id.to_string(), "ghost".to_string()];
+        let map = store.fetch_source_uris(&ids).unwrap();
+        assert_eq!(map.get(&a.id.to_string()).map(String::as_str), Some("file:///x/a.rs"));
+        assert_eq!(map.get(&b.id.to_string()).map(String::as_str), Some("file:///x/b.rs"));
+        assert!(!map.contains_key("ghost"), "unknown ids must not appear in result");
     }
 }
