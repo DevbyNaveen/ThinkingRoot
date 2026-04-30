@@ -16,6 +16,7 @@ mod pipeline;
 mod progress;
 mod provider_cmd;
 mod reflect_cmd;
+mod render_cmd;
 mod rooting_cmd;
 mod serve;
 mod setup;
@@ -56,6 +57,15 @@ enum Commands {
         /// stay in the `attested` tier — same as pre-Rooting behavior.
         #[arg(long)]
         no_rooting: bool,
+        /// Run the v3 minimum 3-phase pipeline: Parse → Extract+Ground+
+        /// Rooting+Link+SVO → CozoDB persist. Skips vector index,
+        /// markdown artifacts, and post-compile health verification —
+        /// products that don't ship inside a v3 `.tr` pack anyway.
+        /// Use with `root pack --format=tr/3` for the fastest v3
+        /// build path. Without this flag, `root compile` runs the full
+        /// 11-phase v1 pipeline (back-compat default).
+        #[arg(long)]
+        v3_minimal: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -284,10 +294,26 @@ enum Commands {
         #[arg(long, value_parser = ["on", "off", "advisory"])]
         rooting_mode: Option<String>,
     },
+    /// Render markdown artifacts (entity pages, architecture map,
+    /// decision log, agent brief, runbook, health report) from the
+    /// compiled CozoDB graph. Per v3 spec §11, the build pipeline no
+    /// longer runs Compile Artifacts by default — agents synthesise
+    /// on demand from claims + source. Users wanting pre-rendered
+    /// markdown invoke this explicitly.
+    Render {
+        /// Path to the compiled workspace.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Run a Reflect cycle over the compiled graph and surface
     /// known-unknowns. Use `--json <path>` to write a stable artifact
     /// the cloud's compile-worker ingests into the federation
     /// `pack_reflect_gaps` table.
+    ///
+    /// Aliased as `root audit` per the v3 spec §11 — the v3 build
+    /// pipeline doesn't run reflect by default; users invoke it
+    /// explicitly via either name.
+    #[command(alias = "audit")]
     Reflect {
         /// Path to the compiled workspace
         #[arg(default_value = ".")]
@@ -323,6 +349,49 @@ enum Commands {
         /// One-line description. Overrides `Pack.toml`.
         #[arg(long)]
         description: Option<String>,
+        /// Pack format: `tr/1` (default, multi-directory tar+zstd
+        /// matching the v1 wire format) or `tr/3` (the 3-file
+        /// `[manifest.toml, source.tar.zst, claims.jsonl]` layout from
+        /// the v3 spec). Default flips to `tr/3` after the v3
+        /// transition lands per `~/.claude/plans/zippy-wiggling-pelican.md`.
+        #[arg(long, default_value = "tr/1")]
+        format: String,
+        /// Path to an Ed25519 signing key (32 raw bytes). When set
+        /// and `--format=tr/3`, the pack is signed inline and emitted
+        /// with `signature.sig` as the 4th outer-tar entry. The Phase
+        /// F design (`docs/2026-04-29-phase-f-trust-verify-spec.md`)
+        /// covers the wire format. This is the air-gapped /
+        /// self-signed path; Sigstore-public-good keyless signing
+        /// uses `--sign-keyless` instead.
+        #[arg(long, value_name = "KEY_FILE", conflicts_with = "sign_keyless")]
+        sign: Option<PathBuf>,
+        /// Sign the pack via Sigstore-public-good keyless DSSE
+        /// (`--format=tr/3` only). The CLI obtains an OIDC id_token
+        /// (preferring `$TR_OIDC_TOKEN` if set; otherwise opening the
+        /// default browser to `https://oauth2.sigstore.dev/auth`),
+        /// requests an ephemeral ECDSA P-256 cert from Fulcio, signs
+        /// the DSSE PAE with the ephemeral key, submits the entry to
+        /// Rekor, and embeds the resulting Sigstore Bundle as
+        /// `signature.sig` in the outer tar. The signing key never
+        /// touches disk. See `crates/tr-sigstore/src/live.rs` for the
+        /// flow.
+        #[arg(long, conflicts_with = "sign")]
+        sign_keyless: bool,
+    },
+    /// Verify a v3 `.tr` pack's integrity and signature without
+    /// installing it. Runs the offline verification chain from spec
+    /// §7.6: recompute the pack hash, check it matches the manifest's
+    /// declared `pack_hash`, then verify the embedded Sigstore bundle
+    /// (DSSE signature + in-toto statement subject digest). Exit codes
+    /// match the install verification surface (0 verified, 1 tampered,
+    /// 2 unsigned, 3 unsupported).
+    Verify {
+        /// Path to the `.tr` pack file.
+        pack: PathBuf,
+        /// Accept Unsigned packs as success. Without this flag, an
+        /// unsigned pack exits 2.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Install a `.tr` knowledge pack — extract its contents to a
     /// target directory's `.thinkingroot/` so the engine can mount it
@@ -611,8 +680,9 @@ async fn async_main() -> anyhow::Result<()> {
             path,
             branch,
             no_rooting,
+            v3_minimal,
         }) => {
-            run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
+            run_compile(&path, branch.as_deref(), use_progress, no_rooting, v3_minimal).await?;
         }
         Some(Commands::Health { path }) => {
             run_health(&path).await?;
@@ -822,6 +892,9 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Reflect { path, json }) => {
             reflect_cmd::run(&path, json.as_ref())?;
         }
+        Some(Commands::Render { path }) => {
+            render_cmd::run(&path)?;
+        }
         Some(Commands::Pack {
             workspace,
             out,
@@ -829,8 +902,30 @@ async fn async_main() -> anyhow::Result<()> {
             version,
             license,
             description,
+            format,
+            sign,
+            sign_keyless,
         }) => {
-            pack_cmd::run_pack(&workspace, out, name, version, license, description)?;
+            pack_cmd::run_pack(
+                &workspace,
+                out,
+                name,
+                version,
+                license,
+                description,
+                &format,
+                sign.as_deref(),
+                sign_keyless,
+            )?;
+        }
+        Some(Commands::Verify {
+            pack,
+            allow_unsigned,
+        }) => {
+            let exit_code = pack_cmd::run_verify(&pack, allow_unsigned)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Some(Commands::Install {
             reference,
@@ -878,10 +973,10 @@ async fn async_main() -> anyhow::Result<()> {
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
-                run_compile(&path, None, use_progress, false).await?;
+                run_compile(&path, None, use_progress, false, false).await?;
             } else {
                 // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None, use_progress, false).await?;
+                run_compile(&PathBuf::from("."), None, use_progress, false, false).await?;
             }
         }
     }
@@ -894,6 +989,7 @@ async fn run_compile(
     branch: Option<&str>,
     use_progress: bool,
     no_rooting: bool,
+    v3_minimal: bool,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
@@ -923,7 +1019,13 @@ async fn run_compile(
 
     let start = Instant::now();
 
-    let result = if use_progress {
+    let result = if v3_minimal {
+        // V3Minimal skips the heavy post-extract steps (vector,
+        // artifacts, verify). Progress UI assumes the full pipeline,
+        // so v3_minimal disables the indicatif bars and uses the
+        // plain async path. CozoDB output is identical either way.
+        pipeline::run_pipeline_v3_minimal(&path, branch, None).await?
+    } else if use_progress {
         progress::run_compile_progress(&path, branch).await?
     } else {
         pipeline::run_pipeline(&path, branch, None).await?

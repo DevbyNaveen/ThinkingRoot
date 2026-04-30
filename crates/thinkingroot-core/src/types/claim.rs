@@ -191,23 +191,68 @@ impl Confidence {
     }
 }
 
-/// Byte-range span within the source document.
+/// Span of source bytes that a claim was extracted from.
+///
+/// Carries both line-based positioning (the v1 contract, used by callers
+/// that work in line space such as the legacy provenance probe) and
+/// byte-range positioning (the v3 contract, required by `claims.jsonl`
+/// per the v3 spec §3.3 wire format `{file, start, end}`).
+///
+/// New code should populate `byte_start`/`byte_end` whenever the parser
+/// or extractor has them. Old code that only knows lines stays backward
+/// compatible — `byte_start`/`byte_end` are `Option<u64>` and serde
+/// defaults to `None` for previously serialized claims.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start_line: u32,
     pub end_line: u32,
     pub start_col: Option<u32>,
     pub end_col: Option<u32>,
+    /// Byte offset (inclusive) within the source file. v3 wire format.
+    #[serde(default)]
+    pub byte_start: Option<u64>,
+    /// Byte offset (exclusive) within the source file. v3 wire format.
+    #[serde(default)]
+    pub byte_end: Option<u64>,
 }
 
 impl SourceSpan {
+    /// Construct a line-based span. Byte fields stay `None`; downstream
+    /// consumers fall back to the line range when bytes are absent.
     pub fn lines(start: u32, end: u32) -> Self {
         Self {
             start_line: start,
             end_line: end,
             start_col: None,
             end_col: None,
+            byte_start: None,
+            byte_end: None,
         }
+    }
+
+    /// Construct a byte-range span. Required by the v3 pack writer so every
+    /// claim emitted in `claims.jsonl` carries `(start, end)` per spec §3.3.
+    /// Line fields stay 0; the byte range is the authoritative source
+    /// citation.
+    pub fn bytes(byte_start: u64, byte_end: u64) -> Self {
+        Self {
+            start_line: 0,
+            end_line: 0,
+            start_col: None,
+            end_col: None,
+            byte_start: Some(byte_start),
+            byte_end: Some(byte_end),
+        }
+    }
+
+    /// Construct a span carrying both line- and byte-level positioning.
+    /// Use this from parsers and extractors that have authoritative byte
+    /// offsets and want to preserve the line range for tooling that still
+    /// works in line space (text editors, error messages).
+    pub fn with_bytes(mut self, byte_start: u64, byte_end: u64) -> Self {
+        self.byte_start = Some(byte_start);
+        self.byte_end = Some(byte_end);
+        self
     }
 }
 

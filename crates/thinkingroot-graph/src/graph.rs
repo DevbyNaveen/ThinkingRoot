@@ -7,6 +7,34 @@ use serde::Serialize;
 use thinkingroot_core::types::{Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
+/// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
+/// adjacent shape: every field maps directly onto the v3 spec §3.3
+/// `ClaimRecord` apart from `ents` which is loaded separately via
+/// [`GraphStore::get_claim_entity_names`].
+#[derive(Debug, Clone)]
+pub struct V3ClaimExportRow {
+    /// CozoDB claim id — the wire-format `id` field.
+    pub id: String,
+    /// Atomic claim statement.
+    pub statement: String,
+    /// Claim taxonomy tag.
+    pub claim_type: String,
+    /// Extractor confidence in [0.0, 1.0].
+    pub confidence: f64,
+    /// Rooting admission tier.
+    pub admission_tier: String,
+    /// Inclusive byte offset within the source file.
+    pub byte_start: u64,
+    /// Exclusive byte offset within the source file.
+    pub byte_end: u64,
+    /// Source row id (UUID-ish).
+    pub source_id: String,
+    /// Source URI (e.g. `file:///abs/path/to/file.rs`).
+    pub source_uri: String,
+    /// BLAKE3 hex of the source bytes — opens the FileSystemSourceStore.
+    pub content_hash: String,
+}
+
 /// Graph storage backed by CozoDB — an embedded Datalog database.
 /// Datalog gives us recursive graph queries, pattern matching, and built-in
 /// graph algorithms (PageRank, shortest path) out of the box.
@@ -25,6 +53,7 @@ impl GraphStore {
         store.create_schema()?;
         store.migrate_claims_extraction_tier()?;
         store.migrate_structural_patterns_schema()?;
+        store.migrate_claims_byte_ranges()?;
         store.create_indexes()?;
         Ok(store)
     }
@@ -131,7 +160,10 @@ impl GraphStore {
                 admission_tier: String default 'attested',
                 derivation_parents: String default '',
                 predicate_json: String default '',
-                last_rooted_at: Float default 0.0
+                last_rooted_at: Float default 0.0,
+                source_path: String default '',
+                byte_start: Int default 0,
+                byte_end: Int default 0
             }",
             ":create entities {
                 id: String
@@ -515,6 +547,79 @@ impl GraphStore {
         Ok(())
     }
 
+    /// v3 byte-range citation migration. Adds `source_path: String`,
+    /// `byte_start: Int`, `byte_end: Int` to the `claims` relation so every
+    /// row carries the verifiable citation triple required by the v3 wire
+    /// format (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §3.3).
+    /// Existing rows backfill with `('', 0, 0)` — the "unknown" sentinel
+    /// the structural extractor and provenance probe already understand.
+    /// Idempotent — re-running against an already-migrated DB is a fast
+    /// probe-and-return.
+    ///
+    /// Like the rooting migration above, `:replace` fails while indexes
+    /// are attached; `create_indexes()` (called next in `init`) recreates
+    /// them atop the new schema.
+    fn migrate_claims_byte_ranges(&self) -> Result<()> {
+        let probe = self.db.run_script(
+            "?[byte_start] := *claims{id: 'probe-noop', byte_start}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if probe.is_ok() {
+            return Ok(()); // new schema in place
+        }
+
+        // Either the column is missing or the relation isn't created yet.
+        // If the error is "relation not found", create_schema will handle
+        // it on first run — nothing to migrate.
+        if let Err(e) = &probe {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("does not exist") {
+                return Ok(());
+            }
+        }
+
+        // Drop indexes that ride atop the claims relation. The rooting
+        // migration drops these too — repeated drops are harmless because
+        // we swallow "not found" errors.
+        let index_drops = [
+            "::index drop claims:by_type",
+            "::index drop claims:by_tier",
+            "::index drop claim_entity_edges:by_entity",
+            "::index drop claim_source_edges:by_source",
+        ];
+        for drop_stmt in &index_drops {
+            let _ = self.db.run_default(drop_stmt);
+        }
+
+        let migration = r#"
+            {
+                ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end] :=
+                    *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at},
+                    source_path = "",
+                    byte_start = 0,
+                    byte_end = 0
+                :replace claims {id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String, extraction_tier: String, event_date: Float, admission_tier: String, derivation_parents: String, predicate_json: String, last_rooted_at: Float, source_path: String, byte_start: Int, byte_end: Int}
+            }
+        "#;
+
+        match self.db.run_default(migration) {
+            Ok(_) => {
+                tracing::debug!("claims byte_range migration applied");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("does not exist") {
+                    return Err(Error::GraphStorage(format!(
+                        "claims byte_range migration failed: {msg}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Run a Datalog query with parameters, returning NamedRows.
     fn query(&self, script: &str, params: BTreeMap<String, DataValue>) -> Result<NamedRows> {
         self.db
@@ -687,12 +792,30 @@ impl GraphStore {
                     .unwrap_or(0.0),
             )),
         );
+        // v3 byte-range citation triple. source_path is the workspace-
+        // relative POSIX path the claim was extracted from; byte_start /
+        // byte_end define the exact source bytes the claim cites. The
+        // tr-format v3 pack writer (Week 2) joins these fields into
+        // claims.jsonl per spec §3.3.
+        let (byte_start_val, byte_end_val) = match claim.source_span {
+            Some(span) => (
+                span.byte_start.unwrap_or(0) as i64,
+                span.byte_end.unwrap_or(0) as i64,
+            ),
+            None => (0, 0),
+        };
+        params.insert(
+            "source_path".into(),
+            DataValue::Str(String::new().into()),
+        );
+        params.insert("byte_start".into(), DataValue::Num(Num::Int(byte_start_val)));
+        params.insert("byte_end".into(), DataValue::Num(Num::Int(byte_end_val)));
 
         self.query(
-            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at] <- [[
-                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date, $admission_tier, $derivation_parents, $predicate_json, $last_rooted_at
+            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end] <- [[
+                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date, $admission_tier, $derivation_parents, $predicate_json, $last_rooted_at, $source_path, $byte_start, $byte_end
             ]]
-            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at}"#,
+            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end}"#,
             params,
         )?;
         Ok(())
@@ -812,6 +935,13 @@ impl GraphStore {
                         Some(p) => serde_json::to_string(p).unwrap_or_default(),
                         None => String::new(),
                     };
+                    let (byte_start_val, byte_end_val) = match c.source_span {
+                        Some(span) => (
+                            span.byte_start.unwrap_or(0) as i64,
+                            span.byte_end.unwrap_or(0) as i64,
+                        ),
+                        None => (0, 0),
+                    };
                     DataValue::List(vec![
                         DataValue::Str(c.id.to_string().into()),
                         DataValue::Str(c.statement.clone().into()),
@@ -840,6 +970,9 @@ impl GraphStore {
                                 .map(|d| d.timestamp() as f64)
                                 .unwrap_or(0.0),
                         )),
+                        DataValue::Str(String::new().into()),
+                        DataValue::Num(Num::Int(byte_start_val)),
+                        DataValue::Num(Num::Int(byte_end_val)),
                     ])
                 })
                 .collect();
@@ -849,11 +982,12 @@ impl GraphStore {
                 "?[id, statement, claim_type, source_id, confidence, sensitivity, \
                   workspace_id, created_at, grounding_score, grounding_method, \
                   extraction_tier, event_date, admission_tier, derivation_parents, \
-                  predicate_json, last_rooted_at] <- $rows \
+                  predicate_json, last_rooted_at, source_path, byte_start, byte_end] <- $rows \
                  :put claims {id => statement, claim_type, source_id, confidence, \
                   sensitivity, workspace_id, created_at, grounding_score, \
                   grounding_method, extraction_tier, event_date, admission_tier, \
-                  derivation_parents, predicate_json, last_rooted_at}",
+                  derivation_parents, predicate_json, last_rooted_at, source_path, \
+                  byte_start, byte_end}",
                 params,
             )?;
         }
@@ -2565,6 +2699,67 @@ impl GraphStore {
             .iter()
             .map(|row| (dv_to_string(&row[0]), dv_to_string(&row[1])))
             .collect())
+    }
+
+    /// Return every claim joined with its source row — the input shape
+    /// the v3 pack writer needs. See [`V3ClaimExportRow`] for field-by-
+    /// field semantics. Empty `content_hash` means the source
+    /// has no byte-level body (e.g. synthetic agent contributions);
+    /// the caller decides whether to skip those claims when building a
+    /// v3 pack.
+    pub fn get_v3_claim_export(&self) -> Result<Vec<V3ClaimExportRow>> {
+        let q = r#"?[id, statement, claim_type, confidence, admission_tier, byte_start, byte_end, source_id, source_uri, content_hash] :=
+            *claims{id, statement, claim_type, confidence, admission_tier, byte_start, byte_end, source_id},
+            *sources{id: source_id, uri: source_uri, content_hash}
+        "#;
+        let result = self.query_read(q)?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| V3ClaimExportRow {
+                id: dv_to_string(&row[0]),
+                statement: dv_to_string(&row[1]),
+                claim_type: dv_to_string(&row[2]),
+                confidence: match &row[3] {
+                    DataValue::Num(Num::Float(f)) => *f,
+                    DataValue::Num(Num::Int(i)) => *i as f64,
+                    _ => 0.8,
+                },
+                admission_tier: dv_to_string(&row[4]),
+                byte_start: match &row[5] {
+                    DataValue::Num(Num::Int(i)) => (*i).max(0) as u64,
+                    _ => 0,
+                },
+                byte_end: match &row[6] {
+                    DataValue::Num(Num::Int(i)) => (*i).max(0) as u64,
+                    _ => 0,
+                },
+                source_id: dv_to_string(&row[7]),
+                source_uri: dv_to_string(&row[8]),
+                content_hash: dv_to_string(&row[9]),
+            })
+            .collect())
+    }
+
+    /// Return a `claim_id → [entity_name]` map. Used alongside
+    /// [`Self::get_v3_claim_export`] by the v3 pack writer to populate
+    /// the `ents` field on each emitted `ClaimRecord`.
+    pub fn get_claim_entity_names(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let q = r#"?[claim_id, entity_name] :=
+            *claim_entity_edges{claim_id, entity_id},
+            *entities{id: entity_id, canonical_name: entity_name}
+        "#;
+        let result = self.query_read(q)?;
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &result.rows {
+            map.entry(dv_to_string(&row[0]))
+                .or_default()
+                .push(dv_to_string(&row[1]));
+        }
+        Ok(map)
     }
 
     pub fn get_all_sources(&self) -> Result<Vec<(String, String, String)>> {

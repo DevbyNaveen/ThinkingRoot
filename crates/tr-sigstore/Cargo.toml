@@ -1,0 +1,94 @@
+[package]
+name = "tr-sigstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sigstore keyless OIDC signing + offline DSSE verification for v3 packs."
+
+[lib]
+name = "tr_sigstore"
+path = "src/lib.rs"
+
+# Default feature set is offline-first: pure Rust, no async runtime, no TLS.
+# It supports BOTH self-signed Ed25519 bundles (default `verify_bundle_offline`
+# path) AND Sigstore Fulcio-issued ECDSA P-256 cert bundles (cryptographic
+# verification only — chain validation against a trust root lands in the
+# follow-up commit). The `live` feature (W3.5) bolts on `sigstore-rs` +
+# `tokio` + `reqwest` for the keyless OIDC sign flow; consumers that only
+# verify never compile that surface.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
+# ECDSA P-256 verification path — Fulcio issues ECDSA P-256 ephemeral certs
+# by default, so any Sigstore-signed bundle the verifier consumes carries an
+# ECDSA P-256 leaf cert. `p256` is the RustCrypto curve impl; `ecdsa` provides
+# the DER-encoded signature parser; `x509-cert` parses the leaf cert's
+# SubjectPublicKeyInfo so we can reconstruct the verifying key. All three
+# track the same `signature 2` + `der 0.7` + `spki 0.7` ecosystem versions
+# already in our workspace lockfile (via tr-revocation + ed25519-dalek).
+p256       = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+ecdsa      = { version = "0.16", default-features = false, features = ["der", "pkcs8", "std"] }
+x509-cert  = { version = "0.2",  default-features = false, features = ["std"] }
+spki       = { version = "0.7",  default-features = false, features = ["std"] }
+der        = { version = "0.7",  default-features = false, features = ["std", "oid", "pem"] }
+signature  = { version = "2",    default-features = false, features = ["std"] }
+# SHA-256 hashing for TBS-cert signature verification during chain
+# validation. Sigstore's Fulcio chain is exclusively ECDSA-with-SHA256;
+# adding other hash variants is straightforward when needed.
+sha2       = { version = "0.10", default-features = false, features = ["std"] }
+
+# ─── `live` feature deps (optional) ──────────────────────────────
+# These pull in the Sigstore Rust SDK and its async / TLS / OAuth
+# transitive dependencies. They are gated behind the `live` feature
+# so consumers that only verify (default) never compile them.
+#
+# The `sign` feature on sigstore-rs activates Fulcio cert request +
+# Rekor witness submission. `rustls-tls` matches our workspace TLS
+# stack (the workspace `reqwest` config also uses `rustls-tls`, so
+# we don't end up with two competing TLS impls in the same binary).
+sigstore   = { version = "0.13", optional = true, default-features = false, features = ["sign", "verify", "rustls-tls"] }
+tokio      = { workspace = true, optional = true }
+# `webbrowser` opens the Sigstore-public-good OIDC issuer in the
+# user's default browser when `live::sign_via_browser_flow` is
+# called. Headless / SSH consumers use the lower-level
+# `live::sign_with_token` and supply an id_token themselves.
+webbrowser = { version = "1", optional = true }
+# Direct Rekor REST submission. `sigstore-rs 0.13`'s built-in Rekor
+# client only knows how to assemble bundles of `kind="hashedrekord"`
+# (its `TryFrom<RekorLogEntry> for TransparencyLogEntry` hardcodes the
+# kind/version, and the bundle layer surfaces `DsseUnsupported` on the
+# verify side) — useless for our DSSE-intoto v0.0.2 flow. We POST
+# straight to `/api/v1/log/entries` instead, ~30 lines of HTTP.
+reqwest    = { workspace = true, optional = true }
+# `openidconnect::core::CoreIdToken` is what `sigstore::fulcio::TokenProvider::Static`
+# wraps. Pinned to `4.0.1` to match what `sigstore 0.13` itself pulls
+# in transitively — keeping versions identical avoids parallel-version
+# duplication of a sizeable async/oauth crate tree.
+openidconnect = { version = "4.0.1", optional = true, default-features = false }
+
+[features]
+default = []
+# Enable the live keyless-signing flow against Sigstore-public-good.
+# Heavy dep tree (sigstore-rs, tokio, rustls); not needed by anyone
+# who only verifies bundles. The CLI (`thinkingroot-cli`) is the only
+# crate today that turns this on; everything else stays lean.
+live = ["dep:sigstore", "dep:tokio", "dep:webbrowser", "dep:reqwest", "dep:openidconnect"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Tests hand-roll syntactically valid X.509 certs (TBS + signature)
+# rather than going through `x509-cert::builder`, because the builder's
+# `Builder` trait bounds aren't satisfied for our exact ecdsa+pkcs8
+# feature set. Hand-rolling keeps the test deps minimal and gives the
+# chain-validation tests precise control over each cert's TBS bytes.

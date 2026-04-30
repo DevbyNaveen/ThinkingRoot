@@ -88,7 +88,9 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
         } else {
             format!("{subject}\n\n{body}")
         };
-        let mut prose_chunk = Chunk::new(&message, ChunkType::Prose, 1, 1);
+        let message_bytes = message.len() as u64;
+        let mut prose_chunk =
+            Chunk::new(&message, ChunkType::Prose, 1, 1).with_byte_range(0, message_bytes);
         prose_chunk.metadata.commit_author = Some(author.to_string());
         prose_chunk.metadata.changed_files = changed_files;
         doc.add_chunk(prose_chunk);

@@ -558,7 +558,7 @@ pub async fn handle_status(root: &Path) -> anyhow::Result<()> {
 /// Strip the workspace root prefix from a URI for compact display.
 fn strip_root(root: &Path, uri: &str) -> String {
     let prefix = root.to_string_lossy();
-    uri.strip_prefix(prefix.as_ref())
+    uri.strip_prefix(AsRef::<str>::as_ref(&prefix))
         .map(|s| s.trim_start_matches('/').to_string())
         .unwrap_or_else(|| uri.to_string())
 }

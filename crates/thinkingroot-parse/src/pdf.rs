@@ -39,6 +39,12 @@ pub fn parse(path: &Path) -> Result<DocumentIR> {
         line += line_count + 1;
     }
 
+    // PDF byte ranges refer to offsets within the EXTRACTED TEXT (not the
+    // original PDF binary). The v3 pack writer ships PDFs as a sidecar
+    // text file alongside the original; byte ranges resolve against the
+    // text version. Substring backfill walks the extracted text once.
+    doc.fill_byte_ranges(&text);
+
     Ok(doc)
 }
 

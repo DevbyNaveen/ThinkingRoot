@@ -45,6 +45,45 @@ impl DocumentIR {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Backfill `byte_start`/`byte_end` on every chunk that still has the
+    /// `(0, 0)` "unknown" sentinel by searching for the chunk's content in
+    /// `source`. Walks the source linearly with a cursor so equal-content
+    /// chunks (e.g., two paragraphs containing the same text) get distinct
+    /// ranges.
+    ///
+    /// Parsers that already populate authoritative byte ranges from a
+    /// tree-sitter `Node::byte_range()` or another byte-aware mechanism
+    /// are unaffected — chunks with non-zero ranges are skipped. Markdown,
+    /// manifest, PDF, and git parsers should call this at the end of
+    /// `parse_*` so v3 pack writes never emit a claim citing `(0, 0)`.
+    ///
+    /// The match is substring-based and tolerant of trimmed content
+    /// (markdown's `flush_prose` trims the chunk before storing). When the
+    /// content cannot be found at-or-after the cursor (e.g., the chunk was
+    /// transformed beyond a substring search), the chunk is left unchanged
+    /// and the cursor stays put — downstream consumers treat `(0, 0)` as
+    /// "unknown" and fall back to line-based positioning.
+    pub fn fill_byte_ranges(&mut self, source: &str) {
+        let mut cursor = 0usize;
+        for chunk in &mut self.chunks {
+            if chunk.byte_start != 0 || chunk.byte_end != 0 {
+                // Authoritative range already present — preserve it.
+                continue;
+            }
+            let needle = chunk.content.trim();
+            if needle.is_empty() {
+                continue;
+            }
+            if let Some(found) = source[cursor..].find(needle) {
+                let abs_start = cursor + found;
+                let abs_end = abs_start + needle.len();
+                chunk.byte_start = abs_start as u64;
+                chunk.byte_end = abs_end as u64;
+                cursor = abs_end;
+            }
+        }
+    }
 }
 
 /// A chunk is a semantically meaningful segment of the document.
@@ -54,6 +93,20 @@ pub struct Chunk {
     pub chunk_type: ChunkType,
     pub start_line: u32,
     pub end_line: u32,
+    /// Byte offset (inclusive) of this chunk within its source file.
+    /// Populated by parsers that have access to byte-level positioning
+    /// (tree-sitter `node.byte_range()`, markdown chunker offset tracker).
+    /// Defaults to 0 for parsers that have not been upgraded yet — the
+    /// structural and LLM extractors copy whatever value is here onto the
+    /// emitted [`ExtractedClaim::byte_start`].
+    #[serde(default)]
+    pub byte_start: u64,
+    /// Byte offset (exclusive) of this chunk within its source file.
+    /// Defaults to 0 alongside [`Chunk::byte_start`]; the pair `(0, 0)` is
+    /// the sentinel for "parser has not yet been upgraded to track byte
+    /// offsets". Use [`Chunk::with_byte_range`] to set authoritative values.
+    #[serde(default)]
+    pub byte_end: u64,
     pub heading: Option<String>,
     pub language: Option<String>,
     pub metadata: ChunkMetadata,
@@ -71,6 +124,8 @@ impl Chunk {
             chunk_type,
             start_line,
             end_line,
+            byte_start: 0,
+            byte_end: 0,
             heading: None,
             language: None,
             metadata: ChunkMetadata::default(),
@@ -84,6 +139,16 @@ impl Chunk {
 
     pub fn with_language(mut self, lang: impl Into<String>) -> Self {
         self.language = Some(lang.into());
+        self
+    }
+
+    /// Set the chunk's byte range within its source file. Parsers should
+    /// call this whenever they have authoritative byte offsets (tree-sitter
+    /// `node.byte_range()`, markdown chunker byte cursor) so downstream
+    /// extractors can emit verifiable byte-range citations on every claim.
+    pub fn with_byte_range(mut self, byte_start: u64, byte_end: u64) -> Self {
+        self.byte_start = byte_start;
+        self.byte_end = byte_end;
         self
     }
 }

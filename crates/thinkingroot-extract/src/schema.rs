@@ -19,6 +19,27 @@ pub struct ExtractedClaim {
     pub claim_type: String,
     pub confidence: f64,
     pub entities: Vec<String>,
+    /// POSIX path of the source file inside the workspace / pack source
+    /// bundle. Required by the v3 wire format for `claims.jsonl` per spec
+    /// §3.3 (serialized as `"file"`). Empty string when the parser has not
+    /// been upgraded to populate it yet — the downstream pipeline backfills
+    /// from the chunk's source_uri at insert time.
+    #[serde(default, rename = "file")]
+    pub source_path: String,
+    /// Byte offset (inclusive) within `source_path`. v3 wire field `"start"`
+    /// per spec §3.3. Tree-sitter parsers populate from `node.byte_range()`;
+    /// LLM extractor emits relative to the chunk's authoritative origin.
+    #[serde(default, rename = "start")]
+    pub byte_start: u64,
+    /// Byte offset (exclusive) within `source_path`. v3 wire field `"end"`
+    /// per spec §3.3.
+    #[serde(default, rename = "end")]
+    pub byte_end: u64,
+    /// Verbatim source text that justifies this claim. Pre-v3 the only
+    /// citation mechanism; under v3 still emitted by structural and LLM
+    /// extractors as a debug aid but the authoritative citation is the
+    /// `(source_path, byte_start, byte_end)` triple above. Removable once
+    /// every consumer has migrated to the byte-range contract.
     #[serde(default)]
     pub source_quote: Option<String>,
     #[serde(default)]

@@ -30,7 +30,10 @@ pub fn parse_as_text(path: &Path) -> Result<DocumentIR> {
     };
 
     if !content.trim().is_empty() {
-        doc.add_chunk(Chunk::new(content, ChunkType::Prose, 1, line_count));
+        let len = content.len() as u64;
+        doc.add_chunk(
+            Chunk::new(&content, ChunkType::Prose, 1, line_count).with_byte_range(0, len),
+        );
     }
 
     Ok(doc)
@@ -237,6 +240,13 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
         &current_heading,
         &mut current_links,
     );
+
+    // Backfill byte ranges on every chunk pulldown-cmark emitted (we don't
+    // use OffsetIter here because the existing event-loop accumulates state
+    // across events; the substring-search backfill is correct for typical
+    // markdown where chunks contain unique-enough text). Tree-sitter chunks
+    // would already carry ranges and are skipped.
+    doc.fill_byte_ranges(content);
 
     Ok(doc)
 }

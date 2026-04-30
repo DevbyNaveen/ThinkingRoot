@@ -19,6 +19,7 @@ tracing = { workspace = true }
 
 tr-format = { workspace = true }
 tr-revocation = { workspace = true }
+tr-sigstore = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 

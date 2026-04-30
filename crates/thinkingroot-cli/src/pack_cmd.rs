@@ -34,15 +34,19 @@
 //! canonical bytes (that check is part of [`tr_format::reader`]
 //! itself), so a corrupted or tampered `.tr` is rejected at install.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use thinkingroot_core::types::ContentHash;
 use tr_format::{
-    digest::blake3_hex, reader as tr_reader, writer::PackBuilder, Manifest, TrustTier, Version,
+    digest::blake3_hex, reader as tr_reader, read_v3_pack, writer::PackBuilder, ClaimRecord,
+    Manifest, ManifestV3, TrustTier, V3PackBuilder, Version,
 };
+use tr_verify::{V3TamperedKind, V3Verdict, verify_v3_pack};
 use tr_revocation::{CacheConfig, RevocationCache};
 use tr_verify::{
     AuthorKeyStore, RevokedDetails, TamperedKind, Verdict, Verifier, VerifierConfig,
@@ -119,8 +123,55 @@ struct PackTomlInner {
     description: Option<String>,
 }
 
-/// Run `root pack`. See module-level docs for behaviour.
+/// Run `root pack`. Dispatches to the v1 (multi-directory tar+zstd) or
+/// v3 (3-file `[manifest.toml, source.tar.zst, claims.jsonl]`) writer
+/// based on `format`. See module-level docs for v1 behaviour and
+/// `crates/tr-format/src/writer_v3.rs` for v3.
 pub fn run_pack(
+    workspace: &Path,
+    out: Option<PathBuf>,
+    name_override: Option<String>,
+    version_override: Option<String>,
+    license_override: Option<String>,
+    description_override: Option<String>,
+    format: &str,
+    sign_key_path: Option<&Path>,
+    sign_keyless: bool,
+) -> Result<()> {
+    match format {
+        "tr/1" => {
+            if sign_key_path.is_some() || sign_keyless {
+                return Err(anyhow!(
+                    "`--sign` and `--sign-keyless` are only supported with `--format=tr/3`; \
+                     v1 packs use a different signature mechanism (see Phase F design)"
+                ));
+            }
+            run_pack_v1(
+                workspace,
+                out,
+                name_override,
+                version_override,
+                license_override,
+                description_override,
+            )
+        }
+        "tr/3" => run_pack_v3(
+            workspace,
+            out,
+            name_override,
+            version_override,
+            license_override,
+            description_override,
+            sign_key_path,
+            sign_keyless,
+        ),
+        other => Err(anyhow!(
+            "unknown pack format `{other}`; supported: tr/1, tr/3"
+        )),
+    }
+}
+
+fn run_pack_v1(
     workspace: &Path,
     out: Option<PathBuf>,
     name_override: Option<String>,
@@ -179,6 +230,419 @@ pub fn run_pack(
         out_path.display()
     );
     Ok(())
+}
+
+/// Build a v3 `package.tr` from a compiled workspace.
+///
+/// The flow:
+///
+///  1. Open the workspace's CozoDB at `.thinkingroot/graph.db` and the
+///     [`thinkingroot_rooting::FileSystemSourceStore`] at
+///     `.thinkingroot/rooting/sources/`.
+///  2. Walk every `(uri, content_hash)` source row. For each non-empty
+///     hash, fetch the source bytes from the byte store and stage them
+///     under a workspace-relative POSIX path inside the V3 builder's
+///     source bundle.
+///  3. Walk every claim row joined with its source — populates
+///     `(file, byte_start, byte_end)` from the v3 byte-range columns
+///     persisted by the W1 migration.
+///  4. Walk every `claim_id → entity_name` edge to populate `ents`.
+///  5. Hand off to `V3PackBuilder::build` which seals the manifest with
+///     the three BLAKE3 hashes per spec §3.1.
+fn run_pack_v3(
+    workspace: &Path,
+    out: Option<PathBuf>,
+    name_override: Option<String>,
+    version_override: Option<String>,
+    license_override: Option<String>,
+    description_override: Option<String>,
+    sign_key_path: Option<&Path>,
+    sign_keyless: bool,
+) -> Result<()> {
+    use ed25519_dalek::SigningKey;
+    use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+
+    let engine_dir = workspace.join(".thinkingroot");
+    if !engine_dir.exists() {
+        return Err(anyhow!(
+            "no engine output at `{}`; run `root compile {}` first",
+            engine_dir.display(),
+            workspace.display()
+        ));
+    }
+
+    // 1. Manifest scaffolding from Pack.toml + CLI overrides. The v1
+    //    `build_manifest` already does the merge logic; we lift its
+    //    fields onto a fresh ManifestV3 to avoid duplicating the
+    //    Pack.toml plumbing.
+    let v1_manifest = build_manifest(
+        workspace,
+        name_override,
+        version_override,
+        license_override,
+        description_override,
+    )?;
+    let mut manifest = ManifestV3::new(&v1_manifest.name, v1_manifest.version.clone());
+    if !v1_manifest.license.is_empty() {
+        manifest.license = Some(v1_manifest.license.clone());
+    }
+    if !v1_manifest.description.is_empty() {
+        manifest.description = Some(v1_manifest.description.clone());
+    }
+    manifest.authors = v1_manifest.authors.clone();
+    manifest.extracted_at = Some(chrono::Utc::now());
+    manifest.extractor = Some(format!(
+        "thinkingroot/extract@{}",
+        env!("CARGO_PKG_VERSION")
+    ));
+
+    // 2. Open the workspace stores. CozoDB hands us joined claim+source
+    //    rows; FileSystemSourceStore hands us source bytes by hash.
+    let graph = thinkingroot_graph::graph::GraphStore::init(&engine_dir)
+        .with_context(|| format!("open graph at {}", engine_dir.display()))?;
+    let source_store = FileSystemSourceStore::new(&engine_dir)
+        .with_context(|| format!("open source store at {}", engine_dir.display()))?;
+
+    let mut builder = V3PackBuilder::new(manifest);
+    let workspace_abs = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    // 3. Stage source files. We dedupe by pack path because two source
+    //    rows may legitimately share a URI (e.g. a re-extract that
+    //    produced a fresh row before the prior was GC'd) — the v3 pack
+    //    layout has at most one entry per path.
+    let sources = graph.get_sources_with_hashes()?;
+    let mut packed_paths: HashSet<String> = HashSet::new();
+    let mut source_bytes_added = 0u64;
+    for (uri, content_hash) in &sources {
+        if content_hash.is_empty() {
+            continue;
+        }
+        let hash = ContentHash(content_hash.clone());
+        let bytes = match source_store
+            .get(&hash)
+            .map_err(|e| anyhow!("source store read for {}: {e}", hash.0))?
+        {
+            Some(b) => b,
+            None => continue,
+        };
+        let pack_path = workspace_relative_pack_path(uri, &workspace_abs);
+        if packed_paths.insert(pack_path.clone()) {
+            source_bytes_added += bytes.bytes.len() as u64;
+            builder
+                .add_source_file(&pack_path, &bytes.bytes)
+                .with_context(|| format!("stage source {pack_path}"))?;
+        }
+    }
+
+    // 4. Build claim records. Skip any claim whose owning source isn't
+    //    in the pack (synthetic agent contributions, GC'd sources) so
+    //    every emitted claim has a resolvable `file` field.
+    let claim_rows = graph.get_v3_claim_export()?;
+    let entity_names = graph.get_claim_entity_names()?;
+    let mut claim_count = 0usize;
+    for row in &claim_rows {
+        if row.content_hash.is_empty() {
+            continue;
+        }
+        let pack_path = workspace_relative_pack_path(&row.source_uri, &workspace_abs);
+        if !packed_paths.contains(&pack_path) {
+            continue;
+        }
+        let ents = entity_names.get(&row.id).cloned().unwrap_or_default();
+        let mut record = ClaimRecord::new(
+            row.id.clone(),
+            row.statement.clone(),
+            ents,
+            pack_path,
+            row.byte_start,
+            row.byte_end,
+        );
+        if !row.claim_type.is_empty() {
+            record = record.with_claim_type(row.claim_type.clone());
+        }
+        record = record.with_confidence(row.confidence);
+        if !row.admission_tier.is_empty() {
+            record = record.with_admission_tier(row.admission_tier.clone());
+        }
+        builder.add_claim(record);
+        claim_count += 1;
+    }
+
+    // 5. Seal the pack. If a signing key was supplied, drive
+    //    `build_signed` so a Sigstore Bundle is appended as the 4th
+    //    outer-tar entry. Otherwise emit unsigned — `root verify`
+    //    reports the Unsigned verdict for these.
+    let out_path = out.unwrap_or_else(|| {
+        let owner_slug = v1_manifest.name.replace('/', "-");
+        workspace.join(format!("{owner_slug}-{}.tr", v1_manifest.version))
+    });
+    let pack_filename = out_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("package.tr")
+        .to_string();
+    let bytes = if let Some(key_path) = sign_key_path {
+        let key = load_signing_key(key_path)
+            .with_context(|| format!("load signing key from {}", key_path.display()))?;
+        builder
+            .build_signed(&key, &pack_filename)
+            .map_err(|e| anyhow!("build signed .tr: {e}"))?
+    } else if sign_keyless {
+        run_keyless_signing(builder, &pack_filename)?
+    } else {
+        builder.build().map_err(|e| anyhow!("build .tr: {e}"))?
+    };
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&out_path, &bytes).with_context(|| format!("write {}", out_path.display()))?;
+
+    let signed_label = if sign_key_path.is_some() {
+        " signed"
+    } else if sign_keyless {
+        " signed (keyless)"
+    } else {
+        ""
+    };
+    println!(
+        "  packed{} {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
+        signed_label,
+        v1_manifest.name,
+        v1_manifest.version,
+        packed_paths.len(),
+        source_bytes_added,
+        claim_count,
+        bytes.len(),
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// Load an Ed25519 signing key from disk. Two file formats accepted:
+/// - 32 raw bytes (the most compact form; `dd if=/dev/urandom bs=32
+///   count=1 of=key.bin` produces one).
+/// - 64 hex chars on a single line (with optional trailing newline) —
+///   easier to inspect and to commit-checkable for test fixtures.
+///
+/// Returns a clear error when neither shape matches so the user can
+/// regenerate without guessing.
+fn load_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
+    use ed25519_dalek::SigningKey;
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() == 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        return Ok(SigningKey::from_bytes(&arr));
+    }
+    // Try hex with possible trailing newline.
+    let trimmed = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow!("key file is neither 32 raw bytes nor UTF-8 hex"))?
+        .trim();
+    if trimmed.len() == 64 {
+        let mut arr = [0u8; 32];
+        for i in 0..32 {
+            let byte_str = &trimmed[i * 2..i * 2 + 2];
+            arr[i] = u8::from_str_radix(byte_str, 16)
+                .map_err(|_| anyhow!("key file has invalid hex at byte {i}"))?;
+        }
+        return Ok(SigningKey::from_bytes(&arr));
+    }
+    Err(anyhow!(
+        "signing key must be 32 raw bytes or 64 hex chars; got {} bytes",
+        bytes.len()
+    ))
+}
+
+/// Drive Sigstore-public-good keyless DSSE signing for `root pack
+/// --sign-keyless`. Returns the outer `.tr` bytes (with `signature.sig`
+/// as the 4th tar entry) ready for disk-write.
+///
+/// OIDC token sourcing:
+///
+/// 1. `$TR_OIDC_TOKEN` — preferred for headless / CI use. The CLI does
+///    no further verification on the token; sigstore-rs's
+///    `IdentityToken::try_from(&str)` enforces `aud == "sigstore"`,
+///    Fulcio enforces issuer and challenge.
+/// 2. Otherwise, [`tr_sigstore::live::browser_oidc_flow`] runs the
+///    interactive PKCE redirect against Sigstore-public-good's OIDC
+///    issuer (`oauth2.sigstore.dev/auth`).
+///
+/// We're called from the sync `run_pack_v3` body, which itself runs
+/// inside `async_main`'s tokio multi-thread runtime. The signing
+/// closure uses `tokio::task::block_in_place` + `Handle::current()
+/// .block_on` to drive the async [`tr_sigstore::live::sign_canonical_bytes_keyless`]
+/// without restructuring the surrounding sync code.
+fn run_keyless_signing(
+    builder: tr_format::V3PackBuilder,
+    pack_filename: &str,
+) -> Result<Vec<u8>> {
+    use std::time::SystemTime;
+    use tr_sigstore::live::{
+        IdentityToken, SignKeylessOptions, browser_oidc_flow, sign_canonical_bytes_keyless,
+    };
+
+    // Step 1: obtain the OIDC id_token. Env var preferred; browser
+    // flow as the fallback.
+    let token: IdentityToken = match std::env::var("TR_OIDC_TOKEN") {
+        Ok(jwt) if !jwt.is_empty() => tr_sigstore::live::identity_token_from_jwt(&jwt)
+            .map_err(|e| anyhow!("$TR_OIDC_TOKEN not a valid Sigstore JWT: {e}"))?,
+        _ => {
+            eprintln!(
+                "  opening browser for Sigstore OIDC flow \
+                 (set $TR_OIDC_TOKEN to skip)…"
+            );
+            browser_oidc_flow(None, None, None)
+                .map_err(|e| anyhow!("OIDC browser flow failed: {e}"))?
+        }
+    };
+    // Round-trip back to the JWT string — the keyless signer parses
+    // the JWT itself for the challenge claim and to construct the
+    // `CoreIdToken` openidconnect type. Display impl on
+    // `IdentityToken` returns the original token string.
+    let jwt = token.to_string();
+
+    // Step 2: build the signing closure. The closure receives the
+    // canonical pack bytes (BLAKE3 input per spec §3.1) and returns a
+    // `SigstoreBundle` ready to embed in the outer tar.
+    let signer = move |canonical_bytes: &[u8],
+                       _pack_hash: &str,
+                       pack_filename: &str|
+          -> std::result::Result<tr_sigstore::SigstoreBundle, anyhow::Error> {
+        // From inside the multi-thread tokio runtime, `block_in_place`
+        // tells tokio "this thread is going to do blocking work, move
+        // other tasks off it"; then `Handle::current().block_on` runs
+        // the async signer to completion synchronously. This works
+        // because `async_main` always runs us on a multi-thread
+        // runtime — `Builder::new_multi_thread()` in `main.rs`.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sign_canonical_bytes_keyless(
+                    canonical_bytes,
+                    pack_filename,
+                    &jwt,
+                    SystemTime::now(),
+                    SignKeylessOptions::default(),
+                )
+                .await
+                .map_err(|e| anyhow!("keyless sign: {e}"))
+            })
+        })
+    };
+
+    builder
+        .build_with_signer(signer, pack_filename)
+        .map_err(|e| anyhow!("build keyless-signed .tr: {e}"))
+}
+
+/// Run `root verify <pack>`. Reads the pack from disk, parses the
+/// outer tar, and invokes the v3 verification pipeline. Returns a
+/// process exit code per the v3 spec §10.3 mapping:
+///
+/// - `0` — Verified.
+/// - `1` — Tampered (recomputed hash ≠ declared hash, or signature
+///   mismatch).
+/// - `2` — Unsigned + `--allow-unsigned` not passed.
+/// - `4` — Unsupported (reserved; today's free-fn verify never returns
+///   this — placeholder for the `sigstore-impl` follow-up which adds
+///   trust-root validation for Fulcio-issued certs).
+///
+/// Revocation is intentionally not consulted yet — `tr_revocation` is
+/// async and the CLI's verify path is sync. The follow-up
+/// `sigstore-impl` work wires the cache through with the same
+/// short-circuit semantics as the existing v1 `Verifier::verify`.
+pub fn run_verify(pack_path: &Path, allow_unsigned: bool) -> Result<i32> {
+    let bytes = fs::read(pack_path)
+        .with_context(|| format!("read {}", pack_path.display()))?;
+    let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("parse {}: {e}", pack_path.display()))?;
+    let verdict = verify_v3_pack(&pack);
+
+    match &verdict {
+        V3Verdict::Verified {
+            identity,
+            rekor_log_index,
+            signed_at,
+        } => {
+            println!(
+                "  verified {} {} ({} files, {} claims)",
+                pack.manifest.name,
+                pack.manifest.version,
+                pack.manifest.source_files.unwrap_or(0),
+                pack.manifest.claim_count.unwrap_or(0),
+            );
+            println!("  pack hash: {}", pack.manifest.pack_hash);
+            println!("  signed at: {signed_at}");
+            match identity {
+                Some(id) => println!("  signer: {id}"),
+                None => println!("  signer: self-signed (Ed25519 public key bundled)"),
+            }
+            if let Some(idx) = rekor_log_index {
+                println!("  rekor log index: {idx}");
+            } else {
+                println!("  rekor: not witnessed (self-signed)");
+            }
+            Ok(0)
+        }
+        V3Verdict::Unsigned => {
+            if allow_unsigned {
+                println!(
+                    "  unsigned {} {} (no signature.sig in pack — accepted via --allow-unsigned)",
+                    pack.manifest.name, pack.manifest.version,
+                );
+                Ok(0)
+            } else {
+                eprintln!(
+                    "  unsigned: {} has no signature.sig (use --allow-unsigned to accept)",
+                    pack_path.display()
+                );
+                Ok(EXIT_UNSIGNED)
+            }
+        }
+        V3Verdict::Tampered(kind) => {
+            match kind {
+                V3TamperedKind::PackHashMismatch {
+                    declared,
+                    recomputed,
+                } => {
+                    eprintln!(
+                        "  tampered: pack hash mismatch — manifest declares {declared}, \
+                         recomputed {recomputed}"
+                    );
+                }
+                V3TamperedKind::SignatureFailed { reason } => {
+                    eprintln!("  tampered: signature failed — {reason}");
+                }
+            }
+            Ok(EXIT_TAMPERED)
+        }
+    }
+}
+
+/// Map a stored source URI back to the workspace-relative POSIX path
+/// the v3 pack writer stages it under.
+///
+/// Cases handled:
+/// - `file:///abs/path/to/file.rs` inside `workspace_abs` → relative.
+/// - `file:///abs/elsewhere.rs` outside the workspace → strip
+///   `file://` and the leading slash (path lives at top level).
+/// - Other schemes (`git://`, `mcp://agent/...`) — pass through; the
+///   v3 pack treats them as opaque path strings. Reader-side tooling
+///   can decide how to resolve them.
+fn workspace_relative_pack_path(uri: &str, workspace_abs: &Path) -> String {
+    if let Some(stripped) = uri.strip_prefix("file://") {
+        let abs = Path::new(stripped);
+        if let Ok(rel) = abs.strip_prefix(workspace_abs) {
+            return rel.to_string_lossy().replace('\\', "/");
+        }
+        // Outside workspace — emit as a top-level path with leading
+        // slashes stripped so the v3 writer's safe-path check accepts
+        // it.
+        return stripped.trim_start_matches('/').to_string();
+    }
+    uri.to_string()
 }
 
 /// Resolve the manifest by combining `Pack.toml` (if present) with CLI
@@ -753,6 +1217,259 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::tempdir;
 
+    /// Build a fake v3-shape compiled workspace with a real CozoDB +
+    /// source-byte store. Returns the workspace root.
+    ///
+    /// The shape this produces matches what `root compile` leaves
+    /// behind:
+    /// - `.thinkingroot/graph.db` — CozoDB with one source + one claim
+    ///   carrying a non-zero `(byte_start, byte_end)` triple (W1
+    ///   contract).
+    /// - `.thinkingroot/rooting/sources/...` — durable source-byte
+    ///   store entry the v3 pack writer reads from.
+    /// - `Pack.toml` at workspace root.
+    fn fake_v3_workspace(dir: &Path) -> PathBuf {
+        use thinkingroot_core::types::{ContentHash, SourceSpan, SourceType, WorkspaceId};
+        use thinkingroot_core::{Claim, ClaimType, Source};
+        use thinkingroot_graph::graph::GraphStore;
+        use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+
+        let workspace = dir.to_path_buf();
+        let engine = workspace.join(".thinkingroot");
+        fs::create_dir_all(&engine).unwrap();
+
+        let graph = GraphStore::init(&engine).unwrap();
+        let source_store = FileSystemSourceStore::new(&engine).unwrap();
+
+        // Synthetic source — a small Rust file. The `file://` URI is
+        // what the workspace_relative_pack_path mapping consumes.
+        let source_text = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let abs_path = workspace.join("src").join("lib.rs");
+        fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+        fs::write(&abs_path, source_text).unwrap();
+        let uri = format!("file://{}", abs_path.display());
+        let content_hash = ContentHash::from_bytes(source_text.as_bytes());
+        let source = Source::new(uri.clone(), SourceType::File).with_hash(content_hash.clone());
+        graph.insert_source(&source).unwrap();
+        source_store
+            .put(source.id, &content_hash, source_text.as_bytes())
+            .unwrap();
+
+        // One claim with byte ranges into the source. The byte slice
+        // `[3, 35)` covers `add(a: i32, b: i32) -> i32` — the
+        // function signature.
+        let claim = Claim::new(
+            "add takes two i32 and returns their sum",
+            ClaimType::Definition,
+            source.id,
+            WorkspaceId::new(),
+        )
+        .with_span(SourceSpan::bytes(3, 35));
+        graph.insert_claim(&claim).unwrap();
+
+        fs::write(
+            workspace.join("Pack.toml"),
+            r#"[pack]
+name = "alice/v3-e2e"
+version = "1.0.0"
+license = "MIT"
+description = "v3 lifecycle round-trip test."
+"#,
+        )
+        .unwrap();
+        workspace
+    }
+
+    #[tokio::test]
+    async fn v3_pack_lifecycle_round_trips_byte_ranges() {
+        use tr_format::read_v3_pack;
+
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        // 1. Run pack — same code path as `root pack --format=tr/3`.
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out_tr.exists(), "v3 pack file not produced");
+
+        // 2. Read back via the v3 reader (same code path as
+        //    `root verify` parses with).
+        let bytes = fs::read(&out_tr).unwrap();
+        let pack = read_v3_pack(&bytes).expect("v3 pack must parse");
+
+        // 3. Manifest invariants.
+        assert_eq!(pack.manifest.name, "alice/v3-e2e");
+        assert_eq!(pack.manifest.format_version, "tr/3");
+        assert!(
+            pack.manifest.pack_hash.starts_with("blake3:"),
+            "pack_hash must be set: {:?}",
+            pack.manifest.pack_hash
+        );
+        assert!(pack.manifest.source_hash.starts_with("blake3:"));
+        assert!(pack.manifest.claims_hash.starts_with("blake3:"));
+        assert_eq!(pack.manifest.source_files, Some(1));
+        assert_eq!(pack.manifest.claim_count, Some(1));
+        assert_eq!(pack.manifest.license.as_deref(), Some("MIT"));
+        assert_eq!(
+            pack.manifest.description.as_deref(),
+            Some("v3 lifecycle round-trip test.")
+        );
+        assert!(pack.signature.is_none(), "unsigned pack today");
+
+        // 4. Pack-hash chain. The verifier's first-line defence —
+        //    catches any tampering between sign-time and verify-time.
+        assert_eq!(
+            pack.recompute_pack_hash(),
+            pack.manifest.pack_hash,
+            "recipe-recomputed hash must match manifest's declared hash"
+        );
+
+        // 5. Claims body sanity. JSONL with stable field order, byte
+        //    ranges populated.
+        let claims_text =
+            std::str::from_utf8(&pack.claims_jsonl).expect("claims.jsonl is UTF-8");
+        let lines: Vec<&str> = claims_text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one claim emitted");
+        let line: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("claims.jsonl line parses");
+        assert_eq!(line["start"], 3);
+        assert_eq!(line["end"], 35);
+        assert_eq!(
+            line["stmt"],
+            "add takes two i32 and returns their sum"
+        );
+        assert!(
+            line["file"].as_str().unwrap().ends_with("src/lib.rs"),
+            "file should resolve to a workspace-relative path"
+        );
+
+        // 6. Verify (unsigned path) — confirms the pack itself is
+        //    well-formed even before W3.5 wires Fulcio signing.
+        use tr_verify::{V3Verdict, verify_v3_pack};
+        let verdict = verify_v3_pack(&pack);
+        assert!(
+            matches!(verdict, V3Verdict::Unsigned),
+            "unsigned pack should report Unsigned verdict, got {verdict:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_pack_signed_round_trips_through_verify() {
+        use tr_format::read_v3_pack;
+        use tr_verify::{V3Verdict, verify_v3_pack};
+
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        // Write a deterministic Ed25519 key as 64 hex chars.
+        let key_path = tmp.path().join("signing.key");
+        let hex_key: String = (0..32).map(|i| format!("{:02x}", i + 1)).collect();
+        fs::write(&key_path, &hex_key).unwrap();
+
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+            Some(&key_path),
+            false,
+        )
+        .unwrap();
+
+        // Read back: the pack now carries a signature.sig.
+        let bytes = fs::read(&out_tr).unwrap();
+        let pack = read_v3_pack(&bytes).expect("signed pack must parse");
+        assert!(pack.signature.is_some(), "signed pack must carry signature.sig");
+
+        // Library-level verify: should be Verified (self-signed).
+        let verdict = verify_v3_pack(&pack);
+        match verdict {
+            V3Verdict::Verified {
+                identity,
+                rekor_log_index,
+                ..
+            } => {
+                assert!(identity.is_none(), "self-signed has no Sigstore identity");
+                assert!(rekor_log_index.is_none(), "self-signed has no Rekor entry");
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+
+        // CLI exit-code path: signed pack returns 0 without --allow-unsigned.
+        let code = run_verify(&out_tr, false).unwrap();
+        assert_eq!(code, 0, "signed pack should exit 0");
+    }
+
+    #[tokio::test]
+    async fn signing_key_loader_accepts_raw_and_hex() {
+        let tmp = tempdir().unwrap();
+        // Raw 32 bytes.
+        let raw_path = tmp.path().join("raw.key");
+        let raw: Vec<u8> = (0u8..32u8).collect();
+        fs::write(&raw_path, &raw).unwrap();
+        let raw_key = load_signing_key(&raw_path).expect("raw bytes accepted");
+        // Hex form of same bytes.
+        let hex_path = tmp.path().join("hex.key");
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&hex_path, &hex).unwrap();
+        let hex_key = load_signing_key(&hex_path).expect("hex accepted");
+        assert_eq!(
+            raw_key.verifying_key().to_bytes(),
+            hex_key.verifying_key().to_bytes(),
+            "raw and hex of same bytes must produce the same key"
+        );
+
+        // Wrong length is a clean error.
+        let bad_path = tmp.path().join("bad.key");
+        fs::write(&bad_path, b"short").unwrap();
+        assert!(load_signing_key(&bad_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_pack_then_verify_via_run_verify_cli_path() {
+        // Variant that goes through the `root verify` CLI exit-code
+        // surface end-to-end.
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        let out_tr = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(out_tr.clone()),
+            None,
+            None,
+            None,
+            None,
+            "tr/3",
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Without --allow-unsigned, exit code is EXIT_UNSIGNED = 70.
+        let code = run_verify(&out_tr, false).unwrap();
+        assert_eq!(code, EXIT_UNSIGNED);
+
+        // With --allow-unsigned, exit code is 0.
+        let code = run_verify(&out_tr, true).unwrap();
+        assert_eq!(code, 0);
+    }
+
     /// Set up a fake compiled workspace in `dir`. Returns the workspace
     /// root (parent of `.thinkingroot/`).
     fn fake_engine_workspace(dir: &Path) -> PathBuf {
@@ -799,7 +1516,7 @@ description = "Round-trip test pack."
         let workspace = fake_engine_workspace(src_tmp.path());
 
         let out_tr = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         assert!(out_tr.exists(), ".tr file not produced");
         assert!(
             fs::metadata(&out_tr).unwrap().len() > 0,
@@ -868,6 +1585,9 @@ description = "Round-trip test pack."
             Some("2.5.0".to_string()),
             Some("Apache-2.0".to_string()),
             Some("Bob's fork.".to_string()),
+            "tr/1",
+            None,
+            false,
         )
         .unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
@@ -880,7 +1600,7 @@ description = "Round-trip test pack."
     #[test]
     fn pack_errors_when_engine_dir_absent() {
         let tmp = tempdir().unwrap();
-        let err = run_pack(tmp.path(), None, None, None, None, None).unwrap_err();
+        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1", None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no engine output"), "got: {msg}");
     }
@@ -892,7 +1612,7 @@ description = "Round-trip test pack."
         // Engine dir present, no Pack.toml, no overrides → error mentions `name`.
         fs::create_dir_all(workspace.join(".thinkingroot/artifacts")).unwrap();
         fs::write(workspace.join(".thinkingroot/artifacts/x.md"), b"x").unwrap();
-        let err = run_pack(workspace, None, None, None, None, None).unwrap_err();
+        let err = run_pack(workspace, None, None, None, None, None, "tr/1", None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("name"), "got: {msg}");
     }
@@ -902,7 +1622,7 @@ description = "Round-trip test pack."
         let tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(tmp.path());
         let out_tr = workspace.join("paths.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
         let paths: HashSet<&str> = pack
             .paths()
@@ -924,7 +1644,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let out_tr = workspace.join("explicit.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
@@ -940,7 +1660,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let good_tr = workspace.join("good.tr");
-        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
 
         // Corrupt the file deterministically: zero out a 64-byte run
         // in the middle of the zstd stream + truncate the trailing
@@ -1065,7 +1785,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
         let advertised_hash = blake3_hex(&tr_bytes);
 
@@ -1153,7 +1873,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
 
         struct AppState {

@@ -20,6 +20,11 @@ use crate::{
 /// is a fatal error.
 pub const FORMAT_VERSION: &str = "tr/1";
 
+/// v3 format identifier — `"tr/3"`. Used by [`ManifestV3`] and the v3
+/// writer module. Locked by spec §3.2; readers refusing on mismatch
+/// surfaces incompatibility cleanly.
+pub const FORMAT_VERSION_V3: &str = "tr/3";
+
 /// Trust tier — how strong the provenance claim of this pack is.
 ///
 /// See the Rooting + security-model specs for definitions. Clients
@@ -211,6 +216,265 @@ impl Manifest {
                 what: "manifest.json",
                 detail: format!("name `{}` must be `owner/slug`", self.name),
             }),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// v3 manifest — `manifest.toml` inside the 3-file pack layout.
+//
+// The shape is locked by the v3 spec §3.2. Bytes emitted by
+// `to_canonical_toml` and `canonical_bytes_for_hashing` are the
+// load-bearing inputs to `pack_hash` per spec §3.1; once Sigstore
+// signing lands in Week 3 those bytes become the substrate of every
+// signed pack — changing the canonicalization rule afterward
+// invalidates every previously-signed pack. **Lock locked locked.**
+// ─────────────────────────────────────────────────────────────────
+
+/// The v3 manifest. Carried as `manifest.toml` inside `package.tr`.
+///
+/// Wire-format ordering and serialization are explicitly canonicalized
+/// by [`ManifestV3::to_canonical_toml`] — a manual emitter rather than
+/// the upstream `toml::to_string` call so we don't accidentally inherit
+/// the toml crate's internal map ordering decisions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestV3 {
+    /// `"tr/3"` for this format revision. The only required schema-
+    /// validation field per spec §3.2.
+    pub format_version: String,
+
+    /// Pack coordinate in `owner/slug` form. Same validation as v1.
+    pub name: String,
+
+    /// SemVer of this pack.
+    #[serde(with = "semver_string")]
+    pub version: Version,
+
+    /// `blake3:` + 64 hex chars — BLAKE3 of `source.tar.zst` bytes.
+    pub source_hash: String,
+
+    /// `blake3:` + 64 hex chars — BLAKE3 of `claims.jsonl` bytes.
+    pub claims_hash: String,
+
+    /// `blake3:` + 64 hex chars — BLAKE3 of canonical
+    /// `(manifest_with_pack_hash_blanked || NUL || source.tar.zst || NUL || claims.jsonl)`
+    /// per spec §3.1, §16.1.
+    pub pack_hash: String,
+
+    /// Informational counts. Optional per spec §3.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_files: Option<u64>,
+    /// Total uncompressed source bytes. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bytes: Option<u64>,
+    /// Number of lines in `claims.jsonl`. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_count: Option<u64>,
+    /// When extraction ran. Optional, ISO 8601.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_at: Option<DateTime<Utc>>,
+    /// Extractor identity (e.g. `"thinkingroot/extract@0.9.1"`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor: Option<String>,
+
+    /// SPDX license expression. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+
+    /// One-line description. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Author handles or contact strings. Optional, default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+}
+
+impl ManifestV3 {
+    /// Minimal builder. Hashes are all-empty until the v3 writer fills
+    /// them in at pack-emit time.
+    pub fn new(name: impl Into<String>, version: Version) -> Self {
+        Self {
+            format_version: FORMAT_VERSION_V3.to_string(),
+            name: name.into(),
+            version,
+            source_hash: String::new(),
+            claims_hash: String::new(),
+            pack_hash: String::new(),
+            source_files: None,
+            source_bytes: None,
+            claim_count: None,
+            extracted_at: None,
+            extractor: None,
+            license: None,
+            description: None,
+            authors: Vec::new(),
+        }
+    }
+
+    /// Validate every structural invariant. Reader path; mirrors the v1
+    /// `Manifest::validate` shape so consumers can swap with minimal
+    /// diff.
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != FORMAT_VERSION_V3 {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "format_version must be `{FORMAT_VERSION_V3}`, got `{}`",
+                    self.format_version
+                ),
+            });
+        }
+        validate_name(&self.name)?;
+        for (label, val) in [
+            ("source_hash", &self.source_hash),
+            ("claims_hash", &self.claims_hash),
+        ] {
+            // Empty during pack assembly is OK — writer fills before emit.
+            if !val.is_empty() && !val.starts_with("blake3:") {
+                return Err(Error::Invalid {
+                    what: "manifest.toml",
+                    detail: format!("{label} must start with `blake3:`"),
+                });
+            }
+        }
+        // pack_hash may be empty during canonicalization-for-hashing.
+        if !self.pack_hash.is_empty() && !self.pack_hash.starts_with("blake3:") {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: "pack_hash must start with `blake3:`".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Parse a `manifest.toml` blob and validate.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let s = std::str::from_utf8(bytes).map_err(|e| Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("not valid UTF-8: {e}"),
+        })?;
+        let m: ManifestV3 = toml::from_str(s).map_err(|e| Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("toml parse: {e}"),
+        })?;
+        m.validate()?;
+        Ok(m)
+    }
+
+    /// Emit the canonical TOML body. Used by the v3 writer to produce
+    /// `manifest.toml` and by [`ManifestV3::canonical_bytes_for_hashing`]
+    /// to produce the input to the BLAKE3 pack hash.
+    ///
+    /// Canonicalization rules (spec §3.2 + D7 from the v3 implementation
+    /// plan):
+    /// 1. Keys sorted alphabetically.
+    /// 2. No trailing whitespace on any line.
+    /// 3. Unix line endings (LF).
+    /// 4. Each value emitted with a fixed, locked formatter (no
+    ///    upstream-toml-version-dependent quirks).
+    ///
+    /// `blank_pack_hash = true` blanks the `pack_hash` field — the
+    /// hashing-input form. `blank_pack_hash = false` emits the actual
+    /// manifest-body form for the pack file.
+    fn emit_canonical_toml(&self, blank_pack_hash: bool) -> String {
+        let mut out = String::new();
+        // Alphabetical: authors, claim_count, claims_hash, description,
+        // extracted_at, extractor, format_version, license, name,
+        // pack_hash, source_bytes, source_files, source_hash, version.
+        if !self.authors.is_empty() {
+            out.push_str("authors = [");
+            for (i, a) in self.authors.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push('"');
+                escape_toml_string_into(&mut out, a);
+                out.push('"');
+            }
+            out.push_str("]\n");
+        }
+        if let Some(c) = self.claim_count {
+            out.push_str(&format!("claim_count = {c}\n"));
+        }
+        out.push_str(&format!("claims_hash = \"{}\"\n", self.claims_hash));
+        if let Some(d) = &self.description {
+            out.push_str("description = \"");
+            escape_toml_string_into(&mut out, d);
+            out.push_str("\"\n");
+        }
+        if let Some(e) = &self.extracted_at {
+            // RFC 3339 with seconds precision and a literal `Z` suffix.
+            // Emitted as a quoted basic string (not TOML's native
+            // datetime literal) so chrono's `DateTime<Utc>` serde
+            // adapter — which expects a string — round-trips through
+            // `ManifestV3::parse`. TOML native datetime would require
+            // a custom deserializer in every consumer.
+            out.push_str(&format!(
+                "extracted_at = \"{}\"\n",
+                e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ));
+        }
+        if let Some(e) = &self.extractor {
+            out.push_str("extractor = \"");
+            escape_toml_string_into(&mut out, e);
+            out.push_str("\"\n");
+        }
+        out.push_str(&format!("format_version = \"{}\"\n", self.format_version));
+        if let Some(l) = &self.license {
+            out.push_str("license = \"");
+            escape_toml_string_into(&mut out, l);
+            out.push_str("\"\n");
+        }
+        out.push_str("name = \"");
+        escape_toml_string_into(&mut out, &self.name);
+        out.push_str("\"\n");
+        let pack_hash = if blank_pack_hash {
+            ""
+        } else {
+            self.pack_hash.as_str()
+        };
+        out.push_str(&format!("pack_hash = \"{pack_hash}\"\n"));
+        if let Some(c) = self.source_bytes {
+            out.push_str(&format!("source_bytes = {c}\n"));
+        }
+        if let Some(c) = self.source_files {
+            out.push_str(&format!("source_files = {c}\n"));
+        }
+        out.push_str(&format!("source_hash = \"{}\"\n", self.source_hash));
+        out.push_str(&format!("version = \"{}\"\n", self.version));
+        out
+    }
+
+    /// Canonical TOML body suitable for writing as `manifest.toml`.
+    pub fn to_canonical_toml(&self) -> Vec<u8> {
+        self.emit_canonical_toml(false).into_bytes()
+    }
+
+    /// Canonical bytes used as the pack-hash input. `pack_hash` is
+    /// blanked; everything else is identical to [`to_canonical_toml`].
+    pub fn canonical_bytes_for_hashing(&self) -> Vec<u8> {
+        self.emit_canonical_toml(true).into_bytes()
+    }
+}
+
+/// Escape a string into TOML basic-string form. Only the rules we
+/// actually need: backslash, double-quote, and ASCII control
+/// characters. Other characters (including non-ASCII UTF-8) are
+/// passed through verbatim — TOML basic strings accept arbitrary
+/// Unicode aside from the control range.
+fn escape_toml_string_into(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
         }
     }
 }
