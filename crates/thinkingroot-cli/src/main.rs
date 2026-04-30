@@ -392,6 +392,19 @@ enum Commands {
         /// unsigned pack exits 2.
         #[arg(long)]
         allow_unsigned: bool,
+        /// Skip the revocation deny-list check. Use only for fully
+        /// air-gapped workflows or when the cached snapshot is known
+        /// to be current and offline. Without this flag, the verifier
+        /// consults the cached deny-list (refreshing if stale, falling
+        /// back to the cache on network failure).
+        #[arg(long)]
+        no_revocation_check: bool,
+        /// Registry URL serving `/api/v1/revoked` (for snapshot
+        /// refreshes). Defaults to the configured production registry.
+        /// Override for testing or for self-hosted / on-prem mirror
+        /// deployments. Ignored when `--no-revocation-check` is set.
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
     },
     /// Install a `.tr` knowledge pack — extract its contents to a
     /// target directory's `.thinkingroot/` so the engine can mount it
@@ -921,8 +934,15 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Verify {
             pack,
             allow_unsigned,
+            no_revocation_check,
+            registry,
         }) => {
-            let exit_code = pack_cmd::run_verify(&pack, allow_unsigned)?;
+            let exit_code = pack_cmd::run_verify(
+                &pack,
+                allow_unsigned,
+                !no_revocation_check,
+                registry,
+            )?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

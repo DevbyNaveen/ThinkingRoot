@@ -554,11 +554,37 @@ fn run_keyless_signing(
 /// async and the CLI's verify path is sync. The follow-up
 /// `sigstore-impl` work wires the cache through with the same
 /// short-circuit semantics as the existing v1 `Verifier::verify`.
-pub fn run_verify(pack_path: &Path, allow_unsigned: bool) -> Result<i32> {
+pub fn run_verify(
+    pack_path: &Path,
+    allow_unsigned: bool,
+    revocation_check: bool,
+    registry_override: Option<String>,
+) -> Result<i32> {
     let bytes = fs::read(pack_path)
         .with_context(|| format!("read {}", pack_path.display()))?;
     let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("parse {}: {e}", pack_path.display()))?;
-    let verdict = verify_v3_pack(&pack);
+
+    // Two paths: with revocation (async, consults the cached deny-
+    // list) and without (sync, fully offline). Both produce the same
+    // V3Verdict shape; `Revoked` is only reachable from the async
+    // path. The sync path is the right choice for air-gapped CI / for
+    // verifying packs the deny-list can't speak about (private packs
+    // signed with author keys outside any registry).
+    let verdict = if revocation_check {
+        let cache = build_revocation_cache(registry_override)
+            .context("construct revocation cache")?;
+        // `run_verify` is sync but called from async_main's tokio
+        // runtime — `block_in_place` + `Handle::current().block_on`
+        // drives the async revocation check synchronously. Same idiom
+        // we use for `--sign-keyless` in run_keyless_signing.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                tr_verify::verify_v3_pack_with_revocation(&pack, &cache),
+            )
+        })
+    } else {
+        verify_v3_pack(&pack)
+    };
 
     match &verdict {
         V3Verdict::Verified {
@@ -583,6 +609,11 @@ pub fn run_verify(pack_path: &Path, allow_unsigned: bool) -> Result<i32> {
                 println!("  rekor log index: {idx}");
             } else {
                 println!("  rekor: not witnessed (self-signed)");
+            }
+            if revocation_check {
+                println!("  revocation: not on deny-list");
+            } else {
+                println!("  revocation: skipped (--no-revocation-check)");
             }
             Ok(0)
         }
@@ -618,7 +649,41 @@ pub fn run_verify(pack_path: &Path, allow_unsigned: bool) -> Result<i32> {
             }
             Ok(EXIT_TAMPERED)
         }
+        V3Verdict::Revoked(details) => {
+            let advisory = &details.advisory;
+            eprintln!(
+                "  revoked: {} {} — reason: {:?}",
+                advisory.pack, advisory.version, advisory.reason
+            );
+            eprintln!("  revoked at: unix {}", advisory.revoked_at);
+            eprintln!("  authority: {:?}", advisory.authority);
+            eprintln!("  details: {}", advisory.details_url);
+            Ok(EXIT_REVOKED)
+        }
     }
+}
+
+/// Build a [`tr_revocation::RevocationCache`] using the same defaults
+/// the v1 install path uses: production registry URL (overridable),
+/// platform default cache directory, 60-min fresh TTL, 7-day stale
+/// grace.
+fn build_revocation_cache(
+    registry_override: Option<String>,
+) -> Result<tr_revocation::RevocationCache> {
+    let registry_url_str = match registry_override {
+        Some(s) => s,
+        None => load_default_registry()?,
+    };
+    let registry_url: url::Url = registry_url_str
+        .parse()
+        .with_context(|| format!("parse registry URL `{registry_url_str}`"))?;
+
+    let cache_dir = tr_revocation::default_cache_dir().ok_or_else(|| {
+        anyhow!("could not determine platform cache directory for revocation snapshots")
+    })?;
+
+    let config = tr_revocation::CacheConfig::defaults_for(registry_url, cache_dir);
+    Ok(tr_revocation::RevocationCache::new(config))
 }
 
 /// Map a stored source URI back to the workspace-relative POSIX path
@@ -1411,7 +1476,7 @@ description = "v3 lifecycle round-trip test."
         }
 
         // CLI exit-code path: signed pack returns 0 without --allow-unsigned.
-        let code = run_verify(&out_tr, false).unwrap();
+        let code = run_verify(&out_tr, false, false, None).unwrap();
         assert_eq!(code, 0, "signed pack should exit 0");
     }
 
@@ -1462,11 +1527,11 @@ description = "v3 lifecycle round-trip test."
         .unwrap();
 
         // Without --allow-unsigned, exit code is EXIT_UNSIGNED = 70.
-        let code = run_verify(&out_tr, false).unwrap();
+        let code = run_verify(&out_tr, false, false, None).unwrap();
         assert_eq!(code, EXIT_UNSIGNED);
 
         // With --allow-unsigned, exit code is 0.
-        let code = run_verify(&out_tr, true).unwrap();
+        let code = run_verify(&out_tr, true, false, None).unwrap();
         assert_eq!(code, 0);
     }
 

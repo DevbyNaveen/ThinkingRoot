@@ -53,6 +53,6 @@ pub mod verifier;
 
 pub use error::{Error, Result};
 pub use keys::{AuthorKeyStore, TrustedAuthorKey};
-pub use v3::{V3TamperedKind, V3Verdict, verify_v3_pack};
+pub use v3::{V3TamperedKind, V3Verdict, verify_v3_pack, verify_v3_pack_with_revocation};
 pub use verdict::{RevokedDetails, TamperedKind, Verdict, VerifiedDetails};
 pub use verifier::{Verifier, VerifierConfig};
