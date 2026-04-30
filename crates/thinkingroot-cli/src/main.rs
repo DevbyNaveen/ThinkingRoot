@@ -362,10 +362,21 @@ enum Commands {
         /// F design (`docs/2026-04-29-phase-f-trust-verify-spec.md`)
         /// covers the wire format. This is the air-gapped /
         /// self-signed path; Sigstore-public-good keyless signing
-        /// (`--sign-keyless`) is a follow-up — see the comment in
-        /// `crates/tr-sigstore/src/live.rs`.
-        #[arg(long, value_name = "KEY_FILE")]
+        /// uses `--sign-keyless` instead.
+        #[arg(long, value_name = "KEY_FILE", conflicts_with = "sign_keyless")]
         sign: Option<PathBuf>,
+        /// Sign the pack via Sigstore-public-good keyless DSSE
+        /// (`--format=tr/3` only). The CLI obtains an OIDC id_token
+        /// (preferring `$TR_OIDC_TOKEN` if set; otherwise opening the
+        /// default browser to `https://oauth2.sigstore.dev/auth`),
+        /// requests an ephemeral ECDSA P-256 cert from Fulcio, signs
+        /// the DSSE PAE with the ephemeral key, submits the entry to
+        /// Rekor, and embeds the resulting Sigstore Bundle as
+        /// `signature.sig` in the outer tar. The signing key never
+        /// touches disk. See `crates/tr-sigstore/src/live.rs` for the
+        /// flow.
+        #[arg(long, conflicts_with = "sign")]
+        sign_keyless: bool,
     },
     /// Verify a v3 `.tr` pack's integrity and signature without
     /// installing it. Runs the offline verification chain from spec
@@ -893,6 +904,7 @@ async fn async_main() -> anyhow::Result<()> {
             description,
             format,
             sign,
+            sign_keyless,
         }) => {
             pack_cmd::run_pack(
                 &workspace,
@@ -903,6 +915,7 @@ async fn async_main() -> anyhow::Result<()> {
                 description,
                 &format,
                 sign.as_deref(),
+                sign_keyless,
             )?;
         }
         Some(Commands::Verify {

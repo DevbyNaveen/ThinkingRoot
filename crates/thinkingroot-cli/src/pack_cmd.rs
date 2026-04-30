@@ -136,12 +136,13 @@ pub fn run_pack(
     description_override: Option<String>,
     format: &str,
     sign_key_path: Option<&Path>,
+    sign_keyless: bool,
 ) -> Result<()> {
     match format {
         "tr/1" => {
-            if sign_key_path.is_some() {
+            if sign_key_path.is_some() || sign_keyless {
                 return Err(anyhow!(
-                    "`--sign` is only supported with `--format=tr/3`; \
+                    "`--sign` and `--sign-keyless` are only supported with `--format=tr/3`; \
                      v1 packs use a different signature mechanism (see Phase F design)"
                 ));
             }
@@ -162,6 +163,7 @@ pub fn run_pack(
             license_override,
             description_override,
             sign_key_path,
+            sign_keyless,
         ),
         other => Err(anyhow!(
             "unknown pack format `{other}`; supported: tr/1, tr/3"
@@ -255,6 +257,7 @@ fn run_pack_v3(
     license_override: Option<String>,
     description_override: Option<String>,
     sign_key_path: Option<&Path>,
+    sign_keyless: bool,
 ) -> Result<()> {
     use ed25519_dalek::SigningKey;
     use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
@@ -386,6 +389,8 @@ fn run_pack_v3(
         builder
             .build_signed(&key, &pack_filename)
             .map_err(|e| anyhow!("build signed .tr: {e}"))?
+    } else if sign_keyless {
+        run_keyless_signing(builder, &pack_filename)?
     } else {
         builder.build().map_err(|e| anyhow!("build .tr: {e}"))?
     };
@@ -398,6 +403,8 @@ fn run_pack_v3(
 
     let signed_label = if sign_key_path.is_some() {
         " signed"
+    } else if sign_keyless {
+        " signed (keyless)"
     } else {
         ""
     };
@@ -448,6 +455,87 @@ fn load_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
         "signing key must be 32 raw bytes or 64 hex chars; got {} bytes",
         bytes.len()
     ))
+}
+
+/// Drive Sigstore-public-good keyless DSSE signing for `root pack
+/// --sign-keyless`. Returns the outer `.tr` bytes (with `signature.sig`
+/// as the 4th tar entry) ready for disk-write.
+///
+/// OIDC token sourcing:
+///
+/// 1. `$TR_OIDC_TOKEN` — preferred for headless / CI use. The CLI does
+///    no further verification on the token; sigstore-rs's
+///    `IdentityToken::try_from(&str)` enforces `aud == "sigstore"`,
+///    Fulcio enforces issuer and challenge.
+/// 2. Otherwise, [`tr_sigstore::live::browser_oidc_flow`] runs the
+///    interactive PKCE redirect against Sigstore-public-good's OIDC
+///    issuer (`oauth2.sigstore.dev/auth`).
+///
+/// We're called from the sync `run_pack_v3` body, which itself runs
+/// inside `async_main`'s tokio multi-thread runtime. The signing
+/// closure uses `tokio::task::block_in_place` + `Handle::current()
+/// .block_on` to drive the async [`tr_sigstore::live::sign_canonical_bytes_keyless`]
+/// without restructuring the surrounding sync code.
+fn run_keyless_signing(
+    builder: tr_format::V3PackBuilder,
+    pack_filename: &str,
+) -> Result<Vec<u8>> {
+    use std::time::SystemTime;
+    use tr_sigstore::live::{
+        IdentityToken, SignKeylessOptions, browser_oidc_flow, sign_canonical_bytes_keyless,
+    };
+
+    // Step 1: obtain the OIDC id_token. Env var preferred; browser
+    // flow as the fallback.
+    let token: IdentityToken = match std::env::var("TR_OIDC_TOKEN") {
+        Ok(jwt) if !jwt.is_empty() => tr_sigstore::live::identity_token_from_jwt(&jwt)
+            .map_err(|e| anyhow!("$TR_OIDC_TOKEN not a valid Sigstore JWT: {e}"))?,
+        _ => {
+            eprintln!(
+                "  opening browser for Sigstore OIDC flow \
+                 (set $TR_OIDC_TOKEN to skip)…"
+            );
+            browser_oidc_flow(None, None, None)
+                .map_err(|e| anyhow!("OIDC browser flow failed: {e}"))?
+        }
+    };
+    // Round-trip back to the JWT string — the keyless signer parses
+    // the JWT itself for the challenge claim and to construct the
+    // `CoreIdToken` openidconnect type. Display impl on
+    // `IdentityToken` returns the original token string.
+    let jwt = token.to_string();
+
+    // Step 2: build the signing closure. The closure receives the
+    // canonical pack bytes (BLAKE3 input per spec §3.1) and returns a
+    // `SigstoreBundle` ready to embed in the outer tar.
+    let signer = move |canonical_bytes: &[u8],
+                       _pack_hash: &str,
+                       pack_filename: &str|
+          -> std::result::Result<tr_sigstore::SigstoreBundle, anyhow::Error> {
+        // From inside the multi-thread tokio runtime, `block_in_place`
+        // tells tokio "this thread is going to do blocking work, move
+        // other tasks off it"; then `Handle::current().block_on` runs
+        // the async signer to completion synchronously. This works
+        // because `async_main` always runs us on a multi-thread
+        // runtime — `Builder::new_multi_thread()` in `main.rs`.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sign_canonical_bytes_keyless(
+                    canonical_bytes,
+                    pack_filename,
+                    &jwt,
+                    SystemTime::now(),
+                    SignKeylessOptions::default(),
+                )
+                .await
+                .map_err(|e| anyhow!("keyless sign: {e}"))
+            })
+        })
+    };
+
+    builder
+        .build_with_signer(signer, pack_filename)
+        .map_err(|e| anyhow!("build keyless-signed .tr: {e}"))
 }
 
 /// Run `root verify <pack>`. Reads the pack from disk, parses the
@@ -1210,6 +1298,7 @@ description = "v3 lifecycle round-trip test."
             None,
             "tr/3",
             None,
+            false,
         )
         .unwrap();
         assert!(out_tr.exists(), "v3 pack file not produced");
@@ -1298,6 +1387,7 @@ description = "v3 lifecycle round-trip test."
             None,
             "tr/3",
             Some(&key_path),
+            false,
         )
         .unwrap();
 
@@ -1367,6 +1457,7 @@ description = "v3 lifecycle round-trip test."
             None,
             "tr/3",
             None,
+            false,
         )
         .unwrap();
 
@@ -1425,7 +1516,7 @@ description = "Round-trip test pack."
         let workspace = fake_engine_workspace(src_tmp.path());
 
         let out_tr = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         assert!(out_tr.exists(), ".tr file not produced");
         assert!(
             fs::metadata(&out_tr).unwrap().len() > 0,
@@ -1496,6 +1587,7 @@ description = "Round-trip test pack."
             Some("Bob's fork.".to_string()),
             "tr/1",
             None,
+            false,
         )
         .unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
@@ -1508,7 +1600,7 @@ description = "Round-trip test pack."
     #[test]
     fn pack_errors_when_engine_dir_absent() {
         let tmp = tempdir().unwrap();
-        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1", None).unwrap_err();
+        let err = run_pack(tmp.path(), None, None, None, None, None, "tr/1", None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("no engine output"), "got: {msg}");
     }
@@ -1520,7 +1612,7 @@ description = "Round-trip test pack."
         // Engine dir present, no Pack.toml, no overrides → error mentions `name`.
         fs::create_dir_all(workspace.join(".thinkingroot/artifacts")).unwrap();
         fs::write(workspace.join(".thinkingroot/artifacts/x.md"), b"x").unwrap();
-        let err = run_pack(workspace, None, None, None, None, None, "tr/1", None).unwrap_err();
+        let err = run_pack(workspace, None, None, None, None, None, "tr/1", None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("name"), "got: {msg}");
     }
@@ -1530,7 +1622,7 @@ description = "Round-trip test pack."
         let tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(tmp.path());
         let out_tr = workspace.join("paths.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let pack = tr_reader::read_file(&out_tr).unwrap();
         let paths: HashSet<&str> = pack
             .paths()
@@ -1552,7 +1644,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let out_tr = workspace.join("explicit.tr");
-        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(out_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
 
         let dst_tmp = tempdir().unwrap();
         let target = dst_tmp.path().join("dst");
@@ -1568,7 +1660,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let good_tr = workspace.join("good.tr");
-        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(good_tr.clone()), None, None, None, None, "tr/1", None, false).unwrap();
 
         // Corrupt the file deterministically: zero out a 64-byte run
         // in the middle of the zstd stream + truncate the trailing
@@ -1693,7 +1785,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
         let advertised_hash = blake3_hex(&tr_bytes);
 
@@ -1781,7 +1873,7 @@ description = "Round-trip test pack."
         let src_tmp = tempdir().unwrap();
         let workspace = fake_engine_workspace(src_tmp.path());
         let tr_out = workspace.join("alice-demo-0.1.0.tr");
-        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None).unwrap();
+        run_pack(&workspace, Some(tr_out.clone()), None, None, None, None, "tr/1", None, false).unwrap();
         let tr_bytes = fs::read(&tr_out).unwrap();
 
         struct AppState {

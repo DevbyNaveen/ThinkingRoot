@@ -41,6 +41,7 @@ use std::time::SystemTime;
 
 use ed25519_dalek::SigningKey;
 use tar::{Builder, Header, HeaderMode};
+use tr_sigstore::SigstoreBundle;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::{
@@ -49,6 +50,31 @@ use crate::{
     error::{Error, Result},
     manifest::ManifestV3,
 };
+
+/// Output of [`V3PackBuilder::prepare_canonical`] — the canonical pack
+/// bytes plus everything `emit_outer_tar` needs to serialize the
+/// final wire output. Internal to writer_v3 (not exposed): callers
+/// drive [`V3PackBuilder::build`], [`V3PackBuilder::build_signed`], or
+/// [`V3PackBuilder::build_with_signer`] and let those orchestrate.
+struct CanonicalPack {
+    /// The BLAKE3 input for `pack_hash` per spec §3.1, namely
+    /// `canonical_manifest_with_blank_pack_hash || NUL ||
+    /// source.tar.zst || NUL || claims.jsonl`. Surfaced to
+    /// `build_with_signer`'s closure so signers can compute their own
+    /// subject digests over the same canonical bytes.
+    canonical_bytes: Vec<u8>,
+    /// `manifest.toml` with `pack_hash` populated — what lands in the
+    /// outer tar entry 1.
+    manifest_toml: Vec<u8>,
+    /// Inner source archive — outer tar entry 2.
+    source_tar_zst: Vec<u8>,
+    /// JSONL claims body — outer tar entry 3.
+    claims_jsonl: Vec<u8>,
+    /// `blake3:<hex>`-prefixed pack hash. Same as the corresponding
+    /// field of `manifest_toml`'s `pack_hash` line, but pre-extracted
+    /// to save consumers a TOML reparse.
+    pack_hash: String,
+}
 
 /// Path of the inner source bundle inside the outer `.tr` tar.
 pub const SOURCE_BUNDLE_NAME: &str = "source.tar.zst";
@@ -130,17 +156,44 @@ impl V3PackBuilder {
     /// 6. Wrap into the outer tar `[manifest.toml, source.tar.zst,
     ///    claims.jsonl]` in that order.
     pub fn build(mut self) -> Result<Vec<u8>> {
-        // 1. Inner source archive.
+        let prepared = self.prepare_canonical()?;
+        emit_outer_tar(
+            &prepared.manifest_toml,
+            &prepared.source_tar_zst,
+            &prepared.claims_jsonl,
+            None,
+        )
+    }
+
+    /// Run the canonical-bytes prep (steps 1–5 of the pack-build recipe
+    /// per spec §3.1) and return everything a downstream signer or tar
+    /// emitter needs:
+    ///
+    /// - `canonical_bytes` — the BLAKE3 input for `pack_hash`, namely
+    ///   `canonical_manifest_with_blank_pack_hash || NUL ||
+    ///   source.tar.zst || NUL || claims.jsonl`. This is what every v3
+    ///   signer (Ed25519 self-signed and Sigstore-keyless DSSE both)
+    ///   covers.
+    /// - `manifest_toml` — same manifest but with `pack_hash` populated;
+    ///   this is the `manifest.toml` that lands in the outer tar.
+    /// - `source_tar_zst`, `claims_jsonl` — outer tar payload entries
+    ///   2 and 3.
+    /// - `pack_hash` — the `blake3:<hex>`-prefixed digest matching
+    ///   `manifest.pack_hash`.
+    ///
+    /// Shared by [`Self::build`], [`Self::build_signed`] (Ed25519
+    /// self-signed), and [`Self::build_with_signer`] (Sigstore-keyless
+    /// DSSE) so the canonicalization rule has one definition. Locking
+    /// this rule was D7 of the v3 implementation plan; the golden-bytes
+    /// test in `tests/v3_golden.rs` is what pins it.
+    fn prepare_canonical(&mut self) -> Result<CanonicalPack> {
         let source_tar_zst = self.build_inner_source_archive()?;
         let source_hash = format!("blake3:{}", blake3_hex(&source_tar_zst));
 
-        // 2. Claims JSONL.
         self.claims.sort_by(|a, b| a.id.cmp(&b.id));
         let claims_jsonl = self.serialize_claims_jsonl()?;
         let claims_hash = format!("blake3:{}", blake3_hex(&claims_jsonl));
 
-        // 3. Populate informational manifest fields. Hashes go in now;
-        //    `pack_hash` stays empty until step 4.
         self.manifest.source_hash = source_hash;
         self.manifest.claims_hash = claims_hash;
         self.manifest.source_files = Some(self.source_files.len() as u64);
@@ -152,26 +205,27 @@ impl V3PackBuilder {
         );
         self.manifest.claim_count = Some(self.claims.len() as u64);
 
-        // 4. Pack hash recipe. The canonical manifest bytes here have
-        //    `pack_hash` blanked — that's the contract spec §3.1 makes
-        //    with verifiers.
         let canonical_manifest = self.manifest.canonical_bytes_for_hashing();
-        let mut hash_input = Vec::with_capacity(
+        let mut canonical_bytes = Vec::with_capacity(
             canonical_manifest.len() + 1 + source_tar_zst.len() + 1 + claims_jsonl.len(),
         );
-        hash_input.extend_from_slice(&canonical_manifest);
-        hash_input.push(0);
-        hash_input.extend_from_slice(&source_tar_zst);
-        hash_input.push(0);
-        hash_input.extend_from_slice(&claims_jsonl);
-        self.manifest.pack_hash = format!("blake3:{}", blake3_hex(&hash_input));
+        canonical_bytes.extend_from_slice(&canonical_manifest);
+        canonical_bytes.push(0);
+        canonical_bytes.extend_from_slice(&source_tar_zst);
+        canonical_bytes.push(0);
+        canonical_bytes.extend_from_slice(&claims_jsonl);
+        let pack_hash = format!("blake3:{}", blake3_hex(&canonical_bytes));
+        self.manifest.pack_hash = pack_hash.clone();
 
-        // 5. Final manifest.toml — same canonicalization, but with
-        //    `pack_hash` filled in now.
         let manifest_toml = self.manifest.to_canonical_toml();
 
-        // 6. Outer tar (uncompressed).
-        emit_outer_tar(&manifest_toml, &source_tar_zst, &claims_jsonl, None)
+        Ok(CanonicalPack {
+            canonical_bytes,
+            manifest_toml,
+            source_tar_zst,
+            claims_jsonl,
+            pack_hash,
+        })
     }
 
     /// Build a signed pack. Same as [`build`] except the supplied
@@ -193,55 +247,68 @@ impl V3PackBuilder {
         signing_key: &SigningKey,
         pack_filename: &str,
     ) -> Result<Vec<u8>> {
-        // 1–5: same as `build` up to the manifest-with-pack_hash step.
-        let source_tar_zst = self.build_inner_source_archive()?;
-        let source_hash = format!("blake3:{}", blake3_hex(&source_tar_zst));
-        self.claims.sort_by(|a, b| a.id.cmp(&b.id));
-        let claims_jsonl = self.serialize_claims_jsonl()?;
-        let claims_hash = format!("blake3:{}", blake3_hex(&claims_jsonl));
-        self.manifest.source_hash = source_hash;
-        self.manifest.claims_hash = claims_hash;
-        self.manifest.source_files = Some(self.source_files.len() as u64);
-        self.manifest.source_bytes = Some(
-            self.source_files
-                .values()
-                .map(|b| b.len() as u64)
-                .sum::<u64>(),
-        );
-        self.manifest.claim_count = Some(self.claims.len() as u64);
-
-        let canonical_manifest = self.manifest.canonical_bytes_for_hashing();
-        let mut hash_input = Vec::with_capacity(
-            canonical_manifest.len() + 1 + source_tar_zst.len() + 1 + claims_jsonl.len(),
-        );
-        hash_input.extend_from_slice(&canonical_manifest);
-        hash_input.push(0);
-        hash_input.extend_from_slice(&source_tar_zst);
-        hash_input.push(0);
-        hash_input.extend_from_slice(&claims_jsonl);
-        let pack_hash = format!("blake3:{}", blake3_hex(&hash_input));
-        self.manifest.pack_hash = pack_hash.clone();
-
-        let manifest_toml = self.manifest.to_canonical_toml();
-
-        // 6. Sigstore bundle over the canonical pack hash. The bundle
-        //    binds the BLAKE3 digest into a DSSE-signed in-toto
-        //    statement; a verifier replays the chain offline to prove
-        //    (a) the bundle's signature is valid for the declared key
-        //    and (b) the statement's subject digest matches the pack
-        //    hash recomputed from the outer tar's bytes.
-        let bundle =
-            tr_sigstore::sign_pack(&pack_hash, pack_filename, signing_key, SystemTime::now())
-                .map_err(|e| Error::Invalid {
-                    what: "signature.sig",
-                    detail: format!("sigstore sign: {e}"),
-                })?;
+        let prepared = self.prepare_canonical()?;
+        // The bundle binds the BLAKE3 digest into a DSSE-signed in-toto
+        // statement; a verifier replays the chain offline to prove
+        // (a) the bundle's signature is valid for the declared key
+        // and (b) the statement's subject digest matches the pack
+        // hash recomputed from the outer tar's bytes.
+        let bundle = tr_sigstore::sign_pack(
+            &prepared.pack_hash,
+            pack_filename,
+            signing_key,
+            SystemTime::now(),
+        )
+        .map_err(|e| Error::Invalid {
+            what: "signature.sig",
+            detail: format!("sigstore sign: {e}"),
+        })?;
         let bundle_bytes = serde_json::to_vec(&bundle)?;
-
         emit_outer_tar(
-            &manifest_toml,
-            &source_tar_zst,
-            &claims_jsonl,
+            &prepared.manifest_toml,
+            &prepared.source_tar_zst,
+            &prepared.claims_jsonl,
+            Some(&bundle_bytes),
+        )
+    }
+
+    /// Build a signed pack via a caller-supplied closure. The closure
+    /// receives the canonical pack bytes (the BLAKE3-input bytes spec
+    /// §3.1 specifies for `pack_hash`), the formatted `pack_hash`
+    /// string (e.g. `"blake3:abc..."`), and the `pack_filename` to
+    /// embed in the bundle's in-toto statement; it returns a
+    /// [`SigstoreBundle`] which is appended to the outer tar as
+    /// `signature.sig`.
+    ///
+    /// This is the integration point for Sigstore-keyless DSSE
+    /// signing: callers supply a closure that drives
+    /// `tr_sigstore::live::sign_canonical_bytes_keyless` (Fulcio cert
+    /// request → DSSE PAE sign → Rekor witness). The closure can also
+    /// route through any other signer that produces a v3-compatible
+    /// bundle (Ed25519 self-signed, HSM-backed, KMS, etc.) without
+    /// `tr-format` taking a dependency on each signer's transitive
+    /// stack.
+    ///
+    /// `E` is the closure's error type — propagated as
+    /// [`Error::Invalid`] with `what="signature.sig"`. Use
+    /// [`std::convert::Infallible`] when the signer cannot fail
+    /// (callers wrapping a sync stable signer).
+    pub fn build_with_signer<F, E>(mut self, sign_fn: F, pack_filename: &str) -> Result<Vec<u8>>
+    where
+        F: FnOnce(&[u8], &str, &str) -> std::result::Result<SigstoreBundle, E>,
+        E: std::fmt::Display,
+    {
+        let prepared = self.prepare_canonical()?;
+        let bundle = sign_fn(&prepared.canonical_bytes, &prepared.pack_hash, pack_filename)
+            .map_err(|e| Error::Invalid {
+                what: "signature.sig",
+                detail: format!("external signer: {e}"),
+            })?;
+        let bundle_bytes = serde_json::to_vec(&bundle)?;
+        emit_outer_tar(
+            &prepared.manifest_toml,
+            &prepared.source_tar_zst,
+            &prepared.claims_jsonl,
             Some(&bundle_bytes),
         )
     }

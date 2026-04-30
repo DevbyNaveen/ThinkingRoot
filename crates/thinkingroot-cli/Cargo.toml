@@ -72,6 +72,13 @@ ignore = { workspace = true }
 # Used by `root pack --sign` to load Ed25519 signing keys from disk.
 ed25519-dalek = { workspace = true }
 
+# `root pack --sign-keyless` drives Sigstore-public-good keyless DSSE
+# signing through tr-sigstore's `live` feature — Fulcio cert request,
+# DSSE PAE sign with the ephemeral key, Rekor witness submission. The
+# `live` feature pulls in sigstore-rs + reqwest + openidconnect; only
+# the CLI takes that compile cost (everything else stays lean).
+tr-sigstore = { workspace = true, features = ["live"] }
+
 [features]
 ## Enable neural embedding for semantic search. On by default; disable with
 ## --no-default-features for faster test builds that skip ONNX Runtime linking.
