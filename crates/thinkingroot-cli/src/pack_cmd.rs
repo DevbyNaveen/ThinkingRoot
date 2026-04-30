@@ -177,8 +177,12 @@ fn run_pack_v3(
 
     // 2. Open the workspace stores. CozoDB hands us joined claim+source
     //    rows; FileSystemSourceStore hands us source bytes by hash.
-    let graph = thinkingroot_graph::graph::GraphStore::init(&engine_dir)
-        .with_context(|| format!("open graph at {}", engine_dir.display()))?;
+    //    `StorageEngine::init` writes the graph at `<data_dir>/graph/`,
+    //    so we resolve the same nested path here rather than opening a
+    //    fresh empty DB at `<data_dir>/graph.db`.
+    let graph_dir = engine_dir.join("graph");
+    let graph = thinkingroot_graph::graph::GraphStore::init(&graph_dir)
+        .with_context(|| format!("open graph at {}", graph_dir.display()))?;
     let source_store = FileSystemSourceStore::new(&engine_dir)
         .with_context(|| format!("open source store at {}", engine_dir.display()))?;
 
@@ -586,14 +590,18 @@ fn build_revocation_cache(
 ///   v3 pack treats them as opaque path strings. Reader-side tooling
 ///   can decide how to resolve them.
 fn workspace_relative_pack_path(uri: &str, workspace_abs: &Path) -> String {
-    if let Some(stripped) = uri.strip_prefix("file://") {
-        let abs = Path::new(stripped);
-        if let Ok(rel) = abs.strip_prefix(workspace_abs) {
+    // Source URIs are stored either as `file://<abs-path>` (parser
+    // canonical form) or as a bare absolute path. Both need to be
+    // turned into a workspace-relative path the v3 pack writer's
+    // safe-path check accepts (no leading `/`, no `..`).
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    let candidate = Path::new(stripped);
+    if candidate.is_absolute() {
+        if let Ok(rel) = candidate.strip_prefix(workspace_abs) {
             return rel.to_string_lossy().replace('\\', "/");
         }
         // Outside workspace — emit as a top-level path with leading
-        // slashes stripped so the v3 writer's safe-path check accepts
-        // it.
+        // slashes stripped so the writer accepts it.
         return stripped.trim_start_matches('/').to_string();
     }
     uri.to_string()
@@ -1105,17 +1113,16 @@ fn default_install_dir(manifest: &ManifestV3) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use tempfile::tempdir;
 
     /// Build a fake v3-shape compiled workspace with a real CozoDB +
     /// source-byte store. Returns the workspace root.
     ///
-    /// The shape this produces matches what `root compile` leaves
-    /// behind:
-    /// - `.thinkingroot/graph.db` — CozoDB with one source + one claim
-    ///   carrying a non-zero `(byte_start, byte_end)` triple (W1
-    ///   contract).
+    /// Layout mirrors `StorageEngine::init`, which is what `root
+    /// compile` actually produces:
+    /// - `.thinkingroot/graph/graph.db` — CozoDB with one source + one
+    ///   claim carrying a non-zero `(byte_start, byte_end)` triple
+    ///   (W1 contract).
     /// - `.thinkingroot/rooting/sources/...` — durable source-byte
     ///   store entry the v3 pack writer reads from.
     /// - `Pack.toml` at workspace root.
@@ -1127,9 +1134,10 @@ mod tests {
 
         let workspace = dir.to_path_buf();
         let engine = workspace.join(".thinkingroot");
-        fs::create_dir_all(&engine).unwrap();
+        let graph_dir = engine.join("graph");
+        fs::create_dir_all(&graph_dir).unwrap();
 
-        let graph = GraphStore::init(&engine).unwrap();
+        let graph = GraphStore::init(&graph_dir).unwrap();
         let source_store = FileSystemSourceStore::new(&engine).unwrap();
 
         // Synthetic source — a small Rust file. The `file://` URI is
