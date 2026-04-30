@@ -32,7 +32,7 @@ thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
 thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
-thinkingroot-verify-internal = { workspace = true }
+thinkingroot-health = { workspace = true }
 thinkingroot-serve = { workspace = true }
 thinkingroot-branch = { workspace = true }
 thinkingroot-ground = { workspace = true }

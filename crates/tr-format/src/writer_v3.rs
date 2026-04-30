@@ -400,10 +400,9 @@ fn append_file<W: Write>(builder: &mut Builder<W>, path: &str, bytes: &[u8]) -> 
     Ok(())
 }
 
-/// Same path-safety contract as the v1 writer: relative paths only, no
-/// `..`, no leading `/`. The outer tar paths are also validated here so
-/// we never emit a v3 pack that an older or stricter reader would
-/// reject.
+/// Path-safety contract: relative paths only, no `..`, no leading `/`.
+/// The outer tar paths are validated here so we never emit a v3 pack
+/// that a stricter reader would reject.
 fn assert_safe_path(path: &str) -> Result<()> {
     if path.is_empty() {
         return Err(Error::Invalid {

@@ -26,11 +26,11 @@ impl Probe for PredicateProbe {
             }
         };
 
-        // Source lookup: v1 resolves against the claim's own source only.
-        // When derivation is present (Week 4+ topology probe will relate
-        // parents), the scope can broaden; for now, a derived claim's
-        // predicate runs against each parent's source. Callers that want
-        // custom scope should use predicate.scope.globs (not yet plumbed).
+        // Source lookup: the probe resolves against the claim's own source
+        // only. For derived claims, the predicate runs against each parent's
+        // source (the topology probe handles cross-parent entity relations).
+        // Callers that want custom scope should use predicate.scope.globs
+        // (not yet plumbed).
         let source_lookup_id = ctx.claim.source.to_string();
         let source = ctx
             .graph

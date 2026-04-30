@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Reader/writer for the TR-1 .tr portable knowledge pack format."
+description = "Reader/writer for the v3 (`tr/3`) .tr portable knowledge pack format — three files (manifest.toml + source.tar.zst + claims.jsonl) plus an optional Sigstore signature.sig."
 
 [lib]
 name = "tr_format"

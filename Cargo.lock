@@ -6033,7 +6033,7 @@ dependencies = [
  "tempfile",
  "thinkingroot-core",
  "thinkingroot-graph",
- "thinkingroot-verify-internal",
+ "thinkingroot-health",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -6071,12 +6071,12 @@ dependencies = [
  "thinkingroot-extract",
  "thinkingroot-graph",
  "thinkingroot-ground",
+ "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-parse",
  "thinkingroot-reflect",
  "thinkingroot-rooting",
  "thinkingroot-serve",
- "thinkingroot-verify-internal",
  "tokio",
  "toml",
  "tr-format",
@@ -6182,6 +6182,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-health"
+version = "0.9.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thinkingroot-core",
+ "thinkingroot-graph",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "thinkingroot-link"
 version = "0.9.1"
 dependencies = [
@@ -6246,10 +6260,10 @@ dependencies = [
  "thinkingroot-core",
  "thinkingroot-extract",
  "thinkingroot-graph",
+ "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-parse",
  "thinkingroot-serve",
- "thinkingroot-verify-internal",
  "tokio",
 ]
 
@@ -6292,18 +6306,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thinkingroot-safety"
-version = "0.9.1"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thinkingroot-core",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "thinkingroot-serve"
 version = "0.9.1"
 dependencies = [
@@ -6330,11 +6332,11 @@ dependencies = [
  "thinkingroot-extract",
  "thinkingroot-graph",
  "thinkingroot-ground",
+ "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-parse",
  "thinkingroot-reflect",
  "thinkingroot-rooting",
- "thinkingroot-verify-internal",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -6342,20 +6344,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "thinkingroot-verify-internal"
-version = "0.9.1"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "thinkingroot-core",
- "thinkingroot-graph",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

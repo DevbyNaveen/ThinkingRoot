@@ -21,7 +21,8 @@ pub struct SourceBytes {
     /// Content-addressing key. Identical content → identical hash regardless
     /// of which `source_id` originally produced it.
     pub content_hash: ContentHash,
-    /// Raw bytes. No compression in v1.
+    /// Raw bytes. Stored uncompressed; the v3 pack writer compresses
+    /// only the outer `source.tar.zst` archive, not individual blobs.
     pub bytes: Vec<u8>,
 }
 

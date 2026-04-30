@@ -7,9 +7,8 @@ members = [
     "crates/thinkingroot-extract",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
-    "crates/thinkingroot-verify",
+    "crates/thinkingroot-health",
     "crates/thinkingroot-serve",
-    "crates/thinkingroot-safety",
     "crates/thinkingroot-branch",
     "crates/thinkingroot-ground",
     "crates/thinkingroot-rooting",
@@ -35,9 +34,8 @@ default-members = [
     "crates/thinkingroot-extract",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
-    "crates/thinkingroot-verify",
+    "crates/thinkingroot-health",
     "crates/thinkingroot-serve",
-    "crates/thinkingroot-safety",
     "crates/thinkingroot-branch",
     "crates/thinkingroot-ground",
     "crates/thinkingroot-rooting",
@@ -73,9 +71,8 @@ thinkingroot-parse   = { path = "crates/thinkingroot-parse",   version = "0.9.0"
 thinkingroot-extract = { path = "crates/thinkingroot-extract", version = "0.9.0" }
 thinkingroot-link    = { path = "crates/thinkingroot-link",    version = "0.9.0" }
 thinkingroot-compile = { path = "crates/thinkingroot-compile", version = "0.9.0" }
-thinkingroot-verify-internal = { path = "crates/thinkingroot-verify", version = "0.9.0" }
+thinkingroot-health  = { path = "crates/thinkingroot-health",  version = "0.9.0" }
 thinkingroot-serve   = { path = "crates/thinkingroot-serve",   version = "0.9.0", default-features = false }
-thinkingroot-safety  = { path = "crates/thinkingroot-safety",  version = "0.9.0" }
 thinkingroot-branch  = { path = "crates/thinkingroot-branch",  version = "0.9.0", default-features = false }
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
 thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }

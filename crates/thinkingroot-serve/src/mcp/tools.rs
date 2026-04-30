@@ -505,7 +505,7 @@ pub async fn handle_call(
             let chat = snapshot
                 .as_ref()
                 .map(|s| s.config.chat.resolve(&s.source_kinds))
-                .unwrap_or_else(AskRequest::legacy_chat);
+                .unwrap_or_else(AskRequest::default_chat);
             let identity_owned = snapshot
                 .as_ref()
                 .map(|s| build_workspace_identity(s, &s.config.chat));

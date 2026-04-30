@@ -31,7 +31,8 @@ pub struct ManifestV3 {
     /// validation field per spec §3.2.
     pub format_version: String,
 
-    /// Pack coordinate in `owner/slug` form. Same validation as v1.
+    /// Pack coordinate in `owner/slug` form. Validation rules: each
+    /// segment is `[a-z0-9][a-z0-9-]*`, length ≤ 64.
     pub name: String,
 
     /// SemVer of this pack.
@@ -100,9 +101,9 @@ impl ManifestV3 {
         }
     }
 
-    /// Validate every structural invariant. Reader path; mirrors the v1
-    /// `Manifest::validate` shape so consumers can swap with minimal
-    /// diff.
+    /// Validate every structural invariant on the reader path:
+    /// `format_version == "tr/3"`, well-formed `name`/`version`,
+    /// non-empty hash fields, and consistent counts.
     pub fn validate(&self) -> Result<()> {
         if self.format_version != FORMAT_VERSION_V3 {
             return Err(Error::Invalid {

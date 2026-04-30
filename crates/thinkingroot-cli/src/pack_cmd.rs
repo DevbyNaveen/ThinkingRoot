@@ -97,8 +97,10 @@ struct PackTomlInner {
     description: Option<String>,
 }
 
-/// Run `root pack`. v3-only: there is no `--format` option since
-/// the v1 wire format was deleted in the legacy cleanup commits.
+/// Run `root pack`. Emits a v3 (`tr/3`) pack — three files plus a
+/// 20-line manifest, optionally followed by a `signature.sig`
+/// (Sigstore Bundle v0.3 when `--sign-keyless` was passed,
+/// self-signed Ed25519 envelope when `--sign <key-file>` was passed).
 pub fn run_pack(
     workspace: &Path,
     out: Option<PathBuf>,
@@ -423,20 +425,24 @@ fn run_keyless_signing(
 
 /// Run `root verify <pack>`. Reads the pack from disk, parses the
 /// outer tar, and invokes the v3 verification pipeline. Returns a
-/// process exit code per the v3 spec §10.3 mapping:
+/// process exit code per the Phase F design §2.3 mapping
+/// (constants defined at the top of this module):
 ///
 /// - `0` — Verified.
-/// - `1` — Tampered (recomputed hash ≠ declared hash, or signature
-///   mismatch).
-/// - `2` — Unsigned + `--allow-unsigned` not passed.
-/// - `4` — Unsupported (reserved; today's free-fn verify never returns
-///   this — placeholder for the `sigstore-impl` follow-up which adds
-///   trust-root validation for Fulcio-issued certs).
+/// - [`EXIT_UNSIGNED`] (70) — Pack has no `signature.sig` and
+///   `--allow-unsigned` was not passed.
+/// - [`EXIT_TAMPERED`] (71) — Recomputed pack hash diverged from
+///   the manifest's declared `pack_hash`, or the DSSE signature
+///   failed to verify against its trust roots.
+/// - [`EXIT_REVOKED`] (72) — Pack hash is on the registry's signed
+///   revocation deny-list.
 ///
-/// Revocation is intentionally not consulted yet — `tr_revocation` is
-/// async and the CLI's verify path is sync. The follow-up
-/// `sigstore-impl` work wires the cache through with the same
-/// short-circuit semantics as the existing v1 `Verifier::verify`.
+/// When `revocation_check` is true the function constructs a
+/// [`tr_revocation::RevocationCache`] and drives the async
+/// [`tr_verify::verify_v3_pack_with_revocation`] from the current
+/// tokio runtime. When false, it calls the sync
+/// [`tr_verify::verify_v3_pack`] for fully-offline / air-gapped
+/// verification.
 pub fn run_verify(
     pack_path: &Path,
     allow_unsigned: bool,
@@ -546,10 +552,10 @@ pub fn run_verify(
     }
 }
 
-/// Build a [`tr_revocation::RevocationCache`] using the same defaults
-/// the v1 install path uses: production registry URL (overridable),
-/// platform default cache directory, 60-min fresh TTL, 7-day stale
-/// grace.
+/// Build a [`tr_revocation::RevocationCache`] using the Phase F
+/// defaults: production registry URL (overridable via
+/// `--registry`), platform default cache directory, 60-min fresh
+/// TTL, 7-day stale grace.
 fn build_revocation_cache(
     registry_override: Option<String>,
 ) -> Result<tr_revocation::RevocationCache> {

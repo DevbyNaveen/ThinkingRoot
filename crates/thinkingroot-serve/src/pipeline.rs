@@ -135,74 +135,23 @@ pub struct PipelineResult {
     pub cache_dirty: bool,
 }
 
-/// Pipeline mode — controls whether the post-extract heavy steps
-/// (vector index, artifact compilation, post-compile verify) run.
+/// Run the v3 pipeline: Parse → Extract+Ground+Rooting+Link+SVO →
+/// CozoDB persist. The 3 user-visible phases (Parse / Extract /
+/// Pack+Sign) of the v3 final plan §5 are realised here as Parse +
+/// Extract; Pack+Sign lives in `tr-format` / `tr-sigstore` and runs
+/// only when the user invokes `root pack`.
 ///
-/// Per the v3 implementation plan §Week 4 + D6: `Full` is the default
-/// for `root compile` and the Python `compile()` binding. `V3Minimal`
-/// is what `root pack --format=tr/3` callers want when they're
-/// optimising for v3 wire-format output and don't need the v1
-/// artifacts CozoDB doesn't include in the pack anyway.
-///
-/// Same CozoDB output in both modes — minimal just skips the steps
-/// whose products aren't part of a v3 pack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineMode {
-    /// All 11 phases run. Preserves the v1 contract: emits markdown
-    /// artifacts to `<workspace>/.thinkingroot/artifacts/`, builds the
-    /// vector index, and runs post-compile health verification.
-    Full,
-    /// 3-phase v3 minimum: Parse → Extract+Ground+Rooting+Link+SVO →
-    /// CozoDB persist. Skips:
-    /// - **Phase 9 Vector update** — consumers re-embed at consume
-    ///   time per spec §13.1.
-    /// - **Phase 10 Selective compilation** — markdown artifacts move
-    ///   to standalone `root render` per spec §11.
-    /// - **Phase 11 Verify** — post-compile health score moves to
-    ///   standalone `root health` per spec §11.
-    /// - **Early-exit Compiler/Verifier** when no docs changed.
-    ///
-    /// CozoDB still receives every claim/source/edge insert; v3 packs
-    /// produced from a V3Minimal compile carry the same byte-range
-    /// citations as a Full compile.
-    V3Minimal,
-}
-
-/// Run the full pipeline. Same as the historic v1 entry point — kept
-/// stable so every existing caller (CLI compile, watch mode, Python
-/// `compile()`, engine.compile) doesn't need a code change. Preserves
-/// the v1 contract per D6 of the v3 implementation plan.
+/// Vector indexing, markdown artifacts, and post-compile health
+/// verification are NOT part of `root compile` — they live in
+/// dedicated commands (`root query` / `root render` / `root health`)
+/// per v3 spec §11. Skipping them at compile time is what lets the
+/// 3-phase pipeline finish in ~30s instead of ~3min.
 pub async fn run_pipeline(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<PipelineResult> {
-    run_pipeline_with_mode(root_path, branch, progress, PipelineMode::Full).await
-}
-
-/// Run the pipeline in the v3-minimal mode — Parse → Extract → CozoDB
-/// persist, no artifacts/vector/verify. Same CozoDB output as
-/// `run_pipeline`; just faster. Used by callers that produce v3 packs
-/// directly (artifacts/vector aren't part of the v3 wire format).
-pub async fn run_pipeline_v3_minimal(
-    root_path: &Path,
-    branch: Option<&str>,
-    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-) -> Result<PipelineResult> {
-    run_pipeline_with_mode(root_path, branch, progress, PipelineMode::V3Minimal).await
-}
-
-/// Internal entry point — both [`run_pipeline`] and
-/// [`run_pipeline_v3_minimal`] funnel through here. The mode flag
-/// gates Phases 9/10/11 + the early-exit artifact path; everything
-/// else (parse, extract, ground, root, link, SVO) runs identically.
-pub async fn run_pipeline_with_mode(
-    root_path: &Path,
-    branch: Option<&str>,
-    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-    mode: PipelineMode,
-) -> Result<PipelineResult> {
-    let result = run_pipeline_inner(root_path, branch, progress.clone(), mode).await;
+    let result = run_pipeline_inner(root_path, branch, progress.clone()).await;
     if let Err(ref e) = result
         && let Some(ref tx) = progress
     {
@@ -217,7 +166,6 @@ async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-    mode: PipelineMode,
 ) -> Result<PipelineResult> {
     macro_rules! emit {
         ($event:expr) => {
@@ -284,18 +232,9 @@ async fn run_pipeline_inner(
     });
 
     // ─── Early exit: nothing to process ────────────────────────────────
+    // Vectors are not built here — `root query` lazy-builds them on
+    // first call per v3 final plan §13.1.
     if potentially_changed.is_empty() && deleted_sources.is_empty() {
-        // If the vector index is missing (e.g. previous run crashed before
-        // save), rebuild it now from the graph before returning.
-        if storage.vector.is_empty() {
-            tracing::info!("vector index empty on early-exit — rebuilding from graph");
-            let (ent_count, clm_count) =
-                update_vector_index_full_with_progress(&mut storage, &progress)?;
-            emit!(ProgressEvent::VectorUpdateDone {
-                entities_indexed: ent_count,
-                claims_indexed: clm_count,
-            });
-        }
         return Ok(PipelineResult {
             files_parsed,
             claims_count: 0,
@@ -599,18 +538,12 @@ async fn run_pipeline_inner(
 
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
-    let mut changed = 0usize;
-    let mut deleted = 0usize;
-
-    let mut stale_claim_vector_ids: Vec<String> = Vec::new();
-    let mut stale_entity_candidate_ids: Vec<String> = Vec::new();
 
     for doc in &truly_changed {
         let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
         if !existing_sources.is_empty() {
             for (source_id, _, _) in &existing_sources {
                 affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
-                // Fetch entity IDs once, reuse for both cross-file triples and vector stale IDs.
                 let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
                 if !entity_ids_from_source.is_empty() {
                     let cross_file_triples = storage
@@ -625,22 +558,13 @@ async fn run_pipeline_inner(
                         source_id
                     );
                 }
-                // Capture stale vector entries before removal.
-                for cid in storage.graph.get_claim_ids_for_source(source_id)? {
-                    stale_claim_vector_ids.push(format!("claim:{cid}"));
-                }
-                for eid in &entity_ids_from_source {
-                    stale_entity_candidate_ids.push(format!("entity:{eid}"));
-                }
             }
             storage.graph.remove_source_by_uri(&doc.uri)?;
-            changed += 1;
         }
     }
 
     for (source_id, uri) in &deleted_sources {
         affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
-        // Fetch entity IDs once, reuse for both cross-file triples and vector stale IDs.
         let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
         if !entity_ids_from_source.is_empty() {
             let cross_file_triples = storage
@@ -655,16 +579,8 @@ async fn run_pipeline_inner(
                 source_id
             );
         }
-        // Capture stale vector entries before removal.
-        for cid in storage.graph.get_claim_ids_for_source(source_id)? {
-            stale_claim_vector_ids.push(format!("claim:{cid}"));
-        }
-        for eid in &entity_ids_from_source {
-            stale_entity_candidate_ids.push(format!("entity:{eid}"));
-        }
         storage.graph.remove_source_by_uri(uri)?;
         fingerprints.remove(uri);
-        deleted += 1;
     }
 
     // ─── Phase 5: Incremental entity relation update for removals ──────
@@ -676,8 +592,6 @@ async fn run_pipeline_inner(
             .update_entity_relations_for_triples(&affected_triples)?;
     }
 
-    let has_any_changes = changed > 0 || deleted > 0 || !truly_changed.is_empty();
-
     // If only deletions or all fingerprint hits — no new content to link.
     if truly_changed.is_empty() {
         emit!(ProgressEvent::LinkComplete {
@@ -686,66 +600,19 @@ async fn run_pipeline_inner(
             contradictions: 0
         });
 
-        // Vector index, selective compilation, and post-compile health
-        // verification are part of the v1 contract — V3Minimal skips
-        // them per spec §11. CozoDB content is identical either way.
-        let (artifacts_count, contradictions_count, health_score) =
-            if matches!(mode, PipelineMode::Full) {
-                let (ent_count, clm_count) =
-                    update_vector_index_full_with_progress(&mut storage, &progress)?;
-                emit!(ProgressEvent::VectorUpdateDone {
-                    entities_indexed: ent_count,
-                    claims_indexed: clm_count,
-                });
-
-                let compiler = {
-                    let c = thinkingroot_compile::Compiler::new(&config)?;
-                    if let Some(ref tx) = progress {
-                        let tx_compile = tx.clone();
-                        let pf = Arc::new(move |done: usize, total: usize| {
-                            let _ = tx_compile
-                                .send(ProgressEvent::CompilationProgress { done, total });
-                        })
-                            as thinkingroot_compile::CompileProgressFn;
-                        c.with_progress(pf)
-                    } else {
-                        c
-                    }
-                };
-                let artifacts =
-                    compiler.compile_affected(&storage.graph, &data_dir, &[], has_any_changes)?;
-                emit!(ProgressEvent::CompilationDone {
-                    artifacts: artifacts.len()
-                });
-
-                let verifier = thinkingroot_verify_internal::Verifier::new(&config);
-                let verification = verifier.verify(&storage.graph)?;
-                emit!(ProgressEvent::VerificationDone {
-                    health: verification.health_score.as_percentage(),
-                });
-                (
-                    artifacts.len(),
-                    verification.contradictions,
-                    verification.health_score.as_percentage(),
-                )
-            } else {
-                // V3Minimal: health is a v1 concept; report the
-                // best-case 100 (no contradictions counted because the
-                // v3 verifier doesn't run in this mode — see spec §11).
-                (0usize, 0usize, 100u8)
-            };
-
         fingerprints.save()?;
         config.save(root_path)?;
 
+        // Health/artifacts/contradictions are surfaced by `root health`
+        // and `root render` — `root compile` only persists the graph.
         return Ok(PipelineResult {
             files_parsed,
             claims_count: 0,
             entities_count: 0,
             relations_count: 0,
-            contradictions_count,
-            artifacts_count,
-            health_score,
+            contradictions_count: 0,
+            artifacts_count: 0,
+            health_score: 0,
             cache_hits,
             early_cutoffs: skipped + fingerprint_cutoffs,
             structural_extractions: extraction.structural_extractions,
@@ -1020,164 +887,11 @@ async fn run_pipeline_inner(
         .graph
         .update_entity_relations_for_triples(&new_triples)?;
 
-    // ─── Phase 9: Vector update ─────────────────────────────────────────
-    // V3Minimal skips vector index entirely — consumers re-embed at
-    // consume time per spec §13.1 (embedding models drift 7+ nDCG@10
-    // points/year per MTEB; baked embeddings are anti-feature).
-    if matches!(mode, PipelineMode::Full)
-        && deleted == 0
-    {
-        // Surgical update: remove stale entries, upsert new ones.
-        // Claims are always source-scoped — all stale claim IDs are safe to remove.
-        // Entities may survive if other sources still reference them — only remove
-        // those no longer present in the graph after removal.
-        let current_entity_ids: std::collections::HashSet<String> = storage
-            .graph
-            .get_all_entities()?
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect();
-
-        let mut stale_ids: Vec<&str> = stale_claim_vector_ids.iter().map(|s| s.as_str()).collect();
-        let truly_stale_entity_ids: Vec<String> = stale_entity_candidate_ids
-            .iter()
-            .filter(|id| {
-                // Strip "entity:" prefix to get raw entity ID for graph lookup.
-                let raw = id.strip_prefix("entity:").unwrap_or(id);
-                !current_entity_ids.contains(raw)
-            })
-            .cloned()
-            .collect();
-        stale_ids.extend(truly_stale_entity_ids.iter().map(|s| s.as_str()));
-
-        storage.vector.remove_by_ids(&stale_ids);
-
-        // Build new vector items for affected entities and newly added claims.
-        let all_entities = storage.graph.get_all_entities()?;
-        let affected_set: std::collections::HashSet<&str> = link_output
-            .affected_entity_ids
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let new_entity_items: Vec<(String, String, String)> = all_entities
-            .iter()
-            .filter(|(id, _, _)| affected_set.contains(id.as_str()))
-            .map(|(id, name, etype)| {
-                (
-                    format!("entity:{id}"),
-                    format!("{name} ({etype})"),
-                    format!("entity|{id}|{name}|{etype}"),
-                )
-            })
-            .collect();
-
-        let all_claims = storage.graph.get_all_claims_with_sources()?;
-        let added_claim_set: std::collections::HashSet<&str> = link_output
-            .added_claim_ids
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let new_claim_items: Vec<(String, String, String)> = all_claims
-            .iter()
-            .filter(|(id, _, _, _, _, _)| added_claim_set.contains(id.as_str()))
-            .map(|(id, statement, ctype, conf, uri, _)| {
-                (
-                    format!("claim:{id}"),
-                    statement.clone(),
-                    format!("claim|{id}|{ctype}|{conf}|{uri}"),
-                )
-            })
-            .collect();
-
-        let ent_count = new_entity_items.len();
-        let clm_count = new_claim_items.len();
-        let total_vec = ent_count + clm_count;
-
-        upsert_with_vector_progress(
-            &mut storage.vector,
-            &new_entity_items,
-            512,
-            0,
-            total_vec,
-            &progress,
-        )?;
-        upsert_with_vector_progress(
-            &mut storage.vector,
-            &new_claim_items,
-            512,
-            ent_count,
-            total_vec,
-            &progress,
-        )?;
-        storage.vector.save()?;
-
-        tracing::info!(
-            "vector index updated surgically: removed {}, added {} entities + {} claims",
-            stale_ids.len(),
-            ent_count,
-            clm_count,
-        );
-        emit!(ProgressEvent::VectorUpdateDone {
-            entities_indexed: ent_count,
-            claims_indexed: clm_count,
-        });
-    } else if matches!(mode, PipelineMode::Full) {
-        // Deletions occurred — full rebuild to correctly handle orphaned entries.
-        let (ent_count, clm_count) =
-            update_vector_index_full_with_progress(&mut storage, &progress)?;
-        emit!(ProgressEvent::VectorUpdateDone {
-            entities_indexed: ent_count,
-            claims_indexed: clm_count,
-        });
-    }
-
-    // ─── Phase 10: Selective compilation ────────────────────────────────
-    // Phase 11: Verify + persist (post-compile health). Both move to
-    // standalone subcommands in v3 (spec §11): `root render` for
-    // artifacts, `root health` for the verify pass. V3Minimal skips
-    // them so v3 packs build fast; Full keeps them for the v1
-    // contract preserved by D6 (Python `compile()`, `root compile`).
-    let (artifacts_count, contradictions_count, health_score) =
-        if matches!(mode, PipelineMode::Full) {
-            let compiler = {
-                let c = thinkingroot_compile::Compiler::new(&config)?;
-                if let Some(ref tx) = progress {
-                    let tx_compile = tx.clone();
-                    let pf = Arc::new(move |done: usize, total: usize| {
-                        let _ = tx_compile
-                            .send(ProgressEvent::CompilationProgress { done, total });
-                    }) as thinkingroot_compile::CompileProgressFn;
-                    c.with_progress(pf)
-                } else {
-                    c
-                }
-            };
-            let artifacts = compiler.compile_affected(
-                &storage.graph,
-                &data_dir,
-                &link_output.affected_entity_ids,
-                true,
-            )?;
-            emit!(ProgressEvent::CompilationDone {
-                artifacts: artifacts.len()
-            });
-
-            let verifier = thinkingroot_verify_internal::Verifier::new(&config);
-            let verification = verifier.verify(&storage.graph)?;
-            emit!(ProgressEvent::VerificationDone {
-                health: verification.health_score.as_percentage(),
-            });
-            (
-                artifacts.len(),
-                verification.contradictions,
-                verification.health_score.as_percentage(),
-            )
-        } else {
-            // V3Minimal: artifacts/health are v1 concepts. Report
-            // best-case 100 so consumers reading PipelineResult don't
-            // mistake a skipped run for an unhealthy graph.
-            (0usize, 0usize, 100u8)
-        };
+    // Vector index, markdown artifacts, and post-compile health
+    // verification are NOT part of `root compile` in v3 — they live
+    // in `root query` (which lazily builds the index on first call),
+    // `root render`, and `root health` respectively. Per v3 final
+    // plan §5.4 / §11.
 
     fingerprints.save()?;
     config.save(root_path)?;
@@ -1187,46 +901,26 @@ async fn run_pipeline_inner(
         claims_count,
         entities_count,
         relations_count,
-        contradictions_count,
-        artifacts_count,
-        health_score,
+        contradictions_count: 0,
+        artifacts_count: 0,
+        health_score: 0,
         cache_hits,
         early_cutoffs: skipped + fingerprint_cutoffs,
         structural_extractions,
-        // Full pipeline ran — CozoDB has new data.
+        // v3 pipeline ran — CozoDB has new data.
         cache_dirty: true,
     })
 }
 
-/// Chunk `items` into batches of `chunk_size`, calling `upsert_batch` per chunk
-/// and emitting `VectorProgress` events.  `offset` is added to the running
-/// `done` counter so that entity and claim passes share a single progress bar.
-fn upsert_with_vector_progress(
-    vector: &mut thinkingroot_graph::vector::VectorStore,
-    items: &[(String, String, String)],
-    chunk_size: usize,
-    offset: usize,
-    total: usize,
-    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-) -> Result<usize> {
-    let mut done = 0usize;
-    for chunk in items.chunks(chunk_size) {
-        vector.upsert_batch(chunk)?;
-        done += chunk.len();
-        if let Some(tx) = progress {
-            let _ = tx.send(ProgressEvent::VectorProgress {
-                done: offset + done,
-                total,
-            });
-        }
-    }
-    Ok(done)
-}
-
-fn update_vector_index_full_with_progress(
-    storage: &mut StorageEngine,
-    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-) -> Result<(usize, usize)> {
+/// Rebuild the vector index from the persisted CozoDB graph. Used by
+/// `root query` / `root ask` on first call after a v3 `root compile`,
+/// since v3 `root compile` deliberately does not embed (consumers
+/// choose their own embedding model per v3 final plan §13.1).
+///
+/// Resets the existing index, embeds every entity + claim currently
+/// in the graph, and saves to disk. Returns
+/// `(entities_indexed, claims_indexed)`.
+pub fn rebuild_vector_index(storage: &mut StorageEngine) -> Result<(usize, usize)> {
     storage.vector.reset();
 
     let entities = storage.graph.get_all_entities()?;
@@ -1254,19 +948,22 @@ fn update_vector_index_full_with_progress(
         })
         .collect();
 
-    let total = entity_items.len() + claim_items.len();
-
-    let entity_count =
-        upsert_with_vector_progress(&mut storage.vector, &entity_items, 512, 0, total, progress)?;
-    let claim_count = upsert_with_vector_progress(
-        &mut storage.vector,
-        &claim_items,
-        512,
-        entity_count,
-        total,
-        progress,
-    )?;
+    let entity_count = upsert_in_chunks(&mut storage.vector, &entity_items, 512)?;
+    let claim_count = upsert_in_chunks(&mut storage.vector, &claim_items, 512)?;
     storage.vector.save()?;
 
     Ok((entity_count, claim_count))
+}
+
+fn upsert_in_chunks(
+    vector: &mut thinkingroot_graph::vector::VectorStore,
+    items: &[(String, String, String)],
+    chunk_size: usize,
+) -> Result<usize> {
+    let mut done = 0usize;
+    for chunk in items.chunks(chunk_size) {
+        vector.upsert_batch(chunk)?;
+        done += chunk.len();
+    }
+    Ok(done)
 }

@@ -40,7 +40,7 @@ impl Probe for ProvenanceProbe {
         let source_text = match bytes {
             Some(b) => match String::from_utf8(b.bytes.clone()) {
                 Ok(s) => s,
-                // Non-UTF-8 source (binary). Rooting v1 only supports text sources.
+                // Non-UTF-8 source (binary). The provenance probe only operates over text sources.
                 Err(_) => {
                     return Ok(ProbeResult::skipped(
                         ProbeName::Provenance,

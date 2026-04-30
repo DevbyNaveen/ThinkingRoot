@@ -6,8 +6,8 @@
 //! to `Quarantined`.
 //!
 //! Non-derived claims (extracted directly from source) have no parents, so
-//! the probe returns `skipped`. Week 4 v1 only checks intersection size; a
-//! future pass can score path-length or co-occurrence frequency.
+//! the probe returns `skipped`. Today the probe only checks intersection
+//! size; a future pass can score path-length or co-occurrence frequency.
 //!
 //! Non-fatal probe: failure → `Quarantined`, not `Rejected`.
 

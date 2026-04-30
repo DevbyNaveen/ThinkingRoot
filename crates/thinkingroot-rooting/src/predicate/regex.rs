@@ -24,8 +24,8 @@ impl PredicateEngine for RegexEngine {
         let pattern = Regex::new(&predicate.query)
             .map_err(|e| RootingError::InvalidPredicate(format!("regex compile: {e}")))?;
 
-        // Treat non-UTF-8 bytes as a no-match rather than a hard error. Rooting
-        // v1 only supports text sources for the regex engine.
+        // Treat non-UTF-8 bytes as a no-match rather than a hard error. The
+        // regex engine only operates over text sources.
         let text = match std::str::from_utf8(source_bytes) {
             Ok(t) => t,
             Err(_) => {

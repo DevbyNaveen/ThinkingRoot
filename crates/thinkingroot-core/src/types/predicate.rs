@@ -89,7 +89,8 @@ pub struct Predicate {
 
 /// Which languages the predicate engine supports. The MVP covers the three
 /// most common source types for developer knowledge packs; more can be added
-/// post-v1 without breaking the wire format.
+/// without breaking the wire format (the enum is forward-compatible because
+/// unknown variants are rejected at parse time, not silently dropped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PredicateLanguage {

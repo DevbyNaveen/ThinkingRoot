@@ -8,7 +8,7 @@ use thinkingroot_core::{
     SourceId, WorkspaceId, config::Config,
 };
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_verify_internal::Verifier;
+use thinkingroot_health::Verifier;
 
 /// Compute a BLAKE3 hash of a normalised claim statement.
 /// Normalisation: lowercase + collapse whitespace.

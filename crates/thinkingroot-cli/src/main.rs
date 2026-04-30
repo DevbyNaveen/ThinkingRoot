@@ -46,7 +46,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compile a directory through the full knowledge pipeline
+    /// Compile a directory through the v3 knowledge pipeline
+    /// (Parse → Extract+Ground+Rooting+Link+SVO → CozoDB persist).
+    /// Vector indexing, markdown artifacts, and the post-compile
+    /// health score are NOT part of this command — invoke
+    /// `root query`/`root ask` (auto-builds the index on first call),
+    /// `root render`, and `root health` for those.
     Compile {
         /// Path to the directory to compile
         path: PathBuf,
@@ -57,15 +62,6 @@ enum Commands {
         /// stay in the `attested` tier — same as pre-Rooting behavior.
         #[arg(long)]
         no_rooting: bool,
-        /// Run the v3 minimum 3-phase pipeline: Parse → Extract+Ground+
-        /// Rooting+Link+SVO → CozoDB persist. Skips vector index,
-        /// markdown artifacts, and post-compile health verification —
-        /// products that don't ship inside a v3 `.tr` pack anyway.
-        /// Use with `root pack --format=tr/3` for the fastest v3
-        /// build path. Without this flag, `root compile` runs the full
-        /// 11-phase v1 pipeline (back-compat default).
-        #[arg(long)]
-        v3_minimal: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -325,10 +321,14 @@ enum Commands {
     },
     /// Package a compiled workspace into a portable `.tr` knowledge
     /// pack. Reads metadata from `<workspace>/Pack.toml`; CLI flags
-    /// override individual fields. The output `.tr` is a `tar+zstd`
-    /// archive with a TR-1 manifest at root + every file under
-    /// `<workspace>/.thinkingroot/` (minus `cache/`, `config.toml`,
-    /// `fingerprints.json` which are local-only).
+    /// override individual fields. The output `.tr` is a v3
+    /// (`tr/3`) outer tar containing `manifest.toml` +
+    /// `source.tar.zst` + `claims.jsonl` (and `signature.sig` when
+    /// `--sign` or `--sign-keyless` was passed). Skips three
+    /// local-only paths from the workspace: `cache/` (recompute
+    /// artefact, contains workstation paths), `config.toml`
+    /// (workspace-local, may carry provider keys),
+    /// `fingerprints.json` (incremental-compile mtime ledger).
     Pack {
         /// Path to the workspace root (must contain `.thinkingroot/`).
         #[arg(default_value = ".")]
@@ -374,9 +374,10 @@ enum Commands {
     /// installing it. Runs the offline verification chain from spec
     /// §7.6: recompute the pack hash, check it matches the manifest's
     /// declared `pack_hash`, then verify the embedded Sigstore bundle
-    /// (DSSE signature + in-toto statement subject digest). Exit codes
-    /// match the install verification surface (0 verified, 1 tampered,
-    /// 2 unsigned, 3 unsupported).
+    /// (DSSE signature + in-toto statement subject digest). Exit
+    /// codes match the install verification surface
+    /// (`pack_cmd::EXIT_*`): 0 verified, 70 unsigned (without
+    /// `--allow-unsigned`), 71 tampered, 72 revoked.
     Verify {
         /// Path to the `.tr` pack file.
         pack: PathBuf,
@@ -685,9 +686,8 @@ async fn async_main() -> anyhow::Result<()> {
             path,
             branch,
             no_rooting,
-            v3_minimal,
         }) => {
-            run_compile(&path, branch.as_deref(), use_progress, no_rooting, v3_minimal).await?;
+            run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
         }
         Some(Commands::Health { path }) => {
             run_health(&path).await?;
@@ -983,10 +983,10 @@ async fn async_main() -> anyhow::Result<()> {
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             if let Some(path) = cli.path {
-                run_compile(&path, None, use_progress, false, false).await?;
+                run_compile(&path, None, use_progress, false).await?;
             } else {
                 // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None, use_progress, false, false).await?;
+                run_compile(&PathBuf::from("."), None, use_progress, false).await?;
             }
         }
     }
@@ -999,7 +999,6 @@ async fn run_compile(
     branch: Option<&str>,
     use_progress: bool,
     no_rooting: bool,
-    v3_minimal: bool,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
@@ -1029,13 +1028,7 @@ async fn run_compile(
 
     let start = Instant::now();
 
-    let result = if v3_minimal {
-        // V3Minimal skips the heavy post-extract steps (vector,
-        // artifacts, verify). Progress UI assumes the full pipeline,
-        // so v3_minimal disables the indicatif bars and uses the
-        // plain async path. CozoDB output is identical either way.
-        pipeline::run_pipeline_v3_minimal(&path, branch, None).await?
-    } else if use_progress {
+    let result = if use_progress {
         progress::run_compile_progress(&path, branch).await?
     } else {
         pipeline::run_pipeline(&path, branch, None).await?
@@ -1126,7 +1119,7 @@ async fn run_health(path: &PathBuf) -> anyhow::Result<()> {
     let storage = thinkingroot_graph::StorageEngine::init(&data_dir)
         .await
         .context("failed to open storage")?;
-    let verifier = thinkingroot_verify_internal::Verifier::new(&config);
+    let verifier = thinkingroot_health::Verifier::new(&config);
     let result = verifier.verify(&storage.graph)?;
 
     print_banner();
@@ -1146,6 +1139,39 @@ async fn run_health(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Lazy-build the vector index from the persisted graph if it's
+/// empty. v3 `root compile` does not embed; the index is materialised
+/// on first `root query` / `root ask` and reused thereafter (per v3
+/// final plan §13.1 — consumers choose their own embedding model).
+fn ensure_vector_index(
+    storage: &mut thinkingroot_graph::StorageEngine,
+    path: &Path,
+) -> anyhow::Result<()> {
+    if !storage.vector.is_empty() {
+        return Ok(());
+    }
+    let claim_count = storage.graph.get_all_claims_with_sources()?.len();
+    if claim_count == 0 {
+        anyhow::bail!(
+            "No claims in the compiled graph. Run `root compile {}` first.",
+            path.display()
+        );
+    }
+    println!(
+        "  {} building search index from {} claims (one-time, ~10s for 1k claims)…",
+        style("Indexing:").cyan().bold(),
+        style(claim_count).white()
+    );
+    let (entities, claims) = thinkingroot_serve::pipeline::rebuild_vector_index(storage)?;
+    println!(
+        "  {} {} entities + {} claims indexed",
+        style("Indexed:").green().bold(),
+        entities,
+        claims
+    );
+    Ok(())
+}
+
 async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<()> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("path not found: {}", path.display()))?;
@@ -1162,9 +1188,7 @@ async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<
         .await
         .context("failed to open storage")?;
 
-    if storage.vector.is_empty() {
-        anyhow::bail!("No embeddings found. Run `root compile` first to build the search index.");
-    }
+    ensure_vector_index(&mut storage, &path)?;
 
     println!();
     println!(
@@ -1273,6 +1297,17 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
         );
     }
 
+    // Lazy-build the vector index BEFORE mounting QueryEngine — once
+    // QueryEngine takes ownership of storage behind a Mutex, rebuilding
+    // is harder to drive from the CLI. v3 packs deliberately don't ship
+    // an in-pack vector index (final plan §13.1).
+    {
+        let mut storage = thinkingroot_graph::StorageEngine::init(&data_dir)
+            .await
+            .context("failed to open storage")?;
+        ensure_vector_index(&mut storage, &path)?;
+    }
+
     println!();
     println!(
         "  {} \"{}\"",
@@ -1362,7 +1397,7 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
     let chat = snapshot
         .as_ref()
         .map(|s| s.config.chat.resolve(&s.source_kinds))
-        .unwrap_or_else(AskRequest::legacy_chat);
+        .unwrap_or_else(AskRequest::default_chat);
     let identity_owned = snapshot.as_ref().map(|s| {
         thinkingroot_serve::intelligence::identity::build_workspace_identity(s, &s.config.chat)
     });

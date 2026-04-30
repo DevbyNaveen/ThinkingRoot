@@ -450,9 +450,9 @@ impl ToolHandler for ReadSourceTool {
 /// `search_claims` — v3 spec §8.5 MCP tool. Returns matching claims as
 /// `(id, stmt, file, byte_range)` so the agent can pivot directly into
 /// `read_source(claim_id)` for the verbatim text. Output is JSON for
-/// the agent's parser; deliberately distinct from the v1 `search`
-/// tool's prose-formatted output (which mixes claims + entities for
-/// human-readable debugging).
+/// the agent's parser; deliberately distinct from the human-oriented
+/// `search` tool's prose-formatted output (which mixes claims +
+/// entities for human-readable debugging).
 pub struct SearchClaimsTool {
     ctx: ToolContext,
 }

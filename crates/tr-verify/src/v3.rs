@@ -336,8 +336,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     // verify_v3_pack_with_revocation tests. We construct a
     // RevocationCache against a temp-dir and pre-seed the snapshot
-    // file to bypass the network — same mechanic the v1 verifier's
-    // tests use.
+    // file directly so the cache treats it as already-fetched-and-
+    // fresh, bypassing the registry HTTP path entirely.
     // ─────────────────────────────────────────────────────────────
 
     use std::time::SystemTime;
@@ -371,9 +371,11 @@ mod tests {
                     details_url: "https://example.com/advisory".to_string(),
                 })
                 .collect(),
-            // Ed25519 signature placeholder — tests bypass verification
-            // via `pre_seed_snapshot` writing snapshot.json directly,
-            // skipping the signed-fetch path.
+            // Empty signature is acceptable in this fixture because the
+            // test pre-seeds `snapshot.json` directly on disk, which
+            // bypasses the signed-fetch path entirely (production code
+            // requires a valid Ed25519 signature against the registry's
+            // signing key).
             signature: String::new(),
             signing_key_id: "test-key".to_string(),
             next_poll_hint_sec: 3600,

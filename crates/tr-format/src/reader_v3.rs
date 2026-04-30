@@ -1,14 +1,14 @@
 //! v3 pack reader — parse a `package.tr` (the 3-file outer tar layout)
 //! back into typed structures.
 //!
-//! Unlike the v1 reader, the v3 reader does **not** uncompress the
-//! source bundle — it returns `source.tar.zst` as opaque bytes alongside
-//! the manifest and claims. Consumers that need the source files
-//! (`root verify`, the v3 reader half of `root install`) then do their
-//! own zstd-decode + tar walk over the inner archive. Keeping the inner
-//! source bundle as raw bytes preserves the BLAKE3 hash chain — the
-//! pack-hash recipe (`docs/2026-04-29-thinkingroot-v3-final-plan.md`
-//! §3.1) consumes the inner bundle byte-for-byte.
+//! The reader does **not** uncompress the source bundle — it returns
+//! `source.tar.zst` as opaque bytes alongside the manifest and claims.
+//! Consumers that need the source files (`root verify`, the v3 reader
+//! half of `root install`) then do their own zstd-decode + tar walk
+//! over the inner archive. Keeping the inner source bundle as raw
+//! bytes preserves the BLAKE3 hash chain — the pack-hash recipe
+//! (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §3.1) consumes
+//! the inner bundle byte-for-byte.
 
 use std::io::{Cursor, Read};
 

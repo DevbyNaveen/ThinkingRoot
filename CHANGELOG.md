@@ -9,6 +9,71 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — `root compile` is now the v3 3-phase pipeline
+
+`root compile` runs the v3 pipeline by default (Parse →
+Extract+Ground+Rooting+Link+SVO → CozoDB persist). The legacy
+11-phase v1 path has been **deleted**, not gated behind a flag.
+Specifically:
+
+- `PipelineMode` enum removed from `thinkingroot-serve::pipeline`.
+- `run_pipeline_v3_minimal` removed; `run_pipeline` is the only
+  entry point and runs the v3 path.
+- `--v3-minimal` flag removed from `root compile` (it was the only
+  way to opt into v3 before; v3 is now unconditional).
+- In-pipeline vector index update (Phase 9), markdown artifact
+  compilation (Phase 10), and post-compile health verification
+  (Phase 11) deleted from the pipeline body.
+
+The three former in-pipeline phases moved to standalone commands:
+
+- **Vector index** — `root query` and `root ask` now lazy-build
+  the index from the persisted graph on first call (one-time cost,
+  ~10 s per 1 k claims; subsequent calls reuse the saved index).
+  Public API: `thinkingroot_serve::pipeline::rebuild_vector_index`.
+- **Markdown artifacts** — `root render` (was already present).
+- **Health score** — `root health` (was already present).
+
+This matches the v3 final plan §5.4 / §11: v3 packs ship source
+bytes + claims; everything else is derived state, built at consume
+time. The compile-time pipeline now finishes in ~30 s instead of
+~3 min for a 300-file repo.
+
+### Removed — v1 wire format and v1 trust verifier
+
+The v1 `.tr` wire format and the v1 trust verifier have been
+deleted from `tr-format` and `tr-verify`. The repository now
+ships only the v3 wire format (`tr/3`), specified canonically in
+`docs/2026-04-29-thinkingroot-v3-final-plan.md`.
+
+Symbols deleted (commit `a53c56a`):
+
+- `tr_format::Manifest` (v1)
+- `tr_format::TrustTier`
+- `tr_format::writer::PackBuilder`
+- `tr_format::reader::Pack`, `read_bytes`, `read_file`
+- `tr_format::capabilities::Capabilities`
+- `tr_verify::Verifier`, `VerifierConfig`
+- `tr_verify::Verdict`, `RevokedDetails`, `TamperedKind`,
+  `VerifiedDetails`
+- `tr_verify::AuthorKeyStore`, `TrustedAuthorKey`
+
+`tr-c2pa` stub crate was deleted in commit `5fa9066`; C2PA
+support is deferred to v3.2+ per v3 final plan §11.
+
+What remains in `tr-format`: `ManifestV3`, `V3PackBuilder`,
+`read_v3_pack`, `V3Pack`, `ClaimRecord`. What remains in
+`tr-verify`: `verify_v3_pack`, `verify_v3_pack_with_revocation`,
+`V3Verdict`, `V3TamperedKind`.
+
+Cloud-side coordination is documented in
+`docs/2026-04-30-v1-removal-cross-repo-coordination.md`. The
+sibling `~/Desktop/thinkingroot-cloud/services/registry/`
+imports v1 symbols at `services/registry/src/service.rs:17,
+283–287, 355–356` and `services/registry/tests/integration.rs:21,
+46, 50`; cloud-side migration must land before the next
+workspace version bump.
+
 ### Added — chat streaming + fast-fail pre-flight
 
 Real token-by-token SSE streaming and an actionable pre-flight
@@ -140,13 +205,23 @@ the same wire path against `gpt-5.4`; gated on
 
 ### Added — `tr-format` + `.tr` distribution loop
 
+> **⚠ Superseded:** this section documents the **v1 wire format**
+> (`tr/1`, `manifest.json` + 6 directories), which has been
+> deleted in commit `a53c56a`. See the "Removed — v1 wire format"
+> entry above. The current format is **v3** (`tr/3`,
+> `manifest.toml` + `source.tar.zst` + `claims.jsonl` +
+> optional `signature.sig`); the current public API is
+> `tr_format::{ManifestV3, V3PackBuilder, read_v3_pack, V3Pack,
+> ClaimRecord}`. The text below is preserved as historical
+> context only.
+
 The `.tr` distribution loop closes inside the OSS engine. Users
 no longer need to round-trip through the cloud just to share a
 compiled knowledge pack: any `.thinkingroot/` workspace can be
 packaged with `root pack`, and any `.tr` — local file, direct
 URL, or registry coordinate — can be installed with `root install`.
 
-#### `tr-format` crate
+#### `tr-format` crate (v1 — superseded)
 
 - **New crate `tr-format` at `crates/tr-format/`** — reader, writer,
   manifest schema, BLAKE3 digest helper, and capability set for the
@@ -156,9 +231,10 @@ URL, or registry coordinate — can be installed with `root install`.
   The crate is read-only and write-only — it does **not** execute
   anything from a `.tr`; mount/execute is the responsibility of the
   engine itself.
-- **Public re-exports**: `tr_format::{Manifest, TrustTier, Version,
-  Error}` plus `tr_format::reader::{read_file, read_bytes,
-  DEFAULT_SIZE_CAP}` and `tr_format::writer::PackBuilder`.
+- **Public re-exports** *(all deleted in commit `a53c56a`)*:
+  `tr_format::{Manifest, TrustTier, Version, Error}` plus
+  `tr_format::reader::{read_file, read_bytes, DEFAULT_SIZE_CAP}`
+  and `tr_format::writer::PackBuilder`.
 - **24 unit tests + 1 doctest** ship with the crate, including a
   long-paths-round-trip regression test exercising tar `LongLink`
   extension entries (real engine artifact filenames routinely

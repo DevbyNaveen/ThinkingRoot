@@ -201,8 +201,8 @@ pub struct VerificationMaterial {
     pub x509_certificate_chain: Option<X509CertificateChain>,
 
     /// Rekor inclusion proofs witnessing the signing event. Empty for
-    /// self-signed bundles. The `sigstore-impl` flow populates one
-    /// entry per Rekor witness.
+    /// self-signed bundles; populated with one entry per Rekor witness
+    /// for keyless-signed bundles.
     #[serde(rename = "tlogEntries", default, skip_serializing_if = "Vec::is_empty")]
     pub tlog_entries: Vec<TlogEntry>,
 }
@@ -216,9 +216,10 @@ pub struct PublicKeyMaterial {
     pub raw_bytes: String,
 }
 
-/// X.509 cert chain placeholder — populated by the `sigstore-impl`
-/// flow when Fulcio issues the cert. Shape matches Sigstore's
-/// `X509CertificateChain` proto so swap-in is byte-identical.
+/// X.509 cert chain carried inside a keyless-signed bundle. Shape
+/// matches Sigstore's `X509CertificateChain` proto byte-for-byte.
+/// Populated by the keyless flow when Fulcio issues the ephemeral
+/// signing cert; absent for self-signed bundles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct X509CertificateChain {
     /// PEM-encoded leaf-first cert chain.

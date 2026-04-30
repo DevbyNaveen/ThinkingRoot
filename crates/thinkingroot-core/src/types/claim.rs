@@ -193,15 +193,15 @@ impl Confidence {
 
 /// Span of source bytes that a claim was extracted from.
 ///
-/// Carries both line-based positioning (the v1 contract, used by callers
-/// that work in line space such as the legacy provenance probe) and
-/// byte-range positioning (the v3 contract, required by `claims.jsonl`
-/// per the v3 spec §3.3 wire format `{file, start, end}`).
+/// Carries both line-based positioning (used by callers that work in
+/// line space such as the provenance probe) and byte-range positioning
+/// (required by the v3 `claims.jsonl` wire format `{file, start, end}`,
+/// see v3 spec §3.3).
 ///
 /// New code should populate `byte_start`/`byte_end` whenever the parser
-/// or extractor has them. Old code that only knows lines stays backward
-/// compatible — `byte_start`/`byte_end` are `Option<u64>` and serde
-/// defaults to `None` for previously serialized claims.
+/// or extractor has them. Callers that only know lines stay compatible
+/// because `byte_start`/`byte_end` are `Option<u64>` and serde defaults
+/// to `None` for previously serialized claims.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start_line: u32,

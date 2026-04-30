@@ -9,8 +9,8 @@ use crate::graph_cache::{CachedClaim, KnowledgeGraph, RawGraphData};
 pub use crate::pipeline::PipelineResult;
 use thinkingroot_core::{Config, Error, Result};
 use thinkingroot_graph::StorageEngine;
-use thinkingroot_verify_internal::Verifier;
-pub use thinkingroot_verify_internal::verifier::VerificationResult;
+use thinkingroot_health::Verifier;
+pub use thinkingroot_health::verifier::VerificationResult;
 
 // ---------------------------------------------------------------------------
 // Public response types

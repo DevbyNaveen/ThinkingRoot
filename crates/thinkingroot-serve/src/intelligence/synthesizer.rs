@@ -6,7 +6,7 @@
 //
 //   * `Memory`         — the LongMemEval-tuned, byte-identical v0.9.0
 //                        prompt that scored 91.2 % on LME-500. The bench
-//                        harness pins this via `AskRequest::legacy_chat`
+//                        harness pins this via `AskRequest::default_chat`
 //                        and `history: &[]`, which together give a
 //                        wire-prompt byte-identical to v0.9.0.
 //
@@ -44,9 +44,9 @@
 // LongMemEval contract — explicitly tested:
 //
 //   * `MEMORY_SYSTEM_PROMPT` is byte-identical to the v0.9.0 prompt
-//     (`memory_persona_prompt_is_byte_identical_to_legacy`).
-//   * `AskRequest::legacy_chat()` returns Memory + Terse.
-//   * With `chat = legacy_chat()`, `identity = None`, `history = &[]`,
+//     (`memory_persona_prompt_is_byte_identical_to_baseline`).
+//   * `AskRequest::default_chat()` returns Memory + Terse.
+//   * With `chat = default_chat()`, `identity = None`, `history = &[]`,
 //     `build_user_message` returns the v0.9.0 body byte-for-byte
 //     (`build_user_message_no_identity_omits_system_reminder`).
 //   * The Memory persona never renders a history block, even if the
@@ -72,7 +72,7 @@ use crate::intelligence::temporal::compute_temporal_anchors;
 //
 // `MEMORY_SYSTEM_PROMPT` is the LongMemEval contract — byte-identical to
 // the v0.9.0 `HYBRID_SYNTHESIS_PROMPT`. The
-// `memory_persona_prompt_is_byte_identical_to_legacy` test guards that
+// `memory_persona_prompt_is_byte_identical_to_baseline` test guards that
 // contract.
 
 const MEMORY_SYSTEM_PROMPT: &str = r#"You are a precise personal memory assistant. You have two types of information:
@@ -359,8 +359,14 @@ pub struct AskRequest<'a> {
 
 impl<'a> AskRequest<'a> {
     /// Default `chat` value used by callers that haven't opted in to the
-    /// persona registry yet (LongMemEval bench, ablation harness).
-    pub fn legacy_chat() -> ResolvedChat {
+    /// persona registry yet (LongMemEval bench, ablation harness, REST
+    /// `/ask` endpoint without an explicit persona). Returns
+    /// `Memory + Terse`, the configuration that scored 91.2 % on
+    /// LongMemEval-500 (round 6, 2026-04-17). Test
+    /// `memory_persona_prompt_is_byte_identical_to_baseline` is the
+    /// regression guard — do not change the return value without
+    /// re-running the benchmark first.
+    pub fn default_chat() -> ResolvedChat {
         ResolvedChat {
             persona: ChatPersona::Memory,
             verbosity: ChatVerbosity::Terse,
@@ -1172,7 +1178,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
 "#;
 
     #[test]
-    fn memory_persona_prompt_is_byte_identical_to_legacy() {
+    fn memory_persona_prompt_is_byte_identical_to_baseline() {
         assert_eq!(
             MEMORY_SYSTEM_PROMPT, LEGACY_HYBRID_SYNTHESIS_PROMPT,
             "MEMORY_SYSTEM_PROMPT diverged from the v0.9.0 LongMemEval-91.2% prompt; \
@@ -1185,15 +1191,15 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn legacy_chat_is_memory_terse() {
-        let c = AskRequest::legacy_chat();
+    fn default_chat_is_memory_terse() {
+        let c = AskRequest::default_chat();
         assert_eq!(c.persona, ChatPersona::Memory);
         assert_eq!(c.verbosity, ChatVerbosity::Terse);
     }
 
     #[test]
-    fn build_system_prompt_memory_returns_legacy() {
-        let p = build_system_prompt(AskRequest::legacy_chat());
+    fn build_system_prompt_memory_returns_baseline() {
+        let p = build_system_prompt(AskRequest::default_chat());
         assert_eq!(p, MEMORY_SYSTEM_PROMPT);
     }
 
@@ -1355,7 +1361,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             answer_sids: &sids,
             sessions_dir: &claims_dir,
             excluded_claim_ids: &excluded,
-            chat: AskRequest::legacy_chat(),
+            chat: AskRequest::default_chat(),
             identity: None,
             today: None,
             history: NO_HISTORY,
@@ -1425,7 +1431,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             answer_sids: &sids,
             sessions_dir: &dir,
             excluded_claim_ids: &excluded,
-            chat: AskRequest::legacy_chat(),
+            chat: AskRequest::default_chat(),
             identity: None,
             today: None,
             history: NO_HISTORY,
@@ -1653,7 +1659,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             answer_sids: &sids,
             sessions_dir: &dir,
             excluded_claim_ids: &excluded,
-            chat: AskRequest::legacy_chat(),
+            chat: AskRequest::default_chat(),
             identity: None,
             today: None,
             history: &history,
@@ -1797,7 +1803,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
     fn compose_full_memory_persona_ignores_style_and_skills() {
         // LongMemEval contract: Memory persona produces byte-identical
         // wire prompt regardless of style/skills passed in.
-        let chat = AskRequest::legacy_chat();
+        let chat = AskRequest::default_chat();
         let with_extras = compose_full_system_prompt(
             chat,
             Some(&fixture_style()),

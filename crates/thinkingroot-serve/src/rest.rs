@@ -886,14 +886,15 @@ async fn ask_handler(
     let llm = engine.workspace_llm(&ws);
 
     // Workspace identity / persona — the chat-time prompt structure that
-    // anchors the model to *this* workspace. Falls back to the legacy
-    // (Memory/Terse, identity=None) shape when the workspace isn't
-    // mounted, preserving the v0.9.0 wire prompt for tests / harnesses.
+    // anchors the model to *this* workspace. Falls back to the
+    // Memory/Terse default (identity=None) when the workspace isn't
+    // mounted, preserving the v0.9.0 LongMemEval-91.2% wire prompt
+    // for tests / harnesses.
     let snapshot = engine.workspace_chat_snapshot(&ws).await;
     let chat = snapshot
         .as_ref()
         .map(|s| s.config.chat.resolve(&s.source_kinds))
-        .unwrap_or_else(SynthAskRequest::legacy_chat);
+        .unwrap_or_else(SynthAskRequest::default_chat);
     let identity_owned = snapshot
         .as_ref()
         .map(|s| build_workspace_identity(s, &s.config.chat));
@@ -1019,7 +1020,7 @@ async fn ask_stream_handler(
     let chat = snapshot
         .as_ref()
         .map(|s| s.config.chat.resolve(&s.source_kinds))
-        .unwrap_or_else(SynthAskRequest::legacy_chat);
+        .unwrap_or_else(SynthAskRequest::default_chat);
     let identity_owned = snapshot
         .as_ref()
         .map(|s| build_workspace_identity(s, &s.config.chat));
@@ -1199,7 +1200,7 @@ async fn agent_stream_response(
     let chat = snapshot
         .as_ref()
         .map(|s| s.config.chat.resolve(&s.source_kinds))
-        .unwrap_or_else(SynthAskRequest::legacy_chat);
+        .unwrap_or_else(SynthAskRequest::default_chat);
     drop(engine);
 
     let Some(workspace_root) = workspace_root else {
