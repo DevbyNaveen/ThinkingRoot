@@ -1,37 +1,30 @@
-//! Live keyless-signing flow against Sigstore-public-good.
+//! Live OIDC primitives for the future keyless-signing flow against
+//! Sigstore-public-good.
 //!
-//! Gated behind the `live` feature. Pulls in `sigstore-rs` as the
-//! transport layer for Fulcio cert requests and Rekor witness
-//! submission, plus the OAuth + browser machinery for interactive
-//! OIDC. Consumers that only verify bundles never compile this module.
+//! Gated behind the `live` feature. Pulls in `sigstore-rs` for the
+//! `IdentityToken` wrapper + the PKCE-redirect browser flow.
+//! Consumers that only verify bundles never compile this module.
 //!
-//! Three public entry points cover the common cases:
+//! Two public entry points are stable today:
 //!
-//! - [`IdentityToken`] — re-exported from sigstore-rs. The Fulcio API
-//!   accepts a JWT id_token wrapped in this type. CLI flows acquire
-//!   the token via [`browser_oidc_flow`] (interactive); CI flows
-//!   typically receive an ambient OIDC token from their environment
-//!   (e.g. `ACTIONS_ID_TOKEN_REQUEST_URL` for GitHub Actions) and
-//!   construct the [`IdentityToken`] with [`identity_token_from_jwt`].
-//! - [`browser_oidc_flow`] — opens the user's default browser to the
-//!   configured OIDC issuer (default: Sigstore-public-good), runs a
-//!   PKCE-protected redirect listener on `127.0.0.1:8080`, and
-//!   returns the resulting [`IdentityToken`].
-//! - [`sign_canonical_bytes_keyless`] (commit-2 work) — drives the
-//!   full keyless flow: ephemeral keypair → Fulcio cert → DSSE sign
-//!   → Rekor witness → assembled bundle, returned as canonical JSON
-//!   bytes ready to drop into a v3 pack as `signature.sig`.
+//! - [`identity_token_from_jwt`] — wrap a pre-fetched JWT (e.g. a CI
+//!   ambient OIDC token from `ACTIONS_ID_TOKEN_REQUEST_URL`) into the
+//!   sigstore-rs [`IdentityToken`] type used by Fulcio's API.
+//! - [`browser_oidc_flow`] — interactive PKCE flow: opens the user's
+//!   default browser to the OIDC issuer (default: Sigstore-public-
+//!   good), runs a redirect listener on `127.0.0.1:8080`, and returns
+//!   the resulting [`IdentityToken`].
 //!
-//! This commit lands the feature flag, the dep tree, and the
-//! re-exports / token helpers. The actual sign function is the next
-//! commit (it requires a corresponding verifier change to accept
-//! sigstore-rs's SHA-256 subject digest, which is its own commit).
+//! The actual end-to-end keyless signing function — Fulcio cert
+//! request + DSSE-signed in-toto statement + Rekor witness submission
+//! → a v3-compatible Sigstore Bundle JSON — is **not yet
+//! implemented**. See the comment on the first commented-out block
+//! below for the design constraint (sigstore-rs 0.13's high-level
+//! signer emits `MessageSignature` bundles; v3 needs DSSE) and the
+//! follow-up plan.
 
 #![allow(missing_docs)] // re-exported sigstore types document themselves
 
-use std::io::Cursor;
-
-use sigstore::bundle::sign::SigningContext;
 use sigstore::oauth::IdentityToken as SigstoreIdentityToken;
 
 use crate::Error;
@@ -109,55 +102,31 @@ pub fn browser_oidc_flow(
     Ok(IdentityToken::from(raw_token))
 }
 
-/// Sign v3 pack canonical bytes via the Sigstore-public-good keyless
-/// flow. Drives the full chain: ephemeral ECDSA P-256 keypair →
-/// Fulcio cert request (with the supplied OIDC token) → DSSE
-/// signature → Rekor witness submission → assembled bundle. Returns
-/// the canonical JSON bytes of the resulting Sigstore Bundle, ready
-/// to drop into a v3 pack as the `signature.sig` outer-tar entry.
-///
-/// **Network access required.** This function makes live HTTPS calls
-/// to `fulcio.sigstore.dev` (cert) and `rekor.sigstore.dev` (witness)
-/// — both Sigstore-public-good instances. There is no offline /
-/// mocked variant; consumers who want to test the verify side
-/// without driving the live signing path should use one of the
-/// synthetic-bundle test helpers in the tr-sigstore test module.
-///
-/// **Subject digest is SHA-256, not BLAKE3.** sigstore-rs's
-/// high-level signer auto-builds an in-toto statement whose subject
-/// digest is `sha256(canonical_bytes)`. Self-signed bundles via
-/// `root pack --sign <key>` keep their `blake3:<hex>` subject; the
-/// verifier dispatches on which key is present in the digest map.
-/// Both hashes are derivable from the same canonical bytes, so no
-/// extra storage cost — verifying just runs the appropriate
-/// recompute.
-///
-/// The bundle's in-toto statement uses a content-addressed subject
-/// name (sigstore-rs picks `sha256:<hex>`). Verifier identity policy
-/// matches on the cert SAN (e.g. the OIDC subject email), not on the
-/// bundle's subject name — so v3 doesn't need to override that field.
-pub fn sign_canonical_bytes_keyless(
-    token: IdentityToken,
-    canonical_bytes: &[u8],
-) -> Result<Vec<u8>, Error> {
-    // sigstore-rs's default flow is async (tokio). The blocking_signer
-    // variant runs the same flow but synchronously — sufficient for
-    // the CLI's `root pack --sign-keyless` path.
-    let ctx = SigningContext::production()
-        .map_err(|e| Error::CertParse(format!("sigstore production context: {e}")))?;
-
-    let session = ctx
-        .blocking_signer(token)
-        .map_err(|e| Error::CertParse(format!("sigstore blocking_signer: {e}")))?;
-
-    let mut cursor = Cursor::new(canonical_bytes);
-    let signing_artifact = session
-        .sign(&mut cursor)
-        .map_err(|e| Error::CertParse(format!("sigstore sign: {e}")))?;
-
-    let bundle = signing_artifact.to_bundle();
-    serde_json::to_vec(&bundle).map_err(Error::BundleParse)
-}
+// The actual keyless-signing function — Fulcio cert request +
+// DSSE-signed in-toto statement + Rekor witness submission, returning
+// a canonical Sigstore Bundle JSON ready for the v3 pack
+// `signature.sig` slot — is **not** implemented here.
+//
+// Why: sigstore-rs 0.13's high-level signer
+// (`bundle::sign::SigningContext::sign(reader)`) emits **MessageSignature**
+// bundles (raw signature over a SHA-256 input digest), not DSSE
+// attestation bundles. Phase F doc §3.3 mandates DSSE for v3 packs so
+// the in-toto `predicateType` binds the bundle to the v3 wire format,
+// and the in-toto subject digest pins the bundle to the canonical
+// pack hash. A MessageSignature bundle has neither, and our
+// `SigstoreBundle` struct (which has `dsse_envelope` as a required
+// field) wouldn't even round-trip-deserialize one.
+//
+// The proper fix is to drive the flow at a lower level: use
+// `sigstore::fulcio::FulcioClient::request_cert` to obtain the
+// ephemeral cert + signer, build the DSSE statement ourselves with
+// the v3 predicate type and subject digest, sign the DSSE PAE with
+// the ephemeral signer, and submit the DSSE entry to Rekor via
+// `sigstore::rekor`. That's its own commit; the OIDC token + browser
+// flow primitives above are reusable when it lands.
+//
+// Tracking: `~/.claude/plans/zippy-wiggling-pelican.md` Task #55-B
+// (DSSE Sigstore signing).
 
 #[cfg(test)]
 mod tests {
