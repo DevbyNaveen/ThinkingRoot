@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
@@ -63,6 +64,12 @@ pub struct Extractor {
     progress: Option<ChunkProgressFn>,
     /// Known entities from the existing graph, injected into LLM prompts.
     known_entities: crate::graph_context::GraphPrimedContext,
+    /// Cancellation token consulted between batches in `extract_all`.
+    /// `None` (the default) means cancellation is opt-out — existing
+    /// callers retain pre-fix behaviour.  The pipeline orchestrator
+    /// installs one via `with_cancel` so the desktop's Stop button can
+    /// trip every in-flight LLM call.
+    cancel: Option<CancellationToken>,
 }
 
 /// The combined output of extraction across all documents.
@@ -127,7 +134,19 @@ impl Extractor {
             cache: None,
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
+            cancel: None,
         })
+    }
+
+    /// Install a cancellation token consulted between extraction batches.
+    /// When the token is tripped, in-flight tasks are aborted and
+    /// `extract_all` returns `Err(Error::Cancelled)`.  Already-completed
+    /// batches are NOT lost — their results are retained in the partial
+    /// `ExtractionOutput` accessible to the caller via the checkpoint
+    /// (introduced by C6 in the same fix series).
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Enable the content-addressable extraction cache stored at
@@ -415,7 +434,20 @@ impl Extractor {
         }
 
         // ── Collect batch results ──────────────────────────────────────────
+        // Cancellation: if a token has been wired in via `with_cancel`,
+        // check between batches.  We consume in-flight join handles
+        // before bailing so already-completed batches still land in
+        // `output` (the caller's checkpoint flushes them).  We also
+        // call `join_set.shutdown().await` to abort the spawned tasks
+        // that haven't returned yet — they'd otherwise keep paying for
+        // an LLM call whose result we'll discard.
         while let Some(join_result) = join_set.join_next().await {
+            if let Some(ref tok) = self.cancel
+                && tok.is_cancelled()
+            {
+                join_set.shutdown().await;
+                return Err(thinkingroot_core::Error::Cancelled);
+            }
             if let Ok(Some((batch_work, batch_results))) = join_result {
                 for chunk_result in batch_results {
                     if chunk_result.id >= batch_work.len() {

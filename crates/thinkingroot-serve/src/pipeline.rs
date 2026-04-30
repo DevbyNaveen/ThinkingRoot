@@ -6,6 +6,7 @@ use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
 use thinkingroot_core::types::WorkspaceId;
 use thinkingroot_graph::StorageEngine;
+use tokio_util::sync::CancellationToken;
 
 /// Events emitted by the pipeline to drive CLI progress bars.
 /// Sent via `tokio::sync::mpsc::UnboundedSender<ProgressEvent>`.
@@ -151,7 +152,27 @@ pub async fn run_pipeline(
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<PipelineResult> {
-    let result = run_pipeline_inner(root_path, branch, progress.clone()).await;
+    // Existing callers (CLI, MCP stdio, integration tests) get a token
+    // that is never tripped — same behaviour as before this fix.  The
+    // desktop calls `run_pipeline_with_cancel` directly with its own
+    // token so it can implement the Stop button.
+    run_pipeline_with_cancel(root_path, branch, progress, CancellationToken::new()).await
+}
+
+/// Cancel-aware variant of [`run_pipeline`].  When the supplied
+/// `CancellationToken` is tripped mid-run, the pipeline stops at the
+/// next checkpoint, surfaces `Error::Cancelled`, and emits a
+/// `ProgressEvent::PipelineFailed { error: "pipeline cancelled by caller" }`
+/// so subscribed bar drivers can finalise cleanly.  Partial state
+/// already persisted by Phase 4 (changed-source removal) is preserved
+/// — the next compile picks it up via the fingerprint check.
+pub async fn run_pipeline_with_cancel(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    cancel: CancellationToken,
+) -> Result<PipelineResult> {
+    let result = run_pipeline_inner(root_path, branch, progress.clone(), cancel).await;
     if let Err(ref e) = result
         && let Some(ref tx) = progress
     {
@@ -166,7 +187,17 @@ async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    cancel: CancellationToken,
 ) -> Result<PipelineResult> {
+    // Helper macro — every long-running phase boundary checks this so
+    // Stop / Ctrl-C never has to wait for the next batch to finish.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if cancel.is_cancelled() {
+                return Err(thinkingroot_core::Error::Cancelled);
+            }
+        };
+    }
     macro_rules! emit {
         ($event:expr) => {
             if let Some(ref tx) = progress {
@@ -183,11 +214,13 @@ async fn run_pipeline_inner(
     // before the actual parse, so the displayed "Parsing" elapsed reflects
     // only the cost of `parse_directory` itself.
     emit!(ProgressEvent::ParseStart);
+    bail_if_cancelled!();
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
     emit!(ProgressEvent::ParseComplete {
         files: files_parsed
     });
+    bail_if_cancelled!();
 
     // ─── Diff phase: compare against the stored graph ──────────────────
     // Storage open + fingerprint load + content-hash scan + deletion detect
@@ -305,7 +338,8 @@ async fn run_pipeline_inner(
             let e = thinkingroot_extract::Extractor::new(&config)
                 .await?
                 .with_cache_dir(&data_dir)
-                .with_known_entities(ctx_with_relations);
+                .with_known_entities(ctx_with_relations)
+                .with_cancel(cancel.clone());
             if let Some(ref tx) = progress {
                 let tx_chunk = tx.clone();
                 let pf = Arc::new(
@@ -392,6 +426,8 @@ async fn run_pipeline_inner(
     // NLI model is embedded in the binary (no downloads). Pool creation is
     // cheap (just RAM detection), but we still use spawn_blocking because
     // ONNX session creation from memory is CPU-heavy.
+
+    bail_if_cancelled!();
 
     // Partition: structural claims get 0.99, LLM claims go to tribunal.
     let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction
@@ -536,6 +572,8 @@ async fn run_pipeline_inner(
         cutoffs: fingerprint_cutoffs,
     });
 
+    bail_if_cancelled!();
+
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
 
@@ -620,6 +658,8 @@ async fn run_pipeline_inner(
             cache_dirty: true,
         });
     }
+
+    bail_if_cancelled!();
 
     // ─── Phase 6: Insert sources for truly-changed documents ───────────
     // Also persist source bytes to the durable Rooting byte-store so Phase 6.5
@@ -800,6 +840,8 @@ async fn run_pipeline_inner(
     // the post-link phase has access to statements + event_date timestamps.
     let claims_for_svo: Vec<thinkingroot_core::Claim> = filtered_extraction.claims.clone();
 
+    bail_if_cancelled!();
+
     // ─── Phase 7: Link ─────────────────────────────────────────────────
     let linker = {
         let l = thinkingroot_link::Linker::new(&storage.graph);
@@ -966,4 +1008,48 @@ fn upsert_in_chunks(
         done += chunk.len();
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-cancelled tokens short-circuit the pipeline before any
+    /// parsing or LLM work — the `bail_if_cancelled!()` checkpoint that
+    /// fires after `ProgressEvent::ParseStart` and before
+    /// `thinkingroot_parse::parse_directory` returns
+    /// `Err(Error::Cancelled)`.  This is the foundational guarantee the
+    /// desktop "Stop compile" button relies on (P3.4).
+    #[tokio::test]
+    async fn pre_cancelled_token_aborts_before_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Touch a file so parse_directory wouldn't trivially return empty.
+        std::fs::write(tmp.path().join("hello.md"), "# hello\n\nbody.").unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = run_pipeline_with_cancel(tmp.path(), None, None, cancel)
+            .await
+            .expect_err("pre-cancelled token must produce Err");
+        assert!(
+            matches!(err, thinkingroot_core::Error::Cancelled),
+            "expected Error::Cancelled, got {err:?}"
+        );
+    }
+
+    /// A fresh, never-tripped token must behave exactly like the old
+    /// `run_pipeline` API — empty workspaces still report parse=0 with
+    /// no error.  Guards against accidental tightening of the cancel
+    /// check (e.g. an `if !is_cancelled` typo).
+    #[tokio::test]
+    async fn untripped_token_runs_to_completion_on_empty_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = run_pipeline_with_cancel(tmp.path(), None, None, CancellationToken::new())
+            .await
+            .expect("untripped token must not abort an empty compile");
+        assert_eq!(result.files_parsed, 0);
+        assert_eq!(result.claims_count, 0);
+        assert!(!result.cache_dirty, "empty compile must not dirty cache");
+    }
 }

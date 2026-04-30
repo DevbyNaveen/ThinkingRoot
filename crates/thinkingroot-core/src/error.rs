@@ -92,6 +92,16 @@ pub enum Error {
 
     #[error("claim quarantined: {reason}")]
     Quarantined { reason: String },
+
+    // --- Pipeline cancellation ---
+    /// Surfaced when a `CancellationToken` was tripped mid-pipeline (e.g.
+    /// the desktop "Stop compile" button or a CLI Ctrl-C handler).  Distinct
+    /// from real failures so callers can render a "cancelled" state rather
+    /// than a red error toast.  Partial state already persisted by Phase 4
+    /// (source removal) and any per-batch checkpoint flushes is preserved
+    /// on disk; the next run resumes from those.
+    #[error("pipeline cancelled by caller")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -108,6 +118,14 @@ impl Error {
             path: Some(path.into()),
             source,
         }
+    }
+
+    /// True when this error represents a clean caller-initiated cancellation
+    /// rather than a failure.  Lets the desktop UI render a "stopped"
+    /// state and lets pipeline orchestrators short-circuit cleanup work
+    /// that would otherwise fight the cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
     }
 
     /// True when the error is a rate-limit / throttle from any LLM provider.
