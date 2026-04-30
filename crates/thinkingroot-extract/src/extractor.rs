@@ -48,6 +48,21 @@ pub enum ExtractionProgressEvent {
 /// Callback fired for extractor progress updates.
 pub type ChunkProgressFn = Arc<dyn Fn(ExtractionProgressEvent) + Send + Sync>;
 
+/// Metadata that flows alongside each spawned batch's success result.
+/// Captured at spawn time so the collect loop can record the batch in
+/// the in-flight checkpoint log without re-deriving the batch's
+/// position.  `batch_idx` mirrors the 0-indexed slot used by
+/// `llm_work.chunks(batch_size).enumerate()`; the `range_*` fields
+/// are 1-indexed inclusive chunk numbers (same vocabulary as
+/// `ProgressEvent::ExtractionBatchStart`).
+#[derive(Debug, Clone, Copy)]
+struct BatchMeta {
+    batch_idx: usize,
+    range_start: usize,
+    range_end: usize,
+    batch_chunks: usize,
+}
+
 /// The main extraction engine. Takes DocumentIRs and produces
 /// Claims, Entities, and Relations via LLM extraction.
 pub struct Extractor {
@@ -70,6 +85,16 @@ pub struct Extractor {
     /// installs one via `with_cancel` so the desktop's Stop button can
     /// trip every in-flight LLM call.
     cancel: Option<CancellationToken>,
+    /// Per-batch checkpoint log used to skip already-completed batches
+    /// on resume.  None = no checkpointing (existing test callers).
+    /// The pipeline installs one via `with_checkpoint` so a killed
+    /// compile resumes from the last completed batch.
+    checkpoint: Option<Arc<crate::checkpoint::InFlightCheckpoint>>,
+    /// Snapshot of batches already completed in a previous run, loaded
+    /// once at construction time.  Used by `extract_all` to short-
+    /// circuit the spawn step for batches whose claims are already
+    /// in the per-chunk content cache.
+    completed_batches: crate::checkpoint::CompletedBatches,
 }
 
 /// The combined output of extraction across all documents.
@@ -148,7 +173,33 @@ impl Extractor {
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
             cancel: None,
+            checkpoint: None,
+            completed_batches: crate::checkpoint::CompletedBatches::default(),
         })
+    }
+
+    /// Install an in-flight checkpoint log under `<data_dir>` so a
+    /// killed compile resumes from the last completed batch instead
+    /// of reissuing every cache-miss.  Loads any existing log up-front
+    /// — if the file is malformed we err out rather than silently
+    /// accepting a corrupt resume.
+    ///
+    /// The orchestrator clears the log via
+    /// `InFlightCheckpoint::clear(data_dir)` after Phase 7 succeeds —
+    /// at that point CozoDB is the source of truth.
+    pub fn with_checkpoint(mut self, data_dir: &std::path::Path) -> Result<Self> {
+        let completed = crate::checkpoint::InFlightCheckpoint::load_completed_batches(data_dir)?;
+        if !completed.is_empty() {
+            tracing::info!(
+                completed_batches = completed.batches.len(),
+                already_done_chunks = completed.chunks_already_done,
+                "resuming from in-flight checkpoint"
+            );
+        }
+        let ckpt = crate::checkpoint::InFlightCheckpoint::open(data_dir)?;
+        self.checkpoint = Some(Arc::new(ckpt));
+        self.completed_batches = completed;
+        Ok(self)
     }
 
     /// Install a cancellation token consulted between extraction batches.
@@ -402,9 +453,22 @@ impl Extractor {
                 // on permanent failure so the collect loop can attribute the
                 // affected chunk range to the user.  Pre-fix this was an
                 // `Option<...>` whose `None` was silently dropped — the user
-                // saw "extraction complete" with claims missing.
-                type BatchOk = (Vec<ChunkWork>, Vec<crate::batch::BatchChunkResult>);
+                // saw "extraction complete" with claims missing.  The Ok
+                // arm carries `BatchMeta` so the collect-side checkpoint
+                // record can attribute each completed batch back to its
+                // 0-indexed slot + 1-indexed chunk range.
+                type BatchOk = (
+                    BatchMeta,
+                    Vec<ChunkWork>,
+                    Vec<crate::batch::BatchChunkResult>,
+                );
                 type BatchFail = (usize, usize);
+                let meta = BatchMeta {
+                    batch_idx,
+                    range_start,
+                    range_end,
+                    batch_chunks,
+                };
                 let permit = match sem.acquire().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -451,7 +515,7 @@ impl Extractor {
                     Ok(raw_response) => {
                         let batch_results =
                             crate::batch::parse_batch_response(&raw_response, &expected_ids);
-                        Ok((batch_work, batch_results))
+                        Ok((meta, batch_work, batch_results))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -490,8 +554,8 @@ impl Extractor {
                     continue;
                 }
             };
-            let (batch_work, batch_results) = match batch_outcome {
-                Ok(pair) => pair,
+            let (batch_meta, batch_work, batch_results) = match batch_outcome {
+                Ok(triple) => triple,
                 Err((rs, re)) => {
                     output.failed_batches += 1;
                     output.failed_batch_ranges.push((rs, re));
@@ -555,6 +619,28 @@ impl Extractor {
                             source_uri: work.source_uri.clone(),
                         });
                     }
+                }
+                // Cache + claim merge for this batch are durable now.
+                // Record the batch in the in-flight log so a kill-and-
+                // resume can fast-forward past it.  The cache write
+                // ordering matters: the per-chunk content cache was
+                // populated above, so a re-run will see cache hits for
+                // these chunks even if the checkpoint write below fails.
+                if let Some(ref ckpt) = self.checkpoint
+                    && let Err(e) = ckpt.record_batch(
+                        batch_meta.batch_idx,
+                        batch_meta.range_start,
+                        batch_meta.range_end,
+                        batch_meta.batch_chunks,
+                    )
+                {
+                    // Non-fatal: the per-chunk cache is the source of
+                    // truth.  A missing checkpoint record just means
+                    // the next run won't log the resume hint.
+                    tracing::warn!(
+                        batch_idx = batch_meta.batch_idx,
+                        "failed to record checkpoint entry: {e}"
+                    );
                 }
             }
         }

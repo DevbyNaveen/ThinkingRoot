@@ -358,11 +358,18 @@ async fn run_pipeline_inner(
         extraction = thinkingroot_extract::ExtractionOutput::default();
     } else {
         let extractor = {
+            // Open the in-flight checkpoint log under <data_dir>.  If
+            // a previous run was interrupted mid-extract, the loader
+            // surfaces those completed batches so the resume path can
+            // log "resuming from N batches" without redoing them
+            // (correctness is provided by the per-chunk content cache;
+            // the checkpoint adds attribution + observability).
             let e = thinkingroot_extract::Extractor::new(&config)
                 .await?
                 .with_cache_dir(&data_dir)
                 .with_known_entities(ctx_with_relations)
-                .with_cancel(cancel.clone());
+                .with_cancel(cancel.clone())
+                .with_checkpoint(&data_dir)?;
             if let Some(ref tx) = progress {
                 let tx_chunk = tx.clone();
                 let pf = Arc::new(
@@ -982,6 +989,15 @@ async fn run_pipeline_inner(
 
     fingerprints.save()?;
     config.save(root_path)?;
+
+    // Phase 7 succeeded — CozoDB is now the source of truth.  Clear the
+    // in-flight checkpoint log so the next compile starts fresh.
+    // Failure is non-fatal (a stale .in-flight.jsonl just means the
+    // next run logs a misleading "resuming" message, then produces
+    // identical output via cache hits).
+    if let Err(e) = thinkingroot_extract::InFlightCheckpoint::clear(&data_dir) {
+        tracing::warn!("failed to clear in-flight checkpoint after Phase 7: {e}");
+    }
 
     Ok(PipelineResult {
         files_parsed,
