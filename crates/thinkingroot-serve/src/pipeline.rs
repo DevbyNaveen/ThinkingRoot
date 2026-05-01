@@ -1016,7 +1016,20 @@ async fn run_pipeline_inner(
                         entities = entity_name_to_id.len(),
                         "event calendar: SVO events compiled with correct entity IDs"
                     ),
-                    Err(e) => tracing::warn!("event calendar: insertion failed (non-fatal): {e}"),
+                    // Events are a derived secondary index — the rest
+                    // of the graph (claims, entities, relations) is
+                    // already persisted by this point, so we don't
+                    // fail the compile.  We do log at error level
+                    // (was warn) so a systemic insert bug surfaces
+                    // instead of sitting silently in tracing output:
+                    // pre-fix the `:put events { col: var }` syntax
+                    // bug made every call here error and the
+                    // calendar table sat empty in prod for unknown
+                    // duration without anyone noticing.
+                    Err(e) => tracing::error!(
+                        attempted = extracted_events.len(),
+                        "event calendar: insertion failed — calendar queries will return empty until next successful compile: {e}"
+                    ),
                 }
             } else {
                 tracing::info!(

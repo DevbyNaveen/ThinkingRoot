@@ -4174,28 +4174,39 @@ impl GraphStore {
     ) -> Result<usize> {
         let mut count = 0;
         for ev in events {
+            // CozoDB `:put` does not support `col: var` rename mapping
+            // inside the relation braces — the names must match either
+            // the head clause's bound vars or the relation's column
+            // names verbatim.  Match the existing convention used by
+            // `insert_source` / `insert_claim`: head vars and params
+            // are named identically to the schema columns.
             let mut params = BTreeMap::new();
             params.insert("id".into(), DataValue::Str(ev.id.clone().into()));
             params.insert(
-                "subj".into(),
+                "subject_entity_id".into(),
                 DataValue::Str(ev.subject_entity_id.clone().into()),
             );
             params.insert("verb".into(), DataValue::Str(ev.verb.clone().into()));
             params.insert(
-                "obj".into(),
+                "object_entity_id".into(),
                 DataValue::Str(ev.object_entity_id.clone().into()),
             );
-            params.insert("ts".into(), DataValue::from(ev.timestamp));
+            params.insert("timestamp".into(), DataValue::from(ev.timestamp));
             params.insert(
-                "nd".into(),
+                "normalized_date".into(),
                 DataValue::Str(ev.normalized_date.clone().into()),
             );
-            params.insert("src".into(), DataValue::Str(ev.source_id.clone().into()));
-            params.insert("conf".into(), DataValue::from(ev.confidence));
+            params.insert(
+                "source_id".into(),
+                DataValue::Str(ev.source_id.clone().into()),
+            );
+            params.insert("confidence".into(), DataValue::from(ev.confidence));
 
             self.query(
-                "?[id, subj, verb, obj, ts, nd, src, conf] <- [[$id, $subj, $verb, $obj, $ts, $nd, $src, $conf]]
-                 :put events { id => subject_entity_id: subj, verb, object_entity_id: obj, timestamp: ts, normalized_date: nd, source_id: src, confidence: conf }",
+                r#"?[id, subject_entity_id, verb, object_entity_id, timestamp, normalized_date, source_id, confidence] <- [[
+                    $id, $subject_entity_id, $verb, $object_entity_id, $timestamp, $normalized_date, $source_id, $confidence
+                ]]
+                :put events {id => subject_entity_id, verb, object_entity_id, timestamp, normalized_date, source_id, confidence}"#,
                 params,
             )?;
             count += 1;
@@ -5375,6 +5386,69 @@ mod tests {
         assert!(
             !map.contains_key("ghost"),
             "unknown ids must not appear in result"
+        );
+    }
+
+    #[test]
+    fn insert_events_round_trip() {
+        // Regression: pre-fix `insert_events` used the unsupported
+        // `:put events { id => subject_entity_id: subj, ... }` rename
+        // syntax and every call returned a CozoDB script error.  The
+        // pipeline swallowed the error as a warning so the events
+        // table sat empty in production.  This test exercises the
+        // full round trip — insert two events, query them by time
+        // range and by subject — to make sure the fix lands and
+        // future regressions in the events relation surface in CI.
+        use thinkingroot_core::types::ExtractedEvent;
+        let mut store = mem_store();
+
+        let events = vec![
+            ExtractedEvent {
+                id: "ev-1".to_string(),
+                subject_entity_id: "alice".to_string(),
+                verb: "visited".to_string(),
+                object_entity_id: "paris".to_string(),
+                timestamp: 1_700_000_000.0,
+                normalized_date: "2023-11-14".to_string(),
+                source_id: "src-1".to_string(),
+                confidence: 0.9,
+            },
+            ExtractedEvent {
+                id: "ev-2".to_string(),
+                subject_entity_id: "bob".to_string(),
+                verb: "decided".to_string(),
+                object_entity_id: "".to_string(),
+                timestamp: 1_700_001_000.0,
+                normalized_date: "2023-11-14".to_string(),
+                source_id: "src-1".to_string(),
+                confidence: 0.7,
+            },
+        ];
+
+        let inserted = store.insert_events(&events).unwrap();
+        assert_eq!(inserted, 2, "both events must persist");
+
+        let in_range = store
+            .query_events_in_range(1_699_999_999.0, 1_700_002_000.0)
+            .unwrap();
+        assert_eq!(in_range.len(), 2);
+
+        let alice_events = store.query_events_for_entity("alice").unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].verb, "visited");
+        assert_eq!(alice_events[0].object_entity_id, "paris");
+        assert_eq!(alice_events[0].normalized_date, "2023-11-14");
+
+        // Re-inserting the same event id is an upsert (`:put` semantics).
+        let again = store.insert_events(&events[..1]).unwrap();
+        assert_eq!(again, 1);
+        let still_two = store
+            .query_events_in_range(1_699_999_999.0, 1_700_002_000.0)
+            .unwrap();
+        assert_eq!(
+            still_two.len(),
+            2,
+            "upsert must not create duplicates on repeat insert"
         );
     }
 }
