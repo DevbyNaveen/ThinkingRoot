@@ -3311,6 +3311,11 @@ impl GraphStore {
             self.remove_claim(claim_id)?;
         }
 
+        // Derived SVO calendar — must be cascaded before the
+        // orphan-entity sweep, otherwise events keep pointing at
+        // entity ULIDs the sweep is about to delete.
+        self.remove_events_for_source(source_id)?;
+
         self.remove_source(source_id)?;
 
         for entity_id in affected_entity_ids {
@@ -3537,6 +3542,29 @@ impl GraphStore {
         self.query(
             r#"?[id] <- [[$sid]]
             :rm sources {id}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Cascade-remove every `events` row whose `source_id` matches.
+    ///
+    /// Called from `remove_source_by_id` when a source is deleted.
+    /// The `events` relation is a derived SVO calendar populated at
+    /// compile time; without this cascade an orphan row survives
+    /// every file delete or rename and `query_events_in_range` /
+    /// `query_events_for_entity` emit ULID strings for entities the
+    /// orphan-entity sweep has already GCd.  Mirrors the predicate
+    /// `:rm` shape used by `truncate_structural_patterns_for_scope`
+    /// — `::remove` is rejected by Cozo while the
+    /// `events:by_subject` / `events:by_timestamp` indexes are
+    /// attached, so we delete by subquery.
+    fn remove_events_for_source(&self, source_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("sid".into(), DataValue::Str(source_id.into()));
+        self.query(
+            r#"?[id] := *events{id, source_id: $sid}
+            :rm events {id}"#,
             params,
         )?;
         Ok(())
@@ -5449,6 +5477,115 @@ mod tests {
             still_two.len(),
             2,
             "upsert must not create duplicates on repeat insert"
+        );
+    }
+
+    #[test]
+    fn remove_source_cascades_to_events() {
+        // Regression: `remove_source_by_id` cascades through claims,
+        // claim_*_edges, contradictions, source_entity_relations,
+        // sources, and orphan entities — but pre-fix it never
+        // touched the `events` relation.  Once `insert_events` was
+        // repaired (see `insert_events_round_trip`), every file
+        // delete or rename leaked orphan event rows pointing at
+        // entity ULIDs the orphan-entity sweep had already GCd, and
+        // `query_events_in_range` / `query_events_for_entity` would
+        // emit those orphans straight to the calendar UI.
+        //
+        // This test inserts a source + an event tagged with that
+        // source, deletes the source by URI, and asserts every
+        // event read path returns empty.
+        use thinkingroot_core::types::ExtractedEvent;
+        let mut store = mem_store();
+
+        let source = thinkingroot_core::Source::new(
+            "test://alice.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("hash-events".into()));
+        let source_id = source.id.to_string();
+        store.insert_source(&source).unwrap();
+
+        store
+            .insert_events(&[
+                ExtractedEvent {
+                    id: "ev-cascade-1".into(),
+                    subject_entity_id: "alice-ulid".into(),
+                    verb: "visited".into(),
+                    object_entity_id: "paris-ulid".into(),
+                    timestamp: 1_700_000_000.0,
+                    normalized_date: "2023-11-14".into(),
+                    source_id: source_id.clone(),
+                    confidence: 0.9,
+                },
+                ExtractedEvent {
+                    id: "ev-cascade-2".into(),
+                    subject_entity_id: "bob-ulid".into(),
+                    verb: "decided".into(),
+                    object_entity_id: "".into(),
+                    timestamp: 1_700_001_000.0,
+                    normalized_date: "2023-11-14".into(),
+                    source_id: source_id.clone(),
+                    confidence: 0.7,
+                },
+            ])
+            .unwrap();
+        // A second source with its own event — must survive the cascade.
+        let other = thinkingroot_core::Source::new(
+            "test://bob.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("hash-other".into()));
+        let other_id = other.id.to_string();
+        store.insert_source(&other).unwrap();
+        store
+            .insert_events(&[ExtractedEvent {
+                id: "ev-other".into(),
+                subject_entity_id: "carol-ulid".into(),
+                verb: "wrote".into(),
+                object_entity_id: "".into(),
+                timestamp: 1_700_500_000.0,
+                normalized_date: "2023-11-20".into(),
+                source_id: other_id,
+                confidence: 0.8,
+            }])
+            .unwrap();
+
+        let before = store
+            .query_events_in_range(1_699_999_999.0, 1_701_000_000.0)
+            .unwrap();
+        assert_eq!(before.len(), 3, "preconditions: all three events present");
+
+        let removed = store.remove_source_by_uri("test://alice.md").unwrap();
+        assert_eq!(removed, 1);
+
+        let after = store
+            .query_events_in_range(1_699_999_999.0, 1_701_000_000.0)
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "events tied to the removed source must cascade out; \
+             only the unrelated source's event must remain"
+        );
+        assert_eq!(after[0].id, "ev-other");
+
+        // Per-entity read path agrees with the range read path.
+        assert!(
+            store.query_events_for_entity("alice-ulid").unwrap().is_empty(),
+            "subject lookup for the removed source's entity must be empty"
+        );
+        assert!(
+            store.query_events_for_entity("bob-ulid").unwrap().is_empty(),
+            "subject lookup for the removed source's other entity must be empty"
+        );
+        assert_eq!(
+            store
+                .query_events_for_entity("carol-ulid")
+                .unwrap()
+                .len(),
+            1,
+            "the unrelated source's entity event must still be findable"
         );
     }
 }
