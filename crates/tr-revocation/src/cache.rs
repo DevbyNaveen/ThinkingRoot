@@ -130,11 +130,17 @@ impl RevocationCache {
         &self.config
     }
 
-    /// Read the cached snapshot from disk and classify its freshness.
+    /// Read the cached snapshot from disk, **verify its signature**,
+    /// and classify its freshness.
     ///
     /// Returns `(None, FreshnessState::Missing)` when no snapshot has
-    /// ever been written. Otherwise returns the parsed snapshot and a
-    /// freshness label derived from `snapshot.fetched_at`.
+    /// ever been written. Otherwise the snapshot is checked against
+    /// [`CacheConfig::trusted_keys`] before being returned: an
+    /// attacker who plants a tampered `snapshot.json` in the cache
+    /// directory cannot bypass revocation by impersonating the
+    /// registry. Signature verification is mandatory on the read-hot
+    /// path, not just on HTTP refresh — same threat model the rest of
+    /// the verifier applies.
     pub fn load(&self) -> Result<(Option<Snapshot>, FreshnessState)> {
         let snap_path = self.snapshot_path();
         if !snap_path.exists() {
@@ -148,6 +154,11 @@ impl RevocationCache {
             });
         }
         let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+        // Defense-in-depth: an attacker with write access to the cache
+        // directory must not be able to substitute a forged deny-list.
+        // Verifying on every disk read closes the gap that previously
+        // existed (signature was checked only on HTTP refresh).
+        self.verify_signature(&snapshot)?;
         let fetched_at = self.read_fetched_at().unwrap_or(0);
         let now = unix_now()?;
         let age = now.saturating_sub(fetched_at);
@@ -234,12 +245,21 @@ impl RevocationCache {
     ///
     /// If the cached snapshot is [`FreshnessState::Fresh`], return it
     /// without I/O. Otherwise attempt a refresh; on success re-load.
-    /// On network failure, fall back to the cached snapshot if any —
-    /// the caller inspects [`FreshnessState`] to decide whether to
-    /// proceed.
+    /// On network failure, fall back to the cached snapshot — the
+    /// caller inspects [`FreshnessState`] to decide whether to proceed.
     ///
-    /// Returns an error only when there is no usable snapshot at all
-    /// (no cache and refresh failed).
+    /// **First-boot grace** (`revocation-protocol-spec.md` §5.4): a
+    /// brand-new client that has never reached the registry stamps the
+    /// time of its first install attempt into `<cache_dir>/.first_boot_at`.
+    /// While `now - first_boot_at <= stale_grace`, this function
+    /// returns an empty snapshot with [`FreshnessState::Missing`] so
+    /// callers can surface a warning. Past the grace window, it
+    /// returns [`Error::NoTrustedSnapshot`] so the install flow can
+    /// hard-fail rather than silently accepting any pack as
+    /// non-revoked.
+    ///
+    /// Returns an error when no usable snapshot exists and the
+    /// first-boot grace has elapsed.
     pub async fn load_or_refresh(&self) -> Result<(Snapshot, FreshnessState)> {
         let (cached, state) = self.load()?;
 
@@ -264,22 +284,79 @@ impl RevocationCache {
                     );
                     Ok((snap, state))
                 }
-                None => {
-                    // First-boot grace per `revocation-protocol-spec.md`
-                    // §5.4: a brand-new client that cannot reach the
-                    // registry yet proceeds with an empty deny-list.
-                    // Freshness stays `Missing` so the verifier surface
-                    // can warn in the user-facing log; a follow-up step
-                    // (Step 5b) tracks an install-time marker file to
-                    // refuse after 7 days of never-fetched.
-                    tracing::warn!(
-                        error = %network_err,
-                        "no cached revocation snapshot and registry is unreachable; proceeding with empty deny-list (first-boot grace)"
-                    );
-                    Ok((empty_snapshot(), FreshnessState::Missing))
-                }
+                None => self.first_boot_grace_decision(network_err),
             },
         }
+    }
+
+    /// Apply the first-boot grace window when no cached snapshot exists
+    /// and the registry is unreachable.
+    ///
+    /// On the very first such call, stamps `now` into
+    /// `<cache_dir>/.first_boot_at`. On subsequent calls, compares
+    /// `now - first_boot_at` against [`CacheConfig::stale_grace`]: if
+    /// the window has elapsed, returns
+    /// [`Error::NoTrustedSnapshot`] so the verifier can refuse the
+    /// install. Inside the window, returns an empty snapshot so first-
+    /// boot offline workflows continue to function.
+    fn first_boot_grace_decision(
+        &self,
+        network_err: Error,
+    ) -> Result<(Snapshot, FreshnessState)> {
+        let now = unix_now()?;
+        let marker = self.first_boot_marker_path();
+        let first_boot_at = match std::fs::read_to_string(&marker) {
+            Ok(s) => s.trim().parse::<u64>().ok(),
+            Err(_) => None,
+        };
+
+        let first_boot_at = match first_boot_at {
+            Some(t) => t,
+            None => {
+                // Stamp the marker now so the grace window starts
+                // counting from this point. Use the same atomic-write
+                // pattern as the snapshot itself so a concurrent crash
+                // can't leave a half-written marker.
+                std::fs::create_dir_all(&self.config.cache_dir)?;
+                let tmp = self
+                    .config
+                    .cache_dir
+                    .join(".first_boot_at.tmp");
+                std::fs::write(&tmp, now.to_string())?;
+                rename_atomic(&tmp, &marker)?;
+                now
+            }
+        };
+
+        let age = now.saturating_sub(first_boot_at);
+        if age > self.config.stale_grace.as_secs() {
+            tracing::error!(
+                error = %network_err,
+                first_boot_at,
+                grace_secs = self.config.stale_grace.as_secs(),
+                age_secs = age,
+                "revocation cache: first-boot grace expired and registry still unreachable; refusing to install"
+            );
+            return Err(Error::NoTrustedSnapshot {
+                age_secs: age,
+                grace_secs: self.config.stale_grace.as_secs(),
+                source: Box::new(network_err),
+            });
+        }
+
+        tracing::warn!(
+            error = %network_err,
+            age_secs = age,
+            grace_secs = self.config.stale_grace.as_secs(),
+            "no cached revocation snapshot and registry is unreachable; proceeding with empty deny-list (first-boot grace, {} of {} seconds elapsed)",
+            age,
+            self.config.stale_grace.as_secs(),
+        );
+        Ok((empty_snapshot(), FreshnessState::Missing))
+    }
+
+    fn first_boot_marker_path(&self) -> PathBuf {
+        self.config.cache_dir.join(".first_boot_at")
     }
 
     /// Pure lookup. Linear scan over `snapshot.entries`.

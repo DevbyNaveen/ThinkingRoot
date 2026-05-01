@@ -546,6 +546,17 @@ pub fn run_verify(
             eprintln!("  details: {}", advisory.details_url);
             Ok(EXIT_REVOKED)
         }
+        V3Verdict::RevocationUnverifiable { reason } => {
+            // Hard-fail rather than silently accept. A pack that
+            // crypto-verified but whose revocation status is unknown
+            // could be revoked-and-malicious; the safe default is to
+            // refuse until the registry is reachable again.
+            eprintln!(
+                "  refused: revocation status unverifiable — {reason}\n  \
+                 (use --no-revocation-check to override on an air-gapped install)"
+            );
+            Ok(EXIT_REVOKED)
+        }
     }
 }
 
@@ -988,6 +999,14 @@ fn enforce_v3_verdict(pack: &V3Pack, verdict: &V3Verdict, allow_unsigned: bool) 
         V3Verdict::Revoked(d) => Err(InstallRefused {
             exit_code: EXIT_REVOKED,
             message: format_revoked(d),
+        }
+        .into()),
+        V3Verdict::RevocationUnverifiable { reason } => Err(InstallRefused {
+            exit_code: EXIT_REVOKED,
+            message: format!(
+                "✗ refusing to install `{}` — revocation status unverifiable: {reason}",
+                pack.manifest.name
+            ),
         }
         .into()),
     }

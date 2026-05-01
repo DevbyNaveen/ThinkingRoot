@@ -49,6 +49,26 @@ pub enum Error {
     /// almost always a misconfigured clock on first boot of a VM.
     #[error("system time is before the Unix epoch")]
     ClockSkew,
+
+    /// The first-boot grace window has elapsed without a successful
+    /// snapshot fetch. Returned by [`crate::RevocationCache::load_or_refresh`]
+    /// when no cached snapshot exists and the registry has been
+    /// unreachable since `<cache_dir>/.first_boot_at`. Callers must
+    /// hard-fail the install — proceeding with an unverified deny-list
+    /// would silently accept revoked packs forever.
+    #[error(
+        "no trusted revocation snapshot available — first-boot grace expired \
+         ({age_secs}s elapsed, grace was {grace_secs}s); underlying network error: {source}"
+    )]
+    NoTrustedSnapshot {
+        /// Seconds elapsed since the first-boot marker was stamped.
+        age_secs: u64,
+        /// Configured stale-grace window in seconds.
+        grace_secs: u64,
+        /// Underlying transport error from the most recent refresh
+        /// attempt; boxed so the `Error` enum stays small.
+        source: Box<Error>,
+    },
 }
 
 /// Convenience alias for `Result<T, crate::Error>`.

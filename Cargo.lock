@@ -6794,6 +6794,7 @@ version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "p256",
  "semver",
  "serde",
  "serde_json",

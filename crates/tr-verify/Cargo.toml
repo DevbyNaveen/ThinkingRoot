@@ -16,12 +16,18 @@ path = "src/lib.rs"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+base64 = { workspace = true }
 
 tr-format = { workspace = true }
 tr-revocation = { workspace = true }
 tr-sigstore = { workspace = true }
 
 ed25519-dalek = { workspace = true }
+# Type-only dep — we name `p256::ecdsa::VerifyingKey` in the keyless
+# verification helper that sits between `tr_sigstore`'s rekor public-
+# key constructor and its SET-verification function. Same version
+# `tr-sigstore` already pulls in.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

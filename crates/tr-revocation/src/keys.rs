@@ -7,19 +7,39 @@
 //! the old or new key continues to verify until the old key ages out
 //! in a follow-up `root` release.
 //!
-//! **v0.1 bootstrap:** the [`PINNED_RAW`] table is empty pending the
-//! cloud team's coordinated key publication. Tests inject their own
-//! [`PinnedKey`] via [`crate::CacheConfig::trusted_keys`] — the empty
-//! default is intentional and forces an explicit configuration in any
-//! production caller until the real key lands via a coordinated PR
-//! pair.
+//! ## Trust anchor: `thinkingroot-revocation-v1`
+//!
+//! Real Ed25519 public-key bytes are embedded below. The matching
+//! private key lives in
+//! `~/.config/thinkingroot-cloud/secrets/revocation_signing.key.b64`
+//! on the cloud signing host (chmod 0600); it is **not** present in
+//! this repository. The cloud-side
+//! `services/registry/src/revocation/sign.rs` consumes that file at
+//! request-handling time to sign each snapshot before serving it from
+//! `/api/v1/revoked`.
+//!
+//! Rotation flow when the cloud team mints a successor key
+//! (`thinkingroot-revocation-v2`): publish the new public bytes here
+//! as a *second* entry in [`PINNED_RAW`] alongside `v1`, ship a `root`
+//! release, wait the 30-day overlap window, then drop the `v1` row in
+//! a follow-up release. Snapshots signed under either key verify
+//! during the overlap.
 
 /// Compile-time table of `(key_id, ed25519_public)` pairs the binary
-/// trusts. Populated by a coordinated PR pair with the cloud team
-/// before the v0.1 tag.
+/// trusts. Append-only during rotation overlaps; entries are removed
+/// only after the prior key has aged out of all in-flight snapshots.
 pub const PINNED_RAW: &[(&str, [u8; 32])] = &[
-    // Intentionally empty until the cloud key is published. See
-    // §6 of the Phase F design doc for the rotation flow.
+    // thinkingroot-revocation-v1 — generated 2026-05-01 via
+    // ed25519-dalek 2.x with `OsRng`. Public bytes only; the matching
+    // private key is held outside this repo (see module docs).
+    (
+        "thinkingroot-revocation-v1",
+        [
+            0x63, 0x16, 0x84, 0x65, 0xe4, 0xc3, 0xbc, 0x54, 0x96, 0x45, 0x96, 0xf6, 0x26, 0x17,
+            0xd0, 0x61, 0x07, 0xac, 0x81, 0x7c, 0x1e, 0xe8, 0xb7, 0xcb, 0x29, 0xed, 0x0a, 0xe2,
+            0xd9, 0x10, 0x4b, 0xd6,
+        ],
+    ),
 ];
 
 /// Ed25519 public key the client pins to verify revocation snapshots.
@@ -45,4 +65,40 @@ pub fn pinned_keys() -> Vec<PinnedKey> {
             ed25519_public: *bytes,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_set_is_non_empty_and_well_formed() {
+        // Production binaries must ship with at least one trust anchor;
+        // an empty set silently disables revocation verification.
+        let keys = pinned_keys();
+        assert!(!keys.is_empty(), "PINNED_RAW must contain ≥1 trust anchor");
+        for k in &keys {
+            assert!(!k.key_id.is_empty(), "every pinned key needs a key_id");
+            // Sanity: every byte zero is almost certainly a placeholder
+            // that escaped review.
+            assert!(
+                k.ed25519_public.iter().any(|b| *b != 0),
+                "pinned key {} has all-zero bytes",
+                k.key_id
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_key_id_is_unique() {
+        let keys = pinned_keys();
+        let mut seen = std::collections::HashSet::new();
+        for k in &keys {
+            assert!(
+                seen.insert(k.key_id.clone()),
+                "duplicate key_id in PINNED_RAW: {}",
+                k.key_id
+            );
+        }
+    }
 }

@@ -48,8 +48,8 @@ pub mod live;
 pub mod rekor;
 pub mod trust_root;
 pub use rekor::{
-    RFC6962_LEAF_PREFIX, leaf_hash_from_canonical_body, verify_inclusion_proof_offline,
-    verify_set_signature,
+    RFC6962_LEAF_PREFIX, integrated_time_to_system, leaf_hash_from_canonical_body,
+    verify_inclusion_proof_offline, verify_set_signature,
 };
 pub use trust_root::{
     SIGSTORE_PUBLIC_GOOD_FULCIO_V1_ROOT_SHA256_HEX, SIGSTORE_PUBLIC_GOOD_REKOR_LOG_ID_HEX,
@@ -848,6 +848,160 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Lowercase hex of arbitrary bytes. Public so verifier code can
+/// compare a Rekor `log_id` (raw bytes from the bundle) against the
+/// vendored [`SIGSTORE_PUBLIC_GOOD_REKOR_LOG_ID_HEX`] constant.
+pub fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Extract a Sigstore-keyless signer identity from the bundle's leaf
+/// X.509 cert by parsing its SubjectAltName extension.
+///
+/// Sigstore Fulcio embeds the OIDC subject (workflow URL for GitHub
+/// Actions, email for browser-flow signers) as a GeneralName inside
+/// the SAN extension (OID 2.5.29.17). Returns the first URI or
+/// rfc822Name (email) GeneralName found, with URI preferred when both
+/// are present (URI is what GitHub Actions / GitLab CI inject).
+///
+/// Returns `Ok(None)` for self-signed bundles (no cert chain) and
+/// when the SAN extension is absent. Returns `Err` only on cert
+/// decode failure or malformed SAN bytes.
+pub fn extract_oidc_identity(bundle: &SigstoreBundle) -> Result<Option<String>> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use x509_cert::Certificate;
+    use x509_cert::der::Decode;
+
+    let chain = match bundle.verification_material.x509_certificate_chain.as_ref() {
+        Some(c) if !c.certificates.is_empty() => c,
+        _ => return Ok(None),
+    };
+    let der = B64
+        .decode(&chain.certificates[0].raw_bytes)
+        .map_err(|e| Error::CertParse(format!("identity leaf base64: {e}")))?;
+    let cert = Certificate::from_der(&der)
+        .map_err(|e| Error::CertParse(format!("identity leaf DER decode: {e}")))?;
+
+    let extensions = match cert.tbs_certificate.extensions.as_ref() {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    // OID 2.5.29.17 — subjectAltName.
+    let san_oid = ::der::asn1::ObjectIdentifier::new_unwrap("2.5.29.17");
+    let san_ext = match extensions.iter().find(|e| e.extn_id == san_oid) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    parse_san_for_identity(san_ext.extn_value.as_bytes())
+}
+
+/// Walk the bytes of a SubjectAltName extension and return the first
+/// URI or email GeneralName. GeneralName is an ASN.1 CHOICE with
+/// IMPLICIT tagging; for our two cases we only need the IA5String
+/// payload at context-specific tags `[1]` (email) and `[6]` (URI).
+///
+/// The format is `SEQUENCE OF GeneralName`. Each GeneralName entry on
+/// the wire begins with a context-specific tag byte (0xA0 + N for
+/// constructed forms, 0x80 + N for primitive IA5Strings). We do a
+/// single pass byte-by-byte: read tag, read length (DER short or long
+/// form), read value, and check for tag numbers 1 and 6.
+///
+/// Hand-rolled rather than going through `x509_cert::ext::pkix`
+/// because that requires the `pem` + `pkix` features on `x509-cert`
+/// which would inflate the dep tree; the SAN encoding is simple
+/// enough that direct parsing keeps this crate's surface tight and
+/// match the test fixtures we synthesize end-to-end.
+fn parse_san_for_identity(bytes: &[u8]) -> Result<Option<String>> {
+    if bytes.len() < 2 {
+        return Err(Error::CertParse("SAN extension shorter than 2 bytes".into()));
+    }
+    if bytes[0] != 0x30 {
+        return Err(Error::CertParse(format!(
+            "SAN extension is not a SEQUENCE (tag 0x{:02x})",
+            bytes[0]
+        )));
+    }
+    // Decode the outer SEQUENCE length.
+    let (outer_len, header_len) = decode_der_length(&bytes[1..])
+        .ok_or_else(|| Error::CertParse("SAN outer SEQUENCE length malformed".into()))?;
+    let body_start = 1 + header_len;
+    if bytes.len() < body_start + outer_len {
+        return Err(Error::CertParse(
+            "SAN outer SEQUENCE truncated".into(),
+        ));
+    }
+    let body = &bytes[body_start..body_start + outer_len];
+
+    let mut email_fallback: Option<String> = None;
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        let remaining = &body[cursor..];
+        if remaining.is_empty() {
+            break;
+        }
+        let tag = remaining[0];
+        let (val_len, hdr_len) = decode_der_length(&remaining[1..])
+            .ok_or_else(|| Error::CertParse("SAN inner length malformed".into()))?;
+        let val_start = 1 + hdr_len;
+        if remaining.len() < val_start + val_len {
+            return Err(Error::CertParse("SAN inner value truncated".into()));
+        }
+        let val = &remaining[val_start..val_start + val_len];
+
+        // Context-specific primitive (class=0b10, p/c=0): high bits 0b10_00_xxxx
+        // → tag byte = 0x80 | tag_number for primitive, 0xA0 | n for constructed.
+        // Sigstore-issued GeneralName for URI / email is primitive IA5String.
+        if (tag & 0xC0) == 0x80 {
+            let constructed = (tag & 0x20) != 0;
+            let tag_num = tag & 0x1F;
+            if !constructed {
+                let s = std::str::from_utf8(val).map_err(|e| {
+                    Error::CertParse(format!("SAN GeneralName not UTF-8 IA5: {e}"))
+                })?;
+                match tag_num {
+                    6 => return Ok(Some(s.to_string())), // URI — Sigstore preferred
+                    1 if email_fallback.is_none() => {
+                        email_fallback = Some(s.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cursor += val_start + val_len;
+    }
+    Ok(email_fallback)
+}
+
+/// Decode a DER length prefix starting at `bytes[0]`. Returns
+/// `(length, prefix_byte_count)` so callers can advance their cursor
+/// past the entire length-of-length encoding.
+fn decode_der_length(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let first = bytes[0];
+    if first < 0x80 {
+        return Some((first as usize, 1));
+    }
+    let count = (first & 0x7F) as usize;
+    if count == 0 || count > std::mem::size_of::<usize>() || bytes.len() < 1 + count {
+        return None;
+    }
+    let mut len: usize = 0;
+    for &b in &bytes[1..1 + count] {
+        len = (len << 8) | (b as usize);
+    }
+    Some((len, 1 + count))
 }
 
 #[cfg(test)]
