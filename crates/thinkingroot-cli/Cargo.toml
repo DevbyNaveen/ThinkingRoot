@@ -22,6 +22,14 @@ path = "src/main.rs"
 # doesn't have to depend on a trust crate for one helper.
 sha2 = "0.10"
 
+# Cross-process advisory file lock for the lazy vector-index rebuild.
+# Two concurrent `root ask` invocations on the same workspace each
+# observed the empty index and embedded the entire claim set twice;
+# the second writer wasted the cost and racy-overwrote the first
+# writer's index. fs2 wraps flock/LockFileEx so we get correct
+# auto-release on process death (no stale-lockfile hazard).
+fs2 = "0.4"
+
 # `.tr` reader/writer (Phase A relocation — canonical home for the
 # wire format). Used by `root pack` and `root install`.
 tr-format     = { workspace = true }

@@ -38,6 +38,16 @@ pub struct V3ClaimExportRow {
 /// Graph storage backed by CozoDB — an embedded Datalog database.
 /// Datalog gives us recursive graph queries, pattern matching, and built-in
 /// graph algorithms (PageRank, shortest path) out of the box.
+///
+/// `Clone` is cheap — `cozo::DbInstance` is internally `Arc<...>` and
+/// shares the same underlying database connection.  Cloning lets a
+/// caller release the outer `Mutex<StorageEngine>` and then run a
+/// long-lived read (e.g. the health verifier's ~1.2s sequential
+/// query batch) without serialising every concurrent reader behind
+/// it.  The mutex is still required for the writer side because
+/// vector-store mutations and graph schema migrations need to be
+/// linearised against each other.
+#[derive(Clone)]
 pub struct GraphStore {
     db: DbInstance,
 }

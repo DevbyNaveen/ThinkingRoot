@@ -1,13 +1,37 @@
 #!/bin/sh
 # ThinkingRoot installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/DevbyNaveen/ThinkingRoot/main/install.sh | sh
-set -e
+#
+# Strict mode: fail fast on any error, undefined variable, or pipeline
+# component failure. `set -e` alone leaves the script exposed to typos
+# in variable names (silently expanding to empty strings — used to
+# overwrite legitimate paths) and to grep/curl failures inside pipes
+# returning success because the last command succeeded.
+set -eu
+# `pipefail` is POSIX-2024 but not in /bin/sh on macOS 10.x; tolerate
+# the failure so we still get -eu on minimal shells.
+(set -o pipefail 2>/dev/null) && set -o pipefail || true
+# Guard against IFS-based command injection if the user has a
+# pre-seeded IFS in their environment.
+IFS='
+'
 
 REPO="DevbyNaveen/ThinkingRoot"
 RELEASES_REPO="DevbyNaveen/releases"
 NLI_MODELS_TAG="nli-models"
 BINARY="root"
 INSTALL_DIR="${INSTALL_DIR:-}"
+# Optional minisign public key for verifying `checksums.txt`.  When
+# unset the installer falls back to TLS-only trust on the checksum
+# file — a CA-level MITM (or a release-pipeline compromise that can
+# write to the GitHub release assets) would not be detected.  Setting
+# this to a published TR key closes that gap end-to-end.  Override
+# with: TR_MINISIGN_PUBKEY="RWQf6...rest..."  curl ... | sh
+TR_MINISIGN_PUBKEY="${TR_MINISIGN_PUBKEY:-}"
+# Set to "1" to require signature verification — installs abort if
+# minisign is missing or the checksum file isn't signed. Default off
+# so first-boot CI/CD pipelines without minisign installed still work.
+TR_REQUIRE_SIGNATURE="${TR_REQUIRE_SIGNATURE:-0}"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -192,14 +216,65 @@ main() {
 
   ASSET_PATH="${TMP_DIR}/${ASSET}"
   CHECKSUMS_PATH="${TMP_DIR}/checksums.txt"
+  CHECKSUMS_SIG_PATH="${TMP_DIR}/checksums.txt.minisig"
 
   say "Downloading binary..."
   download "$ASSET_URL" "$ASSET_PATH"
   download_quiet "$CHECKSUM_URL" "$CHECKSUMS_PATH"
 
+  # Optional signature verification.  When TR_MINISIGN_PUBKEY is set
+  # AND `minisign` is installed, verify checksums.txt before trusting
+  # any digest from it.  This closes the MITM-with-forged-TLS-cert
+  # gap and the "release-pipeline compromise rewrites checksums.txt"
+  # gap.  When the env var is unset the installer falls back to
+  # TLS-only trust (current behaviour).
+  if [ -n "$TR_MINISIGN_PUBKEY" ]; then
+    if is_cmd minisign; then
+      SIG_URL="${BASE_URL}/checksums.txt.minisig"
+      if download_quiet "$SIG_URL" "$CHECKSUMS_SIG_PATH" 2>/dev/null; then
+        say "Verifying checksum signature with minisign..."
+        if minisign -V -P "$TR_MINISIGN_PUBKEY" \
+            -m "$CHECKSUMS_PATH" -x "$CHECKSUMS_SIG_PATH" >/dev/null 2>&1; then
+          say "Signature OK"
+        else
+          err "checksums.txt signature verification failed — refusing to install"
+        fi
+      else
+        if [ "$TR_REQUIRE_SIGNATURE" = "1" ]; then
+          err "TR_REQUIRE_SIGNATURE=1 but checksums.txt.minisig is missing"
+        else
+          warn "checksums.txt.minisig not published yet — falling back to TLS-only trust"
+        fi
+      fi
+    else
+      if [ "$TR_REQUIRE_SIGNATURE" = "1" ]; then
+        err "TR_REQUIRE_SIGNATURE=1 but minisign is not installed (brew install minisign / apt install minisign)"
+      else
+        warn "minisign not installed — falling back to TLS-only trust on checksums.txt"
+      fi
+    fi
+  elif [ "$TR_REQUIRE_SIGNATURE" = "1" ]; then
+    err "TR_REQUIRE_SIGNATURE=1 but TR_MINISIGN_PUBKEY is unset"
+  fi
+
   say "Verifying SHA256 checksum..."
-  EXPECTED="$(grep " ${ASSET}$" "$CHECKSUMS_PATH" | awk '{print $1}')"
-  [ -z "$EXPECTED" ] && err "Checksum not found for ${ASSET} in checksums.txt"
+  # Anchor the match: an unanchored grep would treat
+  # `root-linux-amd64` as a substring of `root-linux-amd64.exe` and
+  # pull the wrong line.  `grep -F` (literal, no regex meta) defends
+  # against artifact names that ever contain `.` or `+`.
+  EXPECTED="$(grep -F " ${ASSET}" "$CHECKSUMS_PATH" \
+              | awk -v a=" ${ASSET}" '$0 ~ a"$" || $0 ~ "[*]"substr(a,2)"$" {print $1; exit}')"
+  if [ -z "$EXPECTED" ]; then
+    err "Checksum not found for ${ASSET} in checksums.txt"
+  fi
+  # Reject malformed digest entries (sha256 = exactly 64 hex chars).
+  # Defense-in-depth in case checksums.txt itself was truncated mid-line.
+  case "$EXPECTED" in
+    *[!0-9a-fA-F]*) err "Malformed SHA256 in checksums.txt: ${EXPECTED}" ;;
+  esac
+  if [ "${#EXPECTED}" != 64 ]; then
+    err "SHA256 must be 64 hex chars, got ${#EXPECTED}: ${EXPECTED}"
+  fi
   ACTUAL="$(sha256 "$ASSET_PATH")"
   if [ "$EXPECTED" != "$ACTUAL" ]; then
     printf '\033[1;31mChecksum mismatch!\n  Expected: %s\n  Got:      %s\033[0m\n' \
@@ -209,13 +284,34 @@ main() {
   say "Checksum OK"
 
   if [ "$IS_BUNDLE" = "1" ]; then
-    # Extract binary + ONNX Runtime dylib both to INSTALL_DIR
-    tar -xzf "$ASSET_PATH" -C "$INSTALL_DIR"
-    chmod +x "${INSTALL_DIR}/${BINARY}"
+    # Extract binary + ONNX Runtime dylib to a staging dir first so a
+    # corrupt tarball can't half-overwrite an existing install.  Move
+    # into place atomically only after extraction succeeds.
+    STAGE_DIR="${TMP_DIR}/stage"
+    mkdir -p "$STAGE_DIR"
+    tar -xzf "$ASSET_PATH" -C "$STAGE_DIR"
+    [ -f "${STAGE_DIR}/${BINARY}" ] || err "tarball did not contain ${BINARY}"
+    chmod +x "${STAGE_DIR}/${BINARY}"
+    # Move every staged file into INSTALL_DIR with a tmp + rename.
+    for src in "$STAGE_DIR"/*; do
+      base="$(basename "$src")"
+      mv "$src" "${INSTALL_DIR}/${base}.tr-installing" \
+        || err "failed to stage ${base} into ${INSTALL_DIR}"
+      mv "${INSTALL_DIR}/${base}.tr-installing" "${INSTALL_DIR}/${base}" \
+        || err "failed to install ${base} into ${INSTALL_DIR}"
+    done
     say "Installed: ${INSTALL_DIR}/${BINARY} (+ libonnxruntime dylib)"
   else
     chmod +x "$ASSET_PATH"
-    mv "$ASSET_PATH" "${INSTALL_DIR}/${BINARY}"
+    # Atomic install: move to a sibling tmp path first, then rename
+    # over the live binary.  Pre-fix a SIGINT during `mv` could leave
+    # `INSTALL_DIR/root` truncated — half of the new bytes, half of
+    # the old, which crashes on first invocation.
+    STAGED="${INSTALL_DIR}/${BINARY}.tr-installing"
+    mv "$ASSET_PATH" "$STAGED" \
+      || err "failed to stage binary into ${INSTALL_DIR} (insufficient permissions?)"
+    mv "$STAGED" "${INSTALL_DIR}/${BINARY}" \
+      || { rm -f "$STAGED"; err "failed to install binary into ${INSTALL_DIR}"; }
     say "Installed: ${INSTALL_DIR}/${BINARY}"
   fi
 

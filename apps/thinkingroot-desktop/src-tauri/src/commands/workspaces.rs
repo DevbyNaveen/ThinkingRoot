@@ -173,6 +173,16 @@ pub enum CompileProgress {
     Started {
         workspace: String,
     },
+    /// Emitted while the compile task is waiting for the bundled
+    /// `root` sidecar to finish booting (livez probe + child-process
+    /// liveness).  Pre-fix the user's "Compile" click sat silent for
+    /// up to 120 s with no UI signal that anything was happening,
+    /// indistinguishable from a hung app.  Now React renders a
+    /// "Waiting for engine…" indicator that resolves into the
+    /// ParseComplete/ExtractionStart events the user expects.
+    Booting {
+        workspace: String,
+    },
     ParseComplete {
         files: usize,
     },
@@ -311,10 +321,22 @@ pub async fn workspace_compile(
         // The sidecar handle is stored only after `spawn()` completes
         // its readiness probe (polling /livez for up to 120s AND
         // checking that the child process hasn't crashed).
+        //
+        // **UX**: pre-fix the user clicked Compile and sat watching a
+        // dead spinner for up to 120s while the sidecar booted, with
+        // no signal that anything was happening.  Now we emit a
+        // `Booting` phase up-front so the UI can render an
+        // explanatory state, and we drop the global cap to 60 s —
+        // a healthy sidecar boots in 2–4 s; 60 s already covers the
+        // worst observed cold-start (large NLI ONNX model + first-run
+        // fastembed download) by 5×.  Beyond that the sidecar is
+        // wedged and we should fail fast rather than block the user.
+        const SIDECAR_BOOT_MAX_ATTEMPTS: u32 = 120; // 120 * 500 ms = 60 s
+        let mut emitted_booting = false;
         let sidecar = {
             let state = app_for_task.state::<AppState>();
             let mut result = None;
-            for attempt in 0u32..240 {
+            for attempt in 0u32..SIDECAR_BOOT_MAX_ATTEMPTS {
                 {
                     let guard = state.sidecar.lock().await;
                     if let Some(h) = guard.as_ref() {
@@ -322,14 +344,21 @@ pub async fn workspace_compile(
                         break;
                     }
                 }
-                if attempt == 0 {
+                if !emitted_booting {
+                    emitted_booting = true;
                     tracing::info!(
                         workspace = %label_for_task,
                         "sidecar handle not yet available — waiting for sidecar to finish booting",
                     );
+                    let _ = app_for_task.emit(
+                        "workspace_compile_progress",
+                        CompileProgress::Booting {
+                            workspace: label_for_task.clone(),
+                        },
+                    );
                 }
                 // Check cancellation so a Stop click during the wait
-                // doesn't block for the full 120 s.
+                // doesn't block for the full 60 s.
                 if cancel_for_task.is_cancelled() {
                     break;
                 }
@@ -361,12 +390,23 @@ pub async fn workspace_compile(
                 }
                 other => other,
             }
+        } else if cancel_for_task.is_cancelled() {
+            // User clicked Stop during the boot-wait window.  Emit the
+            // neutral cancelled state rather than a red error toast —
+            // the compile never actually started, so there's nothing
+            // to undo.
+            Err(CompileDriveError::Cancelled)
         } else {
             tracing::error!(
                 workspace = %label_for_task,
-                "sidecar unavailable — failing compile because sidecar is strictly required",
+                "sidecar unavailable after 60s boot timeout — failing compile",
             );
-            Err(CompileDriveError::Failed("Sidecar process is unavailable or failed to start.".to_string()))
+            Err(CompileDriveError::Failed(
+                "Engine sidecar did not finish booting within 60 seconds. \
+                 Check the logs (Help → Open Logs) — the bundled `root` binary \
+                 may be missing or the data directory may be unwritable."
+                    .to_string(),
+            ))
         };
 
         match outcome {

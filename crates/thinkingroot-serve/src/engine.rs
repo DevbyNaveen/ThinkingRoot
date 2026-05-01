@@ -1056,11 +1056,24 @@ impl QueryEngine {
 
     /// Run health/verification checks on the workspace.
     /// Reads directly from CozoDB — verification needs full consistency checks.
+    ///
+    /// **Lock semantics.** `Verifier::verify` issues ~9 sequential
+    /// CozoDB queries plus a `count_low_grounding_claims` join (~700
+    /// ms wall on a 50k-claim graph).  Pre-fix this hold time blocked
+    /// every concurrent `search`, `read_source`, and `brain_load`
+    /// against the same workspace.  We now clone the `GraphStore`
+    /// (cheap — `Arc<DbInstance>`-backed) under the lock and release
+    /// it before calling into the verifier; CozoDB's internal locking
+    /// still serialises actual disk operations, but at the page-cache
+    /// granularity the engine already supports.
     pub async fn health(&self, ws: &str) -> Result<VerificationResult> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
+        let graph = {
+            let storage = handle.storage.lock().await;
+            storage.graph.clone()
+        };
         let verifier = Verifier::new(&handle.config);
-        verifier.verify(&storage.graph)
+        verifier.verify(&graph)
     }
 
     /// Read the exact source bytes a claim cites. Powers the v3 MCP
@@ -1160,9 +1173,16 @@ impl QueryEngine {
     /// synchronously).
     pub async fn rooting_report(&self, ws: &str) -> Result<RootingReport> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        let (rooted, attested, quarantined, rejected) =
-            storage.graph.count_claims_by_admission_tier()?;
+        // Clone the graph handle out from under the mutex so the tier
+        // count query (~50–200 ms over the whole `verification_certificates`
+        // scan on a 50k-claim graph) doesn't block concurrent
+        // search/brain_load callers.  See `health()` for the
+        // architectural rationale.
+        let graph = {
+            let storage = handle.storage.lock().await;
+            storage.graph.clone()
+        };
+        let (rooted, attested, quarantined, rejected) = graph.count_claims_by_admission_tier()?;
         Ok(RootingReport {
             workspace: ws.to_string(),
             rooted,
@@ -1184,9 +1204,12 @@ impl QueryEngine {
         min_confidence: Option<f64>,
     ) -> Result<Vec<ClaimInfo>> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
+        let graph = {
+            let storage = handle.storage.lock().await;
+            storage.graph.clone()
+        };
 
-        let rows = storage.graph.get_rooted_claims_filtered(
+        let rows = graph.get_rooted_claims_filtered(
             type_filter.as_deref(),
             entity_filter.as_deref(),
             min_confidence,

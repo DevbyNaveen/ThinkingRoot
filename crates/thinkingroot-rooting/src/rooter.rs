@@ -167,29 +167,37 @@ fn trial_one(ctx: &ProbeContext<'_>) -> Result<(TrialVerdict, Option<Certificate
     }
 
     // Predicate (non-fatal — Week 3+).
+    //
+    // Probes themselves return `Ok(ProbeResult::skipped(...))` for the
+    // legitimate "nothing to evaluate" cases (no predicate attached,
+    // claim is not derived, claim has no event date, etc.).  An
+    // `Err(_)` from the probe means a real failure — graph storage
+    // error, regex compile error, JSONPath parse error.  Pre-fix we
+    // demoted *every* `Err(_)` to `skipped("engine not yet
+    // available")`, which silently masked storage corruption,
+    // accidentally-malformed predicates, and post-migration schema
+    // gaps as "no signal" — pushing the affected claims to Attested
+    // when they should have been Quarantined or surfaced loudly.
+    //
+    // Post-fix every probe error propagates up via `?` so the
+    // pipeline's per-batch resilience layer (extractor.rs:run_batch)
+    // records the failure and the user sees it in
+    // `failed_chunk_ranges`.  The legitimate skip cases are
+    // unaffected because they remain `Ok(skipped)`.
     let predicate_result = match ctx.predicate {
-        Some(_) => match PredicateProbe.run(ctx) {
-            Ok(r) => r,
-            Err(_) => ProbeResult::skipped(ProbeName::Predicate, "engine not yet available"),
-        },
+        Some(_) => PredicateProbe.run(ctx)?,
         None => ProbeResult::skipped(ProbeName::Predicate, "no predicate attached"),
     };
     let predicate_passed = predicate_result.passed;
     probes.push(predicate_result);
 
     // Topology (non-fatal — Week 4).
-    let topology_result = match TopologyProbe.run(ctx) {
-        Ok(r) => r,
-        Err(_) => ProbeResult::skipped(ProbeName::Topology, "engine not yet available"),
-    };
+    let topology_result = TopologyProbe.run(ctx)?;
     let topology_passed = topology_result.passed;
     probes.push(topology_result);
 
     // Temporal (non-fatal — Week 5).
-    let temporal_result = match TemporalProbe.run(ctx) {
-        Ok(r) => r,
-        Err(_) => ProbeResult::skipped(ProbeName::Temporal, "engine not yet available"),
-    };
+    let temporal_result = TemporalProbe.run(ctx)?;
     let temporal_passed = temporal_result.passed;
     probes.push(temporal_result);
 

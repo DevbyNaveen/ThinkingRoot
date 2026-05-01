@@ -357,6 +357,11 @@ export async function workspaceCompile(args: WorkspaceCompileArgs): Promise<stri
 
 export type CompileProgress =
   | { phase: "started"; workspace: string }
+  // Emitted while the desktop is waiting for the bundled `root`
+  // sidecar to finish booting (livez probe).  Without this signal the
+  // user clicked Compile and saw no UI activity for up to 60 s; React
+  // can now render an explanatory "Waiting for engine…" state.
+  | { phase: "booting"; workspace: string }
   | { phase: "parse_complete"; files: number }
   | { phase: "extraction_start"; total_chunks: number; total_batches: number }
   | { phase: "extraction_progress"; done: number; total: number }

@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use console::style;
 use serde_json::{Value, json};
+use thinkingroot_core::atomic_write;
 use thinkingroot_core::global_config::Credentials;
 
 /// The JSON key / format that each tool uses for MCP server configuration.
@@ -193,28 +194,66 @@ pub(crate) const CREDENTIAL_VARS: &[&str] = &[
 
 /// Build a JSON object of credential env vars for injection into stdio subprocess configs.
 ///
-/// Resolution order per variable:
-///   1. Live env var (highest — allows CI/CD override)
-///   2. Value from `~/.config/thinkingroot/credentials.toml` (set by `root setup`)
+/// **Security model.**  Pre-fix this function copied the *plaintext*
+/// API key into every tool's MCP config file (`~/.cursor/mcp.json`,
+/// `~/.codex/config.toml`, etc.).  Those files are world-readable on
+/// the user's machine — `cat ~/.cursor/mcp.json` from any other
+/// process under the same user account leaks the key, and the user's
+/// dotfiles backup (Time Machine, iCloud Drive, dotfile-sync repos)
+/// would happily back the secrets up to off-machine storage.  Worst
+/// case the user pastes their `mcp.json` into a forum thread for
+/// debugging.
 ///
-/// This ensures that tools like Claude Desktop get the key even when the user's
-/// shell profile hasn't exported it — which is the common case for GUI apps.
-fn credential_env_json() -> serde_json::Map<String, Value> {
+/// Post-fix we forward `${VAR}` placeholders instead of literals.
+/// The MCP host is responsible for substituting from the parent
+/// shell environment (Cursor + VS Code + Codex all support this);
+/// when the parent shell doesn't have the var set we supplement by
+/// asking the launched `root` binary to read from
+/// `~/.config/thinkingroot/credentials.toml` (chmod 0600 — set by
+/// `Credentials::save`).  Either way the secret never sits in
+/// plaintext inside a config file.
+///
+/// `tool_supports_var_expansion` distinguishes the path: tools that
+/// expand `${VAR}` get placeholders; tools that don't get an empty
+/// env table and rely entirely on the credentials.toml fallback
+/// inside the spawned `root` binary.
+fn credential_env_json(tool_supports_var_expansion: bool) -> serde_json::Map<String, Value> {
     // Load stored credentials once; fall back to empty map on any error.
     let stored = Credentials::load().unwrap_or_default();
 
     let mut map = serde_json::Map::new();
     for var in CREDENTIAL_VARS {
-        // Priority 1: live env var
-        let value = std::env::var(var)
+        let parent_has = std::env::var(var)
             .ok()
-            .filter(|v| !v.is_empty())
-            // Priority 2: credentials.toml
-            .or_else(|| stored.get(var).map(str::to_string));
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let cred_has = stored.get(var).map(|v| !v.is_empty()).unwrap_or(false);
 
-        if let Some(val) = value {
-            map.insert(var.to_string(), json!(val));
+        // Only emit a key if we actually have a credential to forward
+        // (either from the parent shell or from credentials.toml).
+        // Emitting empty-string placeholders for every known provider
+        // would let an attacker who can read the MCP config infer
+        // which providers the user *might* have keys for.
+        if !parent_has && !cred_has {
+            continue;
         }
+
+        let value = if tool_supports_var_expansion && parent_has {
+            // Tell the MCP host to expand `${OPENAI_API_KEY}` from the
+            // shell environment at spawn time.  Cursor, VS Code MCP,
+            // Codex, Claude Desktop all honour this syntax.
+            json!(format!("${{{var}}}"))
+        } else {
+            // Tools that don't expand `${VAR}` (or for vars that the
+            // parent shell doesn't carry — common for GUI Claude
+            // Desktop) get an empty placeholder.  The launched
+            // subprocess reads `credentials.toml` directly via
+            // `Credentials::load()` to recover the secret without it
+            // ever sitting in this config file.
+            json!("")
+        };
+
+        map.insert(var.to_string(), value);
     }
     map
 }
@@ -224,7 +263,11 @@ fn credential_env_json() -> serde_json::Map<String, Value> {
 /// VS Code requires an explicit `"type": "stdio"` field; all other tools infer
 /// the transport from the presence of a `command` key.
 fn stdio_entry(bin_path: &str, workspace_path: &str, needs_type_field: bool) -> Value {
-    let env_obj = credential_env_json();
+    // All JSON-based tools we currently target (Cursor, VS Code,
+    // Windsurf, Cline, Continue.dev, Antigravity, Zed, Claude Desktop,
+    // Claude Code) honour `${VAR}` expansion in the env table.  Codex
+    // (TOML) has its own writer that passes false explicitly.
+    let env_obj = credential_env_json(true);
     let mut entry = if needs_type_field {
         json!({
             "type": "stdio",
@@ -335,13 +378,30 @@ pub fn write_tool_config(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(path, &json_out)
+    write_config_atomic(path, json_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
         tool: tool.name,
         path: path.clone(),
         action: WriteAction::Written,
+    })
+}
+
+/// Atomic write for tool MCP config files — tmp + rename so a SIGINT
+/// during `write` can't truncate `~/.cursor/mcp.json` and brick the
+/// user's IDE on next start.  The `0o600` mode is defence-in-depth:
+/// even though we now emit `${VAR}` placeholders rather than literal
+/// keys, a future tool plugin or third-party fork could append real
+/// secrets here.  Costs nothing to keep the file user-only.
+fn write_config_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mode = Some(0o600u32);
+    #[cfg(not(unix))]
+    let mode = None::<u32>;
+    atomic_write(path, contents, mode).map_err(|e| match e {
+        thinkingroot_core::Error::Io { source, .. } => source,
+        other => std::io::Error::other(other.to_string()),
     })
 }
 
@@ -375,7 +435,7 @@ pub fn remove_tool_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<
         });
     }
 
-    std::fs::write(path, &json_out)
+    write_config_atomic(path, json_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
@@ -454,7 +514,7 @@ fn write_claude_code_config(
         });
     }
 
-    std::fs::write(path, &json_out)
+    write_config_atomic(path, json_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
@@ -494,7 +554,7 @@ fn remove_claude_code_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Resu
         });
     }
 
-    std::fs::write(path, &json_out)
+    write_config_atomic(path, json_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
@@ -546,7 +606,7 @@ fn write_codex_config(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(path, &toml_out)
+    write_config_atomic(path, toml_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
@@ -585,19 +645,29 @@ pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: 
             toml::Value::String(workspace_path.to_string()),
         ]),
     );
-    // Forward credential env vars so the subprocess can reach LLM providers
-    // even when Codex is launched outside a shell (e.g., as a GUI app).
-    // Uses the same two-level resolution as credential_env_json().
+    // Forward credential env vars as `${VAR}` placeholders.  Codex
+    // expands shell vars from the parent environment at spawn time;
+    // when a var isn't set in the parent, the spawned `root` reads
+    // credentials.toml (chmod 0600) directly.  See
+    // `credential_env_json` for the security rationale — pre-fix
+    // this function inlined plaintext keys into config.toml.
     let stored = Credentials::load().unwrap_or_default();
     let mut env_map = toml::map::Map::new();
     for var in CREDENTIAL_VARS {
-        let value = std::env::var(var)
+        let parent_has = std::env::var(var)
             .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| stored.get(var).map(str::to_string));
-        if let Some(val) = value {
-            env_map.insert(var.to_string(), toml::Value::String(val));
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let cred_has = stored.get(var).map(|v| !v.is_empty()).unwrap_or(false);
+        if !parent_has && !cred_has {
+            continue;
         }
+        let val = if parent_has {
+            format!("${{{var}}}")
+        } else {
+            String::new()
+        };
+        env_map.insert(var.to_string(), toml::Value::String(val));
     }
     if !env_map.is_empty() {
         entry.insert("env".to_string(), toml::Value::Table(env_map));
@@ -642,7 +712,7 @@ fn remove_codex_config(tool: &DetectedTool, dry_run: bool) -> anyhow::Result<Wri
         });
     }
 
-    std::fs::write(path, &toml_out)
+    write_config_atomic(path, toml_out.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     Ok(WriteResult {
@@ -1055,7 +1125,10 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
     }
 
     #[test]
-    fn codex_toml_captures_env_vars_when_set() {
+    fn codex_toml_emits_var_placeholder_not_plaintext_secret() {
+        // Regression test: pre-fix this function inlined the plaintext
+        // secret value into config.toml.  Post-fix it must emit the
+        // `${VAR}` placeholder so the secret stays out of the file.
         let _guard = ENV_LOCK.lock().unwrap();
         let test_key = "AWS_ACCESS_KEY_ID";
         let test_value = "AKIAIOSFODNN7EXAMPLE";
@@ -1070,9 +1143,17 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
         assert_eq!(mcp["command"].as_str().unwrap(), "/usr/local/bin/root");
         assert!(
             mcp.contains_key("env"),
-            "env table should exist when credentials are set"
+            "env table should exist when a credential is detected"
         );
-        assert_eq!(mcp["env"][test_key].as_str().unwrap(), test_value);
+        let emitted = mcp["env"][test_key].as_str().unwrap();
+        assert_eq!(
+            emitted, "${AWS_ACCESS_KEY_ID}",
+            "must emit the shell placeholder, not the literal secret"
+        );
+        assert_ne!(
+            emitted, test_value,
+            "plaintext secret must NEVER be written to the MCP config"
+        );
 
         unsafe {
             if let Some(val) = original_val {
@@ -1085,7 +1166,13 @@ args = ["serve", "--mcp-stdio", "--path", "/workspace"]
 
     #[test]
     fn codex_toml_omits_env_table_when_no_credentials_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = match ENV_LOCK.lock() {
+            Ok(g) => g,
+            // PoisonError is benign for read-only purposes — earlier
+            // tests in the same process panicked while holding the
+            // mutex.  Recovering the guard lets this test still run.
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let original_vals: Vec<(String, Option<String>)> = CREDENTIAL_VARS
             .iter()
             .map(|v| (v.to_string(), std::env::var(v).ok()))

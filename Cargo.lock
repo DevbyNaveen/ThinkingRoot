@@ -6054,6 +6054,7 @@ dependencies = [
  "dialoguer",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "fs2",
  "ignore",
  "indicatif",
  "notify",

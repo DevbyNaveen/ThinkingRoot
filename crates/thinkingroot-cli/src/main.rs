@@ -1162,13 +1162,83 @@ async fn run_health(path: &PathBuf) -> anyhow::Result<()> {
 /// empty. v3 `root compile` does not embed; the index is materialised
 /// on first `root query` / `root ask` and reused thereafter (per v3
 /// final plan §13.1 — consumers choose their own embedding model).
+///
+/// **Race semantics.** Two concurrent `root ask` invocations on the
+/// same workspace previously each observed the empty index, both
+/// embedded the entire claim set, and the second writer overwrote
+/// the first.  The second-writer cost is non-trivial — embedding a
+/// 100k-claim graph can take 5+ minutes — and the racy double-write
+/// can corrupt the index if two threads ever interleave RocksDB
+/// batches mid-commit.
+///
+/// The fix is a cross-process advisory lock at
+/// `<data_dir>/.thinkingroot/.vector_index.lock`.  Pattern:
+///   1. Open the lockfile (creating it if absent).
+///   2. Take an exclusive `fs2` lock — blocks until any concurrent
+///      builder finishes and releases.
+///   3. Re-check `is_empty()` AFTER acquiring the lock (the
+///      double-checked-locking pattern: another process may have
+///      finished while we were waiting, so we'd skip the rebuild
+///      entirely).
+///   4. Build under the held lock.
+///   5. Release on `Drop` (RAII).  fs2 also auto-releases on process
+///      death so a crashed builder doesn't leave a stale lock.
 fn ensure_vector_index(
     storage: &mut thinkingroot_graph::StorageEngine,
     path: &Path,
 ) -> anyhow::Result<()> {
+    use fs2::FileExt;
+
+    // Fast path: index already populated, no lock acquisition needed.
+    // Reading `is_empty()` is cheap and lock-free — only contend on
+    // the lockfile when we'd actually rebuild.
     if !storage.vector.is_empty() {
         return Ok(());
     }
+
+    let data_dir = path.join(".thinkingroot");
+    // The lockfile lives under .thinkingroot/ (already created by
+    // `root compile`) so `root ask` doesn't need to mkdir it.
+    let lock_path = data_dir.join(".vector_index.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open vector-index lockfile at {}", lock_path.display()))?;
+
+    // `lock_exclusive` blocks until acquired (no busy-wait).  fs2
+    // delegates to flock/LockFileEx; the OS releases on process
+    // exit even if the process panics or is SIGKILL'd, so a stale
+    // lockfile can never deadlock a future `root ask`.
+    #[allow(clippy::incompatible_msrv)]
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("failed to acquire vector-index lock at {}", lock_path.display()))?;
+
+    // RAII guard releases the OS lock on scope exit (success OR
+    // panic).  The file itself is left on disk so subsequent
+    // invocations can re-lock it without re-creating; the file is
+    // 0 bytes so retention is harmless.
+    struct LockGuard(std::fs::File);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            #[allow(clippy::incompatible_msrv)]
+            let _ = self.0.unlock();
+        }
+    }
+    let _guard = LockGuard(lock_file);
+
+    // Double-checked locking: another process may have built the
+    // index while we waited.  Reload the vector store's emptiness
+    // signal — fastembed/cozo persist the rows on disk, so the
+    // freshly-acquired storage handle sees the post-build state on
+    // its next read.
+    if !storage.vector.is_empty() {
+        return Ok(());
+    }
+
     let claim_count = storage.graph.get_all_claims_with_sources()?.len();
     if claim_count == 0 {
         anyhow::bail!(
