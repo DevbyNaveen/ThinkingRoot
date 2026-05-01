@@ -542,20 +542,34 @@ impl Extractor {
         }
 
         // ── Collect batch results ──────────────────────────────────────────
-        // Cancellation: if a token has been wired in via `with_cancel`,
-        // check between batches.  We consume in-flight join handles
-        // before bailing so already-completed batches still land in
-        // `output` (the caller's checkpoint flushes them).  We also
-        // call `join_set.shutdown().await` to abort the spawned tasks
-        // that haven't returned yet — they'd otherwise keep paying for
-        // an LLM call whose result we'll discard.
-        while let Some(join_result) = join_set.join_next().await {
-            if let Some(ref tok) = self.cancel
-                && tok.is_cancelled()
-            {
-                join_set.shutdown().await;
-                return Err(thinkingroot_core::Error::Cancelled);
-            }
+        // Cancellation runs concurrently with the join: if the token
+        // fires while every spawned task is still awaiting its LLM
+        // round-trip, the `tokio::select!` arm picks it up
+        // immediately instead of waiting for the slowest inflight
+        // batch to return. Pre-fix the cancel check sat AFTER
+        // `join_next().await` and the desktop's Stop button could
+        // wait minutes against a slow-completing batch before the
+        // pipeline acknowledged the cancel.
+        loop {
+            let join_result = match self.cancel.as_ref() {
+                Some(tok) => {
+                    tokio::select! {
+                        biased;
+                        _ = tok.cancelled() => {
+                            join_set.shutdown().await;
+                            return Err(thinkingroot_core::Error::Cancelled);
+                        }
+                        next = join_set.join_next() => match next {
+                            Some(r) => r,
+                            None => break,
+                        }
+                    }
+                }
+                None => match join_set.join_next().await {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
             let batch_outcome = match join_result {
                 Ok(inner) => inner,
                 Err(join_err) => {

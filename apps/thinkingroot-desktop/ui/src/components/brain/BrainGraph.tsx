@@ -88,19 +88,27 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
   const transformRef = useRef<ZoomTransform>(zoomIdentity);
   const zoomBehaviorRef = useRef<ZoomBehavior<HTMLCanvasElement, unknown> | null>(null);
 
-  const [hovered, setHovered] = useState<string | null>(null);
-  const [isolated, setIsolated] = useState<string | null>(null);
-  const [size, setSize] = useState({ w: 800, h: 600 });
-
-  // Mirrors of UI state read from inside the (stable) draw closure.
-  // Updating a ref does NOT retrigger the canvas-init effect — that's
-  // exactly the H2 fix.  Pre-rewrite the parent's `searchQuery` prop
-  // sat in the render-effect dep list, so every keystroke tore down
-  // and rebuilt the canvas pipeline.
+  // Hovered + isolated entities live exclusively in refs (CLAUDE.md
+  // audit invariant) — every mouse-move would otherwise re-render
+  // this 5K-node component and re-run hook preamble at 60 Hz.  We
+  // call `drawRef.current?.()` directly from the event handlers
+  // instead, redrawing only the canvas without involving React.
   const hoveredRef = useRef<string | null>(null);
   const isolatedRef = useRef<string | null>(null);
   const searchQueryRef = useRef<string | undefined>(undefined);
   const drawRef = useRef<(() => void) | null>(null);
+  const setHovered = (id: string | null) => {
+    if (hoveredRef.current === id) return;
+    hoveredRef.current = id;
+    drawRef.current?.();
+  };
+  const setIsolated = (id: string | null) => {
+    if (isolatedRef.current === id) return;
+    isolatedRef.current = id;
+    drawRef.current?.();
+  };
+
+  const [size, setSize] = useState({ w: 800, h: 600 });
 
   // 1. Prepare data + adjacency map + per-entity best semantic type.
   const { nodes, links, neighborMap } = useMemo(() => {
@@ -370,17 +378,10 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     };
   }, [nodes, links, neighborMap, size]);
 
-  // 4. Mirror UI state into refs and trigger a single redraw — no
-  //    canvas reinit, no sim restart.  This is what makes the search
-  //    input feel instant on a 10K-node graph.
-  useEffect(() => {
-    hoveredRef.current = hovered;
-    drawRef.current?.();
-  }, [hovered]);
-  useEffect(() => {
-    isolatedRef.current = isolated;
-    drawRef.current?.();
-  }, [isolated]);
+  // 4. Mirror only `searchQuery` (a parent prop, so we can't make it
+  //    a ref) into the canvas-readable ref. Hovered/isolated already
+  //    sit in refs — see the `setHovered` / `setIsolated` shims
+  //    above — so no extra effect is needed for them.
   useEffect(() => {
     searchQueryRef.current = searchQuery;
     drawRef.current?.();

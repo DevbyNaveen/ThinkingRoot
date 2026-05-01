@@ -517,14 +517,13 @@ async fn collect_azure(
         }
     }
 
-    // Set the env var in this process so it's usable immediately.
-    unsafe {
-        std::env::set_var(pdef.default_env, &api_key);
-    }
-
     let model_str = resolve_model(theme, model, &[&deployment])?;
 
-    // Persist key to credentials.toml so future commands work in a fresh shell.
+    // Persist key to credentials.toml so future commands work in a
+    // fresh shell, and inject directly into the in-memory provider
+    // config for the current process — no `unsafe std::env::set_var`
+    // (audit invariant: forbidden, races concurrent getenv reads in
+    // multi-thread tokio runtimes).
     crate::setup::persist_credential(pdef.default_env, &api_key);
     let mut llm = base_llm_config("azure", &model_str);
     llm.providers.azure = Some(AzureConfig {
@@ -533,7 +532,7 @@ async fn collect_azure(
         deployment: Some(deployment),
         api_version: Some(api_version),
         api_key_env: Some(pdef.default_env.to_string()),
-        api_key: None, // stored in credentials.toml, not config.toml
+        api_key: Some(api_key.clone()), // in-memory only; stripped on save
     });
     Ok(llm)
 }
@@ -583,17 +582,18 @@ async fn collect_generic(
     no_validate: bool,
 ) -> anyhow::Result<LlmConfig> {
     // ── API key ───────────────────────────────────────────────────
+    // The key flows into LlmConfig.providers.<name>.api_key
+    // directly — `unsafe std::env::set_var` from a tokio runtime
+    // races concurrent getenv reads (audit invariant: never
+    // mutate global env state from this process).
     let api_key = if pdef.default_env.is_empty() {
         // No-auth provider (shouldn't happen for generic, but guard)
         String::new()
     } else if let Some(k) = key {
-        // Key passed via --key flag
-        unsafe {
-            std::env::set_var(pdef.default_env, k);
-        }
+        // Key passed via --key flag.
         k.to_string()
     } else if let Ok(k) = std::env::var(pdef.default_env) {
-        // Already set in environment
+        // Already set in environment by the user's shell profile.
         println!(
             "  {} {} is already set in environment.",
             style("✓").green(),
@@ -601,22 +601,18 @@ async fn collect_generic(
         );
         k
     } else {
-        // Prompt interactively
+        // Prompt interactively.
         println!(
             "  {} {} is not set.",
             style("!").yellow(),
             style(pdef.default_env).cyan()
         );
-        let k: String = Password::with_theme(theme)
+        Password::with_theme(theme)
             .with_prompt(format!(
                 "{} API key",
                 pdef.label.split_whitespace().next().unwrap_or(pdef.id)
             ))
-            .interact()?;
-        unsafe {
-            std::env::set_var(pdef.default_env, &k);
-        }
-        k
+            .interact()?
     };
 
     // ── Validate key ──────────────────────────────────────────────
@@ -664,7 +660,11 @@ async fn collect_generic(
     let model_str = resolve_model(theme, model, &effective)?;
 
     // ── Build LlmConfig ───────────────────────────────────────────
-    // Persist key to credentials.toml so future commands work in a fresh shell.
+    // Persist key to credentials.toml for future commands, and
+    // attach it to the in-memory ProviderConfig so the current
+    // process can use it immediately.  `Config::save` strips
+    // `api_key` before writing config.toml, so the on-disk
+    // workspace config stays free of credentials.
     if !pdef.default_env.is_empty() && !api_key.is_empty() {
         crate::setup::persist_credential(pdef.default_env, &api_key);
     }
@@ -674,7 +674,11 @@ async fn collect_generic(
         } else {
             Some(pdef.default_env.to_string())
         },
-        api_key: None, // stored in credentials.toml, not config.toml
+        api_key: if api_key.is_empty() {
+            None
+        } else {
+            Some(api_key.clone()) // in-memory only; stripped on save
+        },
         base_url: effective_base,
         default_model: None,
     };

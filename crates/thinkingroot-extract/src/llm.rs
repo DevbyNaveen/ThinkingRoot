@@ -1559,6 +1559,22 @@ impl AnthropicProvider {
             });
         }
 
+        // Surface 4xx auth/permission/not-found errors as
+        // `LlmProvider` with the HTTP status fingerprint embedded so
+        // `Error::is_permanent` short-circuits the retry loop.  Pre-
+        // fix the code fell through to `resp.json()` below, which
+        // emitted a `serde` parse error on Anthropic's HTML error
+        // page — that error wasn't `is_permanent`, so a stale API
+        // key burned the full `max_retries` quota before failing.
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            return Err(Error::LlmProvider {
+                provider: "anthropic".into(),
+                message: format!("got HTTP {status} from anthropic: {snippet}"),
+            });
+        }
+
         // Capture rate limit headers before consuming body.
         let limits = HeaderRateLimits::from_headers(resp.headers());
 

@@ -834,10 +834,13 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
             });
         }
         "azure" => {
-            // Inject into env for this process session.
-            unsafe {
-                std::env::set_var("AZURE_OPENAI_API_KEY", &setup.api_key);
-            }
+            // Persist the credential. Subsequent in-process reads
+            // pick the key up via `Credentials::inject_into` →
+            // `LlmConfig.providers.azure.api_key`, so a global
+            // env-var write is not needed (and forbidden by the
+            // audit invariants — `unsafe std::env::set_var` from a
+            // tokio runtime races against concurrent getenv reads
+            // and is undefined behaviour on glibc/macOS libc).
             persist_credential("AZURE_OPENAI_API_KEY", &setup.api_key);
             llm.providers.azure = Some(AzureConfig {
                 resource_name: setup.azure_resource.clone(),
@@ -845,7 +848,7 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
                 deployment: setup.azure_deployment.clone(),
                 api_version: setup.azure_api_version.clone(),
                 api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
-                api_key: None, // never stored in config.toml — lives in credentials.toml
+                api_key: Some(setup.api_key.clone()), // in-memory only; stripped on save
             });
         }
         _ => {
@@ -870,12 +873,15 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
             }
             // Standard API-key providers.
             let env_var = provider.default_env;
-            // Inject into env for this process session.
-            unsafe {
-                std::env::set_var(env_var, &setup.api_key);
-            }
-            // Persist to credentials.toml so future invocations work without
-            // requiring `export KEY=...` in the shell profile.
+            // Persist to credentials.toml so future invocations work
+            // without requiring `export KEY=...` in the shell
+            // profile. Set the key directly on the in-memory config
+            // for the current process instead of mutating the
+            // global environment — `unsafe std::env::set_var` from
+            // a tokio runtime races against concurrent getenv reads
+            // and is forbidden by the audit invariants. `Config::save`
+            // strips api_key fields from the persisted TOML, so this
+            // does not leak into config.toml.
             persist_credential(env_var, &setup.api_key);
             let resolved_base_url = setup
                 .base_url
@@ -883,7 +889,7 @@ fn set_provider_config(llm: &mut LlmConfig, provider: &ProviderDef, setup: &Prov
                 .or_else(|| provider.base_url.map(str::to_string));
             let cfg = ProviderConfig {
                 api_key_env: Some(env_var.to_string()),
-                api_key: None, // never stored in config.toml — lives in credentials.toml
+                api_key: Some(setup.api_key.clone()), // in-memory only; stripped on save
                 base_url: resolved_base_url,
                 default_model: None,
             };

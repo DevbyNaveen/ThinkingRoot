@@ -6,6 +6,26 @@ use crate::intelligence::session::{SessionContext, SessionStore};
 use serde_json::Value;
 
 // Path to the workspace sessions directory is resolved from the engine's workspace root_path.
+/// Build the canonical MCP `tools/call` text response for a payload
+/// the handler has already produced.  Centralises the
+/// `serde_json::to_string_pretty(payload)` step so a serialization
+/// failure surfaces as a JSON-RPC error (code -32603) rather than an
+/// empty string the calling LLM would interpret as "no results".
+///
+/// Audit invariant: no `unwrap_or_default()` on engine-error
+/// returns. The previous pattern of
+/// `serde_json::to_string_pretty(...).unwrap_or_default()` masked
+/// every serialization failure as success-with-empty-content.
+fn mcp_text_result<T: serde::Serialize>(id: Option<Value>, payload: &T) -> JsonRpcResponse {
+    match serde_json::to_string_pretty(payload) {
+        Ok(content) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("serialize result: {e}")),
+    }
+}
+
 fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
     engine
         .workspace_root_path(ws)
@@ -13,9 +33,22 @@ fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"))
 }
 
-fn session_actor(sessions: &SessionStore, session_id: &str) -> crate::engine::BranchActor {
-    if let Ok(store) = sessions.try_lock()
-        && let Some(session) = store.get(session_id)
+/// Resolve the [`crate::engine::BranchActor`] for an MCP session.
+///
+/// Audit fix: previously used `try_lock()` and silently fell back to
+/// `BranchActor::User(session_id)` when the lock was contended. That
+/// fallback compared the raw session UUID against
+/// `branch_ref.permissions.writers` and `owner` — which never matched —
+/// so under realistic concurrent MCP load Alice's writes were rejected
+/// (or worse, accepted on a branch with no owner) whenever the session
+/// store mutex happened to be held by another tool call. Now waits
+/// for the lock; the lock is never held for long in any handler.
+async fn session_actor(
+    sessions: &SessionStore,
+    session_id: &str,
+) -> crate::engine::BranchActor {
+    let store = sessions.lock().await;
+    if let Some(session) = store.get(session_id)
         && let Some(owner) = session.owner.as_ref()
     {
         return crate::engine::BranchActor::User(owner.clone());
@@ -621,13 +654,7 @@ pub async fn handle_call(
                 .list_claims_branched(ws, filter, active_branch.as_deref())
                 .await
             {
-                Ok(claims) => {
-                    let content = serde_json::to_string_pretty(&claims).unwrap_or_default();
-                    JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                    )
-                }
+                Ok(claims) => mcp_text_result(id, &claims),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
@@ -652,37 +679,19 @@ pub async fn handle_call(
                 .get_relations_branched(ws, entity, active_branch.as_deref())
                 .await
             {
-                Ok(rels) => {
-                    let content = serde_json::to_string_pretty(&rels).unwrap_or_default();
-                    JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                    )
-                }
+                Ok(rels) => mcp_text_result(id, &rels),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
 
         // ── Pipeline ──────────────────────────────────────────────────────
         "compile" => match engine.compile(ws).await {
-            Ok(result) => {
-                let content = serde_json::to_string_pretty(&result).unwrap_or_default();
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                )
-            }
+            Ok(result) => mcp_text_result(id, &result),
             Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
 
         "health_check" => match engine.health(ws).await {
-            Ok(result) => {
-                let content = serde_json::to_string_pretty(&result).unwrap_or_default();
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                )
-            }
+            Ok(result) => mcp_text_result(id, &result),
             Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
 
@@ -778,13 +787,7 @@ pub async fn handle_call(
                 mc.max_health_drop,
                 mc.block_on_contradictions,
             ) {
-                Ok(diff) => {
-                    let content = serde_json::to_string_pretty(&diff).unwrap_or_default();
-                    JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                    )
-                }
+                Ok(diff) => mcp_text_result(id, &diff),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
@@ -864,7 +867,7 @@ pub async fn handle_call(
                 .unwrap_or(".");
             let root = std::path::Path::new(root_path_str);
             match engine
-                .rebase_branch(root, branch_name, session_actor(sessions, session_id))
+                .rebase_branch(root, branch_name, session_actor(sessions, session_id).await)
                 .await
             {
                 Ok(diff) => JsonRpcResponse::success(
@@ -1186,7 +1189,7 @@ pub async fn handle_call(
                     active_branch.as_deref(),
                     agent_claims,
                     sessions,
-                    session_actor(sessions, session_id),
+                    session_actor(sessions, session_id).await,
                 )
                 .await
             {
@@ -1241,26 +1244,14 @@ pub async fn handle_call(
                 .list_rooted_claims(ws, type_filter, entity_filter, min_confidence)
                 .await
             {
-                Ok(claims) => {
-                    let content = serde_json::to_string_pretty(&claims).unwrap_or_default();
-                    JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                    )
-                }
+                Ok(claims) => mcp_text_result(id, &claims),
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
 
         // ── Rooting: admission tier counts + recent failures ──────────────
         "rooting_report" => match engine.rooting_report(ws).await {
-            Ok(report) => {
-                let content = serde_json::to_string_pretty(&report).unwrap_or_default();
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-                )
-            }
+            Ok(report) => mcp_text_result(id, &report),
             Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
 
@@ -1303,7 +1294,7 @@ pub async fn handle_call(
                 .unwrap_or(".");
             let root = std::path::Path::new(root_path_str);
             match engine
-                .delete_branch_as(root, branch_name, session_actor(sessions, session_id))
+                .delete_branch_as(root, branch_name, session_actor(sessions, session_id).await)
                 .await
             {
                 Ok(()) => JsonRpcResponse::success(

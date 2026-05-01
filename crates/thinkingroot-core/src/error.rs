@@ -148,6 +148,14 @@ impl Error {
     pub fn is_permanent(&self) -> bool {
         match self {
             Self::MissingConfig(_) => true,
+            // Structurally-broken config (typo in `api_version`,
+            // missing `deployment` field, malformed TOML) re-fails
+            // identically on every retry — burning the retry budget
+            // on it just delays the user-visible error.
+            Self::Config(_) => true,
+            // Path traversal / identifier-validation refusals are
+            // never going to succeed on retry; surface immediately.
+            Self::SecurityViolation(_) => true,
             Self::UnsupportedFileType { .. } => true,
             // LlmProvider errors carry a free-form message; recognise the
             // common HTTP-status fingerprints upstream surfaces emit.

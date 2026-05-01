@@ -994,13 +994,25 @@ async fn run_pipeline_inner(
     //
     // Non-fatal: event calendar failure must never abort the pipeline.
     {
-        let entity_name_to_id: std::collections::HashMap<String, String> = storage
-            .graph
-            .get_all_entities()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, name, _)| (name.to_lowercase(), id))
-            .collect();
+        // Audit invariant: no `unwrap_or_default()` on engine-error
+        // returns.  A real CozoDB failure here previously masqueraded
+        // as "no entities yet" and silently skipped event-calendar
+        // compilation; surface it explicitly so a systemic storage
+        // bug shows up in error logs.
+        let entity_name_to_id: std::collections::HashMap<String, String> =
+            match storage.graph.get_all_entities() {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|(id, name, _)| (name.to_lowercase(), id))
+                    .collect(),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "event calendar: get_all_entities failed; skipping SVO compilation"
+                    );
+                    std::collections::HashMap::new()
+                }
+            };
 
         if entity_name_to_id.is_empty() {
             tracing::warn!("event calendar: entity table empty after linking — skipping");
