@@ -39,12 +39,20 @@ impl BranchRegistry {
         })
     }
 
-    /// Save registry to disk.
+    /// Save registry to disk atomically (tmp + rename).
+    ///
+    /// Concurrent `root branch create` / `root merge` invocations
+    /// against the same workspace previously raced on a non-atomic
+    /// write that could leave an empty registry.toml on a crash.
+    /// The rename here makes the file change visible all-or-nothing;
+    /// the read-modify-write window between two concurrent callers
+    /// is still last-writer-wins, but neither produces a corrupt
+    /// file.
     pub fn save(&self) -> Result<()> {
         let path = self.refs_dir.join(REGISTRY_FILE);
         let content =
             toml::to_string_pretty(&self.data).map_err(|e| Error::Serialization(e.to_string()))?;
-        fs::write(path, content)?;
+        thinkingroot_core::atomic_write(&path, content.as_bytes(), None)?;
         Ok(())
     }
 
@@ -164,9 +172,57 @@ pub fn read_head(refs_dir: &Path) -> Result<String> {
     }
 }
 
-/// Write the active HEAD branch name.
+/// Write the active HEAD branch name atomically.  Validates the
+/// branch name first so a malformed value (`..`, control chars,
+/// NULs, leading `.`) cannot leave HEAD pointing at a path no
+/// registry entry matches and cannot escape the refs directory.
+///
+/// Allows `/` and `-` — a `feature/x` style hierarchy is the same
+/// convention git uses, and the registry's TOML keys handle it.
 pub fn write_head(refs_dir: &Path, branch_name: &str) -> Result<()> {
+    validate_branch_name(branch_name)
+        .map_err(|msg| Error::BranchNotFound(format!("invalid branch name: {msg}")))?;
     let path = refs_dir.join(HEAD_FILE);
-    fs::write(path, branch_name)?;
+    thinkingroot_core::atomic_write(&path, branch_name.as_bytes(), None)?;
+    Ok(())
+}
+
+/// Validate a branch name. Stricter than [`thinkingroot_core::validate_id`]
+/// in some ways (no leading dot, no `..` segment) but allows `/` so
+/// `feature/x` style hierarchies work.
+///
+/// Rejects: empty, > 255 bytes, NUL byte, backslash, control
+/// characters, path-traversal segments (`.` or `..` between
+/// slashes), names starting with `.` or `-`.
+fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("name is empty".into());
+    }
+    if name.len() > 255 {
+        return Err(format!("name exceeds 255 chars: {} chars", name.len()));
+    }
+    if name.starts_with('.') || name.starts_with('-') || name.starts_with('/') {
+        return Err(format!("name starts with `{}`", &name[..1]));
+    }
+    if name.ends_with('/') {
+        return Err("name ends with `/`".into());
+    }
+    if name.contains("//") {
+        return Err("name contains `//`".into());
+    }
+    for ch in name.chars() {
+        match ch {
+            '\\' | '\0' => return Err(format!("forbidden character `{ch}`")),
+            c if c.is_control() => {
+                return Err("contains control character".into());
+            }
+            _ => {}
+        }
+    }
+    for segment in name.split('/') {
+        if segment == "." || segment == ".." {
+            return Err(format!("path-traversal segment `{segment}`"));
+        }
+    }
     Ok(())
 }

@@ -369,6 +369,7 @@ impl GraphStore {
             "::index create claims:by_tier { admission_tier }",
             "::index create trial_verdicts:by_claim { claim_id }",
             "::index create trial_verdicts:by_time { trial_at }",
+            "::index create verification_certificates:by_claim { claim_id }",
             "::index create derivation_edges:by_parent { parent_claim_id }",
             "::index create derivation_edges:by_child { child_claim_id }",
             // Reflect — support the `gaps` tool's entity-scoped query path
@@ -3308,6 +3309,13 @@ impl GraphStore {
             self.remove_claim_source_edges_for_claim(claim_id)?;
             self.remove_claim_temporal(claim_id)?;
             self.remove_contradictions_for_claim(claim_id)?;
+            // Cascade rooting-side state keyed by claim_id before the
+            // claim row itself disappears.  Each helper uses the
+            // predicate-`:rm` shape because the relations carry
+            // attached secondary indexes.
+            self.remove_trial_verdicts_for_claim(claim_id)?;
+            self.remove_certificates_for_claim(claim_id)?;
+            self.remove_derivation_edges_for_claim(claim_id)?;
             self.remove_claim(claim_id)?;
         }
 
@@ -3570,6 +3578,87 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Cascade-remove every `trial_verdicts` row whose `claim_id`
+    /// matches. Called from `remove_source_by_id` after the claims
+    /// themselves are gone.
+    ///
+    /// `trial_verdicts` is the append-only audit log of probe runs;
+    /// pre-fix every source-removal cycle leaked rows that pointed
+    /// at no-longer-existent claim IDs, distorting the health-score
+    /// admission-tier histogram and silently inflating verdict
+    /// counts as users edit/rename files.  Predicate-`:rm` shape
+    /// mirrors the events cascade — `trial_verdicts:by_claim` and
+    /// `:by_time` indexes are attached so `::remove` is rejected.
+    fn remove_trial_verdicts_for_claim(&self, claim_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        self.query(
+            r#"?[id] := *trial_verdicts{id, claim_id: $cid}
+            :rm trial_verdicts {id}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Cascade-remove every `verification_certificates` row whose
+    /// `claim_id` matches.  Called from `remove_source_by_id`.
+    ///
+    /// Without this cascade `get_certificate_by_hash` returns a
+    /// certificate whose `claim_id` is dangling (the row in
+    /// `claims` is gone), and the `certificates` relation grows
+    /// indefinitely across compile cycles — the table is
+    /// content-addressed by hash so the same trial inputs would
+    /// otherwise stack up forever.  The newly-added
+    /// `verification_certificates:by_claim` secondary index makes
+    /// this O(matches) instead of O(n).
+    fn remove_certificates_for_claim(&self, claim_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        self.query(
+            r#"?[hash] := *verification_certificates{hash, claim_id: $cid}
+            :rm verification_certificates {hash}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Cascade-remove every `derivation_edges` row that names
+    /// `claim_id` as parent OR child.  Called from
+    /// `remove_source_by_id` so the rooting graph-traversal queries
+    /// (which walk `derivation_edges:by_parent`/`:by_child`) don't
+    /// follow dead edges into deleted claims and silently return
+    /// empty proofs for surviving claims that derived from the
+    /// removed source's claims.
+    fn remove_derivation_edges_for_claim(&self, claim_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        self.query(
+            r#"?[parent_claim_id, child_claim_id] := *derivation_edges{parent_claim_id, child_claim_id},
+                (parent_claim_id = $cid or child_claim_id = $cid)
+            :rm derivation_edges {parent_claim_id, child_claim_id}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Cascade-remove every `known_unknowns` row whose `entity_id`
+    /// matches. Called from `remove_entity` so the orphan sweep
+    /// can't leave gap rows pointing at GC'd entities.  Pre-fix
+    /// `reflect_list_open_gap_rows` (which joins `known_unknowns`
+    /// with `entities`) would silently drop these orphan rows
+    /// while `reflect_count_open_known_unknowns` (no join) kept
+    /// counting them — count and detail diverged.
+    fn remove_known_unknowns_for_entity(&self, entity_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("eid".into(), DataValue::Str(entity_id.into()));
+        self.query(
+            r#"?[id] := *known_unknowns{id, entity_id: $eid}
+            :rm known_unknowns {id}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
     fn remove_source_relations(&self, source_id: &str) -> Result<()> {
         for (sid, from_id, to_id, relation_type, _) in self.get_all_source_relations_raw()? {
             if sid == source_id {
@@ -3648,6 +3737,13 @@ impl GraphStore {
         }
 
         self.remove_relations_for_entity(entity_id)?;
+
+        // Cascade `known_unknowns` rows keyed by this entity before the
+        // entity row itself is gone — otherwise `reflect_list_open_gap_rows`
+        // (joining `known_unknowns` with `entities`) silently drops them
+        // while `reflect_count_open_known_unknowns` (no join) keeps
+        // counting them.
+        self.remove_known_unknowns_for_entity(entity_id)?;
 
         let mut params = BTreeMap::new();
         params.insert("eid".into(), DataValue::Str(entity_id.into()));
@@ -5586,6 +5682,255 @@ mod tests {
                 .len(),
             1,
             "the unrelated source's entity event must still be findable"
+        );
+    }
+
+    /// Per-relation row counter for the cascade regression tests
+    /// below.  Each branch picks an existing key column and asks
+    /// CozoDB for a count — equivalent to `SELECT COUNT(*)` against
+    /// each table.
+    fn count_rows_in(store: &GraphStore, relation: &str) -> usize {
+        let rows = match relation {
+            "trial_verdicts" => store
+                .db
+                .run_script(
+                    "?[count(id)] := *trial_verdicts{id}",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap(),
+            "verification_certificates" => store
+                .db
+                .run_script(
+                    "?[count(hash)] := *verification_certificates{hash}",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap(),
+            "derivation_edges" => store
+                .db
+                .run_script(
+                    "?[count(parent_claim_id)] := *derivation_edges{parent_claim_id, child_claim_id}",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap(),
+            "known_unknowns" => store
+                .db
+                .run_script(
+                    "?[count(id)] := *known_unknowns{id}",
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .unwrap(),
+            other => panic!("count_rows_in: unsupported relation `{other}`"),
+        };
+        count_from_rows(&rows.rows) as usize
+    }
+
+    /// Seed one source-bound claim and link it via
+    /// `claim_source_edges` so `remove_source_by_uri` will pick it
+    /// up.  Returns `(claim_id_string, source_id_string)`.
+    fn seed_claim_with_source(
+        store: &GraphStore,
+        source_uri: &str,
+        suffix: &str,
+    ) -> (String, String) {
+        let source = thinkingroot_core::Source::new(
+            source_uri.into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash(format!("hash-{suffix}")));
+        let source_id = source.id.to_string();
+        store.insert_source(&source).unwrap();
+
+        let claim = thinkingroot_core::Claim::new(
+            format!("statement for {suffix}"),
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        let claim_id = claim.id.to_string();
+        store.insert_claim(&claim).unwrap();
+        store.link_claim_to_source(&claim_id, &source_id).unwrap();
+        (claim_id, source_id)
+    }
+
+    #[test]
+    fn remove_source_cascades_to_trial_verdicts() {
+        let store = mem_store();
+        let (claim_alice, _) = seed_claim_with_source(&store, "test://alice-tv.md", "tv-a");
+        let (claim_bob, _) = seed_claim_with_source(&store, "test://bob-tv.md", "tv-b");
+
+        // Insert one verdict per claim.  Tuple shape locked by
+        // `insert_trial_verdicts_batch`: (id, claim_id, trial_at,
+        // admission_tier, provenance, contradiction, predicate,
+        // topology, temporal, certificate_hash, failure_reason,
+        // rooter_version).
+        let verdicts = vec![
+            (
+                "v-a".to_string(),
+                claim_alice.clone(),
+                1_700_000_000.0_f64,
+                "rooted".to_string(),
+                0.9_f64,
+                0.0_f64,
+                -1.0_f64,
+                -1.0_f64,
+                -1.0_f64,
+                String::new(),
+                String::new(),
+                "test".to_string(),
+            ),
+            (
+                "v-b".to_string(),
+                claim_bob.clone(),
+                1_700_000_001.0_f64,
+                "attested".to_string(),
+                0.5_f64,
+                0.0_f64,
+                -1.0_f64,
+                -1.0_f64,
+                -1.0_f64,
+                String::new(),
+                String::new(),
+                "test".to_string(),
+            ),
+        ];
+        store.insert_trial_verdicts_batch(&verdicts).unwrap();
+        assert_eq!(count_rows_in(&store, "trial_verdicts"), 2);
+
+        store.remove_source_by_uri("test://alice-tv.md").unwrap();
+        assert_eq!(
+            count_rows_in(&store, "trial_verdicts"),
+            1,
+            "verdict for the removed source's claim must cascade out"
+        );
+    }
+
+    #[test]
+    fn remove_source_cascades_to_derivation_edges() {
+        let store = mem_store();
+        let (parent_id, _) = seed_claim_with_source(&store, "test://alice-de.md", "de-p");
+        let (child_id, _) = seed_claim_with_source(&store, "test://bob-de.md", "de-c");
+
+        // Insert one derivation edge parent -> child.
+        let mut params = BTreeMap::new();
+        params.insert("p".into(), DataValue::Str(parent_id.clone().into()));
+        params.insert("c".into(), DataValue::Str(child_id.clone().into()));
+        store
+            .query(
+                r#"?[parent_claim_id, child_claim_id, derivation_rule] <- [[$p, $c, 'unit-test']]
+                :put derivation_edges {parent_claim_id, child_claim_id => derivation_rule}"#,
+                params,
+            )
+            .unwrap();
+        assert_eq!(count_rows_in(&store, "derivation_edges"), 1);
+
+        store.remove_source_by_uri("test://alice-de.md").unwrap();
+        assert_eq!(
+            count_rows_in(&store, "derivation_edges"),
+            0,
+            "edge naming the removed source's claim as parent must cascade"
+        );
+
+        // Re-create with the surviving claim as child to exercise
+        // the child-side path.
+        let (parent2_id, _) =
+            seed_claim_with_source(&store, "test://alice-de2.md", "de-p2");
+        let mut params = BTreeMap::new();
+        params.insert("p".into(), DataValue::Str(parent2_id.into()));
+        params.insert("c".into(), DataValue::Str(child_id.clone().into()));
+        store
+            .query(
+                r#"?[parent_claim_id, child_claim_id, derivation_rule] <- [[$p, $c, 'unit-test']]
+                :put derivation_edges {parent_claim_id, child_claim_id => derivation_rule}"#,
+                params,
+            )
+            .unwrap();
+        store.remove_source_by_uri("test://bob-de.md").unwrap();
+        assert_eq!(
+            count_rows_in(&store, "derivation_edges"),
+            0,
+            "edge naming the removed source's claim as child must cascade"
+        );
+    }
+
+    #[test]
+    fn remove_source_cascades_to_verification_certificates() {
+        let store = mem_store();
+        let (claim_id, _) =
+            seed_claim_with_source(&store, "test://alice-cert.md", "cert-1");
+
+        let mut params = BTreeMap::new();
+        params.insert("h".into(), DataValue::Str("cert-hash-aaa".into()));
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        store
+            .query(
+                r#"?[hash, claim_id, created_at] <- [[$h, $cid, 1700000000.0]]
+                :put verification_certificates {hash => claim_id, created_at}"#,
+                params,
+            )
+            .unwrap();
+        assert_eq!(count_rows_in(&store, "verification_certificates"), 1);
+
+        store.remove_source_by_uri("test://alice-cert.md").unwrap();
+        assert_eq!(
+            count_rows_in(&store, "verification_certificates"),
+            0,
+            "certificate for the removed source's claim must cascade"
+        );
+    }
+
+    #[test]
+    fn remove_entity_cascades_to_known_unknowns() {
+        let store = mem_store();
+
+        // Seed two entities and a known_unknown for each.
+        for (eid, gap_id) in [("ent-aa", "gap-aa"), ("ent-bb", "gap-bb")] {
+            let mut params = BTreeMap::new();
+            params.insert("eid".into(), DataValue::Str(eid.into()));
+            store
+                .query(
+                    r#"?[id, canonical_name, entity_type] <- [[$eid, 'name', 'kind']]
+                    :put entities {id => canonical_name, entity_type}"#,
+                    params,
+                )
+                .unwrap();
+
+            let mut params = BTreeMap::new();
+            params.insert("gid".into(), DataValue::Str(gap_id.into()));
+            params.insert("eid".into(), DataValue::Str(eid.into()));
+            store
+                .query(
+                    r#"?[id, entity_id, pattern_id, expected_claim_type] <- [[$gid, $eid, 'pat-1', 'fact']]
+                    :put known_unknowns {id => entity_id, pattern_id, expected_claim_type}"#,
+                    params,
+                )
+                .unwrap();
+        }
+        assert_eq!(count_rows_in(&store, "known_unknowns"), 2);
+
+        // Wire `ent-aa` to a claim through claim_entity_edges so
+        // the orphan sweep in `remove_source_by_id` will GC it.
+        let (claim_id, _) =
+            seed_claim_with_source(&store, "test://alice-ku.md", "ku-1");
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        params.insert("eid".into(), DataValue::Str("ent-aa".into()));
+        store
+            .query(
+                r#"?[claim_id, entity_id] <- [[$cid, $eid]]
+                :put claim_entity_edges {claim_id, entity_id}"#,
+                params,
+            )
+            .unwrap();
+
+        store.remove_source_by_uri("test://alice-ku.md").unwrap();
+        assert_eq!(
+            count_rows_in(&store, "known_unknowns"),
+            1,
+            "gap row for the GC'd entity must cascade; the unrelated entity's row remains"
         );
     }
 }

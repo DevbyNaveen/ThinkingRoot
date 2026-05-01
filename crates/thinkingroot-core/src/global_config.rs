@@ -60,14 +60,13 @@ impl GlobalConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| Error::MissingConfig("cannot resolve config directory".into()))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
-        }
         // Write config without embedded key values — keys go to credentials.toml only.
         let config_to_write = self.without_keys();
         let content = toml::to_string_pretty(&config_to_write)?;
-        std::fs::write(&path, content).map_err(|e| Error::io_path(&path, e))?;
-        Ok(())
+        // Atomic write: tmp + rename so a crash mid-save can't leave
+        // a half-written global config that fails to parse on next
+        // startup.
+        crate::safe_path::atomic_write(&path, content.as_bytes(), None)
     }
 
     /// Return a copy of self with all `api_key` fields cleared so they are
@@ -105,6 +104,13 @@ impl GlobalConfig {
         if let Some(ref mut cfg) = p.azure {
             cfg.api_key = None;
         }
+        // Ollama also carries an `api_key` slot for tokened deployments
+        // (private mirrors / Open WebUI). Strip it like every other
+        // provider so a key set in `credentials.toml` doesn't leak into
+        // the world-readable `config.toml`.
+        if let Some(ref mut cfg) = p.ollama {
+            cfg.api_key = None;
+        }
         c
     }
 }
@@ -140,22 +146,18 @@ impl Credentials {
     }
 
     /// Persist credentials to disk with restrictive file permissions (0600 on Unix).
+    ///
+    /// Atomic + chmod-before-rename: the destination is created via
+    /// `atomic_write` so a crash mid-save cannot leave an empty
+    /// `credentials.toml`, and the 0600 mode is set on the temp file
+    /// before the rename so there is no window where another local
+    /// user can read the freshly-written keys at the default 0644
+    /// umask.
     pub fn save(&self) -> Result<()> {
         let path = GlobalConfig::credentials_path()
             .ok_or_else(|| Error::MissingConfig("cannot resolve config directory".into()))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
-        }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, &content).map_err(|e| Error::io_path(&path, e))?;
-        // Set 0600 permissions on Unix so only the owner can read the file.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms).map_err(|e| Error::io_path(&path, e))?;
-        }
-        Ok(())
+        crate::safe_path::atomic_write(&path, content.as_bytes(), Some(0o600))
     }
 
     /// Set or update a single credential by its env var name.
@@ -272,15 +274,19 @@ impl WorkspaceRegistry {
     }
 
     /// Save the registry, creating the config directory if needed.
+    ///
+    /// Atomic: tmp + rename so a crash mid-write cannot leave the
+    /// shared workspace registry as zero or partial bytes.  Two
+    /// concurrent `root workspace add` invocations will still race
+    /// at the read-modify-write level (last writer wins on the
+    /// rename), but neither will produce a corrupt file —
+    /// `WorkspaceRegistry::load` always sees either the prior
+    /// snapshot or the new one in full.
     pub fn save(&self) -> Result<()> {
         let path = Self::path()
             .ok_or_else(|| Error::MissingConfig("cannot resolve config directory".into()))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
-        }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&path, content).map_err(|e| Error::io_path(&path, e))?;
-        Ok(())
+        crate::safe_path::atomic_write(&path, content.as_bytes(), None)
     }
 
     /// Add or replace a workspace entry (matched by name).

@@ -189,7 +189,11 @@ impl Config {
     /// Priority: per-workspace `.thinkingroot/config.toml` > global `~/.config/thinkingroot/config.toml` > defaults.
     pub fn load_merged(workspace_path: &std::path::Path) -> Result<Self> {
         let global = crate::global_config::GlobalConfig::load().unwrap_or_else(|e| {
-            eprintln!("  Warning: could not load global config, using defaults: {e}");
+            // `eprintln!` in a library function bypasses the
+            // tracing subscriber that the caller (sidecar, CLI,
+            // desktop) configured; route through `tracing` so log
+            // levels and structured-output mode work as expected.
+            tracing::warn!("could not load global config, using defaults: {e}");
             crate::global_config::GlobalConfig::default()
         });
         let config_path = workspace_path.join(".thinkingroot").join("config.toml");
@@ -218,18 +222,14 @@ impl Config {
     /// upstream environment never re-exposes keys via filesystem ACLs.
     pub fn save(&self, root_path: &Path) -> Result<()> {
         let dir = root_path.join(".thinkingroot");
-        std::fs::create_dir_all(&dir).map_err(|e| Error::io_path(&dir, e))?;
         let config_path = dir.join("config.toml");
         let stripped = self.without_keys();
         let content = toml::to_string_pretty(&stripped)?;
-        std::fs::write(&config_path, content).map_err(|e| Error::io_path(&config_path, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| Error::io_path(&config_path, e))?;
-        }
-        Ok(())
+        // Atomic + chmod-before-rename: a crash mid-write cannot
+        // leave a half-written workspace config that fails to parse,
+        // and the destination is never world-readable even for the
+        // brief window between create and chmod.
+        crate::safe_path::atomic_write(&config_path, content.as_bytes(), Some(0o600))
     }
 
     /// Return a copy of self with all `api_key` values cleared so credentials

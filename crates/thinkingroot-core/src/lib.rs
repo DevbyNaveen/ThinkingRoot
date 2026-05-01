@@ -12,5 +12,5 @@ pub use global_config::{
     Credentials, GlobalConfig, ServeConfig, WorkspaceEntry, WorkspaceRegistry,
 };
 pub use id::Id;
-pub use safe_path::{is_loopback_host, safe_join_under, validate_id};
+pub use safe_path::{atomic_write, is_loopback_host, safe_join_under, validate_id};
 pub use types::*;

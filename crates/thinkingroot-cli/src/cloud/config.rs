@@ -68,8 +68,16 @@ pub fn load_or_default(override_server: Option<&str>) -> Result<Config> {
     Ok(cfg)
 }
 
-/// Persist the config to disk, creating parent directories with
-/// 0700 permissions and the file with 0600 on POSIX.
+/// Persist the config to disk atomically, with the parent directory
+/// at 0700 and the file at 0600 on POSIX.
+///
+/// Atomic via `thinkingroot_core::atomic_write` (tmp + chmod +
+/// rename): a SIGKILL between the open-truncate and the final write
+/// previously left an empty `auth.json` that failed to parse on
+/// next startup, logging the user out with a confusing TOML error.
+/// chmod 0600 is set on the temp file before the rename so there is
+/// no window where another local user can read the freshly-written
+/// token at the default umask.
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
@@ -81,13 +89,8 @@ pub fn save(cfg: &Config) -> Result<()> {
         }
     }
     let body = serde_json::to_vec_pretty(cfg)?;
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    thinkingroot_core::atomic_write(&path, &body, Some(0o600))
+        .map_err(|e| anyhow!("save {}: {e}", path.display()))
 }
 
 /// Return the saved token, or a friendly error if the user hasn't

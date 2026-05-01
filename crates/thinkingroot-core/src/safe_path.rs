@@ -1,4 +1,5 @@
-//! Path-traversal-safe joining and identifier validation primitives.
+//! Path-traversal-safe joining, identifier validation, and atomic-
+//! write primitives.
 //!
 //! Every place we accept untrusted path input — `.tr` pack tar
 //! extraction, Tauri `fs::*` commands the webview can call, conversation
@@ -154,6 +155,76 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Atomically write `bytes` to `path`. Writes to a sibling temp
+/// file and renames over the destination; a SIGKILL or panic
+/// mid-write leaves either the prior contents or the new contents,
+/// never a half-written/zero-byte file. POSIX `rename(2)` is atomic
+/// on the same filesystem; Windows `MoveFileExW` with replace
+/// semantics provides the equivalent guarantee.
+///
+/// **Permissions**: when `chmod_unix` is `Some`, the temp file is
+/// chmod'd before the rename so the destination's mode is set
+/// atomically. Use `Some(0o600)` for credentials/token files —
+/// without it, the new file is created with the process umask
+/// (typically `0o644`) and a window exists where another local
+/// user could read it.
+///
+/// **Use this everywhere** registries, credentials, branches, auth
+/// tokens, configs are written. The audit found six non-atomic
+/// `fs::write` paths that all leak data on a crash.
+pub fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    chmod_unix: Option<u32>,
+) -> Result<()> {
+    use std::fs;
+
+    let parent = path.parent().ok_or_else(|| {
+        Error::SecurityViolation(format!(
+            "atomic_write: path has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|e| Error::io_path(parent, e))?;
+
+    // Per-pid temp suffix keeps concurrent writes from clobbering
+    // each other's tmp file before either has had a chance to
+    // rename. Same pattern the revocation cache uses.
+    let tmp = path.with_file_name(format!(
+        "{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    fs::write(&tmp, bytes).map_err(|e| Error::io_path(&tmp, e))?;
+
+    #[cfg(unix)]
+    if let Some(mode) = chmod_unix {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
+            .map_err(|e| Error::io_path(&tmp, e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // chmod is a no-op on non-Unix; the bit pattern doesn't map
+        // cleanly to ACLs. Callers that store secrets on Windows
+        // should use a separate hardening path (DPAPI, Credential
+        // Manager) — out of scope for this helper.
+        let _ = chmod_unix;
+    }
+
+    fs::rename(&tmp, path).map_err(|e| {
+        // On rename failure, do best-effort cleanup of the temp file
+        // — leaving stray .tmp-NNN files in config directories is
+        // user-visible noise. The original `e` is the actionable
+        // error to surface.
+        let _ = fs::remove_file(&tmp);
+        Error::io_path(path, e)
+    })?;
+    Ok(())
+}
+
 /// Returns `true` iff `host` is a literal loopback host: `127.0.0.0/8`,
 /// `localhost`, or `::1`. Uses real IP-address parsing rather than
 /// string-prefix matching, so `127.evil.com` is correctly classified
@@ -289,6 +360,57 @@ mod tests {
         assert!(is_loopback_host("LocalHost"));
         assert!(is_loopback_host("::1"));
         assert!(is_loopback_host("[::1]"));
+    }
+
+    #[test]
+    fn atomic_write_creates_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("config.toml");
+        atomic_write(&dest, b"alpha", None).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"alpha");
+    }
+
+    #[test]
+    fn atomic_write_overwrites_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("config.toml");
+        atomic_write(&dest, b"first", None).unwrap();
+        atomic_write(&dest, b"second", None).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"second");
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("nested/dir/credentials.toml");
+        atomic_write(&dest, b"key=secret", Some(0o600)).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"key=secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_chmod_applied_to_destination() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("creds.toml");
+        atomic_write(&dest, b"k=v", Some(0o600)).unwrap();
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "chmod must propagate through rename");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a.toml");
+        atomic_write(&dest, b"x", None).unwrap();
+        // Only the destination should exist — no `.tmp-PID` strays.
+        let mut entries: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["a.toml".to_string()]);
     }
 
     #[test]
