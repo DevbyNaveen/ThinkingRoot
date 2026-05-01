@@ -206,25 +206,22 @@ export async function gitBranches(path: string): Promise<BranchInfo[]> {
 // ─── `.tr` install preview ──────────────────────────────────────────
 
 export type Verdict =
-  | { kind: "verified"; tier: "T0" | "T1" | "T2" | "T3" | "T4"; author_id: string | null; sigstore_log_index: number | null; revocation_freshness_secs: number }
+  | { kind: "verified"; identity: string | null; rekor_log_index: number | null; signed_at: string }
   | { kind: "unsigned" }
-  | { kind: "tampered"; what: "manifest_hash_mismatch" | "archive_corrupt" | "signature_payload_mismatch"; expected?: string; actual?: string }
-  | { kind: "revoked"; advisory: { reason?: string; published_at?: string } }
-  | { kind: "key_unknown"; key_id: string }
-  | { kind: "stale_cache"; age_days: number }
-  | { kind: "unsupported"; tier: string; reason: string };
+  | { kind: "tampered"; what: "pack_hash_mismatch"; declared: string; recomputed: string }
+  | { kind: "tampered"; what: "signature_failed"; reason: string }
+  | { kind: "revoked"; advisory: { reason: string; revoked_at: number; pack: string; version: string; details_url: string; authority: string } };
 
 export interface InstallPreview {
   path: string;
   name: string;
   version: string;
-  license: string;
-  trust_tier: string;
+  license: string | null;
   markdown: string;
   manifest_table: string;
   source_count: number;
-  entry_count: number;
-  payload_bytes: number;
+  claim_count: number;
+  source_archive_bytes: number;
   verdict: Verdict;
 }
 

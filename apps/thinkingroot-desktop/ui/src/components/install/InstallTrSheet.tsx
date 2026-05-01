@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import {
   AlertTriangle,
-  CheckCircle2,
   FileWarning,
   Loader2,
   ShieldCheck,
@@ -168,8 +167,8 @@ function PreviewBody({ preview }: { preview: InstallPreview }) {
           {preview.name} <span className="text-muted-foreground">{preview.version}</span>
         </h3>
         <p className="text-[11px] text-muted-foreground">
-          License {preview.license} · Trust tier {preview.trust_tier} · {preview.entry_count}{" "}
-          entries · {preview.source_count} sources · {formatBytes(preview.payload_bytes)}
+          {preview.license ? `License ${preview.license} · ` : ""}
+          {preview.claim_count} claims · {preview.source_count} sources · {formatBytes(preview.source_archive_bytes)}
         </p>
       </header>
 
@@ -226,16 +225,16 @@ function verdictTone(verdict: Verdict): {
   switch (verdict.kind) {
     case "verified":
       return {
-        title: `Verified · ${verdict.tier}`,
-        body: verdict.author_id
-          ? `Signed by author key ${verdict.author_id}.`
+        title: `Verified`,
+        body: verdict.identity
+          ? `Signed by identity ${verdict.identity}.`
           : "Manifest hash + revocation cache passed.",
         Icon: ShieldCheck,
         classes: "border-success/40 bg-success/10 text-success",
       };
     case "unsigned":
       return {
-        title: "Unsigned (T0)",
+        title: "Unsigned",
         body: "No signature attached. Local installs accept this; remote installs require --allow-unsigned.",
         Icon: ShieldQuestion,
         classes: "border-warn/40 bg-warn/10 text-warn",
@@ -244,11 +243,9 @@ function verdictTone(verdict: Verdict): {
       return {
         title: "Tampered",
         body:
-          verdict.what === "manifest_hash_mismatch"
-            ? `Manifest hash mismatch (expected ${verdict.expected ?? "?"}, computed ${verdict.actual ?? "?"}).`
-            : verdict.what === "archive_corrupt"
-              ? "Archive bytes are corrupt."
-              : "Signature payload does not match the pack contents.",
+          verdict.what === "pack_hash_mismatch"
+            ? `Pack hash mismatch (expected ${verdict.declared}, computed ${verdict.recomputed}).`
+            : `Signature check failed: ${verdict.reason}`,
         Icon: AlertTriangle,
         classes: "border-destructive/40 bg-destructive/10 text-destructive",
       };
@@ -258,27 +255,6 @@ function verdictTone(verdict: Verdict): {
         body: verdict.advisory.reason ?? "Pack appears on the registry deny-list.",
         Icon: AlertTriangle,
         classes: "border-destructive/40 bg-destructive/10 text-destructive",
-      };
-    case "key_unknown":
-      return {
-        title: "Unknown signer",
-        body: `Signed by ${verdict.key_id}, which is not in this machine's trust store.`,
-        Icon: ShieldQuestion,
-        classes: "border-warn/40 bg-warn/10 text-warn",
-      };
-    case "stale_cache":
-      return {
-        title: "Stale revocation cache",
-        body: `Cache is ${verdict.age_days} days old. Refresh with \`root revoked refresh\` while online.`,
-        Icon: AlertTriangle,
-        classes: "border-warn/40 bg-warn/10 text-warn",
-      };
-    case "unsupported":
-      return {
-        title: `Unsupported tier (${verdict.tier})`,
-        body: verdict.reason,
-        Icon: CheckCircle2,
-        classes: "border-muted bg-muted/30 text-muted-foreground",
       };
   }
 }

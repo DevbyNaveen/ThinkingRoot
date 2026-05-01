@@ -19,6 +19,9 @@ import {
   Hammer,
   GitMerge,
   ShieldCheck,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -82,6 +85,7 @@ export function RightRail() {
         {(surface === "chats" || surface === "brain") && (
           <WorkspaceCard activeWorkspace={activeWorkspace} />
         )}
+        <CompilationProgressIndicator />
         {(surface === "chats" || surface === "brain") && activeWorkspace && (
           <BranchPanel workspace={activeWorkspace} />
         )}
@@ -294,6 +298,112 @@ function SettingsHelp() {
         <li>Workspace registry → ~/.config/thinkingroot/workspaces.toml</li>
         <li>Sidecar logs → tracing → stderr (run with RUST_LOG=debug)</li>
       </ul>
+    </section>
+  );
+}
+
+function CompilationProgressIndicator() {
+  const progress = useApp((s) => s.compileProgress);
+  if (!progress) return null;
+
+  let title = "Compiling...";
+  let details = "";
+  let percent = 0;
+  let isDone = false;
+  let isError = false;
+
+  switch (progress.phase) {
+    case "started":
+      title = "Starting compilation";
+      details = `Workspace: ${progress.workspace}`;
+      percent = 5;
+      break;
+    case "parse_complete":
+      title = "Parsing source files";
+      details = `Parsed ${progress.files} files`;
+      percent = 15;
+      break;
+    case "extraction_start":
+      title = "Extracting claims";
+      details = `Starting ${progress.total_batches} batches`;
+      percent = 20;
+      break;
+    case "extraction_progress":
+      title = "Extracting claims";
+      details = `${progress.done} / ${progress.total} chunks`;
+      percent = 20 + Math.floor((progress.done / Math.max(1, progress.total)) * 30);
+      break;
+    case "extraction_complete":
+      title = "Extraction complete";
+      details = `${progress.claims} claims, ${progress.entities} entities`;
+      percent = 50;
+      break;
+    case "grounding_progress":
+      title = "Grounding entities";
+      details = `${progress.done} / ${progress.total}`;
+      percent = 50 + Math.floor((progress.done / Math.max(1, progress.total)) * 15);
+      break;
+    case "linking_start":
+      title = "Linking knowledge graph";
+      details = `${progress.total_entities} entities to link`;
+      percent = 65;
+      break;
+    case "linking_progress":
+      title = "Linking knowledge graph";
+      details = `${progress.done} / ${progress.total}`;
+      percent = 65 + Math.floor((progress.done / Math.max(1, progress.total)) * 15);
+      break;
+    case "vector_progress":
+      title = "Building vector index";
+      details = `${progress.done} / ${progress.total}`;
+      percent = 80 + Math.floor((progress.done / Math.max(1, progress.total)) * 19);
+      break;
+    case "done":
+      title = "Compilation complete";
+      details = `${progress.claims} claims, ${progress.entities} entities`;
+      percent = 100;
+      isDone = true;
+      break;
+    case "failed":
+      title = "Compilation failed";
+      details = progress.error;
+      percent = 100;
+      isError = true;
+      break;
+  }
+
+  return (
+    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3 shadow-sm relative overflow-hidden">
+      <div className="absolute inset-0 bg-gradient-to-br from-accent/5 to-transparent pointer-events-none" />
+      <header className="flex items-center gap-2 text-xs relative z-10">
+        {isDone ? (
+          <CheckCircle2 className="size-4 text-emerald-500 drop-shadow-sm" />
+        ) : isError ? (
+          <AlertCircle className="size-4 text-destructive drop-shadow-sm" />
+        ) : (
+          <Loader2 className="size-4 animate-spin text-accent drop-shadow-sm" />
+        )}
+        <h3 className="font-medium tracking-tight text-foreground">{title}</h3>
+        {!isDone && !isError && (
+          <span className="ml-auto font-mono text-[9px] text-accent font-medium">
+            {percent}%
+          </span>
+        )}
+      </header>
+      <div className="flex flex-col gap-1.5 relative z-10 mt-1">
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted/50 border border-border/50">
+          <div
+            className={cn(
+              "h-full transition-all duration-300 ease-out",
+              isDone ? "bg-emerald-500" : isError ? "bg-destructive" : "bg-accent bg-stripe-gradient"
+            )}
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+        <p className="text-[10px] text-muted-foreground truncate mt-0.5" title={details}>
+          {details}
+        </p>
+      </div>
     </section>
   );
 }

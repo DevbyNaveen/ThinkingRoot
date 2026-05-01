@@ -1,0 +1,7 @@
+{
+  "name": "thinkingroot-desktop",
+  "private": true,
+  "scripts": {
+    "tauri": "./ui/node_modules/.bin/tauri"
+  }
+}

@@ -21,6 +21,10 @@ import type {
  * truth — no fixture data, no MOCK_*.
  */
 interface AppStore {
+  // Compile Progress
+  compileProgress: CompileProgress | null;
+  setCompileProgress: (p: CompileProgress | null) => void;
+
   // UI
   surface: Surface;
   setSurface: (s: Surface) => void;
@@ -100,9 +104,14 @@ function key(workspace: string, conversationId: string): string {
   return `${workspace}::${conversationId}`;
 }
 
+import type { CompileProgress } from "@/lib/tauri";
+
 export const useApp = create<AppStore>()(
   persist(
     (set, get) => ({
+      compileProgress: null,
+      setCompileProgress: (compileProgress) => set({ compileProgress }),
+
       surface: "chats",
       setSurface: (surface) => set({ surface }),
       theme: "dark",

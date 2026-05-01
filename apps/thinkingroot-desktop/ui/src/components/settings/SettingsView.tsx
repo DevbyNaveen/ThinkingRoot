@@ -186,11 +186,6 @@ export function SettingsView() {
           provider,
           extraction_model: wsPending.extraction_model,
           compilation_model: wsPending.compilation_model,
-          azure_resource_name: wsPending.azure_resource_name,
-          azure_endpoint_base: wsPending.azure_endpoint_base,
-          azure_deployment: wsPending.azure_deployment,
-          azure_api_version: wsPending.azure_api_version,
-          azure_api_key_env: wsPending.azure_api_key_env,
         });
       }
 
@@ -618,60 +613,9 @@ function AzureWorkspaceCard({
                 {wsLlm.workspace_path ?? "—"}
               </span>
             </div>
-            <span
-              className={cn(
-                "rounded px-1.5 py-0.5 text-[10px]",
-                wsLlm.azure_api_key_env_present
-                  ? "bg-success/15 text-success"
-                  : "bg-yellow-500/15 text-yellow-300",
-              )}
-            >
-              {wsLlm.azure_api_key_env_present
-                ? `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} live`
-                : `${wsLlm.azure_api_key_env ?? "AZURE_OPENAI_API_KEY"} not in env`}
-            </span>
           </div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <Field label="Resource name">
-              <input
-                type="text"
-                value={wsField("azure_resource_name") ?? wsLlm.azure_resource_name ?? ""}
-                onChange={(e) =>
-                  setWsPending((p) => ({ ...p, azure_resource_name: e.target.value }))
-                }
-                className={fieldClass}
-              />
-            </Field>
-            <Field label="Endpoint base (override)">
-              <input
-                type="text"
-                value={wsField("azure_endpoint_base") ?? wsLlm.azure_endpoint_base ?? ""}
-                onChange={(e) =>
-                  setWsPending((p) => ({ ...p, azure_endpoint_base: e.target.value }))
-                }
-                className={fieldClass}
-              />
-            </Field>
-            <Field label="Deployment">
-              <input
-                type="text"
-                value={wsField("azure_deployment") ?? wsLlm.azure_deployment ?? ""}
-                onChange={(e) =>
-                  setWsPending((p) => ({ ...p, azure_deployment: e.target.value }))
-                }
-                className={fieldClass}
-              />
-            </Field>
-            <Field label="API version">
-              <input
-                type="text"
-                value={wsField("azure_api_version") ?? wsLlm.azure_api_version ?? ""}
-                onChange={(e) =>
-                  setWsPending((p) => ({ ...p, azure_api_version: e.target.value }))
-                }
-                className={fieldClass}
-              />
-            </Field>
+
             <Field label="Extraction model">
               <input
                 type="text"

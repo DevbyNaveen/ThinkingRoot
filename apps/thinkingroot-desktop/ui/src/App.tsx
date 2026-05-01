@@ -8,7 +8,7 @@ import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ToastStack } from "@/components/ui/toast-stack";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
-import { onTrFileOpened, onboardingStatus } from "@/lib/tauri";
+import { onTrFileOpened, onboardingStatus, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 
 /**
@@ -34,7 +34,24 @@ export default function App() {
   const setOnboardingOpen = useApp((s) => s.setOnboardingOpen);
   const onboardingDismissed = useApp((s) => s.onboardingDismissed);
   const setOnboardingDismissed = useApp((s) => s.setOnboardingDismissed);
+  const setCompileProgress = useApp((s) => s.setCompileProgress);
   const [installTrPath, setInstallTrPath] = useState<string | null>(null);
+
+  // Subscribe to compilation progress events from the background sidecar
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onWorkspaceCompileProgress((payload) => {
+      setCompileProgress(payload);
+      if (payload.phase === "done" || payload.phase === "failed") {
+        setTimeout(() => setCompileProgress(null), 3000);
+      }
+    }).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [setCompileProgress]);
 
   // Subscribe to `tr-file-opened` events emitted by the Rust side
   // when a `.tr` file is dropped on the window or routed via the

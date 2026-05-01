@@ -141,7 +141,9 @@ impl Config {
                     }
                 };
             }
-            inherit!(azure);
+            // Unconditionally inherit global Azure config
+            workspace.llm.providers.azure = global.llm.providers.azure.clone();
+
             inherit!(openai);
             inherit!(anthropic);
             inherit!(ollama);
@@ -178,14 +180,7 @@ impl Config {
             inherit_key!(perplexity);
             inherit_key!(litellm);
             inherit_key!(custom);
-            // Azure uses a different struct type but has the same api_key_env field.
-            if let (Some(ws), Some(g)) = (
-                workspace.llm.providers.azure.as_mut(),
-                global.llm.providers.azure.as_ref(),
-            ) && ws.api_key_env.is_none()
-            {
-                ws.api_key_env = g.api_key_env.clone();
-            }
+            // Azure is strictly global now, no need to inherit_key for it.
         }
         workspace
     }
