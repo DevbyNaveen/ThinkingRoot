@@ -348,7 +348,10 @@ mod tests {
             let mut m = sample();
             m.name = bad.to_string();
             let toml_bytes = m.to_canonical_toml();
-            assert!(ManifestV3::parse(&toml_bytes).is_err(), "`{bad}` should fail");
+            assert!(
+                ManifestV3::parse(&toml_bytes).is_err(),
+                "`{bad}` should fail"
+            );
         }
     }
 

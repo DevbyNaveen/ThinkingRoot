@@ -76,11 +76,7 @@ impl Keystore {
     /// Returns `None` if no platform config directory is available
     /// (e.g. headless CI without `$HOME`).
     pub fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| {
-            d.join("thinkingroot")
-                .join("keys")
-                .join("trusted.json")
-        })
+        dirs::config_dir().map(|d| d.join("thinkingroot").join("keys").join("trusted.json"))
     }
 
     /// Load the keystore from a JSON file at `path`. If the file
@@ -97,11 +93,7 @@ impl Keystore {
         }
         let raw = std::fs::read_to_string(&path)?;
         let parsed: OnDisk = serde_json::from_str(&raw)?;
-        let keys = parsed
-            .keys
-            .into_iter()
-            .map(|k| (k.id.clone(), k))
-            .collect();
+        let keys = parsed.keys.into_iter().map(|k| (k.id.clone(), k)).collect();
         Ok(Self {
             keys,
             path: Some(path),

@@ -1,7 +1,7 @@
 //! `root login` — paste your API token, validate against the cloud's
 //! `/me` endpoint, persist server + token + cached identity.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use console::style;
 use serde::Deserialize;
 

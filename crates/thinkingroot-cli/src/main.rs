@@ -11,12 +11,12 @@ mod cloud;
 mod eval_cmd;
 mod mcp_config;
 mod pack_cmd;
-mod resolver;
 mod pipeline;
 mod progress;
 mod provider_cmd;
 mod reflect_cmd;
 mod render_cmd;
+mod resolver;
 mod rooting_cmd;
 mod serve;
 mod setup;
@@ -927,12 +927,8 @@ async fn async_main() -> anyhow::Result<()> {
             no_revocation_check,
             registry,
         }) => {
-            let exit_code = pack_cmd::run_verify(
-                &pack,
-                allow_unsigned,
-                !no_revocation_check,
-                registry,
-            )?;
+            let exit_code =
+                pack_cmd::run_verify(&pack, allow_unsigned, !no_revocation_check, registry)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

@@ -72,8 +72,7 @@ pub const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
 
 /// Sigstore Bundle media-type for v0.3 wire format. The bundle JSON
 /// includes this as `mediaType`.
-pub const SIGSTORE_BUNDLE_MEDIA_TYPE: &str =
-    "application/vnd.dev.sigstore.bundle+json;version=0.3";
+pub const SIGSTORE_BUNDLE_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle+json;version=0.3";
 
 /// Errors produced by sign + verify. Distinct types per failure mode
 /// so callers (tr-verify) can map straight to a `Verdict` variant.
@@ -252,7 +251,11 @@ pub struct TlogEntry {
     pub log_id: Option<LogId>,
     /// E.g. `"hashedrekord"` + `"0.0.1"`. Identifies which Rekor entry
     /// kind generated `canonicalized_body`.
-    #[serde(rename = "kindVersion", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "kindVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub kind_version: Option<KindVersion>,
     /// Unix-seconds timestamp Rekor recorded for this entry.
     #[serde(rename = "integratedTime")]
@@ -262,19 +265,31 @@ pub struct TlogEntry {
     /// because some Rekor versions emit only the inclusion proof; if
     /// present, it's the load-bearing piece that ties this entry to
     /// the Rekor key without recomputing the Merkle root.
-    #[serde(rename = "inclusionPromise", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "inclusionPromise",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inclusion_promise: Option<InclusionPromise>,
     /// Inclusion-proof Merkle audit path + tree size + signed
     /// checkpoint. Verifiers replay this against the Rekor public key
     /// without network access.
-    #[serde(rename = "inclusionProof", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "inclusionProof",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inclusion_proof: Option<RekorInclusionProof>,
     /// Canonicalized JSON of the original Rekor entry body. The leaf
     /// hash is `SHA-256(0x00 || canonical_body)`. Stored base64 on
     /// the wire; consumers that just want to verify the inclusion
     /// proof against a leaf hash they computed externally can ignore
     /// this field.
-    #[serde(rename = "canonicalizedBody", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "canonicalizedBody",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub canonicalized_body: Option<String>,
 }
 
@@ -328,7 +343,11 @@ pub struct RekorInclusionProof {
     /// signed-checkpoint format. Optional; when absent, callers
     /// must rely on `inclusion_promise.signed_entry_timestamp`
     /// instead.
-    #[serde(rename = "checkpoint", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "checkpoint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub checkpoint: Option<RekorCheckpoint>,
 }
 
@@ -620,10 +639,13 @@ fn verify_statement_semantics(
         });
     }
 
-    let subject = statement.subject.first().ok_or_else(|| Error::SubjectMismatch {
-        expected: "any matching digest".into(),
-        payload: "statement has no subjects".into(),
-    })?;
+    let subject = statement
+        .subject
+        .first()
+        .ok_or_else(|| Error::SubjectMismatch {
+            expected: "any matching digest".into(),
+            payload: "statement has no subjects".into(),
+        })?;
 
     let mut tried = Vec::with_capacity(subject.digest.len());
     for (algo, value) in subject.digest.iter() {
@@ -644,11 +666,7 @@ fn verify_statement_semantics(
 /// Verify the DSSE signature with a raw Ed25519 public key from the
 /// bundle's `verification_material.public_key.raw_bytes`. Used for
 /// self-signed bundles (`root pack --sign <key-file>`).
-fn verify_dsse_with_ed25519(
-    pk: &PublicKeyMaterial,
-    pae: &[u8],
-    sig_bytes: &[u8],
-) -> Result<()> {
+fn verify_dsse_with_ed25519(pk: &PublicKeyMaterial, pae: &[u8], sig_bytes: &[u8]) -> Result<()> {
     let b64 = base64::engine::general_purpose::STANDARD;
 
     let raw = b64.decode(&pk.raw_bytes)?;
@@ -657,8 +675,8 @@ fn verify_dsse_with_ed25519(
     }
     let mut key_array = [0u8; 32];
     key_array.copy_from_slice(&raw);
-    let verifying = VerifyingKey::from_bytes(&key_array)
-        .map_err(|_| Error::InvalidKeyLength(32))?;
+    let verifying =
+        VerifyingKey::from_bytes(&key_array).map_err(|_| Error::InvalidKeyLength(32))?;
 
     if sig_bytes.len() != 64 {
         return Err(Error::InvalidSignatureLength(sig_bytes.len()));
@@ -860,13 +878,7 @@ mod tests {
     #[test]
     fn sign_round_trips_through_verify() {
         let key = generate_signing_key(1);
-        let bundle = sign_pack(
-            fixture_hash(),
-            "package.tr",
-            &key,
-            SystemTime::UNIX_EPOCH,
-        )
-        .unwrap();
+        let bundle = sign_pack(fixture_hash(), "package.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
         let stmt = verify_bundle_offline(&bundle, fixture_hash()).unwrap();
         assert_eq!(stmt.predicate_type, DSSE_STATEMENT_TYPE);
         assert_eq!(stmt.predicate.format_version, "tr/3");
@@ -878,8 +890,7 @@ mod tests {
     fn verify_rejects_wrong_hash() {
         let key = generate_signing_key(2);
         let bundle = sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
-        let other_hash =
-            "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let other_hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
         let err = verify_bundle_offline(&bundle, other_hash).unwrap_err();
         assert!(matches!(err, Error::SubjectMismatch { .. }));
     }
@@ -887,8 +898,7 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_signature() {
         let key = generate_signing_key(3);
-        let mut bundle =
-            sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
+        let mut bundle = sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
         // Flip a bit in the base64 signature → still valid base64, but
         // the underlying bytes no longer verify.
         let sig = &bundle.dsse_envelope.signatures[0].sig;
@@ -905,8 +915,7 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_payload() {
         let key = generate_signing_key(4);
-        let mut bundle =
-            sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
+        let mut bundle = sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
         // Decode payload, change the subject, re-encode. Signature
         // covers the original payload — the swap breaks it.
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -953,8 +962,7 @@ mod tests {
     #[test]
     fn missing_public_key_in_bundle_errors_cleanly() {
         let key = generate_signing_key(7);
-        let mut bundle =
-            sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
+        let mut bundle = sign_pack(fixture_hash(), "p.tr", &key, SystemTime::UNIX_EPOCH).unwrap();
         bundle.verification_material.public_key = None;
         let err = verify_bundle_offline(&bundle, fixture_hash()).unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
@@ -998,13 +1006,11 @@ mod tests {
         // trait directly in this version, so we go via `From`.
         let pk = p256::PublicKey::from(verifying);
         let spki_der = pk.to_public_key_der().expect("encode SPKI");
-        let spki = SubjectPublicKeyInfoOwned::try_from(spki_der.as_bytes())
-            .expect("parse SPKI");
+        let spki = SubjectPublicKeyInfoOwned::try_from(spki_der.as_bytes()).expect("parse SPKI");
 
         // ecdsa-with-SHA256 — the algorithm OID Sigstore-issued certs
         // use for the issuer signature.
-        let ecdsa_with_sha256 =
-            ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let ecdsa_with_sha256 = ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
         let sig_alg = AlgorithmIdentifierOwned {
             oid: ecdsa_with_sha256,
             parameters: None,
@@ -1158,8 +1164,7 @@ mod tests {
     fn ecdsa_p256_rejects_wrong_subject_digest() {
         let signing = deterministic_p256_key(0x99);
         let bundle = build_ecdsa_signed_bundle(&signing, fixture_hash(), "p.tr");
-        let other =
-            "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+        let other = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
         let err = verify_bundle_offline(&bundle, other).unwrap_err();
         assert!(matches!(err, Error::SubjectMismatch { .. }));
     }
@@ -1207,8 +1212,7 @@ mod tests {
             &int_signer,
             "Synthetic Intermediate",
         );
-        let leaf_cert =
-            tr_tests::build_leaf(&int_signer, &int_name, &leaf_signer, "leaf");
+        let leaf_cert = tr_tests::build_leaf(&int_signer, &int_name, &leaf_signer, "leaf");
 
         // Sign the DSSE PAE with the leaf.
         let bare = strip_blake3_prefix(pack_hash);
@@ -1270,16 +1274,11 @@ mod tests {
 
     #[test]
     fn full_chain_bundle_verifies_against_synthetic_trust_root() {
-        let (bundle, root_der) =
-            build_full_synthetic_bundle(fixture_hash(), "full-chain.tr");
+        let (bundle, root_der) = build_full_synthetic_bundle(fixture_hash(), "full-chain.tr");
         let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
-        let (stmt, root_idx) = verify_bundle_with_trust_root(
-            &bundle,
-            fixture_hash(),
-            &trust_root,
-            SystemTime::now(),
-        )
-        .unwrap();
+        let (stmt, root_idx) =
+            verify_bundle_with_trust_root(&bundle, fixture_hash(), &trust_root, SystemTime::now())
+                .unwrap();
         assert_eq!(root_idx, 0);
         assert_eq!(stmt.predicate.format_version, "tr/3");
         assert_eq!(stmt.subject[0].name, "full-chain.tr");
@@ -1302,7 +1301,9 @@ mod tests {
     /// flow once and committing the resulting JSON as a fixture.
     #[test]
     fn offline_replay_full_sigstore_style_bundle_verifies() {
-        use crate::rekor::{leaf_hash_from_canonical_body, verify_inclusion_proof_offline, verify_set_signature};
+        use crate::rekor::{
+            leaf_hash_from_canonical_body, verify_inclusion_proof_offline, verify_set_signature,
+        };
         use crate::trust_root::test_helpers::*;
         use sha2::Digest as _;
 
@@ -1334,10 +1335,7 @@ mod tests {
                 name: "package.tr".to_string(),
                 digest: {
                     let mut m = serde_json::Map::new();
-                    m.insert(
-                        "sha256".to_string(),
-                        serde_json::Value::String(sha256_hex),
-                    );
+                    m.insert("sha256".to_string(), serde_json::Value::String(sha256_hex));
                     m
                 },
             }],
@@ -1368,7 +1366,8 @@ mod tests {
                 h.finalize().into()
             })
             .collect();
-        let leaves: Vec<[u8; 32]> = vec![other_leaves[0], our_leaf, other_leaves[1], other_leaves[2]];
+        let leaves: Vec<[u8; 32]> =
+            vec![other_leaves[0], our_leaf, other_leaves[1], other_leaves[2]];
 
         // Compute the Merkle root from the 4-leaf tree (RFC 6962).
         let level1_left: [u8; 32] = {
@@ -1447,8 +1446,12 @@ mod tests {
                 public_key: None,
                 x509_certificate_chain: Some(X509CertificateChain {
                     certificates: vec![
-                        X509Certificate { raw_bytes: b64.encode(&leaf_der) },
-                        X509Certificate { raw_bytes: b64.encode(&int_der) },
+                        X509Certificate {
+                            raw_bytes: b64.encode(&leaf_der),
+                        },
+                        X509Certificate {
+                            raw_bytes: b64.encode(&int_der),
+                        },
                     ],
                 }),
                 tlog_entries: vec![tlog_entry.clone()],
@@ -1481,9 +1484,7 @@ mod tests {
         assert_eq!(root_idx, 0, "chain should terminate at our synthetic root");
 
         // Layer 2: Rekor inclusion proof against claimed root.
-        let proof = bundle
-            .verification_material
-            .tlog_entries[0]
+        let proof = bundle.verification_material.tlog_entries[0]
             .inclusion_proof
             .as_ref()
             .unwrap();
@@ -1496,18 +1497,13 @@ mod tests {
 
     #[test]
     fn full_chain_bundle_with_no_chain_errors_missing_key() {
-        let (mut bundle, root_der) =
-            build_full_synthetic_bundle(fixture_hash(), "p.tr");
+        let (mut bundle, root_der) = build_full_synthetic_bundle(fixture_hash(), "p.tr");
         bundle.verification_material.x509_certificate_chain = None;
         bundle.verification_material.public_key = None;
         let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
-        let err = verify_bundle_with_trust_root(
-            &bundle,
-            fixture_hash(),
-            &trust_root,
-            SystemTime::now(),
-        )
-        .unwrap_err();
+        let err =
+            verify_bundle_with_trust_root(&bundle, fixture_hash(), &trust_root, SystemTime::now())
+                .unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
     }
 
@@ -1523,19 +1519,13 @@ mod tests {
         // Build a trust root with one bogus root CA — the check should
         // fail with MissingVerificationKey before chain validation runs.
         let bogus_root = deterministic_p256_key(0xD1);
-        let (root_cert, _) = crate::trust_root::test_helpers::build_self_signed_root(
-            &bogus_root,
-            "Bogus",
-        );
+        let (root_cert, _) =
+            crate::trust_root::test_helpers::build_self_signed_root(&bogus_root, "Bogus");
         let root_der = ::der::Encode::to_der(&root_cert).unwrap();
         let trust_root = TrustedRoot::from_root_ders(&[&root_der]).unwrap();
-        let err = verify_bundle_with_trust_root(
-            &bundle,
-            fixture_hash(),
-            &trust_root,
-            SystemTime::now(),
-        )
-        .unwrap_err();
+        let err =
+            verify_bundle_with_trust_root(&bundle, fixture_hash(), &trust_root, SystemTime::now())
+                .unwrap_err();
         assert!(matches!(err, Error::MissingVerificationKey));
     }
 
@@ -1560,10 +1550,7 @@ mod tests {
                 name: "package.tr".to_string(),
                 digest: {
                     let mut m = serde_json::Map::new();
-                    m.insert(
-                        "sha256".to_string(),
-                        serde_json::Value::String(sha_hex),
-                    );
+                    m.insert("sha256".to_string(), serde_json::Value::String(sha_hex));
                     m
                 },
             }],
@@ -1646,8 +1633,7 @@ mod tests {
         // unknown algorithms.
         let canonical_bytes: &[u8] = b"some bytes";
         let key = generate_signing_key(0xE4);
-        let mut bundle =
-            build_self_signed_bundle_with_sha256_subject(canonical_bytes, &key);
+        let mut bundle = build_self_signed_bundle_with_sha256_subject(canonical_bytes, &key);
 
         // Re-sign with a payload that uses an unknown digest algo.
         let mut new_statement = InTotoStatement {

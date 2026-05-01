@@ -13,7 +13,8 @@ use thinkingroot_core::{
     Claim, ClaimType, ContentHash, MergedBy, Source, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_serve::engine::{ClaimFilter, QueryEngine};
+use thinkingroot_serve::engine::{AgentClaim, BranchActor, ClaimFilter, QueryEngine};
+use thinkingroot_serve::intelligence::session::new_session_store;
 
 fn seed_claim(graph: &GraphStore, workspace: WorkspaceId, statement: &str, uri: &str) -> String {
     let source = Source::new(uri.to_string(), SourceType::Document)
@@ -233,5 +234,214 @@ async fn merge_branch_missing_branch_errors() {
     assert!(
         msg.contains("not found") || msg.contains("does/not/exist"),
         "error should mention missing branch, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn merge_into_branch_updates_target_branch_without_touching_main_cache() {
+    let dir = tempdir().unwrap();
+    let root: PathBuf = dir.path().to_path_buf();
+    let graph_dir = root.join(".thinkingroot").join("graph");
+    std::fs::create_dir_all(&graph_dir).unwrap();
+    let workspace = WorkspaceId::new();
+
+    {
+        let main_graph = GraphStore::init(&graph_dir).unwrap();
+        seed_claim(&main_graph, workspace, "baseline claim", "file:///main.md");
+    }
+
+    thinkingroot_branch::create_branch(&root, "feature/source", "main", None)
+        .await
+        .unwrap();
+    thinkingroot_branch::create_branch(&root, "feature/target", "main", None)
+        .await
+        .unwrap();
+
+    {
+        let source_graph =
+            GraphStore::init(&root.join(".thinkingroot/branches/feature-source/graph")).unwrap();
+        seed_claim(
+            &source_graph,
+            workspace,
+            "feature source adds Redis session storage",
+            "file:///source.md",
+        );
+    }
+
+    let mut engine = QueryEngine::new();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
+
+    let diff = engine
+        .merge_into_branch(
+            &root,
+            "feature/source",
+            Some("feature/target"),
+            true,
+            false,
+            MergedBy::Human {
+                user: "test".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.to_branch, "feature/target");
+
+    let target_claims = engine
+        .list_claims_branched("demo", ClaimFilter::default(), Some("feature/target"))
+        .await
+        .unwrap();
+    assert!(
+        target_claims
+            .iter()
+            .any(|c| c.statement.contains("Redis session storage")),
+        "target branch should contain merged branch-only claim"
+    );
+
+    let main_claims = engine
+        .list_claims("demo", ClaimFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(main_claims.len(), 1, "main cache should remain unchanged");
+}
+
+#[tokio::test]
+async fn rebase_branch_pulls_parent_claims_into_child_branch() {
+    let dir = tempdir().unwrap();
+    let root: PathBuf = dir.path().to_path_buf();
+    let graph_dir = root.join(".thinkingroot").join("graph");
+    std::fs::create_dir_all(&graph_dir).unwrap();
+    let workspace = WorkspaceId::new();
+
+    {
+        let main_graph = GraphStore::init(&graph_dir).unwrap();
+        seed_claim(
+            &main_graph,
+            workspace,
+            "baseline claim",
+            "file:///baseline.md",
+        );
+    }
+
+    thinkingroot_branch::create_branch_with_owner(
+        &root,
+        "feature/owned",
+        "main",
+        None,
+        Some("alice".to_string()),
+        thinkingroot_core::BranchPermissions::default(),
+    )
+    .await
+    .unwrap();
+
+    {
+        let main_graph = GraphStore::init(&graph_dir).unwrap();
+        seed_claim(
+            &main_graph,
+            workspace,
+            "main gained OAuth support after branch creation",
+            "file:///main-after.md",
+        );
+    }
+
+    let mut engine = QueryEngine::new();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
+
+    let diff = engine
+        .rebase_branch(
+            &root,
+            "feature/owned",
+            BranchActor::User("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.from_branch, "main");
+    assert_eq!(diff.to_branch, "feature/owned");
+
+    let branch_claims = engine
+        .list_claims_branched("demo", ClaimFilter::default(), Some("feature/owned"))
+        .await
+        .unwrap();
+    assert!(
+        branch_claims
+            .iter()
+            .any(|c| c.statement.contains("OAuth support")),
+        "rebased branch should now include parent-only claim"
+    );
+}
+
+#[tokio::test]
+async fn branch_permissions_block_non_owner_contribute_and_delete() {
+    let dir = tempdir().unwrap();
+    let root: PathBuf = dir.path().to_path_buf();
+    let graph_dir = root.join(".thinkingroot").join("graph");
+    std::fs::create_dir_all(&graph_dir).unwrap();
+    let workspace = WorkspaceId::new();
+
+    {
+        let main_graph = GraphStore::init(&graph_dir).unwrap();
+        seed_claim(
+            &main_graph,
+            workspace,
+            "baseline claim",
+            "file:///baseline.md",
+        );
+    }
+
+    thinkingroot_branch::create_branch_with_owner(
+        &root,
+        "feature/private",
+        "main",
+        None,
+        Some("alice".to_string()),
+        thinkingroot_core::BranchPermissions::default(),
+    )
+    .await
+    .unwrap();
+
+    let mut engine = QueryEngine::new();
+    engine
+        .mount("demo".to_string(), root.clone())
+        .await
+        .unwrap();
+    let sessions = new_session_store();
+
+    let err = engine
+        .contribute_claims_as(
+            "demo",
+            "sess-1",
+            Some("feature/private"),
+            vec![AgentClaim {
+                statement: "unauthorized claim".to_string(),
+                claim_type: "fact".to_string(),
+                confidence: Some(0.8),
+                entities: vec!["Private".to_string()],
+            }],
+            &sessions,
+            BranchActor::User("bob".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected permission failure for contribute, got {err}"
+    );
+
+    let err = engine
+        .delete_branch_as(
+            &root,
+            "feature/private",
+            BranchActor::User("bob".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected permission failure for delete, got {err}"
     );
 }

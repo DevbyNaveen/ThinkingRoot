@@ -155,11 +155,7 @@ fn utf8_safe_end(bytes: &[u8]) -> usize {
         };
         let lead_pos = end - 1;
         let have = bytes.len() - lead_pos;
-        if have < needed {
-            lead_pos
-        } else {
-            end
-        }
+        if have < needed { lead_pos } else { end }
     }
 }
 
@@ -212,7 +208,12 @@ pub fn render_identity_block(identity: &WorkspaceIdentity, today: Option<&str>) 
 mod tests {
     use super::*;
 
-    fn snap(name: &str, root: &Path, claim_count: usize, kinds: &[(&str, usize)]) -> WorkspaceChatSnapshot {
+    fn snap(
+        name: &str,
+        root: &Path,
+        claim_count: usize,
+        kinds: &[(&str, usize)],
+    ) -> WorkspaceChatSnapshot {
         WorkspaceChatSnapshot {
             name: name.to_string(),
             root_path: root.to_path_buf(),
@@ -236,8 +237,7 @@ mod tests {
     #[test]
     fn auto_discovers_claude_md_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), b"# Project\nHello, agent.")
-            .unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), b"# Project\nHello, agent.").unwrap();
         let s = snap("acme", dir.path(), 0, &[]);
         let cfg = ChatConfig::default();
         let id = build_workspace_identity(&s, &cfg);

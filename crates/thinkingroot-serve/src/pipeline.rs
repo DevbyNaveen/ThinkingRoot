@@ -657,11 +657,9 @@ async fn run_pipeline_inner(
         // failure made every run see the source as "fingerprint-
         // matched empty" which then short-circuited as unchanged —
         // claims for that source would never persist.
-        let fp_bytes = serde_json::to_vec(&source_claims)
-            .map_err(|e| thinkingroot_core::Error::Config(format!(
-                "fingerprint serialize for {}: {e}",
-                doc.uri
-            )))?;
+        let fp_bytes = serde_json::to_vec(&source_claims).map_err(|e| {
+            thinkingroot_core::Error::Config(format!("fingerprint serialize for {}: {e}", doc.uri))
+        })?;
         let fp = crate::fingerprint::FingerprintStore::compute(&fp_bytes);
 
         if fingerprints.is_unchanged(&doc.uri, &fp) {

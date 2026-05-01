@@ -66,10 +66,17 @@ pub struct BranchCreateArgs {
 pub async fn branch_create(args: BranchCreateArgs) -> Result<BranchView, String> {
     let path = workspace_path(&args.workspace)?;
     let parent = args.parent.unwrap_or_else(|| "main".to_string());
-    let branch =
-        thinkingroot_branch::create_branch(&path, &args.name, &parent, args.description)
-            .await
-            .map_err(|e| e.to_string())?;
+    let owner = std::env::var("USER").ok();
+    let branch = thinkingroot_branch::create_branch_with_owner(
+        &path,
+        &args.name,
+        &parent,
+        args.description,
+        owner,
+        thinkingroot_core::BranchPermissions::default(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(BranchView {
         current: false,
         parent: branch.parent.clone(),
@@ -174,7 +181,13 @@ pub async fn branch_delete(
     if let Some(engine) = engine_opt {
         let engine = engine.read().await;
         engine
-            .delete_branch(&path, &args.name)
+            .delete_branch_as(
+                &path,
+                &args.name,
+                thinkingroot_serve::engine::BranchActor::User(
+                    std::env::var("USER").unwrap_or_else(|_| "desktop".to_string()),
+                ),
+            )
             .await
             .map_err(|e| e.to_string())?;
     } else {

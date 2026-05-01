@@ -419,8 +419,7 @@ mod tests {
 
     #[test]
     fn handles_bom_prefix() {
-        let raw =
-            "\u{feff}---\nname: x\ndescription: y\n---\n\nbody\n";
+        let raw = "\u{feff}---\nname: x\ndescription: y\n---\n\nbody\n";
         let s = parse_skill(PathBuf::from("/tmp/x.md"), raw).unwrap();
         assert_eq!(s.name, "x");
     }

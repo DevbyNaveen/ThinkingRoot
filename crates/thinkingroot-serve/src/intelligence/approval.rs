@@ -172,8 +172,7 @@ impl ApprovalGate for ChannelApprovalGate {
 // and the approval POST looks up the sender and fires it.
 
 /// Map keyed by tool_use_id → reply oneshot. Lives on `AppState`.
-pub type PendingApprovalMap =
-    Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
+pub type PendingApprovalMap = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
 
 pub fn new_pending_approval_map() -> PendingApprovalMap {
     Arc::new(Mutex::new(HashMap::new()))
@@ -434,12 +433,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_unknown_id_is_a_noop() {
         let pending = new_pending_approval_map();
-        let resolved = ToolApprovalRouter::resolve(
-            &pending,
-            "nonexistent",
-            ApprovalDecision::Approved,
-        )
-        .await;
+        let resolved =
+            ToolApprovalRouter::resolve(&pending, "nonexistent", ApprovalDecision::Approved).await;
         assert!(!resolved);
     }
 }

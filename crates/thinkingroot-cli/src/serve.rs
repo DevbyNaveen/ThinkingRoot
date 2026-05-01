@@ -153,8 +153,24 @@ pub async fn run_serve(
         };
 
         if workspaces.is_empty() {
-            anyhow::bail!(
-                "No workspaces registered. Run `root setup` or `root workspace add <path>`."
+            // When launched as the desktop sidecar (no --path, no --name),
+            // bail only when the user explicitly named a workspace that doesn't
+            // exist.  For the zero-workspaces case we start with an empty
+            // engine so port 31760 binds and the compile/stream endpoint
+            // remains reachable (it accepts root_path in the POST body and
+            // doesn't need a pre-mounted workspace).  Crashing here caused the
+            // sidecar to exit before binding the port; the desktop still held
+            // a SidecarHandle pointing at the dead process, so every compile
+            // attempt got "connection refused".
+            if name.is_some() {
+                anyhow::bail!(
+                    "No workspaces registered. Run `root setup` or `root workspace add <path>`."
+                );
+            }
+            tracing::warn!(
+                "workspace registry is empty — starting server with no mounted workspaces. \
+                 Compile and query endpoints that require a workspace name will return errors \
+                 until you run `root workspace add <path>`."
             );
         }
         workspaces

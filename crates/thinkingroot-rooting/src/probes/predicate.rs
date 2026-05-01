@@ -68,7 +68,11 @@ impl Probe for PredicateProbe {
                 // `PredicateEvaluation::strength`). Downstream in the rooter
                 // this is compared against `config.predicate_strength_threshold`
                 // to demote weak-predicate matches from Rooted to Attested.
-                score: if eval.passed { eval.strength as f64 } else { 0.0 },
+                score: if eval.passed {
+                    eval.strength as f64
+                } else {
+                    0.0
+                },
                 passed: eval.passed,
                 detail: eval.detail,
             }),

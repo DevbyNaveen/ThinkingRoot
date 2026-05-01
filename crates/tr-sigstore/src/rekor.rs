@@ -69,9 +69,7 @@ pub fn verify_inclusion_proof_offline(
             inclusion_proof.tree_size
         )));
     }
-    if inclusion_proof.log_index < 0
-        || inclusion_proof.log_index >= inclusion_proof.tree_size
-    {
+    if inclusion_proof.log_index < 0 || inclusion_proof.log_index >= inclusion_proof.tree_size {
         return Err(Error::CertParse(format!(
             "rekor inclusion_proof.log_index {} out of range for tree_size {}",
             inclusion_proof.log_index, inclusion_proof.tree_size
@@ -123,9 +121,7 @@ pub fn verify_inclusion_proof_offline(
             // consumed.
         } else {
             let sibling = sibling_iter.next().ok_or_else(|| {
-                Error::CertParse(
-                    "rekor audit path is too short for the given tree shape".into(),
-                )
+                Error::CertParse("rekor audit path is too short for the given tree shape".into())
             })?;
             running = if idx.is_multiple_of(2) {
                 hash_node(&running, sibling)
@@ -474,8 +470,8 @@ mod tests {
             canonicalized_body: Some(b64_encode(canonical_body)),
         };
 
-        let err = verify_set_signature(&entry, canonical_body, &log_id_bytes, &other_vk)
-            .unwrap_err();
+        let err =
+            verify_set_signature(&entry, canonical_body, &log_id_bytes, &other_vk).unwrap_err();
         assert!(matches!(err, Error::SignatureMismatch));
     }
 

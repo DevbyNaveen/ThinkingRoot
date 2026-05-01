@@ -32,7 +32,7 @@ use anyhow::Context as _;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::pipeline::{PipelineResult, ProgressEvent, run_pipeline_with_options, PipelineOptions};
+use crate::pipeline::{PipelineOptions, PipelineResult, ProgressEvent, run_pipeline_with_options};
 
 #[derive(Debug, Clone)]
 struct ActiveExtractionBatch {

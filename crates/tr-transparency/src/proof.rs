@@ -110,11 +110,7 @@ pub fn build_proof(leaves: &[[u8; 32]], leaf_index: usize) -> InclusionProof {
 /// frontier survived intact. RFC 6962 §2.1.2 defines a strictly
 /// smaller proof; the simpler form here keeps the implementation
 /// auditable while still detecting tampering.
-pub fn build_consistency(
-    leaves: &[[u8; 32]],
-    old_size: usize,
-    new_size: usize,
-) -> Vec<[u8; 32]> {
+pub fn build_consistency(leaves: &[[u8; 32]], old_size: usize, new_size: usize) -> Vec<[u8; 32]> {
     if old_size == 0 || new_size <= old_size {
         return Vec::new();
     }
@@ -124,11 +120,7 @@ pub fn build_consistency(
 
 /// Verify that `leaf` belongs to the tree whose root is
 /// `expected_root`, using `proof`.
-pub fn verify_inclusion(
-    leaf: &[u8; 32],
-    expected_root: &[u8; 32],
-    proof: &InclusionProof,
-) -> bool {
+pub fn verify_inclusion(leaf: &[u8; 32], expected_root: &[u8; 32], proof: &InclusionProof) -> bool {
     if proof.siblings.len() != proof.directions.len() {
         return false;
     }

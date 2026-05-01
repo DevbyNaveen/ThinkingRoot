@@ -131,7 +131,11 @@ impl TransparencyLog {
             return Err(crate::Error::OutOfRange(new_size, self.len()));
         }
         let leaves = self.leaf_hashes();
-        Ok(crate::proof::build_consistency(&leaves, old_size as usize, new_size as usize))
+        Ok(crate::proof::build_consistency(
+            &leaves,
+            old_size as usize,
+            new_size as usize,
+        ))
     }
 
     fn leaf_hashes(&self) -> Vec<[u8; 32]> {

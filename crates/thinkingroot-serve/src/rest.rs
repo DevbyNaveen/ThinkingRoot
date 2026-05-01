@@ -99,6 +99,16 @@ fn err_response(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
+fn request_user(headers: &HeaderMap) -> Option<String> {
+    ["x-thinkingroot-user", "x-user"]
+        .into_iter()
+        .find_map(|name| headers.get(name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 // ─── Query Params ────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -165,6 +175,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/branches/{branch}/diff", get(diff_branch_handler))
             .route("/branches/{branch}/merge", post(merge_branch_handler))
+            .route(
+                "/branches/{source}/merge-into/{target}",
+                post(merge_into_branch_handler),
+            )
+            .route("/branches/{branch}/rebase", post(rebase_branch_handler))
             .route("/branches/{branch}/rollback", post(rollback_merge_handler))
             .route("/branches/{branch}/checkout", post(checkout_branch_handler))
             .route("/branches/{branch}", delete(delete_branch_handler))
@@ -659,6 +674,7 @@ struct CreateBranchRequest {
 
 async fn create_branch_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<CreateBranchRequest>,
 ) -> impl IntoResponse {
     let root = match &state.workspace_root {
@@ -672,7 +688,16 @@ async fn create_branch_handler(
         }
     };
     let parent = body.parent.as_deref().unwrap_or("main");
-    match thinkingroot_branch::create_branch(&root, &body.name, parent, body.description).await {
+    match thinkingroot_branch::create_branch_with_owner(
+        &root,
+        &body.name,
+        parent,
+        body.description,
+        request_user(&headers),
+        thinkingroot_core::BranchPermissions::default(),
+    )
+    .await
+    {
         Ok(branch) => ok_response(serde_json::json!({ "branch": branch })).into_response(),
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -684,6 +709,7 @@ async fn create_branch_handler(
 
 async fn delete_branch_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
     let root = match &state.workspace_root {
@@ -697,7 +723,10 @@ async fn delete_branch_handler(
         }
     };
     let engine = state.engine.read().await;
-    match engine.delete_branch(&root, &branch).await {
+    let actor = request_user(&headers)
+        .map(crate::engine::BranchActor::User)
+        .unwrap_or(crate::engine::BranchActor::System);
+    match engine.delete_branch_as(&root, &branch, actor).await {
         Ok(_) => ok_response(serde_json::json!({ "deleted": branch })).into_response(),
         Err(e) => err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &e.to_string()),
     }
@@ -814,6 +843,7 @@ struct MergeBranchRequest {
 
 async fn merge_branch_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(branch): Path<String>,
     body: Option<Json<MergeBranchRequest>>,
 ) -> impl IntoResponse {
@@ -837,13 +867,14 @@ async fn merge_branch_handler(
 
     let engine = state.engine.read().await;
     match engine
-        .merge_branch(
+        .merge_into_branch(
             &root,
             &branch,
+            None,
             force,
             propagate_deletions,
             MergedBy::Human {
-                user: "api".to_string(),
+                user: request_user(&headers).unwrap_or_else(|| "api".to_string()),
             },
         )
         .await
@@ -861,6 +892,103 @@ async fn merge_branch_handler(
         Err(e) => err_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "MERGE_BLOCKED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn merge_into_branch_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((source, target)): Path<(String, String)>,
+    body: Option<Json<MergeBranchRequest>>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    use thinkingroot_core::MergedBy;
+
+    let force = body.as_ref().and_then(|b| b.force).unwrap_or(false);
+    let propagate_deletions = body
+        .as_ref()
+        .and_then(|b| b.propagate_deletions)
+        .unwrap_or(false);
+
+    let engine = state.engine.read().await;
+    match engine
+        .merge_into_branch(
+            &root,
+            &source,
+            Some(&target),
+            force,
+            propagate_deletions,
+            MergedBy::Human {
+                user: request_user(&headers).unwrap_or_else(|| "api".to_string()),
+            },
+        )
+        .await
+    {
+        Ok(diff) => ok_response(serde_json::json!({
+            "merged": source,
+            "target": target,
+            "new_claims": diff.new_claims.len(),
+            "new_entities": diff.new_entities.len(),
+            "auto_resolved": diff.auto_resolved.len(),
+        }))
+        .into_response(),
+        Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
+            err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
+        }
+        Err(e) => err_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "MERGE_BLOCKED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn rebase_branch_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(branch): Path<String>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+
+    let actor = request_user(&headers)
+        .map(crate::engine::BranchActor::User)
+        .unwrap_or(crate::engine::BranchActor::System);
+    let engine = state.engine.read().await;
+    match engine.rebase_branch(&root, &branch, actor).await {
+        Ok(diff) => ok_response(serde_json::json!({
+            "rebased": branch,
+            "from_branch": diff.from_branch,
+            "new_claims": diff.new_claims.len(),
+            "new_entities": diff.new_entities.len(),
+            "auto_resolved": diff.auto_resolved.len(),
+        }))
+        .into_response(),
+        Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
+            err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
+        }
+        Err(e) => err_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "REBASE_BLOCKED",
             &e.to_string(),
         ),
     }
@@ -969,9 +1097,7 @@ struct ChatTurnPayload {
 /// take down the chat surface — the worst case is the synthesizer sees
 /// fewer turns than the client thought it sent. Empty `content` strings
 /// are also dropped to keep the prompt tight.
-fn decode_history(
-    payload: &[ChatTurnPayload],
-) -> Vec<crate::intelligence::synthesizer::ChatTurn> {
+fn decode_history(payload: &[ChatTurnPayload]) -> Vec<crate::intelligence::synthesizer::ChatTurn> {
     use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
     payload
         .iter()
@@ -1322,11 +1448,7 @@ async fn ask_stream_handler(
 // `approval_requested` SSE event so the desktop UI can render its
 // claim card. The UI then POSTs the decision to
 // `/ask/approval/{tool_use_id}`.
-async fn agent_stream_response(
-    state: Arc<AppState>,
-    ws: String,
-    body: AskRequest,
-) -> Response {
+async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskRequest) -> Response {
     use crate::intelligence::agent::AgentEvent;
     use crate::intelligence::agent_streaming::{
         StreamAgentDeps, StreamAgentRequest, agent_event_to_sse, spawn_agent_run,
@@ -1421,8 +1543,7 @@ async fn agent_stream_response(
             })
         })
         .collect();
-    let agent_messages =
-        crate::intelligence::agent::chat_turns_to_messages(&chat_history);
+    let agent_messages = crate::intelligence::agent::chat_turns_to_messages(&chat_history);
 
     let conversation_id = body
         .conversation_id
@@ -1543,9 +1664,7 @@ async fn ask_approval_handler(
     let decision = match body.decision.as_str() {
         "approve" | "approved" => ApprovalDecision::Approved,
         _ => ApprovalDecision::Rejected {
-            reason: body
-                .reason
-                .unwrap_or_else(|| "user declined".to_string()),
+            reason: body.reason.unwrap_or_else(|| "user declined".to_string()),
         },
     };
 

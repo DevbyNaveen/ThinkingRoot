@@ -17,6 +17,26 @@ pub struct BranchRef {
     pub status: BranchStatus,
     /// Optional human-readable description of the branch's purpose.
     pub description: Option<String>,
+    /// Optional owner identity for SaaS / collaborative permission checks.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Branch-level read/write/merge permissions.
+    #[serde(default)]
+    pub permissions: BranchPermissions,
+}
+
+/// Per-branch collaborative permissions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BranchPermissions {
+    /// Identities allowed to read the branch when read-gating is enabled.
+    #[serde(default)]
+    pub readers: Vec<String>,
+    /// Identities allowed to contribute new claims to the branch.
+    #[serde(default)]
+    pub writers: Vec<String>,
+    /// Identities allowed to merge into or delete the branch.
+    #[serde(default)]
+    pub mergers: Vec<String>,
 }
 
 /// Lifecycle status of a knowledge branch.
@@ -58,9 +78,17 @@ mod tests {
             created_at: Utc::now(),
             status: BranchStatus::Active,
             description: Some("test branch".to_string()),
+            owner: Some("alice".to_string()),
+            permissions: BranchPermissions {
+                readers: vec!["bob".to_string()],
+                writers: vec!["carol".to_string()],
+                mergers: vec!["dave".to_string()],
+            },
         };
         assert_eq!(b.name, "feature/x");
         assert!(matches!(b.status, BranchStatus::Active));
+        assert_eq!(b.owner.as_deref(), Some("alice"));
+        assert_eq!(b.permissions.readers, vec!["bob"]);
     }
 
     #[test]

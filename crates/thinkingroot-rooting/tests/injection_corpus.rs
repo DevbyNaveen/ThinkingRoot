@@ -142,10 +142,7 @@ fn build_fixtures() -> Vec<Fixture> {
             body.push_str(&format!("pub mod {} {{\n", name));
             for (subj, desc) in items.iter() {
                 body.push_str(&format!("    /// {} {}\n", subj, desc));
-                body.push_str(&format!(
-                    "    pub struct {} {{ inner: () }}\n",
-                    subj
-                ));
+                body.push_str(&format!("    pub struct {} {{ inner: () }}\n", subj));
                 body.push_str(&format!(
                     "    impl {} {{ pub fn new() -> Self {{ Self {{ inner: () }} }} }}\n",
                     subj
@@ -208,9 +205,7 @@ fn adversarial_corpus_meets_rejection_targets() {
         let hash = ContentHash::from_bytes(f.body.as_bytes());
         let source = Source::new(f.uri.clone(), SourceType::File).with_hash(hash.clone());
         graph.insert_source(&source).unwrap();
-        store
-            .put(source.id, &hash, f.body.as_bytes())
-            .unwrap();
+        store.put(source.id, &hash, f.body.as_bytes()).unwrap();
         source_ids.push(source.id);
         source_by_idx.insert(idx, source);
     }
@@ -226,13 +221,8 @@ fn adversarial_corpus_meets_rejection_targets() {
             // Statement is the exact doc-comment text embedded in the source,
             // so provenance token overlap is ≈ 1.0.
             let statement = format!("{subj} {desc}");
-            let incumbent = Claim::new(
-                &statement,
-                ClaimType::Fact,
-                src.id,
-                WorkspaceId::new(),
-            )
-            .with_confidence(0.95);
+            let incumbent = Claim::new(&statement, ClaimType::Fact, src.id, WorkspaceId::new())
+                .with_confidence(0.95);
             graph.insert_claim(&incumbent).unwrap();
             incumbents.push(incumbent);
         }
@@ -281,7 +271,11 @@ fn adversarial_corpus_meets_rejection_targets() {
         // registered contradiction record is what makes the contradiction
         // probe reject the candidate. This isolates the probe we are
         // measuring.
-        let statement = format!("{} (contested claim #{})", incumbent.statement, class_b.len());
+        let statement = format!(
+            "{} (contested claim #{})",
+            incumbent.statement,
+            class_b.len()
+        );
         let candidate = Claim::new(
             &statement,
             ClaimType::Fact,
@@ -459,28 +453,44 @@ fn adversarial_corpus_meets_rejection_targets() {
         a_quar = o_a.quarantined,
         a_att = o_a.attested,
         a_roo = o_a.rooted,
-        a_pass = if o_a.pct(o_a.rejected) >= CLASS_A_TARGET_REJECT { "✅" } else { "❌" },
+        a_pass = if o_a.pct(o_a.rejected) >= CLASS_A_TARGET_REJECT {
+            "✅"
+        } else {
+            "❌"
+        },
         b_rej = o_b.rejected,
         b_tot = o_b.total,
         b_rej_pct = o_b.pct(o_b.rejected) * 100.0,
         b_quar = o_b.quarantined,
         b_att = o_b.attested,
         b_roo = o_b.rooted,
-        b_pass = if o_b.pct(o_b.rejected) >= CLASS_B_TARGET_REJECT { "✅" } else { "❌" },
+        b_pass = if o_b.pct(o_b.rejected) >= CLASS_B_TARGET_REJECT {
+            "✅"
+        } else {
+            "❌"
+        },
         c_rej = o_c.rejected,
         c_tot = o_c.total,
         c_quar = o_c.quarantined,
         c_quar_pct = o_c.pct(o_c.quarantined) * 100.0,
         c_att = o_c.attested,
         c_roo = o_c.rooted,
-        c_pass = if o_c.pct(o_c.quarantined) >= CLASS_C_TARGET_QUARANTINE { "✅" } else { "❌" },
+        c_pass = if o_c.pct(o_c.quarantined) >= CLASS_C_TARGET_QUARANTINE {
+            "✅"
+        } else {
+            "❌"
+        },
         d_rej = o_d.rejected,
         d_tot = o_d.total,
         d_quar = o_d.quarantined,
         d_att = o_d.attested,
         d_roo = o_d.rooted,
         d_roo_pct = o_d.pct(o_d.rooted) * 100.0,
-        d_pass = if (1.0 - o_d.pct(o_d.rooted)) >= CLASS_D_TARGET_NOT_ROOTED { "✅" } else { "❌" },
+        d_pass = if (1.0 - o_d.pct(o_d.rooted)) >= CLASS_D_TARGET_NOT_ROOTED {
+            "✅"
+        } else {
+            "❌"
+        },
     );
 
     // Write the report only when explicitly requested, so routine test runs

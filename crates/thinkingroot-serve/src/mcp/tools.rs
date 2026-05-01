@@ -13,6 +13,16 @@ fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"))
 }
 
+fn session_actor(sessions: &SessionStore, session_id: &str) -> crate::engine::BranchActor {
+    if let Ok(store) = sessions.try_lock()
+        && let Some(session) = store.get(session_id)
+        && let Some(owner) = session.owner.as_ref()
+    {
+        return crate::engine::BranchActor::User(owner.clone());
+    }
+    crate::engine::BranchActor::User(session_id.to_string())
+}
+
 /// Resolve the `workspace` tool argument to a mounted workspace name.
 ///
 /// Workspaces are mounted by basename (see `cli/src/serve.rs`), but MCP clients
@@ -52,14 +62,12 @@ fn resolve_workspace_arg_with<F: Fn(&str) -> bool>(
 ) -> String {
     match arg {
         Some(value) if is_mounted(value) => value.to_string(),
-        Some(value) if value.contains('/') || value.contains('\\') => {
-            std::path::Path::new(value)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|name| is_mounted(name))
-                .map(str::to_string)
-                .unwrap_or_else(|| value.to_string())
-        }
+        Some(value) if value.contains('/') || value.contains('\\') => std::path::Path::new(value)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|name| is_mounted(name))
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string()),
         Some(value) => value.to_string(),
         None => default_ws.unwrap_or("default").to_string(),
     }
@@ -157,13 +165,28 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "merge_branch",
-                "description": "Merge a knowledge branch into main (runs health CI gate)",
+                "description": "Merge a knowledge branch into main or another target branch (runs health CI gate)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branch":    { "type": "string" },
+                        "target":    { "type": "string", "description": "Optional target branch. Defaults to main." },
+                        "workspace": { "type": "string" },
+                        "force":     { "type": "boolean", "default": false },
+                        "propagate_deletions": { "type": "boolean", "default": false },
+                        "root_path": { "type": "string" }
+                    },
+                    "required": ["branch", "workspace"]
+                }
+            },
+            {
+                "name": "rebase_branch",
+                "description": "Sync a branch with its parent by applying parent-only claims into the branch.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "branch":    { "type": "string" },
                         "workspace": { "type": "string" },
-                        "force":     { "type": "boolean", "default": false },
                         "root_path": { "type": "string" }
                     },
                     "required": ["branch", "workspace"]
@@ -684,7 +707,16 @@ pub async fn handle_call(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            match thinkingroot_branch::create_branch(root, branch_name, "main", description).await {
+            match thinkingroot_branch::create_branch_with_owner(
+                root,
+                branch_name,
+                "main",
+                description,
+                Some(session_id.to_string()),
+                thinkingroot_core::BranchPermissions::default(),
+            )
+            .await
+            {
                 Ok(branch) => JsonRpcResponse::success(
                     id,
                     serde_json::json!({
@@ -777,18 +809,20 @@ pub async fn handle_call(
                 .get("force")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let target = arguments.get("target").and_then(|v| v.as_str());
             let propagate_deletions = arguments
                 .get("propagate_deletions")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             match engine
-                .merge_branch(
+                .merge_into_branch(
                     root,
                     branch_name,
+                    target,
                     force,
                     propagate_deletions,
                     thinkingroot_core::MergedBy::Human {
-                        user: "mcp".to_string(),
+                        user: session_id.to_string(),
                     },
                 )
                 .await
@@ -799,8 +833,49 @@ pub async fn handle_call(
                         "content": [{
                             "type": "text",
                             "text": format!(
-                                "Branch '{}' merged: {} new claims, {} new entities, {} auto-resolved",
+                                "Branch '{}' merged into '{}': {} new claims, {} new entities, {} auto-resolved",
                                 branch_name,
+                                target.unwrap_or("main"),
+                                diff.new_claims.len(),
+                                diff.new_entities.len(),
+                                diff.auto_resolved.len()
+                            )
+                        }]
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "rebase_branch" => {
+            let branch_name = match arguments.get("branch").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'branch' argument".to_string(),
+                    );
+                }
+            };
+            let root_path_str = arguments
+                .get("root_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let root = std::path::Path::new(root_path_str);
+            match engine
+                .rebase_branch(root, branch_name, session_actor(sessions, session_id))
+                .await
+            {
+                Ok(diff) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": format!(
+                                "Branch '{}' rebased from '{}': {} new claims, {} new entities, {} auto-resolved",
+                                branch_name,
+                                diff.from_branch,
                                 diff.new_claims.len(),
                                 diff.new_entities.len(),
                                 diff.auto_resolved.len()
@@ -1105,12 +1180,13 @@ pub async fn handle_call(
             };
 
             match engine
-                .contribute_claims(
+                .contribute_claims_as(
                     ws,
                     session_id,
                     active_branch.as_deref(),
                     agent_claims,
                     sessions,
+                    session_actor(sessions, session_id),
                 )
                 .await
             {
@@ -1226,7 +1302,10 @@ pub async fn handle_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
             let root = std::path::Path::new(root_path_str);
-            match engine.delete_branch(root, branch_name).await {
+            match engine
+                .delete_branch_as(root, branch_name, session_actor(sessions, session_id))
+                .await
+            {
                 Ok(()) => JsonRpcResponse::success(
                     id,
                     serde_json::json!({

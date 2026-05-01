@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SERVER: &str = "https://api.thinkingroot.dev";
@@ -42,8 +42,8 @@ impl Config {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| anyhow!("could not determine user config directory"))?;
+    let base =
+        dirs::config_dir().ok_or_else(|| anyhow!("could not determine user config directory"))?;
     Ok(base.join("thinkingroot").join("auth.json"))
 }
 
@@ -53,8 +53,7 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn load_or_default(override_server: Option<&str>) -> Result<Config> {
     let path = config_path()?;
     let mut cfg = if path.exists() {
-        let bytes =
-            fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_slice::<Config>(&bytes)
             .with_context(|| format!("parse {}", path.display()))?
     } else {
@@ -74,8 +73,7 @@ pub fn load_or_default(override_server: Option<&str>) -> Result<Config> {
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

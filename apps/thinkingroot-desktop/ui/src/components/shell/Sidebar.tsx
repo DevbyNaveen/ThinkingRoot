@@ -184,8 +184,8 @@ export function Sidebar() {
               right={
                 <div className="flex items-center gap-1">
                   <IconBtn
-                    title="Re-scan disk"
-                    aria-label="Re-scan"
+                    title="Refresh workspace list"
+                    aria-label="Refresh workspaces"
                     busy={scanning}
                     onClick={async () => {
                       setScanning(true);
@@ -196,6 +196,11 @@ export function Sidebar() {
                             `Found ${r.registered.length} new workspace${r.registered.length === 1 ? "" : "s"}`,
                             { kind: "success" },
                           );
+                        } else {
+                          toast("Workspace list refreshed", {
+                            kind: "success",
+                            body: "Scanned your workspace roots for folders containing `.thinkingroot`.",
+                          });
                         }
                         await refresh();
                       } catch (e) {
@@ -240,9 +245,9 @@ export function Sidebar() {
 
             {workspaces.length === 0 ? (
               <p className="px-2 py-3 text-[11px] text-muted-foreground">
-                No workspaces yet. Click the folder icon above to add one,
-                or run <code className="font-mono">root compile &lt;path&gt;</code>{" "}
-                in the terminal.
+                No workspaces yet. Use refresh to scan for folders that already
+                contain <code className="font-mono">.thinkingroot</code>, or
+                click the folder-plus icon to add one manually.
               </p>
             ) : (
               <ul className="flex flex-col">
@@ -501,11 +506,11 @@ function SectionHeader({
   right?: React.ReactNode;
 }) {
   return (
-    <div className="mt-3 flex h-7 items-center justify-between px-2">
+    <div className="mt-3 flex h-7 items-center px-2">
       <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
         {label}
       </span>
-      {right}
+      {right ? <div className="ml-2 flex items-center gap-1">{right}</div> : null}
     </div>
   );
 }
@@ -528,7 +533,7 @@ function IconBtn({
       onClick={onClick}
       title={title}
       disabled={busy}
-      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:opacity-50"
+      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted/30 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:opacity-50"
       {...rest}
     >
       {children}

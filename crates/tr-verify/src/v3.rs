@@ -341,9 +341,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
 
     use std::time::SystemTime;
-    use tr_revocation::{
-        Advisory, Authority, CacheConfig, Reason, RevocationCache, Snapshot,
-    };
+    use tr_revocation::{Advisory, Authority, CacheConfig, Reason, RevocationCache, Snapshot};
 
     fn fixture_revocation_cache(
         revoked_hashes: Vec<String>,
@@ -403,10 +401,7 @@ mod tests {
         // Registry URL is unused on the fresh-cache path but required
         // by CacheConfig — point at localhost so a misconfigured test
         // can't accidentally hit a real registry.
-        let config = CacheConfig::defaults_for(
-            "http://127.0.0.1:1/".parse().unwrap(),
-            cache_dir,
-        );
+        let config = CacheConfig::defaults_for("http://127.0.0.1:1/".parse().unwrap(), cache_dir);
         (RevocationCache::new(config), tmp)
     }
 
@@ -415,8 +410,7 @@ mod tests {
         let bytes = fixture_signed_pack(10);
         let pack = read_v3_pack(&bytes).unwrap();
         // Add the pack's actual hash to the deny-list.
-        let (cache, _tmp) =
-            fixture_revocation_cache(vec![pack.manifest.pack_hash.clone()]);
+        let (cache, _tmp) = fixture_revocation_cache(vec![pack.manifest.pack_hash.clone()]);
 
         let verdict = verify_v3_pack_with_revocation(&pack, &cache).await;
         match verdict {

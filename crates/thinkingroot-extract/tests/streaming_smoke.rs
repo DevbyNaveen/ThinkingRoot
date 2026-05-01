@@ -106,10 +106,10 @@ async fn azure_real_sse_streams_multiple_chunks() {
         }
     };
 
-    let resource = std::env::var("AZURE_OPENAI_RESOURCE")
-        .unwrap_or_else(|_| "openai-gpt-mini".to_string());
-    let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT")
-        .unwrap_or_else(|_| "gpt-5.4".to_string());
+    let resource =
+        std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_else(|_| "openai-gpt-mini".to_string());
+    let deployment =
+        std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "gpt-5.4".to_string());
     let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
         .unwrap_or_else(|_| "2025-01-01-preview".to_string());
 

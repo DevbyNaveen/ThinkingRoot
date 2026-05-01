@@ -7,79 +7,75 @@ use thinkingroot_core::error::Error;
 use thinkingroot_core::{KnowledgeDiff, MergedBy, Result};
 use thinkingroot_graph::graph::GraphStore;
 
-/// Execute a merge of `branch_name` into main.
-///
-/// 1. Verify diff.merge_allowed (abort with MergeBlocked if not).
-/// 2. Snapshot main's graph.db to graph.db.pre-merge-{slug}-{ts} before any mutation.
-/// 3. Open main graph.
-/// 4. Insert new claims from diff into main.
-/// 5. Link each new claim to matching entities in main (by canonical name lookup).
-/// 6. Auto-resolved: supersede the losing claim in main.
-/// 7. Insert new entities into main.
-/// 8. Link new relations (by canonical name lookup).
-/// 9. Rebuild entity relations in main for consistency.
-/// 10. Mark branch as merged in registry.
-pub async fn execute_merge(
-    root_path: &Path,
-    branch_name: &str,
-    diff: &KnowledgeDiff,
-    merged_by: MergedBy,
-    propagate_deletions: bool,
+fn snapshot_target_db(
+    target_data_dir: &std::path::Path,
+    snapshot_prefix: &str,
+    snapshot_subject: &str,
 ) -> Result<()> {
-    if !diff.merge_allowed {
-        return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
-    }
-
-    // Acquire advisory merge lock — prevents concurrent merges from racing on graph.db.
-    let _merge_lock = MergeLock::acquire(root_path)?;
-
-    let main_data_dir = resolve_data_dir(root_path, None);
-
-    // Pre-merge snapshot — copy graph.db before any mutation.
-    // This enables `root merge --rollback <branch>` to restore to this point.
-    let db_path = main_data_dir.join("graph").join("graph.db");
+    let db_path = target_data_dir.join("graph").join("graph.db");
     if db_path.exists() {
         let ts = chrono::Utc::now().timestamp();
-        let slug = slugify(branch_name);
-        let backup_path = main_data_dir
+        let slug = slugify(snapshot_subject);
+        let backup_path = target_data_dir
             .join("graph")
-            .join(format!("graph.db.pre-merge-{slug}-{ts}"));
+            .join(format!("graph.db.{snapshot_prefix}-{slug}-{ts}"));
         std::fs::copy(&db_path, &backup_path)?;
-        tracing::debug!("pre-merge snapshot written to {}", backup_path.display());
+        tracing::debug!("snapshot written to {}", backup_path.display());
+    }
+    Ok(())
+}
+
+async fn apply_branch_diff(
+    root_path: &Path,
+    source_branch_name: &str,
+    target_branch: Option<&str>,
+    diff: &KnowledgeDiff,
+    propagate_deletions: bool,
+    snapshot_prefix: &str,
+    snapshot_subject: &str,
+) -> Result<()> {
+    if source_branch_name == target_branch.unwrap_or("main") {
+        return Err(Error::MergeBlocked(
+            "source and target branches must be different".to_string(),
+        ));
     }
 
-    let main_graph = GraphStore::init(&main_data_dir.join("graph"))?;
+    let _merge_lock = MergeLock::acquire(root_path)?;
+    let target_data_dir = resolve_data_dir(root_path, target_branch);
+    snapshot_target_db(&target_data_dir, snapshot_prefix, snapshot_subject)?;
+    let target_graph = GraphStore::init(&target_data_dir.join("graph"))?;
+    let source_data_dir = resolve_data_dir(root_path, Some(source_branch_name));
+    let source_graph = GraphStore::init(&source_data_dir.join("graph"))?;
 
-    // Copy source records for all new claims from the branch graph.
-    // Claims carry a source_id foreign key — without the corresponding source row
-    // in main, health checks will report them as orphaned claims.
-    let branch_data_dir = resolve_data_dir(root_path, Some(branch_name));
-    let branch_graph = GraphStore::init(&branch_data_dir.join("graph"))?;
-
+    // Copy source records for all new claims from the source graph.
     let mut copied_source_ids = std::collections::HashSet::new();
     for diff_claim in &diff.new_claims {
         let source_id = diff_claim.claim.source.to_string();
         if copied_source_ids.contains(&source_id) {
             continue;
         }
-        match branch_graph.get_source_by_id(&source_id) {
+        match source_graph.get_source_by_id(&source_id) {
             Ok(Some(source)) => {
-                // Only insert if not already present in main (idempotent).
-                if main_graph.find_sources_by_uri(&source.uri)?.is_empty() {
-                    tracing::debug!("merge: copying source '{}' from branch to main", source.uri);
-                    main_graph.insert_source(&source)?;
+                if target_graph.find_sources_by_uri(&source.uri)?.is_empty() {
+                    tracing::debug!(
+                        "merge: copying source '{}' from branch '{}' into '{}'",
+                        source.uri,
+                        source_branch_name,
+                        target_branch.unwrap_or("main")
+                    );
+                    target_graph.insert_source(&source)?;
                 }
                 copied_source_ids.insert(source_id);
             }
             Ok(None) => {
                 tracing::warn!(
-                    "merge: source '{}' not found in branch graph — claim will be orphaned",
+                    "merge: source '{}' not found in source graph — claim will be orphaned",
                     source_id
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    "merge: failed to look up source '{}' in branch graph: {}",
+                    "merge: failed to look up source '{}' in source graph: {}",
                     source_id,
                     e
                 );
@@ -90,42 +86,32 @@ pub async fn execute_merge(
     // Insert new claims
     for diff_claim in &diff.new_claims {
         let c = &diff_claim.claim;
-        main_graph.insert_claim(c)?;
+        target_graph.insert_claim(c)?;
+        target_graph.link_claim_to_source(&c.id.to_string(), &c.source.to_string())?;
 
-        // Populate the claim ↔ source junction. `insert_claim` only writes the
-        // `claims` relation; readers like `get_all_claims_with_sources` join
-        // through `claim_source_edges`, so without this edge the merged claim
-        // is invisible to post-merge queries (and to the serve cache).
-        main_graph.link_claim_to_source(&c.id.to_string(), &c.source.to_string())?;
-
-        // Link to entities by canonical name
         for entity_name in &diff_claim.entity_context {
-            if let Some(entity_id) = main_graph.find_entity_id_by_name(entity_name)? {
-                main_graph.link_claim_to_entity(&c.id.to_string(), &entity_id)?;
+            if let Some(entity_id) = target_graph.find_entity_id_by_name(entity_name)? {
+                target_graph.link_claim_to_entity(&c.id.to_string(), &entity_id)?;
             }
         }
     }
 
-    // Auto-resolved: supersede the loser in main
+    // Auto-resolved: supersede the loser in target
     for resolution in &diff.auto_resolved {
         if resolution.winner == resolution.branch_claim_id {
-            // Branch won — supersede main claim
-            main_graph.supersede_claim(&resolution.main_claim_id, &resolution.branch_claim_id)?;
+            target_graph.supersede_claim(&resolution.main_claim_id, &resolution.branch_claim_id)?;
         }
-        // If main won — branch claim is simply not inserted
     }
 
-    // Insert new entities
     for diff_entity in &diff.new_entities {
-        main_graph.insert_entity(&diff_entity.entity)?;
+        target_graph.insert_entity(&diff_entity.entity)?;
     }
 
-    // Link new relations — look up entity IDs by canonical name and call link_entities.
     for diff_relation in &diff.new_relations {
-        let from_id = main_graph.find_entity_id_by_name(&diff_relation.from_name)?;
-        let to_id = main_graph.find_entity_id_by_name(&diff_relation.to_name)?;
+        let from_id = target_graph.find_entity_id_by_name(&diff_relation.from_name)?;
+        let to_id = target_graph.find_entity_id_by_name(&diff_relation.to_name)?;
         if let (Some(from), Some(to)) = (from_id, to_id) {
-            main_graph.link_entities(
+            target_graph.link_entities(
                 &from,
                 &to,
                 &diff_relation.relation_type,
@@ -134,66 +120,52 @@ pub async fn execute_merge(
         }
     }
 
-    // Propagate deletions: sources present in main but absent in branch were
-    // deleted on the branch — remove them (and all derived claims) from main.
     if propagate_deletions {
         use std::collections::HashSet;
-        let branch_uris: HashSet<String> = branch_graph
+        let source_uris: HashSet<String> = source_graph
             .get_all_sources()?
             .into_iter()
             .map(|(_, uri, _)| uri)
             .collect();
-        let main_sources = main_graph.get_all_sources()?;
-        for (_id, uri, source_type) in main_sources {
-            // Only propagate deletions for file-based sources; skip Git/URL sources
-            // that the branch may simply never have compiled.
+        let target_sources = target_graph.get_all_sources()?;
+        for (_id, uri, source_type) in target_sources {
             let is_file_source = matches!(
                 source_type.as_str(),
                 "File" | "Document" | "Markdown" | "Code"
             );
-            if is_file_source && !branch_uris.contains(&uri) {
-                // Collect candidate IDs *before* removal.
+            if is_file_source && !source_uris.contains(&uri) {
                 let mut candidate_claims = Vec::new();
                 let mut candidate_entities = HashSet::new();
 
-                // Note: we use `unwrap_or_default()` here to treat "source not found" as no-op during deletion propagation.
-                for (sid, _, _) in main_graph.find_sources_by_uri(&uri).unwrap_or_default() {
+                for (sid, _, _) in target_graph.find_sources_by_uri(&uri).unwrap_or_default() {
                     candidate_claims.extend(
-                        main_graph
+                        target_graph
                             .get_claim_ids_for_source(&sid)
                             .unwrap_or_default(),
                     );
                     candidate_entities.extend(
-                        main_graph
+                        target_graph
                             .get_entity_ids_for_source(&sid)
                             .unwrap_or_default(),
                     );
                 }
 
-                let removed = main_graph.remove_source_by_uri(&uri)?;
+                let removed = target_graph.remove_source_by_uri(&uri)?;
                 if removed > 0 {
                     tracing::info!(
                         "merge(propagate-deletions): removed source '{}' (deleted on branch '{}')",
                         uri,
-                        branch_name
+                        source_branch_name
                     );
 
-                    // Identify which IDs should actually be purged from the vector index.
-                    // Claims are always removed when their source is removed.
-                    // Entities are only purged if they were actually orphaned and removed from the graph store.
                     let mut vec_ids: Vec<String> = Vec::new();
                     for cid in candidate_claims {
                         vec_ids.push(format!("claim:{cid}"));
                     }
                     for eid in candidate_entities {
-                        match main_graph.get_entity_by_id(&eid) {
-                            Ok(None) => {
-                                // Entity truly removed from graph — candidate for vector purge.
-                                vec_ids.push(format!("entity:{eid}"));
-                            }
-                            Ok(Some(_)) => {
-                                // Entity still exists (supported by other sources).
-                            }
+                        match target_graph.get_entity_by_id(&eid) {
+                            Ok(None) => vec_ids.push(format!("entity:{eid}")),
+                            Ok(Some(_)) => {}
                             Err(e) => {
                                 tracing::warn!(
                                     "merge: failed to check existence of candidate entity '{}' (non-fatal): {}",
@@ -204,15 +176,13 @@ pub async fn execute_merge(
                         }
                     }
 
-                    // Purge stale embeddings from the main vector index.
                     if !vec_ids.is_empty() {
-                        let main_data_dir = resolve_data_dir(root_path, None);
-                        if let Ok(mut main_vec) =
-                            thinkingroot_graph::vector::VectorStore::init(&main_data_dir).await
+                        if let Ok(mut target_vec) =
+                            thinkingroot_graph::vector::VectorStore::init(&target_data_dir).await
                         {
                             let id_refs: Vec<&str> = vec_ids.iter().map(|s| s.as_str()).collect();
-                            main_vec.remove_by_ids(&id_refs);
-                            if let Err(e) = main_vec.save() {
+                            target_vec.remove_by_ids(&id_refs);
+                            if let Err(e) = target_vec.save() {
                                 tracing::warn!("vector purge save failed (non-fatal): {e}");
                             }
                         }
@@ -222,29 +192,24 @@ pub async fn execute_merge(
         }
     }
 
-    // Rebuild entity relations for consistency
-    main_graph.rebuild_entity_relations()?;
+    target_graph.rebuild_entity_relations()?;
 
-    // Reconcile vector indexes: copy branch embeddings into main so that
-    // contributed claims written to the branch become searchable in main
-    // after the merge without requiring a full recompile.
-    let branch_data_dir = resolve_data_dir(root_path, Some(branch_name));
-    let main_data_dir = resolve_data_dir(root_path, None);
-    if branch_data_dir.join("vectors.bin").exists() {
+    if source_data_dir.join("vectors.bin").exists() {
         match (
-            thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await,
-            thinkingroot_graph::vector::VectorStore::init(&main_data_dir).await,
+            thinkingroot_graph::vector::VectorStore::init(&source_data_dir).await,
+            thinkingroot_graph::vector::VectorStore::init(&target_data_dir).await,
         ) {
-            (Ok(branch_vec), Ok(mut main_vec)) => {
-                let items = branch_vec.all_items();
+            (Ok(source_vec), Ok(mut target_vec)) => {
+                let items = source_vec.all_items();
                 if !items.is_empty() {
-                    match main_vec.upsert_raw_batch(items) {
+                    match target_vec.upsert_raw_batch(items) {
                         Ok(n) => {
-                            if let Err(e) = main_vec.save() {
+                            if let Err(e) = target_vec.save() {
                                 tracing::warn!("merge vector save failed (non-fatal): {e}");
                             } else {
                                 tracing::info!(
-                                    "merge: reconciled {n} branch vector embeddings into main"
+                                    "merge: reconciled {n} branch vector embeddings into '{}'",
+                                    target_branch.unwrap_or("main")
                                 );
                             }
                         }
@@ -260,13 +225,80 @@ pub async fn execute_merge(
         }
     }
 
+    Ok(())
+}
+
+/// Execute a merge of `branch_name` into main.
+pub async fn execute_merge(
+    root_path: &Path,
+    branch_name: &str,
+    diff: &KnowledgeDiff,
+    merged_by: MergedBy,
+    propagate_deletions: bool,
+) -> Result<()> {
+    execute_merge_into(
+        root_path,
+        branch_name,
+        None,
+        diff,
+        merged_by,
+        propagate_deletions,
+    )
+    .await
+}
+
+/// Execute a merge of `source_branch_name` into an explicit target branch.
+pub async fn execute_merge_into(
+    root_path: &Path,
+    source_branch_name: &str,
+    target_branch: Option<&str>,
+    diff: &KnowledgeDiff,
+    merged_by: MergedBy,
+    propagate_deletions: bool,
+) -> Result<()> {
+    if !diff.merge_allowed {
+        return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
+    }
+    apply_branch_diff(
+        root_path,
+        source_branch_name,
+        target_branch,
+        diff,
+        propagate_deletions,
+        "pre-merge",
+        source_branch_name,
+    )
+    .await?;
+
     // Mark branch as merged in registry
     let refs_dir = root_path.join(".thinkingroot-refs");
     std::fs::create_dir_all(&refs_dir)?;
     let mut registry = BranchRegistry::load_or_create(&refs_dir)?;
-    registry.mark_merged(branch_name, merged_by)?;
+    registry.mark_merged(source_branch_name, merged_by)?;
 
     Ok(())
+}
+
+/// Rebase `branch_name` with changes from `parent_branch_name`.
+pub async fn execute_rebase(
+    root_path: &Path,
+    branch_name: &str,
+    parent_branch_name: &str,
+    diff: &KnowledgeDiff,
+) -> Result<()> {
+    if !diff.merge_allowed {
+        return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
+    }
+    apply_branch_diff(
+        root_path,
+        parent_branch_name,
+        Some(branch_name),
+        diff,
+        false,
+        "pre-rebase",
+        branch_name,
+    )
+    .await
 }
 
 /// Roll back a merge by restoring the pre-merge snapshot of graph.db.

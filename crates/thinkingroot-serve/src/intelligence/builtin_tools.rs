@@ -589,11 +589,15 @@ fn validate_workspace_relative_path(path: &str) -> std::result::Result<(), Strin
         return Err("path is empty".into());
     }
     if path.starts_with('/') {
-        return Err(format!("path `{path}` must be workspace-relative, not absolute"));
+        return Err(format!(
+            "path `{path}` must be workspace-relative, not absolute"
+        ));
     }
     for component in path.split('/') {
         if component == ".." {
-            return Err(format!("path `{path}` contains `..` (traversal not allowed)"));
+            return Err(format!(
+                "path `{path}` contains `..` (traversal not allowed)"
+            ));
         }
     }
     Ok(())
@@ -652,11 +656,13 @@ impl ToolHandler for CreateBranchTool {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        match thinkingroot_branch::create_branch(
+        match thinkingroot_branch::create_branch_with_owner(
             &self.ctx.workspace_root,
             name,
             parent,
             description,
+            Some(self.ctx.agent_id.clone()),
+            thinkingroot_core::BranchPermissions::default(),
         )
         .await
         {
@@ -666,14 +672,12 @@ impl ToolHandler for CreateBranchTool {
                 // automatically. The session store is the same one
                 // engine.contribute_claims consults at write time.
                 let mut store = self.ctx.sessions.lock().await;
-                let session = store
-                    .entry(self.ctx.session_id.clone())
-                    .or_insert_with(|| {
-                        crate::intelligence::session::SessionContext::new(
-                            self.ctx.session_id.clone(),
-                            self.ctx.workspace.clone(),
-                        )
-                    });
+                let session = store.entry(self.ctx.session_id.clone()).or_insert_with(|| {
+                    crate::intelligence::session::SessionContext::new(
+                        self.ctx.session_id.clone(),
+                        self.ctx.workspace.clone(),
+                    )
+                });
                 session.active_branch = Some(branch.name.clone());
                 ToolHandlerResult::ok(format!(
                     "Created branch '{}' from '{}'. The session is now writing to this branch.",
@@ -766,12 +770,13 @@ impl ToolHandler for ContributeClaimTool {
 
         let engine = self.ctx.engine.read().await;
         match engine
-            .contribute_claims(
+            .contribute_claims_as(
                 &self.ctx.workspace,
                 &self.ctx.session_id,
                 active_branch.as_deref(),
                 vec![agent_claim],
                 &self.ctx.sessions,
+                crate::engine::BranchActor::Agent(self.ctx.agent_id.clone()),
             )
             .await
         {
@@ -789,7 +794,11 @@ impl ToolHandler for ContributeClaimTool {
                     "Contributed {} claim(s) to {}. claim_id={}{warnings_msg}",
                     result.accepted_count,
                     where_to,
-                    result.accepted_ids.first().map(|s| s.as_str()).unwrap_or("(none)")
+                    result
+                        .accepted_ids
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("(none)")
                 ))
             }
             Err(e) => ToolHandlerResult::error(format!("contribute_claim failed: {e}")),
@@ -852,9 +861,10 @@ impl ToolHandler for MergeBranchTool {
 
         let engine = self.ctx.engine.read().await;
         match engine
-            .merge_branch(
+            .merge_into_branch(
                 &self.ctx.workspace_root,
                 branch,
+                None,
                 force,
                 propagate_deletions,
                 merged_by,
@@ -915,7 +925,11 @@ impl ToolHandler for AbandonBranchTool {
 
         let engine = self.ctx.engine.read().await;
         match engine
-            .delete_branch(&self.ctx.workspace_root, branch)
+            .delete_branch_as(
+                &self.ctx.workspace_root,
+                branch,
+                crate::engine::BranchActor::Agent(self.ctx.agent_id.clone()),
+            )
             .await
         {
             Ok(()) => {
@@ -1206,7 +1220,9 @@ mod tests {
     #[tokio::test]
     async fn use_skill_errors_on_unknown_name() {
         let tool = UseSkillTool::new(fixture_ctx());
-        let res = tool.handle(serde_json::json!({"name": "nonexistent"})).await;
+        let res = tool
+            .handle(serde_json::json!({"name": "nonexistent"}))
+            .await;
         assert!(res.is_error);
         assert!(res.content.contains("no such skill"));
     }

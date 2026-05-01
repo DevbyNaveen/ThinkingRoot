@@ -253,12 +253,14 @@ pub fn verify_entry(entry: &TraceEntry, expected_prev_blake3: &str) -> Result<()
     }
     let pubkey = parse_pubkey(&entry.signed_by)?;
     let signature = parse_signature(&entry.signature)?;
-    pubkey.verify(pre_image.as_bytes(), &signature).map_err(|e| {
-        Error::Verification(format!(
-            "trace entry seq={} signature verify failed: {e}",
-            entry.seq
-        ))
-    })?;
+    pubkey
+        .verify(pre_image.as_bytes(), &signature)
+        .map_err(|e| {
+            Error::Verification(format!(
+                "trace entry seq={} signature verify failed: {e}",
+                entry.seq
+            ))
+        })?;
     Ok(())
 }
 
@@ -315,10 +317,9 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
             kind::AGENT_TOOL_REJECTED,
             json!({"id": id, "name": name, "reason": reason}),
         ),
-        AgentEvent::ToolCallExecuting { id, name } => (
-            kind::AGENT_TOOL_EXECUTING,
-            json!({"id": id, "name": name}),
-        ),
+        AgentEvent::ToolCallExecuting { id, name } => {
+            (kind::AGENT_TOOL_EXECUTING, json!({"id": id, "name": name}))
+        }
         AgentEvent::ToolCallFinished {
             id,
             name,
@@ -340,9 +341,7 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
             kind::AGENT_RUN_DONE,
             json!({"final_text": final_text, "iterations": iterations}),
         ),
-        AgentEvent::Error { message } => {
-            (kind::AGENT_RUN_ERROR, json!({"message": message}))
-        }
+        AgentEvent::Error { message } => (kind::AGENT_RUN_ERROR, json!({"message": message})),
     }
 }
 
@@ -370,8 +369,7 @@ impl TraceWriterCore {
     fn make_entry(&mut self, kind: &str, payload: serde_json::Value) -> TraceEntry {
         let seq = self.seq;
         let timestamp = Utc::now();
-        let pre_image =
-            canonical_pre_image(seq, &timestamp, kind, &payload, &self.prev_blake3);
+        let pre_image = canonical_pre_image(seq, &timestamp, kind, &payload, &self.prev_blake3);
         let blake3 = blake3_link(&self.prev_blake3, &pre_image);
         let signature = self.signing_key.sign(pre_image.as_bytes());
         let entry = TraceEntry {
@@ -463,10 +461,7 @@ impl FileTraceLog {
         Self::open_with_signing_key(path, generate_signing_key()).await
     }
 
-    pub async fn open_with_signing_key(
-        path: PathBuf,
-        signing_key: SigningKey,
-    ) -> Result<Self> {
+    pub async fn open_with_signing_key(path: PathBuf, signing_key: SigningKey) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await

@@ -310,7 +310,8 @@ impl Extractor {
         for doc in documents {
             for chunk in &doc.chunks {
                 // ── Tier Router: structural or LLM? ──
-                let is_structural = crate::router::classify(chunk) == crate::router::Tier::Structural;
+                let is_structural =
+                    crate::router::classify(chunk) == crate::router::Tier::Structural;
                 if is_structural {
                     let result = crate::structural::extract_structural(chunk, &doc.uri);
                     let produced = !result.claims.is_empty()
@@ -723,10 +724,8 @@ impl Extractor {
             // whose parser hasn't been upgraded yet — leave source_span
             // unset so downstream consumers fall back to whole-file scope.
             if ext_claim.byte_end > ext_claim.byte_start {
-                claim = claim.with_span(SourceSpan::bytes(
-                    ext_claim.byte_start,
-                    ext_claim.byte_end,
-                ));
+                claim =
+                    claim.with_span(SourceSpan::bytes(ext_claim.byte_start, ext_claim.byte_end));
             }
             // Wire event_date: convert ISO string → DateTime<Utc>.
             if let Some(ref date_str) = ext_claim.event_date
@@ -821,10 +820,7 @@ fn backfill_chunk_origin(
         if claim.source_path.is_empty() {
             claim.source_path = source_uri.to_string();
         }
-        if claim.byte_start == 0
-            && claim.byte_end == 0
-            && chunk_byte_end > chunk_byte_start
-        {
+        if claim.byte_start == 0 && claim.byte_end == 0 && chunk_byte_end > chunk_byte_start {
             claim.byte_start = chunk_byte_start;
             claim.byte_end = chunk_byte_end;
         }

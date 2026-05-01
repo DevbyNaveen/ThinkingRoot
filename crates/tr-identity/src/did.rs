@@ -275,9 +275,6 @@ mod tests {
     fn web_url_includes_path_segments() {
         let d = Did::parse("did:web:alice.example:keys:author").unwrap();
         let u = did_web_url(&d).unwrap();
-        assert_eq!(
-            u.as_str(),
-            "https://alice.example/keys/author/did.json"
-        );
+        assert_eq!(u.as_str(), "https://alice.example/keys/author/did.json");
     }
 }

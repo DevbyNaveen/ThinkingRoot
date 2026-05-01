@@ -54,7 +54,7 @@ use console::style;
 use serde::Serialize;
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_reflect::{
-    list_open_gaps, GapReport, ReflectConfig, ReflectEngine, ReflectResult,
+    GapReport, ReflectConfig, ReflectEngine, ReflectResult, list_open_gaps,
 };
 
 #[derive(Debug, Serialize)]
@@ -154,11 +154,7 @@ pub fn run(workspace_path: &Path, json_out: Option<&PathBuf>) -> anyhow::Result<
         );
     }
     if open.len() > to_show {
-        println!(
-            "  {}  …{} more",
-            style("…").dim(),
-            open.len() - to_show
-        );
+        println!("  {}  …{} more", style("…").dim(), open.len() - to_show);
     }
     println!();
     Ok(())

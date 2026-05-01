@@ -8,9 +8,9 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use serde::de::DeserializeOwned;
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()

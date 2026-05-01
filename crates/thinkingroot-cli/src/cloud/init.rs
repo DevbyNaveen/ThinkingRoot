@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use console::style;
 
 use super::config;
@@ -73,11 +73,7 @@ pub async fn run(
         style("✓").green(),
         style(manifest_path.display()).bold()
     );
-    println!(
-        "  pack: {}/{}",
-        style(&owner).bold(),
-        style(&slug).bold()
-    );
+    println!("  pack: {}/{}", style(&owner).bold(), style(&slug).bold());
     println!("  next: {}", style("root publish").cyan());
     Ok(())
 }

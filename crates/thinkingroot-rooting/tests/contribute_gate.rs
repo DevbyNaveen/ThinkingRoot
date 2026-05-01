@@ -17,8 +17,7 @@
 //!             so the audit trail survives removal.
 
 use thinkingroot_core::types::{
-    AdmissionTier, Claim, ClaimType, ContentHash, ContradictionId, Source, SourceType,
-    WorkspaceId,
+    AdmissionTier, Claim, ClaimType, ContentHash, ContradictionId, Source, SourceType, WorkspaceId,
 };
 use thinkingroot_rooting::{
     CandidateClaim, FileSystemSourceStore, Rooter, RootingConfig, SourceByteStore,
@@ -42,12 +41,9 @@ fn setup_graph_with_contradiction() -> (
     // provenance always passes; contradiction is the only fatal failure.
     let source_body = "PaymentService charges cards via Stripe for card processing";
     let hash = ContentHash::from_bytes(source_body.as_bytes());
-    let source =
-        Source::new("file:///payment.rs".into(), SourceType::File).with_hash(hash.clone());
+    let source = Source::new("file:///payment.rs".into(), SourceType::File).with_hash(hash.clone());
     graph.insert_source(&source).unwrap();
-    store
-        .put(source.id, &hash, source_body.as_bytes())
-        .unwrap();
+    store.put(source.id, &hash, source_body.as_bytes()).unwrap();
 
     // Incumbent: high-confidence established fact.
     let incumbent = Claim::new(
@@ -85,10 +81,7 @@ fn setup_graph_with_contradiction() -> (
 }
 
 fn count_claims(graph: &thinkingroot_graph::graph::GraphStore) -> usize {
-    graph
-        .get_all_claim_ids()
-        .expect("count claims")
-        .len()
+    graph.get_all_claim_ids().expect("count claims").len()
 }
 
 fn claim_exists(graph: &thinkingroot_graph::graph::GraphStore, claim_id: &str) -> bool {
@@ -210,12 +203,9 @@ fn enforce_mode_keeps_rooted_claims() {
 
     let source_body = "AuthService validates JWT tokens and rotates keys hourly";
     let hash = ContentHash::from_bytes(source_body.as_bytes());
-    let source =
-        Source::new("file:///auth.rs".into(), SourceType::File).with_hash(hash.clone());
+    let source = Source::new("file:///auth.rs".into(), SourceType::File).with_hash(hash.clone());
     graph.insert_source(&source).unwrap();
-    store
-        .put(source.id, &hash, source_body.as_bytes())
-        .unwrap();
+    store.put(source.id, &hash, source_body.as_bytes()).unwrap();
 
     let candidate = Claim::new(
         "AuthService validates JWT tokens",

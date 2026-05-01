@@ -910,7 +910,10 @@ impl GraphStore {
             .find_source_uri_by_id(&claim.source.to_string())
             .unwrap_or_default();
         params.insert("source_path".into(), DataValue::Str(source_path.into()));
-        params.insert("byte_start".into(), DataValue::Num(Num::Int(byte_start_val)));
+        params.insert(
+            "byte_start".into(),
+            DataValue::Num(Num::Int(byte_start_val)),
+        );
         params.insert("byte_end".into(), DataValue::Num(Num::Int(byte_end_val)));
 
         self.query(
@@ -1053,10 +1056,7 @@ impl GraphStore {
                         None => (0, 0),
                     };
                     let source_id_str = c.source.to_string();
-                    let source_path = uri_by_id
-                        .get(&source_id_str)
-                        .cloned()
-                        .unwrap_or_default();
+                    let source_path = uri_by_id.get(&source_id_str).cloned().unwrap_or_default();
                     DataValue::List(vec![
                         DataValue::Str(c.id.to_string().into()),
                         DataValue::Str(c.statement.clone().into()),
@@ -2859,9 +2859,7 @@ impl GraphStore {
     /// Return a `claim_id → [entity_name]` map. Used alongside
     /// [`Self::get_v3_claim_export`] by the v3 pack writer to populate
     /// the `ents` field on each emitted `ClaimRecord`.
-    pub fn get_claim_entity_names(
-        &self,
-    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    pub fn get_claim_entity_names(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let q = r#"?[claim_id, entity_name] :=
             *claim_entity_edges{claim_id, entity_id},
             *entities{id: entity_id, canonical_name: entity_name}
@@ -5281,20 +5279,20 @@ mod tests {
         // string instead of resolving from the sources table.
         use thinkingroot_core::types::{Claim, ClaimType, Source, SourceType, WorkspaceId};
         let store = mem_store();
-        let src = Source::new(
-            "file:///tmp/foo.rs".to_string(),
-            SourceType::File,
-        );
+        let src = Source::new("file:///tmp/foo.rs".to_string(), SourceType::File);
         let src_id = src.id;
         store.insert_source(&src).unwrap();
 
-        let claim = Claim::new("foo claims bar", ClaimType::Fact, src_id, WorkspaceId::new());
+        let claim = Claim::new(
+            "foo claims bar",
+            ClaimType::Fact,
+            src_id,
+            WorkspaceId::new(),
+        );
         let claim_id = claim.id;
         store.insert_claim(&claim).unwrap();
 
-        let written = store
-            .get_claim_source_path(&claim_id.to_string())
-            .unwrap();
+        let written = store.get_claim_source_path(&claim_id.to_string()).unwrap();
         assert_eq!(
             written, "file:///tmp/foo.rs",
             "single-row insert must populate source_path from sources, got {written:?}"
@@ -5366,8 +5364,17 @@ mod tests {
 
         let ids = vec![a.id.to_string(), b.id.to_string(), "ghost".to_string()];
         let map = store.fetch_source_uris(&ids).unwrap();
-        assert_eq!(map.get(&a.id.to_string()).map(String::as_str), Some("file:///x/a.rs"));
-        assert_eq!(map.get(&b.id.to_string()).map(String::as_str), Some("file:///x/b.rs"));
-        assert!(!map.contains_key("ghost"), "unknown ids must not appear in result");
+        assert_eq!(
+            map.get(&a.id.to_string()).map(String::as_str),
+            Some("file:///x/a.rs")
+        );
+        assert_eq!(
+            map.get(&b.id.to_string()).map(String::as_str),
+            Some("file:///x/b.rs")
+        );
+        assert!(
+            !map.contains_key("ghost"),
+            "unknown ids must not appear in result"
+        );
     }
 }

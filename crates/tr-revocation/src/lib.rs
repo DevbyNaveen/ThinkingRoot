@@ -25,9 +25,7 @@ pub mod error;
 pub mod keys;
 pub mod snapshot;
 
-pub use cache::{
-    CacheConfig, FreshnessState, RefreshOutcome, RevocationCache, default_cache_dir,
-};
+pub use cache::{CacheConfig, FreshnessState, RefreshOutcome, RevocationCache, default_cache_dir};
 pub use error::{Error, Result};
 pub use keys::{PinnedKey, pinned_keys};
 pub use snapshot::{Advisory, Authority, Reason, Snapshot};

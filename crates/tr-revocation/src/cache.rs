@@ -252,9 +252,7 @@ impl RevocationCache {
             Ok(_) => {
                 let (snap, new_state) = self.load()?;
                 let snap = snap.ok_or_else(|| {
-                    Error::Network(
-                        "registry refresh succeeded but cache load returned None".into(),
-                    )
+                    Error::Network("registry refresh succeeded but cache load returned None".into())
                 })?;
                 Ok((snap, new_state))
             }
@@ -310,8 +308,8 @@ impl RevocationCache {
             .find(|k| k.key_id == snapshot.signing_key_id)
             .ok_or_else(|| Error::KeyUnknown(snapshot.signing_key_id.clone()))?;
 
-        let verifying = VerifyingKey::from_bytes(&key.ed25519_public)
-            .map_err(|_| Error::BadSignature)?;
+        let verifying =
+            VerifyingKey::from_bytes(&key.ed25519_public).map_err(|_| Error::BadSignature)?;
 
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(&snapshot.signature)

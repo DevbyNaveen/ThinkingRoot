@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thinkingroot_core::Result;
 use thinkingroot_core::error::Error;
-use thinkingroot_core::{BranchRef, BranchStatus, MergedBy};
+use thinkingroot_core::{BranchPermissions, BranchRef, BranchStatus, MergedBy};
 
 const REGISTRY_FILE: &str = "branches.toml";
 const HEAD_FILE: &str = "HEAD";
@@ -55,6 +55,24 @@ impl BranchRegistry {
         parent: &str,
         description: Option<String>,
     ) -> Result<BranchRef> {
+        self.create_branch_with_owner(
+            name,
+            parent,
+            description,
+            None,
+            BranchPermissions::default(),
+        )
+    }
+
+    /// Create a new branch entry with optional owner + explicit permissions.
+    pub fn create_branch_with_owner(
+        &mut self,
+        name: &str,
+        parent: &str,
+        description: Option<String>,
+        owner: Option<String>,
+        permissions: BranchPermissions,
+    ) -> Result<BranchRef> {
         if self
             .data
             .branches
@@ -70,6 +88,8 @@ impl BranchRegistry {
             created_at: Utc::now(),
             status: BranchStatus::Active,
             description,
+            owner,
+            permissions,
         };
         self.data.branches.push(branch.clone());
         self.save()?;

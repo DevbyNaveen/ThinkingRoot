@@ -299,11 +299,15 @@ impl V3PackBuilder {
         E: std::fmt::Display,
     {
         let prepared = self.prepare_canonical()?;
-        let bundle = sign_fn(&prepared.canonical_bytes, &prepared.pack_hash, pack_filename)
-            .map_err(|e| Error::Invalid {
-                what: "signature.sig",
-                detail: format!("external signer: {e}"),
-            })?;
+        let bundle = sign_fn(
+            &prepared.canonical_bytes,
+            &prepared.pack_hash,
+            pack_filename,
+        )
+        .map_err(|e| Error::Invalid {
+            what: "signature.sig",
+            detail: format!("external signer: {e}"),
+        })?;
         let bundle_bytes = serde_json::to_vec(&bundle)?;
         emit_outer_tar(
             &prepared.manifest_toml,
@@ -327,10 +331,12 @@ impl V3PackBuilder {
         }
         let mut compressed = Vec::with_capacity(tar_bytes.len() / 2);
         {
-            let mut encoder = ZstdEncoder::new(&mut compressed, self.inner_zstd_level)
-                .map_err(|e| Error::Invalid {
-                    what: "source.tar.zst",
-                    detail: format!("zstd encoder: {e}"),
+            let mut encoder =
+                ZstdEncoder::new(&mut compressed, self.inner_zstd_level).map_err(|e| {
+                    Error::Invalid {
+                        what: "source.tar.zst",
+                        detail: format!("zstd encoder: {e}"),
+                    }
                 })?;
             encoder.write_all(&tar_bytes)?;
             encoder.finish().map_err(|e| Error::Invalid {

@@ -172,7 +172,10 @@ mod tests {
     fn invalid_key_length_is_loud() {
         assert!(matches!(
             PublicKeyRef::from_slice(&[0u8; 31]),
-            Err(Error::InvalidKeyLength { expected: 32, actual: 31 })
+            Err(Error::InvalidKeyLength {
+                expected: 32,
+                actual: 31
+            })
         ));
     }
 

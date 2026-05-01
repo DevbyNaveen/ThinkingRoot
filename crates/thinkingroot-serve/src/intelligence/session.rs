@@ -24,6 +24,8 @@ const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct SessionContext {
     pub id: String,
     pub workspace: String,
+    /// Optional user identity associated with this session.
+    pub owner: Option<String>,
     /// Canonical entity names explored this session (ordered by recency).
     pub active_entities: Vec<String>,
     /// Claim IDs already delivered — used to filter duplicate content.
@@ -47,6 +49,7 @@ impl SessionContext {
         Self {
             id: id.into(),
             workspace: workspace.into(),
+            owner: None,
             active_entities: Vec::new(),
             delivered_claim_ids: HashSet::new(),
             focus_entity: None,
@@ -70,6 +73,12 @@ impl SessionContext {
     pub fn set_branch(&mut self, branch: String) {
         self.last_active = Instant::now();
         self.active_branch = Some(branch);
+    }
+
+    /// Associate a human owner with this session.
+    pub fn set_owner(&mut self, owner: String) {
+        self.last_active = Instant::now();
+        self.owner = Some(owner);
     }
 
     /// Clear the active branch (revert contribute back to main).

@@ -206,22 +206,25 @@ export async function gitBranches(path: string): Promise<BranchInfo[]> {
 // ─── `.tr` install preview ──────────────────────────────────────────
 
 export type Verdict =
-  | { kind: "verified"; identity: string | null; rekor_log_index: number | null; signed_at: string }
+  | { kind: "verified"; tier: "T0" | "T1" | "T2" | "T3" | "T4"; author_id: string | null; sigstore_log_index: number | null; revocation_freshness_secs: number }
   | { kind: "unsigned" }
-  | { kind: "tampered"; what: "pack_hash_mismatch"; declared: string; recomputed: string }
-  | { kind: "tampered"; what: "signature_failed"; reason: string }
-  | { kind: "revoked"; advisory: { reason: string; revoked_at: number; pack: string; version: string; details_url: string; authority: string } };
+  | { kind: "tampered"; what: "manifest_hash_mismatch" | "archive_corrupt" | "signature_payload_mismatch"; expected?: string; actual?: string }
+  | { kind: "revoked"; advisory: { reason?: string; published_at?: string } }
+  | { kind: "key_unknown"; key_id: string }
+  | { kind: "stale_cache"; age_days: number }
+  | { kind: "unsupported"; tier: string; reason: string };
 
 export interface InstallPreview {
   path: string;
   name: string;
   version: string;
-  license: string | null;
+  license: string;
+  trust_tier: string;
   markdown: string;
   manifest_table: string;
   source_count: number;
-  claim_count: number;
-  source_archive_bytes: number;
+  entry_count: number;
+  payload_bytes: number;
   verdict: Verdict;
 }
 
@@ -352,42 +355,12 @@ export async function workspaceCompile(args: WorkspaceCompileArgs): Promise<stri
   });
 }
 
-/**
- * Stop the in-progress compile, if any.  Resolves to `true` when a
- * compile was active and its cancellation token was tripped; `false`
- * otherwise.  The actual abort + `CompileProgress::Cancelled` event
- * arrive through the existing `workspace_compile_progress` channel
- * after the pipeline reaches its next phase boundary (typically <1s).
- */
-export async function workspaceCompileStop(): Promise<boolean> {
-  return invoke<boolean>("workspace_compile_stop");
-}
-
-export interface CompileStatus {
-  active: boolean;
-  workspace: string | null;
-}
-
-/**
- * Poll for the current compile status.  Used by the Compile modal so
- * the Stop button can stay disabled when nothing is running, without
- * depending on event ordering.
- */
-export async function workspaceCompileStatus(): Promise<CompileStatus> {
-  return invoke<CompileStatus>("workspace_compile_status");
-}
-
 export type CompileProgress =
   | { phase: "started"; workspace: string }
   | { phase: "parse_complete"; files: number }
   | { phase: "extraction_start"; total_chunks: number; total_batches: number }
   | { phase: "extraction_progress"; done: number; total: number }
   | { phase: "extraction_complete"; claims: number; entities: number }
-  | {
-      phase: "extraction_partial";
-      failed_batches: number;
-      failed_chunk_ranges: [number, number][];
-    }
   | { phase: "grounding_progress"; done: number; total: number }
   | { phase: "linking_start"; total_entities: number }
   | { phase: "linking_progress"; done: number; total: number }
@@ -402,10 +375,7 @@ export type CompileProgress =
       artifacts: number;
       health_score: number;
       cache_dirty: boolean;
-      failed_batches: number;
-      failed_chunk_ranges: [number, number][];
     }
-  | { phase: "cancelled" }
   | { phase: "failed"; error: string };
 
 export function onWorkspaceCompileProgress(

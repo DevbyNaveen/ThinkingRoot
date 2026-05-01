@@ -134,10 +134,7 @@ impl InFlightCheckpoint {
     /// malformed lines abort the load with `Err` so the caller can
     /// decide between "redo everything" (typical) or "bail loudly".
     pub fn load_completed_batches(data_dir: &Path) -> Result<CompletedBatches> {
-        let path = data_dir
-            .join("cache")
-            .join("extraction")
-            .join(FILE_NAME);
+        let path = data_dir.join("cache").join("extraction").join(FILE_NAME);
         if !path.exists() {
             return Ok(CompletedBatches::default());
         }
@@ -173,10 +170,7 @@ impl InFlightCheckpoint {
     /// is the source of truth and the in-flight log is dead weight.
     /// Idempotent: missing file is success.
     pub fn clear(data_dir: &Path) -> Result<()> {
-        let path = data_dir
-            .join("cache")
-            .join("extraction")
-            .join(FILE_NAME);
+        let path = data_dir.join("cache").join("extraction").join(FILE_NAME);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -223,7 +217,10 @@ mod tests {
     fn open_in_clean_dir_returns_empty_completed_set() {
         let tmp = data_dir();
         let c = InFlightCheckpoint::load_completed_batches(tmp.path()).unwrap();
-        assert!(c.is_empty(), "fresh data_dir must have no completed batches");
+        assert!(
+            c.is_empty(),
+            "fresh data_dir must have no completed batches"
+        );
         assert_eq!(c.chunks_already_done, 0);
     }
 

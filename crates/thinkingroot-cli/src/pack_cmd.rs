@@ -33,15 +33,13 @@
 //! subject digest, and revocation deny-list before extracting any
 //! source files.
 
+use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use thinkingroot_core::types::ContentHash;
-use tr_format::{
-    read_v3_pack, ClaimRecord, ManifestV3, V3Pack, V3PackBuilder, Version,
-};
+use tr_format::{ClaimRecord, ManifestV3, V3Pack, V3PackBuilder, Version, read_v3_pack};
 use tr_revocation::{CacheConfig, RevocationCache};
 use tr_verify::{V3TamperedKind, V3Verdict, verify_v3_pack};
 
@@ -365,10 +363,7 @@ fn load_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey> {
 /// closure uses `tokio::task::block_in_place` + `Handle::current()
 /// .block_on` to drive the async [`tr_sigstore::live::sign_canonical_bytes_keyless`]
 /// without restructuring the surrounding sync code.
-fn run_keyless_signing(
-    builder: tr_format::V3PackBuilder,
-    pack_filename: &str,
-) -> Result<Vec<u8>> {
+fn run_keyless_signing(builder: tr_format::V3PackBuilder, pack_filename: &str) -> Result<Vec<u8>> {
     use std::time::SystemTime;
     use tr_sigstore::live::{
         IdentityToken, SignKeylessOptions, browser_oidc_flow, sign_canonical_bytes_keyless,
@@ -453,8 +448,7 @@ pub fn run_verify(
     revocation_check: bool,
     registry_override: Option<String>,
 ) -> Result<i32> {
-    let bytes = fs::read(pack_path)
-        .with_context(|| format!("read {}", pack_path.display()))?;
+    let bytes = fs::read(pack_path).with_context(|| format!("read {}", pack_path.display()))?;
     let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("parse {}: {e}", pack_path.display()))?;
 
     // Two paths: with revocation (async, consults the cached deny-
@@ -464,16 +458,15 @@ pub fn run_verify(
     // verifying packs the deny-list can't speak about (private packs
     // signed with author keys outside any registry).
     let verdict = if revocation_check {
-        let cache = build_revocation_cache(registry_override)
-            .context("construct revocation cache")?;
+        let cache =
+            build_revocation_cache(registry_override).context("construct revocation cache")?;
         // `run_verify` is sync but called from async_main's tokio
         // runtime — `block_in_place` + `Handle::current().block_on`
         // drives the async revocation check synchronously. Same idiom
         // we use for `--sign-keyless` in run_keyless_signing.
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                tr_verify::verify_v3_pack_with_revocation(&pack, &cache),
-            )
+            tokio::runtime::Handle::current()
+                .block_on(tr_verify::verify_v3_pack_with_revocation(&pack, &cache))
         })
     } else {
         verify_v3_pack(&pack)
@@ -622,8 +615,8 @@ fn build_manifest_v3(
     let from_file: Option<PackTomlInner> = if pack_toml_path.exists() {
         let raw = fs::read_to_string(&pack_toml_path)
             .with_context(|| format!("read {}", pack_toml_path.display()))?;
-        let parsed: PackTomlFile = toml::from_str(&raw)
-            .with_context(|| format!("parse {}", pack_toml_path.display()))?;
+        let parsed: PackTomlFile =
+            toml::from_str(&raw).with_context(|| format!("parse {}", pack_toml_path.display()))?;
         Some(parsed.pack)
     } else {
         None
@@ -654,7 +647,8 @@ fn build_manifest_v3(
         .with_context(|| format!("parse version `{}` (must be semver)", version_str))?;
 
     let mut manifest = ManifestV3::new(name, version);
-    if let Some(license) = license_override.or_else(|| from_file.as_ref().map(|p| p.license.clone()))
+    if let Some(license) =
+        license_override.or_else(|| from_file.as_ref().map(|p| p.license.clone()))
     {
         manifest.license = Some(license);
     }
@@ -686,23 +680,17 @@ fn build_manifest_v3(
 /// readable preview to stdout — no verification, no extraction. Used
 /// by `root install --dry-run` and the desktop install sheet path
 /// (which calls into `tr-render` directly via Tauri).
-pub async fn run_install_dry_run(
-    reference: &str,
-    registry_override: Option<String>,
-) -> Result<()> {
+pub async fn run_install_dry_run(reference: &str, registry_override: Option<String>) -> Result<()> {
     let install_ref = parse_install_ref(reference)?;
     let resolver = build_resolver(install_ref, registry_override)?;
     let bytes = resolver.resolve().await?;
     let pack = read_v3_pack(&bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
-    let preview =
-        tr_render::render_preview(&pack).map_err(|e| anyhow!("render preview: {e}"))?;
+    let preview = tr_render::render_preview(&pack).map_err(|e| anyhow!("render preview: {e}"))?;
 
     println!("{}", preview.manifest_table);
     println!();
     println!("{}", preview.markdown);
-    println!(
-        "(dry-run — nothing extracted; pass without `--dry-run` to install)"
-    );
+    println!("(dry-run — nothing extracted; pass without `--dry-run` to install)");
     Ok(())
 }
 
@@ -868,8 +856,8 @@ fn load_default_registry() -> Result<String> {
             struct RegistryConfig {
                 default: String,
             }
-            let parsed: RegistryConfig = toml::from_str(&raw)
-                .with_context(|| format!("parse {}", cfg_path.display()))?;
+            let parsed: RegistryConfig =
+                toml::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
             if !parsed.default.trim().is_empty() {
                 return Ok(parsed.default.trim().to_string());
             }
@@ -948,8 +936,7 @@ async fn install_from_bytes(
     user_allow_unsigned: bool,
 ) -> Result<()> {
     let pack = read_v3_pack(bytes).map_err(|e| anyhow!("read .tr: {e}"))?;
-    let verdict =
-        tr_verify::verify_v3_pack_with_revocation(&pack, cache).await;
+    let verdict = tr_verify::verify_v3_pack_with_revocation(&pack, cache).await;
     let allow_unsigned = user_allow_unsigned || !is_remote;
     enforce_v3_verdict(&pack, &verdict, allow_unsigned)?;
     extract_v3_pack_to_target(&pack, target)
@@ -1018,7 +1005,10 @@ fn format_v3_tampered(manifest: &ManifestV3, kind: &V3TamperedKind) -> String {
             format!("signature failed: {reason}")
         }
     };
-    format!("✗ pack `{}` failed integrity check: {detail}", manifest.name)
+    format!(
+        "✗ pack `{}` failed integrity check: {detail}",
+        manifest.name
+    )
 }
 
 fn format_revoked(d: &tr_verify::RevokedDetails) -> String {
@@ -1065,22 +1055,23 @@ fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<(
             .into_owned();
         let dest = sources_dir.join(&path);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         let mut buf = Vec::with_capacity(entry.size() as usize);
         std::io::Read::read_to_end(&mut entry, &mut buf)
             .map_err(|e| anyhow!("read entry {}: {e}", path.display()))?;
-        fs::write(&dest, &buf)
-            .with_context(|| format!("write {}", dest.display()))?;
+        fs::write(&dest, &buf).with_context(|| format!("write {}", dest.display()))?;
         count += 1;
     }
 
     // Drop the manifest + claims alongside the sources for downstream
     // tooling. Manifest is re-emitted as canonical TOML so the on-disk
     // copy is byte-identical to what the pack carried.
-    fs::write(engine_dir.join("manifest.toml"), manifest.to_canonical_toml())
-        .with_context(|| format!("write {}", engine_dir.join("manifest.toml").display()))?;
+    fs::write(
+        engine_dir.join("manifest.toml"),
+        manifest.to_canonical_toml(),
+    )
+    .with_context(|| format!("write {}", engine_dir.join("manifest.toml").display()))?;
     fs::write(engine_dir.join("claims.jsonl"), &pack.claims_jsonl)
         .with_context(|| format!("write {}", engine_dir.join("claims.jsonl").display()))?;
 
@@ -1235,18 +1226,14 @@ description = "v3 lifecycle round-trip test."
 
         // 5. Claims body sanity. JSONL with stable field order, byte
         //    ranges populated.
-        let claims_text =
-            std::str::from_utf8(&pack.claims_jsonl).expect("claims.jsonl is UTF-8");
+        let claims_text = std::str::from_utf8(&pack.claims_jsonl).expect("claims.jsonl is UTF-8");
         let lines: Vec<&str> = claims_text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "exactly one claim emitted");
         let line: serde_json::Value =
             serde_json::from_str(lines[0]).expect("claims.jsonl line parses");
         assert_eq!(line["start"], 3);
         assert_eq!(line["end"], 35);
-        assert_eq!(
-            line["stmt"],
-            "add takes two i32 and returns their sum"
-        );
+        assert_eq!(line["stmt"], "add takes two i32 and returns their sum");
         assert!(
             line["file"].as_str().unwrap().ends_with("src/lib.rs"),
             "file should resolve to a workspace-relative path"
@@ -1291,7 +1278,10 @@ description = "v3 lifecycle round-trip test."
         // Read back: the pack now carries a signature.sig.
         let bytes = fs::read(&out_tr).unwrap();
         let pack = read_v3_pack(&bytes).expect("signed pack must parse");
-        assert!(pack.signature.is_some(), "signed pack must carry signature.sig");
+        assert!(
+            pack.signature.is_some(),
+            "signed pack must carry signature.sig"
+        );
 
         // Library-level verify: should be Verified (self-signed).
         let verdict = verify_v3_pack(&pack);
@@ -1449,7 +1439,6 @@ description = "v3 lifecycle round-trip test."
         let err = refuse_insecure_http("http://example.com/x").unwrap_err();
         assert!(format!("{err}").contains("https"), "got: {err}");
     }
-
 
     // -------------------------------------------------------------------------
     // V3 install policy + extraction integration tests.
@@ -1621,7 +1610,7 @@ description = "v3 lifecycle round-trip test."
             Some(target.clone()),
             None,
             &cache,
-            true, // is_remote
+            true,  // is_remote
             false, // user_allow_unsigned = false
         )
         .await
@@ -1669,11 +1658,7 @@ description = "v3 lifecycle round-trip test."
         // building the revocation snapshot since `fresh_revocation_cache`
         // re-adds the prefix.
         let bare_hash = pack.manifest.pack_hash.strip_prefix("blake3:").unwrap();
-        let cache = fresh_revocation_cache(
-            tmp.path().join("rev"),
-            &rev_key,
-            &[bare_hash],
-        );
+        let cache = fresh_revocation_cache(tmp.path().join("rev"), &rev_key, &[bare_hash]);
 
         let target = tmp.path().join("install");
         let err = install_with_revocation_cache(

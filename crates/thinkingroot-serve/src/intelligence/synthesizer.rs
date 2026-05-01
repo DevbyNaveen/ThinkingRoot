@@ -219,10 +219,9 @@ Hard rules:
 pub fn build_system_prompt(chat: ResolvedChat) -> &'static str {
     match chat.persona {
         ChatPersona::Memory => MEMORY_SYSTEM_PROMPT,
-        ChatPersona::Auto
-        | ChatPersona::Conversational
-        | ChatPersona::Code
-        | ChatPersona::Docs => CONVERSATIONAL_SYSTEM_PROMPT,
+        ChatPersona::Auto | ChatPersona::Conversational | ChatPersona::Code | ChatPersona::Docs => {
+            CONVERSATIONAL_SYSTEM_PROMPT
+        }
     }
 }
 
@@ -256,9 +255,7 @@ pub fn compose_full_system_prompt(
 
     let composed = crate::intelligence::styles::compose_system_prompt(persona, style);
 
-    let manifest = skills
-        .map(|s| s.manifest_for_prompt())
-        .unwrap_or_default();
+    let manifest = skills.map(|s| s.manifest_for_prompt()).unwrap_or_default();
 
     if manifest.trim().is_empty() {
         composed
@@ -594,7 +591,10 @@ fn build_user_message(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String
     };
 
     match req.identity {
-        Some(identity) => format!("{}{with_history}", render_system_reminder(identity, req.today)),
+        Some(identity) => format!(
+            "{}{with_history}",
+            render_system_reminder(identity, req.today)
+        ),
         None => with_history,
     }
 }
@@ -689,8 +689,7 @@ pub fn is_chitchat(text: &str) -> bool {
         .trim_start_matches(|c: char| matches!(c, ' '));
     let exact = matches!(
         core,
-        "hi"
-            | "hello"
+        "hi" | "hello"
             | "hey"
             | "yo"
             | "hi there"
@@ -799,10 +798,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
 /// through `chat_stream` so the desktop sees a single token event with
 /// the model's full reply (or a `Static` fall-back when the connect
 /// fails).
-async fn chitchat_streaming(
-    llm: Option<Arc<LlmClient>>,
-    req: &AskRequest<'_>,
-) -> StreamingAnswer {
+async fn chitchat_streaming(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> StreamingAnswer {
     let category = req.category.to_string();
 
     let Some(llm_client) = llm else {
@@ -855,8 +851,7 @@ fn chitchat_fallback(question: &str) -> String {
     let q = question.trim().to_lowercase();
     if q.starts_with("thank") {
         "You're welcome.".to_string()
-    } else if q.starts_with("hi") || q.starts_with("hello") || q.starts_with("hey") || q == "yo"
-    {
+    } else if q.starts_with("hi") || q.starts_with("hello") || q.starts_with("hey") || q == "yo" {
         "Hi.".to_string()
     } else if q.starts_with("bye") || q.starts_with("goodbye") || q.starts_with("see you") {
         "Talk soon.".to_string()
@@ -1804,11 +1799,8 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         // LongMemEval contract: Memory persona produces byte-identical
         // wire prompt regardless of style/skills passed in.
         let chat = AskRequest::default_chat();
-        let with_extras = compose_full_system_prompt(
-            chat,
-            Some(&fixture_style()),
-            Some(&fixture_skills()),
-        );
+        let with_extras =
+            compose_full_system_prompt(chat, Some(&fixture_style()), Some(&fixture_skills()));
         assert_eq!(with_extras, MEMORY_SYSTEM_PROMPT);
     }
 

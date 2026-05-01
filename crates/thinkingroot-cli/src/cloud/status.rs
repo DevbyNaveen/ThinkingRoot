@@ -1,7 +1,7 @@
 //! `root status` — list recent cloud compile jobs for the logged-in
 //! user.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use console::style;
 use serde::Deserialize;
 

@@ -43,10 +43,11 @@ use serde::Deserialize;
 use sigstore::oauth::IdentityToken as SigstoreIdentityToken;
 
 use crate::{
-    DSSE_PAYLOAD_TYPE, DSSE_STATEMENT_TYPE, DsseEnvelope, DsseSignature, Error, IN_TOTO_STATEMENT_V1,
-    InTotoStatement, KindVersion, LogId, PackPredicate, RekorCheckpoint, RekorInclusionProof,
-    SIGSTORE_BUNDLE_MEDIA_TYPE, SigstoreBundle, Subject, TlogEntry, VerificationMaterial,
-    X509Certificate, X509CertificateChain, dsse_pae, format_rfc3339, sha256_hex,
+    DSSE_PAYLOAD_TYPE, DSSE_STATEMENT_TYPE, DsseEnvelope, DsseSignature, Error,
+    IN_TOTO_STATEMENT_V1, InTotoStatement, KindVersion, LogId, PackPredicate, RekorCheckpoint,
+    RekorInclusionProof, SIGSTORE_BUNDLE_MEDIA_TYPE, SigstoreBundle, Subject, TlogEntry,
+    VerificationMaterial, X509Certificate, X509CertificateChain, dsse_pae, format_rfc3339,
+    sha256_hex,
 };
 
 // Re-exports — using these directly from `tr_sigstore::live` keeps
@@ -118,14 +119,10 @@ pub fn browser_oidc_flow(
         .unwrap_or(redirect)
         .trim_end_matches('/');
 
-    let (_claims, raw_token) = RedirectListener::new(
-        listener_addr,
-        oauth_client,
-        nonce,
-        pkce_verifier,
-    )
-    .redirect_listener()
-    .map_err(|e| Error::CertParse(format!("OIDC redirect listener: {e}")))?;
+    let (_claims, raw_token) =
+        RedirectListener::new(listener_addr, oauth_client, nonce, pkce_verifier)
+            .redirect_listener()
+            .map_err(|e| Error::CertParse(format!("OIDC redirect listener: {e}")))?;
 
     Ok(IdentityToken::from(raw_token))
 }
@@ -459,10 +456,7 @@ async fn submit_to_rekor(
     rekor_url: &str,
     proposed: &serde_json::Value,
 ) -> Result<RekorRestLogEntry, Error> {
-    let endpoint = format!(
-        "{}/api/v1/log/entries",
-        rekor_url.trim_end_matches('/')
-    );
+    let endpoint = format!("{}/api/v1/log/entries", rekor_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
     let resp = client
         .post(&endpoint)
@@ -474,9 +468,7 @@ async fn submit_to_rekor(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(Error::CertParse(format!(
-            "Rekor returned {status}: {body}"
-        )));
+        return Err(Error::CertParse(format!("Rekor returned {status}: {body}")));
     }
 
     let parsed: RekorCreateResponse = resp
@@ -496,8 +488,8 @@ fn rekor_entry_to_tlog(entry: &RekorRestLogEntry) -> Result<TlogEntry, Error> {
     let b64 = base64::engine::general_purpose::STANDARD;
 
     // logID: hex → bytes → base64.
-    let log_id_bytes = hex_decode(&entry.log_id)
-        .map_err(|e| Error::CertParse(format!("Rekor logID hex: {e}")))?;
+    let log_id_bytes =
+        hex_decode(&entry.log_id).map_err(|e| Error::CertParse(format!("Rekor logID hex: {e}")))?;
     let log_id_b64 = b64.encode(&log_id_bytes);
 
     let inclusion_proof = entry.verification.inclusion_proof.as_ref().map(|p| {
@@ -703,9 +695,8 @@ mod tests {
                 wrapped.push_str("\r\n");
             }
         }
-        let pem = format!(
-            "-----BEGIN CERTIFICATE-----\r\n{wrapped}\r\n-----END CERTIFICATE-----\r\n"
-        );
+        let pem =
+            format!("-----BEGIN CERTIFICATE-----\r\n{wrapped}\r\n-----END CERTIFICATE-----\r\n");
         let chain = parse_pem_cert_chain(&pem).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].len(), 150);
@@ -783,14 +774,8 @@ mod tests {
         let tlog = rekor_entry_to_tlog(&entry).unwrap();
         assert_eq!(tlog.log_index, 42);
         assert_eq!(tlog.integrated_time, 1700000000);
-        assert_eq!(
-            tlog.kind_version.as_ref().unwrap().kind,
-            "intoto"
-        );
-        assert_eq!(
-            tlog.kind_version.as_ref().unwrap().version,
-            "0.0.2"
-        );
+        assert_eq!(tlog.kind_version.as_ref().unwrap().kind, "intoto");
+        assert_eq!(tlog.kind_version.as_ref().unwrap().version, "0.0.2");
         // logID hex → 32 bytes → base64 of 32 bytes = 44 chars (with padding).
         assert_eq!(tlog.log_id.as_ref().unwrap().key_id.len(), 44);
         let proof = tlog.inclusion_proof.as_ref().unwrap();
@@ -802,7 +787,10 @@ mod tests {
         }
         assert!(proof.checkpoint.is_some());
         assert_eq!(
-            tlog.inclusion_promise.as_ref().unwrap().signed_entry_timestamp,
+            tlog.inclusion_promise
+                .as_ref()
+                .unwrap()
+                .signed_entry_timestamp,
             "c2V0LWJhc2U2NA=="
         );
     }

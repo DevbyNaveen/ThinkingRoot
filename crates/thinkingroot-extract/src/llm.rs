@@ -51,8 +51,7 @@ pub struct ChatFinish {
 
 /// Pinned, boxed stream of `ChatChunk` results — the public surface
 /// every `LlmClient::chat_stream` consumer holds onto.
-pub type ChatStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk>> + Send>>;
+pub type ChatStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk>> + Send>>;
 
 // ── Tool calling — public types ──────────────────────────────────
 //
@@ -512,11 +511,26 @@ impl Provider {
         tool_choice: &ToolChoice,
     ) -> Result<ToolUseResponse> {
         match self {
-            Provider::Anthropic(p) => p.chat_with_tools(system, messages, tools, tool_choice).await,
-            Provider::Azure(p) => p.chat_with_tools(system, messages, tools, tool_choice).await,
-            Provider::OpenAi(p) => p.chat_with_tools(system, messages, tools, tool_choice).await,
-            Provider::Bedrock(p) => p.chat_with_tools(system, messages, tools, tool_choice).await,
-            Provider::Ollama(p) => p.chat_with_tools(system, messages, tools, tool_choice).await,
+            Provider::Anthropic(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
+            Provider::Azure(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
+            Provider::OpenAi(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
+            Provider::Bedrock(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
+            Provider::Ollama(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
         }
     }
 }
@@ -646,11 +660,10 @@ impl BedrockProvider {
         tool_choice: &ToolChoice,
     ) -> Result<ToolUseResponse> {
         use aws_sdk_bedrockruntime::types::{
-            AnyToolChoice, AutoToolChoice, ContentBlock, ConversationRole,
-            InferenceConfiguration, Message, SpecificToolChoice, StopReason,
-            SystemContentBlock, Tool as BedrockTool, ToolChoice as BedrockToolChoice,
-            ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
-            ToolResultStatus, ToolSpecification, ToolUseBlock,
+            AnyToolChoice, AutoToolChoice, ContentBlock, ConversationRole, InferenceConfiguration,
+            Message, SpecificToolChoice, StopReason, SystemContentBlock, Tool as BedrockTool,
+            ToolChoice as BedrockToolChoice, ToolConfiguration, ToolInputSchema, ToolResultBlock,
+            ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
         };
 
         // ── Build toolConfig ─────────────────────────────────────
@@ -675,15 +688,14 @@ impl BedrockProvider {
                 BedrockToolChoice::Auto(AutoToolChoice::builder().build())
             }
             ToolChoice::Any => BedrockToolChoice::Any(AnyToolChoice::builder().build()),
-            ToolChoice::Named(name) => BedrockToolChoice::Tool(
-                SpecificToolChoice::builder()
-                    .name(name)
-                    .build()
-                    .map_err(|e| Error::LlmProvider {
+            ToolChoice::Named(name) => {
+                BedrockToolChoice::Tool(SpecificToolChoice::builder().name(name).build().map_err(
+                    |e| Error::LlmProvider {
                         provider: "bedrock".into(),
                         message: format!("build SpecificToolChoice: {e}"),
-                    })?,
-            ),
+                    },
+                )?)
+            }
         };
 
         let tool_config = ToolConfiguration::builder()
@@ -2146,12 +2158,11 @@ fn parse_openai_tool_response(
             // OpenAI returns `arguments` as a stringified JSON object.
             // Parse to serde_json::Value so callers don't need to.
             let raw_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
-            let input: serde_json::Value = serde_json::from_str(raw_args).map_err(|e| {
-                Error::LlmProvider {
+            let input: serde_json::Value =
+                serde_json::from_str(raw_args).map_err(|e| Error::LlmProvider {
                     provider: provider.to_string(),
                     message: format!("tool_call arguments not JSON: {e}; raw={raw_args}"),
-                }
-            })?;
+                })?;
             calls.push(ToolCall { id, name, input });
         }
         let text_preamble = message["content"].as_str().unwrap_or("").to_string();
@@ -2266,10 +2277,12 @@ fn parse_anthropic_tool_response(
 ) -> Result<ToolUseResponse> {
     let stop_reason = json["stop_reason"].as_str().unwrap_or("");
     let truncated = stop_reason == "max_tokens";
-    let content = json["content"].as_array().ok_or_else(|| Error::LlmProvider {
-        provider: "anthropic".into(),
-        message: format!("response missing content array: {json}"),
-    })?;
+    let content = json["content"]
+        .as_array()
+        .ok_or_else(|| Error::LlmProvider {
+            provider: "anthropic".into(),
+            message: format!("response missing content array: {json}"),
+        })?;
 
     let mut text_buf = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
@@ -2359,9 +2372,7 @@ fn estimated_message_chars(msg: &ChatMessage) -> usize {
             .iter()
             .map(|c| c.name.len() + c.input.to_string().len() + 32)
             .sum(),
-        ChatMessage::ToolResults(results) => {
-            results.iter().map(|r| r.content.len() + 32).sum()
-        }
+        ChatMessage::ToolResults(results) => results.iter().map(|r| r.content.len() + 32).sum(),
     }
 }
 
@@ -3030,7 +3041,10 @@ impl LlmClient {
                 Ok(response) => {
                     // Truncation handling: bail rather than return a
                     // partial. The caller can shorten context and retry.
-                    if let ToolUseResponse::Text { truncated: true, .. } = &response {
+                    if let ToolUseResponse::Text {
+                        truncated: true, ..
+                    } = &response
+                    {
                         return Err(Error::TruncatedOutput {
                             provider: self.provider.provider_name().to_string(),
                             model: self.provider.model_name().to_string(),
@@ -3045,14 +3059,13 @@ impl LlmClient {
                         // System + serialized messages + serialized tools
                         // is a stable upper bound on input; output we
                         // estimate from the response payload.
-                        let approx_tokens =
-                            ((system.len()
-                                + messages
-                                    .iter()
-                                    .map(estimated_message_chars)
-                                    .sum::<usize>()
-                                + tools.iter().map(|t| t.name.len() + t.description.len()).sum::<usize>())
-                                / 4) as u64;
+                        let approx_tokens = ((system.len()
+                            + messages.iter().map(estimated_message_chars).sum::<usize>()
+                            + tools
+                                .iter()
+                                .map(|t| t.name.len() + t.description.len())
+                                .sum::<usize>())
+                            / 4) as u64;
                         sched.record_success(approx_tokens, &limits, ticket).await;
                     }
                     return Ok(response);
@@ -3741,10 +3754,22 @@ mod tests {
     fn openai_provider_strips_trailing_v1_from_base_url() {
         // Providers like OpenRouter store "https://host/api/v1" in config.
         // OpenAiProvider must strip the /v1 so chat() doesn't produce a double /v1.
-        let p = OpenAiProvider::new("key", "model", "https://openrouter.ai/api/v1", "openrouter", 120);
+        let p = OpenAiProvider::new(
+            "key",
+            "model",
+            "https://openrouter.ai/api/v1",
+            "openrouter",
+            120,
+        );
         assert_eq!(p.base_url, "https://openrouter.ai/api");
 
-        let p2 = OpenAiProvider::new("key", "model", "https://api.together.xyz/v1", "together", 120);
+        let p2 = OpenAiProvider::new(
+            "key",
+            "model",
+            "https://api.together.xyz/v1",
+            "together",
+            120,
+        );
         assert_eq!(p2.base_url, "https://api.together.xyz");
 
         // Providers without /v1 suffix must be unchanged.
@@ -3995,15 +4020,19 @@ mod tests {
                 .contains("knowledge graph")
         );
         assert_eq!(arr[0]["function"]["parameters"]["type"], "object");
-        assert_eq!(
-            arr[0]["function"]["parameters"]["required"][0], "query"
-        );
+        assert_eq!(arr[0]["function"]["parameters"]["required"][0], "query");
     }
 
     #[test]
     fn openai_tool_choice_maps_each_variant() {
-        assert_eq!(openai_tool_choice(&ToolChoice::Auto), serde_json::json!("auto"));
-        assert_eq!(openai_tool_choice(&ToolChoice::None), serde_json::json!("none"));
+        assert_eq!(
+            openai_tool_choice(&ToolChoice::Auto),
+            serde_json::json!("auto")
+        );
+        assert_eq!(
+            openai_tool_choice(&ToolChoice::None),
+            serde_json::json!("none")
+        );
         assert_eq!(
             openai_tool_choice(&ToolChoice::Any),
             serde_json::json!("required")
@@ -4086,7 +4115,9 @@ mod tests {
         let resp =
             parse_openai_tool_response(&json, HeaderRateLimits::default(), "openai").unwrap();
         match resp {
-            ToolUseResponse::Text { text, truncated, .. } => {
+            ToolUseResponse::Text {
+                text, truncated, ..
+            } => {
                 assert_eq!(text, "There are 3 providers.");
                 assert!(!truncated);
             }
@@ -4129,10 +4160,13 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let resp =
-            parse_openai_tool_response(&json, HeaderRateLimits::default(), "azure").unwrap();
+        let resp = parse_openai_tool_response(&json, HeaderRateLimits::default(), "azure").unwrap();
         match resp {
-            ToolUseResponse::ToolCalls { calls, text_preamble, .. } => {
+            ToolUseResponse::ToolCalls {
+                calls,
+                text_preamble,
+                ..
+            } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "call_001");
                 assert_eq!(calls[0].name, "search");
@@ -4268,7 +4302,9 @@ mod tests {
         });
         let resp = parse_anthropic_tool_response(&json, HeaderRateLimits::default()).unwrap();
         match resp {
-            ToolUseResponse::Text { text, truncated, .. } => {
+            ToolUseResponse::Text {
+                text, truncated, ..
+            } => {
                 assert_eq!(text, "There are 3 providers.");
                 assert!(!truncated);
             }
@@ -4306,7 +4342,11 @@ mod tests {
         });
         let resp = parse_anthropic_tool_response(&json, HeaderRateLimits::default()).unwrap();
         match resp {
-            ToolUseResponse::ToolCalls { calls, text_preamble, .. } => {
+            ToolUseResponse::ToolCalls {
+                calls,
+                text_preamble,
+                ..
+            } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].id, "tu_42");
                 assert_eq!(calls[0].name, "search");
@@ -4457,7 +4497,11 @@ mod tests {
         assert_eq!(outer_timeout_secs(120), 240);
         assert_eq!(outer_timeout_secs(600), 1200);
         assert_eq!(outer_timeout_secs(30), 60, "floor must clamp to 60");
-        assert_eq!(outer_timeout_secs(1), 60, "tiny inner timeouts still get >= 60s outer");
+        assert_eq!(
+            outer_timeout_secs(1),
+            60,
+            "tiny inner timeouts still get >= 60s outer"
+        );
         // Saturating multiplication: u64::MAX / 2 + 1 doubled would
         // overflow, so saturating_mul must clamp.
         assert_eq!(outer_timeout_secs(u64::MAX), u64::MAX);
@@ -4468,9 +4512,7 @@ mod tests {
         // Regression for C3: previously the per-provider reqwest::Client
         // timeout was hard-coded to 90s regardless of LlmConfig.
         // Verify the value flows from the config into LlmClient.timeout_secs.
-        use thinkingroot_core::config::{
-            LlmConfig, ProviderConfig, ProvidersConfig,
-        };
+        use thinkingroot_core::config::{LlmConfig, ProviderConfig, ProvidersConfig};
         // Use ollama because it doesn't require an API key — picking a
         // fake base_url is fine; we never make a real request.
         let cfg = LlmConfig {
@@ -4489,7 +4531,9 @@ mod tests {
                 ..Default::default()
             },
         };
-        let client = LlmClient::new(&cfg).await.expect("ollama client builds without auth");
+        let client = LlmClient::new(&cfg)
+            .await
+            .expect("ollama client builds without auth");
         assert_eq!(
             client.timeout_secs(),
             333,
@@ -4502,9 +4546,7 @@ mod tests {
         // Older on-disk configs may have request_timeout_secs == 0 (the
         // serde default for u64).  Treat that as "unset" rather than a
         // 0-second timeout that would fail every call.
-        use thinkingroot_core::config::{
-            LlmConfig, ProviderConfig, ProvidersConfig,
-        };
+        use thinkingroot_core::config::{LlmConfig, ProviderConfig, ProvidersConfig};
         let cfg = LlmConfig {
             default_provider: "ollama".into(),
             extraction_model: "llama3".into(),

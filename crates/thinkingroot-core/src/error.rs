@@ -87,8 +87,8 @@ pub enum Error {
     Serialization(String),
 
     // --- Safety ---
-    #[error("permission denied: agent {agent_id} cannot {action}")]
-    PermissionDenied { agent_id: String, action: String },
+    #[error("permission denied: {actor} cannot {action}")]
+    PermissionDenied { actor: String, action: String },
 
     #[error("claim quarantined: {reason}")]
     Quarantined { reason: String },
@@ -224,8 +224,7 @@ mod tests {
     #[test]
     fn missing_config_is_permanent() {
         // No retry budget should be spent on a deployment-name typo.
-        assert!(Error::MissingConfig("set [llm.providers.azure].deployment".into())
-            .is_permanent());
+        assert!(Error::MissingConfig("set [llm.providers.azure].deployment".into()).is_permanent());
     }
 
     #[test]

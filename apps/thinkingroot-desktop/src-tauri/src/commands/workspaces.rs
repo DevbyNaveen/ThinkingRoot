@@ -287,19 +287,40 @@ pub async fn workspace_compile(
         // the writer of `graph.db`.  When the sidecar handle is
         // populated (the bundled `root` binary spawned successfully),
         // route compile through the sidecar's SSE compile/stream
-        // endpoint; otherwise fall back to in-process so the desktop
-        // still works on machines where the sidecar binary failed to
-        // resolve (the warning in agent_runtime_subprocess::spawn).
+        // endpoint.
+        //
+        // The sidecar handle is stored only after `spawn()` completes
+        // its readiness probe (polling /livez for up to 120s AND
+        // checking that the child process hasn't crashed).
         let sidecar = {
             let state = app_for_task.state::<AppState>();
-            let guard = state.sidecar.lock().await;
-            guard
-                .as_ref()
-                .map(|h| (h.host.clone(), h.port))
+            let mut result = None;
+            for attempt in 0u32..240 {
+                {
+                    let guard = state.sidecar.lock().await;
+                    if let Some(h) = guard.as_ref() {
+                        result = Some((h.host.clone(), h.port));
+                        break;
+                    }
+                }
+                if attempt == 0 {
+                    tracing::info!(
+                        workspace = %label_for_task,
+                        "sidecar handle not yet available — waiting for sidecar to finish booting",
+                    );
+                }
+                // Check cancellation so a Stop click during the wait
+                // doesn't block for the full 120 s.
+                if cancel_for_task.is_cancelled() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            result
         };
 
         let outcome = if let Some((host, port)) = sidecar {
-            drive_compile_via_sidecar(
+            let sidecar_result = drive_compile_via_sidecar(
                 app_for_task.clone(),
                 host,
                 port,
@@ -308,20 +329,25 @@ pub async fn workspace_compile(
                 branch.clone(),
                 cancel_for_task.clone(),
             )
-            .await
+            .await;
+
+            match sidecar_result {
+                Err(CompileDriveError::Failed(ref msg)) => {
+                    tracing::error!(
+                        workspace = %label_for_task,
+                        error = %msg,
+                        "sidecar compile failed",
+                    );
+                    Err(CompileDriveError::Failed(msg.clone()))
+                }
+                other => other,
+            }
         } else {
-            tracing::warn!(
+            tracing::error!(
                 workspace = %label_for_task,
-                "sidecar unavailable — falling back to in-process compile",
+                "sidecar unavailable — failing compile because sidecar is strictly required",
             );
-            drive_compile_in_process(
-                app_for_task.clone(),
-                path_for_task.clone(),
-                label_for_task.clone(),
-                branch.clone(),
-                cancel_for_task.clone(),
-            )
-            .await
+            Err(CompileDriveError::Failed("Sidecar process is unavailable or failed to start.".to_string()))
         };
 
         match outcome {
@@ -455,12 +481,45 @@ async fn drive_compile_via_sidecar(
     // SSE response keeps the connection alive via the server's
     // KeepAlive `keep-alive` events; reqwest's connection-pool idle
     // timeout never fires while bytes are flowing.
-    let resp = match client.post(&url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(CompileDriveError::Failed(format!(
-                "sidecar compile request failed: {e}"
-            )));
+    //
+    // Retry up to 3 times with 2-second backoff in case the sidecar is
+    // still booting (CozoDB mount can take a few seconds even after the
+    // HTTP listener binds, and the readiness probe in spawn() polls
+    // /livez which returns OK as soon as axum starts — before all
+    // workspace mounts have completed). Transient ECONNREFUSED or
+    // ECONNRESET errors during startup are the primary failure mode
+    // surfaced as "sidecar compile request failed".
+    let resp = {
+        let mut last_err: Option<reqwest::Error> = None;
+        let mut result = None;
+        for attempt in 0u8..5 {
+            if attempt > 0 {
+                tracing::warn!(
+                    attempt,
+                    url = %url,
+                    error = %last_err.as_ref().unwrap(),
+                    "sidecar compile request failed, retrying in 2s",
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            match client.post(&url).json(&body).send().await {
+                Ok(r) => {
+                    result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        match result {
+            Some(r) => r,
+            None => {
+                return Err(CompileDriveError::Failed(format!(
+                    "sidecar compile request failed after 3 attempts: {}",
+                    last_err.unwrap()
+                )));
+            }
         }
     };
 

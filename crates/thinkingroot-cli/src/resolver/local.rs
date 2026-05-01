@@ -25,8 +25,7 @@ impl LocalFsResolver {
 #[async_trait]
 impl PackResolver for LocalFsResolver {
     async fn resolve(&self) -> Result<Vec<u8>> {
-        std::fs::read(&self.path)
-            .with_context(|| format!("read {}", self.path.display()))
+        std::fs::read(&self.path).with_context(|| format!("read {}", self.path.display()))
     }
 }
 

@@ -7,9 +7,7 @@
 use chrono::Utc;
 use sha2::Digest;
 use tempfile::tempdir;
-use tr_transparency::{
-    LogEntry, LogEntryKind, TransparencyLog, verify_inclusion,
-};
+use tr_transparency::{LogEntry, LogEntryKind, TransparencyLog, verify_inclusion};
 
 fn fake_entry(pack: &str) -> LogEntry {
     LogEntry {
@@ -79,7 +77,8 @@ fn consistency_proof_present_for_extended_log() {
     let dir = tempdir().unwrap();
     let mut log = TransparencyLog::open(dir.path()).unwrap();
     for i in 0..4 {
-        log.append(fake_entry(&format!("alice/p{i}@0.1.0"))).unwrap();
+        log.append(fake_entry(&format!("alice/p{i}@0.1.0")))
+            .unwrap();
     }
     let proof = log.consistency_proof(2, 4).unwrap();
     // Two extra leaves were appended → at least one sibling needed.

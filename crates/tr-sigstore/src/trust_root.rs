@@ -93,9 +93,7 @@ impl TrustedRoot {
             });
         }
         if roots.is_empty() {
-            return Err(Error::CertParse(
-                "from_root_ders: empty input slice".into(),
-            ));
+            return Err(Error::CertParse("from_root_ders: empty input slice".into()));
         }
         Ok(Self {
             fulcio_roots: roots,
@@ -311,10 +309,7 @@ impl<'a> Iterator for PemBlockIter<'a> {
             }
 
             // Decode base64 body (with whitespace stripped).
-            let cleaned: String = body
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
+            let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
             use base64::Engine as _;
             let der = match base64::engine::general_purpose::STANDARD.decode(cleaned) {
                 Ok(d) => d,
@@ -378,9 +373,7 @@ pub fn verify_cert_chain(
     // Decode + parse every chain cert once.
     let mut chain_certs: Vec<X509Cert> = Vec::with_capacity(chain.certificates.len());
     for (i, c) in chain.certificates.iter().enumerate() {
-        let der = b64
-            .decode(&c.raw_bytes)
-            .map_err(Error::Base64)?;
+        let der = b64.decode(&c.raw_bytes).map_err(Error::Base64)?;
         let parsed = X509Cert::from_der(&der)
             .map_err(|e| Error::CertParse(format!("chain[{i}] DER decode: {e}")))?;
         chain_certs.push(parsed);
@@ -412,12 +405,12 @@ pub fn verify_cert_chain(
                     break;
                 }
             }
-            root_index = Some(
-                found.ok_or_else(|| Error::ChainDoesNotReachTrustRoot(format!(
+            root_index = Some(found.ok_or_else(|| {
+                Error::ChainDoesNotReachTrustRoot(format!(
                     "topmost chain cert (index {i}) is not signed by any of the {} trusted root(s)",
                     trust_root.root_count()
-                )))?,
-            );
+                ))
+            })?);
         }
     }
     Ok(root_index.expect("chain non-empty -> root_index set in loop"))
@@ -429,17 +422,13 @@ pub fn verify_cert_chain(
 /// algorithm. Other algorithms surface as
 /// [`Error::UnsupportedKeyAlgorithm`] so callers see a clean
 /// "unsupported" verdict rather than a generic signature failure.
-fn verify_cert_signature_by_cert(
-    child: &X509Cert,
-    issuer: &X509Cert,
-) -> Result<(), Error> {
+fn verify_cert_signature_by_cert(child: &X509Cert, issuer: &X509Cert) -> Result<(), Error> {
     use signature::Verifier as _;
     use x509_cert::der::Encode as _;
 
     // Sigstore's CA chain uses ecdsa-with-SHA256 exclusively. OID is
     // 1.2.840.10045.4.3.2.
-    let ecdsa_with_sha256 =
-        ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    let ecdsa_with_sha256 = ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
     if child.signature_algorithm.oid != ecdsa_with_sha256 {
         return Err(Error::UnsupportedKeyAlgorithm(format!(
             "issuer signature algorithm {:?} unsupported (expected ecdsa-with-SHA256)",
@@ -524,9 +513,7 @@ fn check_cert_validity(cert: &X509Cert, signed_at: SystemTime) -> Result<(), Str
 pub(crate) mod test_helpers {
     use ::der::Encode as _;
     use ::der::asn1::BitString;
-    pub use p256::ecdsa::{
-        DerSignature as P256DerSignature, SigningKey as P256SigningKey,
-    };
+    pub use p256::ecdsa::{DerSignature as P256DerSignature, SigningKey as P256SigningKey};
     use signature::Signer as _;
     use spki::{EncodePublicKey as _, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
@@ -570,8 +557,7 @@ pub(crate) mod test_helpers {
         validity_seconds: u64,
     ) -> X509Cert {
         // ecdsa-with-SHA256: 1.2.840.10045.4.3.2.
-        let ecdsa_with_sha256 =
-            ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+        let ecdsa_with_sha256 = ::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
         let sig_alg = AlgorithmIdentifierOwned {
             oid: ecdsa_with_sha256,
             parameters: None,
@@ -582,10 +568,7 @@ pub(crate) mod test_helpers {
             serial_number: SerialNumber::from(serial),
             signature: sig_alg.clone(),
             issuer: issuer_name.clone(),
-            validity: Validity::from_now(std::time::Duration::from_secs(
-                validity_seconds,
-            ))
-            .unwrap(),
+            validity: Validity::from_now(std::time::Duration::from_secs(validity_seconds)).unwrap(),
             subject: subject_name.clone(),
             subject_public_key_info: subject_spki,
             issuer_unique_id: None,
@@ -603,15 +586,11 @@ pub(crate) mod test_helpers {
         X509Cert {
             tbs_certificate: tbs,
             signature_algorithm: sig_alg,
-            signature: BitString::from_bytes(sig_bytes.as_ref())
-                .expect("sig bitstring"),
+            signature: BitString::from_bytes(sig_bytes.as_ref()).expect("sig bitstring"),
         }
     }
 
-    pub fn build_self_signed_root(
-        signer: &P256SigningKey,
-        cn: &str,
-    ) -> (X509Cert, Name) {
+    pub fn build_self_signed_root(signer: &P256SigningKey, cn: &str) -> (X509Cert, Name) {
         let name = Name::from_str(&format!("CN={cn}")).unwrap();
         let spki = spki_from(signer.verifying_key());
         let cert = build_signed_cert(&name, spki, &name, signer, 1, 86_400);
@@ -626,14 +605,7 @@ pub(crate) mod test_helpers {
     ) -> (X509Cert, Name) {
         let int_name = Name::from_str(&format!("CN={cn}")).unwrap();
         let int_spki = spki_from(int_signer.verifying_key());
-        let cert = build_signed_cert(
-            &int_name,
-            int_spki,
-            issuer_name,
-            issuer_signer,
-            2,
-            86_400,
-        );
+        let cert = build_signed_cert(&int_name, int_spki, issuer_name, issuer_signer, 2, 86_400);
         (cert, int_name)
     }
 
@@ -645,14 +617,7 @@ pub(crate) mod test_helpers {
     ) -> X509Cert {
         let subject = Name::from_str(&format!("CN={cn}")).unwrap();
         let leaf_spki = spki_from(leaf_signer.verifying_key());
-        build_signed_cert(
-            &subject,
-            leaf_spki,
-            issuer_name,
-            issuer_signer,
-            3,
-            86_400,
-        )
+        build_signed_cert(&subject, leaf_spki, issuer_name, issuer_signer, 3, 86_400)
     }
 }
 
@@ -677,16 +642,10 @@ mod tests {
         let int_key = p256_key(0x20);
         let leaf_key = p256_key(0x30);
 
-        let (root_cert, root_name) =
-            build_self_signed_root(&root_key, "Test Sigstore Root");
-        let (int_cert, int_name) = build_intermediate(
-            &root_key,
-            &root_name,
-            &int_key,
-            "Test Fulcio Intermediate",
-        );
-        let leaf_cert =
-            build_leaf(&int_key, &int_name, &leaf_key, "Test Subject");
+        let (root_cert, root_name) = build_self_signed_root(&root_key, "Test Sigstore Root");
+        let (int_cert, int_name) =
+            build_intermediate(&root_key, &root_name, &int_key, "Test Fulcio Intermediate");
+        let leaf_cert = build_leaf(&int_key, &int_name, &leaf_key, "Test Subject");
 
         let chain = crate::X509CertificateChain {
             certificates: vec![
@@ -695,8 +654,7 @@ mod tests {
             ],
         };
 
-        let trust_root =
-            TrustedRoot::from_root_ders(&[&root_cert.to_der().unwrap()]).unwrap();
+        let trust_root = TrustedRoot::from_root_ders(&[&root_cert.to_der().unwrap()]).unwrap();
 
         let idx = verify_cert_chain(&chain, &trust_root, SystemTime::now()).unwrap();
         assert_eq!(idx, 0, "expected chain to terminate at the only root");
@@ -711,8 +669,7 @@ mod tests {
         let int_key = p256_key(0x42);
         let leaf_key = p256_key(0x43);
 
-        let (_root_a_cert, root_a_name) =
-            build_self_signed_root(&root_a, "Real Root");
+        let (_root_a_cert, root_a_name) = build_self_signed_root(&root_a, "Real Root");
         let (int_cert, int_name) =
             build_intermediate(&root_a, &root_a_name, &int_key, "Intermediate");
         let leaf_cert = build_leaf(&int_key, &int_name, &leaf_key, "Leaf");
@@ -725,10 +682,8 @@ mod tests {
         };
 
         // Trust root only knows the unrelated root_b.
-        let (root_b_cert, _) =
-            build_self_signed_root(&root_b, "Unrelated Root");
-        let trust_root =
-            TrustedRoot::from_root_ders(&[&root_b_cert.to_der().unwrap()]).unwrap();
+        let (root_b_cert, _) = build_self_signed_root(&root_b, "Unrelated Root");
+        let trust_root = TrustedRoot::from_root_ders(&[&root_b_cert.to_der().unwrap()]).unwrap();
 
         let err = verify_cert_chain(&chain, &trust_root, SystemTime::now()).unwrap_err();
         assert!(

@@ -70,10 +70,7 @@ pub fn walk(root: &Path, config: &ParserConfig) -> Result<Vec<PathBuf>> {
             }
             Ok(_) => {} // size OK
             Err(e) => {
-                tracing::warn!(
-                    "skipping {} (metadata failed: {e})",
-                    path.display(),
-                );
+                tracing::warn!("skipping {} (metadata failed: {e})", path.display(),);
                 continue;
             }
         }

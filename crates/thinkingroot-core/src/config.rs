@@ -813,9 +813,9 @@ impl ChatConfig {
 
         let auto_verbosity = match persona {
             ChatPersona::Memory => ChatVerbosity::Terse,
-            ChatPersona::Code
-            | ChatPersona::Docs
-            | ChatPersona::Conversational => ChatVerbosity::Rich,
+            ChatPersona::Code | ChatPersona::Docs | ChatPersona::Conversational => {
+                ChatVerbosity::Rich
+            }
             ChatPersona::Auto => ChatVerbosity::Rich, // unreachable after the match above
         };
 
@@ -1270,10 +1270,7 @@ name = "old"
     #[test]
     fn resolve_docs_only_workspace_picks_conversational_rich() {
         let cfg = ChatConfig::default();
-        let mix = vec![
-            ("md".to_string(), 120usize),
-            ("rst".to_string(), 30usize),
-        ];
+        let mix = vec![("md".to_string(), 120usize), ("rst".to_string(), 30usize)];
         let r = cfg.resolve(&mix);
         assert_eq!(r.persona, ChatPersona::Conversational);
         assert_eq!(r.verbosity, ChatVerbosity::Rich);
@@ -1472,6 +1469,9 @@ base_url = "https://my-endpoint.com/v1"
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "workspace config.toml must be 0600, got {mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "workspace config.toml must be 0600, got {mode:o}"
+        );
     }
 }

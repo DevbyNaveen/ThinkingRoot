@@ -92,13 +92,34 @@ pub fn compute_diff(
     max_health_drop: f64,
     block_on_contradictions: bool,
 ) -> Result<KnowledgeDiff> {
+    compute_diff_into(
+        main_graph,
+        branch_graph,
+        from_branch,
+        None,
+        auto_resolve_threshold,
+        max_health_drop,
+        block_on_contradictions,
+    )
+}
+
+/// Compute the semantic diff between a source branch and an explicit target branch.
+pub fn compute_diff_into(
+    target_graph: &GraphStore,
+    source_graph: &GraphStore,
+    from_branch: &str,
+    target_branch: Option<&str>,
+    auto_resolve_threshold: f64,
+    max_health_drop: f64,
+    block_on_contradictions: bool,
+) -> Result<KnowledgeDiff> {
     let verifier = Verifier::new(&Config::default());
-    let health_before = verifier.verify(main_graph)?.health_score;
-    let health_after = verifier.verify(branch_graph)?.health_score;
+    let health_before = verifier.verify(target_graph)?.health_score;
+    let health_after = verifier.verify(source_graph)?.health_score;
 
     // Load claims from both graphs
-    let main_claims_raw = main_graph.get_all_claims_with_sources()?;
-    let branch_claims_raw = branch_graph.get_all_claims_with_sources()?;
+    let main_claims_raw = target_graph.get_all_claims_with_sources()?;
+    let branch_claims_raw = source_graph.get_all_claims_with_sources()?;
 
     // Build main hash set for deduplication
     let main_hashes: HashSet<String> = main_claims_raw
@@ -118,10 +139,10 @@ pub fn compute_diff(
         .map(|(id, _, _, _, _, _)| id.as_str())
         .collect();
     let entity_map: HashMap<String, Vec<String>> =
-        branch_graph.get_entity_names_for_claims(&new_claim_id_strs)?;
+        source_graph.get_entity_names_for_claims(&new_claim_id_strs)?;
 
     // Get real source IDs so merged claims are not orphaned in main.
-    let claim_source_map = branch_graph.get_claim_source_id_map()?;
+    let claim_source_map = source_graph.get_claim_source_id_map()?;
 
     // Check new claims for contradictions against main claims
     let mut new_claims: Vec<DiffClaim> = Vec::new();
@@ -277,13 +298,13 @@ pub fn compute_diff(
     }
 
     // Identify new entities (in branch, not in main by canonical name)
-    let main_entity_names: HashSet<String> = main_graph
+    let main_entity_names: HashSet<String> = target_graph
         .get_entities_with_aliases()?
         .into_iter()
         .map(|e| e.canonical_name.clone())
         .collect();
 
-    let new_entities: Vec<DiffEntity> = branch_graph
+    let new_entities: Vec<DiffEntity> = source_graph
         .get_entities_with_aliases()?
         .into_iter()
         .filter(|e| !main_entity_names.contains(&e.canonical_name))
@@ -294,13 +315,13 @@ pub fn compute_diff(
         .collect();
 
     // Identify new relations (in branch, not in main by (from_name, to_name, rel_type) key).
-    let main_relation_keys: HashSet<(String, String, String)> = main_graph
+    let main_relation_keys: HashSet<(String, String, String)> = target_graph
         .get_all_relations()?
         .into_iter()
         .map(|(from, to, rel, _, _, _)| (from, to, rel))
         .collect();
 
-    let new_relations: Vec<DiffRelation> = branch_graph
+    let new_relations: Vec<DiffRelation> = source_graph
         .get_all_relations()?
         .into_iter()
         .filter(|(from, to, rel, _, _, _)| {
@@ -337,7 +358,7 @@ pub fn compute_diff(
 
     Ok(KnowledgeDiff {
         from_branch: from_branch.to_string(),
-        to_branch: "main".to_string(),
+        to_branch: target_branch.unwrap_or("main").to_string(),
         computed_at: Utc::now(),
         new_claims,
         new_entities,
@@ -349,4 +370,25 @@ pub fn compute_diff(
         merge_allowed: blocking_reasons.is_empty(),
         blocking_reasons,
     })
+}
+
+/// Compute the diff needed to rebase `branch_name` with claims from its parent.
+pub fn compute_rebase_diff(
+    branch_graph: &GraphStore,
+    parent_graph: &GraphStore,
+    branch_name: &str,
+    parent_name: &str,
+    auto_resolve_threshold: f64,
+    max_health_drop: f64,
+    block_on_contradictions: bool,
+) -> Result<KnowledgeDiff> {
+    compute_diff_into(
+        branch_graph,
+        parent_graph,
+        parent_name,
+        Some(branch_name),
+        auto_resolve_threshold,
+        max_health_drop,
+        block_on_contradictions,
+    )
 }

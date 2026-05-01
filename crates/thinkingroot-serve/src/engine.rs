@@ -193,6 +193,33 @@ pub struct ClaimFilter {
     pub offset: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub enum BranchActor {
+    Anonymous,
+    User(String),
+    Agent(String),
+    System,
+}
+
+impl BranchActor {
+    fn label(&self) -> String {
+        match self {
+            Self::Anonymous => "anonymous".to_string(),
+            Self::User(user) => format!("user:{user}"),
+            Self::Agent(agent) => format!("agent:{agent}"),
+            Self::System => "system".to_string(),
+        }
+    }
+
+    fn identity(&self) -> Option<&str> {
+        match self {
+            Self::User(user) => Some(user.as_str()),
+            Self::Agent(agent) => Some(agent.as_str()),
+            Self::Anonymous | Self::System => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal workspace handle
 // ---------------------------------------------------------------------------
@@ -345,6 +372,57 @@ impl QueryEngine {
     /// entries without borrowing the whole engine.
     pub fn branch_engines_arc(&self) -> Arc<crate::branch_cache::BranchEngineCache> {
         self.branch_engines.clone()
+    }
+
+    fn branch_ref_for_root(
+        root: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<Option<thinkingroot_core::BranchRef>> {
+        if branch_name == "main" {
+            return Ok(None);
+        }
+        let refs_dir = root.join(".thinkingroot-refs");
+        let registry = thinkingroot_branch::branch::BranchRegistry::load_or_create(&refs_dir)?;
+        Ok(registry.get(branch_name).cloned())
+    }
+
+    fn ensure_branch_permission(
+        actor: &BranchActor,
+        branch_ref: Option<&thinkingroot_core::BranchRef>,
+        action: &str,
+    ) -> Result<()> {
+        let Some(branch_ref) = branch_ref else {
+            return Ok(());
+        };
+        let Some(identity) = actor.identity() else {
+            return Ok(());
+        };
+
+        if branch_ref
+            .owner
+            .as_deref()
+            .is_some_and(|owner| owner == identity)
+        {
+            return Ok(());
+        }
+
+        let allowed = match action {
+            "read_branch" => branch_ref.permissions.readers.iter().any(|v| v == identity),
+            "write_branch" => branch_ref.permissions.writers.iter().any(|v| v == identity),
+            "merge_branch" | "delete_branch" | "rebase_branch" => {
+                branch_ref.permissions.mergers.iter().any(|v| v == identity)
+            }
+            _ => false,
+        };
+
+        if allowed || branch_ref.owner.is_none() {
+            Ok(())
+        } else {
+            Err(Error::PermissionDenied {
+                actor: actor.label(),
+                action: action.to_string(),
+            })
+        }
     }
 
     /// Mount a workspace by name, opening the `.thinkingroot/` data directory,
@@ -1333,9 +1411,7 @@ impl QueryEngine {
         // block_in_place: see rationale on `search` above.
         let vector_results = {
             let mut storage = handle.storage.lock().await;
-            run_blocking(|| {
-                storage.vector.search_scoped(query, top_k * 3, scope)
-            })?
+            run_blocking(|| storage.vector.search_scoped(query, top_k * 3, scope))?
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -1525,8 +1601,7 @@ impl QueryEngine {
         // ── 1. Search branch vector index ─────────────────────────────────────
         let branch_vector_hits: Vec<(String, String, f32)> = if branch_data_dir.exists() {
             match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
-                Ok(mut bv) => run_blocking(|| bv.search(query, top_k * 2))
-                    .unwrap_or_default(),
+                Ok(mut bv) => run_blocking(|| bv.search(query, top_k * 2)).unwrap_or_default(),
                 Err(_) => vec![],
             }
         } else {
@@ -1994,6 +2069,26 @@ Rules: \
         agent_claims: Vec<AgentClaim>,
         sessions: &crate::intelligence::session::SessionStore,
     ) -> Result<ContributeResult> {
+        self.contribute_claims_as(
+            ws,
+            session_id,
+            branch,
+            agent_claims,
+            sessions,
+            BranchActor::System,
+        )
+        .await
+    }
+
+    pub async fn contribute_claims_as(
+        &self,
+        ws: &str,
+        session_id: &str,
+        branch: Option<&str>,
+        agent_claims: Vec<AgentClaim>,
+        sessions: &crate::intelligence::session::SessionStore,
+        actor: BranchActor,
+    ) -> Result<ContributeResult> {
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_core::types::{ContentHash, SourceType, TrustLevel};
 
@@ -2017,6 +2112,8 @@ Rules: \
 
         // Branch path: writes go to the branch graph only; main cache unchanged.
         if let Some(branch_name) = branch {
+            let branch_ref = Self::branch_ref_for_root(&handle.root_path, branch_name)?;
+            Self::ensure_branch_permission(&actor, branch_ref.as_ref(), "write_branch")?;
             let branch_data_dir = resolve_data_dir(&handle.root_path, Some(branch_name));
             if !branch_data_dir.exists() {
                 return Err(Error::EntityNotFound(format!(
@@ -2166,9 +2263,7 @@ Rules: \
                                     {
                                         if let Some(c) = claims.get(idx) {
                                             let cid = c.id.to_string();
-                                            if let Err(e) =
-                                                storage.graph.remove_claim_fully(&cid)
-                                            {
+                                            if let Err(e) = storage.graph.remove_claim_fully(&cid) {
                                                 tracing::warn!(
                                                     "contribute enforce: remove_claim_fully({}) failed: {e}",
                                                     cid
@@ -2190,9 +2285,7 @@ Rules: \
                             if output.rejected_count > 0 || output.quarantined_count > 0 {
                                 warnings.push(format!(
                                     "rooting: {} rejected, {} quarantined{}",
-                                    output.rejected_count,
-                                    output.quarantined_count,
-                                    enforce_note
+                                    output.rejected_count, output.quarantined_count, enforce_note
                                 ));
                             } else {
                                 tracing::info!(
@@ -2276,16 +2369,46 @@ Rules: \
         propagate_deletions: bool,
         merged_by: thinkingroot_core::MergedBy,
     ) -> Result<thinkingroot_core::KnowledgeDiff> {
-        use thinkingroot_branch::diff::compute_diff;
-        use thinkingroot_branch::merge::execute_merge;
+        self.merge_into_branch(
+            root,
+            branch_name,
+            None,
+            force,
+            propagate_deletions,
+            merged_by,
+        )
+        .await
+    }
+
+    pub async fn merge_into_branch(
+        &self,
+        root: &std::path::Path,
+        source_branch_name: &str,
+        target_branch: Option<&str>,
+        force: bool,
+        propagate_deletions: bool,
+        merged_by: thinkingroot_core::MergedBy,
+    ) -> Result<thinkingroot_core::KnowledgeDiff> {
+        use thinkingroot_branch::diff::compute_diff_into;
+        use thinkingroot_branch::merge::execute_merge_into;
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_graph::graph::GraphStore;
 
-        let main_data_dir = resolve_data_dir(root, None);
-        let branch_data_dir = resolve_data_dir(root, Some(branch_name));
-        if !branch_data_dir.exists() {
+        let actor = match &merged_by {
+            thinkingroot_core::MergedBy::Human { user } => BranchActor::User(user.clone()),
+            thinkingroot_core::MergedBy::Agent { agent_id } => BranchActor::Agent(agent_id.clone()),
+        };
+        Self::ensure_branch_permission(
+            &actor,
+            Self::branch_ref_for_root(root, target_branch.unwrap_or("main"))?.as_ref(),
+            "merge_branch",
+        )?;
+
+        let target_data_dir = resolve_data_dir(root, target_branch);
+        let source_data_dir = resolve_data_dir(root, Some(source_branch_name));
+        if !source_data_dir.exists() {
             return Err(Error::EntityNotFound(format!(
-                "branch '{branch_name}' not found"
+                "branch '{source_branch_name}' not found"
             )));
         }
 
@@ -2297,15 +2420,16 @@ Rules: \
             None => Config::load_merged(root)?.merge,
         };
 
-        let main_graph = GraphStore::init(&main_data_dir.join("graph"))
-            .map_err(|e| Error::GraphStorage(format!("main graph init failed: {e}")))?;
-        let branch_graph = GraphStore::init(&branch_data_dir.join("graph"))
-            .map_err(|e| Error::GraphStorage(format!("branch graph init failed: {e}")))?;
+        let target_graph = GraphStore::init(&target_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("target graph init failed: {e}")))?;
+        let source_graph = GraphStore::init(&source_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("source graph init failed: {e}")))?;
 
-        let mut diff = compute_diff(
-            &main_graph,
-            &branch_graph,
-            branch_name,
+        let mut diff = compute_diff_into(
+            &target_graph,
+            &source_graph,
+            source_branch_name,
+            target_branch,
             merge_cfg.auto_resolve_threshold,
             merge_cfg.max_health_drop,
             merge_cfg.block_on_contradictions,
@@ -2318,15 +2442,22 @@ Rules: \
         // Drop the separate GraphStore handle on main *before* executing the
         // merge so `execute_merge` can take its own handle to `graph.db`
         // (some SQLite configurations serialize writers).
-        drop(main_graph);
-        drop(branch_graph);
+        drop(target_graph);
+        drop(source_graph);
 
-        execute_merge(root, branch_name, &diff, merged_by, propagate_deletions).await?;
+        execute_merge_into(
+            root,
+            source_branch_name,
+            target_branch,
+            &diff,
+            merged_by,
+            propagate_deletions,
+        )
+        .await?;
 
-        // Reload the mounted workspace's cache so queries reflect the merge.
-        // Hold the storage mutex across reload so no concurrent writer can
-        // slip in between (same discipline as contribute_claims L1647–1656).
-        if let Some(handle) = mounted {
+        if let Some(handle) = mounted
+            && target_branch.unwrap_or("main") == "main"
+        {
             let storage = handle.storage.lock().await;
             match KnowledgeGraph::load_from_graph(&storage.graph) {
                 Ok(new_cache) => {
@@ -2338,6 +2469,12 @@ Rules: \
             }
         }
 
+        if let Some(target_branch_name) = target_branch.filter(|b| *b != "main") {
+            self.branch_engines
+                .invalidate(root, target_branch_name)
+                .await;
+        }
+
         Ok(diff)
     }
 
@@ -2345,9 +2482,38 @@ Rules: \
     /// branch from the engine cache so stale handles can't serve reads
     /// against an Abandoned entry.
     pub async fn delete_branch(&self, root: &std::path::Path, branch_name: &str) -> Result<()> {
+        self.delete_branch_as(root, branch_name, BranchActor::System)
+            .await
+    }
+
+    pub async fn delete_branch_as(
+        &self,
+        root: &std::path::Path,
+        branch_name: &str,
+        actor: BranchActor,
+    ) -> Result<()> {
+        let branch_ref = Self::branch_ref_for_root(root, branch_name)?;
+        Self::ensure_branch_permission(&actor, branch_ref.as_ref(), "delete_branch")?;
         self.branch_engines.invalidate(root, branch_name).await;
         thinkingroot_branch::delete_branch(root, branch_name)
             .map_err(|e| Error::GraphStorage(format!("delete_branch failed: {e}")))
+    }
+
+    pub async fn rebase_branch(
+        &self,
+        root: &std::path::Path,
+        branch_name: &str,
+        actor: BranchActor,
+    ) -> Result<thinkingroot_core::KnowledgeDiff> {
+        let branch_ref = Self::branch_ref_for_root(root, branch_name)?;
+        Self::ensure_branch_permission(&actor, branch_ref.as_ref(), "rebase_branch")?;
+
+        let diff = thinkingroot_branch::rebase_branch(root, branch_name)
+            .await
+            .map_err(|e| Error::GraphStorage(format!("rebase_branch failed: {e}")))?;
+
+        self.branch_engines.invalidate(root, branch_name).await;
+        Ok(diff)
     }
 
     /// Garbage-collect all Abandoned branches (hard-delete their data dirs).
@@ -2705,10 +2871,7 @@ mod source_kind_tests {
             source_kind_from_uri("https://x.com/foo.json?token=abc", "api"),
             "json"
         );
-        assert_eq!(
-            source_kind_from_uri("file:///doc.md#anchor", "doc"),
-            "md"
-        );
+        assert_eq!(source_kind_from_uri("file:///doc.md#anchor", "doc"), "md");
     }
 }
 

@@ -27,9 +27,7 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::engine::QueryEngine;
 use crate::intelligence::agent::{Agent, AgentEvent, AgentRequest, LlmBackend};
-use crate::intelligence::approval::{
-    PendingApprovalMap, ToolApprovalRouter,
-};
+use crate::intelligence::approval::{PendingApprovalMap, ToolApprovalRouter};
 use crate::intelligence::builtin_tools::{ToolContext, register_builtin_tools};
 use crate::intelligence::session::SessionStore;
 use crate::intelligence::skills::SkillRegistry;
@@ -159,10 +157,9 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
             "tool_call_rejected",
             json!({"id": id, "name": name, "reason": reason}),
         ),
-        AgentEvent::ToolCallExecuting { id, name } => (
-            "tool_call_executing",
-            json!({"id": id, "name": name}),
-        ),
+        AgentEvent::ToolCallExecuting { id, name } => {
+            ("tool_call_executing", json!({"id": id, "name": name}))
+        }
         AgentEvent::ToolCallFinished {
             id,
             name,

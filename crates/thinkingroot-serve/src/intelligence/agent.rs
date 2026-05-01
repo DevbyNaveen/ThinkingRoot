@@ -32,10 +32,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use thinkingroot_core::{Error, Result};
 use thinkingroot_extract::llm::{
     ChatMessage, LlmClient, Tool, ToolCall, ToolChoice, ToolResult, ToolUseResponse,
 };
-use thinkingroot_core::{Error, Result};
 use tokio::sync::mpsc;
 
 use crate::intelligence::approval::{ApprovalDecision, ApprovalGate};
@@ -307,11 +307,18 @@ impl Agent {
             };
 
             match response {
-                ToolUseResponse::Text { text, truncated, .. } => {
+                ToolUseResponse::Text {
+                    text, truncated, ..
+                } => {
                     if !text.is_empty() {
                         accumulated_text.push_str(&text);
-                        self.emit(sink, AgentEvent::Text { content: text.clone() })
-                            .await;
+                        self.emit(
+                            sink,
+                            AgentEvent::Text {
+                                content: text.clone(),
+                            },
+                        )
+                        .await;
                     }
                     if truncated {
                         self.emit(
@@ -822,11 +829,7 @@ mod tests {
         }
         #[async_trait]
         impl ApprovalGate for RecordingGate {
-            async fn check(
-                &self,
-                tool_name: &str,
-                _input: &serde_json::Value,
-            ) -> ApprovalDecision {
+            async fn check(&self, tool_name: &str, _input: &serde_json::Value) -> ApprovalDecision {
                 self.checks.lock().unwrap().push(tool_name.to_string());
                 ApprovalDecision::Approved
             }
@@ -925,9 +928,12 @@ mod tests {
             .events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::ToolCallFinished { name, content, is_error, .. } => {
-                    Some((name.as_str(), content.as_str(), *is_error))
-                }
+                AgentEvent::ToolCallFinished {
+                    name,
+                    content,
+                    is_error,
+                    ..
+                } => Some((name.as_str(), content.as_str(), *is_error)),
                 _ => None,
             })
             .expect("expected a ToolCallFinished event");
@@ -1144,8 +1150,7 @@ mod tests {
             },
         ]));
         let trace = Arc::new(InMemoryTraceLog::new());
-        let agent = Agent::new(llm, registry, Arc::new(AutoApprove))
-            .with_trace_log(trace.clone());
+        let agent = Agent::new(llm, registry, Arc::new(AutoApprove)).with_trace_log(trace.clone());
 
         let req = AgentRequest {
             system: "sys".to_string(),
@@ -1194,8 +1199,7 @@ mod tests {
             },
         ]));
         let trace = Arc::new(InMemoryTraceLog::new());
-        let agent =
-            Agent::new(llm, registry, Arc::new(DenyAll)).with_trace_log(trace.clone());
+        let agent = Agent::new(llm, registry, Arc::new(DenyAll)).with_trace_log(trace.clone());
 
         let req = AgentRequest {
             system: "sys".to_string(),

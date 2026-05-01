@@ -265,7 +265,16 @@ async fn maybe_auto_create_branch(
 
     // ── 5. Create the stream branch (idempotent — ignore "already exists") ────
     let branch_name = format!("stream/{session_id}");
-    match thinkingroot_branch::create_branch(&root, &branch_name, "main", None).await {
+    match thinkingroot_branch::create_branch_with_owner(
+        &root,
+        &branch_name,
+        "main",
+        None,
+        Some(session_id.to_string()),
+        thinkingroot_core::BranchPermissions::default(),
+    )
+    .await
+    {
         Ok(_) => {
             tracing::info!(
                 session_id,
@@ -286,6 +295,9 @@ async fn maybe_auto_create_branch(
     // ── 6. Set the branch on the session ─────────────────────────────────────
     let mut store = sessions.lock().await;
     if let Some(session) = store.get_mut(session_id) {
+        if session.owner.is_none() {
+            session.set_owner(session_id.to_string());
+        }
         session.set_branch(branch_name);
     }
 }

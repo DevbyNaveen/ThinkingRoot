@@ -133,12 +133,12 @@ pub fn read_v3_pack(bytes: &[u8]) -> Result<V3Pack> {
     let manifest = ManifestV3::parse(&manifest_bytes)?;
 
     let signature = match signature_bytes {
-        Some(bytes) => Some(serde_json::from_slice::<SigstoreBundle>(&bytes).map_err(|e| {
-            Error::Invalid {
+        Some(bytes) => Some(
+            serde_json::from_slice::<SigstoreBundle>(&bytes).map_err(|e| Error::Invalid {
                 what: "signature.sig",
                 detail: format!("Sigstore bundle parse: {e}"),
-            }
-        })?),
+            })?,
+        ),
         None => None,
     };
 

@@ -152,12 +152,7 @@ mod tests {
         let docs = parse_directory(tmp.path(), &cfg()).expect("parse_directory");
         let mut uris: Vec<&str> = docs
             .iter()
-            .filter_map(|d| {
-                d.uri
-                    .rsplit('/')
-                    .next()
-                    .filter(|n| n.ends_with(".md"))
-            })
+            .filter_map(|d| d.uri.rsplit('/').next().filter(|n| n.ends_with(".md")))
             .collect();
         // The git-log path may also append docs; drop them so we only
         // assert the file-order invariant.

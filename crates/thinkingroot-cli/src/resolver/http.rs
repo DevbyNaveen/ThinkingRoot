@@ -6,7 +6,7 @@
 //! [`HttpRegistryResolver`] adds the discovery-doc → download-URL →
 //! BLAKE3 cross-check flow against `{owner}/{slug}@{version}`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use tr_format::digest::blake3_hex;
 
@@ -131,7 +131,9 @@ impl PackResolver for HttpRegistryResolver {
             .ok_or_else(|| anyhow!("registry doc missing endpoints.download"))?;
         // Default max-pack-bytes when the discovery doc doesn't override.
         // 100 MiB matches the v3 spec §6.4 single-pack ceiling.
-        let max_bytes = disco["max_pack_bytes"].as_u64().unwrap_or(100 * 1024 * 1024);
+        let max_bytes = disco["max_pack_bytes"]
+            .as_u64()
+            .unwrap_or(100 * 1024 * 1024);
 
         // 2. Build the download URL by template substitution.
         let download_path = pattern

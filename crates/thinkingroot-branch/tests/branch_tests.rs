@@ -41,6 +41,7 @@ fn resolve_data_dir_branch() {
 
 use tempfile::tempdir;
 use thinkingroot_branch::branch::{BranchRegistry, read_head, write_head};
+use thinkingroot_core::BranchPermissions;
 
 #[test]
 fn registry_create_and_list() {
@@ -101,6 +102,34 @@ fn registry_persists_across_loads() {
     assert_eq!(branches.len(), 1);
     assert_eq!(branches[0].name, "feature/y");
     assert_eq!(branches[0].description, Some("test desc".to_string()));
+}
+
+#[test]
+fn registry_persists_owner_and_permissions() {
+    let dir = tempdir().unwrap();
+    let refs_dir = dir.path().join(".thinkingroot-refs");
+    std::fs::create_dir_all(&refs_dir).unwrap();
+
+    {
+        let mut reg = BranchRegistry::load_or_create(&refs_dir).unwrap();
+        reg.create_branch_with_owner(
+            "feature/secure",
+            "main",
+            None,
+            Some("alice".to_string()),
+            BranchPermissions {
+                readers: vec!["reader".to_string()],
+                writers: vec!["writer".to_string()],
+                mergers: vec!["merger".to_string()],
+            },
+        )
+        .unwrap();
+    }
+
+    let reg2 = BranchRegistry::load_or_create(&refs_dir).unwrap();
+    let branch = reg2.get("feature/secure").unwrap();
+    assert_eq!(branch.owner.as_deref(), Some("alice"));
+    assert_eq!(branch.permissions.writers, vec!["writer"]);
 }
 
 #[test]

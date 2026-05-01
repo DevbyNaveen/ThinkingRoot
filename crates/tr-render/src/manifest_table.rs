@@ -12,10 +12,7 @@ pub(crate) fn format(pack: &V3Pack) -> String {
         ("name", m.name.clone()),
         ("version", m.version.to_string()),
         ("format", m.format_version.clone()),
-        (
-            "license",
-            m.license.clone().unwrap_or_else(|| "-".into()),
-        ),
+        ("license", m.license.clone().unwrap_or_else(|| "-".into())),
         ("pack_hash", short_hash(&m.pack_hash)),
         ("source_hash", short_hash(&m.source_hash)),
         ("claims_hash", short_hash(&m.claims_hash)),
@@ -66,21 +63,18 @@ pub(crate) fn format(pack: &V3Pack) -> String {
     let _ = writeln!(
         out,
         "{:<key_width$}  {:<val_width$}",
-        "key", "value",
+        "key",
+        "value",
         key_width = key_width,
         val_width = val_width
     );
-    let _ = writeln!(
-        out,
-        "{}  {}",
-        "-".repeat(key_width),
-        "-".repeat(val_width)
-    );
+    let _ = writeln!(out, "{}  {}", "-".repeat(key_width), "-".repeat(val_width));
     for (k, v) in rows {
         let _ = writeln!(
             out,
             "{:<key_width$}  {:<val_width$}",
-            k, v,
+            k,
+            v,
             key_width = key_width,
             val_width = val_width
         );

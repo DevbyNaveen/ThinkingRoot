@@ -36,8 +36,8 @@ pub fn run(path: &Path) -> Result<()> {
         );
     }
 
-    let config = Config::load_merged(path)
-        .with_context(|| format!("load config at {}", path.display()))?;
+    let config =
+        Config::load_merged(path).with_context(|| format!("load config at {}", path.display()))?;
     let graph = GraphStore::init(&engine_dir)
         .with_context(|| format!("open graph at {}", engine_dir.display()))?;
 
