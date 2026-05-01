@@ -156,6 +156,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/galaxy", get(get_galaxy))
             .route("/ws/{ws}/compile", post(compile))
+            .route("/ws/{ws}/compile/stream", post(compile_stream))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
             .route(
@@ -436,6 +437,171 @@ async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> 
         Ok(result) => ok_response(result).into_response(),
         Err(e) => match_engine_error(e),
     }
+}
+
+// ─── Streaming compile (P4 / H5) ─────────────────────────────
+//
+// `POST /api/v1/ws/{ws}/compile/stream` runs the v3 pipeline in this
+// process and streams every `ProgressEvent` to the client as an SSE
+// frame, plus a single `done`/`failed`/`cancelled` terminator.  Used
+// by the desktop to route compile through the managed sidecar so the
+// desktop process is never the writer of `graph.db` — pre-fix the
+// in-process compile froze the desktop's Brain view because both the
+// pipeline (writer) and `MountedMemory` (reader) shared the desktop's
+// CozoDB instance.
+//
+// The handler doesn't go through `QueryEngine::compile` — that path
+// requires the workspace to be mounted in this server's engine and
+// does its own cache reload.  The desktop's sidecar is launched
+// without `--path` args (workspaces are managed via the registry,
+// not CLI flags), so we run `run_pipeline_with_options` directly
+// against the explicit `root_path` from the request body.  This
+// keeps the contract simple: the client tells the server what to
+// compile; the server doesn't need its own mount table.
+//
+// Cancellation is wired via a `CancellationToken` whose
+// `DropGuard` lives inside the SSE stream.  When the client
+// disconnects, axum drops the response body future, the guard
+// drops, the token trips, and the running pipeline exits at the
+// next phase boundary with `Error::Cancelled` (which we surface
+// as a `cancelled` SSE event for callers that race the disconnect).
+#[derive(Debug, Deserialize)]
+struct CompileStreamRequest {
+    /// Absolute path to the workspace root.  Required when this
+    /// server was started without `--path`; defaults to
+    /// `state.workspace_root` otherwise.
+    root_path: Option<String>,
+    /// Optional branch — `None` resolves to the active head.
+    branch: Option<String>,
+    /// Skip Phase 6.5 (Rooting admission gate).  Mirrors
+    /// `PipelineOptions::no_rooting` and the CLI's `--no-rooting`
+    /// flag.
+    #[serde(default)]
+    no_rooting: bool,
+}
+
+async fn compile_stream(
+    State(state): State<Arc<AppState>>,
+    Path(_ws): Path<String>,
+    Json(body): Json<CompileStreamRequest>,
+) -> Response {
+    use crate::pipeline::{PipelineOptions, ProgressEvent, run_pipeline_with_options};
+    use tokio_util::sync::CancellationToken;
+
+    let root_path = match (body.root_path.as_deref(), state.workspace_root.as_ref()) {
+        (Some(p), _) => PathBuf::from(p),
+        (None, Some(r)) => r.clone(),
+        (None, None) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "MISSING_ROOT_PATH",
+                "request body must include root_path when the server has no --path arg",
+            );
+        }
+    };
+
+    if !root_path.is_dir() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "ROOT_PATH_NOT_DIR",
+            &format!("root_path is not a directory: {}", root_path.display()),
+        );
+    }
+
+    let branch = body.branch.clone();
+    let no_rooting = body.no_rooting;
+
+    // The DropGuard fires the cancel token when the SSE stream is
+    // dropped (client disconnect, axum body cancellation, etc.).
+    // The pipeline task receives the same token and bails at the
+    // next phase boundary.
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+    let drop_guard = cancel.drop_guard();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+    let root_for_task = root_path.clone();
+
+    let pipeline_handle = tokio::spawn(async move {
+        run_pipeline_with_options(
+            &root_for_task,
+            branch.as_deref(),
+            Some(tx),
+            PipelineOptions {
+                cancel: cancel_for_task,
+                no_rooting,
+            },
+        )
+        .await
+    });
+
+    let stream = async_stream::stream! {
+        // Keep the drop guard alive for the lifetime of the stream.
+        // Dropping it (client disconnect / response cancel) trips
+        // the pipeline's CancellationToken — that's the cleanup
+        // path that turns "user closed the modal" into "stop the
+        // pipeline cleanly" without requiring an explicit
+        // cancel-by-id route.
+        let _guard = drop_guard;
+        let mut handle = Some(pipeline_handle);
+
+        while let Some(event) = rx.recv().await {
+            let payload = match serde_json::to_string(&event) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Should not happen — every ProgressEvent variant
+                    // is composed of primitives. If it does, surface
+                    // the error rather than silently swallowing the
+                    // event so the desktop can show a real failure
+                    // instead of an incomplete progress stream.
+                    let payload = serde_json::json!({
+                        "error": format!("progress event encode failed: {e}"),
+                    })
+                    .to_string();
+                    yield Ok::<Event, std::convert::Infallible>(
+                        Event::default().event("failed").data(payload),
+                    );
+                    return;
+                }
+            };
+            yield Ok(Event::default().event("progress").data(payload));
+        }
+
+        // Channel closed → the pipeline task has finished. Await
+        // its outcome and emit a single terminator event.
+        if let Some(h) = handle.take() {
+            match h.await {
+                Ok(Ok(result)) => {
+                    let payload = serde_json::to_string(&result)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(Event::default().event("done").data(payload));
+                }
+                Ok(Err(e)) if e.is_cancelled() => {
+                    yield Ok(Event::default().event("cancelled").data("{}"));
+                }
+                Ok(Err(e)) => {
+                    let payload =
+                        serde_json::json!({ "error": e.to_string() }).to_string();
+                    yield Ok(Event::default().event("failed").data(payload));
+                }
+                Err(e) => {
+                    let payload = serde_json::json!({
+                        "error": format!("pipeline task panicked: {e}"),
+                    })
+                    .to_string();
+                    yield Ok(Event::default().event("failed").data(payload));
+                }
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 async fn verify_ws(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {

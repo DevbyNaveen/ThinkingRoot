@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
-use thinkingroot_serve::pipeline::{ProgressEvent, run_pipeline_with_cancel};
+use thinkingroot_serve::pipeline::{
+    PipelineResult, ProgressEvent, run_pipeline_with_cancel,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -281,34 +283,50 @@ pub async fn workspace_compile(
             },
         );
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
-        let app_for_progress = app_for_task.clone();
-        let label_for_progress = label_for_task.clone();
-        let pump = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                let mapped = map_progress(&label_for_progress, event);
-                if let Some(payload) = mapped {
-                    let _ = app_for_progress.emit("workspace_compile_progress", payload);
-                }
-            }
-        });
+        // P4 (H5): prefer the sidecar so the desktop process is never
+        // the writer of `graph.db`.  When the sidecar handle is
+        // populated (the bundled `root` binary spawned successfully),
+        // route compile through the sidecar's SSE compile/stream
+        // endpoint; otherwise fall back to in-process so the desktop
+        // still works on machines where the sidecar binary failed to
+        // resolve (the warning in agent_runtime_subprocess::spawn).
+        let sidecar = {
+            let state = app_for_task.state::<AppState>();
+            let guard = state.sidecar.lock().await;
+            guard
+                .as_ref()
+                .map(|h| (h.host.clone(), h.port))
+        };
 
-        let outcome = run_pipeline_with_cancel(
-            &path_for_task,
-            branch.as_deref(),
-            Some(tx),
-            cancel_for_task,
-        )
-        .await;
-
-        // Drop the sender side by waiting for the pump to drain — we
-        // already moved `tx` into `run_pipeline`, so the channel closes
-        // when run_pipeline returns. The pump task exits its loop when
-        // recv() yields None.
-        let _ = pump.await;
+        let outcome = if let Some((host, port)) = sidecar {
+            drive_compile_via_sidecar(
+                app_for_task.clone(),
+                host,
+                port,
+                path_for_task.clone(),
+                label_for_task.clone(),
+                branch.clone(),
+                cancel_for_task.clone(),
+            )
+            .await
+        } else {
+            tracing::warn!(
+                workspace = %label_for_task,
+                "sidecar unavailable — falling back to in-process compile",
+            );
+            drive_compile_in_process(
+                app_for_task.clone(),
+                path_for_task.clone(),
+                label_for_task.clone(),
+                branch.clone(),
+                cancel_for_task.clone(),
+            )
+            .await
+        };
 
         match outcome {
             Ok(result) => {
+                let cache_dirty = result.cache_dirty;
                 let _ = app_for_task.emit(
                     "workspace_compile_progress",
                     CompileProgress::Done {
@@ -319,30 +337,40 @@ pub async fn workspace_compile(
                         contradictions: result.contradictions_count,
                         artifacts: result.artifacts_count,
                         health_score: result.health_score,
-                        cache_dirty: result.cache_dirty,
+                        cache_dirty,
                         failed_batches: result.failed_batches,
                         failed_chunk_ranges: result.failed_chunk_ranges.clone(),
                     },
                 );
+                // P4 / H6: only drop the desktop's MountedMemory when
+                // the pipeline actually wrote.  A noop compile (every
+                // file fingerprint-identical) leaves the cached engine
+                // valid — re-mounting would burn the QueryEngine
+                // construction cost for nothing.  When cache_dirty is
+                // true the mounted engine's connection-level views are
+                // stale; dropping it forces the next memory_list /
+                // brain_load to remount fresh against the post-compile
+                // graph.db.
+                if cache_dirty {
+                    let state = app_for_task.state::<AppState>();
+                    let mut guard = state.memory.lock().await;
+                    *guard = None;
+                }
             }
-            Err(e) if e.is_cancelled() => {
+            Err(CompileDriveError::Cancelled) => {
                 let _ = app_for_task
                     .emit("workspace_compile_progress", CompileProgress::Cancelled);
             }
-            Err(e) => {
+            Err(CompileDriveError::Failed(msg)) => {
                 let _ = app_for_task.emit(
                     "workspace_compile_progress",
-                    CompileProgress::Failed {
-                        error: e.to_string(),
-                    },
+                    CompileProgress::Failed { error: msg },
                 );
             }
         }
 
         // Compile is over — clear the active-compile slot so a
-        // subsequent click of "Compile" can start fresh.  Done in a
-        // separate scope so the lock is held only while taking the
-        // handle.
+        // subsequent click of "Compile" can start fresh.
         let state = app_for_task.state::<AppState>();
         let mut guard = state.active_compile.lock().await;
         *guard = None;
@@ -350,6 +378,201 @@ pub async fn workspace_compile(
 
     Ok(workspace_label)
 }
+
+/// Outcome distinct from a raw `Result<PipelineResult, String>` so the
+/// dispatcher can differentiate user-initiated cancellation (mapped to
+/// the neutral `Cancelled` UI state) from a real pipeline failure.
+enum CompileDriveError {
+    Cancelled,
+    Failed(String),
+}
+
+/// In-process pipeline driver — the pre-P4 behaviour.  Used when the
+/// sidecar handle is `None` (the bundled `root` binary failed to
+/// resolve at startup).  Pumps `ProgressEvent`s through the same
+/// mapper the SSE driver uses so the UI sees identical events
+/// regardless of which path actually ran the pipeline.
+async fn drive_compile_in_process(
+    app: AppHandle,
+    path: PathBuf,
+    label: String,
+    branch: Option<String>,
+    cancel: CancellationToken,
+) -> Result<PipelineResult, CompileDriveError> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
+    let app_for_progress = app.clone();
+    let label_for_progress = label.clone();
+    let pump = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Some(payload) = map_progress(&label_for_progress, event) {
+                let _ = app_for_progress.emit("workspace_compile_progress", payload);
+            }
+        }
+    });
+
+    let outcome =
+        run_pipeline_with_cancel(&path, branch.as_deref(), Some(tx), cancel).await;
+    let _ = pump.await;
+
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(e) if e.is_cancelled() => Err(CompileDriveError::Cancelled),
+        Err(e) => Err(CompileDriveError::Failed(e.to_string())),
+    }
+}
+
+/// Sidecar pipeline driver — POST `/api/v1/ws/{ws}/compile/stream`,
+/// parse the SSE stream, fan progress out to the UI, and yield the
+/// final `PipelineResult`.  The same `CancellationToken` plumbed
+/// through `AppState.active_compile` is honoured here: when tripped,
+/// we drop the response body (which trips the server-side DropGuard
+/// that owns the pipeline's cancel token) and surface
+/// `CompileDriveError::Cancelled` to the dispatcher.
+async fn drive_compile_via_sidecar(
+    app: AppHandle,
+    host: String,
+    port: u16,
+    path: PathBuf,
+    label: String,
+    branch: Option<String>,
+    cancel: CancellationToken,
+) -> Result<PipelineResult, CompileDriveError> {
+    use eventsource_stream::Eventsource;
+    use futures::StreamExt;
+
+    let url = format!(
+        "http://{host}:{port}/api/v1/ws/desktop/compile/stream"
+    );
+    let body = serde_json::json!({
+        "root_path": path.display().to_string(),
+        "branch": branch,
+        "no_rooting": false,
+    });
+
+    let client = reqwest::Client::new();
+    // Per-request timeout is intentionally absent — compiles legitimately
+    // run for minutes on first-time large workspaces.  The streaming
+    // SSE response keeps the connection alive via the server's
+    // KeepAlive `keep-alive` events; reqwest's connection-pool idle
+    // timeout never fires while bytes are flowing.
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(CompileDriveError::Failed(format!(
+                "sidecar compile request failed: {e}"
+            )));
+        }
+    };
+
+    if !resp.status().is_success() {
+        // Pull the body so the caller sees the engine's own error
+        // envelope (`{"ok":false,"error":{"code":...}}`) rather than
+        // the bare HTTP status code.
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(CompileDriveError::Failed(format!(
+            "sidecar compile returned HTTP {status}: {body}"
+        )));
+    }
+
+    let mut stream = resp.bytes_stream().eventsource();
+    let mut final_result: Option<PipelineResult> = None;
+    let mut error: Option<String> = None;
+    let mut cancelled = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Drop the stream → reqwest closes the body → axum
+                // detects the disconnect → server-side DropGuard
+                // fires → pipeline exits.  We don't wait for the
+                // "cancelled" SSE terminator here because the user
+                // wants the UI to react immediately.
+                cancelled = true;
+                break;
+            }
+            ev = stream.next() => {
+                match ev {
+                    None => break,
+                    Some(Ok(event)) => {
+                        match event.event.as_str() {
+                            "progress" => {
+                                match serde_json::from_str::<ProgressEvent>(&event.data) {
+                                    Ok(pe) => {
+                                        if let Some(payload) = map_progress(&label, pe) {
+                                            let _ = app.emit(
+                                                "workspace_compile_progress",
+                                                payload,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            data = %event.data,
+                                            "failed to deserialise progress event from sidecar — skipping"
+                                        );
+                                    }
+                                }
+                            }
+                            "done" => {
+                                match serde_json::from_str::<PipelineResult>(&event.data) {
+                                    Ok(pr) => final_result = Some(pr),
+                                    Err(e) => {
+                                        error = Some(format!(
+                                            "sidecar emitted malformed done payload: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            "cancelled" => {
+                                cancelled = true;
+                            }
+                            "failed" => {
+                                let msg = serde_json::from_str::<serde_json::Value>(
+                                    &event.data,
+                                )
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error")
+                                        .and_then(|e| e.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| {
+                                    "sidecar compile failed (no error message)".to_string()
+                                });
+                                error = Some(msg);
+                            }
+                            // Keep-alive comments and unknown event
+                            // types are ignored — keeps the stream
+                            // forward-compatible if the engine ever
+                            // adds new event variants.
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error = Some(format!("SSE stream error: {e}"));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if cancelled {
+        return Err(CompileDriveError::Cancelled);
+    }
+    if let Some(err) = error {
+        return Err(CompileDriveError::Failed(err));
+    }
+    final_result.ok_or_else(|| {
+        CompileDriveError::Failed(
+            "sidecar SSE stream ended without `done` event".to_string(),
+        )
+    })
+}
+
 
 /// Stop an in-progress compile.  Returns `true` when a compile was
 /// active and the cancellation token was tripped; `false` when no

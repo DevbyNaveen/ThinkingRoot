@@ -11,7 +11,14 @@ use tokio_util::sync::CancellationToken;
 /// Events emitted by the pipeline to drive CLI progress bars.
 /// Sent via `tokio::sync::mpsc::UnboundedSender<ProgressEvent>`.
 /// The CLI bar-driver task consumes these and renders indicatif bars.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived so the SSE compile route in
+/// `rest.rs::compile_stream` can wire-encode each event as a JSON SSE
+/// frame and the desktop sidecar consumer can deserialise back into
+/// the same enum without a parallel wire vocabulary.  Wire shape:
+/// `{"kind":"parse_complete","files":12}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// Parsing is about to begin. Emitted immediately before `parse_directory`
     /// so the bar driver can start its clock at the same instant the pipeline
@@ -127,7 +134,7 @@ pub enum ProgressEvent {
     PipelineFailed { error: String },
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineResult {
     pub files_parsed: usize,
     pub claims_count: usize,
