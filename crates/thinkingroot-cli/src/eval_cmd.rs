@@ -339,8 +339,15 @@ pub async fn run_eval(
         let response = ask(&engine, synthesis_llm.clone(), &ask_req).await;
         let predicted = response.answer;
 
-        let correct =
-            judge_answer(&judge_llm, &q.question, &q.answer, &predicted, &q.category).await;
+        let correct = judge_answer(
+            &judge_llm,
+            &q.question,
+            &q.answer,
+            &predicted,
+            &q.category,
+            config.llm.request_timeout_secs,
+        )
+        .await;
 
         let stats = category_stats.entry(q.category.clone()).or_default();
         stats.total += 1;
@@ -454,6 +461,7 @@ async fn judge_answer(
     ground_truth: &str,
     predicted: &str,
     category: &str,
+    request_timeout_secs: u64,
 ) -> bool {
     // Fast path: abstention match
     let gt_l = ground_truth.to_lowercase();
@@ -503,8 +511,16 @@ async fn judge_answer(
         };
 
         let chat_fut = j.chat(system, &user_msg);
-        if let Ok(Ok(resp)) =
-            tokio::time::timeout(std::time::Duration::from_secs(45), chat_fut).await
+        // Honour the workspace's `request_timeout_secs` (CLAUDE.md
+        // audit invariant: never hardcode timeouts at the call
+        // site). Pre-fix the 45s literal silently truncated slow
+        // judge calls on Bedrock cross-region / Ollama / OpenRouter
+        // under load and corrupted the LongMemEval accuracy figure.
+        if let Ok(Ok(resp)) = tokio::time::timeout(
+            std::time::Duration::from_secs(request_timeout_secs),
+            chat_fut,
+        )
+        .await
         {
             return resp.trim().starts_with('1');
         }

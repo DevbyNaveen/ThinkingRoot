@@ -118,8 +118,18 @@ pub struct WorkspaceSetActiveArgs {
 /// Mark a registered workspace as the one chat / brain / privacy commands
 /// resolve to. Persists into the shared `WorkspaceRegistry.active` pointer
 /// — single source of truth.
+///
+/// Drops the cached [`MountedMemory`] so the next memory read remounts
+/// against the new workspace's data directory. Pre-fix the in-process
+/// `MountedMemory` survived the registry change; calls to `brain_load`
+/// or `memory_list` immediately after switching workspaces saw the
+/// previous workspace's claims for the duration of the cache lifetime.
 #[tauri::command]
-pub fn workspace_set_active(args: WorkspaceSetActiveArgs) -> Result<String, String> {
+pub async fn workspace_set_active(
+    app: tauri::AppHandle,
+    args: WorkspaceSetActiveArgs,
+) -> Result<String, String> {
+    use tauri::Manager;
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
     let abs = registry
         .workspaces
@@ -131,6 +141,15 @@ pub fn workspace_set_active(args: WorkspaceSetActiveArgs) -> Result<String, Stri
         .set_active(&args.name)
         .map_err(|e| e.to_string())?;
     registry.save().map_err(|e| e.to_string())?;
+
+    // Invalidate the desktop's cached MountedMemory so the next read
+    // remounts against the freshly-active workspace.  Same pattern
+    // the dirty-compile path uses (see `workspace_compile`).
+    let state = app.state::<crate::state::AppState>();
+    let mut guard = state.memory.lock().await;
+    *guard = None;
+    drop(guard);
+
     Ok(abs)
 }
 
@@ -482,17 +501,18 @@ async fn drive_compile_via_sidecar(
     // KeepAlive `keep-alive` events; reqwest's connection-pool idle
     // timeout never fires while bytes are flowing.
     //
-    // Retry up to 3 times with 2-second backoff in case the sidecar is
-    // still booting (CozoDB mount can take a few seconds even after the
-    // HTTP listener binds, and the readiness probe in spawn() polls
-    // /livez which returns OK as soon as axum starts — before all
-    // workspace mounts have completed). Transient ECONNREFUSED or
-    // ECONNRESET errors during startup are the primary failure mode
-    // surfaced as "sidecar compile request failed".
+    // Retry up to MAX_COMPILE_RETRIES times with 2-second backoff in
+    // case the sidecar is still booting (CozoDB mount can take a few
+    // seconds even after the HTTP listener binds, and the readiness
+    // probe in spawn() polls /livez which returns OK as soon as axum
+    // starts — before all workspace mounts have completed). Transient
+    // ECONNREFUSED or ECONNRESET errors during startup are the primary
+    // failure mode surfaced as "sidecar compile request failed".
+    const MAX_COMPILE_RETRIES: u8 = 5;
     let resp = {
         let mut last_err: Option<reqwest::Error> = None;
         let mut result = None;
-        for attempt in 0u8..5 {
+        for attempt in 0u8..MAX_COMPILE_RETRIES {
             if attempt > 0 {
                 tracing::warn!(
                     attempt,
@@ -516,7 +536,7 @@ async fn drive_compile_via_sidecar(
             Some(r) => r,
             None => {
                 return Err(CompileDriveError::Failed(format!(
-                    "sidecar compile request failed after 3 attempts: {}",
+                    "sidecar compile request failed after {MAX_COMPILE_RETRIES} attempts: {}",
                     last_err.unwrap()
                 )));
             }

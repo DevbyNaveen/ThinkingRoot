@@ -1469,9 +1469,17 @@ impl QueryEngine {
                 storage.graph.search_claims(query)?
             };
             for (cid, stmt, ctype, conf, uri) in kw_claims {
-                let in_scope = allowed_source_ids
-                    .iter()
-                    .any(|sid| uri.contains(sid.as_str()));
+                // Mirror the vector-phase scope rule above: an empty
+                // `allowed_source_ids` means "no scope filter" and
+                // every claim is admitted.  Pre-fix the keyword
+                // fallback used `iter().any(...)` which is `false`
+                // for an empty iterator — so unscoped queries that
+                // fell below `top_k` vector hits silently lost
+                // recall on sparse workspaces.
+                let in_scope = allowed_source_ids.is_empty()
+                    || allowed_source_ids
+                        .iter()
+                        .any(|sid| uri.contains(sid.as_str()));
                 if in_scope && seen_claim_ids.insert(cid.clone()) {
                     claim_hits.push(ClaimSearchHit {
                         id: cid,

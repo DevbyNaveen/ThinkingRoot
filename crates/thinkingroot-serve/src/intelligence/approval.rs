@@ -249,16 +249,40 @@ impl ApprovalGate for ToolApprovalRouter {
             guard.insert(id.clone(), reply_tx);
         }
 
-        match reply_rx.await {
-            Ok(decision) => decision,
-            Err(_) => {
+        // Hard cap on how long we wait for a human decision.  Pre-fix
+        // a never-arriving approval (network drop after the prompt
+        // was rendered, client crash, frontend bug) would stall the
+        // agent's `dispatch_calls` task indefinitely, holding an SSE
+        // response body open and pinning a tokio worker — a small
+        // burst of these exhausts the runtime under realistic load.
+        // 5-minute window matches the typical "looking at terminal,
+        // about to click" budget; longer is operator-tunable by
+        // re-prompting.
+        const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        let result = tokio::time::timeout(APPROVAL_TIMEOUT, reply_rx).await;
+        match result {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(_)) => {
                 // Sender dropped without firing — most often because
                 // the user closed the conversation before answering.
-                // Clean the stale entry and report a rejection.
                 let mut guard = self.pending.lock().await;
                 guard.remove(&id);
                 ApprovalDecision::Rejected {
                     reason: "approval channel closed before decision".to_string(),
+                }
+            }
+            Err(_elapsed) => {
+                // Timeout: the prompt is still in `pending` (no one
+                // resolved it).  Drop the entry so a follow-up post
+                // for the same `id` doesn't hit a dead receiver, and
+                // surface the timeout as a rejection.
+                let mut guard = self.pending.lock().await;
+                guard.remove(&id);
+                ApprovalDecision::Rejected {
+                    reason: format!(
+                        "no approval received within {} seconds",
+                        APPROVAL_TIMEOUT.as_secs()
+                    ),
                 }
             }
         }

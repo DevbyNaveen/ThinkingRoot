@@ -42,7 +42,11 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     onWorkspaceCompileProgress((payload) => {
       setCompileProgress(payload);
-      if (payload.phase === "done" || payload.phase === "failed") {
+      if (
+        payload.phase === "done" ||
+        payload.phase === "failed" ||
+        payload.phase === "cancelled"
+      ) {
         setTimeout(() => setCompileProgress(null), 3000);
       }
     }).then((un) => {

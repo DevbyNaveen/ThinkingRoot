@@ -376,7 +376,14 @@ export type CompileProgress =
       health_score: number;
       cache_dirty: boolean;
     }
-  | { phase: "failed"; error: string };
+  | { phase: "failed"; error: string }
+  // The Rust `CompileProgress::Cancelled` variant fires when the user
+  // hits Stop or the SSE response is dropped mid-compile.  Without
+  // this variant the union didn't model it and the App-shell
+  // progress handler's `phase === "done" || phase === "failed"`
+  // check left the spinner spinning forever after a successful
+  // cancel.
+  | { phase: "cancelled" };
 
 export function onWorkspaceCompileProgress(
   handler: (payload: CompileProgress) => void,
