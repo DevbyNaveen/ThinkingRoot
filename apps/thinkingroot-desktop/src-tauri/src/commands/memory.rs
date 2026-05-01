@@ -94,6 +94,13 @@ pub async fn brain_load(app: AppHandle) -> Result<BrainSnapshot, String> {
     let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
 
     let engine_guard = engine.read().await;
+    // P6 / H3: no SQL-side cap on the brain view.  The d3 graph
+    // needs every claim to compute correct entity-claim counts and
+    // link weights; truncating to 500 silently dropped relations and
+    // misled users who scrolled past the cliff.  The React side
+    // virtualises the rendered list, so the wire payload size is
+    // the only real constraint — and even at 100K claims that's a
+    // few MB over loopback IPC, fast enough for a one-time load.
     let claims = engine_guard
         .list_claims(
             &ws,
@@ -101,7 +108,7 @@ pub async fn brain_load(app: AppHandle) -> Result<BrainSnapshot, String> {
                 claim_type: None,
                 entity_name: None,
                 min_confidence: None,
-                limit: Some(500),
+                limit: None,
                 offset: None,
             },
         )
@@ -213,6 +220,8 @@ async fn load_claims(
     filter_type: Option<&str>,
 ) -> anyhow::Result<Vec<ClaimRow>> {
     let guard = engine.read().await;
+    // P6 / H3: no SQL-side cap.  Match brain_load — the React side
+    // virtualises the rendered list.
     let claims = guard
         .list_claims(
             workspace,
@@ -220,7 +229,7 @@ async fn load_claims(
                 claim_type: filter_type.map(ToString::to_string),
                 entity_name: None,
                 min_confidence: None,
-                limit: Some(500),
+                limit: None,
                 offset: None,
             },
         )
