@@ -337,16 +337,24 @@ impl Compiler {
         let contradictions: Vec<serde_json::Value> = contradictions_raw
             .iter()
             .map(|(_, claim_a_id, claim_b_id, explanation, status)| {
-                // Look up claim statements.
+                // Look up the actual claim statement for each contradiction
+                // side via `get_claim_by_id` — the right API for a
+                // claim-id lookup. Pre-fix the code called
+                // `get_claims_for_entity(claim_id)`, which always
+                // returned an empty Vec (claim_id is not an entity_id),
+                // so the contradiction report rendered raw ULIDs to
+                // the user instead of the offending statements.
                 let claim_a_stmt = graph
-                    .get_claims_for_entity(claim_a_id) // This won't find by claim ID, use a workaround
+                    .get_claim_by_id(claim_a_id)
                     .ok()
-                    .and_then(|v| v.first().map(|(_, s, _)| s.clone()))
+                    .flatten()
+                    .map(|c| c.statement.clone())
                     .unwrap_or_else(|| claim_a_id.clone());
                 let claim_b_stmt = graph
-                    .get_claims_for_entity(claim_b_id)
+                    .get_claim_by_id(claim_b_id)
                     .ok()
-                    .and_then(|v| v.first().map(|(_, s, _)| s.clone()))
+                    .flatten()
+                    .map(|c| c.statement.clone())
                     .unwrap_or_else(|| claim_b_id.clone());
 
                 serde_json::json!({

@@ -2526,13 +2526,23 @@ impl GraphStore {
 
     /// Count claims with grounding_score below a threshold.
     /// Ignores ungrounded claims (score = -1.0).
+    ///
+    /// Pure read — uses `ScriptMutability::Immutable` so the health
+    /// scorer (which calls this) doesn't acquire CozoDB's write lock
+    /// and serialise concurrent Brain reads behind it.  Pre-fix the
+    /// helper went through `self.query` which is `Mutable`, inflating
+    /// `brain_load` latency every time `root health` ran.
     pub fn count_low_grounding_claims(&self, threshold: f64) -> Result<usize> {
         let mut params = BTreeMap::new();
         params.insert("threshold".into(), DataValue::Num(Num::Float(threshold)));
-        let result = self.query(
-            "?[count(id)] := *claims{id, grounding_score: gs}, gs >= 0.0, gs < $threshold",
-            params,
-        )?;
+        let result = self
+            .db
+            .run_script(
+                "?[count(id)] := *claims{id, grounding_score: gs}, gs >= 0.0, gs < $threshold",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("count_low_grounding_claims: {e}")))?;
         Ok(count_from_rows(&result.rows))
     }
 
@@ -4196,6 +4206,15 @@ impl GraphStore {
 
     /// Return the top `limit` entities ranked by claim count.
     pub fn get_top_entities_by_claim_count(&self, limit: usize) -> Result<Vec<TopEntity>> {
+        // Push the caller's `limit` into the Datalog query so a
+        // request for `limit > 20` actually returns more than 20
+        // rows.  Pre-fix the script hardcoded `:limit 20`, which
+        // capped the server-side result regardless of `limit` and
+        // silently truncated `top entities` dashboards — same
+        // family of bug as the Brain view's pre-rewrite SQL LIMIT
+        // (CLAUDE.md "no SQL LIMIT" invariant).
+        let mut params = BTreeMap::new();
+        params.insert("lim".into(), DataValue::Num(Num::Int(limit as i64)));
         let result = self
             .db
             .run_script(
@@ -4205,8 +4224,8 @@ impl GraphStore {
                     entity_cnts[eid, cnt],
                     *entities{id: eid, canonical_name: name, entity_type}
                 :order -cnt
-                :limit 20"#,
-                BTreeMap::new(),
+                :limit $lim"#,
+                params,
                 ScriptMutability::Immutable,
             )
             .map_err(|e| Error::GraphStorage(format!("top_entities query failed: {e}")))?;
