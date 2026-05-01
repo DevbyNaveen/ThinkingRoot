@@ -275,3 +275,68 @@ async fn ops_endpoints_bypass_auth() {
         );
     }
 }
+
+// ─── SSE compile route validation (P4 / H5) ──────────────────
+//
+// The streaming compile route's validation paths run before any
+// pipeline work, so we can exercise them without spinning up a
+// real workspace.  End-to-end coverage of the streaming path lives
+// in the desktop integration tests where a tempdir workspace is
+// available.
+
+#[tokio::test]
+async fn compile_stream_rejects_missing_root_path() {
+    let app = empty_app(None).await;
+    // No body fields: `root_path` defaults to None and the server
+    // has no `--path` set, so it must surface the missing-path
+    // error rather than panicking when it tries to canonicalise an
+    // empty string.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ws/anything/compile/stream")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "MISSING_ROOT_PATH");
+}
+
+#[tokio::test]
+async fn compile_stream_rejects_non_directory_path() {
+    let app = empty_app(None).await;
+    // `/this/path/does/not/exist` exists on no test machine; the
+    // handler must reject it pre-pipeline rather than letting
+    // run_pipeline_with_options surface a confusing IO error far
+    // down the call stack.
+    let body = serde_json::json!({
+        "root_path": "/this/path/does/not/exist",
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ws/anything/compile/stream")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "ROOT_PATH_NOT_DIR");
+}

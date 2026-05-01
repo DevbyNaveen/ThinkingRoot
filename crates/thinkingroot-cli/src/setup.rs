@@ -296,7 +296,7 @@ pub async fn run_setup() -> anyhow::Result<()> {
     // Compile — reuse the same world-class progress display used by `root compile`.
     if compile_now {
         println!("  Compiling {}...\n", abs_ws_path.display());
-        match crate::progress::run_compile_progress(&abs_ws_path, None).await {
+        match crate::progress::run_compile_progress(&abs_ws_path, None, /* no_rooting= */ false).await {
             Ok(result) => {
                 println!(
                     "  {} {} claims · {} entities · {} relations\n",

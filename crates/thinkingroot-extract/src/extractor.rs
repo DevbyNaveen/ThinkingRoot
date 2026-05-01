@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
@@ -47,6 +48,21 @@ pub enum ExtractionProgressEvent {
 /// Callback fired for extractor progress updates.
 pub type ChunkProgressFn = Arc<dyn Fn(ExtractionProgressEvent) + Send + Sync>;
 
+/// Metadata that flows alongside each spawned batch's success result.
+/// Captured at spawn time so the collect loop can record the batch in
+/// the in-flight checkpoint log without re-deriving the batch's
+/// position.  `batch_idx` mirrors the 0-indexed slot used by
+/// `llm_work.chunks(batch_size).enumerate()`; the `range_*` fields
+/// are 1-indexed inclusive chunk numbers (same vocabulary as
+/// `ProgressEvent::ExtractionBatchStart`).
+#[derive(Debug, Clone, Copy)]
+struct BatchMeta {
+    batch_idx: usize,
+    range_start: usize,
+    range_end: usize,
+    batch_chunks: usize,
+}
+
 /// The main extraction engine. Takes DocumentIRs and produces
 /// Claims, Entities, and Relations via LLM extraction.
 pub struct Extractor {
@@ -63,6 +79,27 @@ pub struct Extractor {
     progress: Option<ChunkProgressFn>,
     /// Known entities from the existing graph, injected into LLM prompts.
     known_entities: crate::graph_context::GraphPrimedContext,
+    /// When `true` (default), structural-classified chunks ALSO go to
+    /// the LLM for semantic extraction.  Set to `false` for code-heavy
+    /// repos where the LLM rarely adds value over the structural
+    /// metadata.  Sourced from `config.extraction.structural_plus_llm`.
+    structural_plus_llm: bool,
+    /// Cancellation token consulted between batches in `extract_all`.
+    /// `None` (the default) means cancellation is opt-out — existing
+    /// callers retain pre-fix behaviour.  The pipeline orchestrator
+    /// installs one via `with_cancel` so the desktop's Stop button can
+    /// trip every in-flight LLM call.
+    cancel: Option<CancellationToken>,
+    /// Per-batch checkpoint log used to skip already-completed batches
+    /// on resume.  None = no checkpointing (existing test callers).
+    /// The pipeline installs one via `with_checkpoint` so a killed
+    /// compile resumes from the last completed batch.
+    checkpoint: Option<Arc<crate::checkpoint::InFlightCheckpoint>>,
+    /// Snapshot of batches already completed in a previous run, loaded
+    /// once at construction time.  Used by `extract_all` to short-
+    /// circuit the spawn step for batches whose claims are already
+    /// in the per-chunk content cache.
+    completed_batches: crate::checkpoint::CompletedBatches,
 }
 
 /// The combined output of extraction across all documents.
@@ -86,6 +123,19 @@ pub struct ExtractionOutput {
     /// Maps ClaimId → the LLM's cited source_quote for that claim.
     /// Used by Judge 2 (span attribution) in the grounding system.
     pub claim_source_quotes: HashMap<ClaimId, String>,
+    /// Number of LLM batches that exhausted retries and produced no
+    /// claims.  Pre-fix these failures were silently dropped: the
+    /// orchestrator reported "extraction complete" with claims missing.
+    /// Surfaced to callers so the CLI / desktop can render a partial-
+    /// failure warning, and so the next compile knows which chunks to
+    /// re-target.
+    pub failed_batches: usize,
+    /// `(range_start, range_end)` chunk-index ranges (1-indexed,
+    /// inclusive) of every batch that failed permanently.  Mirrors the
+    /// shape of `ProgressEvent::ExtractionBatchStart::range_*` so a
+    /// single user-visible vocabulary describes both states.  Empty
+    /// when `failed_batches == 0`.
+    pub failed_batch_ranges: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +177,46 @@ impl Extractor {
             cache: None,
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
+            structural_plus_llm: config.extraction.structural_plus_llm,
+            cancel: None,
+            checkpoint: None,
+            completed_batches: crate::checkpoint::CompletedBatches::default(),
         })
+    }
+
+    /// Install an in-flight checkpoint log under `<data_dir>` so a
+    /// killed compile resumes from the last completed batch instead
+    /// of reissuing every cache-miss.  Loads any existing log up-front
+    /// — if the file is malformed we err out rather than silently
+    /// accepting a corrupt resume.
+    ///
+    /// The orchestrator clears the log via
+    /// `InFlightCheckpoint::clear(data_dir)` after Phase 7 succeeds —
+    /// at that point CozoDB is the source of truth.
+    pub fn with_checkpoint(mut self, data_dir: &std::path::Path) -> Result<Self> {
+        let completed = crate::checkpoint::InFlightCheckpoint::load_completed_batches(data_dir)?;
+        if !completed.is_empty() {
+            tracing::info!(
+                completed_batches = completed.batches.len(),
+                already_done_chunks = completed.chunks_already_done,
+                "resuming from in-flight checkpoint"
+            );
+        }
+        let ckpt = crate::checkpoint::InFlightCheckpoint::open(data_dir)?;
+        self.checkpoint = Some(Arc::new(ckpt));
+        self.completed_batches = completed;
+        Ok(self)
+    }
+
+    /// Install a cancellation token consulted between extraction batches.
+    /// When the token is tripped, in-flight tasks are aborted and
+    /// `extract_all` returns `Err(Error::Cancelled)`.  Already-completed
+    /// batches are NOT lost — their results are retained in the partial
+    /// `ExtractionOutput` accessible to the caller via the checkpoint
+    /// (introduced by C6 in the same fix series).
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Enable the content-addressable extraction cache stored at
@@ -221,16 +310,21 @@ impl Extractor {
         for doc in documents {
             for chunk in &doc.chunks {
                 // ── Tier Router: structural or LLM? ──
-                if crate::router::classify(chunk) == crate::router::Tier::Structural {
+                let is_structural = crate::router::classify(chunk) == crate::router::Tier::Structural;
+                if is_structural {
                     let result = crate::structural::extract_structural(chunk, &doc.uri);
-                    if !result.claims.is_empty()
+                    let produced = !result.claims.is_empty()
                         || !result.entities.is_empty()
-                        || !result.relations.is_empty()
-                    {
+                        || !result.relations.is_empty();
+                    if produced {
                         structural_results.push((doc.source_id, doc.uri.clone(), result));
-                        // No `continue` — chunk also queued for LLM below so both run additively.
-                        // Structural provides graph topology at 0.99 confidence;
-                        // LLM provides semantic meaning — they are complementary, not redundant.
+                    }
+                    // M4: when `structural_plus_llm` is disabled, code-heavy
+                    // chunks skip the LLM entirely once the structural pass
+                    // produced something useful.  Default-true preserves
+                    // pre-fix behaviour (additive structural + LLM).
+                    if produced && !self.structural_plus_llm {
+                        continue;
                     }
                 }
 
@@ -366,7 +460,35 @@ impl Extractor {
             let batch_chunks = batch_work.len();
 
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.ok()?;
+                // Spawn return type carries `Err((range_start, range_end))`
+                // on permanent failure so the collect loop can attribute the
+                // affected chunk range to the user.  Pre-fix this was an
+                // `Option<...>` whose `None` was silently dropped — the user
+                // saw "extraction complete" with claims missing.  The Ok
+                // arm carries `BatchMeta` so the collect-side checkpoint
+                // record can attribute each completed batch back to its
+                // 0-indexed slot + 1-indexed chunk range.
+                type BatchOk = (
+                    BatchMeta,
+                    Vec<ChunkWork>,
+                    Vec<crate::batch::BatchChunkResult>,
+                );
+                type BatchFail = (usize, usize);
+                let meta = BatchMeta {
+                    batch_idx,
+                    range_start,
+                    range_end,
+                    batch_chunks,
+                };
+                let permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Semaphore closed (normally only on shutdown).
+                        // Treat as a permanent failure so the caller knows.
+                        return Err::<BatchOk, BatchFail>((range_start, range_end));
+                    }
+                };
+                let _permit = permit;
 
                 if let Some(ref pf) = progress {
                     pf(ExtractionProgressEvent::BatchStart {
@@ -404,19 +526,54 @@ impl Extractor {
                     Ok(raw_response) => {
                         let batch_results =
                             crate::batch::parse_batch_response(&raw_response, &expected_ids);
-                        Some((batch_work, batch_results))
+                        Ok((meta, batch_work, batch_results))
                     }
                     Err(e) => {
-                        tracing::warn!("batch extraction failed: {e}");
-                        None
+                        tracing::warn!(
+                            range_start,
+                            range_end,
+                            "batch extraction failed permanently: {e}"
+                        );
+                        Err((range_start, range_end))
                     }
                 }
             });
         }
 
         // ── Collect batch results ──────────────────────────────────────────
+        // Cancellation: if a token has been wired in via `with_cancel`,
+        // check between batches.  We consume in-flight join handles
+        // before bailing so already-completed batches still land in
+        // `output` (the caller's checkpoint flushes them).  We also
+        // call `join_set.shutdown().await` to abort the spawned tasks
+        // that haven't returned yet — they'd otherwise keep paying for
+        // an LLM call whose result we'll discard.
         while let Some(join_result) = join_set.join_next().await {
-            if let Ok(Some((batch_work, batch_results))) = join_result {
+            if let Some(ref tok) = self.cancel
+                && tok.is_cancelled()
+            {
+                join_set.shutdown().await;
+                return Err(thinkingroot_core::Error::Cancelled);
+            }
+            let batch_outcome = match join_result {
+                Ok(inner) => inner,
+                Err(join_err) => {
+                    // Tokio task panic — count as a permanent failure
+                    // but with no range information available.
+                    tracing::error!("batch task panicked: {join_err}");
+                    output.failed_batches += 1;
+                    continue;
+                }
+            };
+            let (batch_meta, batch_work, batch_results) = match batch_outcome {
+                Ok(triple) => triple,
+                Err((rs, re)) => {
+                    output.failed_batches += 1;
+                    output.failed_batch_ranges.push((rs, re));
+                    continue;
+                }
+            };
+            {
                 for chunk_result in batch_results {
                     if chunk_result.id >= batch_work.len() {
                         continue;
@@ -473,6 +630,28 @@ impl Extractor {
                             source_uri: work.source_uri.clone(),
                         });
                     }
+                }
+                // Cache + claim merge for this batch are durable now.
+                // Record the batch in the in-flight log so a kill-and-
+                // resume can fast-forward past it.  The cache write
+                // ordering matters: the per-chunk content cache was
+                // populated above, so a re-run will see cache hits for
+                // these chunks even if the checkpoint write below fails.
+                if let Some(ref ckpt) = self.checkpoint
+                    && let Err(e) = ckpt.record_batch(
+                        batch_meta.batch_idx,
+                        batch_meta.range_start,
+                        batch_meta.range_end,
+                        batch_meta.batch_chunks,
+                    )
+                {
+                    // Non-fatal: the per-chunk cache is the source of
+                    // truth.  A missing checkpoint record just means
+                    // the next run won't log the resume hint.
+                    tracing::warn!(
+                        batch_idx = batch_meta.batch_idx,
+                        "failed to record checkpoint entry: {e}"
+                    );
                 }
             }
         }
@@ -750,6 +929,8 @@ impl ExtractionOutput {
         self.structural_extractions += other.structural_extractions;
         self.source_texts.extend(other.source_texts);
         self.claim_source_quotes.extend(other.claim_source_quotes);
+        self.failed_batches += other.failed_batches;
+        self.failed_batch_ranges.extend(other.failed_batch_ranges);
     }
 }
 
@@ -969,6 +1150,39 @@ mod tests {
             parse_relation_type("related_to"),
             Some(RelationType::RelatedTo)
         );
+    }
+
+    #[test]
+    fn extraction_output_default_has_no_failed_batches() {
+        // Regression for C4: pre-fix the partial-failure counter didn't
+        // exist; failed batches were silently dropped.  A fresh
+        // ExtractionOutput must start clean so the merge accumulator
+        // produces 0 in the no-failures case.
+        let out = ExtractionOutput::default();
+        assert_eq!(out.failed_batches, 0);
+        assert!(out.failed_batch_ranges.is_empty());
+    }
+
+    #[test]
+    fn extraction_output_merge_accumulates_failed_batches() {
+        // The pipeline calls `output.merge(converted)` for every chunk
+        // result; failed_batches must roll forward end-to-end so the
+        // CLI summary + ProgressEvent::ExtractionPartial see the right
+        // total.  Mirrors how the merge of cache_hits / chunks_processed
+        // already works.
+        let mut a = ExtractionOutput {
+            failed_batches: 1,
+            failed_batch_ranges: vec![(1, 6)],
+            ..Default::default()
+        };
+        let b = ExtractionOutput {
+            failed_batches: 2,
+            failed_batch_ranges: vec![(13, 18), (25, 30)],
+            ..Default::default()
+        };
+        a.merge(b);
+        assert_eq!(a.failed_batches, 3);
+        assert_eq!(a.failed_batch_ranges, vec![(1, 6), (13, 18), (25, 30)]);
     }
 }
 

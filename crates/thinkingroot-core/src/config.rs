@@ -209,13 +209,56 @@ impl Config {
     }
 
     /// Save config to the `.thinkingroot/config.toml` file.
+    ///
+    /// API key values are stripped before writing so workspace config files
+    /// never carry plaintext credentials. Mirrors the policy enforced for the
+    /// global config at `~/.config/thinkingroot/config.toml`. Credentials live
+    /// in `~/.config/thinkingroot/credentials.toml` (mode 0600). On Unix the
+    /// workspace config file is also written with mode 0600 so a leaky
+    /// upstream environment never re-exposes keys via filesystem ACLs.
     pub fn save(&self, root_path: &Path) -> Result<()> {
         let dir = root_path.join(".thinkingroot");
         std::fs::create_dir_all(&dir).map_err(|e| Error::io_path(&dir, e))?;
         let config_path = dir.join("config.toml");
-        let content = toml::to_string_pretty(self)?;
+        let stripped = self.without_keys();
+        let content = toml::to_string_pretty(&stripped)?;
         std::fs::write(&config_path, content).map_err(|e| Error::io_path(&config_path, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| Error::io_path(&config_path, e))?;
+        }
         Ok(())
+    }
+
+    /// Return a copy of self with all `api_key` values cleared so credentials
+    /// are never serialised into a workspace's `config.toml`. Mirrors
+    /// `GlobalConfig::without_keys` (`global_config.rs`); kept private so
+    /// callers can't accidentally embed keys via the public surface.
+    fn without_keys(&self) -> Self {
+        let mut c = self.clone();
+        let p = &mut c.llm.providers;
+        for slot in [
+            &mut p.openai,
+            &mut p.anthropic,
+            &mut p.ollama,
+            &mut p.groq,
+            &mut p.deepseek,
+            &mut p.openrouter,
+            &mut p.together,
+            &mut p.perplexity,
+            &mut p.litellm,
+            &mut p.custom,
+        ] {
+            if let Some(cfg) = slot {
+                cfg.api_key = None;
+            }
+        }
+        if let Some(ref mut az) = p.azure {
+            az.api_key = None;
+        }
+        c
     }
 }
 
@@ -357,6 +400,19 @@ pub struct ExtractionConfig {
     /// Set to 1 to disable batching entirely.
     #[serde(default)]
     pub extraction_batch_size: Option<usize>,
+    /// When `true` (default), structural-classified chunks (function
+    /// definitions, imports, manifest deps) ALSO go to the LLM for
+    /// semantic extraction, in addition to the zero-LLM structural
+    /// pass.  Set to `false` for code-heavy repos where the LLM rarely
+    /// adds value over the structural metadata — typical 30-50% LLM
+    /// cost reduction at the price of slightly thinner prose-claim
+    /// coverage on code chunks.
+    #[serde(default = "default_structural_plus_llm")]
+    pub structural_plus_llm: bool,
+}
+
+fn default_structural_plus_llm() -> bool {
+    true
 }
 
 impl Default for ExtractionConfig {
@@ -367,6 +423,7 @@ impl Default for ExtractionConfig {
             extract_relations: true,
             max_retries: 3,
             extraction_batch_size: None,
+            structural_plus_llm: true,
         }
     }
 }
@@ -1348,5 +1405,73 @@ base_url = "https://my-endpoint.com/v1"
                 .as_deref(),
             Some("https://my-endpoint.com/v1")
         );
+    }
+
+    #[test]
+    fn save_strips_api_key_values_from_workspace_config() {
+        // Regression for the C1 credential leak: pipeline.rs calls
+        // `config.save(root_path)?` after every successful compile, which
+        // serialised the merged config — including api_key values pulled in
+        // from credentials.toml — into the workspace's config.toml in
+        // plaintext.  After the fix, the saved file must contain neither
+        // the OpenAI key nor the Azure key.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut c = Config::default();
+        c.llm.providers.openai = Some(ProviderConfig {
+            api_key_env: Some("OPENAI_API_KEY".into()),
+            api_key: Some("sk-leak-canary-openai".into()),
+            base_url: None,
+            default_model: None,
+        });
+        c.llm.providers.azure = Some(crate::config::AzureConfig {
+            resource_name: Some("openai-gpt-mini".into()),
+            endpoint_base: None,
+            deployment: Some("gpt-5.4".into()),
+            api_version: Some("2024-08-01-preview".into()),
+            api_key_env: Some("AZURE_OPENAI_API_KEY".into()),
+            api_key: Some("azure-leak-canary".into()),
+        });
+
+        c.save(tmp.path()).expect("save succeeded");
+        let content = std::fs::read_to_string(tmp.path().join(".thinkingroot/config.toml"))
+            .expect("read written file");
+        assert!(
+            !content.contains("sk-leak-canary-openai"),
+            "openai api_key leaked into workspace config:\n{content}"
+        );
+        assert!(
+            !content.contains("azure-leak-canary"),
+            "azure api_key leaked into workspace config:\n{content}"
+        );
+        // The api_key_env pointer must still be there — it's safe and the
+        // engine needs it at runtime to look up the value from the env or
+        // credentials.toml.
+        assert!(
+            content.contains("AZURE_OPENAI_API_KEY"),
+            "api_key_env pointer must still be persisted"
+        );
+
+        // The in-memory `c` must NOT have been mutated by save() — callers
+        // who hold the merged config keep the keys for the rest of the run.
+        assert_eq!(
+            c.llm.providers.openai.as_ref().unwrap().api_key.as_deref(),
+            Some("sk-leak-canary-openai"),
+            "save() must not mutate the in-memory config"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_workspace_config_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let c = Config::default();
+        c.save(tmp.path()).expect("save succeeded");
+        let mode = std::fs::metadata(tmp.path().join(".thinkingroot/config.toml"))
+            .expect("stat written file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "workspace config.toml must be 0600, got {mode:o}");
     }
 }

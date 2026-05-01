@@ -28,3 +28,4 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile = "3"

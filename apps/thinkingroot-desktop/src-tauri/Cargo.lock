@@ -7588,6 +7588,7 @@ dependencies = [
  "thinkingroot-serve",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml 0.8.2",
  "tr-format",
  "tr-render",
@@ -7619,6 +7620,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 
@@ -7686,6 +7688,7 @@ dependencies = [
  "ignore",
  "pdf-extract",
  "pulldown-cmark",
+ "rayon",
  "serde",
  "serde_json",
  "thinkingroot-core",
@@ -7782,6 +7785,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -8029,6 +8033,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

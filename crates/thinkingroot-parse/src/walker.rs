@@ -53,16 +53,29 @@ pub fn walk(root: &Path, config: &ParserConfig) -> Result<Vec<PathBuf>> {
             continue;
         }
 
-        // Check file size limit.
-        if let Ok(meta) = path.metadata()
-            && meta.len() > config.max_file_size
-        {
-            tracing::debug!(
-                "skipping large file: {} ({} bytes)",
-                path.display(),
-                meta.len()
-            );
-            continue;
+        // Check file size limit.  metadata() can fail on macOS APFS clones,
+        // some FUSE mounts, and racy unlinks.  Pre-fix the failure branch
+        // silently *passed* the file through, which then got read in full
+        // regardless of `max_file_size`.  Treat any metadata failure as a
+        // skip with a warning so a 2 GB log file behind a flaky FUSE mount
+        // can never blow the parser's budget.
+        match path.metadata() {
+            Ok(meta) if meta.len() > config.max_file_size => {
+                tracing::debug!(
+                    "skipping large file: {} ({} bytes)",
+                    path.display(),
+                    meta.len()
+                );
+                continue;
+            }
+            Ok(_) => {} // size OK
+            Err(e) => {
+                tracing::warn!(
+                    "skipping {} (metadata failed: {e})",
+                    path.display(),
+                );
+                continue;
+            }
         }
 
         // If include_extensions is set, filter by extension.

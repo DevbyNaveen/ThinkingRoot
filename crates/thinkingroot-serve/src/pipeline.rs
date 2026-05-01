@@ -6,11 +6,19 @@ use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
 use thinkingroot_core::types::WorkspaceId;
 use thinkingroot_graph::StorageEngine;
+use tokio_util::sync::CancellationToken;
 
 /// Events emitted by the pipeline to drive CLI progress bars.
 /// Sent via `tokio::sync::mpsc::UnboundedSender<ProgressEvent>`.
 /// The CLI bar-driver task consumes these and renders indicatif bars.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived so the SSE compile route in
+/// `rest.rs::compile_stream` can wire-encode each event as a JSON SSE
+/// frame and the desktop sidecar consumer can deserialise back into
+/// the same enum without a parallel wire vocabulary.  Wire shape:
+/// `{"kind":"parse_complete","files":12}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// Parsing is about to begin. Emitted immediately before `parse_directory`
     /// so the bar driver can start its clock at the same instant the pipeline
@@ -58,6 +66,15 @@ pub enum ProgressEvent {
         claims: usize,
         entities: usize,
         cache_hits: usize,
+    },
+    /// Some LLM batches failed permanently (retries exhausted) and the
+    /// claims they would have produced are missing.  Emitted after
+    /// `ExtractionComplete` only when `failed_batches > 0`.  Pre-fix
+    /// these failures were silently dropped — the user only saw "ok"
+    /// even though their compile was incomplete.
+    ExtractionPartial {
+        failed_batches: usize,
+        failed_chunk_ranges: Vec<(usize, usize)>,
     },
     /// Grounding tribunal is starting (runs between extraction and linking).
     GroundingStart {
@@ -117,7 +134,7 @@ pub enum ProgressEvent {
     PipelineFailed { error: String },
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineResult {
     pub files_parsed: usize,
     pub claims_count: usize,
@@ -133,6 +150,18 @@ pub struct PipelineResult {
     /// `false` means all files were fingerprint-identical — the cache is still
     /// current and the caller should skip the reload entirely.
     pub cache_dirty: bool,
+    /// LLM batches that exhausted retries during extraction.  Non-zero
+    /// means the compile is partial — claims are missing for chunks in
+    /// `failed_chunk_ranges`.  Surfaced so the CLI can print a yellow
+    /// warning and the desktop can render a non-fatal toast.
+    #[serde(default)]
+    pub failed_batches: usize,
+    /// `(range_start, range_end)` chunk ranges (inclusive, 1-indexed) of
+    /// every batch that failed permanently.  Identical wire shape to
+    /// `ProgressEvent::ExtractionBatchStart::range_*` so callers don't
+    /// need a second vocabulary.
+    #[serde(default)]
+    pub failed_chunk_ranges: Vec<(usize, usize)>,
 }
 
 /// Run the v3 pipeline: Parse → Extract+Ground+Rooting+Link+SVO →
@@ -151,7 +180,76 @@ pub async fn run_pipeline(
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<PipelineResult> {
-    let result = run_pipeline_inner(root_path, branch, progress.clone()).await;
+    // Existing callers (CLI, MCP stdio, integration tests) get a token
+    // that is never tripped — same behaviour as before this fix.  The
+    // desktop calls `run_pipeline_with_options` directly with its own
+    // token so it can implement the Stop button.
+    run_pipeline_with_options(root_path, branch, progress, PipelineOptions::default()).await
+}
+
+/// Cancel-aware variant of [`run_pipeline`].  Equivalent to
+/// `run_pipeline_with_options(.., PipelineOptions { cancel, ..Default::default() })`.
+/// Kept for callers that only need cancellation and don't want to
+/// construct an options struct.
+pub async fn run_pipeline_with_cancel(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    cancel: CancellationToken,
+) -> Result<PipelineResult> {
+    run_pipeline_with_options(
+        root_path,
+        branch,
+        progress,
+        PipelineOptions {
+            cancel,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Per-invocation knobs.  Adding fields here is the supported way to
+/// extend the pipeline without forking another `run_pipeline_*`
+/// function for every flag.  The `Default` impl produces the
+/// behaviour of the un-tripped, full-rooting compile that
+/// [`run_pipeline`] uses for backwards-compat.
+#[derive(Debug, Clone)]
+pub struct PipelineOptions {
+    /// Cancellation token consulted at every phase boundary.  When
+    /// tripped mid-run, the pipeline stops at the next checkpoint,
+    /// surfaces `Error::Cancelled`, and emits
+    /// `ProgressEvent::PipelineFailed`.  Partial state already
+    /// persisted by Phase 4 (changed-source removal) is preserved.
+    pub cancel: CancellationToken,
+    /// Skip Phase 6.5 (Rooting admission gate).  All admitted claims
+    /// stay in the `attested` tier — same as pre-Rooting behaviour.
+    /// Pre-fix this was driven by an env var
+    /// (`TR_ROOTING_DISABLED=1`) that the CLI set via
+    /// `unsafe { std::env::set_var(...) }`; this field replaces that
+    /// hazard with explicit plumbing.
+    pub no_rooting: bool,
+}
+
+impl Default for PipelineOptions {
+    fn default() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            no_rooting: false,
+        }
+    }
+}
+
+/// Full-surface variant.  The other run_pipeline functions delegate
+/// here.  Adding a new pipeline knob means adding a field to
+/// [`PipelineOptions`] — no new public function required.
+pub async fn run_pipeline_with_options(
+    root_path: &Path,
+    branch: Option<&str>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    options: PipelineOptions,
+) -> Result<PipelineResult> {
+    let result = run_pipeline_inner(root_path, branch, progress.clone(), options).await;
     if let Err(ref e) = result
         && let Some(ref tx) = progress
     {
@@ -166,7 +264,18 @@ async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    options: PipelineOptions,
 ) -> Result<PipelineResult> {
+    let PipelineOptions { cancel, no_rooting } = options;
+    // Helper macro — every long-running phase boundary checks this so
+    // Stop / Ctrl-C never has to wait for the next batch to finish.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if cancel.is_cancelled() {
+                return Err(thinkingroot_core::Error::Cancelled);
+            }
+        };
+    }
     macro_rules! emit {
         ($event:expr) => {
             if let Some(ref tx) = progress {
@@ -183,11 +292,13 @@ async fn run_pipeline_inner(
     // before the actual parse, so the displayed "Parsing" elapsed reflects
     // only the cost of `parse_directory` itself.
     emit!(ProgressEvent::ParseStart);
+    bail_if_cancelled!();
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
     emit!(ProgressEvent::ParseComplete {
         files: files_parsed
     });
+    bail_if_cancelled!();
 
     // ─── Diff phase: compare against the stored graph ──────────────────
     // Storage open + fingerprint load + content-hash scan + deletion detect
@@ -248,6 +359,8 @@ async fn run_pipeline_inner(
             structural_extractions: 0,
             // All files were content-hash identical — CozoDB was not touched.
             cache_dirty: false,
+            failed_batches: 0,
+            failed_chunk_ranges: Vec::new(),
         });
     }
 
@@ -302,10 +415,18 @@ async fn run_pipeline_inner(
         extraction = thinkingroot_extract::ExtractionOutput::default();
     } else {
         let extractor = {
+            // Open the in-flight checkpoint log under <data_dir>.  If
+            // a previous run was interrupted mid-extract, the loader
+            // surfaces those completed batches so the resume path can
+            // log "resuming from N batches" without redoing them
+            // (correctness is provided by the per-chunk content cache;
+            // the checkpoint adds attribution + observability).
             let e = thinkingroot_extract::Extractor::new(&config)
                 .await?
                 .with_cache_dir(&data_dir)
-                .with_known_entities(ctx_with_relations);
+                .with_known_entities(ctx_with_relations)
+                .with_cancel(cancel.clone())
+                .with_checkpoint(&data_dir)?;
             if let Some(ref tx) = progress {
                 let tx_chunk = tx.clone();
                 let pf = Arc::new(
@@ -365,6 +486,16 @@ async fn run_pipeline_inner(
             entities: raw.entities.len(),
             cache_hits: raw.cache_hits,
         });
+        if raw.failed_batches > 0 {
+            tracing::warn!(
+                failed_batches = raw.failed_batches,
+                "extraction completed with permanent batch failures — emitting partial event"
+            );
+            emit!(ProgressEvent::ExtractionPartial {
+                failed_batches: raw.failed_batches,
+                failed_chunk_ranges: raw.failed_batch_ranges.clone(),
+            });
+        }
         cache_hits = raw.cache_hits;
         extraction = raw;
     }
@@ -392,6 +523,8 @@ async fn run_pipeline_inner(
     // NLI model is embedded in the binary (no downloads). Pool creation is
     // cheap (just RAM detection), but we still use spawn_blocking because
     // ONNX session creation from memory is CPU-heavy.
+
+    bail_if_cancelled!();
 
     // Partition: structural claims get 0.99, LLM claims go to tribunal.
     let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction
@@ -519,7 +652,16 @@ async fn run_pipeline_inner(
             .iter()
             .filter(|c| c.source == doc.source_id)
             .collect();
-        let fp_bytes = serde_json::to_vec(&source_claims).unwrap_or_default();
+        // M1: propagate the serialize error rather than silently
+        // computing a fingerprint of empty bytes.  Pre-fix a serialize
+        // failure made every run see the source as "fingerprint-
+        // matched empty" which then short-circuited as unchanged —
+        // claims for that source would never persist.
+        let fp_bytes = serde_json::to_vec(&source_claims)
+            .map_err(|e| thinkingroot_core::Error::Config(format!(
+                "fingerprint serialize for {}: {e}",
+                doc.uri
+            )))?;
         let fp = crate::fingerprint::FingerprintStore::compute(&fp_bytes);
 
         if fingerprints.is_unchanged(&doc.uri, &fp) {
@@ -535,6 +677,8 @@ async fn run_pipeline_inner(
         truly_changed: truly_changed.len(),
         cutoffs: fingerprint_cutoffs,
     });
+
+    bail_if_cancelled!();
 
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
@@ -618,8 +762,12 @@ async fn run_pipeline_inner(
             structural_extractions: extraction.structural_extractions,
             // Deletions or fingerprint cutoffs mutated CozoDB — cache is stale.
             cache_dirty: true,
+            failed_batches: extraction.failed_batches,
+            failed_chunk_ranges: extraction.failed_batch_ranges.clone(),
         });
     }
+
+    bail_if_cancelled!();
 
     // ─── Phase 6: Insert sources for truly-changed documents ───────────
     // Also persist source bytes to the durable Rooting byte-store so Phase 6.5
@@ -674,6 +822,11 @@ async fn run_pipeline_inner(
         structural_extractions: extraction.structural_extractions,
         source_texts: extraction.source_texts,
         claim_source_quotes: extraction.claim_source_quotes,
+        // Carry partial-failure attribution forward so consumers downstream
+        // (currently the pipeline summary; soon the desktop UI per C4)
+        // can render an honest "N batches failed" warning.
+        failed_batches: extraction.failed_batches,
+        failed_batch_ranges: extraction.failed_batch_ranges,
     };
 
     // ─── Phase 6.5: Rooting ────────────────────────────────────────────
@@ -682,12 +835,16 @@ async fn run_pipeline_inner(
     // claims are removed from the extraction before Link sees them.
     //
     // Disabled when either the workspace config opts out
-    // (`config.rooting.disabled`) or the per-invocation env flag is set
-    // (`TR_ROOTING_DISABLED=1`, populated by `root compile --no-rooting`).
+    // (`config.rooting.disabled`) or the caller passed `no_rooting`
+    // (M3 — pre-fix this was an `unsafe { std::env::set_var(...) }`
+    // hazard; the env var is honoured here as a deprecated fallback
+    // so any external script that still sets `TR_ROOTING_DISABLED=1`
+    // keeps working unchanged).
     let rooting_disabled_env = std::env::var("TR_ROOTING_DISABLED")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if !config.rooting.disabled && !rooting_disabled_env && !filtered_extraction.claims.is_empty() {
+    let rooting_skipped = no_rooting || rooting_disabled_env;
+    if !config.rooting.disabled && !rooting_skipped && !filtered_extraction.claims.is_empty() {
         let rooting_cfg = thinkingroot_rooting::RootingConfig {
             disabled: config.rooting.disabled,
             provenance_threshold: config.rooting.provenance_threshold,
@@ -794,11 +951,18 @@ async fn run_pipeline_inner(
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();
     let relations_count = filtered_extraction.relations.len();
+    // Snapshot failed-batch attribution before Linker moves the
+    // extraction.  The PipelineResult needs them at the very end so
+    // the CLI/desktop can render an honest partial-failure summary.
+    let failed_batches = filtered_extraction.failed_batches;
+    let failed_chunk_ranges = filtered_extraction.failed_batch_ranges.clone();
 
     // Retain a lightweight clone of the filtered claims for Phase 2c-post-link
     // (SVO event extraction).  We clone before the linker takes ownership so that
     // the post-link phase has access to statements + event_date timestamps.
     let claims_for_svo: Vec<thinkingroot_core::Claim> = filtered_extraction.claims.clone();
+
+    bail_if_cancelled!();
 
     // ─── Phase 7: Link ─────────────────────────────────────────────────
     let linker = {
@@ -896,6 +1060,15 @@ async fn run_pipeline_inner(
     fingerprints.save()?;
     config.save(root_path)?;
 
+    // Phase 7 succeeded — CozoDB is now the source of truth.  Clear the
+    // in-flight checkpoint log so the next compile starts fresh.
+    // Failure is non-fatal (a stale .in-flight.jsonl just means the
+    // next run logs a misleading "resuming" message, then produces
+    // identical output via cache hits).
+    if let Err(e) = thinkingroot_extract::InFlightCheckpoint::clear(&data_dir) {
+        tracing::warn!("failed to clear in-flight checkpoint after Phase 7: {e}");
+    }
+
     Ok(PipelineResult {
         files_parsed,
         claims_count,
@@ -909,6 +1082,8 @@ async fn run_pipeline_inner(
         structural_extractions,
         // v3 pipeline ran — CozoDB has new data.
         cache_dirty: true,
+        failed_batches,
+        failed_chunk_ranges,
     })
 }
 
@@ -966,4 +1141,48 @@ fn upsert_in_chunks(
         done += chunk.len();
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-cancelled tokens short-circuit the pipeline before any
+    /// parsing or LLM work — the `bail_if_cancelled!()` checkpoint that
+    /// fires after `ProgressEvent::ParseStart` and before
+    /// `thinkingroot_parse::parse_directory` returns
+    /// `Err(Error::Cancelled)`.  This is the foundational guarantee the
+    /// desktop "Stop compile" button relies on (P3.4).
+    #[tokio::test]
+    async fn pre_cancelled_token_aborts_before_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Touch a file so parse_directory wouldn't trivially return empty.
+        std::fs::write(tmp.path().join("hello.md"), "# hello\n\nbody.").unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = run_pipeline_with_cancel(tmp.path(), None, None, cancel)
+            .await
+            .expect_err("pre-cancelled token must produce Err");
+        assert!(
+            matches!(err, thinkingroot_core::Error::Cancelled),
+            "expected Error::Cancelled, got {err:?}"
+        );
+    }
+
+    /// A fresh, never-tripped token must behave exactly like the old
+    /// `run_pipeline` API — empty workspaces still report parse=0 with
+    /// no error.  Guards against accidental tightening of the cancel
+    /// check (e.g. an `if !is_cancelled` typo).
+    #[tokio::test]
+    async fn untripped_token_runs_to_completion_on_empty_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = run_pipeline_with_cancel(tmp.path(), None, None, CancellationToken::new())
+            .await
+            .expect("untripped token must not abort an empty compile");
+        assert_eq!(result.files_parsed, 0);
+        assert_eq!(result.claims_count, 0);
+        assert!(!result.cache_dirty, "empty compile must not dirty cache");
+    }
 }

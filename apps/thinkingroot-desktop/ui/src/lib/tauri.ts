@@ -352,12 +352,42 @@ export async function workspaceCompile(args: WorkspaceCompileArgs): Promise<stri
   });
 }
 
+/**
+ * Stop the in-progress compile, if any.  Resolves to `true` when a
+ * compile was active and its cancellation token was tripped; `false`
+ * otherwise.  The actual abort + `CompileProgress::Cancelled` event
+ * arrive through the existing `workspace_compile_progress` channel
+ * after the pipeline reaches its next phase boundary (typically <1s).
+ */
+export async function workspaceCompileStop(): Promise<boolean> {
+  return invoke<boolean>("workspace_compile_stop");
+}
+
+export interface CompileStatus {
+  active: boolean;
+  workspace: string | null;
+}
+
+/**
+ * Poll for the current compile status.  Used by the Compile modal so
+ * the Stop button can stay disabled when nothing is running, without
+ * depending on event ordering.
+ */
+export async function workspaceCompileStatus(): Promise<CompileStatus> {
+  return invoke<CompileStatus>("workspace_compile_status");
+}
+
 export type CompileProgress =
   | { phase: "started"; workspace: string }
   | { phase: "parse_complete"; files: number }
   | { phase: "extraction_start"; total_chunks: number; total_batches: number }
   | { phase: "extraction_progress"; done: number; total: number }
   | { phase: "extraction_complete"; claims: number; entities: number }
+  | {
+      phase: "extraction_partial";
+      failed_batches: number;
+      failed_chunk_ranges: [number, number][];
+    }
   | { phase: "grounding_progress"; done: number; total: number }
   | { phase: "linking_start"; total_entities: number }
   | { phase: "linking_progress"; done: number; total: number }
@@ -372,7 +402,10 @@ export type CompileProgress =
       artifacts: number;
       health_score: number;
       cache_dirty: boolean;
+      failed_batches: number;
+      failed_chunk_ranges: [number, number][];
     }
+  | { phase: "cancelled" }
   | { phase: "failed"; error: string };
 
 export function onWorkspaceCompileProgress(
