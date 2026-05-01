@@ -174,6 +174,15 @@ pub struct ConversationDeleteArgs {
 
 #[tauri::command]
 pub fn conversations_delete(args: ConversationDeleteArgs) -> Result<bool, String> {
+    // Sandbox the id before joining it into the conversations
+    // directory — without this guard, an id like `../../etc/passwd`
+    // resolves outside the conversations dir and lets a malicious
+    // call delete arbitrary JSON files the desktop process can
+    // reach.  `read_conversation` already runs this check; mirror
+    // it on the delete path for consistency.
+    if !is_safe_id(&args.id) {
+        return Err("invalid conversation id".to_string());
+    }
     let entry = lookup_workspace(&args.workspace)?;
     let dir = conv_dir(&entry.path);
     let path = dir.join(format!("{}.json", args.id));

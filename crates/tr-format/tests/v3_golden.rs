@@ -31,9 +31,16 @@ use tr_format::{ClaimRecord, ManifestV3, V3PackBuilder, digest::blake3_hex};
 /// numbers, and the authors array.
 fn fixture_manifest() -> ManifestV3 {
     let mut m = ManifestV3::new("alice/golden", Version::parse("1.0.0").unwrap());
-    m.source_hash = "blake3:00000000000000000000000000000000".into();
-    m.claims_hash = "blake3:11111111111111111111111111111111".into();
-    m.pack_hash = "blake3:22222222222222222222222222222222".into();
+    // Hashes must be 64-lowercase-hex per the v3 spec; the validator
+    // refuses truncated forms.  These all-zero / all-one / all-two
+    // 64-char strings keep the fixture's "deterministic / human-readable"
+    // intent while satisfying validation.
+    m.source_hash =
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000".into();
+    m.claims_hash =
+        "blake3:1111111111111111111111111111111111111111111111111111111111111111".into();
+    m.pack_hash =
+        "blake3:2222222222222222222222222222222222222222222222222222222222222222".into();
     m.source_files = Some(2);
     m.source_bytes = Some(42);
     m.claim_count = Some(3);
@@ -50,16 +57,16 @@ fn fixture_manifest() -> ManifestV3 {
 const FIXTURE_CANONICAL_TOML: &str = "\
 authors = [\"alice@example.com\", \"bob@example.com\"]
 claim_count = 3
-claims_hash = \"blake3:11111111111111111111111111111111\"
+claims_hash = \"blake3:1111111111111111111111111111111111111111111111111111111111111111\"
 description = \"golden-bytes fixture\"
 extractor = \"thinkingroot/extract@0.9.1\"
 format_version = \"tr/3\"
 license = \"MIT\"
 name = \"alice/golden\"
-pack_hash = \"blake3:22222222222222222222222222222222\"
+pack_hash = \"blake3:2222222222222222222222222222222222222222222222222222222222222222\"
 source_bytes = 42
 source_files = 2
-source_hash = \"blake3:00000000000000000000000000000000\"
+source_hash = \"blake3:0000000000000000000000000000000000000000000000000000000000000000\"
 version = \"1.0.0\"
 ";
 
@@ -68,7 +75,7 @@ version = \"1.0.0\"
 const FIXTURE_HASH_INPUT_TOML: &str = "\
 authors = [\"alice@example.com\", \"bob@example.com\"]
 claim_count = 3
-claims_hash = \"blake3:11111111111111111111111111111111\"
+claims_hash = \"blake3:1111111111111111111111111111111111111111111111111111111111111111\"
 description = \"golden-bytes fixture\"
 extractor = \"thinkingroot/extract@0.9.1\"
 format_version = \"tr/3\"
@@ -77,7 +84,7 @@ name = \"alice/golden\"
 pack_hash = \"\"
 source_bytes = 42
 source_files = 2
-source_hash = \"blake3:00000000000000000000000000000000\"
+source_hash = \"blake3:0000000000000000000000000000000000000000000000000000000000000000\"
 version = \"1.0.0\"
 ";
 

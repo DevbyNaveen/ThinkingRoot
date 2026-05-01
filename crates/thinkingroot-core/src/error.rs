@@ -102,6 +102,17 @@ pub enum Error {
     /// on disk; the next run resumes from those.
     #[error("pipeline cancelled by caller")]
     Cancelled,
+
+    // --- Security (path traversal, identifier validation) ---
+    /// Returned by [`crate::safe_path`] helpers when an untrusted
+    /// input would escape its trust boundary: a tar entry containing
+    /// `..`, an absolute path passed through a JS bridge, a control
+    /// character in a conversation ID, etc. Treat as a hard refusal
+    /// at the call site — never silently fall back to an "unsafe"
+    /// path. Distinct from [`Error::Io`] so security audits and
+    /// telemetry can count traversal attempts separately.
+    #[error("security: {0}")]
+    SecurityViolation(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

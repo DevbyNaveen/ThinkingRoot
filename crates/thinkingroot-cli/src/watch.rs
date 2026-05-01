@@ -12,6 +12,14 @@ use crate::pipeline;
 /// Build a gitignore-aware matcher from the workspace's `exclude_patterns`
 /// and `.gitignore` rules. Returns a closure that returns `true` for paths
 /// the watcher should **ignore** (i.e. noise).
+///
+/// The matcher also defends against symlink loops: a path whose
+/// canonicalised form escapes the workspace root (or whose
+/// canonicalisation fails) is treated as ignore. This stops the
+/// classic inotify spin where a symlink inside the watched tree
+/// points back at an ancestor — `notify`'s recursive watcher crawls
+/// the cycle, fires events forever, saturates the event queue, and
+/// floods stderr with errors.
 fn build_ignore_matcher(root: &Path, config: &Config) -> impl Fn(&Path) -> bool {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
 
@@ -49,6 +57,8 @@ fn build_ignore_matcher(root: &Path, config: &Config) -> impl Fn(&Path) -> bool 
         ".venv",
     ];
 
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
     move |path: &Path| {
         // Fast path: check path components against the built-in blocklist.
         for component in path.components() {
@@ -56,6 +66,18 @@ fn build_ignore_matcher(root: &Path, config: &Config) -> impl Fn(&Path) -> bool 
             if ALWAYS_IGNORE.iter().any(|&blocked| name == blocked) {
                 return true;
             }
+        }
+
+        // Symlink-loop guard: any event coming from a path that
+        // doesn't canonically live inside the workspace root is
+        // either a cyclic-symlink artefact or filesystem noise from
+        // a sibling directory. Either way it isn't a real source
+        // change worth recompiling for. Treating canonicalisation
+        // failure as ignore is safer than treating it as include
+        // (per the audit's "walker errors mean skip" rule).
+        match path.canonicalize() {
+            Ok(canon) if canon.starts_with(&root_canon) => {}
+            _ => return true,
         }
 
         // Check against gitignore + config exclude_patterns.

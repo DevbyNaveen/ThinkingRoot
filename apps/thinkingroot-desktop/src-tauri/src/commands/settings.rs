@@ -398,7 +398,7 @@ pub struct WorkspaceLlmConfig {
 
 #[tauri::command]
 pub fn workspace_llm_config(workspace_path: String) -> Result<WorkspaceLlmConfig, String> {
-    let root = PathBuf::from(&workspace_path);
+    let root = ensure_registered_workspace(&workspace_path)?;
     let cfg_path = root.join(".thinkingroot").join("config.toml");
 
     if !cfg_path.exists() {
@@ -500,7 +500,7 @@ pub struct WorkspaceLlmWriteArgs {
 
 #[tauri::command]
 pub fn workspace_llm_write(args: WorkspaceLlmWriteArgs) -> Result<String, String> {
-    let root = PathBuf::from(&args.workspace_path);
+    let root = ensure_registered_workspace(&args.workspace_path)?;
     let cfg_path = root.join(".thinkingroot").join("config.toml");
 
     let mut doc: toml::Table = if cfg_path.exists() {
@@ -572,6 +572,30 @@ pub fn workspace_llm_write(args: WorkspaceLlmWriteArgs) -> Result<String, String
 
 fn env_present(name: &str) -> bool {
     std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Verify `raw_path` matches one of the entries in
+/// [`WorkspaceRegistry`].  Returns the canonicalised registered root
+/// on success.  Refusing arbitrary `workspace_path` arguments here is
+/// what stops a webview-side call (XSS or malicious `.tr` drop) from
+/// writing TOML to anywhere on disk via `workspace_llm_write`, or
+/// reading `.thinkingroot/config.toml` from a path the user never
+/// granted access to via `workspace_llm_config`.
+fn ensure_registered_workspace(raw_path: &str) -> Result<PathBuf, String> {
+    let registry = WorkspaceRegistry::load()
+        .map_err(|e| format!("load workspace registry: {e}"))?;
+    let candidate = PathBuf::from(raw_path);
+    let candidate_canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    for ws in &registry.workspaces {
+        let ws_canon = ws.path.canonicalize().unwrap_or_else(|_| ws.path.clone());
+        if candidate_canon == ws_canon {
+            return Ok(ws_canon);
+        }
+    }
+    Err(format!(
+        "{} is not a registered workspace — refuse to read or write its config",
+        candidate.display()
+    ))
 }
 
 fn apply_optional(slot: &mut Option<String>, patch: Option<String>) {

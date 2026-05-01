@@ -896,32 +896,30 @@ pub(crate) fn http_client() -> Result<reqwest::Client> {
 /// localhost is a downgrade attack vector — the registry serves
 /// content-addressed bytes, but TLS still protects against a MITM
 /// substituting a different (validly-hashed) pack.
+///
+/// Loopback classification uses real IP-address parsing via
+/// [`thinkingroot_core::is_loopback_host`] rather than string-prefix
+/// matching, so `http://127.evil.com/...` (which previously slipped
+/// through `starts_with("127.")`) is now correctly refused.
 pub(crate) fn refuse_insecure_http(url: &str) -> Result<()> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return Ok(());
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("parse URL `{url}`"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow!("http URL missing host: {url}"))?;
+            if thinkingroot_core::is_loopback_host(host) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "refusing http:// for non-loopback host `{host}` — registries must use https"
+                ))
+            }
+        }
+        other => Err(anyhow!("unsupported URL scheme `{other}` in {url}")),
     }
-    if !lower.starts_with("http://") {
-        return Err(anyhow!("unsupported URL scheme: {}", url));
-    }
-    let after = &url["http://".len()..];
-    let host_end = after
-        .find(|c: char| c == '/' || c == ':' || c == '?')
-        .unwrap_or(after.len());
-    let host = &after[..host_end];
-    let host_lower = host.to_ascii_lowercase();
-    if host_lower == "localhost"
-        || host_lower == "127.0.0.1"
-        || host_lower.starts_with("127.")
-        || host_lower == "::1"
-        || host_lower == "[::1]"
-    {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "refusing http:// for non-loopback host `{}` — registries must use https",
-        host
-    ))
 }
 
 // `fetch_direct_url` and `fetch_via_registry` were moved into
@@ -1042,25 +1040,82 @@ fn format_revoked(d: &tr_verify::RevokedDetails) -> String {
     )
 }
 
+/// Hard cap on bytes we'll decompress out of `source.tar.zst`.
+/// Defends against decompression-bomb packs where 4 GB of zeroes
+/// compress down to ~4 MB and pass the BLAKE3 hash check on the
+/// compressed bytes. 1 GiB is well above the largest production
+/// pack we expect (a v0.1 typical pack is <100 MB) while bounding
+/// memory exposure on a malicious upload.
+const MAX_DECOMPRESSED_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Hard cap on a single tar entry. Sigstore/cosign packs target a
+/// few MB per file at most; capping at 256 MiB rejects sparse-header
+/// claims that declare a multi-GiB logical size.
+const MAX_TAR_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Extract a verified v3 pack's source archive + manifest + claims
-/// into `target`. The inner `source.tar.zst` is decompressed and walked,
-/// emitting one file per entry under `<target>/.thinkingroot/sources/`.
-/// `manifest.toml` and `claims.jsonl` land under `<target>/.thinkingroot/`
-/// directly so consumers can re-parse them via `tr_format`.
+/// into `target`.
+///
+/// **Atomic by design**: writes the entire payload into a sibling
+/// staging directory (`<target>/.thinkingroot.tmp-<pid>`), then
+/// promotes it via a single `rename(2)` once every file is on disk.
+/// A SIGKILL or panic mid-extraction leaves the staging directory
+/// behind for cleanup but never half-overwrites the live install.
+///
+/// **Tar-slip safe**: every entry's path goes through
+/// [`thinkingroot_core::safe_join_under`] — entries containing `..`,
+/// absolute paths, or ones whose canonicalised parent escapes
+/// `sources_dir` (via a planted symlink) are refused.
+///
+/// **Bounded decompression**: the inner `zstd` stream is read with a
+/// hard byte cap so a decompression-bomb pack cannot exhaust memory
+/// on the install host.
 fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<()> {
+    use std::io::Read as _;
+
     let manifest = &pack.manifest;
     let target_dir = match target {
         Some(t) => t,
         None => default_install_dir(manifest)?,
     };
-    let engine_dir = target_dir.join(".thinkingroot");
+
+    // Stage everything under a temp sibling so we can promote
+    // atomically at the end. `pid()` keeps concurrent installs of
+    // different packs from colliding; same-pack concurrency on the
+    // same target would still collide and one rename will overwrite
+    // the other — correct semantics for "last write wins" without
+    // leaving torn state.
+    let parent = target_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("create parent {}", parent.display()))?;
+    let staging_name = format!(
+        ".thinkingroot.tmp-{}-{}",
+        std::process::id(),
+        manifest.name.replace('/', "_")
+    );
+    let staging_dir = parent.join(staging_name);
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .with_context(|| format!("remove stale staging {}", staging_dir.display()))?;
+    }
+    let _staging_guard = StagingDirGuard {
+        path: staging_dir.clone(),
+    };
+
+    let engine_dir = staging_dir.join(".thinkingroot");
     let sources_dir = engine_dir.join("sources");
     fs::create_dir_all(&sources_dir)
         .with_context(|| format!("create {}", sources_dir.display()))?;
 
-    // Decompress the inner source.tar.zst and walk its entries.
-    let decompressed = zstd::stream::decode_all(&pack.source_archive[..])
-        .map_err(|e| anyhow!("decompress source.tar.zst: {e}"))?;
+    // Bounded zstd decompression. The cap fires before a malicious
+    // pack can swallow all available memory.
+    let decompressed = decode_zstd_capped(
+        &pack.source_archive,
+        MAX_DECOMPRESSED_SOURCE_BYTES,
+    )?;
     let mut archive = tar::Archive::new(std::io::Cursor::new(decompressed));
     let mut count = 0usize;
     for entry in archive
@@ -1072,13 +1127,40 @@ fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<(
             .path()
             .map_err(|e| anyhow!("entry path: {e}"))?
             .into_owned();
-        let dest = sources_dir.join(&path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+
+        // Tar-slip guard. `safe_join_under` refuses `..`, absolute
+        // paths, and symlink-redirected ancestors.
+        let dest = thinkingroot_core::safe_join_under(&sources_dir, &path)
+            .map_err(|e| anyhow!("tar entry {}: {e}", path.display()))?;
+
+        // Per-entry cap to defend against sparse-header tricks.
+        if entry.size() > MAX_TAR_ENTRY_BYTES {
+            return Err(anyhow!(
+                "tar entry {} exceeds {} bytes (size={})",
+                path.display(),
+                MAX_TAR_ENTRY_BYTES,
+                entry.size()
+            ));
         }
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        std::io::Read::read_to_end(&mut entry, &mut buf)
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        // Read with a hard limit so a malicious header that
+        // under-declared its size can't blow past the per-entry cap.
+        let mut buf = Vec::with_capacity(entry.size().min(1 << 20) as usize);
+        let read = (&mut entry)
+            .take(MAX_TAR_ENTRY_BYTES + 1)
+            .read_to_end(&mut buf)
             .map_err(|e| anyhow!("read entry {}: {e}", path.display()))?;
+        if read as u64 > MAX_TAR_ENTRY_BYTES {
+            return Err(anyhow!(
+                "tar entry {} streamed past {} bytes",
+                path.display(),
+                MAX_TAR_ENTRY_BYTES
+            ));
+        }
         fs::write(&dest, &buf).with_context(|| format!("write {}", dest.display()))?;
         count += 1;
     }
@@ -1094,6 +1176,25 @@ fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<(
     fs::write(engine_dir.join("claims.jsonl"), &pack.claims_jsonl)
         .with_context(|| format!("write {}", engine_dir.join("claims.jsonl").display()))?;
 
+    // Promote: remove any prior install at `target_dir`, then rename
+    // the staging dir into place. POSIX `rename` on a directory is
+    // atomic relative to readers; on Windows `MoveFileEx` with
+    // `MOVEFILE_REPLACE_EXISTING` provides equivalent semantics.
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir)
+            .with_context(|| format!("remove prior install at {}", target_dir.display()))?;
+    }
+    fs::rename(&staging_dir, &target_dir).with_context(|| {
+        format!(
+            "promote staging {} -> {}",
+            staging_dir.display(),
+            target_dir.display()
+        )
+    })?;
+    // Promotion succeeded; the guard's destructor would otherwise
+    // remove the (now-renamed) directory.
+    std::mem::forget(_staging_guard);
+
     println!(
         "  installed {} {} ({} source files, {} claims) -> {}",
         manifest.name,
@@ -1103,6 +1204,49 @@ fn extract_v3_pack_to_target(pack: &V3Pack, target: Option<PathBuf>) -> Result<(
         target_dir.display()
     );
     Ok(())
+}
+
+/// RAII guard that removes a staging directory on drop. Used by
+/// [`extract_v3_pack_to_target`] so a panic / early-return mid-
+/// extraction doesn't leave half-written files lying next to the
+/// live install. On the happy path the caller `mem::forget`s the
+/// guard immediately after a successful `rename`.
+struct StagingDirGuard {
+    path: PathBuf,
+}
+
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup; if we can't remove (e.g., a file
+        // we're trying to delete is still open on Windows) the
+        // staging name is unique-by-pid so a subsequent install
+        // attempt will pick a fresh one.
+        if self.path.exists() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Decompress a zstd byte slice with a hard upper bound on the
+/// produced output. Refuses to allocate past `max_bytes` even if the
+/// stream's content frame claims to be larger — defends against
+/// decompression-bomb packs.
+fn decode_zstd_capped(input: &[u8], max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let cursor = std::io::Cursor::new(input);
+    let decoder =
+        zstd::stream::Decoder::new(cursor).map_err(|e| anyhow!("zstd init: {e}"))?;
+    let mut out = Vec::new();
+    let read = decoder
+        .take(max_bytes + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| anyhow!("zstd read: {e}"))?;
+    if read as u64 > max_bytes {
+        return Err(anyhow!(
+            "zstd-decompressed source.tar exceeds cap of {max_bytes} bytes"
+        ));
+    }
+    Ok(out)
 }
 
 /// Default install directory: `~/.thinkingroot/packs/<name>/<version>/`.

@@ -8273,7 +8273,9 @@ dependencies = [
 name = "tr-verify"
 version = "0.9.1"
 dependencies = [
+ "base64 0.22.1",
  "ed25519-dalek",
+ "p256",
  "serde",
  "thiserror 2.0.18",
  "tr-format",

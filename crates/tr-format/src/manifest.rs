@@ -103,7 +103,8 @@ impl ManifestV3 {
 
     /// Validate every structural invariant on the reader path:
     /// `format_version == "tr/3"`, well-formed `name`/`version`,
-    /// non-empty hash fields, and consistent counts.
+    /// hash fields are either empty (during pack assembly) or
+    /// `blake3:<64-lowercase-hex>`, and consistent counts.
     pub fn validate(&self) -> Result<()> {
         if self.format_version != FORMAT_VERSION_V3 {
             return Err(Error::Invalid {
@@ -118,21 +119,9 @@ impl ManifestV3 {
         for (label, val) in [
             ("source_hash", &self.source_hash),
             ("claims_hash", &self.claims_hash),
+            ("pack_hash", &self.pack_hash),
         ] {
-            // Empty during pack assembly is OK — writer fills before emit.
-            if !val.is_empty() && !val.starts_with("blake3:") {
-                return Err(Error::Invalid {
-                    what: "manifest.toml",
-                    detail: format!("{label} must start with `blake3:`"),
-                });
-            }
-        }
-        // pack_hash may be empty during canonicalization-for-hashing.
-        if !self.pack_hash.is_empty() && !self.pack_hash.starts_with("blake3:") {
-            return Err(Error::Invalid {
-                what: "manifest.toml",
-                detail: "pack_hash must start with `blake3:`".into(),
-            });
+            validate_blake3_hash_field(label, val)?;
         }
         Ok(())
     }
@@ -282,30 +271,81 @@ fn escape_toml_string_into(out: &mut String, s: &str) {
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 {
         return Err(Error::Invalid {
-            what: "manifest.json",
+            what: "manifest.toml",
             detail: "name must be 1–128 chars".into(),
         });
     }
     let (owner, slug) = name.split_once('/').ok_or(Error::Invalid {
-        what: "manifest.json",
+        what: "manifest.toml",
         detail: format!("name `{name}` must contain exactly one `/`"),
     })?;
     if owner.is_empty() || slug.is_empty() || slug.contains('/') {
         return Err(Error::Invalid {
-            what: "manifest.json",
+            what: "manifest.toml",
             detail: format!("name `{name}` must be `owner/slug`"),
         });
     }
-    for part in [owner, slug] {
-        if !part
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
+    // Match the documented spec at the struct docstring: each segment
+    // is `[a-z0-9][a-z0-9-]*`, length ≤ 64.  Lowercase-only is what
+    // the registry's URL routing relies on (case-insensitive lookup
+    // would otherwise let two distinct packs collide on disk).
+    for (label, part) in [("owner", owner), ("slug", slug)] {
+        if part.len() > 64 {
             return Err(Error::Invalid {
-                what: "manifest.json",
-                detail: "name parts must match [a-zA-Z0-9._-]".into(),
+                what: "manifest.toml",
+                detail: format!("{label} must be ≤ 64 chars (got {})", part.len()),
             });
         }
+        let first = part.chars().next().expect("non-empty checked above");
+        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "{label} `{part}` must start with [a-z0-9] (lowercase + digit only)"
+                ),
+            });
+        }
+        if !part
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "{label} `{part}` may only contain [a-z0-9-]; uppercase, dots, and underscores are rejected"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `blake3:` hash field — empty allowed (during pack
+/// assembly the writer hasn't filled it yet) or exactly the form
+/// `blake3:<64-lowercase-hex>`. Refuses truncated, uppercase, or
+/// non-hex suffixes that the previous prefix-only check accepted.
+fn validate_blake3_hash_field(label: &'static str, val: &str) -> Result<()> {
+    if val.is_empty() {
+        return Ok(());
+    }
+    let suffix = val.strip_prefix("blake3:").ok_or(Error::Invalid {
+        what: "manifest.toml",
+        detail: format!("{label} must start with `blake3:`"),
+    })?;
+    if suffix.len() != 64 {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!(
+                "{label} suffix must be 64 hex chars (got {})",
+                suffix.len()
+            ),
+        });
+    }
+    if !suffix.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("{label} suffix must be lowercase hex"),
+        });
     }
     Ok(())
 }

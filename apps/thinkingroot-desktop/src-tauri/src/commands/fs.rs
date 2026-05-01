@@ -11,10 +11,20 @@
 //! Hidden entries (names starting with `.`) are skipped except for
 //! `.thinkingroot` itself — that one is the user's compiled artifact
 //! directory and they almost always want it visible.
+//!
+//! ## Sandboxing
+//!
+//! Every path argument the webview can supply is checked against the
+//! current [`thinkingroot_core::WorkspaceRegistry`] before any
+//! `read_dir` call. The webview can only enumerate paths inside one
+//! of the registered workspace roots; an XSS or a malicious `.tr`
+//! file that triggered JS execution cannot exfiltrate the entire
+//! disk's directory tree by passing `path = "/"` or `path = "../.."`.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thinkingroot_core::WorkspaceRegistry;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct FsEntry {
@@ -45,9 +55,14 @@ pub struct FsListDirArgs {
 /// One level of children for `path`. Errors are surfaced as strings
 /// (not panics) so the webview can render them inline as tree nodes
 /// without the whole surface unmounting.
+///
+/// **Sandbox**: `path` must canonically resolve inside one of the
+/// registered workspace roots. An unbounded `path` argument from the
+/// webview would otherwise enumerate the entire filesystem on a
+/// successful XSS or a malicious file dropped on the app.
 #[tauri::command]
 pub fn fs_list_dir(args: FsListDirArgs) -> Result<Vec<FsEntry>, String> {
-    let path = PathBuf::from(&args.path);
+    let path = ensure_under_registered_workspace(&args.path)?;
     if !path.is_dir() {
         return Err(format!("not a directory: {}", path.display()));
     }
@@ -119,6 +134,42 @@ fn should_skip(name: &str) -> bool {
         return false;
     }
     !matches!(name, ".thinkingroot")
+}
+
+/// Canonicalise `raw` and assert it falls inside one of the registered
+/// workspace roots. Returns the canonical path on success; an error
+/// string suitable for the Tauri command result on rejection.
+fn ensure_under_registered_workspace(raw: &str) -> Result<PathBuf, String> {
+    let registry = WorkspaceRegistry::load()
+        .map_err(|e| format!("load workspace registry: {e}"))?;
+    if registry.workspaces.is_empty() {
+        return Err(
+            "no workspace registered yet — set one up before browsing the filesystem".into(),
+        );
+    }
+
+    let raw_path = PathBuf::from(raw);
+    let canonical = match raw_path.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!("resolve {}: {e}", raw_path.display()));
+        }
+    };
+
+    for ws in &registry.workspaces {
+        let root = match ws.path.canonicalize() {
+            Ok(c) => c,
+            Err(_) => ws.path.clone(),
+        };
+        if canonical.starts_with(&root) {
+            return Ok(canonical);
+        }
+    }
+
+    Err(format!(
+        "path {} is outside every registered workspace — refusing to enumerate",
+        canonical.display()
+    ))
 }
 
 fn dir_has_visible_children(path: &Path) -> bool {
