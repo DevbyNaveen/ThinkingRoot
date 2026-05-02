@@ -6,8 +6,17 @@ use thinkingroot_core::Result;
 /// Convert a branch name to a filesystem-safe slug.
 /// "feature/graphql" → "feature-graphql"
 /// "My Branch" → "my-branch"
+///
+/// Inputs that contain only separator/whitespace characters (e.g.
+/// `"///"`, `"   "`, `"--"`) collapse to the empty string under the
+/// previous algorithm — and an empty slug joined with the data
+/// directory yields `<root>/.thinkingroot/branches/`, which then
+/// races every other empty-slug branch into the same directory.
+/// Returns the literal `"branch"` for those degenerate inputs so the
+/// resolved data dir is unambiguous.
 pub fn slugify(name: &str) -> String {
-    name.to_lowercase()
+    let slug = name
+        .to_lowercase()
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' {
@@ -20,7 +29,12 @@ pub fn slugify(name: &str) -> String {
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    if slug.is_empty() {
+        "branch".to_string()
+    } else {
+        slug
+    }
 }
 
 /// Resolve the data directory for a given branch.

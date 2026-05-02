@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,20 @@ pub fn new_session_store() -> SessionStore {
 const DEFAULT_TOKEN_BUDGET: usize = 4_000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Soft cap on the per-session `delivered_claim_ids` deduplication
+/// set.  A long-lived MCP session that runs hundreds of `investigate`
+/// calls would otherwise grow this set without bound — a 100k-claim
+/// graph repeatedly delivered claim-by-claim accumulates ~50 MiB of
+/// `String` headers in the session-store mutex critical section,
+/// which is shared across every concurrent session.
+///
+/// 50_000 is the upper bound where dedup still adds value: beyond
+/// that the session has likely "seen" the entire workspace and the
+/// agent's queries are returning stale repeats anyway.  When the cap
+/// is reached we evict the oldest insertions FIFO so recent claims
+/// continue to dedup correctly.
+const MAX_DELIVERED_CLAIMS: usize = 50_000;
+
 /// Per-session state for an MCP agent connection.
 ///
 /// Tracks what knowledge has been delivered so subsequent responses
@@ -30,6 +44,11 @@ pub struct SessionContext {
     pub active_entities: Vec<String>,
     /// Claim IDs already delivered — used to filter duplicate content.
     pub delivered_claim_ids: HashSet<String>,
+    /// FIFO insertion order for `delivered_claim_ids` so the soft cap
+    /// can evict the oldest entries.  Kept as a side-channel so the
+    /// `HashSet` retains O(1) `contains()` for the hot is_new_claim
+    /// check.
+    delivered_order: VecDeque<String>,
     /// Entity the agent is currently focused on (set by the `focus` tool).
     pub focus_entity: Option<String>,
     /// Branch the agent has checked out (set by `checkout_branch` tool).
@@ -52,6 +71,7 @@ impl SessionContext {
             owner: None,
             active_entities: Vec::new(),
             delivered_claim_ids: HashSet::new(),
+            delivered_order: VecDeque::new(),
             focus_entity: None,
             active_branch: None,
             token_budget: DEFAULT_TOKEN_BUDGET,
@@ -62,10 +82,30 @@ impl SessionContext {
     }
 
     /// Mark claim IDs as delivered — they will be filtered from future responses.
+    ///
+    /// Bounded at `MAX_DELIVERED_CLAIMS` (50 k entries) via FIFO
+    /// eviction.  Pre-fix a long-running session could accumulate the
+    /// entire workspace's claim ids in this set — for a 200 k-claim
+    /// graph the session-store mutex held ~10 MiB *per session*,
+    /// multiplied by however many concurrent agents.
     pub fn mark_delivered(&mut self, claim_ids: &[String]) {
         self.last_active = Instant::now();
         for id in claim_ids {
-            self.delivered_claim_ids.insert(id.clone());
+            // Skip duplicates so the FIFO order tracks unique
+            // insertions, not insertion attempts.
+            if self.delivered_claim_ids.insert(id.clone()) {
+                self.delivered_order.push_back(id.clone());
+            }
+        }
+        // Evict oldest entries when over the cap.  The hot path
+        // (`is_new_claim`) still hits the HashSet for O(1) lookup;
+        // only this writer path pays the cap-maintenance cost.
+        while self.delivered_claim_ids.len() > MAX_DELIVERED_CLAIMS {
+            if let Some(oldest) = self.delivered_order.pop_front() {
+                self.delivered_claim_ids.remove(&oldest);
+            } else {
+                break;
+            }
         }
     }
 
@@ -189,5 +229,30 @@ mod tests {
         let mut s = SessionContext::new("sess-1", "my-ws");
         s.deduct_tokens(DEFAULT_TOKEN_BUDGET + 1000);
         assert_eq!(s.token_budget, 0);
+    }
+
+    #[test]
+    fn delivered_claim_ids_stay_bounded() {
+        // Regression: pre-fix this set grew without bound, exhausting
+        // RAM on long-running MCP sessions in production.
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        let n = MAX_DELIVERED_CLAIMS + 1_000;
+        let ids: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+        s.mark_delivered(&ids);
+        assert_eq!(
+            s.delivered_claim_ids.len(),
+            MAX_DELIVERED_CLAIMS,
+            "set must not exceed the cap"
+        );
+        // Oldest should have been evicted.
+        assert!(
+            s.is_new_claim("c0"),
+            "oldest entry must have been evicted by FIFO"
+        );
+        // Newest should still be present.
+        assert!(
+            !s.is_new_claim(&format!("c{}", n - 1)),
+            "most-recent entry must still be tracked"
+        );
     }
 }

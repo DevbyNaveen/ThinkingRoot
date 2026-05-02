@@ -447,6 +447,19 @@ async fn search(
 }
 
 async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    // The audit flagged that this read guard is held for the entire
+    // compile (multi-minute).  Concurrent *readers* (search,
+    // brain_load, etc.) are unaffected — `RwLock::read` is shared.
+    // The only callers blocked are *writers* of the engine itself,
+    // which are `mount`/`unmount` on the workspace map.  Those run
+    // exactly once per workspace add/remove and are never on a UI hot
+    // path, so the practical contention surface is empty.
+    //
+    // Releasing the guard mid-compile would require changing
+    // `QueryEngine::compile`'s signature to `compile(Arc<Self>)`
+    // because the returned Future captures `&self` from the guard;
+    // that's a public API break we're not pulling forward without
+    // observed contention.
     let engine = state.engine.read().await;
     match engine.compile(&ws).await {
         Ok(result) => ok_response(result).into_response(),

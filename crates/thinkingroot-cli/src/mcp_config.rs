@@ -617,7 +617,19 @@ fn write_codex_config(
 }
 
 pub fn apply_codex_entry(doc: &mut toml::Value, bin_path: &str, workspace_path: &str) {
-    let root = doc.as_table_mut().expect("TOML root must be a table");
+    // A real `~/.codex/config.toml` can be just about anything the
+    // user pasted in — a TOML scalar at the top level, an array,
+    // truncated content, etc.  Pre-fix `expect("TOML root must be a
+    // table")` panicked the whole `root connect` flow on user input
+    // we don't control.  Now we replace a non-table root with an
+    // empty table and continue, matching how `write_codex_config`
+    // initialises a fresh file.
+    if !matches!(doc, toml::Value::Table(_)) {
+        *doc = toml::Value::Table(toml::map::Map::new());
+    }
+    let root = doc
+        .as_table_mut()
+        .expect("just replaced doc with a table above");
 
     if !root.contains_key("mcp_servers") {
         root.insert(

@@ -3339,6 +3339,17 @@ impl GraphStore {
             self.remove_claim(claim_id)?;
         }
 
+        // Prune dangling references from the session-turn calendar
+        // before the rest of the cascade finishes.  Pre-fix `turns`
+        // stored claim ids as a JSON string with no FK back to
+        // `claims`, so once a source was forgotten the turns table
+        // accumulated dangling ids that would resolve to "claim
+        // missing" for any future replay.  See
+        // `prune_turns_referencing_claims` for the rewrite shape.
+        if !claim_ids.is_empty() {
+            self.prune_turns_referencing_claims(&claim_ids)?;
+        }
+
         // Derived SVO calendar — must be cascaded before the
         // orphan-entity sweep, otherwise events keep pointing at
         // entity ULIDs the sweep is about to delete.
@@ -4492,6 +4503,111 @@ impl GraphStore {
                 ScriptMutability::Mutable,
             )
             .map_err(|e| Error::GraphStorage(format!("record_turn failed: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Filter dangling claim references out of the turns calendar.
+    ///
+    /// `turns.claim_ids` is a JSON-encoded `Vec<String>` because the
+    /// list is variable-length per turn — CozoDB doesn't support
+    /// inline arrays as primary-key components.  The downside is that
+    /// CozoDB can't enforce a foreign-key cascade from
+    /// `claims.id → turns.claim_ids[*]`, so when a claim is removed
+    /// (e.g. via `remove_source_by_id`) the turn rows would otherwise
+    /// keep pointing at the dead id.
+    ///
+    /// This helper rewrites every turn row whose `claim_ids` overlap
+    /// with `removed_claim_ids`, decoding the JSON, filtering, and
+    /// re-encoding.  Rows with no overlap are not touched.  When a
+    /// turn ends up with zero remaining claim ids it is deleted in
+    /// full — an empty turn carries no replay value.
+    pub fn prune_turns_referencing_claims(&self, removed_claim_ids: &[String]) -> Result<()> {
+        if removed_claim_ids.is_empty() {
+            return Ok(());
+        }
+        // Pull every turn row first.  Turns are bounded by session
+        // count × turn count which is tiny relative to the claim set,
+        // so a full scan is fine here — and avoids a Datalog rewrite
+        // we'd have to implement around the JSON-string encoding.
+        let result = self
+            .db
+            .run_script(
+                "?[session_id, turn_number, claim_ids, timestamp] := \
+                    *turns{session_id, turn_number, claim_ids, timestamp}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("scan turns: {e}")))?;
+
+        let removed: std::collections::HashSet<&str> =
+            removed_claim_ids.iter().map(String::as_str).collect();
+
+        for row in &result.rows {
+            let session_id = dv_to_string(&row[0]);
+            let turn_number = match &row[1] {
+                DataValue::Num(Num::Int(n)) => *n as u64,
+                DataValue::Num(Num::Float(f)) => *f as u64,
+                _ => continue,
+            };
+            let claim_ids_json = dv_to_string(&row[2]);
+            let timestamp = match &row[3] {
+                DataValue::Num(Num::Float(f)) => *f,
+                DataValue::Num(Num::Int(n)) => *n as f64,
+                _ => continue,
+            };
+
+            let claim_ids: Vec<String> =
+                serde_json::from_str(&claim_ids_json).unwrap_or_default();
+            let kept: Vec<String> = claim_ids
+                .into_iter()
+                .filter(|id| !removed.contains(id.as_str()))
+                .collect();
+
+            // Skip rows that didn't reference any removed claim — the
+            // length comparison is cheaper than re-encoding +
+            // re-writing.  When we re-encode, we always upsert with
+            // the canonical `serde_json` shape so the read path's
+            // `serde_json::from_str` round-trips cleanly.
+            let kept_json = serde_json::to_string(&kept).unwrap_or_else(|_| "[]".to_string());
+            if kept_json == claim_ids_json {
+                continue;
+            }
+
+            if kept.is_empty() {
+                // Empty turns are useless — delete the row outright.
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(session_id.clone().into()));
+                params.insert("turn".into(), DataValue::Num(Num::Int(turn_number as i64)));
+                self.db
+                    .run_script(
+                        "?[session_id, turn_number] <- [[$sid, $turn]] \
+                         :rm turns { session_id, turn_number }",
+                        params,
+                        ScriptMutability::Mutable,
+                    )
+                    .map_err(|e| {
+                        Error::GraphStorage(format!("delete empty turn: {e}"))
+                    })?;
+            } else {
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(session_id.into()));
+                params.insert("turn".into(), DataValue::Num(Num::Int(turn_number as i64)));
+                params.insert("cids".into(), DataValue::Str(kept_json.into()));
+                params.insert("ts".into(), DataValue::Num(Num::Float(timestamp)));
+                self.db
+                    .run_script(
+                        "?[session_id, turn_number, claim_ids, timestamp] <- \
+                         [[$sid, $turn, $cids, $ts]] \
+                         :put turns { session_id, turn_number => claim_ids, timestamp }",
+                        params,
+                        ScriptMutability::Mutable,
+                    )
+                    .map_err(|e| {
+                        Error::GraphStorage(format!("rewrite pruned turn: {e}"))
+                    })?;
+            }
+        }
 
         Ok(())
     }

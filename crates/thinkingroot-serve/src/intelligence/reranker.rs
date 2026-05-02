@@ -46,15 +46,15 @@ impl Reranker {
             return;
         }
 
-        let avg_dl = claims
-            .iter()
-            .map(|c| tokenise(&c.statement).len() as f32)
-            .sum::<f32>()
-            / claims.len() as f32;
+        let docs: Vec<Vec<String>> =
+            claims.iter().map(|c| tokenise(&c.statement)).collect();
+        let stats = CorpusStats::from(&docs);
 
-        for hit in claims.iter_mut() {
-            let bm25 = self.bm25_score(&hit.statement, avg_dl);
-            hit.relevance = blend(hit.relevance, bm25);
+        let raw_scores: Vec<f32> = docs.iter().map(|d| self.bm25_raw(d, &stats)).collect();
+        let normalised = min_max_normalise(&raw_scores);
+
+        for (hit, bm25) in claims.iter_mut().zip(normalised.iter()) {
+            hit.relevance = blend(hit.relevance, *bm25);
         }
 
         claims.sort_by(|a, b| {
@@ -70,15 +70,15 @@ impl Reranker {
             return;
         }
 
-        let avg_dl = entities
-            .iter()
-            .map(|e| tokenise(&e.name).len() as f32)
-            .sum::<f32>()
-            / entities.len() as f32;
+        let docs: Vec<Vec<String>> =
+            entities.iter().map(|e| tokenise(&e.name)).collect();
+        let stats = CorpusStats::from(&docs);
 
-        for hit in entities.iter_mut() {
-            let bm25 = self.bm25_score(&hit.name, avg_dl);
-            hit.relevance = blend(hit.relevance, bm25);
+        let raw_scores: Vec<f32> = docs.iter().map(|d| self.bm25_raw(d, &stats)).collect();
+        let normalised = min_max_normalise(&raw_scores);
+
+        for (hit, bm25) in entities.iter_mut().zip(normalised.iter()) {
+            hit.relevance = blend(hit.relevance, *bm25);
         }
 
         entities.sort_by(|a, b| {
@@ -89,33 +89,99 @@ impl Reranker {
     }
 }
 
+/// Min-max normalisation across a candidate set: maps the highest
+/// raw BM25 score to 1.0 and the lowest (≥0) to 0.0.  When every
+/// candidate scores zero (no term overlap anywhere) the function
+/// returns all zeros — a no-op for the blender.
+fn min_max_normalise(raw: &[f32]) -> Vec<f32> {
+    let max = raw.iter().cloned().fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return vec![0.0; raw.len()];
+    }
+    raw.iter().map(|s| (s / max).clamp(0.0, 1.0)).collect()
+}
+
 // ---------------------------------------------------------------------------
 // BM25 helpers (pure functions)
 // ---------------------------------------------------------------------------
 
+/// Pre-computed corpus statistics: average document length plus
+/// document-frequency for each query term.  Pre-fix the reranker
+/// computed BM25 with N=1 (single doc) which collapses IDF to log(1)=0;
+/// the previous code papered over that by hard-coding IDF=1.0,
+/// reducing BM25 to a pure TF term that overweights generic-but-
+/// frequent matches like "the" in queries that survive
+/// stop-word filtering only by hyphenation.  Now we compute proper
+/// IDF over the candidate document set so a query term that appears
+/// in *every* candidate gets a low IDF weight (it doesn't help
+/// distinguish), while a term that appears in only one document
+/// gets the highest weight.
+struct CorpusStats {
+    avg_dl: f32,
+    n: usize,
+    /// Map from query term → number of documents containing it (df).
+    /// Computed only for query terms (rarely > 5) so the cost is
+    /// O(N · |Q|) which is cheaper than tokenising a corpus index.
+    df: std::collections::HashMap<String, usize>,
+}
+
+impl CorpusStats {
+    fn from(docs: &[Vec<String>]) -> Self {
+        let n = docs.len();
+        let avg_dl = if n == 0 {
+            0.0
+        } else {
+            docs.iter().map(|d| d.len() as f32).sum::<f32>() / n as f32
+        };
+        // Build df only for terms that appear in at least one
+        // document — the bm25_score loop only reads via .get() so
+        // missing keys default-zero correctly.
+        let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for doc in docs {
+            // De-dupe per-document to count documents, not occurrences.
+            let unique: std::collections::HashSet<&String> = doc.iter().collect();
+            for term in unique {
+                *df.entry(term.clone()).or_insert(0) += 1;
+            }
+        }
+        Self { avg_dl, n, df }
+    }
+
+    /// IDF with the BM25-canonical "+0.5" smoothing to keep the score
+    /// non-negative even when a term appears in every doc.
+    /// idf = ln( (N - df + 0.5) / (df + 0.5) + 1.0 )
+    fn idf(&self, term: &str) -> f32 {
+        let df = *self.df.get(term).unwrap_or(&0) as f32;
+        let n = self.n as f32;
+        ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+    }
+}
+
 /// BM25 score for a single document `text` against `self.query_terms`.
+///
+/// Returns the *raw* BM25 sum — the caller is responsible for
+/// normalising across the candidate set via `min_max_normalise` so
+/// the blended score lands in [0, 1].  Pre-fix the per-document
+/// normaliser divided by `Σ(idf × (K1+1))` over **all** query terms
+/// including ones the document didn't match, which caused docs with
+/// missing query terms to score arbitrarily low even when they had
+/// strong matches on the present terms — the BM25 boost couldn't
+/// then beat a slightly-higher initial vector score.
 impl Reranker {
-    fn bm25_score(&self, text: &str, avg_dl: f32) -> f32 {
-        let doc_terms = tokenise(text);
+    fn bm25_raw(&self, doc_terms: &[String], stats: &CorpusStats) -> f32 {
         let dl = doc_terms.len() as f32;
-        // N=1 (single document) — IDF collapses to 1.0 for all terms,
-        // so this reduces to the term-frequency component of BM25.
+        let avg_dl = stats.avg_dl.max(1.0);
         let mut score = 0.0f32;
         for qt in &self.query_terms {
             let tf = doc_terms.iter().filter(|t| *t == qt).count() as f32;
             if tf > 0.0 {
+                let idf = stats.idf(qt);
                 let numerator = tf * (K1 + 1.0);
-                let denominator = tf + K1 * (1.0 - B + B * dl / avg_dl.max(1.0));
-                score += numerator / denominator;
+                let denominator = tf + K1 * (1.0 - B + B * dl / avg_dl);
+                score += idf * (numerator / denominator);
             }
         }
-        // Normalise to [0, 1] range — max possible score is query_terms.len() * (K1+1)/1
-        let max_score = self.query_terms.len() as f32 * (K1 + 1.0);
-        if max_score > 0.0 {
-            score / max_score
-        } else {
-            0.0
-        }
+        score
     }
 }
 
@@ -216,7 +282,60 @@ mod tests {
     #[test]
     fn bm25_score_zero_for_no_overlap() {
         let r = Reranker::new("alice paris tuesday");
-        let score = r.bm25_score("unrelated random words here", 5.0);
+        let docs = vec![
+            tokenise("unrelated random words here"),
+            tokenise("alice was in paris"),
+        ];
+        let stats = CorpusStats::from(&docs);
+        let score = r.bm25_raw(&docs[0], &stats);
         assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn bm25_idf_downweights_terms_present_in_all_docs() {
+        // Regression: pre-fix IDF was hard-coded to 1.0 so a query
+        // term appearing in every candidate scored full BM25 weight,
+        // even though it has zero discriminative power.  With proper
+        // IDF the boost for matching a "common" term must be lower
+        // than the boost for matching a "rare" term.
+        let r_common = Reranker::new("alice");
+        let r_rare = Reranker::new("paris");
+
+        // 5 candidate docs: every doc contains "alice"; only one
+        // contains "paris".
+        let docs = vec![
+            tokenise("alice went home"),
+            tokenise("alice cooked dinner"),
+            tokenise("alice slept early"),
+            tokenise("alice studied hard"),
+            tokenise("alice visited paris yesterday"),
+        ];
+        let stats = CorpusStats::from(&docs);
+
+        // Scoring the 5th doc — it matches both queries, but on the
+        // "alice" query it shares the term with everyone (df=5/N=5)
+        // while on the "paris" query it's unique (df=1/N=5).
+        let alice_score = r_common.bm25_raw(&docs[4], &stats);
+        let paris_score = r_rare.bm25_raw(&docs[4], &stats);
+
+        assert!(
+            paris_score > alice_score,
+            "rare-term match must score higher than common-term match \
+             (alice={alice_score}, paris={paris_score})"
+        );
+    }
+
+    #[test]
+    fn min_max_normalise_handles_all_zero() {
+        let zeros = min_max_normalise(&[0.0, 0.0, 0.0]);
+        assert_eq!(zeros, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn min_max_normalise_maps_max_to_one() {
+        let out = min_max_normalise(&[0.5, 1.5, 2.0]);
+        assert_eq!(out[2], 1.0);
+        assert!((out[1] - 0.75).abs() < 1e-6);
+        assert!((out[0] - 0.25).abs() < 1e-6);
     }
 }

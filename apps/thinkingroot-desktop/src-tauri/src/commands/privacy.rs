@@ -94,10 +94,23 @@ pub async fn privacy_summary(app: AppHandle) -> Result<PrivacySummary, String> {
 
 /// Forget every claim/edge/vector descended from `source_uri`. Returns
 /// the number of source rows removed (0 if no match).
+///
+/// Acquires the engine `RwLock` in **write mode** because this is a
+/// graph mutation: the underlying `QueryEngine::forget_source` runs
+/// `remove_source_by_uri`, refetches raw rows, and atomically swaps
+/// the in-memory cache.  Pre-fix this command held a read lock over
+/// a write operation — type-safe by accident (every actual mutation
+/// inside `forget_source` flows through the inner `Mutex<StorageEngine>`)
+/// but semantically wrong: it let concurrent `privacy_summary` /
+/// `brain_load` readers observe the cache mid-rebuild between the
+/// `remove_source_by_uri` and the cache swap.  Switching to
+/// `write()` linearises the redaction against every other engine
+/// reader, which is the contract the user-facing "Forget" button
+/// promises.
 #[tauri::command]
 pub async fn privacy_forget(app: AppHandle, source_uri: String) -> Result<usize, String> {
     let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
-    let guard = engine.read().await;
+    let guard = engine.write().await;
     guard
         .forget_source(&ws, &source_uri)
         .await

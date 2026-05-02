@@ -475,30 +475,169 @@ async fn wait_for_sidecar_ready(
 async fn cleanup_stale_sidecar(port: u16) {
     #[cfg(unix)]
     {
+        let pids = stale_pids_on_port(port);
+        if pids.is_empty() {
+            return;
+        }
         use std::process::Command as StdCommand;
-        // -t: terse (PID only)
-        // -i: internet (port)
-        // -sTCP:LISTEN: only listeners
-        let output = StdCommand::new("lsof")
-            .arg("-t")
-            .arg("-i")
-            .arg(format!("tcp:{}", port))
-            .arg("-sTCP:LISTEN")
-            .output();
+        for pid in pids {
+            tracing::info!(pid, port, "found stale process on sidecar port; killing");
+            // SIGKILL because if a process is still listening and
+            // hasn't responded to prior shutdown attempts, it's
+            // likely wedged.
+            let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).status();
+        }
+    }
+}
 
-        if let Ok(out) = output {
-            let pids = String::from_utf8_lossy(&out.stdout);
-            for pid_str in pids.lines() {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    tracing::info!(pid, port, "found stale process on sidecar port; killing");
-                    // We use SIGKILL here because if a process is still
-                    // listening and hasn't responded to the app's own
-                    // previous shutdown attempts, it's likely wedged.
-                    let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).status();
+/// Find PIDs holding a TCP listener on `port`.  Tries multiple
+/// strategies because `lsof` is not always installed on minimal
+/// Linux base images (Alpine, distroless, some CI runners) — pre-fix
+/// the cleanup silently no-op'd on those systems and the desktop
+/// would refuse to spawn its sidecar with a confusing "address in
+/// use" error after a crash.
+///
+/// Order:
+///   1. `lsof -t -i tcp:<port> -sTCP:LISTEN` (works on macOS + most Linux)
+///   2. `ss -tlnp` (`ss` ships with iproute2, present on virtually every
+///      modern Linux including Alpine + busybox)
+///   3. `/proc/net/tcp` parse (Linux-only, always present, last resort)
+///
+/// Returns an empty Vec when no strategy worked OR no process holds
+/// the port.
+#[cfg(unix)]
+fn stale_pids_on_port(port: u16) -> Vec<u32> {
+    use std::process::Command as StdCommand;
+
+    // Strategy 1: lsof.
+    if let Ok(out) = StdCommand::new("lsof")
+        .arg("-t")
+        .arg("-i")
+        .arg(format!("tcp:{}", port))
+        .arg("-sTCP:LISTEN")
+        .output()
+        && out.status.success()
+    {
+        let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        // `lsof` exits success with no output when nothing matches —
+        // an empty list here means "lsof ran but found nothing", not
+        // "lsof failed".  Either way return early.
+        return pids;
+    }
+
+    // Strategy 2: `ss -tlnp`.  Output line shape:
+    //   LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("root",pid=1234,fd=3))
+    if let Ok(out) = StdCommand::new("ss")
+        .arg("-tlnp")
+        .output()
+        && out.status.success()
+    {
+        let needle_v4 = format!(":{}", port);
+        let mut pids = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // Only consider listening lines that bind to our port.
+            // `ss` prints the address as `0.0.0.0:<port>` or
+            // `[::]:<port>`; the substring suffix check is sufficient
+            // because the field is whitespace-bounded.
+            let has_port = line.split_whitespace().any(|tok| {
+                tok.ends_with(&needle_v4) && tok.rsplit(':').next() == Some(&port.to_string())
+            });
+            if !has_port {
+                continue;
+            }
+            // Extract pid=NNN from the users:(...) field.
+            for chunk in line.split(',') {
+                if let Some(rest) = chunk.trim().strip_prefix("pid=")
+                    && let Some(pid_str) = rest.split(|c: char| !c.is_ascii_digit()).next()
+                    && let Ok(pid) = pid_str.parse::<u32>()
+                {
+                    pids.push(pid);
                 }
             }
         }
+        if !pids.is_empty() {
+            return pids;
+        }
+        // ss ran but found no PIDs on our port — return empty (the
+        // port is genuinely free, or `ss` doesn't have CAP_NET_ADMIN
+        // and can't see other-user PIDs).  Either way, no kill targets.
+        return Vec::new();
     }
+
+    // Strategy 3 (Linux only): /proc/net/tcp lookup.  Each line ends
+    // with the `inode` field; we then iterate /proc/*/fd/* symlinks
+    // looking for `socket:[<inode>]`.  This is the same approach
+    // procps uses internally and works without any extra binaries.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(inode) = listening_inode_for_port(port) {
+            return pids_owning_socket_inode(inode);
+        }
+    }
+
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn listening_inode_for_port(port: u16) -> Option<u64> {
+    // /proc/net/tcp format: per RFC, the local-address column is
+    // `<hex_ip>:<hex_port>`, state column is `0A` for LISTEN.
+    let raw = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let needle_port = format!(":{:04X}", port);
+    for line in raw.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let _sl = cols.next()?;
+        let local = cols.next()?;
+        let _remote = cols.next()?;
+        let state = cols.next()?;
+        if state != "0A" {
+            continue;
+        }
+        if !local.ends_with(&needle_port) {
+            continue;
+        }
+        // Skip uid, timer, retr, expire, then the inode column.
+        let _uid = cols.next()?;
+        let _timer = cols.next()?;
+        let _retr = cols.next()?;
+        let _expire = cols.next()?;
+        let inode: u64 = cols.next()?.parse().ok()?;
+        return Some(inode);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn pids_owning_socket_inode(inode: u64) -> Vec<u32> {
+    let needle = format!("socket:[{}]", inode);
+    let mut pids = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in read_dir.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd_entry in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd_entry.path())
+                && target.to_string_lossy() == needle
+            {
+                pids.push(pid);
+                break;
+            }
+        }
+    }
+    pids
 }
 
 fn exe_suffix() -> &'static str {

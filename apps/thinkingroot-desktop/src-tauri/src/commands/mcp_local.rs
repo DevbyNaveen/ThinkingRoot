@@ -192,23 +192,38 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
         return Ok(Vec::new());
     };
 
-    let url = format!(
-        "http://{}:{}/.well-known/mcp",
-        sidecar.host, sidecar.port
-    );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = match client.get(&url).send().await {
+
+    // Probe `/livez` to verify the sidecar is actually running before
+    // surfacing any "running" status.  Pre-fix this command claimed
+    // every row was "running" without ever checking — a sidecar that
+    // had crashed but whose handle was still cached in `AppState`
+    // would falsely advertise itself, and external MCP servers listed
+    // by the manifest were marked "running" with zero verification.
+    // Honesty rule: surface what we actually know.
+    let livez_url = format!("http://{}:{}/livez", sidecar.host, sidecar.port);
+    let self_status = match client.get(&livez_url).send().await {
+        Ok(r) if r.status().is_success() => "running",
+        Ok(_) => "unhealthy",
+        Err(_) => "unreachable",
+    };
+
+    let manifest_url = format!(
+        "http://{}:{}/.well-known/mcp",
+        sidecar.host, sidecar.port
+    );
+    let resp = match client.get(&manifest_url).send().await {
         Ok(r) => r,
         Err(_) => {
-            // Manifest may not exist on the engine yet; fall back to
-            // the single self-row we know is true: the sidecar is up.
+            // Manifest may not exist on the engine yet — fall back to
+            // the self-row only.
             return Ok(vec![McpServerRow {
                 name: "thinkingroot".to_string(),
                 transport: "sse".to_string(),
-                status: "running".to_string(),
+                status: self_status.to_string(),
                 description: Some(format!(
                     "Local sidecar at {}:{}",
                     sidecar.host, sidecar.port
@@ -220,7 +235,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
         return Ok(vec![McpServerRow {
             name: "thinkingroot".to_string(),
             transport: "sse".to_string(),
-            status: "running".to_string(),
+            status: self_status.to_string(),
             description: Some(format!(
                 "Local sidecar at {}:{}",
                 sidecar.host, sidecar.port
@@ -232,7 +247,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
     let mut rows = vec![McpServerRow {
         name: "thinkingroot".to_string(),
         transport: "sse".to_string(),
-        status: "running".to_string(),
+        status: self_status.to_string(),
         description: body
             .get("description")
             .and_then(Value::as_str)
@@ -256,10 +271,15 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
                 .get("description")
                 .and_then(Value::as_str)
                 .map(String::from);
+            // External servers listed in the manifest are *configured*
+            // — the sidecar exposes them through its tool catalog —
+            // but we have no signal that the upstream process is
+            // actually serving traffic.  "configured" surfaces that
+            // honestly without falsely promising "running".
             rows.push(McpServerRow {
                 name,
                 transport,
-                status: "running".to_string(),
+                status: "configured".to_string(),
                 description,
             });
         }

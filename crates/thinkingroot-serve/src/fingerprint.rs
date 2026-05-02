@@ -1,16 +1,23 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use thinkingroot_core::{Error, Result};
+use thinkingroot_core::{Error, Result, atomic_write};
 
 /// Stores per-source extraction fingerprints for early cutoff.
 /// If a source's extraction output fingerprint is unchanged from the previous run,
 /// downstream processing (linking, compilation) can be skipped.
 ///
-/// Stored as JSON: `{data_dir}/fingerprints.json` → HashMap<uri, fingerprint_hex>
+/// Stored as JSON: `{data_dir}/fingerprints.json` → BTreeMap<uri, fingerprint_hex>.
+///
+/// `BTreeMap` (rather than `HashMap`) gives deterministic key order
+/// at serialise time so two runs that yield the same fingerprints
+/// produce byte-identical files.  Pre-fix the HashMap ordering
+/// caused fingerprints.json to flap on every compile, which polluted
+/// CI dotfile-sync diffs and tricked the audit into thinking the
+/// cache was being invalidated when it wasn't.
 pub struct FingerprintStore {
     path: PathBuf,
-    fingerprints: HashMap<String, String>,
+    fingerprints: BTreeMap<String, String>,
 }
 
 impl FingerprintStore {
@@ -48,12 +55,18 @@ impl FingerprintStore {
         self.fingerprints.remove(uri);
     }
 
-    /// Persist to disk.
+    /// Persist to disk atomically (tmp + rename).  Pre-fix a SIGINT
+    /// during `std::fs::write` mid-syscall could leave
+    /// `fingerprints.json` truncated; the next compile then either
+    /// failed JSON parsing (full re-extract — minor) or, worse,
+    /// silently parsed a half-written object as a different ledger
+    /// and emitted spurious cache hits.
     pub fn save(&self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.fingerprints)
             .map_err(|e| Error::GraphStorage(format!("fingerprint serialize failed: {e}")))?;
-        std::fs::write(&self.path, bytes).map_err(|e| Error::io_path(&self.path, e))?;
-        Ok(())
+        // No special permissions — fingerprints aren't secret, so we
+        // pass `None` for the chmod and inherit umask defaults.
+        atomic_write(&self.path, &bytes, None)
     }
 }
 
