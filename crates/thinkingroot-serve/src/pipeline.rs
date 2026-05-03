@@ -307,6 +307,30 @@ async fn run_pipeline_inner(
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
 
+    // ─── Compile Completeness Contract auto-migration ──────────────────
+    // Detect a workspace whose `compile_schema_version` predates the
+    // current contract and run `backfill_structural` before Phase 1
+    // starts. Required because legacy claims need their structural
+    // rows emitted retroactively or Phase 9 will fail on the very
+    // first post-upgrade compile. Idempotent — second run is a no-op.
+    let current_version = storage
+        .graph
+        .get_workspace_meta("compile_schema_version")?
+        .unwrap_or_default();
+    if current_version != "2" {
+        tracing::info!(
+            current_version = %current_version,
+            "auto-migrating workspace to Compile Completeness Contract (v2) before compile"
+        );
+        // Drop the open storage handle so backfill can re-open with
+        // exclusive write access (CozoDB allows shared reads but writes
+        // serialise on the SQLite mutex; an in-flight handle would race).
+        drop(storage);
+        let _ = crate::backfill::backfill_structural(&data_dir)?;
+        // Re-open storage with the migrated schema in place.
+        storage = StorageEngine::init(&data_dir).await?;
+    }
+
     // ─── Phase 1: Identify potentially-changed documents ───────────────
     // (content hash differs from stored — NOT yet removed from graph)
     let mut potentially_changed: Vec<_> = Vec::new();
@@ -825,6 +849,13 @@ async fn run_pipeline_inner(
         // can render an honest "N batches failed" warning.
         failed_batches: extraction.failed_batches,
         failed_batch_ranges: extraction.failed_batch_ranges,
+        // Compile Completeness Contract §5 decorations carried from the
+        // extractor into Phase 6.7 (when it lands). Filtering parallels
+        // `claims` above so only truly-changed sources' decorations
+        // survive. The HashMap retain pattern matches what `claim_entity_names`
+        // would do if it were filtered (currently it isn't — see issue C5).
+        claim_quantities: extraction.claim_quantities,
+        claim_expirations: extraction.claim_expirations,
     };
 
     // ─── Phase 6.5: Rooting ────────────────────────────────────────────
@@ -945,6 +976,32 @@ async fn run_pipeline_inner(
             rooting_output.rejected_count
         );
     }
+
+    // ─── Phase 6.7: Structural Persist (Compile Completeness Contract §6) ───
+    // Walks every chunk in every truly-changed document and emits typed
+    // rows into the 16 new structural CozoDB tables, plus a chunks_residual
+    // fall-through for chunks no other emitter covers (the catch-all that
+    // makes I-3 byte coverage tractable). Stamps `content_blake3` onto
+    // every Claim before the linker writes them. Pre-conditions all
+    // satisfied here: sources inserted (Phase 6), bytes available in
+    // byte_store, admission_tier stamped (Phase 6.5 / no-op when rooting
+    // disabled), linker not yet run.
+    let phase_6_7_doc_refs: Vec<&thinkingroot_core::ir::DocumentIR> =
+        truly_changed.iter().copied().collect();
+    let phase_6_7_stats = crate::structural_persist::phase_6_7_structural_persist(
+        &phase_6_7_doc_refs,
+        &mut filtered_extraction,
+        &storage.graph,
+        &byte_store,
+    )?;
+    tracing::info!(
+        sources = phase_6_7_stats.sources_processed,
+        rows = phase_6_7_stats.structural_rows_emitted,
+        residual = phase_6_7_stats.residual_rows_emitted,
+        blake3_spans = phase_6_7_stats.blake3_distinct_spans,
+        elapsed_ms = phase_6_7_stats.elapsed.as_millis() as u64,
+        "phase 6.7 structural persist complete"
+    );
 
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();
@@ -1079,6 +1136,61 @@ async fn run_pipeline_inner(
     // in `root query` (which lazily builds the index on first call),
     // `root render`, and `root health` respectively. Per v3 final
     // plan §5.4 / §11.
+
+    // ─── Phase 9: Byte-Coverage Audit (Compile Completeness Contract §7) ───
+    // Enforces I-3: every source byte maps to ≥1 structural row OR a
+    // chunks_residual row. CI-gating; fails the compile when any
+    // source has uncovered bytes. Per-compile escape hatch:
+    // `TR_SKIP_BYTE_AUDIT=1` (intended for local iteration; CI must
+    // keep it on).
+    let phase_9_skip = std::env::var("TR_SKIP_BYTE_AUDIT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !phase_9_skip {
+        let phase_9_started = std::time::Instant::now();
+        let orphans = storage.graph.query_orphan_bytes()?;
+        if !orphans.is_empty() {
+            // Group by source so the error sample is human-scannable.
+            let mut by_source: std::collections::HashMap<String, Vec<(u64, u64)>> =
+                std::collections::HashMap::new();
+            let total_orphan_bytes: usize = orphans
+                .iter()
+                .map(|(_, s, e)| (e.saturating_sub(*s)) as usize)
+                .sum();
+            for (sid, bs, be) in &orphans {
+                by_source
+                    .entry(sid.to_string())
+                    .or_default()
+                    .push((*bs, *be));
+            }
+            let sources_with_orphans = by_source.len();
+            // Take the first 5 entries for the diagnostic sample. HashMap
+            // iteration order isn't stable but that's fine — `take(5)` is
+            // a "give me a representative slice" contract, not a
+            // "give me the deterministic-ranked top-5".
+            let sample: Vec<(String, Vec<(u64, u64)>)> =
+                by_source.into_iter().take(5).collect();
+            tracing::error!(
+                sources = sources_with_orphans,
+                bytes = total_orphan_bytes,
+                "phase 9 byte-coverage breach detected"
+            );
+            return Err(thinkingroot_core::Error::ByteCoverageBreach {
+                sources_with_orphans,
+                total_orphan_bytes,
+                sample,
+            });
+        }
+        tracing::info!(
+            elapsed_ms = phase_9_started.elapsed().as_millis() as u64,
+            "phase 9 byte-coverage audit passed (zero orphan bytes)"
+        );
+    } else {
+        tracing::warn!(
+            "phase 9 byte-coverage audit SKIPPED via TR_SKIP_BYTE_AUDIT=1; \
+             do not use this in CI"
+        );
+    }
 
     fingerprints.save()?;
     config.save(root_path)?;

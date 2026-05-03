@@ -29,6 +29,8 @@ pub fn is_structurally_extractable(chunk: &Chunk) -> bool {
             | ChunkType::Import
             | ChunkType::ManifestDependency
             | ChunkType::Heading
+            | ChunkType::ConfigEntry
+            | ChunkType::DataRow
     )
 }
 
@@ -45,6 +47,8 @@ pub fn extract_structural(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         ChunkType::Heading => extract_heading(chunk, source_uri),
         ChunkType::Prose => extract_prose(chunk, source_uri),
         ChunkType::Comment | ChunkType::ModuleDoc => extract_doc_comment(chunk, source_uri),
+        ChunkType::ConfigEntry => extract_config_entry(chunk, source_uri),
+        ChunkType::DataRow => extract_data_row(chunk, source_uri),
         _ => ExtractionResult::empty(),
     }
 }
@@ -94,6 +98,7 @@ fn extract_manifest_dep(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        ..Default::default()
     };
 
     ExtractionResult {
@@ -136,6 +141,8 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        symbol: Some(name.clone()),
+        ..Default::default()
     };
 
     let def_claim = ExtractedClaim {
@@ -150,6 +157,8 @@ fn extract_function_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        symbol: Some(name.clone()),
+        ..Default::default()
     };
 
     // ── Relations ─────────────────────────────────────────────────────────────
@@ -252,6 +261,8 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        symbol: Some(name.clone()),
+        ..Default::default()
     };
 
     let file_entity = ExtractedEntity {
@@ -307,6 +318,7 @@ fn extract_type_def(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
             byte_start: chunk.byte_start,
             byte_end: chunk.byte_end,
             predicate: None,
+            ..Default::default()
         };
         result.claims.push(impl_claim);
     }
@@ -379,6 +391,7 @@ fn extract_import(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        ..Default::default()
     };
 
     let uses_relation = ExtractedRelation {
@@ -452,6 +465,7 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         byte_start: chunk.byte_start,
         byte_end: chunk.byte_end,
         predicate: None,
+        ..Default::default()
     };
 
     ExtractionResult {
@@ -529,6 +543,7 @@ fn extract_git_commit(chunk: &Chunk, source_uri: &str, author: &str) -> Extracti
             byte_start: chunk.byte_start,
             byte_end: chunk.byte_end,
             predicate: None,
+            ..Default::default()
         };
         result.entities.push(file_entity);
         result.relations.push(created_by);
@@ -585,42 +600,225 @@ fn extract_prose_links(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
     result
 }
 
-/// Comment/ModuleDoc → Claim(definition) if a parent is present, empty otherwise.
+/// Comment/ModuleDoc → Claim(definition) if a parent is present, plus one
+/// Claim per parsed `@param` / `@returns` / `@throws` doc-tag (Wedge 4).
+/// Returns empty when neither a parent nor any tags are present.
 fn extract_doc_comment(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
-    let parent = match &chunk.metadata.parent {
-        Some(p) if !p.is_empty() => p.clone(),
-        _ => return ExtractionResult::empty(),
-    };
+    let parent = chunk
+        .metadata
+        .parent
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let has_tags = !chunk.metadata.doc_tags.is_empty();
 
-    let statement = format!(
-        "{parent}: {}",
-        chunk
-            .content
-            .trim()
-            .trim_start_matches("///")
-            .trim_start_matches("//!")
-            .trim()
-    );
+    if parent.is_none() && !has_tags {
+        return ExtractionResult::empty();
+    }
 
-    let def_claim = ExtractedClaim {
-        statement,
-        claim_type: "definition".to_string(),
-        confidence: 0.99,
-        entities: vec![parent],
-        source_quote: Some(chunk.content.trim().to_string()),
-        extraction_tier: ExtractionTier::Structural,
-        event_date: None,
-        source_path: source_uri.to_string(),
-        byte_start: chunk.byte_start,
-        byte_end: chunk.byte_end,
-        predicate: None,
+    let mut claims = Vec::new();
+
+    // Original definition claim — only when a parent context is known.
+    if let Some(p) = &parent {
+        let statement = format!(
+            "{p}: {}",
+            chunk
+                .content
+                .trim()
+                .trim_start_matches("///")
+                .trim_start_matches("//!")
+                .trim()
+        );
+        claims.push(ExtractedClaim {
+            statement,
+            claim_type: "definition".to_string(),
+            confidence: 0.99,
+            entities: vec![p.clone()],
+            source_quote: Some(chunk.content.trim().to_string()),
+            extraction_tier: ExtractionTier::Structural,
+            event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
+            predicate: None,
+            ..Default::default()
+        });
+    }
+
+    // Wedge 4: one Claim per parsed doc-tag.  Attached to the parent entity
+    // when known so the graph links @param X → its function.
+    let scope = parent.clone().unwrap_or_else(|| {
+        // No parent — fall back to the file name so the tag still has somewhere to anchor.
+        file_name_from_uri(source_uri)
+    });
+    let tag_entities = if parent.is_some() {
+        vec![scope.clone()]
+    } else {
+        Vec::new()
     };
+    for tag in &chunk.metadata.doc_tags {
+        let statement = match (&tag.kind[..], &tag.name) {
+            ("param", Some(name)) => format!("{scope} parameter {name}: {}", tag.description),
+            ("throws", Some(name)) => format!("{scope} throws {name}: {}", tag.description),
+            ("returns", _) => format!("{scope} returns: {}", tag.description),
+            ("deprecated", _) => format!("{scope} is deprecated: {}", tag.description),
+            ("see", _) => format!("{scope} see also: {}", tag.description),
+            (_, Some(name)) => format!("{scope} @{} {name}: {}", tag.kind, tag.description),
+            (_, None) => format!("{scope} @{}: {}", tag.kind, tag.description),
+        };
+        claims.push(ExtractedClaim {
+            statement,
+            claim_type: "definition".to_string(),
+            confidence: 0.99,
+            entities: tag_entities.clone(),
+            source_quote: None,
+            extraction_tier: ExtractionTier::Structural,
+            event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
+            predicate: None,
+            ..Default::default()
+        });
+    }
 
     ExtractionResult {
-        claims: vec![def_claim],
+        claims,
         entities: Vec::new(),
         relations: Vec::new(),
     }
+}
+
+/// ConfigEntry → Entity(config_key) + Claim(fact `key = value`)
+///             + Relation(file `contains` config_key).
+///
+/// Wedge 4: emitted by `toml_data` / `yaml_data` / `json_data` parsers.
+/// `config_value_type == "table" | "array"` chunks are treated as section
+/// headers (no value); all other types emit a key=value fact claim.
+fn extract_config_entry(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    let key = match &chunk.metadata.config_key {
+        Some(k) if !k.is_empty() => k.clone(),
+        _ => return ExtractionResult::empty(),
+    };
+    let file_name = file_name_from_uri(source_uri);
+
+    let (entity_type, value_type) = match chunk.metadata.config_value_type.as_deref() {
+        Some("table") => ("config_section", "table"),
+        Some("array") => ("config_section", "array"),
+        _ => ("config_key", chunk.metadata.config_value_type.as_deref().unwrap_or("string")),
+    };
+
+    let key_entity = ExtractedEntity {
+        name: key.clone(),
+        entity_type: entity_type.to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("{key} is a {value_type} entry in {file_name}")),
+    };
+    let file_entity = ExtractedEntity {
+        name: file_name.clone(),
+        entity_type: "file".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("Source file {file_name}")),
+    };
+    let contains_rel = ExtractedRelation {
+        from_entity: file_name.clone(),
+        to_entity: key.clone(),
+        relation_type: "contains".to_string(),
+        description: Some(format!("{file_name} contains {entity_type} {key}")),
+        confidence: 0.99,
+    };
+
+    let mut result = ExtractionResult {
+        claims: Vec::new(),
+        entities: vec![key_entity, file_entity],
+        relations: vec![contains_rel],
+    };
+
+    // Section headers carry no value — only the entity + relation.
+    if let Some(value) = chunk.metadata.config_value.as_deref() {
+        let statement = format!("{key} = {value}");
+        let fact_claim = ExtractedClaim {
+            statement,
+            claim_type: "fact".to_string(),
+            confidence: 0.99,
+            entities: vec![key.clone(), file_name.clone()],
+            source_quote: Some(chunk.content.trim().to_string()),
+            extraction_tier: ExtractionTier::Structural,
+            event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
+            predicate: None,
+            ..Default::default()
+        };
+        result.claims.push(fact_claim);
+    }
+
+    result
+}
+
+/// DataRow → Entity(`<file>:row{N}`) + Claim per cell + Relation(file contains row).
+///
+/// Wedge 4: emitted by `csv_data` parser, `json_data` (top-level array of
+/// objects), and `markdown::table_rows`. `row_columns` is required; an empty
+/// metadata row produces no claims (defensive guard against malformed data).
+fn extract_data_row(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
+    if chunk.metadata.row_columns.is_empty() {
+        return ExtractionResult::empty();
+    }
+
+    let file_name = file_name_from_uri(source_uri);
+    let row_idx = chunk.metadata.row_index.unwrap_or(0);
+    let row_name = format!("{file_name}:row{row_idx}");
+
+    let row_entity = ExtractedEntity {
+        name: row_name.clone(),
+        entity_type: "data_row".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("Row {row_idx} of {file_name}")),
+    };
+    let file_entity = ExtractedEntity {
+        name: file_name.clone(),
+        entity_type: "file".to_string(),
+        aliases: Vec::new(),
+        description: Some(format!("Source file {file_name}")),
+    };
+    let contains_rel = ExtractedRelation {
+        from_entity: file_name.clone(),
+        to_entity: row_name.clone(),
+        relation_type: "contains".to_string(),
+        description: Some(format!("{file_name} contains row {row_idx}")),
+        confidence: 0.99,
+    };
+
+    let mut result = ExtractionResult {
+        claims: Vec::new(),
+        entities: vec![row_entity, file_entity],
+        relations: vec![contains_rel],
+    };
+
+    for (header, cell) in &chunk.metadata.row_columns {
+        if header.is_empty() {
+            continue;
+        }
+        let statement = format!("{row_name} {header}: {cell}");
+        result.claims.push(ExtractedClaim {
+            statement,
+            claim_type: "fact".to_string(),
+            confidence: 0.99,
+            entities: vec![row_name.clone()],
+            source_quote: None,
+            extraction_tier: ExtractionTier::Structural,
+            event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
+            predicate: None,
+            ..Default::default()
+        });
+    }
+
+    result
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1208,5 +1406,178 @@ mod tests {
         let result = extract_structural(&chunk, "git://abc123");
         assert!(result.claims.is_empty());
         assert!(result.relations.is_empty());
+    }
+
+    // ── Wedge 4: ConfigEntry handler ─────────────────────────────────────
+
+    #[test]
+    fn config_entry_scalar_produces_entity_and_fact_claim() {
+        let meta = ChunkMetadata {
+            config_key: Some("database.pool_size".to_string()),
+            config_value: Some("10".to_string()),
+            config_value_type: Some("int".to_string()),
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::ConfigEntry, "database.pool_size = 10", meta);
+        let result = extract_structural(&chunk, "config/app.toml");
+
+        let key_entity = result
+            .entities
+            .iter()
+            .find(|e| e.name == "database.pool_size")
+            .expect("expected key entity");
+        assert_eq!(key_entity.entity_type, "config_key");
+
+        let fact = result
+            .claims
+            .iter()
+            .find(|c| c.claim_type == "fact")
+            .expect("expected fact claim");
+        assert_eq!(fact.extraction_tier, ExtractionTier::Structural);
+        assert!(fact.statement.contains("database.pool_size"));
+        assert!(fact.statement.contains("10"));
+
+        let contains = result
+            .relations
+            .iter()
+            .find(|r| r.relation_type == "contains")
+            .expect("expected contains relation");
+        assert_eq!(contains.from_entity, "app.toml");
+        assert_eq!(contains.to_entity, "database.pool_size");
+    }
+
+    #[test]
+    fn config_entry_section_header_emits_no_fact_claim() {
+        let meta = ChunkMetadata {
+            config_key: Some("database".to_string()),
+            config_value: None,
+            config_value_type: Some("table".to_string()),
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::ConfigEntry, "[database]", meta);
+        let result = extract_structural(&chunk, "config/app.toml");
+        assert!(
+            result.claims.is_empty(),
+            "section headers must not emit fact claims"
+        );
+        assert!(
+            result.entities.iter().any(|e| e.entity_type == "config_section"),
+            "section headers emit config_section entity"
+        );
+    }
+
+    #[test]
+    fn config_entry_missing_key_returns_empty() {
+        let chunk = make_chunk(ChunkType::ConfigEntry, "junk", ChunkMetadata::default());
+        let result = extract_structural(&chunk, "config/app.toml");
+        assert!(result.claims.is_empty());
+        assert!(result.entities.is_empty());
+        assert!(result.relations.is_empty());
+    }
+
+    // ── Wedge 4: DataRow handler ─────────────────────────────────────────
+
+    #[test]
+    fn data_row_produces_per_cell_claims() {
+        let meta = ChunkMetadata {
+            row_index: Some(0),
+            row_columns: vec![
+                ("name".to_string(), "alice".to_string()),
+                ("age".to_string(), "30".to_string()),
+            ],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::DataRow, "name=alice | age=30", meta);
+        let result = extract_structural(&chunk, "data/users.csv");
+
+        assert_eq!(
+            result.claims.len(),
+            2,
+            "one fact claim per non-empty header"
+        );
+        assert!(result.claims.iter().all(|c| c.claim_type == "fact"));
+        assert!(result.claims.iter().any(|c| c.statement.contains("alice")));
+        assert!(result.claims.iter().any(|c| c.statement.contains("30")));
+
+        let row_entity = result
+            .entities
+            .iter()
+            .find(|e| e.entity_type == "data_row")
+            .expect("expected data_row entity");
+        assert!(row_entity.name.contains(":row0"));
+    }
+
+    #[test]
+    fn data_row_empty_columns_returns_empty() {
+        let chunk = make_chunk(ChunkType::DataRow, "", ChunkMetadata::default());
+        let result = extract_structural(&chunk, "data/users.csv");
+        assert!(result.claims.is_empty());
+        assert!(result.entities.is_empty());
+        assert!(result.relations.is_empty());
+    }
+
+    // ── Wedge 4: doc_tags emitted as Claims under Comment/ModuleDoc ──────
+
+    #[test]
+    fn comment_with_doc_tags_emits_per_tag_claims() {
+        let meta = ChunkMetadata {
+            parent: Some("parse_document".to_string()),
+            doc_tags: vec![
+                thinkingroot_core::ir::DocTag {
+                    kind: "param".to_string(),
+                    name: Some("path".to_string()),
+                    description: "the file path".to_string(),
+                },
+                thinkingroot_core::ir::DocTag {
+                    kind: "returns".to_string(),
+                    name: None,
+                    description: "the parsed document".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let chunk = make_chunk(
+            ChunkType::Comment,
+            "/// Parses a document.\n/// @param path the file path\n/// @returns the parsed document",
+            meta,
+        );
+        let result = extract_structural(&chunk, "src/parse.rs");
+
+        // 1 definition (existing behaviour) + 2 tag claims = 3
+        assert!(
+            result.claims.len() >= 3,
+            "expected at least 3 claims (definition + 2 tags), got {}",
+            result.claims.len()
+        );
+        assert!(
+            result
+                .claims
+                .iter()
+                .any(|c| c.statement.contains("parameter path")
+                    && c.statement.contains("file path"))
+        );
+        assert!(
+            result
+                .claims
+                .iter()
+                .any(|c| c.statement.starts_with("parse_document returns:"))
+        );
+    }
+
+    #[test]
+    fn comment_with_only_doc_tags_no_parent_still_emits_tag_claims() {
+        // No parent on the chunk — but doc_tags present.  Falls back to file
+        // name as scope, and emits tag claims with empty entities list.
+        let meta = ChunkMetadata {
+            doc_tags: vec![thinkingroot_core::ir::DocTag {
+                kind: "deprecated".to_string(),
+                name: None,
+                description: "use new_api instead".to_string(),
+            }],
+            ..Default::default()
+        };
+        let chunk = make_chunk(ChunkType::ModuleDoc, "//! @deprecated use new_api instead", meta);
+        let result = extract_structural(&chunk, "src/old.rs");
+        assert!(result.claims.iter().any(|c| c.statement.contains("deprecated")));
     }
 }

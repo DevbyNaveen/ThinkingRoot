@@ -9,10 +9,10 @@ pub fn parse(path: &Path, language: &str) -> Result<DocumentIR> {
     let content = std::fs::read_to_string(path).map_err(|e| Error::io_path(path, e))?;
     let hash = ContentHash::from_bytes(content.as_bytes());
 
-    let ts_language = get_language(language)?;
+    let lang = ts_language(language)?;
     let mut parser = tree_sitter::Parser::new();
     parser
-        .set_language(&ts_language)
+        .set_language(&lang)
         .map_err(|e| Error::Parse {
             source_path: path.to_path_buf(),
             message: format!("failed to set language: {e}"),
@@ -41,7 +41,11 @@ pub fn parse(path: &Path, language: &str) -> Result<DocumentIR> {
     Ok(doc)
 }
 
-fn get_language(name: &str) -> Result<tree_sitter::Language> {
+/// Resolve a language name (as used by the parser dispatch in `lib.rs`) to its
+/// tree-sitter `Language` handle. Public so the extract-crate AST splitter
+/// (Wedge 3) can re-parse oversized chunks at statement boundaries without
+/// duplicating the language-name match arm.
+pub fn ts_language(name: &str) -> Result<tree_sitter::Language> {
     match name {
         "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
         "python" => Ok(tree_sitter_python::LANGUAGE.into()),
@@ -241,18 +245,22 @@ fn extract_chunks(source: &str, node: tree_sitter::Node, language: &str, doc: &m
             "line_comment" | "block_comment" | "comment" => {
                 if text.len() > 20 {
                     // Only include substantial comments.
-                    let chunk = Chunk::new(text, ChunkType::Comment, start_line, end_line)
+                    let mut chunk = Chunk::new(text, ChunkType::Comment, start_line, end_line)
                         .with_language(language)
                         .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
+                    // Wedge 4: parse @param/@returns/@throws into metadata.doc_tags
+                    // so the structural extractor can emit per-tag claims.
+                    crate::doctags::populate(&mut chunk);
                     doc.add_chunk(chunk);
                 }
             }
 
             // Module-level doc attributes in Rust
             "inner_attribute_item" if text.starts_with("#![doc") || text.starts_with("//!") => {
-                let chunk = Chunk::new(text, ChunkType::ModuleDoc, start_line, end_line)
+                let mut chunk = Chunk::new(text, ChunkType::ModuleDoc, start_line, end_line)
                     .with_language(language)
                     .with_byte_range(child.start_byte() as u64, child.end_byte() as u64);
+                crate::doctags::populate(&mut chunk);
                 doc.add_chunk(chunk);
             }
 

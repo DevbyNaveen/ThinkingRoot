@@ -27,3 +27,7 @@ pyo3 = { version = "0.23", features = ["extension-module"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Per-Engine session-id derivation (mirrors the EngramManager pointer
+# secret seeding pattern in thinkingroot-serve so AEP probes get a
+# stable session token without forcing the Python caller to mint one).
+blake3 = "1"

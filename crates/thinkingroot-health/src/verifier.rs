@@ -326,6 +326,8 @@ mod tests {
             derivation: None,
             predicate: None,
             last_rooted_at: None,
+            row_blake3: None,
+            symbol: None,
         };
         graph.insert_claim(&claim).unwrap();
 

@@ -125,6 +125,26 @@ pub struct SourceMetadata {
     pub language: Option<String>,
     /// Relative path within the repository.
     pub relative_path: Option<String>,
+    // ─── Compile Completeness Contract §4.7 — git_commits emitter inputs ─
+    /// For git: author email — populates `git_commits.commit_email`.
+    #[serde(default)]
+    pub commit_email: Option<String>,
+    /// For git: commit timestamp as a Unix epoch second — populates
+    /// `git_commits.commit_timestamp` for chronological queries.
+    #[serde(default)]
+    pub commit_timestamp: Option<f64>,
+    /// For git: the commit message body — populates `git_commits.message`.
+    #[serde(default)]
+    pub commit_message: Option<String>,
+    /// For git: parent commit SHA — populates `git_commits.parent_sha` so
+    /// the call graph DAG can be reconstructed via `:by_commit` joins.
+    #[serde(default)]
+    pub parent_sha: Option<String>,
+    /// For git: file paths changed in this commit, JSON-serialised — populates
+    /// `git_commits.changed_files_json` for "files-most-changed-by-author"
+    /// queries without re-walking history.
+    #[serde(default)]
+    pub changed_files_json: Option<String>,
 }
 
 #[cfg(test)]

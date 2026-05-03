@@ -16,6 +16,12 @@ pub struct DocumentIR {
     pub content_hash: ContentHash,
     pub chunks: Vec<Chunk>,
     pub metadata: SourceMetadata,
+    /// Compile Completeness Contract §I-3 exception class — set by
+    /// parsers that strip a trailing newline. Phase 6.7 emits a
+    /// `source_annotations` row of `kind = "trailing_newline_norm"`
+    /// covering the dropped byte so the byte-coverage audit passes.
+    #[serde(default)]
+    pub trailing_newline_normalised: bool,
 }
 
 impl DocumentIR {
@@ -29,6 +35,7 @@ impl DocumentIR {
             content_hash: ContentHash::empty(),
             chunks: Vec::new(),
             metadata: SourceMetadata::default(),
+            trailing_newline_normalised: false,
         }
     }
 
@@ -179,6 +186,14 @@ pub enum ChunkType {
     /// A single dependency declaration from a project manifest file
     /// (Cargo.toml, package.json, go.mod, requirements.txt, pyproject.toml).
     ManifestDependency,
+    /// A single key-value entry (or section header) in a generic config
+    /// or data tree such as TOML, YAML, or JSON. Carries `config_key`,
+    /// `config_value`, and `config_value_type` in [`ChunkMetadata`].
+    ConfigEntry,
+    /// A single tabular row from CSV, TSV, a markdown GFM table, or a
+    /// top-level JSON array-of-objects element. Carries `row_index` and
+    /// `row_columns` (header → cell pairs) in [`ChunkMetadata`].
+    DataRow,
 }
 
 /// Additional metadata for a chunk, depending on its type.
@@ -218,6 +233,69 @@ pub struct ChunkMetadata {
     pub commit_author: Option<String>,
     /// File paths changed in this commit (from diff --stat output).
     pub changed_files: Vec<String>,
+
+    // Wedge 4: TOML/YAML/JSON config-tree extraction.
+    /// Dotted path to this config leaf, e.g. `"database.pool_size"` or
+    /// `"servers[0].host"`. Set on `ChunkType::ConfigEntry` chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_key: Option<String>,
+    /// Primitive scalar rendered as a string (numbers and bools are stringified).
+    /// `None` for table / array / null section headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_value: Option<String>,
+    /// Type of the config value: `"string" | "int" | "bool" | "float"
+    /// | "array" | "table" | "null"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_value_type: Option<String>,
+
+    // Wedge 4: CSV/TSV/markdown-table row extraction.
+    /// Zero-based row index, counted *after* the header row. Set on
+    /// `ChunkType::DataRow` chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u32>,
+    /// Header → cell pairs in the original column order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_columns: Vec<(String, String)>,
+
+    // Wedge 4: doc-comment tag extraction (Rustdoc / JSDoc / Python / JavaDoc).
+    /// Parsed `@param` / `@returns` / `@throws` / `@deprecated` / `@see`
+    /// tags found inside a `Comment` or `ModuleDoc` chunk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_tags: Vec<DocTag>,
+
+    // ─── Compile Completeness Contract §4.16 — code metrics ─────────────
+    /// McCabe cyclomatic complexity for FunctionDef chunks. `None` for
+    /// non-code chunks. Computed by per-language tree-sitter queries in
+    /// `code_metrics.rs` for Rust + TypeScript + Python + Go + Java
+    /// (the v1 supported set per contract §15 Q3); other languages
+    /// leave this at `None` and `complexity_method` reports
+    /// `"unsupported"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cyclomatic: Option<u32>,
+    /// Algorithm used to compute `cyclomatic`. `"mccabe"` for the 5
+    /// supported languages, `"unsupported"` for the rest. Stored so
+    /// queries that filter on cyclomatic can distinguish "0 because
+    /// trivial fn" from "0 because language not yet supported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_method: Option<String>,
+}
+
+/// A single parsed doc-comment annotation tag.
+///
+/// Produced by the doctags parser for the inside of `Comment` / `ModuleDoc`
+/// chunks. `kind` is normalised to a small set of strings (`"param"`,
+/// `"returns"`, `"throws"`, `"deprecated"`, `"see"`); other tags are kept
+/// with their literal kind for forward compatibility.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DocTag {
+    /// Tag kind: `"param" | "returns" | "throws" | "deprecated" | "see" | …`.
+    pub kind: String,
+    /// Tag target name, where applicable (e.g. the parameter name in
+    /// `@param <name>` or the exception type in `@throws <Type>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Free-form description for the tag.
+    pub description: String,
 }
 
 #[cfg(test)]

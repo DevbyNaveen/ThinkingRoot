@@ -113,6 +113,27 @@ pub enum Error {
     /// telemetry can count traversal attempts separately.
     #[error("security: {0}")]
     SecurityViolation(String),
+
+    // --- Compile Completeness Contract §I-3 ---
+    /// Returned by Phase 9 (Byte-Coverage Audit) when one or more
+    /// source bytes are not covered by any structural row at end of
+    /// compile. Carries the count of affected sources and total
+    /// orphan bytes plus a sample for diagnostic rendering — see
+    /// `docs/2026-05-02-compile-completeness-contract.md` §7.3.
+    /// `TR_SKIP_BYTE_AUDIT=1` is the per-compile escape hatch.
+    #[error(
+        "byte-coverage breach: {total_orphan_bytes} orphan bytes across \
+         {sources_with_orphans} sources (run with TR_SKIP_BYTE_AUDIT=1 to \
+         override; see https://docs.thinkingroot.dev/byte-coverage)"
+    )]
+    ByteCoverageBreach {
+        sources_with_orphans: usize,
+        total_orphan_bytes: usize,
+        /// Sample of `(source_id, [(byte_start, byte_end), …])` for the
+        /// first ~5 affected sources. CLI rendering shows these to the
+        /// developer with file:offset hints so they can fix the gap.
+        sample: Vec<(String, Vec<(u64, u64)>)>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

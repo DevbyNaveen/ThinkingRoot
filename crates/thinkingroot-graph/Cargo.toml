@@ -29,6 +29,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 cozo = { workspace = true }
+blake3 = { workspace = true }
 
 fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 

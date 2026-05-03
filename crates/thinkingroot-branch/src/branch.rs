@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thinkingroot_core::Result;
 use thinkingroot_core::error::Error;
-use thinkingroot_core::{BranchPermissions, BranchRef, BranchStatus, MergedBy};
+use thinkingroot_core::{
+    BranchKind, BranchPermissions, BranchRef, BranchStatus, MergePolicy, MergedBy, RedactionPolicy,
+};
 
 const REGISTRY_FILE: &str = "branches.toml";
 const HEAD_FILE: &str = "HEAD";
@@ -73,6 +75,11 @@ impl BranchRegistry {
     }
 
     /// Create a new branch entry with optional owner + explicit permissions.
+    /// Kind defaults to [`BranchKind::Feature`] and merge policy defaults to
+    /// [`MergePolicy::Manual`] — call [`Self::create_branch_full`] when
+    /// either needs a non-default value (e.g. `Stream` branches created
+    /// by `mcp/mod.rs::ensure_session_branch` or `Sandbox` branches
+    /// created by an agent contribution path).
     pub fn create_branch_with_owner(
         &mut self,
         name: &str,
@@ -80,6 +87,36 @@ impl BranchRegistry {
         description: Option<String>,
         owner: Option<String>,
         permissions: BranchPermissions,
+    ) -> Result<BranchRef> {
+        self.create_branch_full(
+            name,
+            parent,
+            description,
+            owner,
+            permissions,
+            BranchKind::default(),
+            MergePolicy::default(),
+            None,
+        )
+    }
+
+    /// Create a new branch entry, threading the full T0.6 attribute set
+    /// (kind + merge_policy) plus the T2.6 redaction policy.
+    ///
+    /// Callers that don't care about kind/policy/redaction should keep
+    /// using [`Self::create_branch_with_owner`] — the defaults match
+    /// the historical behaviour.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_branch_full(
+        &mut self,
+        name: &str,
+        parent: &str,
+        description: Option<String>,
+        owner: Option<String>,
+        permissions: BranchPermissions,
+        kind: BranchKind,
+        merge_policy: MergePolicy,
+        redaction: Option<RedactionPolicy>,
     ) -> Result<BranchRef> {
         if self
             .data
@@ -98,10 +135,32 @@ impl BranchRegistry {
             description,
             owner,
             permissions,
+            kind,
+            merge_policy,
+            redaction,
         };
         self.data.branches.push(branch.clone());
         self.save()?;
         Ok(branch)
+    }
+
+    /// Update the redaction policy on an existing active branch and
+    /// persist. Returns the updated branch.
+    pub fn set_redaction(
+        &mut self,
+        name: &str,
+        policy: Option<RedactionPolicy>,
+    ) -> Result<BranchRef> {
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
+            .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
+            .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        branch.redaction = policy;
+        let updated = branch.clone();
+        self.save()?;
+        Ok(updated)
     }
 
     /// Mark a branch as merged.

@@ -1,5 +1,6 @@
 use super::JsonRpcRequest;
 use crate::engine::QueryEngine;
+use crate::intelligence::engram::{EngramConfig, EngramManager};
 use crate::intelligence::session::{SessionStore, new_session_store};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +14,10 @@ pub async fn run(
     default_workspace: Option<String>,
     sessions: SessionStore,
 ) {
+    // Stdio transport gets its own EngramManager — single client, lives
+    // for the duration of the process. SSE transport uses the AppState's
+    // shared manager.
+    let engram_manager = EngramManager::new(EngramConfig::default());
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
@@ -60,6 +65,7 @@ pub async fn run(
             default_workspace.as_deref(),
             STDIO_SESSION_ID,
             &sessions,
+            &engram_manager,
         )
         .await;
         drop(engine_guard);

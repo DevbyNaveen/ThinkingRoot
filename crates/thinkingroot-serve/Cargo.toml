@@ -31,6 +31,7 @@ thinkingroot-ground = { workspace = true }
 thinkingroot-rooting = { workspace = true }
 thinkingroot-reflect = { workspace = true }
 blake3 = { workspace = true }
+cozo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -53,8 +54,11 @@ ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand = { workspace = true }
 hex = "0.4"
 base64 = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }
+cozo = { workspace = true }
+thinkingroot-parse = { workspace = true }
+thinkingroot-rooting = { workspace = true }

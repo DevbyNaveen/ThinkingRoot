@@ -55,5 +55,12 @@ pdf-extract = "0.7"
 # loss; tree-sitter parsing is pure CPU and embarrassingly parallel.
 rayon = "1"
 
+# Wedge 4: data-file structural extractors.
+# `csv` for CSV/TSV row-as-claim parsing (RFC 4180 quoted fields,
+# embedded newlines).  `serde_yaml` for generic YAML config parsing
+# alongside the TOML/JSON paths that already use `toml` and `serde_json`.
+csv = "1"
+serde_yaml = "0.9"
+
 [dev-dependencies]
 tempfile = "3"

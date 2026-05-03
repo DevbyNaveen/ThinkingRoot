@@ -19,11 +19,14 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
         _ => return Ok(Vec::new()), // Not a git repo, skip silently.
     }
 
+    // Format fields (Compile Completeness Contract §4.7):
+    // %H sha · %an author · %ae email · %at unix_ts · %P parents
+    // · %s subject · %b body · ---END---
     let output = Command::new("git")
         .args([
             "log",
             &format!("-{max_commits}"),
-            "--format=%H%n%an%n%ai%n%s%n%b%n---END---",
+            "--format=%H%n%an%n%ae%n%at%n%P%n%ai%n%s%n%b%n---END---",
         ])
         .current_dir(repo_path)
         .output()
@@ -46,25 +49,42 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
         }
 
         let lines: Vec<&str> = entry.lines().collect();
-        if lines.len() < 4 {
+        if lines.len() < 7 {
             continue;
         }
 
         let sha = lines[0];
         let author = lines[1];
-        let _date = lines[2];
-        let subject = lines[3];
-        let body = if lines.len() > 4 {
-            lines[4..].join("\n").trim().to_string()
+        let author_email = lines[2];
+        let timestamp_str = lines[3];
+        let parents_str = lines[4];
+        let _date = lines[5];
+        let subject = lines[6];
+        let body = if lines.len() > 7 {
+            lines[7..].join("\n").trim().to_string()
         } else {
             String::new()
         };
+
+        // Parse parent SHAs (space-separated, may be empty for root commit).
+        let parent_sha = parents_str
+            .split_whitespace()
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let commit_timestamp: f64 = timestamp_str.parse().unwrap_or(0.0);
 
         let uri = format!("git://{}", sha);
         let source_id = SourceId::new();
         let mut doc = DocumentIR::new(source_id, uri, SourceType::GitCommit);
         doc.author = Some(author.to_string());
         doc.content_hash = ContentHash::from_bytes(sha.as_bytes());
+        // Compile Completeness Contract §4.7 — populate SourceMetadata
+        // fields the `git_commits` emitter needs.
+        doc.metadata.commit_sha = Some(sha.to_string());
+        doc.metadata.commit_email = Some(author_email.to_string());
+        doc.metadata.commit_timestamp = Some(commit_timestamp);
+        doc.metadata.parent_sha = Some(parent_sha);
 
         // Run diff stat first so we can embed it in the Prose chunk metadata.
         let changed_files = if let Ok(diff_output) = Command::new("git")
@@ -89,6 +109,12 @@ pub fn parse_git_log(repo_path: &Path, max_commits: usize) -> Result<Vec<Documen
             format!("{subject}\n\n{body}")
         };
         let message_bytes = message.len() as u64;
+        // Stamp the message + JSON-serialised changed_files onto
+        // SourceMetadata so the git_commits emitter has them.
+        doc.metadata.commit_message = Some(message.clone());
+        doc.metadata.changed_files_json = Some(
+            serde_json::to_string(&changed_files).unwrap_or_else(|_| "[]".to_string()),
+        );
         let mut prose_chunk =
             Chunk::new(&message, ChunkType::Prose, 1, 1).with_byte_range(0, message_bytes);
         prose_chunk.metadata.commit_author = Some(author.to_string());

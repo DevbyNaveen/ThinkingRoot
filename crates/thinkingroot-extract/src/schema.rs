@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-pub use thinkingroot_core::types::ExtractionTier;
+pub use thinkingroot_core::types::{ExpirationSignal, ExtractionTier, RecurringPattern, Sensitivity};
 
 /// The structured output schema that the LLM must return.
 /// This is what we parse from the LLM response for each chunk.
@@ -13,7 +13,7 @@ pub struct ExtractionResult {
     pub relations: Vec<ExtractedRelation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtractedClaim {
     pub statement: String,
     pub claim_type: String,
@@ -55,6 +55,65 @@ pub struct ExtractedClaim {
     /// the claim stays in the `Attested` tier rather than being quarantined.
     #[serde(default)]
     pub predicate: Option<ExtractedPredicate>,
+    // ─── Compile Completeness Contract §5 — three new fields + symbol ────
+    /// §5.1 — sensitivity tier for branch T2.6 PII redaction and the
+    /// v3 mount-time grant model. Populated by the sensitivity classifier
+    /// (`crates/thinkingroot-extract/src/sensitivity.rs`); falls through
+    /// to `Sensitivity::Public` on the storage side when `None`.
+    #[serde(default)]
+    pub sensitivity: Option<Sensitivity>,
+    /// §5.2 — ISO-8601 absolute expiration date derived from
+    /// `expiration_signal` (when the signal is `HardDate`, `RelativeWindow`,
+    /// or `Recurring`). Populates `claim_temporal.valid_until` so the AEP
+    /// `rule_temporal_collapse` rule can filter expired claims.
+    #[serde(default)]
+    pub valid_until: Option<String>,
+    /// §5.2 — typed expiration signal preserved for AEP caveats.
+    #[serde(default)]
+    pub expiration_signal: Option<ExpirationSignal>,
+    /// §5.3 — numeric values mentioned in the claim. Multiple per claim
+    /// because a single statement can mention several metrics
+    /// ("p99=120ms at 50K rps"). Populates the `quantities` table.
+    #[serde(default)]
+    pub quantities: Vec<ExtractedQuantity>,
+    /// §4.1 + §4.4 — function/type identifier for Phase 7e callee
+    /// resolution + code_signatures lookup. The structural extractor
+    /// (`structural.rs:113-229`) populates this from
+    /// `chunk.metadata.function_name` / `type_name`. Empty for non-code
+    /// claims.
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
+/// Compile Completeness Contract §5.3 — a single numeric value extracted
+/// from a claim's statement or chunk text. Populates the `quantities`
+/// table during Phase 6.7.
+///
+/// `byte_start`/`byte_end` are **absolute file-local bytes**, not
+/// chunk-local — they let the row link to a precise source location even
+/// when the surrounding claim covers a longer span.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtractedQuantity {
+    /// Classified metric (latency, throughput, price, cost, share, demand,
+    /// count). Empty when the classifier cannot decide — the row still
+    /// lands so AEP can surface untyped numerics rather than dropping them.
+    #[serde(default)]
+    pub metric_name: String,
+    pub value: f64,
+    pub unit: String,
+    /// "p99" | "p95" | "max" | "avg" | "monthly" | "" — the modifier
+    /// adjacent to the value in source.
+    #[serde(default)]
+    pub qualifier: String,
+    /// True when the source phrase implies dynamism (rate, throughput,
+    /// current load, live demand). Powers AEP's "live values shouldn't
+    /// be treated as static facts" caveat.
+    #[serde(default)]
+    pub is_live: bool,
+    #[serde(default)]
+    pub byte_start: u64,
+    #[serde(default)]
+    pub byte_end: u64,
 }
 
 /// Predicate attached to an extracted claim. Serialized shape is the contract

@@ -83,6 +83,44 @@ pub fn classify(chunk: &Chunk) -> Tier {
                 Tier::Llm
             }
         }
+        // Wedge 4: data-file structural variants.  Defensive metadata gate —
+        // a malformed parser that skipped populating `config_key` /
+        // `row_columns` falls back to LLM rather than emitting empty claims.
+        ChunkType::ConfigEntry => {
+            if chunk
+                .metadata
+                .config_key
+                .as_deref()
+                .is_some_and(|k| !k.is_empty())
+            {
+                Tier::Structural
+            } else {
+                Tier::Llm
+            }
+        }
+        ChunkType::DataRow => {
+            if !chunk.metadata.row_columns.is_empty() {
+                Tier::Structural
+            } else {
+                Tier::Llm
+            }
+        }
+        // Comment / ModuleDoc with parsed doc_tags are structurally extractable
+        // (Wedge 4 doctag pass).  Plain Comments without parent + without tags
+        // still fall through to LLM for prose-level extraction.
+        ChunkType::Comment | ChunkType::ModuleDoc => {
+            let has_parent = chunk
+                .metadata
+                .parent
+                .as_deref()
+                .is_some_and(|p| !p.is_empty());
+            let has_tags = !chunk.metadata.doc_tags.is_empty();
+            if has_parent || has_tags {
+                Tier::Structural
+            } else {
+                Tier::Llm
+            }
+        }
         _ => Tier::Llm,
     }
 }
@@ -214,6 +252,81 @@ mod tests {
     #[test]
     fn prose_without_commit_author_or_links_is_llm() {
         let c = chunk(ChunkType::Prose, ChunkMetadata::default());
+        assert_eq!(classify(&c), Tier::Llm);
+    }
+
+    // ── Wedge 4: ConfigEntry / DataRow routing ───────────────────────────
+
+    #[test]
+    fn config_entry_with_key_is_structural() {
+        let c = chunk(
+            ChunkType::ConfigEntry,
+            ChunkMetadata {
+                config_key: Some("database.pool".to_string()),
+                config_value: Some("10".to_string()),
+                config_value_type: Some("int".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(classify(&c), Tier::Structural);
+    }
+
+    #[test]
+    fn config_entry_without_key_falls_back_to_llm() {
+        let c = chunk(ChunkType::ConfigEntry, ChunkMetadata::default());
+        assert_eq!(classify(&c), Tier::Llm);
+    }
+
+    #[test]
+    fn data_row_with_columns_is_structural() {
+        let c = chunk(
+            ChunkType::DataRow,
+            ChunkMetadata {
+                row_index: Some(0),
+                row_columns: vec![("name".to_string(), "alice".to_string())],
+                ..Default::default()
+            },
+        );
+        assert_eq!(classify(&c), Tier::Structural);
+    }
+
+    #[test]
+    fn data_row_without_columns_falls_back_to_llm() {
+        let c = chunk(ChunkType::DataRow, ChunkMetadata::default());
+        assert_eq!(classify(&c), Tier::Llm);
+    }
+
+    #[test]
+    fn comment_with_parent_is_structural() {
+        let c = chunk(
+            ChunkType::Comment,
+            ChunkMetadata {
+                parent: Some("Foo".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(classify(&c), Tier::Structural);
+    }
+
+    #[test]
+    fn comment_with_doc_tags_is_structural() {
+        let c = chunk(
+            ChunkType::Comment,
+            ChunkMetadata {
+                doc_tags: vec![thinkingroot_core::ir::DocTag {
+                    kind: "param".to_string(),
+                    name: Some("x".to_string()),
+                    description: "the x".to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(classify(&c), Tier::Structural);
+    }
+
+    #[test]
+    fn comment_with_no_parent_no_tags_is_llm() {
+        let c = chunk(ChunkType::Comment, ChunkMetadata::default());
         assert_eq!(classify(&c), Tier::Llm);
     }
 

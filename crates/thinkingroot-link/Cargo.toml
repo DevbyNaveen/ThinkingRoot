@@ -22,3 +22,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 strsim = { workspace = true }
+blake3 = { workspace = true }

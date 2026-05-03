@@ -248,6 +248,21 @@ pub async fn execute_merge(
 }
 
 /// Execute a merge of `source_branch_name` into an explicit target branch.
+///
+/// T0.6 gates layered on top of the existing health-score gate:
+///
+/// - **`MergePolicy::Ephemeral` source** — short-circuits to abandon.
+///   Ephemeral branches never merge by definition; the registry is
+///   updated to `Abandoned` and the disk path is left for `gc_branches`
+///   to reclaim. Merge would be a contract violation, not a config
+///   slip — `Error::MergeBlocked` carries the reason so callers can
+///   surface it instead of silently swallowing the merge.
+/// - **`MergePolicy::RequiresProposal` source** — until T0.4 (Knowledge
+///   PR object) ships the proposal layer, raw merges against a
+///   proposal-gated branch are rejected. The diff already needed to
+///   pass through `compute_diff_into`, so the gate fires only on
+///   actual merge intent — `dry_run` callers (T1.5) and the
+///   diff-display path remain functional.
 pub async fn execute_merge_into(
     root_path: &Path,
     source_branch_name: &str,
@@ -259,6 +274,32 @@ pub async fn execute_merge_into(
     if !diff.merge_allowed {
         return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
     }
+
+    // T0.6 — read merge_policy off the source branch and gate.
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    let registry_for_policy = BranchRegistry::load_or_create(&refs_dir)?;
+    if let Some(branch_ref) = registry_for_policy.get(source_branch_name) {
+        if branch_ref.merge_policy.is_ephemeral() {
+            // Ephemeral never merges — abandon and return without
+            // touching the target graph. Mirrors the T0.6 "Stream
+            // Sandbox Ephemeral default → discard on session end"
+            // contract from `branch-system-improvements.md`.
+            drop(registry_for_policy);
+            let mut registry = BranchRegistry::load_or_create(&refs_dir)?;
+            registry.abandon_branch(source_branch_name)?;
+            return Err(Error::MergeBlocked(format!(
+                "branch '{source_branch_name}' has MergePolicy::Ephemeral — abandoned instead of merged"
+            )));
+        }
+        if branch_ref.merge_policy.requires_proposal() {
+            return Err(Error::MergeBlocked(format!(
+                "branch '{source_branch_name}' has MergePolicy::RequiresProposal — \
+                 open a Knowledge Proposal (T0.4) instead of a raw merge"
+            )));
+        }
+    }
+    drop(registry_for_policy);
+
     apply_branch_diff(
         root_path,
         source_branch_name,
@@ -271,7 +312,6 @@ pub async fn execute_merge_into(
     .await?;
 
     // Mark branch as merged in registry
-    let refs_dir = root_path.join(".thinkingroot-refs");
     std::fs::create_dir_all(&refs_dir)?;
     let mut registry = BranchRegistry::load_or_create(&refs_dir)?;
     registry.mark_merged(source_branch_name, merged_by)?;

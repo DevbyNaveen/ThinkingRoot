@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use thinkingroot_core::ir::{Chunk, ChunkType, DocumentIR};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use thinkingroot_core::ir::{Chunk, ChunkMetadata, ChunkType, DocumentIR};
 use thinkingroot_core::types::{ContentHash, SourceId, SourceMetadata, SourceType};
 use thinkingroot_core::{Error, Result};
 
@@ -54,7 +54,12 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
         ..Default::default()
     };
 
-    let parser = Parser::new(content);
+    let mut opts = Options::empty();
+    // Wedge 4: GFM tables — pulldown-cmark only emits Tag::Table events when
+    // the ENABLE_TABLES extension is on.  Without this flag pipe tables fall
+    // through as prose, which is exactly the behaviour the wedge replaces.
+    opts.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(content, opts);
 
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
@@ -70,6 +75,15 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     let mut heading_stack: Vec<(u8, String)> = Vec::new(); // (level, text) for parent tracking
     let mut current_heading_level: u8 = 1;
     let mut current_links: Vec<String> = Vec::new();
+
+    // Wedge 4: GFM-table state.
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut in_table_cell = false;
+    let mut table_cell_buf = String::new();
+    let mut table_current_row: Vec<String> = Vec::new();
+    let mut table_headers: Vec<String> = Vec::new();
+    let mut table_body_row_idx: u32 = 0;
 
     for event in parser {
         match event {
@@ -195,6 +209,75 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                     current_links.push(url);
                 }
             }
+            // ── Wedge 4: GFM table events ────────────────────────────────
+            Event::Start(Tag::Table(_)) => {
+                flush_prose(
+                    &mut doc,
+                    &mut current_text,
+                    current_start_line,
+                    line_counter,
+                    &current_heading,
+                    &mut current_links,
+                );
+                in_table = true;
+                table_headers.clear();
+                table_current_row.clear();
+                table_body_row_idx = 0;
+            }
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                current_start_line = line_counter + 1;
+            }
+            Event::Start(Tag::TableHead) => {
+                in_table_head = true;
+                table_current_row.clear();
+            }
+            Event::End(TagEnd::TableHead) => {
+                in_table_head = false;
+                table_headers = std::mem::take(&mut table_current_row);
+            }
+            Event::Start(Tag::TableRow) => {
+                table_current_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !in_table_head && !table_headers.is_empty() {
+                    let columns: Vec<(String, String)> = table_headers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            let cell = table_current_row.get(i).cloned().unwrap_or_default();
+                            (h.clone(), cell)
+                        })
+                        .collect();
+                    let display = columns
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let mut chunk =
+                        Chunk::new(display, ChunkType::DataRow, line_counter, line_counter);
+                    if let Some(h) = &current_heading {
+                        chunk = chunk.with_heading(h.clone());
+                    }
+                    chunk.metadata = ChunkMetadata {
+                        row_index: Some(table_body_row_idx),
+                        row_columns: columns,
+                        ..Default::default()
+                    };
+                    doc.add_chunk(chunk);
+                    table_body_row_idx += 1;
+                }
+                table_current_row.clear();
+            }
+            Event::Start(Tag::TableCell) => {
+                in_table_cell = true;
+                table_cell_buf.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                in_table_cell = false;
+                table_current_row.push(table_cell_buf.trim().to_string());
+                table_cell_buf.clear();
+            }
             Event::Text(text) => {
                 let text_str = text.to_string();
                 line_counter += text_str.matches('\n').count() as u32;
@@ -203,6 +286,10 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                     heading_text.push_str(&text_str);
                 } else if in_code_block {
                     code_content.push_str(&text_str);
+                } else if in_table_cell {
+                    table_cell_buf.push_str(&text_str);
+                } else if in_table {
+                    // Text outside cells inside a table (whitespace, etc.) — ignore.
                 } else if in_list {
                     list_content.push_str(&text_str);
                     list_content.push('\n');
@@ -214,14 +301,18 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 line_counter += 1;
                 if in_code_block {
                     code_content.push('\n');
-                } else if !in_heading {
+                } else if in_table_cell {
+                    table_cell_buf.push(' ');
+                } else if !in_heading && !in_table {
                     current_text.push('\n');
                 }
             }
             Event::Code(code) => {
                 if in_heading {
                     heading_text.push_str(&code);
-                } else {
+                } else if in_table_cell {
+                    table_cell_buf.push_str(&code);
+                } else if !in_table {
                     current_text.push('`');
                     current_text.push_str(&code);
                     current_text.push('`');
@@ -248,7 +339,78 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     // would already carry ranges and are skipped.
     doc.fill_byte_ranges(content);
 
+    // Wedge 3: coalesce tiny adjacent prose chunks under the same heading.
+    // Default threshold = 500 tokens (~2_000 chars in the chars/4 heuristic);
+    // overridable from ExtractionConfig::chunk_coalesce_threshold_tokens
+    // by callers that re-run the pass with a custom budget.
+    coalesce_adjacent_prose(&mut doc.chunks, /* threshold_tokens */ 500, /* max_merge */ 8);
+
     Ok(doc)
+}
+
+/// Wedge 3: post-process the chunk list, merging adjacent `Prose` chunks
+/// that share a heading scope when their combined token estimate fits the
+/// `threshold_tokens` budget (`chars / 4`).
+///
+/// Rules (all enforced):
+/// - Only `Prose` chunks coalesce.  Heading / Code / List / Table /
+///   FunctionDef / TypeDef / Import / Comment / ModuleDoc / DataRow /
+///   ConfigEntry / ManifestDependency are barriers.
+/// - Same `heading` value (None==None counts as "same scope").
+/// - Combined `byte_start` = first.byte_start; `byte_end` = last.byte_end.
+/// - `metadata.links` = sorted dedupe union.
+/// - `start_line` = first; `end_line` = last.
+/// - At most `max_merge` chunks per coalesced output (defensive ceiling).
+pub fn coalesce_adjacent_prose(
+    chunks: &mut Vec<Chunk>,
+    threshold_tokens: usize,
+    max_merge: usize,
+) {
+    if chunks.len() < 2 {
+        return;
+    }
+    let max_chars = threshold_tokens.saturating_mul(4).max(1);
+    let max_merge = max_merge.max(2);
+
+    let mut out: Vec<Chunk> = Vec::with_capacity(chunks.len());
+    for chunk in chunks.drain(..) {
+        let Some(last) = out.last_mut() else {
+            out.push(chunk);
+            continue;
+        };
+        let both_prose =
+            last.chunk_type == ChunkType::Prose && chunk.chunk_type == ChunkType::Prose;
+        let same_heading = last.heading == chunk.heading;
+        let combined_chars = last.content.len() + 2 + chunk.content.len();
+        // Count merged so far on `last`: line span / metadata reveals nothing
+        // direct, so use a bounded byte-range proxy plus a strict len check.
+        let merged_count = last
+            .content
+            .matches("\n\n")
+            .count()
+            .saturating_add(1);
+        let under_merge_cap = merged_count < max_merge;
+
+        if both_prose && same_heading && combined_chars <= max_chars && under_merge_cap {
+            // Merge `chunk` into `last`.
+            let chunk_links = chunk.metadata.links.clone();
+            last.content.push_str("\n\n");
+            last.content.push_str(&chunk.content);
+            last.end_line = chunk.end_line;
+            if chunk.byte_end > last.byte_end {
+                last.byte_end = chunk.byte_end;
+            }
+            // Sorted-dedupe link union.
+            let mut links: Vec<String> = std::mem::take(&mut last.metadata.links);
+            links.extend(chunk_links);
+            links.sort();
+            links.dedup();
+            last.metadata.links = links;
+        } else {
+            out.push(chunk);
+        }
+    }
+    *chunks = out;
 }
 
 fn flush_prose(
@@ -402,6 +564,155 @@ mod tests {
             prose.metadata.links.is_empty(),
             "heading links must not leak into next prose chunk: {:?}",
             prose.metadata.links
+        );
+    }
+
+    // ── Wedge 4: GFM table → DataRow per body row ─────────────────────────
+
+    #[test]
+    fn gfm_table_emits_data_row_per_body_row() {
+        let content = "\
+# Users
+
+| Name  | Age |
+|-------|-----|
+| Alice | 30  |
+| Bob   | 25  |
+";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let rows: Vec<_> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::DataRow)
+            .collect();
+        assert_eq!(rows.len(), 2, "two body rows → two DataRow chunks");
+        assert_eq!(rows[0].metadata.row_index, Some(0));
+        assert_eq!(rows[1].metadata.row_index, Some(1));
+
+        let cells_0: &Vec<(String, String)> = &rows[0].metadata.row_columns;
+        assert!(cells_0.iter().any(|(k, v)| k == "Name" && v == "Alice"));
+        assert!(cells_0.iter().any(|(k, v)| k == "Age" && v == "30"));
+    }
+
+    #[test]
+    fn gfm_table_carries_current_heading() {
+        let content = "\
+## Inventory
+
+| Item | Qty |
+|------|-----|
+| Pen  | 5   |
+";
+        let doc = parse_markdown_content(Path::new("test.md"), content).unwrap();
+        let row = doc
+            .chunks
+            .iter()
+            .find(|c| c.chunk_type == ChunkType::DataRow)
+            .expect("expected one DataRow");
+        assert_eq!(row.heading.as_deref(), Some("Inventory"));
+    }
+
+    // ── Wedge 3: prose coalescer ─────────────────────────────────────────
+
+    fn prose_chunk(text: &str, heading: Option<&str>, links: Vec<String>) -> Chunk {
+        let mut c = Chunk::new(text, ChunkType::Prose, 1, 1);
+        if let Some(h) = heading {
+            c = c.with_heading(h);
+        }
+        c.metadata.links = links;
+        c
+    }
+
+    #[test]
+    fn coalesce_merges_tiny_prose_chunks_under_threshold() {
+        let mut chunks = vec![
+            prose_chunk("First short paragraph.", Some("Sec"), vec![]),
+            prose_chunk("Second short paragraph.", Some("Sec"), vec![]),
+            prose_chunk("Third short paragraph.", Some("Sec"), vec![]),
+        ];
+        coalesce_adjacent_prose(&mut chunks, /* threshold */ 500, /* max */ 8);
+        assert_eq!(chunks.len(), 1);
+        let merged = &chunks[0];
+        assert!(merged.content.contains("First"));
+        assert!(merged.content.contains("Second"));
+        assert!(merged.content.contains("Third"));
+    }
+
+    #[test]
+    fn coalesce_does_not_merge_across_heading() {
+        let mut chunks = vec![
+            prose_chunk("intro", Some("A"), vec![]),
+            prose_chunk("body", Some("B"), vec![]),
+        ];
+        coalesce_adjacent_prose(&mut chunks, 500, 8);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_does_not_merge_across_non_prose() {
+        let mut chunks = vec![
+            prose_chunk("a", Some("S"), vec![]),
+            Chunk::new("```\ncode\n```", ChunkType::Code, 1, 1),
+            prose_chunk("b", Some("S"), vec![]),
+        ];
+        coalesce_adjacent_prose(&mut chunks, 500, 8);
+        assert_eq!(chunks.len(), 3, "code chunk is a barrier");
+    }
+
+    #[test]
+    fn coalesce_skipped_when_combined_exceeds_threshold() {
+        let big = "x".repeat(2_500);
+        let mut chunks = vec![
+            prose_chunk(&big, Some("S"), vec![]),
+            prose_chunk(&big, Some("S"), vec![]),
+        ];
+        coalesce_adjacent_prose(&mut chunks, /* threshold tokens */ 500, 8);
+        // 5K + 2 join chars > 2_000 char budget → no merge.
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_unions_links_metadata_dedupe_sorted() {
+        let mut chunks = vec![
+            prose_chunk("a", Some("S"), vec!["./z.md".to_string(), "./b.md".to_string()]),
+            prose_chunk(
+                "b",
+                Some("S"),
+                vec!["./z.md".to_string(), "./a.md".to_string()],
+            ),
+        ];
+        coalesce_adjacent_prose(&mut chunks, 500, 8);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].metadata.links, vec!["./a.md", "./b.md", "./z.md"]);
+    }
+
+    #[test]
+    fn coalesce_preserves_authoritative_byte_ranges() {
+        let mut a = prose_chunk("first", Some("S"), vec![]);
+        a.byte_start = 100;
+        a.byte_end = 110;
+        let mut b = prose_chunk("second", Some("S"), vec![]);
+        b.byte_start = 200;
+        b.byte_end = 220;
+        let mut chunks = vec![a, b];
+        coalesce_adjacent_prose(&mut chunks, 500, 8);
+        assert_eq!(chunks.len(), 1);
+        let c = &chunks[0];
+        assert_eq!(c.byte_start, 100);
+        assert_eq!(c.byte_end, 220);
+    }
+
+    #[test]
+    fn coalesce_caps_at_max_merge_paragraphs() {
+        // Build 12 tiny prose chunks; max_merge=4 forces 3 outputs.
+        let mut chunks: Vec<_> = (0..12)
+            .map(|i| prose_chunk(&format!("p{i}"), Some("S"), vec![]))
+            .collect();
+        coalesce_adjacent_prose(&mut chunks, 500, 4);
+        assert!(
+            chunks.len() >= 3,
+            "max_merge=4 should produce ≥ 3 chunks for 12 inputs, got {}",
+            chunks.len()
         );
     }
 }

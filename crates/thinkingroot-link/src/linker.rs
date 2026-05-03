@@ -179,6 +179,27 @@ impl<'a> Linker<'a> {
             &name_to_entity,
         )?;
 
+        // ─── Phase 7e: Structural Resolution (Compile Completeness Contract §5)
+        // Runs deferred resolutions Phase 6.7 left in place — fills
+        // function_calls.callee_claim_id, code_links.is_internal /
+        // target_source_id, and seeds source_references. Idempotent
+        // via deterministic row IDs.
+        let resolution = crate::structural_resolve::resolve(self.graph)?;
+        if resolution.calls_resolved
+            + resolution.links_resolved
+            + resolution.references_built
+            + resolution.metrics_resolved
+            > 0
+        {
+            tracing::info!(
+                "phase 7e structural resolution: {} function_calls resolved, {} code_links resolved, {} source_references built, {} code_metrics fan_in/out stamped",
+                resolution.calls_resolved,
+                resolution.links_resolved,
+                resolution.references_built,
+                resolution.metrics_resolved,
+            );
+        }
+
         tracing::info!(
             "linking complete: {} entities ({} merged), {} claims, {} relations, {} contradictions",
             output.entities_created,

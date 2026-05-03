@@ -8,8 +8,11 @@ use tracing_subscriber::EnvFilter;
 
 mod branch_cmd;
 mod cloud;
+mod cortex_client;
+mod cortex_remote;
 mod eval_cmd;
 mod mcp_config;
+mod mount_cmd;
 mod pack_cmd;
 mod pipeline;
 mod progress;
@@ -42,6 +45,15 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Cortex Protocol escape hatch: force the in-process call path
+    /// instead of delegating to the daemon. Required for hermetic CI
+    /// (no background daemon survives the test job) and for
+    /// air-gapped scenarios where the daemon is intentionally not
+    /// running. When set, the CLI emits a WARN log so accidental
+    /// uses leave a breadcrumb back to the standard path.
+    #[arg(long, global = true)]
+    in_process: bool,
 }
 
 #[derive(Subcommand)]
@@ -74,6 +86,25 @@ enum Commands {
         /// Path to initialize
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Migrate an existing workspace to a contract version.
+    ///
+    /// Runs the schema upgrades for that contract (idempotent) and
+    /// retroactively emits structural rows for legacy sources via
+    /// `backfill_structural`. Required after upgrading to a release
+    /// that ships a new compile contract — `root compile` auto-runs
+    /// this when it detects the `compile_schema_version` mismatch,
+    /// but you can run it manually here for visibility on a dry-run
+    /// or when migrating a CI cache.
+    Migrate {
+        /// Path to the workspace to migrate
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Migrate to the Compile Completeness Contract (v2). Today
+        /// the only supported migration target — the flag exists so
+        /// future contracts can pin a target version explicitly.
+        #[arg(long)]
+        to_completeness_contract: bool,
     },
     /// Query the compiled knowledge base (raw vector search)
     Query {
@@ -117,8 +148,12 @@ enum Commands {
     },
     /// Start the REST API and MCP server
     Serve {
-        /// Port to bind [default: 3000]
-        #[arg(long, default_value = "3000")]
+        /// Port to bind. Cortex Protocol canonical port is 31760
+        /// (shared with the desktop sidecar so a single-tenant user
+        /// running both surfaces still hits one daemon). Override
+        /// with `--port 3000` to keep the legacy default for existing
+        /// scripts.
+        #[arg(long, default_value = "31760")]
         port: u16,
         /// Host to bind
         #[arg(long, default_value = "127.0.0.1")]
@@ -160,8 +195,10 @@ enum Commands {
         /// Only connect this specific tool (e.g. "claude", "cursor")
         #[arg(long)]
         tool: Option<String>,
-        /// Port the ThinkingRoot server is running on
-        #[arg(long, default_value = "3000")]
+        /// Port the ThinkingRoot server is running on. Defaults to the
+        /// Cortex Protocol canonical port 31760; override only if you
+        /// run the daemon on a non-default port.
+        #[arg(long, default_value = "31760")]
         port: u16,
         /// Show what would be written without changing any files
         #[arg(long)]
@@ -437,6 +474,37 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mount a `.tr` knowledge pack as a live, cortex-attached
+    /// workspace. The pack's claims become queryable through the
+    /// daemon's REST + MCP endpoints in one command — the canonical
+    /// "secondary brain" entry point per
+    /// `docs/secondary-brain-concept.md` §5.
+    ///
+    /// On success, prints a JSON `MountSummary` to stdout containing
+    /// the workspace name, REST URL, MCP URL, and substrate counts
+    /// (sources, claims, entities). The Python and TS SDKs parse
+    /// this verbatim.
+    Mount {
+        /// Path to a `.tr` pack on the local filesystem.
+        pack: PathBuf,
+        /// Override the auto-derived workspace name (default:
+        /// `manifest.name` with `/` replaced by `-`).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Skip Sigstore signature verification when the pack is
+        /// signed. The pack-hash chain is always verified — this
+        /// flag only governs the cert-chain + Rekor inclusion check
+        /// (network-dependent, slower).
+        #[arg(long)]
+        no_verify: bool,
+        /// After replaying claims, drive the daemon to fully recompile
+        /// against the unpacked sources. Rebuilds the 33-table
+        /// structural substrate (function calls, headings, doc tags,
+        /// etc.) at the cost of one LLM extraction pass. Defaults
+        /// off — replay-only mounts are queryable instantly.
+        #[arg(long)]
+        recompile: bool,
+    },
 
     // -------------------------------------------------------------------------
     // Cloud subcommands (Phase G consolidation — replace legacy `tr` binary).
@@ -640,6 +708,43 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async_main())
 }
 
+/// Cortex Protocol entry point for stateful CLI commands.
+///
+/// Returns:
+/// - `Some(Remote)` — daemon is running (or was just auto-spawned);
+///   caller should use the cortex_remote::run_*_remote variant.
+/// - `None` — `--in-process` was set OR resolve_engine errored OR
+///   the connection came back as InProcess. Caller should fall
+///   through to the legacy in-process path.
+///
+/// The decision tree is intentionally lenient: any failure in
+/// resolve_engine logs a WARN and falls back to in-process, so a
+/// transient daemon hiccup doesn't break the user's command.
+async fn try_resolve_remote(
+    in_process_flag: bool,
+) -> Option<thinkingroot_core::cortex::EngineConnection> {
+    if in_process_flag {
+        tracing::warn!(
+            "--in-process flag set; bypassing Cortex Protocol and opening CozoDB locally. \
+             This is the legacy path; remove the flag to use the singleton daemon."
+        );
+        return None;
+    }
+
+    use thinkingroot_core::cortex::{EngineConnection, EngineIntent};
+    match cortex_client::resolve_engine(EngineIntent::Command).await {
+        Ok(conn @ EngineConnection::Remote { .. }) => Some(conn),
+        Ok(EngineConnection::InProcess) | Ok(EngineConnection::Stdio) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cortex resolve_engine failed; falling back to in-process path"
+            );
+            None
+        }
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -681,22 +786,53 @@ async fn async_main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr) // always write to stderr, never stdout
         .init();
 
+    let in_process_flag = cli.in_process;
+
     match cli.command {
         Some(Commands::Compile {
             path,
             branch,
             no_rooting,
         }) => {
-            run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
+            // Cortex Protocol: prefer the daemon. Falls back to
+            // in-process on `--in-process` or daemon error.
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_compile_remote(&conn, &path, branch.as_deref(), no_rooting)
+                    .await?;
+            } else {
+                run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
+            }
         }
         Some(Commands::Health { path }) => {
-            run_health(&path).await?;
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_health_remote(&conn, &path).await?;
+            } else {
+                run_health(&path).await?;
+            }
         }
         Some(Commands::Init { path }) => {
+            // `init` is stateless — it creates a `.thinkingroot/`
+            // directory and writes config. No CozoDB touched, no
+            // cortex routing.
             run_init(&path)?;
         }
+        Some(Commands::Migrate {
+            path,
+            to_completeness_contract,
+        }) => {
+            // `migrate` opens CozoDB to run schema upgrades; today
+            // it's safe to run in-process even when the daemon is
+            // up because `backfill_structural` takes the workspace
+            // lock and waits. Future hardening: route through the
+            // daemon to centralise schema mutations.
+            run_migrate(&path, to_completeness_contract)?;
+        }
         Some(Commands::Query { query, path, top_k }) => {
-            run_query(&path, &query, top_k).await?;
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_query_remote(&conn, &path, &query, top_k).await?;
+            } else {
+                run_query(&path, &query, top_k).await?;
+            }
         }
         Some(Commands::Ask {
             first,
@@ -719,7 +855,11 @@ async fn async_main() -> anyhow::Result<()> {
                     "Please provide a question. Example: root ask \"what did I do last week?\""
                 );
             }
-            run_query_llm(&path, &question, date.as_deref()).await?;
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_ask_remote(&conn, &path, &question, date.as_deref()).await?;
+            } else {
+                run_query_llm(&path, &question, date.as_deref()).await?;
+            }
         }
         Some(Commands::Graph { path, port }) => {
             serve::run_graph(port, path).await?;
@@ -895,10 +1035,29 @@ async fn async_main() -> anyhow::Result<()> {
             .await?;
         }
         Some(Commands::Reflect { path, json }) => {
-            reflect_cmd::run(&path, json.as_ref())?;
+            // The `--json` mode emits to a local file path; that
+            // step is purely local and does not touch CozoDB. The
+            // upstream daemon serves the JSON; we do that
+            // resolve-or-fall-back here, then the local emit step
+            // runs unconditionally. For the no-`--json` branch
+            // (terminal pretty-print) the in-process path stays
+            // canonical so progress streams to the same TTY.
+            if json.is_some() {
+                if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                    cortex_remote::run_reflect_remote(&conn, &path).await?;
+                } else {
+                    reflect_cmd::run(&path, json.as_ref())?;
+                }
+            } else {
+                reflect_cmd::run(&path, json.as_ref())?;
+            }
         }
         Some(Commands::Render { path }) => {
-            render_cmd::run(&path)?;
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_render_remote(&conn, &path).await?;
+            } else {
+                render_cmd::run(&path)?;
+            }
         }
         Some(Commands::Pack {
             workspace,
@@ -952,6 +1111,14 @@ async fn async_main() -> anyhow::Result<()> {
                 return Err(e);
             }
         }
+        Some(Commands::Mount {
+            pack,
+            name,
+            no_verify,
+            recompile,
+        }) => {
+            mount_cmd::run_mount(pack, name, no_verify, recompile).await?;
+        }
         Some(Commands::Login { token, server }) => {
             cloud::login::run(token, server).await?;
         }
@@ -978,11 +1145,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
-            if let Some(path) = cli.path {
-                run_compile(&path, None, use_progress, false).await?;
+            let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_compile_remote(&conn, &path, None, false).await?;
             } else {
-                // No args: compile current directory.
-                run_compile(&PathBuf::from("."), None, use_progress, false).await?;
+                run_compile(&path, None, use_progress, false).await?;
             }
         }
     }
@@ -1536,6 +1703,65 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
     );
     println!();
 
+    Ok(())
+}
+
+fn run_migrate(path: &Path, to_completeness_contract: bool) -> anyhow::Result<()> {
+    if !to_completeness_contract {
+        anyhow::bail!(
+            "no migration target specified. Use --to-completeness-contract to upgrade \
+             this workspace to the v2 schema."
+        );
+    }
+
+    let data_dir = path.join(".thinkingroot");
+    if !data_dir.exists() {
+        anyhow::bail!(
+            "no ThinkingRoot workspace at {} — run `root init` first",
+            path.display()
+        );
+    }
+
+    println!(
+        "  {} migrating workspace at {} to Compile Completeness Contract (v2)",
+        style("→").cyan().bold(),
+        path.display()
+    );
+
+    let report = thinkingroot_serve::backfill::backfill_structural(&data_dir)
+        .map_err(|e| anyhow::anyhow!("backfill failed: {e}"))?;
+
+    println!(
+        "  {} {} sources backfilled, {} skipped (already migrated), {} missing bytes, {} re-parse failures",
+        style("✓").green().bold(),
+        report.sources_backfilled,
+        report.sources_skipped,
+        report.sources_missing_bytes,
+        report.sources_parse_failed,
+    );
+    println!(
+        "  {} {} structural rows emitted ({} chunks_residual fall-through)",
+        style("✓").green().bold(),
+        report.rows_emitted,
+        report.residual_emitted,
+    );
+    if report.orphan_bytes_after > 0 {
+        println!(
+            "  {} {} orphan bytes remain on legacy data — re-compile affected sources to clear",
+            style("!").yellow().bold(),
+            report.orphan_bytes_after,
+        );
+    } else {
+        println!(
+            "  {} byte-coverage audit clean (zero orphans)",
+            style("✓").green().bold()
+        );
+    }
+    println!(
+        "  {} compile_schema_version = {}",
+        style("✓").green().bold(),
+        report.schema_version_after,
+    );
     Ok(())
 }
 

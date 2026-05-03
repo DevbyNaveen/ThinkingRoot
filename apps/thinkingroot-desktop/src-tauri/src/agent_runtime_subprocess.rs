@@ -24,8 +24,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use tauri::{AppHandle, Manager, Runtime};
+use thinkingroot_core::cortex::{self, CortexLock, EngineConnection, EngineIntent, StartedBy};
 use tokio::process::{Child, Command};
 
+use crate::cortex_bridge;
 use crate::state::{AppState, SidecarHandle};
 
 /// Default loopback port for the local sidecar. Chosen to avoid
@@ -34,12 +36,73 @@ use crate::state::{AppState, SidecarHandle};
 const DEFAULT_PORT: u16 = 31760;
 const HOST: &str = "127.0.0.1";
 
-/// Spawn the sidecar. Records the child handle into [`AppState`] so
-/// it can be reaped on app exit. Errors are logged but not bubbled —
-/// the desktop must keep running even if the engine binary is
-/// unavailable on this machine.
+/// Spawn the sidecar — or attach to an already-running one.
+///
+/// **Cortex Protocol contract.** Before spawning, this function calls
+/// `cortex_bridge::resolve_engine(EngineIntent::DesktopBoot)`. If a
+/// healthy daemon already exists (started by the CLI, by `launchd`,
+/// or by another desktop instance), we install a `SidecarHandle`
+/// with `child = None` and return — we did NOT spawn this process,
+/// so `shutdown()` must NOT kill it.
+///
+/// Errors are logged but not bubbled — the desktop must keep
+/// running even if the engine binary is unavailable on this machine.
 pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     let port = sidecar_port();
+
+    // ── Cortex attach path: check for an existing daemon first ─────
+    // Skipped silently when DESKTOP_SIDECAR_PORT is overridden to
+    // something other than the cortex canonical 31760 (test
+    // isolation case).
+    if port == cortex::DEFAULT_PORT {
+        match cortex_bridge::resolve_engine(EngineIntent::DesktopBoot).await {
+            Ok(EngineConnection::Remote { host, port: lock_port, started_by, pid }) => {
+                tracing::info!(
+                    pid,
+                    port = lock_port,
+                    started_by = started_by.as_str(),
+                    "cortex: existing engine found — desktop attaching as thin client"
+                );
+                let state = app.state::<AppState>();
+                let mut guard = state.sidecar.lock().await;
+                *guard = Some(SidecarHandle {
+                    host,
+                    port: lock_port,
+                    pid: Some(pid),
+                    // `child = None` means "we did not spawn this
+                    // process" — `shutdown()` checks this and refuses
+                    // to kill what it doesn't own.
+                    child: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                });
+                return;
+            }
+            Ok(EngineConnection::InProcess) => {
+                // No daemon found; fall through to the spawn path.
+                // (Note: `DesktopBoot` intent does NOT auto-spawn
+                // inside resolve_engine — the desktop's sidecar
+                // manager wants to keep the Child handle for its
+                // own graceful-shutdown contract, so the spawn
+                // happens below.)
+            }
+            Ok(EngineConnection::Stdio) => {
+                // Cannot happen for DesktopBoot intent; defensive
+                // fall-through to the spawn path.
+                tracing::warn!("cortex returned Stdio for DesktopBoot intent — falling through");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cortex resolve failed — proceeding with spawn"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            port,
+            "non-default sidecar port; skipping cortex attach (test isolation mode)"
+        );
+    }
+
     let binary = match resolve_binary(app) {
         Some(p) => p,
         None => {
@@ -56,13 +119,14 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         binary = %binary.display(),
         host = HOST,
         port,
-        "spawning ThinkingRoot sidecar",
+        "spawning ThinkingRoot sidecar (no existing daemon found)",
     );
 
-    // Ensure the port is free before we try to bind it.  `root serve`
-    // bails with "Address already in use" if the port is taken.  This
-    // happens frequently in dev if the previous `pnpm tauri dev` was
-    // killed with SIGKILL (preventing `shutdown()` from running).
+    // Last-resort port cleanup. The cortex check above caught any
+    // ThinkingRoot-managed daemon; this kills only non-cortex
+    // processes (e.g. an unrelated dev server that grabbed 31760).
+    // `cleanup_stale_sidecar` is now a narrow safety net rather
+    // than the primary mechanism.
     cleanup_stale_sidecar(port).await;
 
     let mut cmd = Command::new(&binary);
@@ -201,6 +265,29 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         });
     }
 
+    // ── Cortex Protocol: write the lockfile so a subsequent CLI
+    // invocation discovers and attaches to this daemon instead of
+    // racing it for `graph.db`. Only relevant on the canonical port
+    // (test isolation skips this).
+    if port == cortex::DEFAULT_PORT
+        && let Some(child_pid) = pid
+    {
+        let lock = CortexLock::new(
+            port,
+            StartedBy::Desktop,
+            env!("CARGO_PKG_VERSION"),
+            binary.clone(),
+        );
+        // The lock's `pid` defaults to the desktop's own PID via
+        // `CortexLock::new`, but we want the sidecar's PID so the
+        // CLI's process_alive check sees the engine, not the GUI.
+        let mut lock = lock;
+        lock.pid = child_pid;
+        if let Err(e) = cortex::write_lock(&lock) {
+            tracing::warn!(error = %e, "failed to write cortex.lock; CLI clients may double-spawn");
+        }
+    }
+
     // Spawn a background watchdog: if the child exits unexpectedly at
     // any point after startup, clear `state.sidecar` so that future
     // compile requests fall back to in-process instead of hitting
@@ -268,7 +355,14 @@ pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     tracing::info!(pid = ?handle.pid, "shutting down sidecar");
     let mut child_guard = handle.child.lock().await;
     let Some(mut child) = child_guard.take() else {
-        // Already exited or already shut down; nothing to do.
+        // Cortex attach mode: this desktop did not spawn the daemon
+        // (it attached to one started by the CLI or `launchd`). Do
+        // NOT kill it — that would orphan the CLI users it's still
+        // serving. Leave the cortex.lock alone too: whoever spawned
+        // the daemon owns its lifecycle.
+        tracing::info!(
+            "cortex attach mode — daemon not owned by this desktop, leaving it running"
+        );
         return;
     };
     // Drop stdin so the engine's stdin reader (when any) sees EOF
@@ -296,6 +390,15 @@ pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
             )
             .await;
         }
+    }
+
+    // ── Cortex Protocol: this desktop OWNED the sidecar (we hit the
+    // child.take()-Some branch), so the cortex.lock we wrote on
+    // spawn is now stale. Clean it up. A failure here is logged
+    // but not bubbled — the next caller will treat the lock as
+    // stale anyway because the PID inside it is now dead.
+    if let Err(e) = cortex::remove_lock() {
+        tracing::warn!(error = %e, "failed to remove cortex.lock on desktop shutdown");
     }
 }
 

@@ -1,0 +1,4 @@
+id,name,role,joined_at
+1,alice,admin,2025-01-15
+2,bob,user,2025-03-22
+3,carol,user,2025-06-08

@@ -264,14 +264,24 @@ async fn maybe_auto_create_branch(
     };
 
     // ── 5. Create the stream branch (idempotent — ignore "already exists") ────
+    //
+    // T0.6: tag the branch with `BranchKind::Stream { session_id }` and
+    // `MergePolicy::AutoOnSessionEnd` so `maintenance::cleanup_once` can
+    // identify and dispose it without depending on the historical
+    // `stream/` *name prefix* convention.
     let branch_name = format!("stream/{session_id}");
-    match thinkingroot_branch::create_branch_with_owner(
+    match thinkingroot_branch::create_branch_full(
         &root,
         &branch_name,
         "main",
         None,
         Some(session_id.to_string()),
         thinkingroot_core::BranchPermissions::default(),
+        thinkingroot_core::BranchKind::Stream {
+            session_id: session_id.to_string(),
+        },
+        thinkingroot_core::MergePolicy::AutoOnSessionEnd,
+        None,
     )
     .await
     {
@@ -304,7 +314,7 @@ async fn maybe_auto_create_branch(
 
 #[tracing::instrument(
     name = "mcp.dispatch",
-    skip(request, engine, sessions),
+    skip(request, engine, sessions, engram_manager),
     fields(
         method = %request.method,
         session_id = %session_id,
@@ -318,6 +328,7 @@ pub async fn dispatch(
     default_workspace: Option<&str>,
     session_id: &str,
     sessions: &crate::intelligence::session::SessionStore,
+    engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
 ) -> JsonRpcResponse {
     let id = request.id.clone();
     // If this is a tools/call, record the tool name as a span field so trace
@@ -357,6 +368,7 @@ pub async fn dispatch(
                 default_workspace,
                 session_id,
                 sessions,
+                engram_manager,
             )
             .await
         }

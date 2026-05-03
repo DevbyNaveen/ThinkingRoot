@@ -88,6 +88,7 @@ mod tests {
                 extraction_tier: crate::schema::ExtractionTier::default(),
                 event_date: None,
                 predicate: None,
+                ..Default::default()
             }],
             entities: vec![ExtractedEntity {
                 name: "Rust".into(),

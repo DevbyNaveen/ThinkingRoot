@@ -125,6 +125,17 @@ console = "0.15"
 dirs = "5"
 dialoguer = "0.11"
 
+# Cross-platform PID liveness for the Cortex Protocol singleton
+# discovery. Default-features off to keep us out of the system-stats
+# code paths we don't need; we only call Process::status() / refresh.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# Advisory file locking — used by the Cortex lockfile write path
+# (cortex.lock.write sentinel) and by the vector-index cache.
+fs2 = "0.4"
+# Atomic write-then-rename helper for cortex.lock and other files
+# that must never be observed half-written.
+tempfile = "3"
+
 # Graph DB (Datalog-based, embedded, community edition)
 cozo = { package = "cozo-ce", version = "0.7.13-alpha.3", default-features = false, features = ["minimal", "rayon"] }
 

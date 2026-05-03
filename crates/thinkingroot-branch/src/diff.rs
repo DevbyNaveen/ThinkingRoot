@@ -220,6 +220,8 @@ pub fn compute_diff_into(
                 derivation: None,
                 predicate: None,
                 last_rooted_at: None,
+                row_blake3: None,
+                symbol: None,
             };
             new_claims.push(DiffClaim {
                 claim,

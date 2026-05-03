@@ -6,7 +6,10 @@ pub mod merge;
 pub mod snapshot;
 
 use std::path::Path;
-use thinkingroot_core::{BranchPermissions, BranchRef, Config, MergedBy, Result};
+use thinkingroot_core::{
+    BranchKind, BranchPermissions, BranchRef, Config, MergePolicy, MergedBy, RedactionPolicy,
+    Result,
+};
 use thinkingroot_graph::graph::GraphStore;
 
 /// Create a new knowledge branch from a parent branch (default: main).
@@ -33,6 +36,11 @@ pub async fn create_branch(
 }
 
 /// Create a new branch with an explicit owner and permissions.
+///
+/// `kind` defaults to [`BranchKind::Feature`] and `merge_policy`
+/// defaults to [`MergePolicy::Manual`]. For non-default kinds (e.g.
+/// `Stream` branches created by `mcp/mod.rs::ensure_session_branch`)
+/// use [`create_branch_full`].
 pub async fn create_branch_with_owner(
     root_path: &Path,
     name: &str,
@@ -40,6 +48,34 @@ pub async fn create_branch_with_owner(
     description: Option<String>,
     owner: Option<String>,
     permissions: BranchPermissions,
+) -> Result<BranchRef> {
+    create_branch_full(
+        root_path,
+        name,
+        parent,
+        description,
+        owner,
+        permissions,
+        BranchKind::default(),
+        MergePolicy::default(),
+        None,
+    )
+    .await
+}
+
+/// Create a new branch with the full T0.6 attribute set
+/// (kind + merge policy) plus the T2.6 redaction policy.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_branch_full(
+    root_path: &Path,
+    name: &str,
+    parent: &str,
+    description: Option<String>,
+    owner: Option<String>,
+    permissions: BranchPermissions,
+    kind: BranchKind,
+    merge_policy: MergePolicy,
+    redaction: Option<RedactionPolicy>,
 ) -> Result<BranchRef> {
     let parent_data_dir = snapshot::resolve_data_dir(root_path, Some(parent));
     let branch_data_dir = snapshot::resolve_data_dir(root_path, Some(name));
@@ -49,7 +85,27 @@ pub async fn create_branch_with_owner(
     let refs_dir = root_path.join(".thinkingroot-refs");
     std::fs::create_dir_all(&refs_dir)?;
     let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
-    registry.create_branch_with_owner(name, parent, description, owner, permissions)
+    registry.create_branch_full(
+        name,
+        parent,
+        description,
+        owner,
+        permissions,
+        kind,
+        merge_policy,
+        redaction,
+    )
+}
+
+/// Update the redaction policy on an existing branch and persist.
+pub fn set_branch_redaction(
+    root_path: &Path,
+    name: &str,
+    policy: Option<RedactionPolicy>,
+) -> Result<BranchRef> {
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
+    registry.set_redaction(name, policy)
 }
 
 /// List all active branches for a workspace.

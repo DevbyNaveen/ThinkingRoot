@@ -38,6 +38,9 @@ pub struct AppState {
     /// agent's `ChannelApprovalGate` unblocks. Both sides bound this
     /// shared map; nothing else writes to it.
     pub pending_approvals: crate::intelligence::approval::PendingApprovalMap,
+    /// RARP / Active Engram Protocol manager — owns per-session
+    /// materialised Engrams and serves the 4 new MCP tools.
+    pub engram_manager: Arc<crate::intelligence::engram::EngramManager>,
 }
 
 impl AppState {
@@ -60,6 +63,9 @@ impl AppState {
             sessions: crate::intelligence::session::new_session_store(),
             workspace_root,
             pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
+            engram_manager: crate::intelligence::engram::EngramManager::new(
+                crate::intelligence::engram::EngramConfig::default(),
+            ),
         })
     }
 }
@@ -147,7 +153,14 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
 
     if enable_rest {
         let api_routes = Router::new()
-            .route("/workspaces", get(list_workspaces))
+            .route(
+                "/workspaces",
+                get(list_workspaces).post(mount_workspace_handler),
+            )
+            .route(
+                "/workspaces/{name}",
+                delete(unmount_workspace_handler),
+            )
             .route("/ws/{ws}/entities", get(list_entities))
             .route("/ws/{ws}/entities/{name}", get(get_entity))
             .route("/ws/{ws}/claims", get(list_claims))
@@ -158,6 +171,25 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/health", get(get_health))
             .route("/ws/{ws}/llm/health", get(llm_health_handler))
             .route("/ws/{ws}/search", get(search))
+            .route("/ws/{ws}/search/hybrid", post(hybrid_search_handler))
+            // RARP / Active Engram Protocol — engram lifecycle endpoints
+            // mirror the 4 MCP tools (`materialize_engram`, `probe_engram`,
+            // `list_engrams`, `expire_engram`) so HTTP-only consumers
+            // (Python/TS SDKs, CLI scripts) reach AEP without an MCP
+            // transport. Session id is required and passed via
+            // `X-TR-Session-Id` header — matches the SSE-MCP pattern.
+            .route(
+                "/ws/{ws}/engrams",
+                get(list_engrams_handler).post(materialize_engram_handler),
+            )
+            .route(
+                "/ws/{ws}/engrams/{ptr}",
+                delete(expire_engram_handler),
+            )
+            .route(
+                "/ws/{ws}/engrams/{ptr}/probe",
+                post(probe_engram_handler),
+            )
             .route("/ws/{ws}/ask", post(ask_handler))
             .route("/ws/{ws}/ask/stream", post(ask_stream_handler))
             .route(
@@ -183,6 +215,16 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/branches/{branch}/rollback", post(rollback_merge_handler))
             .route("/branches/{branch}/checkout", post(checkout_branch_handler))
             .route("/branches/{branch}", delete(delete_branch_handler))
+            // T0.7 — connector-attributed bulk contribute with idempotency.
+            .route(
+                "/branches/{branch}/contribute-bulk",
+                post(contribute_bulk_handler),
+            )
+            // T2.6 — per-branch outbound redaction policy.
+            .route(
+                "/branches/{branch}/redaction",
+                post(set_branch_redaction_handler),
+            )
             .route("/head", get(get_head_handler));
         router = router.nest("/api/v1", api_routes);
     }
@@ -308,6 +350,361 @@ async fn list_workspaces(State(state): State<Arc<AppState>>) -> Response {
             &e.to_string(),
         ),
     }
+}
+
+// ─── Workspace mount/unmount (cortex-aware tr-mount target) ─────
+//
+// `POST /api/v1/workspaces` accepts `{ name, root_path }` and mounts
+// the workspace into the running daemon's engine. This is the seam
+// the `root mount` CLI subcommand uses after unpacking a `.tr` pack
+// — the unpacked `<dir>/.thinkingroot/` becomes a workspace the
+// cortex daemon can serve to MCP clients (Claude Desktop, Cursor,
+// etc.) without restart.
+//
+// `DELETE /api/v1/workspaces/{name}` is the symmetric unmount. Both
+// honour the cortex contract: they mutate `engine.workspaces` under
+// the engine write-lock, which serialises with the read paths used
+// by every other handler (search, claims, AEP) so a concurrent
+// query never observes a half-mounted workspace.
+
+#[derive(Debug, Deserialize)]
+struct MountWorkspaceRequest {
+    name: String,
+    root_path: String,
+    /// Optional explicit data directory (defaults to
+    /// `<root_path>/.thinkingroot/`). Set this when the data dir
+    /// lives outside the workspace root — for example, the tr-mount
+    /// flow stages `XDG_DATA_HOME/thinkingroot/mounts/<hash>/` and
+    /// passes both as separate paths.
+    #[serde(default)]
+    data_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MountWorkspaceResponse {
+    name: String,
+    root_path: String,
+    entity_count: usize,
+    claim_count: usize,
+    source_count: usize,
+    /// Public REST root for this workspace — clients append entity /
+    /// claim / engram paths under this prefix.
+    rest_url: String,
+    /// MCP SSE endpoint (clients connect over SSE for the standard
+    /// RARP/Hybrid tool surface).
+    mcp_url: String,
+}
+
+async fn mount_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MountWorkspaceRequest>,
+) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", "name is required");
+    }
+    let root_path = PathBuf::from(&body.root_path);
+    if !root_path.is_absolute() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "root_path must be absolute",
+        );
+    }
+
+    let mut engine = state.engine.write().await;
+    let mount_result = match body.data_dir.as_deref() {
+        Some(dd) => {
+            let data_dir = PathBuf::from(dd);
+            engine
+                .mount_with_data_dir(name.clone(), root_path.clone(), data_dir)
+                .await
+        }
+        None => engine.mount(name.clone(), root_path.clone()).await,
+    };
+    if let Err(e) = mount_result {
+        return match_engine_error(e);
+    }
+
+    // Pull a fresh count so the response carries the substrate size
+    // the SDK can show in its connection summary.
+    let info = match engine.list_workspaces().await {
+        Ok(list) => list.into_iter().find(|w| w.name == name),
+        Err(_) => None,
+    };
+    let (entity_count, claim_count, source_count) = info
+        .map(|w| (w.entity_count, w.claim_count, w.source_count))
+        .unwrap_or((0, 0, 0));
+
+    drop(engine);
+
+    // Emit RARP-aware invalidation so any pre-existing engrams pinned
+    // to a same-named workspace are dropped — defends against the
+    // "remount under the same name returns stale claim ids" case.
+    state.engram_manager.invalidate_workspace(&name).await;
+
+    let rest_url = format!("/api/v1/ws/{name}/");
+    let mcp_url = "/mcp/sse".to_string();
+    ok_response(MountWorkspaceResponse {
+        name,
+        root_path: root_path.display().to_string(),
+        entity_count,
+        claim_count,
+        source_count,
+        rest_url,
+        mcp_url,
+    })
+    .into_response()
+}
+
+async fn unmount_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let mut engine = state.engine.write().await;
+    if let Err(e) = engine.unmount(&name) {
+        return match_engine_error(e);
+    }
+    drop(engine);
+
+    state.engram_manager.invalidate_workspace(&name).await;
+
+    ok_response(serde_json::json!({ "unmounted": name })).into_response()
+}
+
+// ─── RARP / Active Engram Protocol REST endpoints ───────────────
+//
+// These mirror the 4 MCP tools (`materialize_engram`, `probe_engram`,
+// `list_engrams`, `expire_engram`) so HTTP-only consumers can reach
+// the AEP read path. Session id is mandatory and travels in the
+// `X-TR-Session-Id` header — same lifetime contract as the SSE-MCP
+// session: idle TTL eviction, cache-dirty invalidation, max engrams
+// per session enforced by `EngramManager`.
+
+const SESSION_HEADER: &str = "X-TR-Session-Id";
+
+fn require_session_id(headers: &HeaderMap) -> Result<String, Response> {
+    match headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
+        Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        _ => Err(err_response(
+            StatusCode::BAD_REQUEST,
+            "MISSING_SESSION",
+            &format!("{SESSION_HEADER} header is required"),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MaterializeEngramRequest {
+    topic: String,
+    /// Optional explicit seed entity ids; falls back to a vector
+    /// search against the workspace if absent. Mirrors the MCP
+    /// behaviour at mcp/tools.rs::handle_materialize_engram.
+    #[serde(default)]
+    seed_entity_ids: Option<Vec<String>>,
+    /// Optional engram scope (depth_hops, event_window_days,
+    /// clearance, seed_claim_ids, score_with_hybrid).
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+}
+
+async fn materialize_engram_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<MaterializeEngramRequest>,
+) -> Response {
+    let session_id = match require_session_id(&headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let topic = body.topic.trim().to_string();
+    if topic.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", "topic is required");
+    }
+
+    let engine = state.engine.read().await;
+    let seed_entity_ids = match body.seed_entity_ids {
+        Some(ids) => ids,
+        None => match engine.search(&ws, &topic, 10).await {
+            Ok(result) => result.entities.into_iter().map(|e| e.id).collect(),
+            Err(e) => return match_engine_error(e),
+        },
+    };
+    if seed_entity_ids.is_empty() {
+        return err_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "NO_ANCHORS",
+            &format!("no semantic anchors for topic '{topic}'"),
+        );
+    }
+
+    let scope = crate::mcp::tools::parse_scope(body.scope.as_ref());
+
+    let graph = match engine.graph_store(&ws).await {
+        Some(g) => g,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "WORKSPACE_NOT_MOUNTED",
+                &format!("workspace '{ws}' not mounted"),
+            );
+        }
+    };
+
+    match state
+        .engram_manager
+        .materialize_engram(&session_id, &ws, &topic, &graph, seed_entity_ids, scope, None)
+        .await
+    {
+        Ok((pointer, summary)) => ok_response(serde_json::json!({
+            "pointer": pointer,
+            "summary": &*summary,
+        }))
+        .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeEngramRequest {
+    question: String,
+    #[serde(default)]
+    clearance: Option<Vec<String>>,
+    #[serde(default)]
+    probe_kind: Option<String>,
+    /// AEP × Hybrid composition flag. When `true`, the probe answer's
+    /// rows are reordered by `hybrid_retrieve` before being returned.
+    /// Spec: docs/2026-05-02-hybrid-retrieval-spec.md §11.
+    #[serde(default)]
+    score_with_hybrid: bool,
+}
+
+async fn probe_engram_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, ptr)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ProbeEngramRequest>,
+) -> Response {
+    let session_id = match require_session_id(&headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if body.question.trim().is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", "question is required");
+    }
+
+    let engine = state.engine.read().await;
+    let graph = match engine.graph_store(&ws).await {
+        Some(g) => g,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "WORKSPACE_NOT_MOUNTED",
+                &format!("workspace '{ws}' not mounted"),
+            );
+        }
+    };
+    let byte_store = match engine.byte_store(&ws) {
+        Some(b) => b,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "WORKSPACE_NO_BYTE_STORE",
+                &format!("workspace '{ws}' has no byte store"),
+            );
+        }
+    };
+
+    let clearance: Option<Vec<thinkingroot_core::types::Sensitivity>> = body
+        .clearance
+        .as_ref()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| crate::mcp::tools::parse_sensitivity_str(s))
+                .collect()
+        });
+    let probe_kind = body
+        .probe_kind
+        .as_deref()
+        .and_then(crate::mcp::tools::parse_probe_kind_str);
+
+    let probe_clearance = clearance.clone();
+    let mut answer = match state
+        .engram_manager
+        .probe_engram(
+            &session_id,
+            &ptr,
+            &body.question,
+            clearance,
+            &graph,
+            byte_store.as_ref(),
+            probe_kind,
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return match_engine_error(e),
+    };
+
+    if body.score_with_hybrid && !answer.claim_ids.is_empty() {
+        let req = crate::engine::RetrievalRequest {
+            query_text: body.question.clone(),
+            typed_predicates: vec![],
+            session_id: session_id.clone(),
+            clearance: probe_clearance
+                .unwrap_or_else(|| vec![thinkingroot_core::types::Sensitivity::Public]),
+            top_k: answer.claim_ids.len(),
+            time_window: None,
+            scoring_profile: crate::engine::ScoringProfile::default(),
+            require_certificate: false,
+            include_test_origin: true,
+            include_quarantined: false,
+            require_provenance_verified: false,
+            now: None,
+            scoped_claim_ids: Some(answer.claim_ids.clone()),
+        };
+        match engine.hybrid_retrieve(&ws, req, None).await {
+            Ok(resp) => {
+                let new_order: Vec<String> =
+                    resp.hits.iter().map(|h| h.claim_id.clone()).collect();
+                crate::mcp::tools::reorder_probe_answer_in_place(&mut answer, &new_order);
+            }
+            Err(e) => {
+                // Fall back to Datalog order rather than failing the
+                // probe — matches the MCP path's tolerant behaviour.
+                tracing::warn!("hybrid composition fallback: {e}");
+            }
+        }
+    }
+
+    ok_response(answer).into_response()
+}
+
+async fn list_engrams_handler(
+    State(state): State<Arc<AppState>>,
+    Path(_ws): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session_id = match require_session_id(&headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let refs = state.engram_manager.list_engrams(&session_id).await;
+    ok_response(refs).into_response()
+}
+
+async fn expire_engram_handler(
+    State(state): State<Arc<AppState>>,
+    Path((_ws, ptr)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let session_id = match require_session_id(&headers) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let expired = state.engram_manager.expire_engram(&session_id, &ptr).await;
+    ok_response(serde_json::json!({ "expired": expired, "pointer": ptr })).into_response()
 }
 
 async fn list_entities(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
@@ -446,6 +843,25 @@ async fn search(
     }
 }
 
+/// `POST /api/v1/ws/{ws}/search/hybrid` — Hybrid Retrieval (vector × Datalog
+/// × BLAKE3 × 11-component score fusion). Single-shot JSON response, not
+/// SSE; the <25ms p95 budget makes streaming overhead net-negative. Cancel
+/// on client disconnect via the same `CancellationToken + DropGuard`
+/// pattern as the SSE compile route.
+async fn hybrid_search_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<crate::engine::RetrievalRequest>,
+) -> Response {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _drop_guard = cancel.clone().drop_guard();
+    let engine = state.engine.read().await;
+    match engine.hybrid_retrieve(&ws, req, Some(cancel)).await {
+        Ok(resp) => ok_response(resp).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
 async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     // The audit flagged that this read guard is held for the entire
     // compile (multi-minute).  Concurrent *readers* (search,
@@ -462,7 +878,17 @@ async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> 
     // observed contention.
     let engine = state.engine.read().await;
     match engine.compile(&ws).await {
-        Ok(result) => ok_response(result).into_response(),
+        Ok(result) => {
+            // Plan §3.10: when compile dirties the cache, drop every Engram
+            // pointing at this workspace. Without this hook a probe after a
+            // writing compile can return rows whose claim ids were just GC'd.
+            // Mirrors the existing `branch_engines.invalidate_workspace`
+            // call inside `QueryEngine::compile` (engine.rs:2987).
+            if result.cache_dirty {
+                state.engram_manager.invalidate_workspace(&ws).await;
+            }
+            ok_response(result).into_response()
+        }
         Err(e) => match_engine_error(e),
     }
 }
@@ -683,6 +1109,15 @@ struct CreateBranchRequest {
     name: String,
     parent: Option<String>,
     description: Option<String>,
+    /// T0.6 — optional explicit BranchKind. Defaults to Feature.
+    #[serde(default)]
+    kind: Option<thinkingroot_core::BranchKind>,
+    /// T0.6 — optional explicit MergePolicy. Defaults to Manual.
+    #[serde(default)]
+    merge_policy: Option<thinkingroot_core::MergePolicy>,
+    /// T2.6 — optional redaction policy. Defaults to no redaction.
+    #[serde(default)]
+    redaction: Option<thinkingroot_core::RedactionPolicy>,
 }
 
 async fn create_branch_handler(
@@ -701,13 +1136,16 @@ async fn create_branch_handler(
         }
     };
     let parent = body.parent.as_deref().unwrap_or("main");
-    match thinkingroot_branch::create_branch_with_owner(
+    match thinkingroot_branch::create_branch_full(
         &root,
         &body.name,
         parent,
         body.description,
         request_user(&headers),
         thinkingroot_core::BranchPermissions::default(),
+        body.kind.unwrap_or_default(),
+        body.merge_policy.unwrap_or_default(),
+        body.redaction,
     )
     .await
     {
@@ -715,6 +1153,108 @@ async fn create_branch_handler(
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BRANCH_ERROR",
+            &e.to_string(),
+        ),
+    }
+}
+
+// ─── T0.7: contribute-bulk ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ContributeBulkRequest {
+    /// Workspace name (matches the mounted workspace identifier).
+    workspace: String,
+    /// Optional session id for turn-calendar attribution. When absent,
+    /// the synthetic session id derived from the connector identity is
+    /// used.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Connector identifier (e.g. `"github"`, `"slack"`, `"notion"`).
+    connector_id: String,
+    /// Per-install identifier (`"alice-acme-prod"`).
+    install_id: String,
+    /// Idempotency key (the connector picks this; typically the
+    /// webhook delivery id or the upstream event id).
+    idempotency_key: String,
+    /// When `true`, skip per-claim rooting (deferred to end of batch).
+    #[serde(default)]
+    backfill: bool,
+    /// The batch of claims being contributed.
+    claims: Vec<crate::engine::AgentClaim>,
+}
+
+async fn contribute_bulk_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+    Json(body): Json<ContributeBulkRequest>,
+) -> impl IntoResponse {
+    let principal = crate::engine::Principal::Connector {
+        connector_id: body.connector_id.clone(),
+        install_id: body.install_id.clone(),
+    };
+    let session_id = body.session_id.unwrap_or_else(|| {
+        format!(
+            "connector:{}:{}:{}",
+            body.connector_id, body.install_id, body.idempotency_key
+        )
+    });
+    let branch_arg = if branch == "main" {
+        None
+    } else {
+        Some(branch.as_str())
+    };
+
+    let engine = state.engine.read().await;
+    match engine
+        .contribute_bulk(
+            &body.workspace,
+            &session_id,
+            branch_arg,
+            body.claims,
+            &state.sessions,
+            principal,
+            &body.idempotency_key,
+            body.backfill,
+        )
+        .await
+    {
+        Ok(result) => ok_response(serde_json::json!(result)).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "CONTRIBUTE_BULK_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+// ─── T2.6: per-branch redaction policy ────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetRedactionRequest {
+    /// `null` clears the policy; an object sets it.
+    policy: Option<thinkingroot_core::RedactionPolicy>,
+}
+
+async fn set_branch_redaction_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+    Json(body): Json<SetRedactionRequest>,
+) -> impl IntoResponse {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    match thinkingroot_branch::set_branch_redaction(&root, &branch, body.policy) {
+        Ok(updated) => ok_response(serde_json::json!({ "branch": updated })).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "REDACTION_UPDATE_FAILED",
             &e.to_string(),
         ),
     }
@@ -1148,6 +1688,20 @@ async fn ask_handler(
     use crate::intelligence::synthesizer::{AskRequest as SynthAskRequest, ask};
     use std::collections::HashMap;
     use std::collections::HashSet;
+
+    // ── Cortex Protocol cancellation contract ──────────────────────
+    // The ask path is single-task today: dropping the response
+    // future also drops the LLM synthesis call inside `ask()`, so
+    // client disconnect IS cancellation. The explicit
+    // CancellationToken + DropGuard pair below documents the
+    // invariant and provides a hookpoint for the day `ask()` grows
+    // its own `Option<CancellationToken>` argument (mirroring
+    // `hybrid_retrieve`). Until then it is a no-op guard — the
+    // important property is that the pattern matches every other
+    // stateful endpoint so a future audit can grep for it
+    // uniformly.
+    let _cancel = tokio_util::sync::CancellationToken::new();
+    let _drop_guard = _cancel.clone().drop_guard();
 
     let engine = state.engine.read().await;
 

@@ -66,6 +66,17 @@ dialoguer = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+# Cortex Protocol: typed errors on resolve_engine + remote-delegate
+# call paths. The CLI's existing `anyhow::Result<()>` boundary is
+# preserved at the subcommand layer; thiserror only carries
+# typed-but-internally-erased errors back through the cortex_client
+# / cortex_remote modules.
+thiserror = { workspace = true }
+# Cortex Protocol: SSE consumer for `compile/stream` and
+# `ask/stream` over reqwest's bytes_stream.
+async-stream = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
 
 # Cloud subcommands (`root login`, `root publish`, `root whoami`,
 # `root init`, `root status`) — Phase G consolidation. Replace the
@@ -74,6 +85,13 @@ walkdir = "2"
 rpassword = "7"
 tar = "0.4"
 zstd = { version = "0.13", default-features = false }
+
+# `root mount` — replay v3 packs into a fresh CozoDB.  blake3 hashes
+# source bytes for the byte-store layout; ulid mints fallback ClaimIds
+# when a v3 pack carries non-ULID claim ids (defensive — canonical
+# packs always use ULIDs per claims.jsonl spec §3.3).
+blake3 = { workspace = true }
+ulid = { workspace = true }
 
 # Pluggable resolvers for `root install` (Phase C).
 async-trait = "0.1"
@@ -103,3 +121,7 @@ tempfile = "3"
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 semver = { version = "1", features = ["serde"] }
+# Cortex integration tests need to spawn the real `root` binary and
+# serialise per-test environment overrides (XDG_CONFIG_HOME, ports).
+assert_cmd = "2"
+serial_test = "3"

@@ -1,15 +1,20 @@
+pub mod ast_split;
 pub mod batch;
 pub mod cache;
 pub mod checkpoint;
 pub mod events;
+pub mod expiration;
 pub mod extractor;
 pub mod focused_prompts;
 pub mod graph_context;
 pub mod llm;
 pub mod prompts;
+pub mod prose_split;
+pub mod quantity;
 pub mod router;
 pub mod scheduler;
 pub mod schema;
+pub mod sensitivity;
 pub mod structural;
 
 pub use checkpoint::{CompletedBatches, InFlightCheckpoint};

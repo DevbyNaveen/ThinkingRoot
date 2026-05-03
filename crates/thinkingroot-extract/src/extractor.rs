@@ -74,7 +74,16 @@ pub struct Extractor {
     /// Number of cache-miss chunks packed into a single LLM batch call.
     /// Computed from model context window + output cap at construction time;
     /// overridable via `extraction_batch_size` in config.
+    ///
+    /// Wedge 1: this is the *upper bound* on chunks per batch — the actual
+    /// batch size is variable and is decided by the token-aware packer
+    /// (`pack_batches`) which seals a batch when either this chunk-count cap
+    /// or `input_token_budget` is reached, whichever hits first.
     batch_size: usize,
+    /// Wedge 1: per-call input-token budget for the variable-size batch
+    /// packer.  Resolved from `ExtractionConfig::extraction_input_token_budget`
+    /// or, when unset, from `model_input_token_budget(provider, model)`.
+    input_token_budget: usize,
     cache: Option<crate::cache::ExtractionCache>,
     progress: Option<ChunkProgressFn>,
     /// Known entities from the existing graph, injected into LLM prompts.
@@ -136,6 +145,21 @@ pub struct ExtractionOutput {
     /// single user-visible vocabulary describes both states.  Empty
     /// when `failed_batches == 0`.
     pub failed_batch_ranges: Vec<(usize, usize)>,
+    // ─── Compile Completeness Contract §5 — decorations carried to Phase 6.7
+    /// Per-claim quantity rows extracted from the claim's statement.
+    /// Phase 6.7 emits one `quantities` table row per entry. Empty when
+    /// no numerics were detected. Populated by
+    /// `crate::quantity::extract` during `convert_result_static`.
+    pub claim_quantities:
+        HashMap<ClaimId, Vec<crate::schema::ExtractedQuantity>>,
+    /// Per-claim expiration signal + ISO-8601 absolute expiration date.
+    /// Phase 6.7 writes the date into `claim_temporal.valid_until` and
+    /// preserves the typed signal in a future `claim_expiration_signals`
+    /// row. Populated by `crate::expiration::extract` during
+    /// `convert_result_static`. `None` when no expiration phrasing was
+    /// found.
+    pub claim_expirations:
+        HashMap<ClaimId, crate::expiration::ExtractedExpiration>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,9 +185,21 @@ impl Extractor {
             )
         });
 
+        // Wedge 1: resolve the input-token budget driving the variable-size packer.
+        let input_token_budget = config
+            .extraction
+            .extraction_input_token_budget
+            .unwrap_or_else(|| {
+                crate::llm::model_input_token_budget(
+                    &config.llm.default_provider,
+                    &config.llm.extraction_model,
+                )
+            });
+
         tracing::info!(
-            "extraction batch size: {} (provider={}, model={})",
+            "extraction batch caps: chunks_max={} input_tokens_max={} (provider={}, model={})",
             batch_size,
+            input_token_budget,
             config.llm.default_provider,
             config.llm.extraction_model,
         );
@@ -174,6 +210,7 @@ impl Extractor {
             min_confidence: config.extraction.min_confidence,
             max_chunk_tokens: config.extraction.max_chunk_tokens,
             batch_size,
+            input_token_budget,
             cache: None,
             progress: None,
             known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
@@ -343,7 +380,7 @@ impl Extractor {
                     continue;
                 }
 
-                let sub_chunks = split_to_token_budget(&chunk.content, max_chunk_tokens);
+                let sub_chunks = split_chunk_to_token_budget(chunk, max_chunk_tokens);
                 if sub_chunks.len() > 1 {
                     tracing::debug!(
                         "chunk in {} split into {} sub-chunks (estimated {} tokens > limit {})",
@@ -375,19 +412,42 @@ impl Extractor {
         // Structural results are additive — they run in addition to the LLM path, not instead.
         let cache_hits_count = cache_hits_data.len();
         let total_chunks = cache_hits_count + llm_work.len();
-        let total_batches = if llm_work.is_empty() {
+
+        // Wedge 1: pack llm_work into variable-size batches honouring both
+        // the chunk-count cap (`self.batch_size`) and the input-token budget
+        // (`self.input_token_budget`).  Each packed range is `(start, end)`
+        // half-open into `llm_work`.  Cost = chars/4 of the body the LLM
+        // actually sees: sub_chunks joined + ast_anchor + context.
+        let packed_ranges: Vec<(usize, usize)> = pack_batches(
+            &llm_work,
+            self.input_token_budget,
+            self.batch_size,
+            |w: &ChunkWork| {
+                let body_chars: usize = w.sub_chunks.iter().map(|s| s.len()).sum();
+                let aux_chars = w.ast_anchor.len() + w.context.len();
+                estimate_tokens_chars(body_chars + aux_chars)
+            },
+        );
+        let total_batches = packed_ranges.len();
+
+        // The `batch_size` field on `ExtractionProgressEvent::Start` is
+        // backward-compatible with desktop UI consumers — it now carries the
+        // *average* batch size (rounded), not a static stride.
+        let avg_batch_size = if total_batches == 0 {
             0
         } else {
-            llm_work.len().div_ceil(self.batch_size)
+            llm_work.len().div_ceil(total_batches)
         };
         let mut done: usize = 0;
 
         // Emit a start event immediately so the progress bar can switch from
         // "waiting for LLM..." to a real counted bar BEFORE any batch call starts.
+        // `batch_size` here is the AVERAGE chunk count per batch under the
+        // Wedge-1 token-aware packer.  Callers display it as a coarse hint.
         if let Some(ref pf) = self.progress {
             pf(ExtractionProgressEvent::Start {
                 total_chunks,
-                batch_size: self.batch_size,
+                batch_size: avg_batch_size,
                 total_batches,
             });
         }
@@ -449,15 +509,18 @@ impl Extractor {
         let known_entities_section = self.known_entities.prompt_section();
         let mut join_set = tokio::task::JoinSet::new();
 
-        for (batch_idx, batch_work) in llm_work.chunks(self.batch_size).enumerate() {
-            let batch_work: Vec<_> = batch_work.to_vec();
+        for (batch_idx, &(slice_start, slice_end)) in packed_ranges.iter().enumerate() {
+            let batch_work: Vec<_> = llm_work[slice_start..slice_end].to_vec();
             let llm = Arc::clone(&self.llm);
             let sem = Arc::clone(&semaphore);
             let graph_ctx = known_entities_section.clone();
             let progress = self.progress.clone();
             let batch_index = batch_idx + 1;
-            let range_start = cache_hits_count + (batch_idx * self.batch_size) + 1;
-            let range_end = (range_start + batch_work.len()).saturating_sub(1);
+            // Wedge 1: ranges follow the actual packer partition (1-indexed
+            // inclusive on the user-facing `chunks` axis).  Cache hits sit at
+            // positions [1..=cache_hits_count]; LLM work starts after.
+            let range_start = cache_hits_count + slice_start + 1;
+            let range_end = cache_hits_count + slice_end;
             let batch_chunks = batch_work.len();
 
             join_set.spawn(async move {
@@ -725,6 +788,7 @@ impl Extractor {
         }
 
         // Convert claims and track their entity references.
+        let now = chrono::Utc::now();
         for ext_claim in &result.claims {
             if ext_claim.confidence < min_confidence {
                 continue;
@@ -733,6 +797,47 @@ impl Extractor {
             let mut claim = Claim::new(&ext_claim.statement, claim_type, source_id, workspace_id)
                 .with_confidence(ext_claim.confidence)
                 .with_extraction_tier(ext_claim.extraction_tier);
+            // Compile Completeness Contract §4.1 — propagate the symbol
+            // identifier so Phase 7e can resolve `function_calls.callee_name`
+            // → `claim_id` via the `claims.symbol` index.
+            if let Some(sym) = &ext_claim.symbol
+                && !sym.is_empty()
+            {
+                claim = claim.with_symbol(sym.clone());
+            }
+
+            // ─── Compile Completeness Contract §5 — decorate the claim ─
+            // Sensitivity: regex layer reads the statement; merge with
+            // any LLM-suggested tier the extractor stamped onto
+            // `ext_claim.sensitivity`. Higher tier wins.
+            let regex_tier = crate::sensitivity::classify_text(&ext_claim.statement);
+            let merged_tier = crate::sensitivity::merge(ext_claim.sensitivity, regex_tier);
+            if let Some(tier) = merged_tier {
+                claim = claim.with_sensitivity(tier);
+            }
+            // Quantities: extract numeric tuples from the statement.
+            // Multiple per claim are routine. Phase 6.7 reads
+            // `output.claim_quantities[claim.id]` to emit `quantities` rows.
+            let mut quantities = ext_claim.quantities.clone();
+            quantities.extend(crate::quantity::extract(&ext_claim.statement));
+            if !quantities.is_empty() {
+                output.claim_quantities.insert(claim.id, quantities);
+            }
+            // Expiration: prefer LLM-stamped signal; otherwise classify
+            // from the statement. `None` means no expiration phrasing —
+            // Phase 6.7 leaves `claim_temporal.valid_until` at the
+            // never-expires sentinel.
+            let expiration = ext_claim
+                .expiration_signal
+                .clone()
+                .map(|signal| crate::expiration::ExtractedExpiration {
+                    signal,
+                    valid_until: ext_claim.valid_until.clone(),
+                })
+                .or_else(|| crate::expiration::extract(&ext_claim.statement, now));
+            if let Some(exp) = expiration {
+                output.claim_expirations.insert(claim.id, exp);
+            }
             // Propagate v3 byte-range citation onto the claim's source_span
             // when present. (0, 0) is the "unknown" sentinel from chunks
             // whose parser hasn't been upgraded yet — leave source_span
@@ -841,11 +946,119 @@ fn backfill_chunk_origin(
     }
 }
 
-/// Split content into sub-chunks that stay within the token budget.
-/// Splits at line boundaries to preserve semantic integrity.
-fn split_to_token_budget(content: &str, max_tokens: usize) -> Vec<String> {
+/// Wedge 1: estimate the input-token cost of a string for the batch packer.
+/// Reuses the engine-wide `chars / 4` heuristic (matches
+/// `split_to_token_budget` and the throughput scheduler) so all call sites
+/// agree.  Always returns at least 1 — a chunk that contributes zero tokens
+/// would otherwise let the packer accumulate infinite items.
+pub(crate) fn estimate_tokens_chars(chars: usize) -> usize {
+    (chars / 4).max(1)
+}
+
+/// Wedge 1: token-aware batch packer for the variable-size LLM call grouping.
+///
+/// Walks `items` left-to-right and seals a batch when adding the next item
+/// would push the running token total past `token_budget` *or* the item
+/// count past `max_chunks`.  Returns half-open index ranges `[start, end)`
+/// into `items`.
+///
+/// Guarantees:
+/// - Every input is covered by exactly one range (Σ (end - start) ==
+///   items.len()).
+/// - No empty range is produced.
+/// - An item larger than `token_budget` becomes its own batch (size 1) — we
+///   never silently drop oversized items, and `split_to_token_budget` has
+///   already split content above the per-chunk cap before we get here.
+/// - Provider chunk-count caps from `model_batch_size` (Bedrock = 8,
+///   Perplexity = 1, …) flow in via `max_chunks`.
+pub(crate) fn pack_batches<T>(
+    items: &[T],
+    token_budget: usize,
+    max_chunks: usize,
+    cost: impl Fn(&T) -> usize,
+) -> Vec<(usize, usize)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let max_chunks = max_chunks.max(1);
+    let token_budget = token_budget.max(1);
+
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut acc_tokens: usize = 0;
+    for (i, w) in items.iter().enumerate() {
+        let item_cost = cost(w);
+        let count_in_batch = i - start;
+        let would_exceed_tokens = acc_tokens + item_cost > token_budget && count_in_batch > 0;
+        let would_exceed_count = count_in_batch >= max_chunks;
+        if would_exceed_tokens || would_exceed_count {
+            out.push((start, i));
+            start = i;
+            acc_tokens = 0;
+        }
+        acc_tokens += item_cost;
+    }
+    if start < items.len() {
+        out.push((start, items.len()));
+    }
+    out
+}
+
+/// Wedge 3: chunk-aware splitter dispatching on `chunk.chunk_type` and
+/// `chunk.language` so oversized code chunks split at top-level statement
+/// boundaries (not mid-body line cuts) and oversized prose splits at
+/// paragraph / sentence boundaries.  Falls back to the line-based splitter
+/// for any case where the AST or sentence path doesn't apply.
+fn split_chunk_to_token_budget(
+    chunk: &thinkingroot_core::ir::Chunk,
+    max_tokens: usize,
+) -> Vec<String> {
+    use thinkingroot_core::ir::ChunkType;
+
+    let max_chars = max_tokens.saturating_mul(4).max(1);
+    if chunk.content.len() <= max_chars {
+        return vec![chunk.content.clone()];
+    }
+
+    // Code-like chunks with a known language → tree-sitter statement split.
+    let is_code_like = matches!(
+        chunk.chunk_type,
+        ChunkType::FunctionDef | ChunkType::TypeDef | ChunkType::Code | ChunkType::Import
+    );
+    if is_code_like
+        && let Some(lang) = chunk.language.as_deref()
+        && let Some(parts) =
+            crate::ast_split::split_at_statement_boundaries(&chunk.content, lang, max_tokens)
+    {
+        return parts;
+    }
+
+    // Prose / heading / generic markdown → paragraph + sentence split.
+    let is_prose_like = matches!(
+        chunk.chunk_type,
+        ChunkType::Prose
+            | ChunkType::Heading
+            | ChunkType::List
+            | ChunkType::Comment
+            | ChunkType::ModuleDoc
+    );
+    if is_prose_like {
+        let parts = crate::prose_split::split_prose(&chunk.content, max_tokens);
+        if parts.len() > 1 {
+            return parts;
+        }
+    }
+
+    // Final fallback: legacy line-based splitter.
+    split_to_token_budget_lines(&chunk.content, max_tokens)
+}
+
+/// Legacy line-based splitter — preserved as the universal fallback for
+/// chunks where AST / sentence splitting can't help (unknown language,
+/// pathological single-line input).
+fn split_to_token_budget_lines(content: &str, max_tokens: usize) -> Vec<String> {
     // chars/4 is a conservative token approximation that works across all tokenizers.
-    let max_chars = max_tokens * 4;
+    let max_chars = max_tokens.saturating_mul(4).max(1);
 
     if content.len() <= max_chars {
         return vec![content.to_string()];
@@ -941,6 +1154,8 @@ impl ExtractionOutput {
         self.claim_source_quotes.extend(other.claim_source_quotes);
         self.failed_batches += other.failed_batches;
         self.failed_batch_ranges.extend(other.failed_batch_ranges);
+        self.claim_quantities.extend(other.claim_quantities);
+        self.claim_expirations.extend(other.claim_expirations);
     }
 }
 
@@ -1098,7 +1313,7 @@ mod tests {
     #[test]
     fn split_to_token_budget_no_split_needed() {
         let content = "hello world\nfoo bar";
-        let chunks = split_to_token_budget(content, 10000);
+        let chunks = split_to_token_budget_lines(content, 10000);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], content);
     }
@@ -1110,7 +1325,7 @@ mod tests {
         let line_b = "BBBBBBBBBB"; // 10 chars
         let line_c = "CCCCCCCCCC"; // 10 chars
         let content = format!("{line_a}\n{line_b}\n{line_c}");
-        let chunks = split_to_token_budget(&content, 5); // 20 chars budget
+        let chunks = split_to_token_budget_lines(&content, 5); // 20 chars budget
         // line_a + line_b = 21 chars (with \n), so they can't both fit.
         assert!(chunks.len() >= 2);
         // Every line must appear in some chunk.
@@ -1124,9 +1339,49 @@ mod tests {
     fn split_to_token_budget_single_large_line_kept_intact() {
         // A single line larger than budget is kept as-is (can't split mid-line).
         let big_line = "X".repeat(1000);
-        let chunks = split_to_token_budget(&big_line, 10); // 40 chars budget
+        let chunks = split_to_token_budget_lines(&big_line, 10); // 40 chars budget
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], big_line);
+    }
+
+    // ── Wedge 3: chunk-aware AST/prose dispatch ─────────────────────────
+
+    #[test]
+    fn split_chunk_to_token_budget_dispatches_code_to_ast_split() {
+        use thinkingroot_core::ir::{Chunk, ChunkType};
+        // Two adjacent Rust functions, each small individually but together
+        // over the 50-token budget — the AST-aware splitter should produce 2.
+        let src = "pub fn a() -> i32 { 1 }\n\npub fn b() -> i32 { 2 }\n".repeat(8);
+        let mut c = Chunk::new(src.clone(), ChunkType::Code, 1, 1);
+        c = c.with_language("rust");
+        let parts = split_chunk_to_token_budget(&c, 30);
+        assert!(parts.len() > 1, "expected AST split; got {} parts", parts.len());
+        // Every part has balanced braces (no mid-function cuts).
+        for p in &parts {
+            assert_eq!(p.matches('{').count(), p.matches('}').count());
+        }
+    }
+
+    #[test]
+    fn split_chunk_to_token_budget_dispatches_prose_to_prose_split() {
+        use thinkingroot_core::ir::{Chunk, ChunkType};
+        let mut sentences = String::new();
+        for i in 0..50 {
+            sentences.push_str(&format!("Sentence number {i}. "));
+        }
+        let c = Chunk::new(sentences.clone(), ChunkType::Prose, 1, 1);
+        let parts = split_chunk_to_token_budget(&c, 50);
+        assert!(parts.len() > 1);
+    }
+
+    #[test]
+    fn split_chunk_unknown_language_falls_back_to_lines() {
+        use thinkingroot_core::ir::{Chunk, ChunkType};
+        let big = "fn a() {}\n".repeat(2_000); // ~20K chars
+        let mut c = Chunk::new(big, ChunkType::Code, 1, 1);
+        c = c.with_language("cobol"); // unsupported by ts_language
+        let parts = split_chunk_to_token_budget(&c, 100);
+        assert!(parts.len() > 1, "line-based fallback must split");
     }
 
     #[test]
@@ -1193,6 +1448,101 @@ mod tests {
         a.merge(b);
         assert_eq!(a.failed_batches, 3);
         assert_eq!(a.failed_batch_ranges, vec![(1, 6), (13, 18), (25, 30)]);
+    }
+
+    // ── Wedge 1: token-aware mega-batches ────────────────────────────────
+
+    #[test]
+    fn pack_batches_empty_input_yields_no_ranges() {
+        let v: Vec<usize> = Vec::new();
+        let packed = pack_batches(&v, 1000, 64, |_| 100);
+        assert!(packed.is_empty());
+    }
+
+    #[test]
+    fn pack_batches_respects_token_budget() {
+        let costs = vec![100usize, 200, 300, 400, 100, 100];
+        let packed = pack_batches(&costs, 600, 64, |&c| c);
+        // Greedy fill: [100,200,300]=600 → seal, [400,100]=500 → seal at next
+        // would-overflow, [100] stays.  Last batch is whatever fit at end.
+        // Actual run: 100+200=300, +300=600 (== budget, not over), +400 would
+        // be 1000 → seal at idx 3.  Then 400+100=500, +100=600, end.
+        let totals: Vec<usize> = packed
+            .iter()
+            .map(|&(s, e)| costs[s..e].iter().sum())
+            .collect();
+        assert!(totals.iter().all(|&t| t <= 600));
+        // Round-trip: every item is covered exactly once.
+        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
+        assert_eq!(total_count, costs.len());
+    }
+
+    #[test]
+    fn pack_batches_respects_max_chunks_cap() {
+        // Tiny chunks, generous token budget — chunk-count cap should
+        // dominate.
+        let costs = vec![1usize; 200];
+        let packed = pack_batches(&costs, 1_000_000, 32, |&c| c);
+        assert!(
+            packed.iter().all(|&(s, e)| e - s <= 32),
+            "no batch may exceed max_chunks: {packed:?}"
+        );
+        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
+        assert_eq!(total_count, costs.len());
+    }
+
+    #[test]
+    fn pack_batches_passes_through_oversized_item() {
+        // A single item bigger than the budget must still appear (as its own
+        // batch of size 1) — never silently dropped.
+        let costs = vec![50usize, 99_999, 50];
+        let packed = pack_batches(&costs, 100, 64, |&c| c);
+        // Expect: [50] | [99_999] | [50]  (oversized item alone)
+        // Or: [50, 99_999 won't fit] -> [50], [99_999], [50].
+        assert_eq!(packed.len(), 3);
+        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
+        assert_eq!(total_count, 3);
+        // Middle range carries exactly the oversized item.
+        let middle = packed[1];
+        assert_eq!(middle.1 - middle.0, 1);
+    }
+
+    #[test]
+    fn pack_batches_produces_no_empty_ranges() {
+        let costs = vec![10usize; 5];
+        let packed = pack_batches(&costs, 25, 3, |&c| c);
+        assert!(packed.iter().all(|&(s, e)| e > s));
+    }
+
+    #[test]
+    fn pack_batches_handles_zero_token_budget_safely() {
+        // Budget clamped internally to 1; oversized-item rule kicks in.
+        let costs = vec![5usize, 5, 5];
+        let packed = pack_batches(&costs, 0, 64, |&c| c);
+        assert_eq!(packed.len(), 3);
+        assert!(packed.iter().all(|&(s, e)| e - s == 1));
+    }
+
+    #[test]
+    fn estimate_tokens_chars_floors_at_one() {
+        assert_eq!(estimate_tokens_chars(0), 1);
+        assert_eq!(estimate_tokens_chars(3), 1);
+        assert_eq!(estimate_tokens_chars(4), 1);
+        assert_eq!(estimate_tokens_chars(5), 1);
+        assert_eq!(estimate_tokens_chars(8), 2);
+        assert_eq!(estimate_tokens_chars(400), 100);
+    }
+
+    #[test]
+    fn pack_batches_provider_caps_via_max_chunks() {
+        // Bedrock's 8-cap and Perplexity's 1-cap arrive via max_chunks.
+        let costs = vec![50usize; 100];
+        let bedrock = pack_batches(&costs, 1_000_000, 8, |&c| c);
+        assert!(bedrock.iter().all(|&(s, e)| e - s <= 8));
+
+        let sonar = pack_batches(&costs, 1_000_000, 1, |&c| c);
+        assert_eq!(sonar.len(), 100);
+        assert!(sonar.iter().all(|&(s, e)| e - s == 1));
     }
 }
 

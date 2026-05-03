@@ -1,9 +1,14 @@
 pub mod code;
+pub mod csv_data;
+pub mod doctags;
 pub mod git;
+pub mod json_data;
 pub mod manifest;
 pub mod markdown;
 pub mod pdf;
+pub mod toml_data;
 pub mod walker;
+pub mod yaml_data;
 
 use std::path::Path;
 
@@ -54,10 +59,17 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
         "json" if path.file_name().is_some_and(|n| n == "package.json") => manifest::parse(path),
         "mod" if path.file_name().is_some_and(|n| n == "go.mod") => manifest::parse(path),
         "txt" if path.file_name().is_some_and(|n| n == "requirements.txt") => manifest::parse(path),
-        // Treat unknown text files as plain markdown for basic extraction.
-        "txt" | "toml" | "yaml" | "yml" | "json" | "cfg" | "ini" | "env" => {
-            markdown::parse_as_text(path)
-        }
+        // Wedge 4: deterministic data-file extraction.  Generic config and
+        // tabular files used to be ingested as opaque text chunks (or, for
+        // CSV/TSV, dropped entirely as unsupported).  Each gets its own
+        // structural parser now so the LLM tier is bypassed.
+        "toml" => toml_data::parse(path),
+        "yaml" | "yml" => yaml_data::parse(path),
+        "json" => json_data::parse(path),
+        "csv" => csv_data::parse(path, b','),
+        "tsv" => csv_data::parse(path, b'\t'),
+        // Treat remaining unknown text files as plain markdown for basic extraction.
+        "txt" | "cfg" | "ini" | "env" => markdown::parse_as_text(path),
         _ => Err(Error::UnsupportedFileType {
             extension: ext.to_string(),
         }),

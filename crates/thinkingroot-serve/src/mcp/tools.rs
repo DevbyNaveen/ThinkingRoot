@@ -424,6 +424,39 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["claims", "workspace"]
                 }
             },
+            // T0.7 — connector-attributed bulk contribute with idempotent
+            // replay protection. Use from a webhook handler / connector
+            // process where you need at-least-once delivery semantics.
+            {
+                "name": "contribute_bulk",
+                "description": "Connector-attributed bulk contribute. Records a per-(connector_id,install_id,idempotency_key) ingest entry so replay is a safe no-op. Set 'backfill': true to skip per-claim rooting (deferred to end of batch — useful for backfilling historic webhook payloads).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":       { "type": "string" },
+                        "branch":          { "type": "string", "description": "Target branch (omit or 'main' for main)." },
+                        "session_id":      { "type": "string", "description": "Optional turn-calendar attribution; defaults to a synthetic id derived from the connector identity." },
+                        "connector_id":    { "type": "string", "description": "Connector type id (e.g. 'github', 'slack', 'notion')." },
+                        "install_id":      { "type": "string", "description": "Per-install identifier (e.g. 'alice-acme-prod')." },
+                        "idempotency_key": { "type": "string", "description": "Caller-chosen unique key (typically the upstream event id)." },
+                        "backfill":        { "type": "boolean", "default": false },
+                        "claims": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "statement":   { "type": "string" },
+                                    "claim_type":  { "type": "string", "enum": ["fact","decision","opinion","plan","requirement","metric","definition","dependency","api_signature","architecture","preference"], "default": "fact" },
+                                    "confidence":  { "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
+                                    "entities":    { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["statement"]
+                            }
+                        }
+                    },
+                    "required": ["workspace", "connector_id", "install_id", "idempotency_key", "claims"]
+                }
+            },
             // ── Rooting tools (Phase 6.5 admission gate) ──────────────────
             {
                 "name": "query_rooted",
@@ -449,6 +482,90 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["workspace"]
                 }
+            },
+            // ── RARP / Active Engram Protocol v2 (4 tools) ────────────────
+            {
+                "name": "materialize_engram",
+                "description": "Build an Engram (typed sub-graph) for a topic. Returns an EngramSummary plus a pointer (e.g. '0x7F9A') the caller holds for subsequent probes. Default depth_hops=2, event_window_days=90, clearance=['public']. Optional seed_claim_ids skips vector seeding when the caller already has IDs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic":      { "type": "string", "description": "Free-text topic name (e.g. 'Auth System')" },
+                        "workspace":  { "type": "string" },
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "depth_hops":         { "type": "integer", "minimum": 1, "maximum": 4 },
+                                "event_window_days":  { "type": "integer", "minimum": 1 },
+                                "clearance":          { "type": "array", "items": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] } }
+                            }
+                        },
+                        "seed_claim_ids": { "type": "array", "items": { "type": "string" } },
+                        "seed_entity_ids": { "type": "array", "items": { "type": "string" }, "description": "Pin seed entities; bypasses vector search" }
+                    },
+                    "required": ["topic", "workspace"]
+                }
+            },
+            {
+                "name": "probe_engram",
+                "description": "Probe a materialised Engram with a typed question. Returns a ProbeAnswer with answer rows + per-row provenance (claim_ids, byte spans, BLAKE3, trial_scores, certificate_hash, turn_provenance, derivation_root) + caveats (UnresolvedContradiction, StaleRow, LowConfidence, DerivedFromTest, SupersededByNewerClaim, GapAdjacent, SensitivityRedaction). Optional probe_kind overrides the regex router; turn_provenance lookup is bounded to the most recent 200 turns of the session. Optional score_with_hybrid routes the answer rows through Hybrid Retrieval scoring (vector × Datalog × BLAKE3 × 11-component fusion) for re-ranking before caveat enrichment.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pointer":            { "type": "string", "description": "Engram pointer issued by materialize_engram" },
+                        "question":           { "type": "string" },
+                        "workspace":          { "type": "string" },
+                        "clearance":          { "type": "array", "items": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] } },
+                        "probe_kind":         { "type": "string", "enum": ["factual", "quantitative", "temporal", "authorship", "structural", "relation_callers", "relation_refs", "existential", "comparative", "counterfactual"] },
+                        "score_with_hybrid":  { "type": "boolean", "description": "Route answer rows through Hybrid Retrieval scoring before caveat enrichment. Composes per docs/2026-05-02-hybrid-retrieval-spec.md §11." }
+                    },
+                    "required": ["pointer", "question", "workspace"]
+                }
+            },
+            {
+                "name": "list_engrams",
+                "description": "List active Engram pointers for the current session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string" }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "expire_engram",
+                "description": "Explicitly evict an Engram from the session. Returns { expired: bool }.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pointer":   { "type": "string" },
+                        "workspace": { "type": "string" }
+                    },
+                    "required": ["pointer", "workspace"]
+                }
+            },
+            {
+                "name": "hybrid_retrieve",
+                "description": "World-class hybrid retrieval over the 33-table substrate. Combines vector recall + Datalog filters + per-row BLAKE3 verification + 11-component score fusion. Returns ranked hits with full provenance bundles (byte spans, source authority, admission tier, trial scores, certificate hash, derivation lineage), plus caveats (StaleRow, UnresolvedContradiction, SupersededByNewerClaim, DerivedFromTest, GapAdjacent, SensitivityRedaction, LowConfidence, DroppedQuarantined, BytesUnavailable). Use 'typed_predicates' to filter by entity, doc-tag, marker, code-metric range, authorship, heading path, or supersession. Use 'scoring_profile' = 'compliance' (rooted-only, doubled penalties) for legal/audit queries. Spec: docs/2026-05-02-hybrid-retrieval-spec.md.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":                 { "type": "string" },
+                        "query_text":                { "type": "string", "description": "Free-text query for vector recall. Empty when only typed predicates apply." },
+                        "typed_predicates":          { "type": "array", "default": [], "items": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["entity_type", "entity_name", "claim_type", "source_trust_at_least", "authored_by", "authored_after", "in_call_graph_of", "has_doc_tag", "has_marker", "quantity_range", "in_heading_path", "supersedes_claim", "referenced_by"] } }, "required": ["kind"] }, "description": "Structured filters. Multiple predicates AND-combined." },
+                        "session_id":                { "type": "string" },
+                        "clearance":                 { "type": "array", "default": ["public"], "items": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] } },
+                        "top_k":                     { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                        "scoring_profile":           { "type": "string", "enum": ["default", "compliance", "custom"], "default": "default" },
+                        "scoring_profile_custom":    { "type": "object", "description": "Required when scoring_profile=custom; same shape as ScoringProfile." },
+                        "require_certificate":       { "type": "boolean", "default": false },
+                        "include_test_origin":       { "type": "boolean", "default": false },
+                        "include_quarantined":       { "type": "boolean", "default": false },
+                        "require_provenance_verified": { "type": "boolean", "default": false }
+                    },
+                    "required": ["workspace", "session_id"]
+                }
             }
         ]
     });
@@ -457,7 +574,7 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
 
 #[tracing::instrument(
     name = "mcp.tools.call",
-    skip(params, engine, sessions),
+    skip(params, engine, sessions, engram_manager),
     fields(
         tool = tracing::field::Empty,
         workspace = tracing::field::Empty,
@@ -471,6 +588,7 @@ pub async fn handle_call(
     default_ws: Option<&str>,
     session_id: &str,
     sessions: &SessionStore,
+    engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
 ) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -686,7 +804,14 @@ pub async fn handle_call(
 
         // ── Pipeline ──────────────────────────────────────────────────────
         "compile" => match engine.compile(ws).await {
-            Ok(result) => mcp_text_result(id, &result),
+            Ok(result) => {
+                // Plan §3.10: dirty compile invalidates Engrams for the
+                // workspace so subsequent probes don't return GC'd ids.
+                if result.cache_dirty {
+                    engram_manager.invalidate_workspace(ws).await;
+                }
+                mcp_text_result(id, &result)
+            }
             Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
 
@@ -1223,6 +1348,136 @@ pub async fn handle_call(
             }
         }
 
+        // T0.7 — connector-attributed bulk contribute. Idempotent on
+        // (connector_id, install_id, idempotency_key). Replay short-
+        // circuits to the cached accepted_ids without writing claims.
+        "contribute_bulk" => {
+            let connector_id = match arguments.get("connector_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing or empty 'connector_id' argument".to_string(),
+                    );
+                }
+            };
+            let install_id = match arguments.get("install_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing or empty 'install_id' argument".to_string(),
+                    );
+                }
+            };
+            let idempotency_key =
+                match arguments.get("idempotency_key").and_then(|v| v.as_str()) {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            "Missing or empty 'idempotency_key' argument".to_string(),
+                        );
+                    }
+                };
+            let backfill = arguments
+                .get("backfill")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let raw_claims = match arguments.get("claims") {
+                Some(v) => v,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'claims' argument".to_string(),
+                    );
+                }
+            };
+            let claims: Vec<AgentClaim> = match serde_json::from_value(raw_claims.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("Invalid claims format: {e}"),
+                    );
+                }
+            };
+
+            // Branch can come from the explicit `branch` arg or from the
+            // session's checked-out branch (matches the `contribute` path).
+            let branch_from_session = {
+                let store = sessions.lock().await;
+                store.get(session_id).and_then(|s| s.active_branch.clone())
+            };
+            let branch_arg: Option<String> = arguments
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && *s != "main")
+                .map(String::from)
+                .or(branch_from_session);
+
+            let session_arg: String = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    format!("connector:{connector_id}:{install_id}:{idempotency_key}")
+                });
+
+            let principal = crate::engine::Principal::Connector {
+                connector_id: connector_id.clone(),
+                install_id: install_id.clone(),
+            };
+
+            match engine
+                .contribute_bulk(
+                    ws,
+                    &session_arg,
+                    branch_arg.as_deref(),
+                    claims,
+                    sessions,
+                    principal,
+                    &idempotency_key,
+                    backfill,
+                )
+                .await
+            {
+                Ok(result) => {
+                    let mut text = format!(
+                        "Connector contribute: {} claim(s) accepted (workspace '{}', branch: {})\n\
+                         source: {}\n\
+                         connector: {}/{}\n\
+                         idempotency_key: {}\n",
+                        result.accepted_count,
+                        ws,
+                        branch_arg.as_deref().unwrap_or("main"),
+                        result.source_uri,
+                        connector_id,
+                        install_id,
+                        idempotency_key,
+                    );
+                    if !result.warnings.is_empty() {
+                        text.push_str("warnings:\n");
+                        for w in &result.warnings {
+                            text.push_str(&format!("  ⚠ {w}\n"));
+                        }
+                    }
+                    text.push_str(&format!("ids: {}\n", result.accepted_ids.join(", ")));
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
         // ── Rooting: trust-tier filtered query ────────────────────────────
         //
         // Week 5 ships a graph-direct implementation that queries claims by
@@ -1516,7 +1771,433 @@ pub async fn handle_call(
             }
         }
 
+        // ── RARP / Active Engram Protocol v2 (4 tools) ─────────────────
+        "materialize_engram" => {
+            handle_materialize_engram(id, &arguments, engine, ws, session_id, engram_manager).await
+        }
+
+        "probe_engram" => {
+            handle_probe_engram(id, &arguments, engine, ws, session_id, engram_manager).await
+        }
+
+        "list_engrams" => {
+            let refs = engram_manager.list_engrams(session_id).await;
+            JsonRpcResponse::success(id, serde_json::json!({ "engrams": refs }))
+        }
+
+        "expire_engram" => {
+            let pointer = match arguments.get("pointer").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "Missing 'pointer' argument".to_string(),
+                    );
+                }
+            };
+            let expired = engram_manager.expire_engram(session_id, pointer).await;
+            JsonRpcResponse::success(id, serde_json::json!({ "expired": expired }))
+        }
+
+        "hybrid_retrieve" => handle_hybrid_retrieve(id, &arguments, engine, ws, session_id).await,
+
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+    }
+}
+
+async fn handle_hybrid_retrieve(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+    session_id: &str,
+) -> JsonRpcResponse {
+    use crate::engine::{RetrievalRequest, ScoringProfile, TypedPredicate};
+
+    // Build request from JSON. Most fields ride the serde defaults defined
+    // on RetrievalRequest; we only translate the ones the MCP schema
+    // exposes by name.
+    let mut req: RetrievalRequest = match serde_json::from_value(arguments.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            // Fall back to a minimal manual parse so callers don't need to
+            // submit the full Rust struct shape on first try. Required
+            // fields are session_id + workspace; everything else defaults.
+            let session_id_arg = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(session_id)
+                .to_string();
+            let query_text = arguments
+                .get("query_text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let typed_predicates: Vec<TypedPredicate> = arguments
+                .get("typed_predicates")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let scoring_profile = arguments
+                .get("scoring_profile")
+                .and_then(|v| v.as_str())
+                .and_then(ScoringProfile::by_name)
+                .or_else(|| {
+                    arguments
+                        .get("scoring_profile_custom")
+                        .and_then(|v| serde_json::from_value::<ScoringProfile>(v.clone()).ok())
+                })
+                .unwrap_or_default();
+            let clearance = arguments
+                .get("clearance")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().and_then(parse_sensitivity_str))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![thinkingroot_core::types::Sensitivity::Public]);
+            let top_k = arguments
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(50);
+            tracing::debug!("hybrid_retrieve: serde fallback ({e})");
+            RetrievalRequest {
+                query_text,
+                typed_predicates,
+                session_id: session_id_arg,
+                clearance,
+                top_k,
+                time_window: None,
+                scoring_profile,
+                require_certificate: arguments
+                    .get("require_certificate")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                include_test_origin: arguments
+                    .get("include_test_origin")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                include_quarantined: arguments
+                    .get("include_quarantined")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                require_provenance_verified: arguments
+                    .get("require_provenance_verified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                now: None,
+                scoped_claim_ids: None,
+            }
+        }
+    };
+    // Always honour the session_id wired into the MCP transport — overrides
+    // a misuse where the caller hardcoded a stale id in the JSON body.
+    req.session_id = session_id.to_string();
+
+    match engine.hybrid_retrieve(ws, req, None).await {
+        Ok(resp) => JsonRpcResponse::success(id, serde_json::json!(resp)),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// RARP handlers
+// ───────────────────────────────────────────────────────────────────────
+
+async fn handle_materialize_engram(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+    session_id: &str,
+    engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
+) -> JsonRpcResponse {
+    let topic = match arguments.get("topic").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing 'topic' argument".into());
+        }
+    };
+
+    // Optional explicit seed entity ids; otherwise derive seeds from a
+    // vector search against the workspace for the topic text.
+    let seed_entity_ids: Vec<String> = match arguments
+        .get("seed_entity_ids")
+        .and_then(|v| v.as_array())
+    {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => match engine.search(ws, &topic, 10).await {
+            Ok(result) => result.entities.into_iter().map(|e| e.id).collect(),
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32603,
+                    format!("seed search failed: {e}"),
+                );
+            }
+        },
+    };
+
+    if seed_entity_ids.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("no semantic anchors for topic '{topic}'"),
+        );
+    }
+
+    let scope = parse_scope(arguments.get("scope"));
+
+    let graph = match engine.graph_store(ws).await {
+        Some(g) => g,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("workspace '{ws}' not mounted"),
+            );
+        }
+    };
+
+    // Allow scope.seed_claim_ids to feed the EngramManager (currently the
+    // manager seeds via entity ids; claim ids would map to entity ids
+    // via claim_entity_edges — out of scope for v1 wiring, the entity
+    // path covers the canonical case).
+    let _seed_claim_ids = arguments
+        .get("seed_claim_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    match engram_manager
+        .materialize_engram(session_id, ws, &topic, &graph, seed_entity_ids, scope, None)
+        .await
+    {
+        Ok((pointer, summary)) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "pointer": pointer,
+                "summary": &*summary,
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_probe_engram(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+    session_id: &str,
+    engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
+) -> JsonRpcResponse {
+    let pointer = match arguments.get("pointer").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing 'pointer' argument".into());
+        }
+    };
+    let question = match arguments.get("question").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing 'question' argument".into());
+        }
+    };
+    let clearance = arguments
+        .get("clearance")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(parse_sensitivity_str))
+                .collect::<Vec<_>>()
+        });
+    let probe_kind_override = arguments
+        .get("probe_kind")
+        .and_then(|v| v.as_str())
+        .and_then(parse_probe_kind_str);
+
+    let graph = match engine.graph_store(ws).await {
+        Some(g) => g,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("workspace '{ws}' not mounted"),
+            );
+        }
+    };
+    let byte_store = match engine.byte_store(ws) {
+        Some(b) => b,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("workspace '{ws}' has no byte store"),
+            );
+        }
+    };
+
+    let probe_clearance = clearance.clone();
+    let mut answer = match engram_manager
+        .probe_engram(
+            session_id,
+            pointer,
+            question,
+            clearance,
+            &graph,
+            byte_store.as_ref(),
+            probe_kind_override,
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
+    };
+
+    // AEP × Hybrid composition (spec §11). The flag is per-call (overriding
+    // any default carried on EngramScope.score_with_hybrid).
+    let score_with_hybrid = arguments
+        .get("score_with_hybrid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if score_with_hybrid && !answer.claim_ids.is_empty() {
+        let req = crate::engine::RetrievalRequest {
+            query_text: question.to_string(),
+            typed_predicates: vec![],
+            session_id: session_id.to_string(),
+            clearance: probe_clearance
+                .unwrap_or_else(|| vec![thinkingroot_core::types::Sensitivity::Public]),
+            top_k: answer.claim_ids.len(),
+            time_window: None,
+            scoring_profile: crate::engine::ScoringProfile::default(),
+            require_certificate: false,
+            include_test_origin: true, // probes already classify test rows
+            include_quarantined: false,
+            require_provenance_verified: false,
+            now: None,
+            scoped_claim_ids: Some(answer.claim_ids.clone()),
+        };
+        match engine.hybrid_retrieve(ws, req, None).await {
+            Ok(resp) => {
+                let new_order: Vec<String> =
+                    resp.hits.iter().map(|h| h.claim_id.clone()).collect();
+                reorder_probe_answer_in_place(&mut answer, &new_order);
+            }
+            Err(e) => {
+                // Don't fail the probe — fall back to Datalog query order
+                // and surface as a low-confidence caveat.
+                tracing::warn!("hybrid composition fallback: {e}");
+            }
+        }
+    }
+
+    JsonRpcResponse::success(id, serde_json::json!(answer))
+}
+
+/// Reorder the 5 parallel arrays of `ProbeAnswer` according to a hybrid
+/// ranking. Claim IDs in the original answer that aren't in `new_order`
+/// (e.g. dropped by Hybrid's sensitivity gate) are appended at the end
+/// in their original relative order so the answer's shape never shrinks.
+pub fn reorder_probe_answer_in_place(
+    answer: &mut crate::engine::ProbeAnswer,
+    new_order: &[String],
+) {
+    let n = answer.claim_ids.len();
+    if n == 0 || answer.answer.len() != n {
+        return; // shape guard — never mutate a malformed answer
+    }
+    // Build the index permutation: original position -> rank-by-new-order.
+    let mut indices: Vec<usize> = (0..n).collect();
+    let order_pos: std::collections::HashMap<&str, usize> = new_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    indices.sort_by_key(|&i| order_pos.get(answer.claim_ids[i].as_str()).copied().unwrap_or(usize::MAX));
+
+    // Apply the permutation to all 5 parallel arrays + answer rows.
+    answer.answer = indices.iter().map(|&i| answer.answer[i].clone()).collect();
+    answer.claim_ids = indices.iter().map(|&i| answer.claim_ids[i].clone()).collect();
+    answer.source_byte_spans = indices
+        .iter()
+        .map(|&i| answer.source_byte_spans[i].clone())
+        .collect();
+    answer.source_authority = indices
+        .iter()
+        .map(|&i| answer.source_authority[i])
+        .collect();
+    answer.source_blake3s = indices
+        .iter()
+        .map(|&i| answer.source_blake3s[i].clone())
+        .collect();
+}
+
+pub fn parse_scope(scope: Option<&Value>) -> crate::intelligence::engram::EngramScope {
+    use crate::intelligence::engram::EngramScope;
+    let mut out = EngramScope::default();
+    let Some(s) = scope else {
+        return out;
+    };
+    out.depth_hops = s.get("depth_hops").and_then(|v| v.as_u64()).map(|n| n as u8);
+    out.event_window_days = s
+        .get("event_window_days")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    out.clearance = s
+        .get("clearance")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(parse_sensitivity_str))
+                .collect::<Vec<_>>()
+        });
+    out.seed_claim_ids = s
+        .get("seed_claim_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+    out.score_with_hybrid = s.get("score_with_hybrid").and_then(|v| v.as_bool());
+    out
+}
+
+pub fn parse_sensitivity_str(s: &str) -> Option<thinkingroot_core::types::Sensitivity> {
+    use thinkingroot_core::types::Sensitivity;
+    match s.to_ascii_lowercase().as_str() {
+        "public" => Some(Sensitivity::Public),
+        "internal" => Some(Sensitivity::Internal),
+        "confidential" => Some(Sensitivity::Confidential),
+        "restricted" => Some(Sensitivity::Restricted),
+        _ => None,
+    }
+}
+
+pub fn parse_probe_kind_str(s: &str) -> Option<crate::intelligence::engram::ProbeKind> {
+    use crate::intelligence::engram::ProbeKind;
+    match s.to_ascii_lowercase().as_str() {
+        "factual" => Some(ProbeKind::Factual),
+        "quantitative" => Some(ProbeKind::Quantitative),
+        "temporal" => Some(ProbeKind::Temporal),
+        "authorship" => Some(ProbeKind::Authorship),
+        "structural" => Some(ProbeKind::Structural),
+        "relation_callers" => Some(ProbeKind::RelationCallers),
+        "relation_refs" => Some(ProbeKind::RelationRefs),
+        "existential" => Some(ProbeKind::Existential),
+        "comparative" => Some(ProbeKind::Comparative),
+        "counterfactual" => Some(ProbeKind::Counterfactual),
+        _ => None,
     }
 }
 

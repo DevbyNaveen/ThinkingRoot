@@ -11,6 +11,7 @@
 mod agent_runtime_subprocess;
 mod commands;
 mod config;
+mod cortex_bridge;
 mod state;
 mod tray;
 

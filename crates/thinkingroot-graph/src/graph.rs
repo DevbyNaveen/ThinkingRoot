@@ -53,6 +53,33 @@ pub struct GraphStore {
 }
 
 impl GraphStore {
+    /// Hand out a reference to the underlying Cozo `DbInstance` so callers
+    /// (RARP's `EngramManager`, the `aep_queries` helper) can run
+    /// parameterised scripts directly. `DbInstance` is internally
+    /// `Arc`-shared and `Send + Sync`; concurrent readers serialise on
+    /// Cozo's own SQLite mutex.
+    pub fn raw_db(&self) -> &DbInstance {
+        &self.db
+    }
+
+    /// Build a `GraphStore` from a pre-opened in-memory `DbInstance` for
+    /// fixture tests in sibling modules (e.g. `aep_queries::tests`). Pairs
+    /// with `init_for_testing` to set up the schema without forcing every
+    /// test through the on-disk `init` path.
+    #[doc(hidden)]
+    pub fn from_db_for_testing(db: DbInstance) -> Self {
+        Self { db }
+    }
+
+    /// Run the schema-creation step against a `from_db_for_testing` store
+    /// so fixture tests can `:put` against the live shape without mounting
+    /// a workspace. No migrations — the fresh schema already matches the
+    /// post-Compile-Completeness-Contract layout.
+    #[doc(hidden)]
+    pub fn init_for_testing(&self) -> Result<()> {
+        self.create_schema()
+    }
+
     /// Open or create a CozoDB database at the given path and initialize the schema.
     pub fn init(path: &Path) -> Result<Self> {
         let db_path = path.join("graph.db");
@@ -64,6 +91,11 @@ impl GraphStore {
         store.migrate_claims_extraction_tier()?;
         store.migrate_structural_patterns_schema()?;
         store.migrate_claims_byte_ranges()?;
+        // Compile Completeness Contract §I-4: per-row tamper evidence.
+        // Adds `content_blake3` + `symbol` to `claims` so existing rows
+        // can carry I-4 evidence and Phase 7e callee resolution can join
+        // function_calls.callee_name → claims.symbol.
+        store.migrate_claims_content_blake3()?;
         store.create_indexes()?;
         Ok(store)
     }
@@ -173,7 +205,9 @@ impl GraphStore {
                 last_rooted_at: Float default 0.0,
                 source_path: String default '',
                 byte_start: Int default 0,
-                byte_end: Int default 0
+                byte_end: Int default 0,
+                content_blake3: String default '',
+                symbol: String default ''
             }",
             ":create entities {
                 id: String
@@ -330,6 +364,305 @@ impl GraphStore {
                 resolved_at: Float default 0.0,
                 resolved_by: String default ''
             }",
+            // ─── Compile Completeness Contract §4 — 16 new structural tables ────
+            // Every table carries the I-2 byte-anchoring triple
+            // (source_id, byte_start, byte_end) and the I-4 per-row tamper
+            // evidence column content_blake3. Spec at
+            // docs/2026-05-02-compile-completeness-contract.md.
+
+            // §4.1 function_calls — code call graph.
+            // Source: ChunkMetadata.calls_functions[] populated by code.rs
+            // tree-sitter pass. callee_claim_id resolved during Phase 7e Link
+            // when the linker matches callee_name to a known FunctionDef in
+            // the same workspace; empty if external.
+            ":create function_calls {
+                id: String
+                =>
+                caller_claim_id: String,
+                callee_name: String,
+                callee_claim_id: String default '',
+                source_id: String,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.2 doc_tags — structured documentation annotations
+            // (@param/@returns/@throws/@deprecated/@see) emitted by the
+            // doctags.rs parser into ChunkMetadata.doc_tags.
+            ":create doc_tags {
+                id: String
+                =>
+                claim_id: String,
+                kind: String,
+                target: String default '',
+                description: String default '',
+                source_id: String,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.3 code_links — hyperlinks in prose and comments. Resolution
+            // of is_internal + target_source_id is deferred to Phase 7e.
+            ":create code_links {
+                id: String
+                =>
+                source_id: String,
+                chunk_id: String default '',
+                url: String,
+                link_text: String default '',
+                is_internal: Bool default false,
+                target_source_id: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.4 code_signatures — function/type shape per FunctionDef + TypeDef.
+            // parameters_json + field_types_json hold serialised arrays so
+            // Datalog rules can SUBSTR-match without parsing JSON natively.
+            ":create code_signatures {
+                claim_id: String
+                =>
+                parameters_json: String default '[]',
+                return_type: String default '',
+                visibility: String default '',
+                trait_name: String default '',
+                parent_scope: String default '',
+                field_types_json: String default '[]',
+                source_id: String,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.5 config_tree — TOML/YAML/JSON leaves.
+            // Composite key (source_id, dotted_path) is the natural identity:
+            // each leaf is uniquely addressed within a source.
+            ":create config_tree {
+                source_id: String,
+                dotted_path: String
+                =>
+                value: String default '',
+                value_type: String default 'string',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.6 data_rows — CSV/TSV/markdown-table rows.
+            // columns_json holds the {header: cell} object as a JSON string.
+            ":create data_rows {
+                id: String
+                =>
+                source_id: String,
+                row_index: Int default 0,
+                columns_json: String default '{}',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.7 git_commits — commit-level metadata propagated from the
+            // git pseudo-source's SourceMetadata. Composite key on
+            // (source_id, commit_sha) — a source may have many commits.
+            ":create git_commits {
+                source_id: String,
+                commit_sha: String
+                =>
+                commit_author: String default '',
+                commit_email: String default '',
+                commit_timestamp: Float default 0.0,
+                changed_files_json: String default '[]',
+                message: String default '',
+                parent_sha: String default '',
+                byte_start: Int default 0,
+                byte_end: Int default 0,
+                content_blake3: String default ''
+            }",
+
+            // §4.8 headings — markdown heading hierarchy. parent_heading_id
+            // resolved during the in-doc walk via a heading-id stack
+            // maintained by the Phase 6.7 driver (markdown.rs already sets
+            // ChunkMetadata.parent to the parent heading text).
+            ":create headings {
+                id: String
+                =>
+                source_id: String,
+                level: Int default 1,
+                text: String default '',
+                parent_heading_id: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.9 chunks_residual — chunks that produced 0 claims AND 0
+            // structural rows. The catch-all that makes I-3 (byte coverage)
+            // tractable. Per §15 Q1 we store full content unconditionally
+            // for v1.
+            ":create chunks_residual {
+                id: String
+                =>
+                source_id: String,
+                chunk_type: String default '',
+                content: String default '',
+                metadata_json: String default '{}',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.10 quantities — numeric values extracted from claim
+            // statements + chunk text. Multiple per claim because a single
+            // claim can mention several metrics ("p99=120ms at 50K rps").
+            ":create quantities {
+                id: String
+                =>
+                claim_id: String,
+                metric_name: String default '',
+                value: Float default 0.0,
+                unit: String default '',
+                qualifier: String default '',
+                is_live: Bool default false,
+                captured_at: Float default 0.0,
+                source_id: String,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.11 source_annotations — file-level pragmas (license,
+            // copyright, encoding, shebang, mode, trailing_newline_norm).
+            // The trailing_newline_norm kind is the I-3 exception class
+            // proof that records the byte normalisation.
+            ":create source_annotations {
+                id: String
+                =>
+                source_id: String,
+                kind: String default '',
+                value: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.12 source_references — cross-doc citations. Built at
+            // Phase 7e by joining code_links, function_calls, and import
+            // claims against sources.
+            ":create source_references {
+                id: String
+                =>
+                from_source_id: String,
+                to_source_id: String,
+                reference_kind: String default 'link',
+                fragment: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.13 code_markers — TODO/FIXME/HACK/SAFETY/NOTE/XXX/BUG/PERF
+            // tags discovered by a regex pass over Comment, ModuleDoc, and
+            // Code chunks during Phase 6.7.
+            ":create code_markers {
+                id: String
+                =>
+                source_id: String,
+                kind: String default 'TODO',
+                text: String default '',
+                in_claim_id: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.14 test_annotations — test-marker awareness emitted from
+            // per-language tree-sitter queries against FunctionDef chunks.
+            // framework ∈ {rust_test, junit, jest, pytest}.
+            ":create test_annotations {
+                id: String
+                =>
+                source_id: String,
+                claim_id: String,
+                framework: String default '',
+                annotation_kind: String default '',
+                name: String default '',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.15 git_blame — per-line-range author attribution. Composite
+            // key on (source_id, line_start, line_end) — one row per blame
+            // hunk. byte_start/byte_end give the corresponding byte range.
+            ":create git_blame {
+                source_id: String,
+                line_start: Int,
+                line_end: Int
+                =>
+                commit_sha: String default '',
+                author: String default '',
+                author_email: String default '',
+                blamed_at: Float default 0.0,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // §4.16 code_metrics — per-file / per-function complexity.
+            // scope ∈ {file, function, type}; scope_claim_id is the
+            // owning claim id (empty for file scope). fan_in/fan_out
+            // resolved at Phase 7e from function_calls.
+            ":create code_metrics {
+                id: String
+                =>
+                source_id: String,
+                scope: String default 'file',
+                scope_claim_id: String default '',
+                loc: Int default 0,
+                cyclomatic: Int default 0,
+                fan_in: Int default 0,
+                fan_out: Int default 0,
+                complexity_method: String default 'mccabe',
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
+            // ─── Workspace metadata singleton — schema version + future
+            // workspace-scoped flags. Used by the migration auto-trigger
+            // in pipeline.rs to detect contract-version mismatch.
+            ":create workspace_meta {
+                key: String
+                =>
+                value: String default ''
+            }",
+
+            // ─── T0.7 connector ingest log ───────────────────────────────
+            // Idempotency cache for the `contribute_bulk` API. The
+            // primary key is `(connector_id, install_id, idempotency_key)`
+            // — the natural unit of "this exact webhook payload from this
+            // exact connector install" — and the value is the JSON-
+            // encoded list of claim ids that were accepted on the first
+            // call. Replay of the same key short-circuits to "no-op,
+            // here are the already-accepted ids" so the connector can
+            // safely re-deliver after a network blip without
+            // double-counting.
+            //
+            // No additional indexes — every read is a point lookup on
+            // the full PK from `lookup_ingest`.
+            ":create connector_ingest_log {
+                connector_id: String,
+                install_id: String,
+                idempotency_key: String
+                =>
+                claim_ids: String default '[]',
+                ingested_at: Float default 0.0,
+                branch: String default '',
+                source_uri: String default ''
+            }",
         ];
 
         for stmt in &relations {
@@ -387,6 +720,51 @@ impl GraphStore {
             "::index create known_unknowns:by_entity { entity_id }",
             "::index create known_unknowns:by_status { status }",
             "::index create structural_patterns:by_entity_type { entity_type }",
+            // ─── Compile Completeness Contract §4 — indexes on the 16 new
+            // structural tables. Indexes per the per-section DDL plus a
+            // (source_id, byte_start, byte_end) shape per Phase 9 §7.4.
+            "::index create function_calls:by_caller { caller_claim_id }",
+            "::index create function_calls:by_callee_name { callee_name }",
+            "::index create function_calls:by_callee_id { callee_claim_id }",
+            "::index create function_calls:by_source { source_id }",
+            "::index create doc_tags:by_claim { claim_id }",
+            "::index create doc_tags:by_kind { kind }",
+            "::index create doc_tags:by_source { source_id }",
+            "::index create code_links:by_url { url }",
+            "::index create code_links:by_target { target_source_id }",
+            "::index create code_links:by_source { source_id }",
+            "::index create code_signatures:by_visibility { visibility }",
+            "::index create code_signatures:by_trait { trait_name }",
+            "::index create code_signatures:by_source { source_id }",
+            "::index create config_tree:by_path { dotted_path }",
+            "::index create config_tree:by_type { value_type }",
+            "::index create data_rows:by_source { source_id }",
+            "::index create git_commits:by_author { commit_author }",
+            "::index create git_commits:by_timestamp { commit_timestamp }",
+            "::index create headings:by_source { source_id }",
+            "::index create headings:by_level { level }",
+            "::index create chunks_residual:by_source { source_id }",
+            "::index create chunks_residual:by_type { chunk_type }",
+            "::index create quantities:by_metric { metric_name }",
+            "::index create quantities:by_value { value }",
+            "::index create quantities:by_live { is_live }",
+            "::index create quantities:by_source { source_id }",
+            "::index create source_annotations:by_source { source_id }",
+            "::index create source_annotations:by_kind { kind }",
+            "::index create source_references:by_to { to_source_id }",
+            "::index create source_references:by_from { from_source_id }",
+            "::index create code_markers:by_kind { kind }",
+            "::index create code_markers:by_source { source_id }",
+            "::index create test_annotations:by_framework { framework }",
+            "::index create test_annotations:by_kind { annotation_kind }",
+            "::index create test_annotations:by_source { source_id }",
+            "::index create git_blame:by_author { author }",
+            "::index create git_blame:by_commit { commit_sha }",
+            "::index create git_blame:by_blame_time { blamed_at }",
+            "::index create code_metrics:by_scope { scope }",
+            "::index create code_metrics:by_loc { loc }",
+            "::index create code_metrics:by_cyclomatic { cyclomatic }",
+            "::index create code_metrics:by_source { source_id }",
         ];
 
         for stmt in &indexes {
@@ -642,15 +1020,125 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Compile Completeness Contract §I-4 + §5.1 — adds `content_blake3`
+    /// (per-row tamper evidence over the source byte slice) and `symbol`
+    /// (function/type name for Phase 7e callee resolution) to `claims`.
+    ///
+    /// Existing rows backfill with `('', '')` — the v3 "unknown" sentinel
+    /// pattern. Phase 6.7 stamps the live `content_blake3` on every newly
+    /// inserted claim before the linker writes it; the structural extractor
+    /// (`structural.rs:113-229`) populates `symbol` for FunctionDef and
+    /// TypeDef claims at extraction time. Backfilled rows from this
+    /// migration retain `('', '')` until their owning source is
+    /// re-compiled — `backfill_structural` (Block H) re-fills them by
+    /// re-parsing source bytes.
+    ///
+    /// Idempotent: re-running against an already-migrated DB is a fast
+    /// probe-and-return.
+    fn migrate_claims_content_blake3(&self) -> Result<()> {
+        let probe = self.db.run_script(
+            "?[content_blake3] := *claims{id: 'probe-noop', content_blake3}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if probe.is_ok() {
+            return Ok(()); // new schema in place
+        }
+        if let Err(e) = &probe {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("does not exist") {
+                return Ok(());
+            }
+        }
+
+        // :replace fails while indexes are attached — drop, then
+        // create_indexes() recreates atop the new schema.
+        let index_drops = [
+            "::index drop claims:by_type",
+            "::index drop claims:by_tier",
+            "::index drop claim_entity_edges:by_entity",
+            "::index drop claim_source_edges:by_source",
+        ];
+        for drop_stmt in &index_drops {
+            let _ = self.db.run_default(drop_stmt);
+        }
+
+        let migration = r#"
+            {
+                ?[id, statement, claim_type, source_id, confidence, sensitivity,
+                  workspace_id, created_at, grounding_score, grounding_method,
+                  extraction_tier, event_date, admission_tier, derivation_parents,
+                  predicate_json, last_rooted_at, source_path, byte_start, byte_end,
+                  content_blake3, symbol] :=
+                    *claims{id, statement, claim_type, source_id, confidence,
+                            sensitivity, workspace_id, created_at, grounding_score,
+                            grounding_method, extraction_tier, event_date,
+                            admission_tier, derivation_parents, predicate_json,
+                            last_rooted_at, source_path, byte_start, byte_end},
+                    content_blake3 = "",
+                    symbol = ""
+                :replace claims {
+                    id: String
+                    =>
+                    statement: String,
+                    claim_type: String,
+                    source_id: String,
+                    confidence: Float default 0.8,
+                    sensitivity: String default 'Public',
+                    workspace_id: String default '',
+                    created_at: Float default 0.0,
+                    grounding_score: Float default -1.0,
+                    grounding_method: String default '',
+                    extraction_tier: String default 'llm',
+                    event_date: Float default 0.0,
+                    admission_tier: String default 'attested',
+                    derivation_parents: String default '',
+                    predicate_json: String default '',
+                    last_rooted_at: Float default 0.0,
+                    source_path: String default '',
+                    byte_start: Int default 0,
+                    byte_end: Int default 0,
+                    content_blake3: String default '',
+                    symbol: String default ''
+                }
+            }
+        "#;
+
+        match self.db.run_default(migration) {
+            Ok(_) => {
+                tracing::debug!("claims content_blake3 + symbol migration applied");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("does not exist") {
+                    return Err(Error::GraphStorage(format!(
+                        "claims content_blake3 migration failed: {msg}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Run a Datalog query with parameters, returning NamedRows.
-    fn query(&self, script: &str, params: BTreeMap<String, DataValue>) -> Result<NamedRows> {
+    /// Public to support integration test harnesses that need to issue
+    /// arbitrary scripts (e.g. the Compile Completeness Contract CI
+    /// gates). Pre-contract this was `pub(crate)`; bumping to `pub`
+    /// is the smallest change that keeps the test surface usable
+    /// without exporting `cozo::DbInstance` directly.
+    pub fn query(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows> {
         self.db
             .run_script(script, params, ScriptMutability::Mutable)
             .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))
     }
 
     /// Run a read-only Datalog query.
-    fn query_read(&self, script: &str) -> Result<NamedRows> {
+    pub fn query_read(&self, script: &str) -> Result<NamedRows> {
         self.db
             .run_script(script, BTreeMap::new(), ScriptMutability::Immutable)
             .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))
@@ -1099,6 +1587,8 @@ impl GraphStore {
                         DataValue::Str(source_path.into()),
                         DataValue::Num(Num::Int(byte_start_val)),
                         DataValue::Num(Num::Int(byte_end_val)),
+                        DataValue::Str(c.row_blake3.clone().unwrap_or_default().into()),
+                        DataValue::Str(c.symbol.clone().unwrap_or_default().into()),
                     ])
                 })
                 .collect();
@@ -1108,12 +1598,13 @@ impl GraphStore {
                 "?[id, statement, claim_type, source_id, confidence, sensitivity, \
                   workspace_id, created_at, grounding_score, grounding_method, \
                   extraction_tier, event_date, admission_tier, derivation_parents, \
-                  predicate_json, last_rooted_at, source_path, byte_start, byte_end] <- $rows \
+                  predicate_json, last_rooted_at, source_path, byte_start, byte_end, \
+                  content_blake3, symbol] <- $rows \
                  :put claims {id => statement, claim_type, source_id, confidence, \
                   sensitivity, workspace_id, created_at, grounding_score, \
                   grounding_method, extraction_tier, event_date, admission_tier, \
                   derivation_parents, predicate_json, last_rooted_at, source_path, \
-                  byte_start, byte_end}",
+                  byte_start, byte_end, content_blake3, symbol}",
                 params,
             )?;
         }
@@ -3154,6 +3645,8 @@ impl GraphStore {
             derivation,
             predicate,
             last_rooted_at,
+            row_blake3: None,
+            symbol: None,
         }))
     }
 
@@ -4678,6 +5171,179 @@ impl GraphStore {
             })
             .collect())
     }
+
+    // ─── T0.7: connector ingest log helpers ─────────────────────────────
+
+    /// Look up a previously-recorded connector ingest by its
+    /// `(connector_id, install_id, idempotency_key)` triple.
+    ///
+    /// Returns `Some(claim_ids)` when the key has been seen before
+    /// (the bulk-contribute API short-circuits to "no-op, here are the
+    /// already-accepted ids"), or `None` for a first-time call.
+    ///
+    /// The lookup is a single point query against the relation's
+    /// primary key — O(log n) on the BTree-backed CozoDB store.
+    pub fn lookup_connector_ingest(
+        &self,
+        connector_id: &str,
+        install_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ConnectorIngestRecord>> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(connector_id.into()));
+        params.insert("iid".into(), DataValue::Str(install_id.into()));
+        params.insert("ik".into(), DataValue::Str(idempotency_key.into()));
+
+        let result = self
+            .db
+            .run_script(
+                r#"?[claim_ids, ingested_at, branch, source_uri] :=
+                    *connector_ingest_log{
+                        connector_id: $cid, install_id: $iid, idempotency_key: $ik,
+                        claim_ids, ingested_at, branch, source_uri
+                    }"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("lookup_connector_ingest failed: {e}")))?;
+
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+
+        let claim_ids_json = dv_to_string(&row[0]);
+        let claim_ids: Vec<String> =
+            serde_json::from_str(&claim_ids_json).unwrap_or_default();
+        let ingested_at = match &row[1] {
+            DataValue::Num(Num::Float(f)) => *f,
+            DataValue::Num(Num::Int(i)) => *i as f64,
+            _ => 0.0,
+        };
+        let branch_owned = dv_to_string(&row[2]);
+        let source_uri = dv_to_string(&row[3]);
+
+        Ok(Some(ConnectorIngestRecord {
+            connector_id: connector_id.to_string(),
+            install_id: install_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            claim_ids,
+            ingested_at,
+            branch: if branch_owned.is_empty() {
+                None
+            } else {
+                Some(branch_owned)
+            },
+            source_uri,
+        }))
+    }
+
+    /// Record a successful connector ingest. Atomic `:put` semantics
+    /// — replay against the same PK overwrites the existing row,
+    /// which is the right behaviour because the caller has already
+    /// determined (via `lookup_connector_ingest`) that this is a
+    /// first-time call. The overwrite path only fires on a race
+    /// where two parallel webhook deliveries hit the daemon
+    /// simultaneously; both end up writing the same ids, so
+    /// last-writer-wins is safe.
+    pub fn record_connector_ingest(
+        &self,
+        connector_id: &str,
+        install_id: &str,
+        idempotency_key: &str,
+        claim_ids: &[String],
+        branch: Option<&str>,
+        source_uri: &str,
+    ) -> Result<()> {
+        let ts = chrono::Utc::now().timestamp() as f64;
+        let claim_ids_json =
+            serde_json::to_string(claim_ids).unwrap_or_else(|_| "[]".to_string());
+
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(connector_id.into()));
+        params.insert("iid".into(), DataValue::Str(install_id.into()));
+        params.insert("ik".into(), DataValue::Str(idempotency_key.into()));
+        params.insert("cids".into(), DataValue::Str(claim_ids_json.into()));
+        params.insert("ts".into(), DataValue::Num(Num::Float(ts)));
+        params.insert(
+            "branch".into(),
+            DataValue::Str(branch.unwrap_or("").into()),
+        );
+        params.insert("src".into(), DataValue::Str(source_uri.into()));
+
+        self.db
+            .run_script(
+                "?[connector_id, install_id, idempotency_key, claim_ids, ingested_at, branch, source_uri] <- \
+                 [[$cid, $iid, $ik, $cids, $ts, $branch, $src]] \
+                 :put connector_ingest_log { \
+                     connector_id, install_id, idempotency_key => \
+                     claim_ids, ingested_at, branch, source_uri \
+                 }",
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("record_connector_ingest failed: {e}")))?;
+
+        Ok(())
+    }
+
+    // ─── T2.6: per-claim sensitivity lookup ─────────────────────────────
+
+    /// Fetch the `claims.sensitivity` value (Pascal-case form, e.g.
+    /// `"Public"`, `"Internal"`, `"Confidential"`, `"Restricted"`) for
+    /// a batch of claim ids. Used by the per-branch redaction filter
+    /// to decide which rows to drop or rewrite at the response
+    /// boundary without joining sensitivity into every read query.
+    ///
+    /// Missing claims are simply absent from the returned map — the
+    /// caller decides the default (typically `Sensitivity::Public`).
+    pub fn get_sensitivities_for_claims(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        // CozoDB's parameter binding doesn't support list parameters
+        // for `*claims{id: $ids}` membership tests; the cleanest path
+        // is one point query per id, which is O(log n) per lookup
+        // (fast enough for the per-call top-K rows the redaction
+        // layer touches — never the full claims table).
+        for id in ids {
+            let mut params = BTreeMap::new();
+            params.insert("id".into(), DataValue::Str(id.as_str().into()));
+            let result = self
+                .db
+                .run_script(
+                    "?[s] := *claims{id: $id, sensitivity: s}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| {
+                    Error::GraphStorage(format!("get_sensitivities_for_claims({id}) failed: {e}"))
+                })?;
+            if let Some(row) = result.rows.first() {
+                out.insert(id.clone(), dv_to_string(&row[0]));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A single connector ingest record returned by
+/// [`GraphStore::lookup_connector_ingest`].
+#[derive(Debug, Clone)]
+pub struct ConnectorIngestRecord {
+    pub connector_id: String,
+    pub install_id: String,
+    pub idempotency_key: String,
+    pub claim_ids: Vec<String>,
+    pub ingested_at: f64,
+    /// Branch the ingest targeted, or `None` for main.
+    pub branch: Option<String>,
+    /// Synthetic source URI created for the ingest (matches the
+    /// `mcp://agent/...` convention but with a connector identifier).
+    pub source_uri: String,
 }
 
 /// An SVO event row returned from the `events` table.
@@ -6138,5 +6804,157 @@ mod tests {
             1,
             "gap row for the GC'd entity must cascade; the unrelated entity's row remains"
         );
+    }
+
+    /// AEP §7.3 verification: confirm the three Datalog rules in the
+    /// Active Engram Protocol parse and execute against the actual
+    /// CozoDB schema.  Verifies (a) the rules are syntactically valid
+    /// Cozo, (b) field names match the live `claims` /
+    /// `claim_temporal` / `known_unknowns` schemas, and (c) `now()`
+    /// + `or` + `in <list>` + `!=` behave as the spec assumes.
+    #[test]
+    fn aep_datalog_rules_parse_and_execute() {
+        let store = mem_store();
+
+        // Seed: 4 claims spanning every admission_tier, plus matching
+        // temporal + known_unknowns rows so the rules return non-trivial
+        // result sets.
+        let seed = r#"
+            ?[id, statement, claim_type, source_id, admission_tier] <- [
+                ['c-rooted',      'rooted claim',      'configuration', 's1', 'rooted'],
+                ['c-attested',    'attested claim',    'configuration', 's1', 'attested'],
+                ['c-quarantined', 'quarantined claim', 'configuration', 's1', 'quarantined'],
+                ['c-rejected',    'rejected claim',    'configuration', 's1', 'rejected']
+            ]
+            :put claims {id => statement, claim_type, source_id, admission_tier}
+        "#;
+        store
+            .db
+            .run_default(seed)
+            .expect("seed claims must succeed");
+
+        // Temporal rows: one never-expires (valid_until = 0.0), one
+        // far-future, one already-expired.
+        let seed_temporal = r#"
+            ?[claim_id, valid_from, valid_until, superseded_by] <- [
+                ['c-rooted',      0.0, 0.0,          ''],
+                ['c-attested',    0.0, 99999999999.0, ''],
+                ['c-quarantined', 0.0, 1.0,           '']
+            ]
+            :put claim_temporal {claim_id => valid_from, valid_until, superseded_by}
+        "#;
+        store
+            .db
+            .run_default(seed_temporal)
+            .expect("seed claim_temporal must succeed");
+
+        // Two open known_unknowns + one closed.
+        let seed_gaps = r#"
+            ?[id, entity_id, pattern_id, expected_claim_type, confidence, status] <- [
+                ['g1', 'e-auth', 'pat-a', 'rate_limiting_policy', 0.9, 'open'],
+                ['g2', 'e-auth', 'pat-b', 'session_expiry',       0.8, 'open'],
+                ['g3', 'e-db',   'pat-c', 'backup_policy',        0.7, 'closed']
+            ]
+            :put known_unknowns {id => entity_id, pattern_id,
+                                 expected_claim_type, confidence, status}
+        "#;
+        store
+            .db
+            .run_default(seed_gaps)
+            .expect("seed known_unknowns must succeed");
+
+        // Also link c-rooted to entity e-auth so the §4 Pillar III
+        // multi-relation join + `in <set>` filter has a row to return.
+        store.link_claim_to_entity("c-rooted", "e-auth").unwrap();
+        store
+            .link_claim_to_entity("c-quarantined", "e-auth")
+            .unwrap();
+
+        // ── Rule 1: rule_trust_gate ────────────────────────────────
+        // AEP spec verbatim, with the head renamed to `?` for the
+        // standalone-query form.
+        let r1 = store
+            .db
+            .run_default(
+                r#"?[id] := *claims{id, admission_tier},
+                            admission_tier != 'quarantined',
+                            admission_tier != 'rejected'"#,
+            )
+            .expect("rule_trust_gate must parse and execute");
+        let ids: Vec<String> = r1.rows.iter().map(|r| dv_to_string(&r[0])).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "trust_gate must drop quarantined+rejected, keep rooted+attested"
+        );
+        assert!(ids.contains(&"c-rooted".to_string()));
+        assert!(ids.contains(&"c-attested".to_string()));
+
+        // ── Rule 2: rule_temporal_collapse ─────────────────────────
+        // AEP spec verbatim: `valid_until = 0.0 or valid_until > now()`.
+        let r2 = store
+            .db
+            .run_default(
+                r#"?[id] := *claim_temporal{claim_id: id, valid_until},
+                            valid_until = 0.0 or valid_until > now()"#,
+            )
+            .expect("rule_temporal_collapse must parse and execute");
+        let ids: Vec<String> = r2.rows.iter().map(|r| dv_to_string(&r[0])).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "temporal_collapse must keep never-expire+future, drop expired"
+        );
+        assert!(ids.contains(&"c-rooted".to_string()));
+        assert!(ids.contains(&"c-attested".to_string()));
+
+        // ── Rule 3: rule_gap_scan ──────────────────────────────────
+        // AEP spec verbatim — note the inline-bind `status: 'open'`.
+        let r3 = store
+            .db
+            .run_default(
+                r#"?[entity_id, expected_claim_type, confidence] :=
+                    *known_unknowns{entity_id, expected_claim_type,
+                                    confidence, status: 'open'}"#,
+            )
+            .expect("rule_gap_scan must parse and execute");
+        assert_eq!(
+            r3.rows.len(),
+            2,
+            "gap_scan must return only open gaps (g1+g2), not closed g3"
+        );
+
+        // ── §4 Pillar III combined: multi-relation join + `in <set>` ──
+        // The spec writes `entity_id in engram_0x7F9A_entity_set` —
+        // verify the same shape using a Rust-side parameter `$set`
+        // populated with the cluster.  This is the only rewrite
+        // needed: Cozo `in` requires a list-typed expression on the
+        // RHS, so the symbolic name in the spec resolves to a
+        // parameter at execution time.
+        let mut p = BTreeMap::new();
+        p.insert(
+            "set".into(),
+            DataValue::List(vec![DataValue::Str("e-auth".into())]),
+        );
+        let r4 = store
+            .db
+            .run_script(
+                r#"?[statement, confidence] :=
+                    *claims{id, statement, confidence, admission_tier, claim_type},
+                    *claim_entity_edges{claim_id: id, entity_id},
+                    entity_id in $set,
+                    claim_type = 'configuration',
+                    admission_tier != 'quarantined',
+                    admission_tier != 'rejected'"#,
+                p,
+                ScriptMutability::Immutable,
+            )
+            .expect("Pillar III combined rule must parse and execute");
+        assert_eq!(
+            r4.rows.len(),
+            1,
+            "combined rule must keep c-rooted (edge to e-auth, configuration, rooted) and drop c-quarantined"
+        );
+        assert_eq!(dv_to_string(&r4.rows[0][0]), "rooted claim");
     }
 }

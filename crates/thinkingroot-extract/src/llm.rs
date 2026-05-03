@@ -370,6 +370,57 @@ pub fn model_context_window(model: &str) -> usize {
 ///
 /// Clamped to [1, 64] — never zero (at least try 1 chunk), never more than 64
 /// (empirical ceiling where LLMs reliably track chunk IDs and maintain JSON format).
+/// Wedge 1: per-call input-token budget for the variable-size batch packer.
+///
+/// Returns the maximum number of *input* tokens (system prompt + chunk bodies +
+/// JSON wrapper) the packer should aim for in a single LLM call.  The packer
+/// then walks chunks left-to-right, accumulates `chars / 4` per chunk, and
+/// seals a batch when the next chunk would push it over budget.
+///
+/// Numbers are derived from the same `model_context_window` /
+/// `model_max_output_tokens` table that drives `model_batch_size`, but the
+/// output is a *token* count instead of a *chunk* count — so a workspace of
+/// many tiny chunks (functions, headings) packs many more per call than the
+/// worst-case `max_chunk_tokens` formula allows.
+///
+/// Provider-level caps still apply at the call site (Bedrock = 8 chunks max,
+/// Perplexity Sonar = 1, Ollama default = 1–2): this helper returns the
+/// *token* budget; the chunk-count clamp lives in `model_batch_size`.
+pub fn model_input_token_budget(provider: &str, model: &str) -> usize {
+    // Sonar / Ollama default: a single chunk per call. Return a tiny budget
+    // so the packer + the chunk-count clamp produce the same answer.
+    if provider == "perplexity" || model.to_lowercase().contains("sonar") {
+        return 4_000;
+    }
+    if provider == "ollama" {
+        let m = model.to_lowercase();
+        if m.contains("llama3.1") || m.contains("llama-3.1") || m.contains("llama-3.3") {
+            return 4_000;
+        }
+        return 2_000;
+    }
+
+    let context = model_context_window(model);
+
+    // 70% safety margin (vs. the 80% used for chunk-count math) — fewer
+    // surprises when the JSON wrapper expands more than expected.  Subtract
+    // a fixed overhead for the system prompt + batch wrapper.
+    const OVERHEAD: usize = 700;
+    const SAFETY_NUM: usize = 7;
+    const SAFETY_DEN: usize = 10;
+
+    let safe_input = context.saturating_mul(SAFETY_NUM) / SAFETY_DEN;
+    let budget = safe_input.saturating_sub(OVERHEAD).max(2_000);
+
+    // Bedrock: keep batches small to stay under account-level throughput
+    // caps. 16K input tokens (~8 max-size chunks) was the hand-tuned ceiling.
+    if provider == "bedrock" {
+        return budget.min(16_000);
+    }
+
+    budget
+}
+
 pub fn model_batch_size(provider: &str, model: &str, max_chunk_tokens: usize) -> usize {
     let context = model_context_window(model);
     let max_output = model_max_output_tokens(model) as usize;

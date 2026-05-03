@@ -1,0 +1,9 @@
+{
+  "service_name": "auth",
+  "rate_limit_rps": 1000,
+  "tls_required": true,
+  "endpoints": [
+    {"path": "/login", "method": "POST"},
+    {"path": "/logout", "method": "POST"}
+  ]
+}

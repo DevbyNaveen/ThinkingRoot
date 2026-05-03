@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::branch_cache::BranchEngineCache;
 use crate::intelligence::session::SessionStore;
-use thinkingroot_core::BranchStatus;
+use thinkingroot_core::{BranchKind, BranchStatus};
 
 /// Spawn the stream-branch cleanup task.
 ///
@@ -82,13 +82,28 @@ pub async fn cleanup_once(
         .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("list_branches: {e}")))?;
 
     for branch in branches {
-        // Only consider Active stream branches. Merged/Abandoned are skipped.
+        // Only consider Active branches. Merged/Abandoned are skipped.
         if !matches!(branch.status, BranchStatus::Active) {
             continue;
         }
-        let Some(session_id) = branch.name.strip_prefix("stream/") else {
+
+        // T0.6: filter by typed `BranchKind::Stream { session_id }`
+        // first; fall back to the historical `stream/` *name prefix*
+        // for branches created before T0.6 added the discriminator.
+        // The prefix-only path is the migration shim, not the
+        // long-term contract — once every workspace has been remounted
+        // post-T0.6 it can be removed.
+        let session_id_owned: Option<String> = match &branch.kind {
+            BranchKind::Stream { session_id } => Some(session_id.clone()),
+            _ => branch
+                .name
+                .strip_prefix("stream/")
+                .map(|s| s.to_string()),
+        };
+        let Some(session_id) = session_id_owned else {
             continue;
         };
+        let session_id = session_id.as_str();
         stats.branches_scanned += 1;
 
         // Active (in-memory) and not idle past threshold? Keep it.
@@ -108,7 +123,14 @@ pub async fn cleanup_once(
         let has_contributes =
             branch_has_agent_contributes(workspace_root, &branch.name).unwrap_or(false); // on error, assume has contributes (safe default)
 
-        let effective_action = if action == "purge" && has_contributes {
+        // T0.6 — Ephemeral policy is always abandon. Never purge an
+        // Ephemeral branch on the cleanup tick: the user opted into
+        // "discard, don't merge" but didn't necessarily opt into
+        // "delete the data dir." Purge stays an explicit gc_branches
+        // call.
+        let effective_action = if branch.merge_policy.is_ephemeral() {
+            "abandon"
+        } else if action == "purge" && has_contributes {
             tracing::warn!(
                 branch = %branch.name,
                 session_id,

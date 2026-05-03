@@ -400,6 +400,17 @@ pub struct ExtractionConfig {
     /// Set to 1 to disable batching entirely.
     #[serde(default)]
     pub extraction_batch_size: Option<usize>,
+    /// Wedge 1: input-token budget for the variable-size batch packer.
+    /// When set, overrides the per-model `model_input_token_budget` default.
+    /// The packer fills each batch up to this budget OR the chunk-count cap
+    /// (`extraction_batch_size`), whichever hits first.
+    #[serde(default)]
+    pub extraction_input_token_budget: Option<usize>,
+    /// Wedge 3: tiny adjacent prose chunks under this token threshold are
+    /// merged into a single coalesced chunk by the markdown parser. `None`
+    /// uses the default of `max_chunk_tokens / 4`.
+    #[serde(default)]
+    pub chunk_coalesce_threshold_tokens: Option<usize>,
     /// When `true` (default), structural-classified chunks (function
     /// definitions, imports, manifest deps) ALSO go to the LLM for
     /// semantic extraction, in addition to the zero-LLM structural
@@ -423,6 +434,8 @@ impl Default for ExtractionConfig {
             extract_relations: true,
             max_retries: 3,
             extraction_batch_size: None,
+            extraction_input_token_budget: None,
+            chunk_coalesce_threshold_tokens: None,
             structural_plus_llm: true,
         }
     }

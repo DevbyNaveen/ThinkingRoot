@@ -7,8 +7,11 @@ use tokio::sync::RwLock;
 
 use thinkingroot_branch::snapshot::resolve_data_dir;
 use thinkingroot_core::WorkspaceRegistry;
+use thinkingroot_core::cortex;
 use thinkingroot_serve::engine::QueryEngine;
 use thinkingroot_serve::rest::{AppState, build_router_opts};
+
+use crate::cortex_client;
 
 /// Launch the interactive knowledge graph explorer in the browser.
 ///
@@ -105,6 +108,16 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 }
 
 /// Launch the ThinkingRoot server (REST API + MCP).
+///
+/// Cortex Protocol contract: before binding, this function checks for
+/// an existing healthy daemon via `cortex_client::resolve_engine`.
+/// If one is found, we print a friendly "engine already running"
+/// message and exit 0 — no second listener, no SIGKILL, no lock
+/// torture. If none is found, we proceed with the original bind path
+/// and write the cortex lockfile after a successful bind.
+///
+/// `mcp_stdio` mode bypasses cortex entirely: the editor invokes us
+/// over stdin/stdout, no HTTP, no lock.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     port: u16,
@@ -119,6 +132,47 @@ pub async fn run_serve(
 ) -> anyhow::Result<()> {
     if no_rest && no_mcp {
         anyhow::bail!("--no-rest and --no-mcp cannot be used together: nothing to serve");
+    }
+
+    // ── Cortex attach-or-bind check ────────────────────────────────
+    // Skipped for --mcp-stdio (no listener, no HTTP, no lock).
+    if !mcp_stdio {
+        match cortex_client::resolve_engine(cortex::EngineIntent::Serve).await {
+            Ok(cortex::EngineConnection::Remote { host: ref h, port: p, started_by, pid }) => {
+                println!();
+                println!(
+                    "  {} engine already running on {}:{}",
+                    console::style("ThinkingRoot").green().bold(),
+                    h,
+                    p,
+                );
+                println!(
+                    "  {} pid={} started_by={}",
+                    console::style("note:").dim(),
+                    pid,
+                    started_by.as_str(),
+                );
+                println!(
+                    "  Use {} to inspect or {} to stop the running daemon.",
+                    console::style("`curl http://127.0.0.1:31760/livez`").cyan(),
+                    console::style(format!("`kill {pid}`")).cyan(),
+                );
+                println!();
+                return Ok(());
+            }
+            Ok(cortex::EngineConnection::InProcess) => {
+                // No daemon running — proceed with normal bind path.
+            }
+            Ok(cortex::EngineConnection::Stdio) => {
+                // unreachable because mcp_stdio == false; handled
+                // defensively to keep the match exhaustive without a
+                // bare `_` arm that would mask future variants.
+                unreachable!("Stdio connection only returned for McpStdio intent");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cortex resolve failed; falling back to direct bind");
+            }
+        }
     }
 
     // Resolve workspace paths: explicit --path > --name > registry
@@ -295,10 +349,29 @@ pub async fn run_serve(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("server listening on {}", addr);
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // ── Cortex Protocol: write the lockfile AFTER a successful bind ─
+    // (so a port-in-use crash doesn't leave a misleading lock).
+    // The lock is removed in the graceful_shutdown future below so a
+    // clean Ctrl-C exit cleans up; a SIGKILL leaves the lockfile
+    // behind, which the next caller treats as stale via
+    // `process_alive(pid) == false`.
+    let lock = cortex_client::build_cli_lock(port);
+    if let Err(e) = cortex::write_lock(&lock) {
+        tracing::warn!(error = %e, "failed to write cortex.lock; clients will fall back to spawn");
+    }
 
+    let serve_result = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
+    // Best-effort lock cleanup on shutdown. Logging an error here
+    // is informative but not fatal — the next caller will detect
+    // the stale lock via `process_alive == false`.
+    if let Err(e) = cortex::remove_lock() {
+        tracing::warn!(error = %e, "failed to remove cortex.lock on shutdown");
+    }
+
+    serve_result?;
     Ok(())
 }
 

@@ -14,6 +14,7 @@ rust-version.workspace  = true
 
 [dependencies]
 thinkingroot-core = { workspace = true }
+thinkingroot-parse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +32,10 @@ aws-sdk-bedrockruntime = { workspace = true }
 aws-smithy-types = { workspace = true }
 blake3 = { workspace = true }
 regex = { workspace = true }
+# Wedge 3: tree-sitter for AST-aware chunk splitting at statement boundaries.
+# Grammars are pulled in transitively via `thinkingroot-parse` so we don't
+# duplicate the language-name match arm.
+tree-sitter = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -49,6 +49,21 @@ pub struct Claim {
     /// this claim has never been through Rooting (pre-Rooting claims).
     #[serde(default)]
     pub last_rooted_at: Option<DateTime<Utc>>,
+    /// Compile Completeness Contract §I-4 — per-row tamper evidence.
+    /// `"blake3:<hex>"` over the claim's source byte slice
+    /// (`bytes[byte_start..byte_end]` from the v3 byte-store). Stamped
+    /// by Phase 6.7 before the linker writes the claim. `None` only for
+    /// pre-contract claims that have not been through `backfill_structural`
+    /// yet — AEP / `tr-verify` treat this as "verifiability TBD" and
+    /// downgrade the answer's trust accordingly.
+    #[serde(default)]
+    pub row_blake3: Option<String>,
+    /// Compile Completeness Contract §4.1 — symbol identifier for
+    /// FunctionDef/TypeDef claims, used by Phase 7e to resolve
+    /// `function_calls.callee_claim_id` from `callee_name → symbol`
+    /// lookup. Empty/None for non-code claims.
+    #[serde(default)]
+    pub symbol: Option<String>,
 }
 
 impl Claim {
@@ -81,7 +96,15 @@ impl Claim {
             derivation: None,
             predicate: None,
             last_rooted_at: None,
+            row_blake3: None,
+            symbol: None,
         }
+    }
+
+    /// Stamp the function/type symbol for Phase 7e callee resolution.
+    pub fn with_symbol(mut self, symbol: impl Into<String>) -> Self {
+        self.symbol = Some(symbol.into());
+        self
     }
 
     pub fn with_confidence(mut self, confidence: f64) -> Self {
@@ -263,6 +286,76 @@ pub enum Sensitivity {
     Internal,
     Confidential,
     Restricted,
+}
+
+impl Sensitivity {
+    /// Lossless round-trip via the same `Debug` format the storage layer
+    /// already uses (matches `format!("{:?}", c.sensitivity)` at
+    /// `crates/thinkingroot-graph/src/graph.rs:1503`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Public => "Public",
+            Self::Internal => "Internal",
+            Self::Confidential => "Confidential",
+            Self::Restricted => "Restricted",
+        }
+    }
+
+    /// Inverse of `as_str` — accepts both PascalCase (storage form) and
+    /// snake_case (serde form) for symmetry with the LLM extractor's
+    /// JSON output.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "Public" | "public" => Some(Self::Public),
+            "Internal" | "internal" => Some(Self::Internal),
+            "Confidential" | "confidential" => Some(Self::Confidential),
+            "Restricted" | "restricted" => Some(Self::Restricted),
+            _ => None,
+        }
+    }
+}
+
+/// Compile Completeness Contract §5.2 — structured representation of a
+/// claim's expiration signal. Populated by the expiration extractor
+/// (`crates/thinkingroot-extract/src/expiration.rs`) and consumed at
+/// Phase 6.7 to populate `claim_temporal.valid_until`.
+///
+/// Discriminating between the shapes lets AEP `rule_temporal_collapse`
+/// surface different caveats: a `HardDate` is authoritative; a
+/// `RelativeWindow` may need re-evaluation per probe time; a
+/// `VersionGate` ties to deployed-version state outside this DB.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExpirationSignal {
+    /// Source phrase named an absolute date — "until 2026-12-31".
+    HardDate { iso_date: String },
+    /// Source phrase named a duration from claim creation —
+    /// "valid for 30 days", "expires in 6 months". Duration encoded as
+    /// integer seconds for serde stability.
+    RelativeWindow { duration_secs: i64 },
+    /// Source phrase tied expiry to a software version —
+    /// "deprecated in v2.0".
+    VersionGate { semver: String },
+    /// Source phrase implied recurring rotation —
+    /// "rotates monthly", "every 30 days".
+    Recurring { pattern: RecurringPattern },
+    /// Phrase suggested expiration but didn't pin a shape — the
+    /// expiration extractor surfaces this so AEP can flag the claim
+    /// for re-grounding without taking a strict expiry stance.
+    Unknown,
+}
+
+/// Recurring expiration pattern — companion to `ExpirationSignal::Recurring`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecurringPattern {
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Yearly,
+    EveryNDays { n: u32 },
+    EveryNHours { n: u32 },
 }
 
 /// Tracks which version of the pipeline produced a claim.

@@ -129,6 +129,7 @@ async fn handle_post(
         default_ws.as_deref(),
         &session_id,
         &state.sessions,
+        &state.engram_manager,
     )
     .await;
     drop(engine);

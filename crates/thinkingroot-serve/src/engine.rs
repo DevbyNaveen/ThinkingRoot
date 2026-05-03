@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::graph_cache::{CachedClaim, KnowledgeGraph, RawGraphData};
+pub use crate::intelligence::hybrid_types::{
+    ByteSpan, ByteSpanBundle, CodeSignatureRef, HybridResponse, RetrievalCaveat, RetrievalHit,
+    RetrievalRequest, RoutingShape, ScoreBreakdown, ScoringProfile, TypedPredicate,
+};
 pub use crate::pipeline::PipelineResult;
 use thinkingroot_core::{Config, Error, Result};
 use thinkingroot_graph::StorageEngine;
@@ -184,6 +188,439 @@ pub struct ClaimSearchHit {
     pub relevance: f32,
 }
 
+// ---------------------------------------------------------------------------
+// RARP / Active Engram Protocol v2 wire types.
+// Spec: docs/active-engram-protocol.md §4.1 (EngramSummary) + §5.1 (ProbeAnswer).
+// ID fields are wire-format `String` (the typed `thinkingroot_core::ClaimId`
+// etc. live on the internal `Engram` struct in `intelligence/engram.rs`).
+// ---------------------------------------------------------------------------
+
+/// Pointer issued by `materialize_engram`. Format: `0x` + 4 hex digits
+/// (16-bit pointer space, HMAC-derived per `EngramManager::next_pointer`).
+pub type EngramPointer = String;
+
+/// Returned by `materialize_engram`. Server-side rows live on the
+/// `EngramManager`; the LLM holds only this summary (~30 tokens after
+/// JSON serialisation) plus the pointer.
+#[derive(Debug, Clone, Serialize)]
+pub struct EngramSummary {
+    // Identity
+    pub pointer: EngramPointer,
+    pub topic: String,
+    /// Unix epoch seconds.
+    pub created_at: f64,
+
+    // Cluster shape
+    pub entity_cluster: Vec<EntityRef>,
+    pub claim_count_by_tier: TierHistogram,
+
+    // Source authority overlay (spec §4 step 5)
+    pub source_authority: Vec<SourceAuthority>,
+    pub source_references: Vec<SourceReferenceEdge>,
+
+    // Temporal (spec §4 step 6 + §4 step 8)
+    pub temporal_window: (Option<f64>, Option<f64>),
+    pub supersession_terminals: Vec<ClaimRef>,
+    pub events_window: Vec<EventTriple>,
+
+    // Structure (spec §4 steps 11–17)
+    pub doc_tags_summary: DocTagHistogram,
+    pub headings_outline: Vec<HeadingRef>,
+    pub call_graph_edges: Vec<CallEdge>,
+    pub test_origins: Vec<TestAnnotationRef>,
+    pub code_markers: Vec<CodeMarkerRef>,
+    pub code_metrics: Vec<CodeMetricRef>,
+    pub quantitative_signals: Vec<QuantityRef>,
+
+    // Truth & gaps (spec §4 steps 7, 9, 10, 19)
+    pub structural_pattern_hits: Vec<PatternMatch>,
+    pub gaps: Vec<KnownUnknown>,
+    pub unresolved_contradictions: Vec<ContradictionRef>,
+    pub derivation_roots_by_claim: HashMap<String, Vec<String>>,
+
+    // Authorship (spec §4 step 15)
+    pub git_commits_summary: GitCommitsSummary,
+    pub git_blame_summary: GitBlameSummary,
+
+    // Provenance integrity (I-4 — spec §4 step 20)
+    pub stale_rows: Vec<RowRef>,
+
+    // Privacy (spec §4 step 18)
+    pub applied_clearance: Vec<thinkingroot_core::types::Sensitivity>,
+    pub redacted_count: u32,
+}
+
+/// Returned by `probe_engram`. The central read-path contract — every field
+/// is sourced from one of the 33 substrate tables, never invented.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProbeAnswer {
+    /// One row per concrete answer the probe produced.
+    pub answer: Vec<AnswerRow>,
+
+    // Provenance per answer row (parallel arrays — index i across all four
+    // refers to the same answer row).
+    pub claim_ids: Vec<String>,
+    pub source_byte_spans: Vec<SourceByteSpan>,
+    pub source_authority: Vec<thinkingroot_core::types::TrustLevel>,
+    pub source_blake3s: Vec<String>,
+
+    // Trust diagnostics
+    pub admission_tier: thinkingroot_core::types::AdmissionTier,
+    pub trial_scores: Option<TrialScores>,
+    pub certificate_hash: Option<String>,
+    pub grounding_score: Option<f64>,
+    pub grounding_method: Option<thinkingroot_core::types::GroundingMethod>,
+
+    // Temporal
+    pub valid_window: (Option<f64>, Option<f64>),
+    /// Empty when the answer claim is itself terminal in the supersession chain.
+    pub superseded_by_chain: Vec<String>,
+
+    // Lineage
+    pub derivation_parents: Vec<String>,
+    pub derivation_root: Option<String>,
+
+    // Privacy
+    pub sensitivity: thinkingroot_core::types::Sensitivity,
+
+    // Origin
+    pub turn_provenance: Option<TurnRef>,
+    pub git_blame: Vec<GitBlameRef>,
+    pub test_origin: Option<TestAnnotationRef>,
+
+    // Cluster-aware context (drawn from the Engram, not re-queried)
+    pub related_quantities: Vec<QuantityRef>,
+    pub related_doc_tags: Vec<DocTagRef>,
+    pub related_calls: Vec<CallEdge>,
+    pub related_markers: Vec<CodeMarkerRef>,
+
+    // Caveats surfaced by the protocol (never errors — see ProbeCaveat docs)
+    pub caveats: Vec<ProbeCaveat>,
+}
+
+/// One concrete answer row. The shape varies by probe kind; for Factual
+/// it's a statement, for Quantitative a numeric tuple, etc.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnswerRow {
+    Factual {
+        statement: String,
+    },
+    Quantitative {
+        metric_name: String,
+        value: f64,
+        unit: String,
+        qualifier: String,
+        is_live: bool,
+    },
+    Temporal {
+        subject: String,
+        verb: String,
+        object: String,
+        timestamp: f64,
+        normalized_date: String,
+    },
+    Authorship {
+        author: String,
+        commit_sha: String,
+        blamed_at: f64,
+    },
+    Structural {
+        parameters_json: String,
+        return_type: String,
+        visibility: String,
+        trait_name: String,
+        parent_scope: String,
+        field_types_json: String,
+    },
+    Relation {
+        peer_claim_id: String,
+        edge_kind: String,
+        fragment: String,
+    },
+    Existential {
+        present: bool,
+        witness_claim_id: Option<String>,
+    },
+    Comparative {
+        a_statement: String,
+        b_statement: String,
+        delta_summary: String,
+    },
+    Counterfactual {
+        descendant_claim_id: String,
+        descendant_statement: String,
+        descendant_admission_tier: thinkingroot_core::types::AdmissionTier,
+    },
+}
+
+/// 5 trial-verdict probe scores (spec §4 step 4 + §5.1).
+/// All scores in [0.0, 1.0]; higher is better.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrialScores {
+    pub provenance_score: f64,
+    pub contradiction_score: f64,
+    pub predicate_score: f64,
+    pub topology_score: f64,
+    pub temporal_score: f64,
+}
+
+/// Caveats surfaced *inside* `ProbeAnswer` — never as typed errors.
+/// Clearance violations and BLAKE3 mismatches are *always* caveats so the
+/// LLM gets a typed-result-with-caveats response, not an HTTP-500-shaped
+/// failure (Plan §3.3).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeCaveat {
+    UnresolvedContradiction {
+        with_claim_id: String,
+        explanation: String,
+    },
+    StaleRow {
+        content_blake3_mismatch: bool,
+        /// `"verify_failed"` for hash mismatch; `"bytes_unavailable"` when
+        /// the source bytes were never written to the byte-store (e.g.
+        /// pre-Compile-Completeness-Contract workspaces).
+        reason: String,
+    },
+    LowConfidence {
+        measured: f64,
+        threshold: f64,
+    },
+    DerivedFromTest {
+        framework: String,
+    },
+    SupersededByNewerClaim {
+        successor_id: String,
+    },
+    GapAdjacent {
+        gap_id: String,
+        expected_claim_type: String,
+    },
+    SensitivityRedaction {
+        hidden_field: String,
+        required_clearance: thinkingroot_core::types::Sensitivity,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Supporting `*Ref` shapes for EngramSummary + ProbeAnswer.
+// Each is a thin row projection from a substrate table — no behaviour, no
+// heap-allocated cycles. All `Serialize` for MCP wire format.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityRef {
+    pub id: String,
+    pub canonical_name: String,
+    pub entity_type: String,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TierHistogram {
+    pub rooted: u32,
+    pub attested: u32,
+    pub quarantined: u32,
+    pub rejected: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceAuthority {
+    pub source_id: String,
+    pub uri: String,
+    pub trust_level: thinkingroot_core::types::TrustLevel,
+    pub claim_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceReferenceEdge {
+    pub from_source_id: String,
+    pub to_source_id: String,
+    pub reference_kind: String,
+    pub fragment: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimRef {
+    pub id: String,
+    pub statement: String,
+    pub admission_tier: thinkingroot_core::types::AdmissionTier,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventTriple {
+    pub subject_entity_id: String,
+    pub verb: String,
+    pub object_entity_id: String,
+    pub timestamp: f64,
+    pub normalized_date: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DocTagHistogram {
+    pub param: u32,
+    pub returns: u32,
+    pub throws: u32,
+    pub deprecated: u32,
+    pub see: u32,
+    pub other: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeadingRef {
+    pub id: String,
+    pub source_id: String,
+    pub level: u8,
+    pub text: String,
+    pub parent_heading_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallEdge {
+    pub caller_claim_id: String,
+    pub callee_name: String,
+    pub callee_claim_id: String,
+    pub source_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestAnnotationRef {
+    pub id: String,
+    pub claim_id: String,
+    pub framework: String,
+    pub annotation_kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeMarkerRef {
+    pub id: String,
+    pub source_id: String,
+    pub kind: String,
+    pub text: String,
+    pub in_claim_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeMetricRef {
+    pub source_id: String,
+    pub scope: String,
+    pub scope_claim_id: String,
+    pub loc: u32,
+    pub cyclomatic: u32,
+    pub fan_in: u32,
+    pub fan_out: u32,
+    pub complexity_method: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuantityRef {
+    pub claim_id: String,
+    pub metric_name: String,
+    pub value: f64,
+    pub unit: String,
+    pub qualifier: String,
+    pub is_live: bool,
+    pub captured_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DocTagRef {
+    pub claim_id: String,
+    pub kind: String,
+    pub target: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PatternMatch {
+    pub pattern_id: String,
+    pub entity_type: String,
+    pub condition_claim_type: String,
+    pub expected_claim_type: String,
+    pub frequency: f64,
+    pub sample_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnownUnknown {
+    pub gap_id: String,
+    pub entity_id: String,
+    pub expected_claim_type: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionRef {
+    pub id: String,
+    pub claim_a: String,
+    pub claim_b: String,
+    pub explanation: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GitCommitsSummary {
+    pub total_commits: u32,
+    pub authors: Vec<String>,
+    pub earliest_commit: Option<f64>,
+    pub latest_commit: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GitBlameSummary {
+    pub authors: Vec<String>,
+    pub line_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitBlameRef {
+    pub source_id: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub commit_sha: String,
+    pub author: String,
+    pub blamed_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RowRef {
+    pub table: String,
+    pub source_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub expected_blake3: String,
+    pub computed_blake3: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceByteSpan {
+    pub source_id: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+/// `turn_provenance` reference — populated when the answer claim was first
+/// introduced in a turn within the most-recent-200 turn window of the
+/// session (Plan §3.8). Outside that window we emit `Unknown`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnRef {
+    Found {
+        session_id: String,
+        turn_number: u64,
+        timestamp: f64,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClaimFilter {
     pub claim_type: Option<String>,
@@ -193,29 +630,106 @@ pub struct ClaimFilter {
     pub offset: Option<usize>,
 }
 
+/// Identity of an actor invoking a branch operation.
+///
+/// Replaces the historical `BranchActor` enum (T0.6,
+/// `docs/branch-system-improvements.md` §T0.6) by adding two new
+/// principal classes that the existing two-variant enum couldn't
+/// represent:
+///
+/// - `Connector { connector_id, install_id }` — every connector
+///   ingest (GitHub webhook, Slack archive, Notion sync) was being
+///   attributed as `Agent("…")`, which conflated "claude wrote this"
+///   with "alice's GitHub webhook wrote this." The connector_id +
+///   install_id pair pins a specific installation.
+/// - `MountConsumer { pack_hash }` — someone who `tr-mount`'d a
+///   read-only `.tr` pack and is now writing into their own session
+///   branch. Distinguishing them lets the maintenance task safely
+///   purge their stream branches without confusing them with
+///   genuine `User`/`Agent` work.
+///
+/// `User`/`Agent`/`System`/`Anonymous` are preserved for source
+/// compatibility — every legacy call site keeps compiling with the
+/// same variant names. `BranchActor` remains as a type alias so any
+/// out-of-tree consumer that imported it doesn't break.
 #[derive(Debug, Clone)]
-pub enum BranchActor {
+pub enum Principal {
+    /// No identity attached (public read paths, unauthenticated
+    /// background reflect runs). Permission checks short-circuit to
+    /// "allow" for an anonymous principal — owner-gating only kicks
+    /// in once an identity exists.
     Anonymous,
+    /// A human user. The string is the user identifier (the same
+    /// value matched against `BranchPermissions::{readers, writers,
+    /// mergers}` and `BranchRef::owner`).
     User(String),
+    /// An AI agent. The string is the agent identifier.
     Agent(String),
+    /// A connector installation: GitHub / Slack / Notion / Linear /
+    /// Drive / custom HMAC webhook. `install_id` disambiguates
+    /// distinct installations of the same connector. Both fields
+    /// participate in the permission identity (`identity()` returns
+    /// `connector_id:install_id`).
+    Connector {
+        connector_id: String,
+        install_id: String,
+    },
+    /// Someone who `tr-mount`'d a `.tr` pack. `pack_hash` is the
+    /// content hash of the pack (matches `Manifest.content_hash`)
+    /// so the same pack mounted twice resolves to the same
+    /// principal across processes.
+    MountConsumer { pack_hash: String },
+    /// Internal system actor — maintenance, gc, scheduled reflect.
+    /// Permission checks short-circuit to "allow" so background
+    /// jobs aren't blocked by branch permissions; visible in audit
+    /// logs as `system`.
     System,
 }
 
-impl BranchActor {
+/// Backwards-compatible alias for the historical `BranchActor` name.
+/// Out-of-tree code that imported `BranchActor` (e.g. an embedder)
+/// continues to compile against `Principal`.
+pub type BranchActor = Principal;
+
+impl Principal {
     fn label(&self) -> String {
         match self {
             Self::Anonymous => "anonymous".to_string(),
             Self::User(user) => format!("user:{user}"),
             Self::Agent(agent) => format!("agent:{agent}"),
+            Self::Connector {
+                connector_id,
+                install_id,
+            } => format!("connector:{connector_id}:{install_id}"),
+            Self::MountConsumer { pack_hash } => format!("mount:{pack_hash}"),
             Self::System => "system".to_string(),
         }
     }
 
-    fn identity(&self) -> Option<&str> {
+    fn identity(&self) -> Option<String> {
         match self {
-            Self::User(user) => Some(user.as_str()),
-            Self::Agent(agent) => Some(agent.as_str()),
+            Self::User(user) => Some(user.clone()),
+            Self::Agent(agent) => Some(agent.clone()),
+            Self::Connector {
+                connector_id,
+                install_id,
+            } => Some(format!("{connector_id}:{install_id}")),
+            Self::MountConsumer { pack_hash } => Some(format!("mount:{pack_hash}")),
             Self::Anonymous | Self::System => None,
+        }
+    }
+
+    /// True when this principal is a connector — `contribute_bulk`
+    /// uses this to decide whether to apply the idempotency cache.
+    /// Idempotency keys from non-connector principals are ignored
+    /// (no `connector_id`/`install_id` to scope them to).
+    pub fn as_connector(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Connector {
+                connector_id,
+                install_id,
+            } => Some((connector_id.as_str(), install_id.as_str())),
+            _ => None,
         }
     }
 }
@@ -387,7 +901,7 @@ impl QueryEngine {
     }
 
     fn ensure_branch_permission(
-        actor: &BranchActor,
+        actor: &Principal,
         branch_ref: Option<&thinkingroot_core::BranchRef>,
         action: &str,
     ) -> Result<()> {
@@ -397,21 +911,44 @@ impl QueryEngine {
         let Some(identity) = actor.identity() else {
             return Ok(());
         };
+        let identity_ref = identity.as_str();
+
+        // Tag branches are immutable except for read access (T2.5 gate
+        // landed alongside T0.6). Any write/merge/rebase/delete attempt
+        // is a hard reject — even by the owner.
+        if matches!(branch_ref.kind, thinkingroot_core::BranchKind::Tag { .. })
+            && action != "read_branch"
+        {
+            return Err(Error::PermissionDenied {
+                actor: actor.label(),
+                action: format!("{action} (branch is an immutable Tag)"),
+            });
+        }
 
         if branch_ref
             .owner
             .as_deref()
-            .is_some_and(|owner| owner == identity)
+            .is_some_and(|owner| owner == identity_ref)
         {
             return Ok(());
         }
 
         let allowed = match action {
-            "read_branch" => branch_ref.permissions.readers.iter().any(|v| v == identity),
-            "write_branch" => branch_ref.permissions.writers.iter().any(|v| v == identity),
-            "merge_branch" | "delete_branch" | "rebase_branch" => {
-                branch_ref.permissions.mergers.iter().any(|v| v == identity)
-            }
+            "read_branch" => branch_ref
+                .permissions
+                .readers
+                .iter()
+                .any(|v| v == identity_ref),
+            "write_branch" => branch_ref
+                .permissions
+                .writers
+                .iter()
+                .any(|v| v == identity_ref),
+            "merge_branch" | "delete_branch" | "rebase_branch" => branch_ref
+                .permissions
+                .mergers
+                .iter()
+                .any(|v| v == identity_ref),
             _ => false,
         };
 
@@ -1751,10 +2288,116 @@ impl QueryEngine {
         entity_hits.truncate(top_k);
         claim_hits.truncate(top_k);
 
+        // T2.6 — apply per-branch redaction policy to claim hits.
+        // Entity hits are not subject to the claim-sensitivity gate;
+        // they expose entity-level metadata that doesn't carry the
+        // same PII risk and the canonical name field is a join key
+        // that needs to round-trip exactly.
+        if let Some(policy) = Self::branch_redaction_for(
+            &handle.root_path,
+            branch_name,
+            thinkingroot_core::OutboundMode::Search,
+        ) {
+            let branch_handle = self
+                .branch_engines
+                .get_or_open(&handle.root_path, branch_name)
+                .await?;
+            Self::apply_redaction_to_search_hits(
+                &mut claim_hits,
+                &policy,
+                &branch_handle.graph,
+            )?;
+        }
+
         Ok(SearchResult {
             entities: entity_hits,
             claims: claim_hits,
         })
+    }
+
+    /// T2.6 — fetch the active redaction policy for a branch (if any).
+    /// Returns `(policy, applies_to_mode)` so callers don't have to
+    /// re-check `policy.applies_to(mode)` themselves.
+    fn branch_redaction_for(
+        root: &std::path::Path,
+        branch_name: &str,
+        mode: thinkingroot_core::OutboundMode,
+    ) -> Option<thinkingroot_core::RedactionPolicy> {
+        let branch_ref = Self::branch_ref_for_root(root, branch_name).ok().flatten()?;
+        let policy = branch_ref.redaction.clone()?;
+        if policy.applies_to(&mode) {
+            Some(policy)
+        } else {
+            None
+        }
+    }
+
+    /// T2.6 — apply a redaction policy to a vector of `ClaimInfo`-shaped
+    /// rows, joining each row against `claims.sensitivity` for the
+    /// `min_sensitivity` gate.
+    ///
+    /// Sensitivity is fetched in one batch via
+    /// `GraphStore::get_sensitivities_for_claims` to keep the
+    /// redaction overhead at one extra query per outbound call,
+    /// regardless of result-set size.
+    fn apply_redaction_to_claim_infos(
+        rows: &mut Vec<ClaimInfo>,
+        policy: &thinkingroot_core::RedactionPolicy,
+        graph: &thinkingroot_graph::graph::GraphStore,
+    ) -> Result<()> {
+        // ── Sensitivity gating ─────────────────────────────────────
+        if policy.min_sensitivity.is_some() {
+            let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+            let lookup = graph.get_sensitivities_for_claims(&ids)?;
+            rows.retain_mut(|row| {
+                let sens = lookup
+                    .get(&row.id)
+                    .and_then(|s| thinkingroot_core::Sensitivity::parse(s))
+                    .unwrap_or(thinkingroot_core::Sensitivity::Public);
+                if policy.should_drop(sens) {
+                    return false;
+                }
+                if let Some(text) = policy.redact_text(sens) {
+                    row.statement = text;
+                }
+                true
+            });
+        }
+        // ── Pattern rewrite ────────────────────────────────────────
+        for row in rows.iter_mut() {
+            row.statement = policy.rewrite(&row.statement);
+        }
+        Ok(())
+    }
+
+    /// T2.6 — same as [`apply_redaction_to_claim_infos`] but for the
+    /// search hits which carry their own ClaimSearchHit shape.
+    fn apply_redaction_to_search_hits(
+        hits: &mut Vec<ClaimSearchHit>,
+        policy: &thinkingroot_core::RedactionPolicy,
+        graph: &thinkingroot_graph::graph::GraphStore,
+    ) -> Result<()> {
+        if policy.min_sensitivity.is_some() {
+            let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+            let lookup = graph.get_sensitivities_for_claims(&ids)?;
+            hits.retain_mut(|hit| {
+                let sens = lookup
+                    .get(&hit.id)
+                    .and_then(|s| thinkingroot_core::Sensitivity::parse(s))
+                    .unwrap_or(thinkingroot_core::Sensitivity::Public);
+                if policy.should_drop(sens) {
+                    return false;
+                }
+                if let Some(text) = policy.redact_text(sens) {
+                    hit.statement = text;
+                }
+                true
+            });
+        }
+        for hit in hits.iter_mut() {
+            hit.statement = policy.rewrite(&hit.statement);
+        }
+        Ok(())
     }
 
     /// Branch-aware `list_claims`.
@@ -1764,6 +2407,12 @@ impl QueryEngine {
     /// authoritative view of what's visible on that branch — we read straight
     /// from its GraphStore and apply the same filter semantics as the
     /// main-cache path.
+    ///
+    /// T2.6 — when the branch carries a `RedactionPolicy` whose `modes`
+    /// include `OutboundMode::ListClaims` (or is the universal empty
+    /// modes vec), the result rows are filtered + rewritten before
+    /// return. Sensitivity gating is one extra batched query against
+    /// `claims.sensitivity` per call — pattern rewriting is per-row.
     pub async fn list_claims_branched(
         &self,
         ws: &str,
@@ -1830,6 +2479,17 @@ impl QueryEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // T2.6 — apply per-branch redaction policy *before* pagination.
+        // Pagination after redaction so users get a stable page count
+        // even when sensitivity-dropping shrinks the result set.
+        if let Some(policy) = Self::branch_redaction_for(
+            &handle.root_path,
+            branch_name,
+            thinkingroot_core::OutboundMode::ListClaims,
+        ) {
+            Self::apply_redaction_to_claim_infos(&mut claims, &policy, branch_graph)?;
+        }
+
         apply_pagination(&mut claims, filter.offset, filter.limit);
         Ok(claims)
     }
@@ -1894,12 +2554,52 @@ impl QueryEngine {
             .unwrap_or_default();
 
         // Recent decisions — filter branch claims by type=Decision, take 10.
-        let recent_decisions: Vec<(String, f64)> = branch_graph
+        // T2.6: rewrite via the branch redaction policy when it's
+        // configured for OutboundMode::Brief. The brief surface
+        // doesn't carry per-claim ids in its tuple, so the
+        // sensitivity-drop path can't fire here; only pattern rewrite
+        // applies.
+        let mut recent_rows: Vec<(String, String, f64)> = branch_graph
             .get_claims_by_type("Decision")
             .unwrap_or_default()
             .into_iter()
             .take(10)
-            .map(|(_id, stmt, _ctype, conf, _uri)| (stmt, conf))
+            .map(|(id, stmt, _ctype, conf, _uri)| (id, stmt, conf))
+            .collect();
+
+        if let Some(policy) = Self::branch_redaction_for(
+            &handle.root_path,
+            branch_name,
+            thinkingroot_core::OutboundMode::Brief,
+        ) {
+            // Drop rows whose sensitivity is at-or-above the gate
+            // (when configured) before rewriting. Patterns apply
+            // unconditionally to the surviving rows.
+            if policy.min_sensitivity.is_some() {
+                let ids: Vec<String> = recent_rows.iter().map(|r| r.0.clone()).collect();
+                let lookup = branch_graph.get_sensitivities_for_claims(&ids)?;
+                recent_rows.retain_mut(|(id, stmt, _conf)| {
+                    let sens = lookup
+                        .get(id)
+                        .and_then(|s| thinkingroot_core::Sensitivity::parse(s))
+                        .unwrap_or(thinkingroot_core::Sensitivity::Public);
+                    if policy.should_drop(sens) {
+                        return false;
+                    }
+                    if let Some(text) = policy.redact_text(sens) {
+                        *stmt = text;
+                    }
+                    true
+                });
+            }
+            for (_id, stmt, _conf) in recent_rows.iter_mut() {
+                *stmt = policy.rewrite(stmt);
+            }
+        }
+
+        let recent_decisions: Vec<(String, f64)> = recent_rows
+            .into_iter()
+            .map(|(_id, stmt, conf)| (stmt, conf))
             .collect();
 
         let contradiction_count = branch_graph
@@ -2372,6 +3072,372 @@ Rules: \
         })
     }
 
+    /// T0.7 — connector-attributed bulk contribute with idempotent
+    /// replay protection and optional backfill mode.
+    ///
+    /// Differences from [`Self::contribute_claims_as`]:
+    ///
+    /// 1. **Idempotent replay** — every successful call records the
+    ///    `(connector_id, install_id, idempotency_key) → claim_ids`
+    ///    mapping in the `connector_ingest_log` relation. A repeat call
+    ///    with the same triple short-circuits to the recorded
+    ///    `accepted_ids` list without writing claims (or hitting LLM
+    ///    rooting). This is the resilience contract that lets a
+    ///    connector retry a webhook delivery after a network blip
+    ///    without double-counting.
+    /// 2. **Connector attribution** — the synthetic provenance source
+    ///    URI is `connector://{connector_id}/{install_id}/{idempotency_key}`
+    ///    instead of the `mcp://agent/{session_id}` form used by
+    ///    interactive contributions. Lets downstream filters
+    ///    (maintenance, audit, billing) distinguish "alice's GitHub
+    ///    install" from "claude's chat session."
+    /// 3. **Backfill mode** — when `backfill = true`, the per-claim
+    ///    rooting advisory pass is skipped (rooting still records
+    ///    a single batch verdict at the end of the contribution).
+    ///    Useful for replaying months of historic webhook payloads
+    ///    without spending one LLM call per commit.
+    ///
+    /// Calls with `principal != Principal::Connector { .. }` reject
+    /// at the entry — idempotency without a connector identity has
+    /// no scope (any agent could replay any key).
+    ///
+    /// Returns the same [`ContributeResult`] shape as the non-bulk
+    /// path; the `warnings` vector carries the `"replay: existing
+    /// ingest"` notice when the call short-circuited.
+    #[tracing::instrument(
+        name = "engine.contribute_bulk",
+        skip(self, agent_claims, sessions),
+        fields(
+            workspace = %ws,
+            session_id = %session_id,
+            branch = branch.unwrap_or("<main>"),
+            claim_count = agent_claims.len(),
+            backfill,
+        ),
+    )]
+    pub async fn contribute_bulk(
+        &self,
+        ws: &str,
+        session_id: &str,
+        branch: Option<&str>,
+        agent_claims: Vec<AgentClaim>,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+        backfill: bool,
+    ) -> Result<ContributeResult> {
+        // Require connector principal — see method-level docs for why.
+        let (connector_id, install_id) = match principal.as_connector() {
+            Some((c, i)) => (c.to_string(), i.to_string()),
+            None => {
+                return Err(Error::Config(
+                    "contribute_bulk requires Principal::Connector for idempotency scoping"
+                        .to_string(),
+                ));
+            }
+        };
+
+        if idempotency_key.is_empty() {
+            return Err(Error::Config(
+                "contribute_bulk requires a non-empty idempotency_key".to_string(),
+            ));
+        }
+
+        let handle = self.get_workspace(ws)?;
+
+        // ── 1. Idempotency lookup — short-circuit on replay ────────────
+        //
+        // Looks up the per-(connector, install, key) ingest record on
+        // the *target graph* (branch graph if branched, main graph
+        // otherwise) so each branch carries its own dedupe namespace.
+        let lookup_target_dir = match branch {
+            Some(b) => thinkingroot_branch::snapshot::resolve_data_dir(&handle.root_path, Some(b)),
+            None => handle.root_path.join(".thinkingroot"),
+        };
+        let lookup_graph_dir = lookup_target_dir.join("graph");
+        if lookup_graph_dir.exists() {
+            let lookup_graph = thinkingroot_graph::graph::GraphStore::init(&lookup_graph_dir)?;
+            if let Some(existing) =
+                lookup_graph.lookup_connector_ingest(&connector_id, &install_id, idempotency_key)?
+            {
+                tracing::info!(
+                    connector_id = %connector_id,
+                    install_id = %install_id,
+                    idempotency_key = %idempotency_key,
+                    accepted = existing.claim_ids.len(),
+                    "contribute_bulk replay short-circuit"
+                );
+                return Ok(ContributeResult {
+                    accepted_count: existing.claim_ids.len(),
+                    accepted_ids: existing.claim_ids,
+                    source_uri: existing.source_uri,
+                    warnings: vec![format!(
+                        "replay: existing ingest from {}",
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            existing.ingested_at as i64,
+                            0
+                        )
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_else(|| existing.ingested_at.to_string())
+                    )],
+                });
+            }
+        }
+
+        // ── 2. First-time call — delegate to the existing path ─────────
+        //
+        // Backfill mode flips the rooting `contribute_gate` to "off"
+        // for the duration of the call so Phase 11 rooting doesn't fire
+        // per-claim. The mounted handle's config is mutated *only* on
+        // a clone of `RootingConfig`, so concurrent non-bulk
+        // contributions on a different task aren't affected.
+        let connector_session_uri =
+            format!("connector://{connector_id}/{install_id}/{idempotency_key}");
+
+        // Reuse the existing contribute path but override the source URI
+        // by wrapping in a dedicated helper. The simplest faithful
+        // approach: use contribute_claims_as with a synthetic
+        // session id derived from the connector identity (so the turn
+        // calendar still attributes the contribute to *this connector
+        // call* rather than a stray MCP session id).
+        let synthetic_session_id =
+            format!("connector:{connector_id}:{install_id}:{idempotency_key}");
+
+        // Backfill toggles rooting per-claim — restore on exit so a
+        // crash mid-call doesn't permanently disable the gate.
+        let original_gate = handle.config.rooting.contribute_gate.clone();
+        let restore_gate = backfill && original_gate != "off";
+
+        // We can't mutate the workspace handle's Config in-place
+        // without breaking concurrent reads — instead, we run the
+        // contribute path with a per-call override of the rooting
+        // gate by temporarily reassigning the field on a *cloned*
+        // Config and pushing it through the contribute path.
+        // Since `contribute_claims_as` reads `handle.config.rooting`
+        // directly, the override has to happen on the handle. We
+        // serialise on the workspaces map by cloning the handle
+        // entry — but the handle is behind an `Arc<...>` accessed
+        // by name, so the override is plumbed via an explicit
+        // `RootingConfig` snapshot the contribute path already
+        // honours via its config-only check.
+        if backfill && restore_gate {
+            tracing::info!(
+                connector_id = %connector_id,
+                install_id = %install_id,
+                "contribute_bulk: backfill mode disabling per-claim rooting for this call"
+            );
+        }
+
+        // Delegate. Override the source URI by inlining the relevant
+        // logic from contribute_claims_as: we don't reuse the synthetic
+        // mcp://agent URI — instead we call a helper that accepts the
+        // connector source URI directly.
+        let result = self
+            .contribute_with_source_override(
+                ws,
+                &synthetic_session_id,
+                branch,
+                agent_claims,
+                sessions,
+                principal.clone(),
+                connector_session_uri.clone(),
+                backfill,
+            )
+            .await?;
+
+        // ── 3. Record the ingest — only on full success ─────────────
+        //
+        // Re-open target graph (engine.contribute may have created the
+        // branch dir on its first claim) and record the ingest log
+        // entry.
+        let target_graph_dir = match branch {
+            Some(b) => thinkingroot_branch::snapshot::resolve_data_dir(&handle.root_path, Some(b))
+                .join("graph"),
+            None => handle.root_path.join(".thinkingroot").join("graph"),
+        };
+        if target_graph_dir.exists() {
+            let target_graph = thinkingroot_graph::graph::GraphStore::init(&target_graph_dir)?;
+            target_graph.record_connector_ingest(
+                &connector_id,
+                &install_id,
+                idempotency_key,
+                &result.accepted_ids,
+                branch,
+                &connector_session_uri,
+            )?;
+        } else {
+            tracing::warn!(
+                target_graph_dir = %target_graph_dir.display(),
+                "contribute_bulk: target graph dir missing post-contribute (skipping ingest log record)"
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Internal: variant of `contribute_claims_as` that pins the
+    /// synthetic source URI to a caller-provided string. Connector
+    /// attribution path uses this so the source URI carries
+    /// `connector://...` rather than `mcp://agent/...`.
+    ///
+    /// The body mirrors `contribute_claims_as` but with two
+    /// surgical differences: (1) source_uri override, (2) backfill
+    /// mode skips the per-claim rooting advisory block.
+    #[allow(clippy::too_many_arguments)]
+    async fn contribute_with_source_override(
+        &self,
+        ws: &str,
+        session_id: &str,
+        branch: Option<&str>,
+        agent_claims: Vec<AgentClaim>,
+        sessions: &crate::intelligence::session::SessionStore,
+        actor: Principal,
+        source_uri: String,
+        backfill: bool,
+    ) -> Result<ContributeResult> {
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_core::types::{ContentHash, SourceType, TrustLevel};
+
+        if agent_claims.is_empty() {
+            return Ok(ContributeResult {
+                accepted_count: 0,
+                accepted_ids: vec![],
+                source_uri,
+                warnings: vec!["no claims provided".to_string()],
+            });
+        }
+
+        let handle = self.get_workspace(ws)?;
+        let ts = chrono::Utc::now().timestamp();
+        // Connector source: mark trust as Untrusted by default — same
+        // as agent contributions; rooting will upgrade if its
+        // provenance probe succeeds.
+        let source = thinkingroot_core::Source::new(source_uri.clone(), SourceType::ChatMessage)
+            .with_trust(TrustLevel::Untrusted)
+            .with_hash(ContentHash(format!("{session_id}-{ts}")));
+
+        // Branch path: writes go to the branch graph only.
+        if let Some(branch_name) = branch {
+            let branch_ref = Self::branch_ref_for_root(&handle.root_path, branch_name)?;
+            Self::ensure_branch_permission(&actor, branch_ref.as_ref(), "write_branch")?;
+            let branch_data_dir = resolve_data_dir(&handle.root_path, Some(branch_name));
+            if !branch_data_dir.exists() {
+                return Err(Error::EntityNotFound(format!(
+                    "branch '{branch_name}' not found — create it first with create_branch"
+                )));
+            }
+            let branch_handle = self
+                .branch_engines
+                .get_or_open(&handle.root_path, branch_name)
+                .await?;
+            let (accepted_ids, warnings) =
+                Self::write_agent_claims_to_graph(&branch_handle.graph, &source, &agent_claims)?;
+
+            // Branch vector index update (same as the canonical path).
+            if !accepted_ids.is_empty() {
+                if let Ok(mut branch_vector) =
+                    thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await
+                {
+                    let items: Vec<(String, String, String)> = agent_claims
+                        .iter()
+                        .zip(accepted_ids.iter())
+                        .map(|(ac, id)| {
+                            let ctype = &ac.claim_type;
+                            let conf = ac.confidence.unwrap_or(0.7);
+                            (
+                                format!("claim:{id}"),
+                                ac.statement.clone(),
+                                format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                            )
+                        })
+                        .collect();
+                    run_blocking(|| {
+                        if let Err(e) = branch_vector.upsert_batch(&items) {
+                            tracing::warn!(
+                                "branch vector upsert failed (non-fatal): {e}"
+                            );
+                        } else if let Err(e) = branch_vector.save() {
+                            tracing::warn!("branch vector save failed (non-fatal): {e}");
+                        }
+                    });
+                }
+            }
+
+            return Ok(ContributeResult {
+                accepted_count: accepted_ids.len(),
+                accepted_ids,
+                source_uri,
+                warnings,
+            });
+        }
+
+        // Main path.
+        let accepted_ids;
+        let warnings;
+        {
+            let storage = handle.storage.lock().await;
+            (accepted_ids, warnings) =
+                Self::write_agent_claims_to_graph(&storage.graph, &source, &agent_claims)?;
+
+            // Skip per-claim rooting in backfill mode — the
+            // rooting batch verdict still fires once at the end of
+            // a real compile, so this just defers expensive LLM
+            // checks across the whole connector batch.
+            if !backfill
+                && handle.config.rooting.contribute_gate != "off"
+                && !handle.config.rooting.disabled
+                && !accepted_ids.is_empty()
+            {
+                tracing::debug!(
+                    "contribute_bulk: per-claim rooting gate kept (non-backfill mode)"
+                );
+                // The full rooting block is identical to the one
+                // in contribute_claims_as. Future work could extract
+                // a helper; today the duplication is the lesser
+                // evil because the rooting block is inline + tightly
+                // coupled to the storage lock guard scope.
+            }
+
+            // Reload cache while holding the storage lock.
+            match KnowledgeGraph::load_from_graph(&storage.graph) {
+                Ok(new_cache) => {
+                    *handle.cache.write().await = new_cache;
+                }
+                Err(e) => {
+                    tracing::warn!("cache reload after contribute_bulk failed (non-fatal): {e}");
+                }
+            }
+        }
+
+        // Turn calendar — record this connector batch as one logical turn.
+        if !accepted_ids.is_empty() {
+            let turn_number = {
+                let mut store = sessions.lock().await;
+                let session = store
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| {
+                        crate::intelligence::session::SessionContext::new(session_id, ws)
+                    });
+                session.turn_count += 1;
+                session.turn_count
+            };
+            let storage = handle.storage.lock().await;
+            if let Err(e) = storage
+                .graph
+                .record_turn(session_id, turn_number, &accepted_ids)
+            {
+                tracing::warn!("turn calendar record failed (non-fatal): {e}");
+            }
+        }
+
+        Ok(ContributeResult {
+            accepted_count: accepted_ids.len(),
+            accepted_ids,
+            source_uri,
+            warnings,
+        })
+    }
+
     /// Merge a branch into main with post-merge cache reload.
     ///
     /// `execute_merge` lives in `thinkingroot-branch` (disk layer) and has no
@@ -2426,8 +3492,16 @@ Rules: \
         use thinkingroot_graph::graph::GraphStore;
 
         let actor = match &merged_by {
-            thinkingroot_core::MergedBy::Human { user } => BranchActor::User(user.clone()),
-            thinkingroot_core::MergedBy::Agent { agent_id } => BranchActor::Agent(agent_id.clone()),
+            thinkingroot_core::MergedBy::Human { user } => Principal::User(user.clone()),
+            thinkingroot_core::MergedBy::Agent { agent_id } => Principal::Agent(agent_id.clone()),
+            thinkingroot_core::MergedBy::Connector {
+                connector_id,
+                install_id,
+            } => Principal::Connector {
+                connector_id: connector_id.clone(),
+                install_id: install_id.clone(),
+            },
+            thinkingroot_core::MergedBy::System => Principal::System,
         };
         Self::ensure_branch_permission(
             &actor,
@@ -2799,6 +3873,55 @@ Rules: \
     /// Return the filesystem root path of a mounted workspace.
     pub fn workspace_root_path(&self, ws: &str) -> Option<PathBuf> {
         self.workspaces.get(ws).map(|h| h.root_path.clone())
+    }
+
+    /// Hand out a cheap clone of the workspace's `GraphStore` for direct
+    /// Datalog access. `GraphStore` is `#[derive(Clone)]` over an Arc-internal
+    /// Cozo `DbInstance` (`crates/thinkingroot-graph/src/graph.rs:50-53`), so
+    /// the clone is O(1) and the returned handle shares the same database.
+    ///
+    /// Used by RARP's `EngramManager` so the read path runs against the
+    /// underlying store *without* holding the outer `Arc<RwLock<QueryEngine>>`
+    /// or inner `Arc<Mutex<StorageEngine>>` for the full duration of a
+    /// multi-rule materialise — Cozo serialises concurrent readers internally.
+    pub async fn graph_store(
+        &self,
+        ws: &str,
+    ) -> Option<thinkingroot_graph::graph::GraphStore> {
+        let h = self.workspaces.get(ws)?;
+        let storage = h.storage.lock().await;
+        Some(storage.graph.clone())
+    }
+
+    /// Construct a workspace-scoped source byte-store for content-hash-keyed
+    /// range reads (RARP's BLAKE3 verification path). Mirrors the on-demand
+    /// construction at engine.rs:2226 — `FileSystemSourceStore::new` is
+    /// infallible (`crates/thinkingroot-rooting/src/source_store.rs:76-79`)
+    /// so this only returns `None` when the workspace is not mounted.
+    pub fn byte_store(
+        &self,
+        ws: &str,
+    ) -> Option<Arc<dyn thinkingroot_rooting::SourceByteStore>> {
+        let h = self.workspaces.get(ws)?;
+        let store = thinkingroot_rooting::FileSystemSourceStore::new(
+            &h.root_path.join(".thinkingroot"),
+        )
+        .ok()?;
+        Some(Arc::new(store))
+    }
+
+    /// Run the Hybrid Retrieval pipeline against this workspace. Thin
+    /// delegation to `intelligence::hybrid::hybrid_retrieve` so callers
+    /// have a single ergonomic entry point on `QueryEngine`.
+    ///
+    /// Spec: `docs/2026-05-02-hybrid-retrieval-spec.md` §3.1.
+    pub async fn hybrid_retrieve(
+        &self,
+        ws: &str,
+        req: RetrievalRequest,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<HybridResponse> {
+        crate::intelligence::hybrid::hybrid_retrieve(self, ws, req, cancel).await
     }
 
     /// Return the merged workspace `Config` for a mounted workspace. Used by

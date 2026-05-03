@@ -205,3 +205,216 @@ async fn read_head_defaults_to_main() {
     let head = read_head_branch(root).unwrap();
     assert_eq!(head, "main");
 }
+
+// ─── T0.6: BranchKind + MergePolicy round-trip + persistence ──────────
+
+use thinkingroot_branch::create_branch_full;
+use thinkingroot_core::{BranchKind, MergePolicy};
+
+#[tokio::test]
+async fn create_branch_full_preserves_kind_and_policy() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch_full(
+        root,
+        "stream/sess-7",
+        "main",
+        Some("session branch".into()),
+        Some("sess-7".into()),
+        BranchPermissions::default(),
+        BranchKind::Stream {
+            session_id: "sess-7".into(),
+        },
+        MergePolicy::AutoOnSessionEnd,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let branches = list_branches(root).unwrap();
+    assert_eq!(branches.len(), 1);
+    let b = &branches[0];
+    assert!(matches!(b.kind, BranchKind::Stream { ref session_id } if session_id == "sess-7"));
+    assert_eq!(b.merge_policy, MergePolicy::AutoOnSessionEnd);
+
+    // Reload from disk: TOML must round-trip the typed fields.
+    let refs = root.join(".thinkingroot-refs");
+    let registry = BranchRegistry::load_or_create(&refs).unwrap();
+    let reloaded = registry.get("stream/sess-7").unwrap();
+    assert!(matches!(reloaded.kind, BranchKind::Stream { .. }));
+    assert_eq!(reloaded.merge_policy, MergePolicy::AutoOnSessionEnd);
+}
+
+#[tokio::test]
+async fn ephemeral_merge_short_circuits_to_abandon() {
+    use thinkingroot_branch::merge::execute_merge_into;
+    use thinkingroot_core::error::Error;
+    use thinkingroot_core::{
+        AutoResolution, ContradictionPair, HealthScore, KnowledgeDiff, MergedBy,
+    };
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch_full(
+        root,
+        "sandbox/ephemeral",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Sandbox {
+            agent_id: "claude".into(),
+        },
+        MergePolicy::Ephemeral,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Synthetic empty diff that *would* normally be allowed.
+    let diff = KnowledgeDiff {
+        from_branch: "sandbox/ephemeral".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    let result = execute_merge_into(
+        root,
+        "sandbox/ephemeral",
+        None,
+        &diff,
+        MergedBy::System,
+        false,
+    )
+    .await;
+
+    match result {
+        Err(Error::MergeBlocked(msg)) => {
+            assert!(
+                msg.contains("Ephemeral"),
+                "expected ephemeral message, got: {msg}"
+            );
+        }
+        other => panic!("expected MergeBlocked, got: {other:?}"),
+    }
+
+    // Branch should now be abandoned, not merged.
+    let refs = root.join(".thinkingroot-refs");
+    let registry = BranchRegistry::load_or_create(&refs).unwrap();
+    let abandoned: Vec<_> = registry
+        .list_abandoned()
+        .into_iter()
+        .map(|b| b.name.clone())
+        .collect();
+    assert!(
+        abandoned.contains(&"sandbox/ephemeral".to_string()),
+        "expected ephemeral branch in abandoned list, got: {abandoned:?}"
+    );
+}
+
+#[tokio::test]
+async fn requires_proposal_blocks_raw_merge() {
+    use thinkingroot_branch::merge::execute_merge_into;
+    use thinkingroot_core::error::Error;
+    use thinkingroot_core::{
+        AutoResolution, ContradictionPair, HealthScore, KnowledgeDiff, MergedBy,
+    };
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch_full(
+        root,
+        "feature/risky",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::RequiresProposal {
+            min_reviewers: 2,
+            required_checks: vec!["health_score".into()],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let diff = KnowledgeDiff {
+        from_branch: "feature/risky".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    match execute_merge_into(root, "feature/risky", None, &diff, MergedBy::System, false).await {
+        Err(Error::MergeBlocked(msg)) => {
+            assert!(
+                msg.contains("RequiresProposal") || msg.contains("Knowledge Proposal"),
+                "expected proposal message, got: {msg}"
+            );
+        }
+        other => panic!("expected MergeBlocked, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_branch_redaction_persists() {
+    use thinkingroot_branch::set_branch_redaction;
+    use thinkingroot_core::{RedactionPolicy, Sensitivity};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch(root, "feature/with-policy", "main", None)
+        .await
+        .unwrap();
+
+    let policy = RedactionPolicy {
+        patterns: vec![r"\b\d{3}-\d{2}-\d{4}\b".into()],
+        replacement: "[ssn]".into(),
+        modes: vec![],
+        min_sensitivity: Some(Sensitivity::Confidential),
+        drop_above_min: true,
+    };
+    let updated = set_branch_redaction(root, "feature/with-policy", Some(policy.clone())).unwrap();
+    assert_eq!(updated.redaction.as_ref(), Some(&policy));
+
+    // Reload from disk.
+    let refs = root.join(".thinkingroot-refs");
+    let reg = BranchRegistry::load_or_create(&refs).unwrap();
+    let reloaded = reg.get("feature/with-policy").unwrap();
+    assert_eq!(reloaded.redaction.as_ref(), Some(&policy));
+
+    // Clearing the policy persists too.
+    set_branch_redaction(root, "feature/with-policy", None).unwrap();
+    let reg2 = BranchRegistry::load_or_create(&refs).unwrap();
+    assert!(reg2.get("feature/with-policy").unwrap().redaction.is_none());
+}
