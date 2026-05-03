@@ -3314,6 +3314,25 @@ impl GraphStore {
         }
     }
 
+    /// Cascade-remove every structural row keyed on `source_id` across the
+    /// 16 byte-anchored tables defined in `thinkingroot_core::STRUCTURAL_TABLES`.
+    /// Called from `remove_source_by_id` after the legacy claim/entity
+    /// cascade so a source delete leaves zero orphan structural rows.
+    ///
+    /// All 16 tables have a `:by_source` (or `:by_from`) index — each `:rm`
+    /// is O(matches), not O(table-size).
+    fn cascade_structural_tables_for_source(&self, source_id: &str) -> Result<()> {
+        use thinkingroot_core::structural_registry::STRUCTURAL_TABLES;
+
+        for spec in STRUCTURAL_TABLES {
+            let mut params = BTreeMap::new();
+            params.insert("sid".into(), DataValue::Str(source_id.into()));
+            let script = pk_rm_script_for_table(spec.name, spec.source_id_column);
+            self.query(&script, params)?;
+        }
+        Ok(())
+    }
+
     fn remove_source_by_id(&self, source_id: &str) -> Result<()> {
         let claim_ids = self.get_claim_ids_for_source(source_id)?;
         self.remove_source_relations(source_id)?;
@@ -3354,6 +3373,12 @@ impl GraphStore {
         // orphan-entity sweep, otherwise events keep pointing at
         // entity ULIDs the sweep is about to delete.
         self.remove_events_for_source(source_id)?;
+
+        // Cascade the 16 byte-anchored structural tables introduced by the
+        // Compile Completeness Contract.  Pre-water-flow these rows survived
+        // source delete, leaving AEP/Hybrid clusters joining through dead
+        // claim_ids.
+        self.cascade_structural_tables_for_source(source_id)?;
 
         self.remove_source(source_id)?;
 
@@ -4677,6 +4702,42 @@ pub struct TurnRow {
     pub turn_number: u64,
     pub claim_ids: Vec<String>,
     pub timestamp: f64,
+}
+
+/// Per-structural-table `:rm` script string.  Each table's primary key
+/// is encoded here because Cozo's `:rm` requires the PK projection,
+/// and the PK shape differs per table (most are `id`, but
+/// `code_signatures` keys on `claim_id`, `config_tree` keys on
+/// `(source_id, dotted_path)`, `git_commits` keys on `(source_id,
+/// commit_sha)`, `git_blame` keys on `(source_id, line_start, line_end)`).
+///
+/// Composite-key tables use the `column = $param` filter shape rather
+/// than the `column: $param` body-binding shape because `:rm` needs
+/// `source_id` projected in the rule head, which requires it to be a
+/// bound symbol — `*table{source_id: $sid}` filters but doesn't bind.
+fn pk_rm_script_for_table(name: &str, sid_col: &str) -> String {
+    match name {
+        "code_signatures" => format!(
+            r#"?[claim_id] := *{name}{{claim_id, {sid_col}: $sid}}
+            :rm {name} {{claim_id}}"#
+        ),
+        "config_tree" => format!(
+            r#"?[source_id, dotted_path] := *{name}{{source_id, dotted_path}}, source_id = $sid
+            :rm {name} {{source_id, dotted_path}}"#
+        ),
+        "git_commits" => format!(
+            r#"?[source_id, commit_sha] := *{name}{{source_id, commit_sha}}, source_id = $sid
+            :rm {name} {{source_id, commit_sha}}"#
+        ),
+        "git_blame" => format!(
+            r#"?[source_id, line_start, line_end] := *{name}{{source_id, line_start, line_end}}, source_id = $sid
+            :rm {name} {{source_id, line_start, line_end}}"#
+        ),
+        _ => format!(
+            r#"?[id] := *{name}{{id, {sid_col}: $sid}}
+            :rm {name} {{id}}"#
+        ),
+    }
 }
 
 /// Extract a String from a DataValue.
