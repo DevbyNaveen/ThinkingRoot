@@ -776,6 +776,75 @@ impl GraphStore {
         Ok(result.rows.first().and_then(|r| r.first()).map(dv_to_string))
     }
 
+    /// Return the source_id that owns a given claim_id.  Returns `None` if
+    /// the claim doesn't exist (e.g., it was cascaded away on source delete).
+    /// Used by Phase 7e to determine whether a callee_claim_id resolution
+    /// crosses source boundaries before recording in `resolution_deps`.
+    ///
+    /// Thin wrapper over `lookup_claim_source` with a name that matches the
+    /// T5 spec; callers in this module use `lookup_claim_source` directly.
+    pub fn get_claim_source_id(&self, claim_id: &str) -> Result<Option<String>> {
+        self.lookup_claim_source(claim_id)
+    }
+
+    // ─── T5 resolution_deps — cross-source Phase 7e dependency tracking ───
+
+    /// Record a resolved cross-source dependency (T5 / I-W3).
+    ///
+    /// Called by Phase 7e each time `function_calls.callee_claim_id` or
+    /// `code_links.target_source_id` is set to a non-empty value pointing at
+    /// a *different* source.  Also called by the v2→v3 migration to backfill
+    /// from existing resolved edges.
+    ///
+    /// Idempotent: `:put` semantics upsert over the composite primary key
+    /// `(from_source_id, to_source_id, kind, edge_id)`.
+    pub fn record_resolution_dep(
+        &self,
+        from_source_id: &str,
+        to_source_id: &str,
+        kind: &str,
+        edge_id: &str,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("from".into(), DataValue::Str(from_source_id.into()));
+        params.insert("to".into(), DataValue::Str(to_source_id.into()));
+        params.insert("kind".into(), DataValue::Str(kind.into()));
+        params.insert("eid".into(), DataValue::Str(edge_id.into()));
+        self.query(
+            r#"?[from_source_id, to_source_id, kind, edge_id, resolved_at]
+                <- [[$from, $to, $kind, $eid, 'ASSERT']]
+            :put resolution_deps {from_source_id, to_source_id, kind, edge_id => resolved_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// List every `from_source_id` where a `resolution_deps` row points AT the
+    /// given `target_source_id`.  Phase 4 uses this to collect the set of
+    /// "resolution-dirty" sources when a source is removed — sources in the
+    /// returned list may have stale `function_calls` or `code_links` rows that
+    /// resolved against the removed target.
+    ///
+    /// Returns a sorted, deduplicated list.
+    pub fn list_dependent_sources(&self, target_source_id: &str) -> Result<Vec<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("to".into(), DataValue::Str(target_source_id.into()));
+        let result = self
+            .query(
+                "?[from_source_id] := *resolution_deps{from_source_id, to_source_id: $to}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_dependent_sources: {e}")))?;
+        let mut out: Vec<String> = result
+            .rows
+            .iter()
+            .filter_map(|r: &Vec<DataValue>| r.first().map(dv_to_string))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     // ─── Workspace metadata singleton — schema versioning + flags ─────────
 
     /// Read a `workspace_meta` value. Returns `None` when the key isn't set.

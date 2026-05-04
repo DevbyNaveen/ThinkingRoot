@@ -102,6 +102,27 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
         graph.insert_function_calls_batch(&updated_calls)?;
     }
 
+    // Record resolution_deps for each successful cross-source function_call
+    // resolve (T5).  Runs over the full updated set (newly resolved + re-
+    // resolved after a move); rows that reset to "" are skipped by the
+    // `callee_claim_id.is_empty()` guard.  `record_resolution_dep` is
+    // idempotent so re-runs on stable edges are safe.
+    for call in &updated_calls {
+        if call.callee_claim_id.is_empty() {
+            continue;
+        }
+        if let Some(to_source) = graph.get_claim_source_id(&call.callee_claim_id)? {
+            if to_source != call.source_id {
+                graph.record_resolution_dep(
+                    &call.source_id,
+                    &to_source,
+                    "function_call",
+                    &call.id,
+                )?;
+            }
+        }
+    }
+
     // ── 2. code_links.is_internal + target_source_id (revalidation) ────
     let source_uris = graph.list_source_uris()?;
     let mut uri_lookup: HashMap<String, String> = HashMap::with_capacity(source_uris.len());
@@ -137,6 +158,23 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     stats.links_updated = updated_links.len();
     if !updated_links.is_empty() {
         graph.insert_code_links_batch(&updated_links)?;
+    }
+
+    // Record resolution_deps for each successful cross-source code_link
+    // resolve (T5).  Only `is_internal` links with a non-empty target that
+    // crosses source boundaries are recorded.
+    for link in &updated_links {
+        if !link.is_internal || link.target_source_id.is_empty() {
+            continue;
+        }
+        if link.target_source_id != link.source_id {
+            graph.record_resolution_dep(
+                &link.source_id,
+                &link.target_source_id,
+                "code_link",
+                &link.id,
+            )?;
+        }
     }
 
     // ── 3. source_references build ─────────────────────────────────────

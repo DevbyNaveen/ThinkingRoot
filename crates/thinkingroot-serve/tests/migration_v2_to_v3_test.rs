@@ -6,7 +6,7 @@
 //! - Dangling `callee_claim_id` reset for Phase 7e pointers.
 //! - Auto-trigger behaviour on schema-version mismatch.
 //! - Explicit `backfill_water_flow_v3_at_path` API.
-//! - `resolution_deps` is left empty until T5.
+//! - `resolution_deps` backfill from current resolved edges (T5).
 
 use std::collections::BTreeMap;
 
@@ -157,29 +157,60 @@ fn explicit_root_migrate_runs_same_logic() {
     assert_eq!(v.as_deref(), Some("3"));
 }
 
-/// T3 does not populate `resolution_deps` — that is T5's responsibility.
-/// Pin the current empty-or-absent state so T5 can loosen this assertion
-/// when it lands.
+/// T5: the migration must backfill `resolution_deps` from existing resolved
+/// function_calls so that Phase 4's dirty-source collection works on the first
+/// incremental compile after migration, without requiring a full re-compile.
 #[test]
-fn migration_resolution_deps_left_empty_until_t5() {
+fn migration_builds_resolution_deps_from_current_resolved_edges() {
     let (_dir, store) = make_store();
+
+    // Source A: home of the callee.
+    let src_a = thinkingroot_core::Source::new(
+        "test://ma.rs".into(),
+        thinkingroot_core::types::SourceType::File,
+    )
+    .with_hash(thinkingroot_core::types::ContentHash("hash-ma-mig".into()));
+    let src_a_id = src_a.id.to_string();
+    store.insert_source(&src_a).unwrap();
+
+    // Source B: caller.
+    let src_b = thinkingroot_core::Source::new(
+        "test://mb.rs".into(),
+        thinkingroot_core::types::SourceType::File,
+    )
+    .with_hash(thinkingroot_core::types::ContentHash("hash-mb-mig".into()));
+    let src_b_id = src_b.id.to_string();
+    store.insert_source(&src_b).unwrap();
+
+    // Claim in A.
+    let claim_a = thinkingroot_core::Claim::new(
+        "fn t() {}",
+        thinkingroot_core::types::ClaimType::Fact,
+        src_a.id,
+        thinkingroot_core::types::WorkspaceId::new(),
+    );
+    let claim_a_id = claim_a.id.to_string();
+    store.insert_claim(&claim_a).unwrap();
+
+    // A function_calls row in B already resolved to A's claim.
+    let row = thinkingroot_graph::rows::FunctionCall {
+        id: "fc-mig-1".to_string(),
+        caller_claim_id: "caller-mig".to_string(),
+        callee_name: "t".to_string(),
+        callee_claim_id: claim_a_id,
+        source_id: src_b_id.clone(),
+        byte_start: 0,
+        byte_end: 8,
+        content_blake3: "blake-mig".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    // Run the migration — step 3 must build B → A in resolution_deps.
     backfill_water_flow_v3(&store).unwrap();
 
-    let result = store.raw_db().run_script(
-        "?[count(from_source_id)] := *resolution_deps{from_source_id}",
-        Default::default(),
-        ScriptMutability::Immutable,
+    let deps = store.list_dependent_sources(&src_a_id).unwrap();
+    assert!(
+        deps.contains(&src_b_id),
+        "migration should have built B → A dep in resolution_deps; got: {deps:?}"
     );
-    if let Ok(r) = result {
-        if let Some(row) = r.rows.first() {
-            if let DataValue::Num(cozo::Num::Int(n)) = &row[0] {
-                assert_eq!(
-                    *n, 0,
-                    "resolution_deps should be empty until T5 populates it"
-                );
-            }
-        }
-    }
-    // If the table doesn't exist yet, the script errors — that is also fine
-    // (T5 creates it). The important thing is no panic and no pre-T5 data.
 }

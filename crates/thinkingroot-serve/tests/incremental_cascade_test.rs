@@ -841,3 +841,208 @@ fn function_renamed_in_place_old_row_replaced() {
         "callee_claim_id must be cleared to \"\" after callee symbol is renamed/removed"
     );
 }
+
+// ── T5: resolution_deps table tests ──────────────────────────────────────────
+
+/// Phase 7e must record a `resolution_deps` row whenever a `function_calls`
+/// row is resolved to a callee claim that lives in a different source.
+/// After resolution, querying `resolution_deps` for `(from=B, to=A)` must
+/// return at least one row.
+#[test]
+fn resolution_deps_records_cross_source_dependencies() {
+    let store = make_store();
+
+    // Source A: defines the callee.
+    let src_a = Source::new("test://da.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-da".into()));
+    let src_a_id = src_a.id.to_string();
+    store.insert_source(&src_a).unwrap();
+
+    // Source B: contains the caller.
+    let src_b = Source::new("test://db.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-db".into()));
+    let src_b_id = src_b.id.to_string();
+    store.insert_source(&src_b).unwrap();
+
+    // Claim in A with symbol "dep_target".
+    let claim_a = thinkingroot_core::Claim::new(
+        "fn dep_target() {}",
+        ClaimType::Fact,
+        src_a.id,
+        WorkspaceId::new(),
+    )
+    .with_symbol("dep_target");
+    store.insert_claim(&claim_a).unwrap();
+
+    // function_calls row in B, unresolved.
+    let row = FunctionCall {
+        id: "fc-dep".to_string(),
+        caller_claim_id: "caller-dep".to_string(),
+        callee_name: "dep_target".to_string(),
+        callee_claim_id: String::new(),
+        source_id: src_b_id.clone(),
+        byte_start: 0,
+        byte_end: 16,
+        content_blake3: "blake-dep".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    // Phase 7e must resolve the call and record the cross-source dep.
+    structural_resolve::resolve(&store).unwrap();
+
+    let result = store
+        .raw_db()
+        .run_script(
+            "?[from_source_id, to_source_id, kind] := *resolution_deps{from_source_id, to_source_id, kind}",
+            Default::default(),
+            ScriptMutability::Immutable,
+        )
+        .unwrap();
+    assert!(
+        result.rows.iter().any(|r| {
+            let from = match &r[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            let to = match &r[1] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            from == src_b_id && to == src_a_id
+        }),
+        "expected resolution_deps row (from=B, to=A); got: {:?}",
+        result.rows
+    );
+}
+
+/// When a source is deleted, `resolution_deps` rows pointing AT it (to_source_id)
+/// must be cascaded away so `list_dependent_sources` no longer returns phantom deps.
+#[test]
+fn resolution_deps_cleans_up_on_source_deletion() {
+    let store = make_store();
+
+    // Insert the target source so the row is valid.
+    let src = Source::new("test://r-dep.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-r-dep".into()));
+    let src_id = src.id.to_string();
+    store.insert_source(&src).unwrap();
+
+    // Manually record a dep pointing AT src (simulating a prior Phase 7e run).
+    store
+        .record_resolution_dep("other-source", &src_id, "function_call", "edge-1")
+        .unwrap();
+
+    // Verify the dep exists.
+    let deps_before = store.list_dependent_sources(&src_id).unwrap();
+    assert!(
+        deps_before.contains(&"other-source".to_string()),
+        "dep should be present before deletion"
+    );
+
+    // Delete the target source.
+    store.remove_source_by_uri("test://r-dep.rs").unwrap();
+
+    // The cascade must have removed the resolution_deps row.
+    let deps_after = store.list_dependent_sources(&src_id).unwrap();
+    assert!(
+        deps_after.is_empty(),
+        "resolution_deps rows pointing at deleted source should be cascaded; got: {deps_after:?}"
+    );
+}
+
+// ── T6: function-moved cross-source re-resolution scenario ───────────────────
+
+/// End-to-end scenario: a function moves from source A to source C; source B
+/// had a `function_calls` row resolved to A.  When A is removed and C appears
+/// with the same symbol, Phase 7e (T4 revalidation) must re-point B's row to C.
+/// This test also pins that `resolution_deps` correctly tracks the B → A dep
+/// before the move, so Phase 4's dirty-source collection (T6 pipeline hook)
+/// would correctly identify B as needing re-extraction.
+#[test]
+fn function_moved_file_a_to_file_b_cross_source_resolution_re_resolves() {
+    let store = make_store();
+
+    // Source A: original home of fn `moved`.
+    let src_a = Source::new("test://moved-a.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-ma".into()));
+    let src_a_id = src_a.id.to_string();
+    store.insert_source(&src_a).unwrap();
+
+    // Source B: caller of `moved`.
+    let src_b = Source::new("test://moved-b.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-mb".into()));
+    let src_b_id = src_b.id.to_string();
+    store.insert_source(&src_b).unwrap();
+
+    // Claim in A with symbol "moved".
+    let claim_a = thinkingroot_core::Claim::new(
+        "fn moved() {}",
+        ClaimType::Fact,
+        src_a.id,
+        WorkspaceId::new(),
+    )
+    .with_symbol("moved");
+    store.insert_claim(&claim_a).unwrap();
+
+    // B's function_calls row for `moved`, initially unresolved.
+    let row = FunctionCall {
+        id: "fc-mv".to_string(),
+        caller_claim_id: "caller-mv".to_string(),
+        callee_name: "moved".to_string(),
+        callee_claim_id: String::new(),
+        source_id: src_b_id.clone(),
+        byte_start: 0,
+        byte_end: 16,
+        content_blake3: "blake-mv".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    // Phase 7e resolves B's call to A's claim and records B → A dep.
+    structural_resolve::resolve(&store).unwrap();
+
+    // Confirm resolution_deps recorded the B → A dependency.
+    let dependents_before = store.list_dependent_sources(&src_a_id).unwrap();
+    assert!(
+        dependents_before.contains(&src_b_id),
+        "expected B to depend on A after first Phase 7e; got: {dependents_before:?}"
+    );
+
+    // Insert source C — new home for fn `moved`.
+    let src_c = Source::new("test://moved-c.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-mc".into()));
+    store.insert_source(&src_c).unwrap();
+    let claim_c = thinkingroot_core::Claim::new(
+        "fn moved() {}",
+        ClaimType::Fact,
+        src_c.id,
+        WorkspaceId::new(),
+    )
+    .with_symbol("moved");
+    let claim_c_id = claim_c.id.to_string();
+    store.insert_claim(&claim_c).unwrap();
+
+    // Remove A (simulating the move). The cascade clears resolution_deps for A.
+    store.remove_source_by_uri("test://moved-a.rs").unwrap();
+
+    // Re-run Phase 7e — T4 revalidation must re-point B's row to C's claim.
+    structural_resolve::resolve(&store).unwrap();
+
+    let mut params = BTreeMap::new();
+    params.insert("id".into(), DataValue::Str("fc-mv".into()));
+    let result = store
+        .raw_db()
+        .run_script(
+            "?[callee_claim_id] := *function_calls{id: $id, callee_claim_id}",
+            params,
+            ScriptMutability::Immutable,
+        )
+        .unwrap();
+    let resolved = match &result.rows[0][0] {
+        DataValue::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
+    assert_eq!(
+        resolved, claim_c_id,
+        "function_call should now resolve to C's claim after the move"
+    );
+}

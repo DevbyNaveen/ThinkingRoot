@@ -663,6 +663,24 @@ impl GraphStore {
                 branch: String default '',
                 source_uri: String default ''
             }",
+
+            // ─── T5 resolution_deps — cross-source Phase 7e dependency
+            // tracking.  Each row records "a row of kind={kind} in source
+            // from_source_id={A} resolved its pointer to a claim or source
+            // owned by to_source_id={B}".  Phase 4 consults
+            // `resolution_deps:by_to` when a source is removed to collect
+            // the set of *other* sources whose Phase 7e resolutions are now
+            // stale.  Cascade fires in both directions (from_source_id OR
+            // to_source_id deleted) so deletion of either end cleans the row.
+            // `resolved_at` uses Validity for insert-time stamping via ASSERT.
+            ":create resolution_deps {
+                from_source_id: String,
+                to_source_id: String,
+                kind: String,
+                edge_id: String
+                =>
+                resolved_at: Validity
+            }",
         ];
 
         for stmt in &relations {
@@ -765,6 +783,11 @@ impl GraphStore {
             "::index create code_metrics:by_loc { loc }",
             "::index create code_metrics:by_cyclomatic { cyclomatic }",
             "::index create code_metrics:by_source { source_id }",
+            // T5 resolution_deps indexes — Phase 4 uses by_to to enumerate
+            // sources that transitively depend on a removed source; by_from
+            // supports the converse query (what does source A depend on).
+            "::index create resolution_deps:by_from { from_source_id }",
+            "::index create resolution_deps:by_to { to_source_id }",
         ];
 
         for stmt in &indexes {
@@ -1414,12 +1437,23 @@ impl GraphStore {
             DataValue::Num(Num::Int(byte_start_val)),
         );
         params.insert("byte_end".into(), DataValue::Num(Num::Int(byte_end_val)));
+        // content_blake3 and symbol are both written here so that
+        // `insert_claim` is complete-on-insert — `list_claim_symbols` (Phase
+        // 7e) will see the symbol even if `insert_claims_batch` wasn't used.
+        params.insert(
+            "content_blake3".into(),
+            DataValue::Str(claim.row_blake3.clone().unwrap_or_default().into()),
+        );
+        params.insert(
+            "symbol".into(),
+            DataValue::Str(claim.symbol.clone().unwrap_or_default().into()),
+        );
 
         self.query(
-            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end] <- [[
-                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date, $admission_tier, $derivation_parents, $predicate_json, $last_rooted_at, $source_path, $byte_start, $byte_end
+            r#"?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end, content_blake3, symbol] <- [[
+                $id, $statement, $claim_type, $source_id, $confidence, $sensitivity, $workspace_id, $created_at, $grounding_score, $grounding_method, $extraction_tier, $event_date, $admission_tier, $derivation_parents, $predicate_json, $last_rooted_at, $source_path, $byte_start, $byte_end, $content_blake3, $symbol
             ]]
-            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end}"#,
+            :put claims {id => statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method, extraction_tier, event_date, admission_tier, derivation_parents, predicate_json, last_rooted_at, source_path, byte_start, byte_end, content_blake3, symbol}"#,
             params,
         )?;
         Ok(())
@@ -3872,6 +3906,27 @@ impl GraphStore {
         // source delete, leaving AEP/Hybrid clusters joining through dead
         // claim_ids.
         self.cascade_structural_tables_for_source(source_id)?;
+
+        // Cascade resolution_deps in both directions (T5).  When a source is
+        // removed, every cross-source resolution it participated in becomes
+        // stale — whether this source was the *from* side (caller) or the
+        // *to* side (callee target).  Both directions must be cleaned so
+        // Phase 4's `list_dependent_sources` doesn't return phantom deps
+        // pointing at the deleted source after the cascade completes.
+        // This block runs BEFORE `remove_source` so the row still exists
+        // in `sources` if any constraint were to check it (none do).
+        {
+            let mut params = BTreeMap::new();
+            params.insert("sid".into(), DataValue::Str(source_id.into()));
+            self.db.run_script(
+                r#"?[from_source_id, to_source_id, kind, edge_id]
+                    := *resolution_deps{from_source_id, to_source_id, kind, edge_id},
+                       (from_source_id = $sid or to_source_id = $sid)
+                :rm resolution_deps {from_source_id, to_source_id, kind, edge_id}"#,
+                params,
+                ScriptMutability::Mutable,
+            ).map_err(|e| Error::GraphStorage(format!("cascade resolution_deps for {source_id}: {e}")))?;
+        }
 
         self.remove_source(source_id)?;
 

@@ -714,6 +714,34 @@ async fn run_pipeline_inner(
     bail_if_cancelled!();
 
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
+    // T6: collect "resolution-dirty" sources BEFORE the cascade fires.
+    // `remove_source_by_id` (called via `remove_source_by_uri`) cascades
+    // `resolution_deps`, so we must query `list_dependent_sources` now —
+    // after the cascade the rows are gone and the dirty set would be empty.
+    // The set is used to log observability data immediately; T11 (watch mode)
+    // will consume it for source-granular re-extraction.
+    let mut resolution_dirty_sources: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for doc in &truly_changed {
+        let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
+        for (sid, _, _) in &existing_sources {
+            let deps = storage.graph.list_dependent_sources(sid)?;
+            for dep in deps {
+                resolution_dirty_sources.insert(dep);
+            }
+        }
+    }
+    for (sid, _) in &deleted_sources {
+        let deps = storage.graph.list_dependent_sources(sid)?;
+        for dep in deps {
+            resolution_dirty_sources.insert(dep);
+        }
+    }
+    tracing::info!(
+        resolution_dirty = resolution_dirty_sources.len(),
+        "phase 4 resolution-dirty sources (cross-source Phase 7e deps now stale)"
+    );
+
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
 
     for doc in &truly_changed {

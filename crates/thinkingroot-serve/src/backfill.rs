@@ -277,11 +277,10 @@ fn reparse_from_bytes(uri: &str, bytes: &[u8]) -> Result<DocumentIR> {
 /// 2. Re-reset dangling `callee_claim_id` pointers (resolved to a claim that
 ///    no longer exists) to `""` (treating them as external — semantically
 ///    correct because the callee has been deleted from this workspace).
-/// 3. Bump `compile_schema_version` to `"3"`.
-///
-/// `resolution_deps` population lands in T5; this migration leaves that
-/// table empty (or absent) and a future migration step will rebuild it from
-/// the resolved-edge set.
+/// 3. Build `resolution_deps` from currently-resolved function_calls and
+///    code_links so Phase 4's dirty-source collection (T6) has a populated
+///    table on the first incremental compile after migration.
+/// 4. Bump `compile_schema_version` to `"3"`.
 ///
 /// Idempotent — safe to re-run.
 pub fn backfill_water_flow_v3(store: &GraphStore) -> Result<()> {
@@ -378,7 +377,102 @@ pub fn backfill_water_flow_v3(store: &GraphStore) -> Result<()> {
         "migration step 2: re-reset dangling Phase 7e callee pointers to external"
     );
 
-    // ── Step 3: bump schema version ─────────────────────────────────────
+    // ── Step 3: build resolution_deps from current resolved edges ──────
+    // Backfill from function_calls rows that are already resolved so that
+    // Phase 4's `list_dependent_sources` works on the first incremental
+    // compile after migration without waiting for a full re-compile.
+    let resolved_calls = store
+        .raw_db()
+        .run_script(
+            r#"?[id, source_id, callee_claim_id]
+                := *function_calls{id, source_id, callee_claim_id},
+                   callee_claim_id != ''"#,
+            Default::default(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .map_err(|e| {
+            thinkingroot_core::Error::GraphStorage(format!(
+                "list resolved calls during migration: {e}"
+            ))
+        })?;
+
+    let mut deps_built = 0usize;
+    for r in &resolved_calls.rows {
+        if r.len() < 3 {
+            continue;
+        }
+        let id = match &r[0] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        let from = match &r[1] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        let callee = match &r[2] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        if let Some(to) = store.get_claim_source_id(&callee)? {
+            if to != from {
+                store.record_resolution_dep(&from, &to, "function_call", &id)?;
+                deps_built += 1;
+            }
+        }
+    }
+    tracing::info!(
+        deps_built = deps_built,
+        "migration step 3: built resolution_deps from current resolved function_calls"
+    );
+
+    // Same for code_links.
+    let resolved_links = store
+        .raw_db()
+        .run_script(
+            r#"?[id, source_id, target_source_id, is_internal]
+                := *code_links{id, source_id, target_source_id, is_internal},
+                   target_source_id != ''"#,
+            Default::default(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .map_err(|e| {
+            thinkingroot_core::Error::GraphStorage(format!(
+                "list resolved links during migration: {e}"
+            ))
+        })?;
+
+    let mut link_deps_built = 0usize;
+    for r in &resolved_links.rows {
+        if r.len() < 4 {
+            continue;
+        }
+        let id = match &r[0] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        let from = match &r[1] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        let to = match &r[2] {
+            cozo::DataValue::Str(s) => s.to_string(),
+            _ => continue,
+        };
+        let is_internal = matches!(&r[3], cozo::DataValue::Bool(true));
+        if !is_internal {
+            continue;
+        }
+        if to != from {
+            store.record_resolution_dep(&from, &to, "code_link", &id)?;
+            link_deps_built += 1;
+        }
+    }
+    tracing::info!(
+        link_deps_built = link_deps_built,
+        "migration step 3 (links): built code_link resolution_deps"
+    );
+
+    // ── Step 4: bump schema version ─────────────────────────────────────
     store.set_workspace_meta("compile_schema_version", "3")?;
     tracing::info!("migration complete (compile_schema_version = \"3\")");
 
