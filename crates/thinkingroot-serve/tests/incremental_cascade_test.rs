@@ -755,50 +755,89 @@ fn code_link_target_source_deleted_re_resolves() {
     );
 }
 
-/// Pins the upsert semantics of `insert_function_calls_batch`: re-emitting a
-/// function_calls row with the same `id` but a different `callee_name`
-/// overwrites the prior row in place (`:put` semantics keyed on `id`).
+/// Phase 7e revalidation: when a callee function is renamed in the structural
+/// table (its claim's `symbol` changes from "old_name" to something else or
+/// the claim is removed entirely), `structural_resolve::resolve` must clear
+/// any `function_calls` row that was previously resolved to that claim.
+///
+/// Scenario:
+///   - Source A defines a claim with symbol "old_name".
+///   - Source B has a `function_calls` row for `callee_name = "old_name"`,
+///     already resolved to A's claim id.
+///   - A's claim is removed (simulating a rename / deletion in a later
+///     compile, with no new "old_name" claim replacing it).
+///   - After Phase 7e re-runs, the `callee_claim_id` on B's row must be
+///     cleared to "" because the live claim set no longer contains the target.
 #[test]
 fn function_renamed_in_place_old_row_replaced() {
     let store = make_store();
 
-    let src = Source::new("test://r.rs".into(), SourceType::File)
-        .with_hash(ContentHash("hash-r".into()));
-    let src_id = src.id.to_string();
-    store.insert_source(&src).unwrap();
+    // Source A: home of the function whose symbol will disappear.
+    let src_a = Source::new("test://renamed-a.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-ra".into()));
+    store.insert_source(&src_a).unwrap();
 
-    let v1 = FunctionCall {
-        id: "fc-stable".to_string(),
-        caller_claim_id: "caller-r".to_string(),
+    // Source B: the caller.
+    let src_b = Source::new("test://renamed-b.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-rb".into()));
+    let src_b_id = src_b.id.to_string();
+    store.insert_source(&src_b).unwrap();
+
+    // Insert a claim in A with symbol "old_name" so Phase 7e can resolve it.
+    let claim_a = thinkingroot_core::Claim::new(
+        "fn old_name() { ... }",
+        ClaimType::Fact,
+        src_a.id,
+        WorkspaceId::new(),
+    )
+    .with_symbol("old_name");
+    let claim_a_id = claim_a.id.to_string();
+    store.insert_claim(&claim_a).unwrap();
+
+    // B's function_calls row is already resolved to A's claim (post-Phase 7e
+    // from a previous compile).
+    let call = FunctionCall {
+        id: "fc-rename-stable".to_string(),
+        caller_claim_id: "caller-in-b".to_string(),
         callee_name: "old_name".to_string(),
-        callee_claim_id: String::new(),
-        source_id: src_id.clone(),
+        callee_claim_id: claim_a_id.clone(), // resolved to A's claim
+        source_id: src_b_id.clone(),
         byte_start: 100,
         byte_end: 200,
-        content_blake3: "blake-v1".to_string(),
+        content_blake3: "blake-rename".to_string(),
     };
-    store.insert_function_calls_batch(&[v1.clone()]).unwrap();
+    store.insert_function_calls_batch(&[call]).unwrap();
 
-    // Upsert the same id with updated callee_name.
-    let v2 = FunctionCall {
-        callee_name: "new_name".to_string(),
-        ..v1
-    };
-    store.insert_function_calls_batch(&[v2]).unwrap();
+    // Simulate the rename: remove A's source (which cascades its claim row).
+    // No new "old_name" claim exists — the symbol is simply gone from the
+    // live workspace.
+    store.remove_source_by_uri("test://renamed-a.rs").unwrap();
+
+    // Phase 7e revalidates every row.  The previously-resolved
+    // callee_claim_id no longer exists in the live claim set, so it must be
+    // reset to "" (external / unresolved).
+    let stats = structural_resolve::resolve(&store).unwrap();
+    assert!(
+        stats.calls_updated >= 1,
+        "resolve should have updated the dangling call row"
+    );
 
     let mut params = BTreeMap::new();
-    params.insert("id".into(), DataValue::Str("fc-stable".into()));
+    params.insert("id".into(), DataValue::Str("fc-rename-stable".into()));
     let result = store
         .raw_db()
         .run_script(
-            "?[callee_name] := *function_calls{id: $id, callee_name}",
+            "?[callee_claim_id] := *function_calls{id: $id, callee_claim_id}",
             params,
             ScriptMutability::Immutable,
         )
         .unwrap();
-    let name = match &result.rows[0][0] {
+    let resolved = match &result.rows[0][0] {
         DataValue::Str(s) => s.to_string(),
         _ => String::new(),
     };
-    assert_eq!(name, "new_name", "upsert should overwrite to new_name");
+    assert_eq!(
+        resolved, "",
+        "callee_claim_id must be cleared to \"\" after callee symbol is renamed/removed"
+    );
 }

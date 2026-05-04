@@ -595,67 +595,6 @@ impl GraphStore {
             .collect())
     }
 
-    /// Pull every `function_calls` row with an unresolved `callee_claim_id`
-    /// (empty string). Phase 7e re-inserts these with the resolved id
-    /// via `insert_function_calls_batch` (`:put` upsert).
-    pub fn list_unresolved_function_calls(&self) -> Result<Vec<FunctionCall>> {
-        let result = self.query_read(
-            "?[id, caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3] := \
-             *function_calls{id, caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3}, \
-             callee_claim_id = ''",
-        )?;
-        Ok(result
-            .rows
-            .iter()
-            .filter_map(|r| {
-                if r.len() < 8 {
-                    return None;
-                }
-                Some(FunctionCall {
-                    id: dv_to_string(&r[0]),
-                    caller_claim_id: dv_to_string(&r[1]),
-                    callee_name: dv_to_string(&r[2]),
-                    callee_claim_id: dv_to_string(&r[3]),
-                    source_id: dv_to_string(&r[4]),
-                    byte_start: dv_to_u64(&r[5]),
-                    byte_end: dv_to_u64(&r[6]),
-                    content_blake3: dv_to_string(&r[7]),
-                })
-            })
-            .collect())
-    }
-
-    /// Pull every `code_links` row with an unresolved `target_source_id`.
-    pub fn list_unresolved_code_links(&self) -> Result<Vec<CodeLink>> {
-        let result = self.query_read(
-            "?[id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3] := \
-             *code_links{id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3}, \
-             target_source_id = ''",
-        )?;
-        Ok(result
-            .rows
-            .iter()
-            .filter_map(|r| {
-                if r.len() < 10 {
-                    return None;
-                }
-                let is_internal = matches!(&r[5], DataValue::Bool(b) if *b);
-                Some(CodeLink {
-                    id: dv_to_string(&r[0]),
-                    source_id: dv_to_string(&r[1]),
-                    chunk_id: dv_to_string(&r[2]),
-                    url: dv_to_string(&r[3]),
-                    link_text: dv_to_string(&r[4]),
-                    is_internal,
-                    target_source_id: dv_to_string(&r[6]),
-                    byte_start: dv_to_u64(&r[7]),
-                    byte_end: dv_to_u64(&r[8]),
-                    content_blake3: dv_to_string(&r[9]),
-                })
-            })
-            .collect())
-    }
-
     /// Pull every resolved cross-source `function_calls` row — used by
     /// Phase 7e to seed `source_references` of `reference_kind = "import"`.
     /// Returns rows where `callee_claim_id != ""`.

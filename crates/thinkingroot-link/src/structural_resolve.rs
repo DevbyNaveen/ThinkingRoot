@@ -33,10 +33,16 @@ use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_graph::rows::{CodeLink, CodeMetric, FunctionCall, SourceReference};
 
 /// Stats surfaced to the linker's `tracing::info` summary line.
+///
+/// `calls_updated` and `links_updated` count rows whose stored value changed
+/// in this pass — including both newly-resolved rows (callee_claim_id gained a
+/// value) and dangling-reset rows (callee_claim_id cleared to "" because the
+/// target claim was deleted). "Updated" is the honest term; "resolved" would
+/// imply only new connections were made.
 #[derive(Debug, Default)]
 pub struct ResolutionStats {
-    pub calls_resolved: usize,
-    pub links_resolved: usize,
+    pub calls_updated: usize,
+    pub links_updated: usize,
     pub references_built: usize,
     pub metrics_resolved: usize,
 }
@@ -91,7 +97,7 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
         }
         // else: original is non-empty AND still live — no change needed.
     }
-    stats.calls_resolved = updated_calls.len();
+    stats.calls_updated = updated_calls.len();
     if !updated_calls.is_empty() {
         graph.insert_function_calls_batch(&updated_calls)?;
     }
@@ -128,7 +134,7 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
         }
         // else: original non-empty AND still live, or external — no change.
     }
-    stats.links_resolved = updated_links.len();
+    stats.links_updated = updated_links.len();
     if !updated_links.is_empty() {
         graph.insert_code_links_batch(&updated_links)?;
     }

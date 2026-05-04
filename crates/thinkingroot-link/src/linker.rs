@@ -185,16 +185,16 @@ impl<'a> Linker<'a> {
         // target_source_id, and seeds source_references. Idempotent
         // via deterministic row IDs.
         let resolution = crate::structural_resolve::resolve(self.graph)?;
-        if resolution.calls_resolved
-            + resolution.links_resolved
+        if resolution.calls_updated
+            + resolution.links_updated
             + resolution.references_built
             + resolution.metrics_resolved
             > 0
         {
             tracing::info!(
-                "phase 7e structural resolution: {} function_calls resolved, {} code_links resolved, {} source_references built, {} code_metrics fan_in/out stamped",
-                resolution.calls_resolved,
-                resolution.links_resolved,
+                "phase 7e structural revalidation: {} function_calls updated, {} code_links updated, {} source_references built, {} code_metrics fan_in/out stamped",
+                resolution.calls_updated,
+                resolution.links_updated,
                 resolution.references_built,
                 resolution.metrics_resolved,
             );
