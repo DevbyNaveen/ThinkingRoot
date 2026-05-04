@@ -42,7 +42,7 @@ use thinkingroot_graph::rows::{
     SourceAnnotation, TestAnnotation,
 };
 use thinkingroot_graph::Blake3Cache;
-use thinkingroot_graph::graph::GraphStore;
+use thinkingroot_graph::graph::{GraphStore, PerSourceRows};
 use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
 
 mod code_metrics;
@@ -387,8 +387,14 @@ pub fn phase_6_7_structural_persist(
             &mut buckets.quantities,
         );
 
-        // Drain buckets in 500-row batches via the typed insert helpers.
-        flush_buckets(graph, &mut buckets, &mut stats)?;
+        // Drain buckets via the T7 transactional rebuild — cascade :rm
+        // for the 16 structural tables scoped to this source, then :put
+        // every non-empty bucket, all inside one Cozo `multi_transaction`.
+        // Concurrent AEP/Hybrid readers either see the prior compile's
+        // rows or the new compile's rows, never a torn intermediate.
+        // (Closes invariant I-W4 of the water-flow incremental compile
+        // spec.)
+        flush_buckets(graph, &source_id_str, &mut buckets, &mut stats)?;
 
         stats.sources_processed += 1;
         stats.blake3_distinct_spans += cache.len();
@@ -497,101 +503,93 @@ fn total_row_count(b: &PerTableBuckets) -> usize {
         + b.git_commits.len()
 }
 
+/// Drain `buckets` for the source `source_id` via the T7 transactional
+/// rebuild path: cascade-then-emit on the 16 structural tables, all
+/// inside one `multi_transaction`.  Per-table row counts are still
+/// recorded into `stats` (zero-row tables stay out of `per_table_counts`).
+///
+/// Why we cascade even when every bucket is empty: a source whose new
+/// compile produced no structural rows means the prior compile's rows
+/// are stale by definition.  The cascade clears them.  See the
+/// rationale at the top of `crates/thinkingroot-graph/src/per_source_rows.rs`.
 fn flush_buckets(
     graph: &GraphStore,
+    source_id: &str,
     buckets: &mut PerTableBuckets,
     stats: &mut Phase67Stats,
 ) -> Result<()> {
+    // Move every bucket into PerSourceRows; the per-table counts are
+    // recorded BEFORE the move so the stats reflect what we attempted to
+    // emit even if the rebuild later fails.
+    let mut rows = PerSourceRows::default();
+
     if !buckets.function_calls.is_empty() {
-        let n = buckets.function_calls.len();
-        graph.insert_function_calls_batch(&buckets.function_calls)?;
-        stats.record("function_calls", n);
-        buckets.function_calls.clear();
+        stats.record("function_calls", buckets.function_calls.len());
+        rows.function_calls = std::mem::take(&mut buckets.function_calls);
     }
     if !buckets.doc_tags.is_empty() {
-        let n = buckets.doc_tags.len();
-        graph.insert_doc_tags_batch(&buckets.doc_tags)?;
-        stats.record("doc_tags", n);
-        buckets.doc_tags.clear();
+        stats.record("doc_tags", buckets.doc_tags.len());
+        rows.doc_tags = std::mem::take(&mut buckets.doc_tags);
     }
     if !buckets.code_links.is_empty() {
-        let n = buckets.code_links.len();
-        graph.insert_code_links_batch(&buckets.code_links)?;
-        stats.record("code_links", n);
-        buckets.code_links.clear();
+        stats.record("code_links", buckets.code_links.len());
+        rows.code_links = std::mem::take(&mut buckets.code_links);
     }
     if !buckets.code_signatures.is_empty() {
-        let n = buckets.code_signatures.len();
-        graph.insert_code_signatures_batch(&buckets.code_signatures)?;
-        stats.record("code_signatures", n);
-        buckets.code_signatures.clear();
+        stats.record("code_signatures", buckets.code_signatures.len());
+        rows.code_signatures = std::mem::take(&mut buckets.code_signatures);
     }
     if !buckets.config_tree.is_empty() {
-        let n = buckets.config_tree.len();
-        graph.insert_config_tree_batch(&buckets.config_tree)?;
-        stats.record("config_tree", n);
-        buckets.config_tree.clear();
+        stats.record("config_tree", buckets.config_tree.len());
+        rows.config_tree = std::mem::take(&mut buckets.config_tree);
     }
     if !buckets.data_rows.is_empty() {
-        let n = buckets.data_rows.len();
-        graph.insert_data_rows_batch(&buckets.data_rows)?;
-        stats.record("data_rows", n);
-        buckets.data_rows.clear();
+        stats.record("data_rows", buckets.data_rows.len());
+        rows.data_rows = std::mem::take(&mut buckets.data_rows);
     }
     if !buckets.headings.is_empty() {
-        let n = buckets.headings.len();
-        graph.insert_headings_batch(&buckets.headings)?;
-        stats.record("headings", n);
-        buckets.headings.clear();
+        stats.record("headings", buckets.headings.len());
+        rows.headings = std::mem::take(&mut buckets.headings);
     }
     if !buckets.chunks_residual.is_empty() {
-        let n = buckets.chunks_residual.len();
-        graph.insert_chunks_residual_batch(&buckets.chunks_residual)?;
-        stats.record("chunks_residual", n);
-        buckets.chunks_residual.clear();
+        stats.record("chunks_residual", buckets.chunks_residual.len());
+        rows.chunks_residual = std::mem::take(&mut buckets.chunks_residual);
     }
     if !buckets.quantities.is_empty() {
-        let n = buckets.quantities.len();
-        graph.insert_quantities_batch(&buckets.quantities)?;
-        stats.record("quantities", n);
-        buckets.quantities.clear();
+        stats.record("quantities", buckets.quantities.len());
+        rows.quantities = std::mem::take(&mut buckets.quantities);
     }
     if !buckets.source_annotations.is_empty() {
-        let n = buckets.source_annotations.len();
-        graph.insert_source_annotations_batch(&buckets.source_annotations)?;
-        stats.record("source_annotations", n);
-        buckets.source_annotations.clear();
+        stats.record("source_annotations", buckets.source_annotations.len());
+        rows.source_annotations = std::mem::take(&mut buckets.source_annotations);
     }
     if !buckets.code_markers.is_empty() {
-        let n = buckets.code_markers.len();
-        graph.insert_code_markers_batch(&buckets.code_markers)?;
-        stats.record("code_markers", n);
-        buckets.code_markers.clear();
+        stats.record("code_markers", buckets.code_markers.len());
+        rows.code_markers = std::mem::take(&mut buckets.code_markers);
     }
     if !buckets.test_annotations.is_empty() {
-        let n = buckets.test_annotations.len();
-        graph.insert_test_annotations_batch(&buckets.test_annotations)?;
-        stats.record("test_annotations", n);
-        buckets.test_annotations.clear();
+        stats.record("test_annotations", buckets.test_annotations.len());
+        rows.test_annotations = std::mem::take(&mut buckets.test_annotations);
     }
     if !buckets.code_metrics.is_empty() {
-        let n = buckets.code_metrics.len();
-        graph.insert_code_metrics_batch(&buckets.code_metrics)?;
-        stats.record("code_metrics", n);
-        buckets.code_metrics.clear();
+        stats.record("code_metrics", buckets.code_metrics.len());
+        rows.code_metrics = std::mem::take(&mut buckets.code_metrics);
     }
     if !buckets.git_blame.is_empty() {
-        let n = buckets.git_blame.len();
-        graph.insert_git_blame_batch(&buckets.git_blame)?;
-        stats.record("git_blame", n);
-        buckets.git_blame.clear();
+        stats.record("git_blame", buckets.git_blame.len());
+        rows.git_blame = std::mem::take(&mut buckets.git_blame);
     }
     if !buckets.git_commits.is_empty() {
-        let n = buckets.git_commits.len();
-        graph.insert_git_commits_batch(&buckets.git_commits)?;
-        stats.record("git_commits", n);
-        buckets.git_commits.clear();
+        stats.record("git_commits", buckets.git_commits.len());
+        rows.git_commits = std::mem::take(&mut buckets.git_commits);
     }
+    // `source_references` is not emitted by Phase 6.7 — Phase 7e
+    // (`thinkingroot_link::structural_resolve`) builds it.  The rebuild
+    // still cascades source_references for this source so any stale
+    // reference rows from a prior compile are cleared; the linker
+    // re-inserts after we return.
+
+    graph.transactional_rebuild_source(source_id, &rows)?;
     Ok(())
 }
 

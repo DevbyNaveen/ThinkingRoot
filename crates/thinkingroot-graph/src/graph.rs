@@ -7,6 +7,11 @@ use serde::Serialize;
 use thinkingroot_core::types::{Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
+// T7 — re-export `PerSourceRows` so callers can write
+// `use thinkingroot_graph::graph::PerSourceRows;` alongside the existing
+// `use thinkingroot_graph::graph::GraphStore;`.
+pub use crate::per_source_rows::PerSourceRows;
+
 /// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
 /// adjacent shape: every field maps directly onto the v3 spec §3.3
 /// `ClaimRecord` apart from `ents` which is loaded separately via
