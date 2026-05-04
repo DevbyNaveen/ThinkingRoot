@@ -134,6 +134,15 @@ pub enum Error {
         /// developer with file:offset hints so they can fix the gap.
         sample: Vec<(String, Vec<(u64, u64)>)>,
     },
+
+    /// Phase 9 detected structural rows whose source_id has no row in
+    /// `sources`.  Indicates a missing cascade — see CLAUDE.md
+    /// "Incremental compile water-flow invariants" §I-W2.
+    #[error("graph corruption: {count} structural rows reference deleted sources (sample: {sample:?}). Run `root migrate --to-water-flow` to clean up.")]
+    OrphanStructuralRows {
+        count: usize,
+        sample: Vec<(String, String)>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

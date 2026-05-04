@@ -896,6 +896,47 @@ impl GraphStore {
 
         Ok(orphans)
     }
+
+    /// Detect structural rows whose `source_id` does not exist in the `sources`
+    /// table.  These are the deleted-source orphans Phase 9 was blind to before
+    /// the water-flow ship.  Returns `Vec<(table_name, source_id, row_count)>`.
+    pub fn query_orphan_structural_rows(&self) -> Result<Vec<(String, String, usize)>> {
+        use thinkingroot_core::structural_registry::STRUCTURAL_TABLES;
+        use std::collections::HashSet;
+
+        let live_sources_q = self.query_read("?[id] := *sources{id}")?;
+        let mut live: HashSet<String> = HashSet::new();
+        for row in &live_sources_q.rows {
+            if let Some(v) = row.first() {
+                live.insert(dv_to_string(v));
+            }
+        }
+
+        let mut orphans: Vec<(String, String, usize)> = Vec::new();
+        for spec in STRUCTURAL_TABLES {
+            let script = format!(
+                "?[sid] := *{name}{{{sid_col}: sid}}",
+                name = spec.name,
+                sid_col = spec.source_id_column,
+            );
+            let result = self.query_read(&script)?;
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for r in &result.rows {
+                if let Some(v) = r.first() {
+                    let sid = dv_to_string(v);
+                    *counts.entry(sid).or_insert(0) += 1;
+                }
+            }
+            for (sid, count) in counts {
+                if !live.contains(&sid) {
+                    orphans.push((spec.name.to_string(), sid, count));
+                }
+            }
+        }
+
+        Ok(orphans)
+    }
 }
 
 /// The auto-generated Phase 9 coverage union — one disjunct per of the

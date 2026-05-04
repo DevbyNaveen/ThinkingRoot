@@ -563,3 +563,56 @@ fn all_16_tables_have_cascade_entry() {
         assert!(!spec.source_id_column.is_empty());
     }
 }
+
+#[test]
+fn phase_9_detects_orphan_source_rows() {
+    let store = make_store();
+
+    let row = FunctionCall {
+        id: "fc-orphan".to_string(),
+        caller_claim_id: "caller-orphan".to_string(),
+        callee_name: "ghost".to_string(),
+        callee_claim_id: String::new(),
+        source_id: "ghost-source-id".to_string(),
+        byte_start: 0,
+        byte_end: 16,
+        content_blake3: "blake-ghost".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    let orphans = store.query_orphan_structural_rows().unwrap();
+    assert!(
+        !orphans.is_empty(),
+        "expected at least one orphan structural row, got none"
+    );
+    assert!(
+        orphans.iter().any(|(table, sid, _)| table == "function_calls" && sid == "ghost-source-id"),
+        "expected (function_calls, ghost-source-id) orphan, got: {orphans:?}"
+    );
+}
+
+#[test]
+fn phase_9_passes_after_clean_cascade() {
+    let store = make_store();
+    let source = Source::new("test://clean.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-clean".into()));
+    let source_id = source.id.to_string();
+    store.insert_source(&source).unwrap();
+
+    let row = FunctionCall {
+        id: "fc-clean".to_string(),
+        caller_claim_id: "caller-clean".to_string(),
+        callee_name: "bar".to_string(),
+        callee_claim_id: String::new(),
+        source_id: source_id.clone(),
+        byte_start: 0,
+        byte_end: 16,
+        content_blake3: "blake-clean".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    store.remove_source_by_uri("test://clean.rs").unwrap();
+
+    let orphans = store.query_orphan_structural_rows().unwrap();
+    assert!(orphans.is_empty(), "expected no orphans after clean cascade, got: {orphans:?}");
+}

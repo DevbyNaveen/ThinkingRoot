@@ -1181,6 +1181,21 @@ async fn run_pipeline_inner(
                 sample,
             });
         }
+        let structural_orphans = storage.graph.query_orphan_structural_rows()?;
+        if !structural_orphans.is_empty() {
+            let count: usize = structural_orphans.iter().map(|(_, _, n)| *n).sum();
+            let sample: Vec<(String, String)> = structural_orphans
+                .iter()
+                .take(5)
+                .map(|(table, sid, _)| (table.clone(), sid.clone()))
+                .collect();
+            tracing::error!(
+                count = count,
+                tables = structural_orphans.len(),
+                "phase 9 structural orphan rows detected"
+            );
+            return Err(thinkingroot_core::Error::OrphanStructuralRows { count, sample });
+        }
         tracing::info!(
             elapsed_ms = phase_9_started.elapsed().as_millis() as u64,
             "phase 9 byte-coverage audit passed (zero orphan bytes)"
