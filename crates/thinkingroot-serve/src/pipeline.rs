@@ -307,27 +307,38 @@ async fn run_pipeline_inner(
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
 
-    // ─── Compile Completeness Contract auto-migration ──────────────────
+    // ─── Compile schema auto-migration (pre-v2 → v2 → v3) ────────────
     // Detect a workspace whose `compile_schema_version` predates the
-    // current contract and run `backfill_structural` before Phase 1
-    // starts. Required because legacy claims need their structural
-    // rows emitted retroactively or Phase 9 will fail on the very
-    // first post-upgrade compile. Idempotent — second run is a no-op.
+    // current contract and run the appropriate migration(s) before Phase 1
+    // starts. Both migrations are idempotent — re-running is always safe.
+    //
+    // Chain: version "" or "1" → backfill_structural (v2) → water-flow GC (v3).
+    // Version "2" skips the CCC backfill and goes straight to the v3 step.
+    // Version "3" skips both.
+    //
+    // Each migration drops and re-opens the storage handle to avoid racing
+    // with the CozoDB SQLite write mutex.
     let current_version = storage
         .graph
         .get_workspace_meta("compile_schema_version")?
         .unwrap_or_default();
-    if current_version != "2" {
-        tracing::info!(
-            current_version = %current_version,
-            "auto-migrating workspace to Compile Completeness Contract (v2) before compile"
-        );
-        // Drop the open storage handle so backfill can re-open with
-        // exclusive write access (CozoDB allows shared reads but writes
-        // serialise on the SQLite mutex; an in-flight handle would race).
+    if current_version != "3" {
+        if current_version != "2" {
+            tracing::info!(
+                current_version = %current_version,
+                "auto-migrating workspace from pre-v2 \u{2192} v2 (Compile Completeness Contract)"
+            );
+            // Drop so backfill_structural can re-open with exclusive write access.
+            drop(storage);
+            let _ = crate::backfill::backfill_structural(&data_dir)?;
+            // Re-open with the v2 schema in place.
+            storage = StorageEngine::init(&data_dir).await?;
+        }
+        tracing::info!("auto-migrating workspace from v2 \u{2192} v3 (water-flow incremental GC)");
+        // Drop again so backfill_water_flow_v3_at_path can re-open with exclusive access.
         drop(storage);
-        let _ = crate::backfill::backfill_structural(&data_dir)?;
-        // Re-open storage with the migrated schema in place.
+        crate::backfill::backfill_water_flow_v3_at_path(&data_dir)?;
+        // Re-open with the v3 schema in place.
         storage = StorageEngine::init(&data_dir).await?;
     }
 

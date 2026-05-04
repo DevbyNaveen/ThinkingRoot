@@ -34,6 +34,41 @@ pub const STRUCTURAL_TABLES: &[StructuralTableSpec] = &[
     StructuralTableSpec { name: "code_metrics",       source_id_column: "source_id" },
 ];
 
+/// Generate the CozoDB Datalog script that projects primary-key columns for
+/// rows in `name` matching `sid_col = $sid`, then issues a `:rm` on those
+/// keys.  Used by both the cascade delete in `graph.rs` and the migration
+/// GC sweep in `backfill.rs` — a single canonical copy avoids drift between
+/// the two callers.
+///
+/// Composite-key tables (those where `source_id` is part of the PK) require
+/// unification syntax (`source_id = $sid`) so Cozo resolves the PK tuple
+/// before the `:rm`.  Tables whose PK is a standalone `id` column use the
+/// filter binding `{sid_col}: $sid` directly in the pattern.
+pub fn pk_rm_script_for_table(name: &str, sid_col: &str) -> String {
+    match name {
+        "code_signatures" => format!(
+            r#"?[claim_id] := *{name}{{claim_id, {sid_col}: $sid}}
+            :rm {name} {{claim_id}}"#
+        ),
+        "config_tree" => format!(
+            r#"?[source_id, dotted_path] := *{name}{{source_id, dotted_path}}, source_id = $sid
+            :rm {name} {{source_id, dotted_path}}"#
+        ),
+        "git_commits" => format!(
+            r#"?[source_id, commit_sha] := *{name}{{source_id, commit_sha}}, source_id = $sid
+            :rm {name} {{source_id, commit_sha}}"#
+        ),
+        "git_blame" => format!(
+            r#"?[source_id, line_start, line_end] := *{name}{{source_id, line_start, line_end}}, source_id = $sid
+            :rm {name} {{source_id, line_start, line_end}}"#
+        ),
+        _ => format!(
+            r#"?[id] := *{name}{{id, {sid_col}: $sid}}
+            :rm {name} {{id}}"#
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -270,6 +270,132 @@ fn reparse_from_bytes(uri: &str, bytes: &[u8]) -> Result<DocumentIR> {
     thinkingroot_parse::parse_file(tmp.path())
 }
 
+/// Migrate a workspace's compile substrate from v2 (Compile Completeness
+/// Contract) to v3 (water-flow incremental).  Performs:
+///
+/// 1. Purge orphan structural rows whose `source_id` is not in `sources`.
+/// 2. Re-reset dangling `callee_claim_id` pointers (resolved to a claim that
+///    no longer exists) to `""` (treating them as external — semantically
+///    correct because the callee has been deleted from this workspace).
+/// 3. Bump `compile_schema_version` to `"3"`.
+///
+/// `resolution_deps` population lands in T5; this migration leaves that
+/// table empty (or absent) and a future migration step will rebuild it from
+/// the resolved-edge set.
+///
+/// Idempotent — safe to re-run.
+pub fn backfill_water_flow_v3(store: &GraphStore) -> Result<()> {
+    use thinkingroot_core::structural_registry::STRUCTURAL_TABLES;
+    use cozo::DataValue;
+    use std::collections::{BTreeMap, HashSet};
+
+    tracing::info!("migrating workspace to water-flow schema (v2 \u{2192} v3)");
+
+    // ── Step 1: purge orphan structural rows ────────────────────────────
+    let orphans = store.query_orphan_structural_rows()?;
+    let total_orphan_rows: usize = orphans.iter().map(|(_, _, n)| *n).sum();
+    let mut purged_groups = 0usize;
+
+    for (table_name, source_id, _count) in &orphans {
+        let spec = STRUCTURAL_TABLES
+            .iter()
+            .find(|s| s.name == *table_name)
+            .ok_or_else(|| {
+                thinkingroot_core::Error::Config(format!(
+                    "unknown structural table {table_name} in STRUCTURAL_TABLES registry"
+                ))
+            })?;
+        let mut params = BTreeMap::new();
+        params.insert("sid".into(), DataValue::Str(source_id.clone().into()));
+        let script = thinkingroot_core::structural_registry::pk_rm_script_for_table(
+            spec.name,
+            spec.source_id_column,
+        );
+        store
+            .raw_db()
+            .run_script(&script, params, cozo::ScriptMutability::Mutable)
+            .map_err(|e| {
+                thinkingroot_core::Error::GraphStorage(format!(
+                    "migration purge failed for {table_name}/{source_id}: {e}"
+                ))
+            })?;
+        purged_groups += 1;
+    }
+    tracing::info!(
+        purged_groups = purged_groups,
+        total_orphan_rows = total_orphan_rows,
+        "migration step 1: purged orphan structural rows"
+    );
+
+    // ── Step 2: re-reset dangling callee_claim_id pointers ─────────────
+    // Collect the set of live claim ids.
+    let live_claims_q = store
+        .raw_db()
+        .run_script(
+            "?[id] := *claims{id}",
+            Default::default(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .map_err(|e| {
+            thinkingroot_core::Error::GraphStorage(format!("list claims for dangling-reset: {e}"))
+        })?;
+    let live_claim_ids: HashSet<String> = live_claims_q
+        .rows
+        .iter()
+        .filter_map(|r| r.first())
+        .filter_map(|v| {
+            if let DataValue::Str(s) = v {
+                let s = s.to_string();
+                if s.is_empty() { None } else { Some(s) }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pull all function_calls rows with a non-empty callee_claim_id
+    // (those are the ones Phase 7e resolved; we need to check whether
+    // the callee still exists).
+    let resolved_calls = store.list_resolved_function_calls()?;
+
+    let mut reset = 0usize;
+    let mut dangling_batch: Vec<thinkingroot_graph::rows::FunctionCall> = Vec::new();
+    for call in resolved_calls {
+        if !live_claim_ids.contains(&call.callee_claim_id) {
+            // Callee claim was deleted after resolution — treat as external.
+            dangling_batch.push(thinkingroot_graph::rows::FunctionCall {
+                callee_claim_id: String::new(),
+                ..call
+            });
+            reset += 1;
+        }
+    }
+    if !dangling_batch.is_empty() {
+        store.insert_function_calls_batch(&dangling_batch)?;
+    }
+    tracing::info!(
+        reset_count = reset,
+        "migration step 2: re-reset dangling Phase 7e callee pointers to external"
+    );
+
+    // ── Step 3: bump schema version ─────────────────────────────────────
+    store.set_workspace_meta("compile_schema_version", "3")?;
+    tracing::info!("migration complete (compile_schema_version = \"3\")");
+
+    Ok(())
+}
+
+/// Sibling of `backfill_water_flow_v3` that takes a `data_dir: &Path` —
+/// opens the `GraphStore`, runs the migration, and drops the handle.
+/// Used by the pipeline auto-trigger and the `root migrate --to-water-flow`
+/// subcommand because both need to drop the old storage handle before
+/// migration and re-open it after.
+pub fn backfill_water_flow_v3_at_path(data_dir: &std::path::Path) -> Result<()> {
+    let store = GraphStore::init(data_dir)?;
+    backfill_water_flow_v3(&store)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

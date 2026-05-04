@@ -105,6 +105,18 @@ enum Commands {
         /// future contracts can pin a target version explicitly.
         #[arg(long)]
         to_completeness_contract: bool,
+        /// Migrate to the water-flow incremental schema (v3). Purges orphan
+        /// structural rows left by source deletions that occurred before the
+        /// water-flow cascade fix, re-resets dangling Phase 7e callee pointers,
+        /// and bumps `compile_schema_version` to "3". Idempotent — safe to
+        /// re-run. `root compile` auto-triggers this on first compile after
+        /// an engine upgrade.
+        #[arg(long)]
+        to_water_flow: bool,
+        /// Report what the migration would do without writing anything.
+        /// Only valid with `--to-water-flow`.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Query the compiled knowledge base (raw vector search)
     Query {
@@ -819,13 +831,15 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Migrate {
             path,
             to_completeness_contract,
+            to_water_flow,
+            dry_run,
         }) => {
             // `migrate` opens CozoDB to run schema upgrades; today
             // it's safe to run in-process even when the daemon is
-            // up because `backfill_structural` takes the workspace
-            // lock and waits. Future hardening: route through the
+            // up because the migration helpers take the workspace
+            // lock and wait. Future hardening: route through the
             // daemon to centralise schema mutations.
-            run_migrate(&path, to_completeness_contract)?;
+            run_migrate(&path, to_completeness_contract, to_water_flow, dry_run)?;
         }
         Some(Commands::Query { query, path, top_k }) => {
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
@@ -1706,11 +1720,16 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
     Ok(())
 }
 
-fn run_migrate(path: &Path, to_completeness_contract: bool) -> anyhow::Result<()> {
-    if !to_completeness_contract {
+fn run_migrate(
+    path: &Path,
+    to_completeness_contract: bool,
+    to_water_flow: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if !to_completeness_contract && !to_water_flow {
         anyhow::bail!(
             "no migration target specified. Use --to-completeness-contract to upgrade \
-             this workspace to the v2 schema."
+             to the v2 schema, or --to-water-flow to upgrade to the v3 schema."
         );
     }
 
@@ -1722,6 +1741,43 @@ fn run_migrate(path: &Path, to_completeness_contract: bool) -> anyhow::Result<()
         );
     }
 
+    if to_water_flow {
+        if dry_run {
+            let store = thinkingroot_graph::graph::GraphStore::init(&data_dir)
+                .map_err(|e| anyhow::anyhow!("failed to open workspace: {e}"))?;
+            let orphans = store
+                .query_orphan_structural_rows()
+                .map_err(|e| anyhow::anyhow!("orphan query failed: {e}"))?;
+            let total: usize = orphans.iter().map(|(_, _, n)| *n).sum();
+            println!(
+                "  {} [dry-run] would purge {total} orphan structural rows across {} group(s)",
+                style("→").cyan().bold(),
+                orphans.len()
+            );
+            for (table, sid, count) in orphans.iter().take(10) {
+                println!("    {table:30} source_id={sid:40} {count} rows");
+            }
+            if orphans.len() > 10 {
+                println!("    … and {} more group(s) not shown", orphans.len() - 10);
+            }
+            return Ok(());
+        }
+
+        println!(
+            "  {} migrating workspace at {} to water-flow incremental schema (v3)",
+            style("→").cyan().bold(),
+            path.display()
+        );
+        thinkingroot_serve::backfill::backfill_water_flow_v3_at_path(&data_dir)
+            .map_err(|e| anyhow::anyhow!("water-flow migration failed: {e}"))?;
+        println!(
+            "  {} migration complete: workspace is on water-flow schema (v3).",
+            style("✓").green().bold()
+        );
+        return Ok(());
+    }
+
+    // to_completeness_contract path (v2).
     println!(
         "  {} migrating workspace at {} to Compile Completeness Contract (v2)",
         style("→").cyan().bold(),

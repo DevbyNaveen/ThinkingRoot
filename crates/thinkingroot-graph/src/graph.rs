@@ -5372,38 +5372,13 @@ pub struct TurnRow {
 
 /// Per-structural-table `:rm` script string.  Each table's primary key
 /// is encoded here because Cozo's `:rm` requires the PK projection,
-/// and the PK shape differs per table (most are `id`, but
-/// `code_signatures` keys on `claim_id`, `config_tree` keys on
-/// `(source_id, dotted_path)`, `git_commits` keys on `(source_id,
-/// commit_sha)`, `git_blame` keys on `(source_id, line_start, line_end)`).
-///
-/// Composite-key tables use the `column = $param` filter shape rather
-/// than the `column: $param` body-binding shape because `:rm` needs
-/// `source_id` projected in the rule head, which requires it to be a
-/// bound symbol — `*table{source_id: $sid}` filters but doesn't bind.
+/// Delegate to the canonical implementation in `thinkingroot_core::structural_registry`
+/// so that `cascade_structural_tables_for_source` and the v3 migration GC sweep in
+/// `thinkingroot_serve::backfill` share one authoritative copy of these scripts.
+/// Any future PK-shape change is made once in `structural_registry.rs` and picked
+/// up here automatically.
 fn pk_rm_script_for_table(name: &str, sid_col: &str) -> String {
-    match name {
-        "code_signatures" => format!(
-            r#"?[claim_id] := *{name}{{claim_id, {sid_col}: $sid}}
-            :rm {name} {{claim_id}}"#
-        ),
-        "config_tree" => format!(
-            r#"?[source_id, dotted_path] := *{name}{{source_id, dotted_path}}, source_id = $sid
-            :rm {name} {{source_id, dotted_path}}"#
-        ),
-        "git_commits" => format!(
-            r#"?[source_id, commit_sha] := *{name}{{source_id, commit_sha}}, source_id = $sid
-            :rm {name} {{source_id, commit_sha}}"#
-        ),
-        "git_blame" => format!(
-            r#"?[source_id, line_start, line_end] := *{name}{{source_id, line_start, line_end}}, source_id = $sid
-            :rm {name} {{source_id, line_start, line_end}}"#
-        ),
-        _ => format!(
-            r#"?[id] := *{name}{{id, {sid_col}: $sid}}
-            :rm {name} {{id}}"#
-        ),
-    }
+    thinkingroot_core::structural_registry::pk_rm_script_for_table(name, sid_col)
 }
 
 /// Extract a String from a DataValue.
