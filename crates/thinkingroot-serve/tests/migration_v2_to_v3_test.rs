@@ -18,10 +18,11 @@ use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_graph::rows::FunctionCall;
 use thinkingroot_serve::backfill::backfill_water_flow_v3;
 
-fn make_store() -> GraphStore {
+fn make_store() -> (tempfile::TempDir, GraphStore) {
     let dir = tempdir().unwrap();
-    let path = dir.into_path();
-    GraphStore::init(&path).unwrap()
+    let path = dir.path().to_path_buf();
+    let store = GraphStore::init(&path).unwrap();
+    (dir, store)
 }
 
 /// Insert a `function_calls` row pointing at a source_id that does NOT exist
@@ -29,7 +30,7 @@ fn make_store() -> GraphStore {
 /// schema version.
 #[test]
 fn migration_purges_orphan_structural_rows() {
-    let store = make_store();
+    let (_dir, store) = make_store();
 
     let row = FunctionCall {
         id: "fc-orphan-mig".to_string(),
@@ -67,7 +68,7 @@ fn migration_purges_orphan_structural_rows() {
 /// on the second call and must leave `compile_schema_version = "3"`.
 #[test]
 fn migration_is_idempotent_on_re_run() {
-    let store = make_store();
+    let (_dir, store) = make_store();
     backfill_water_flow_v3(&store).unwrap();
     backfill_water_flow_v3(&store).unwrap();
     let v = store.get_workspace_meta("compile_schema_version").unwrap();
@@ -79,7 +80,7 @@ fn migration_is_idempotent_on_re_run() {
 /// by the migration.
 #[test]
 fn migration_re_resets_dangling_callee_claim_ids() {
-    let store = make_store();
+    let (_dir, store) = make_store();
 
     // Insert a real source so the function_call row is NOT an orphan
     // (it should survive the orphan purge and only be modified by step 2).
@@ -128,7 +129,7 @@ fn migration_re_resets_dangling_callee_claim_ids() {
 #[test]
 fn migration_auto_triggers_on_compile_schema_version_mismatch() {
     let dir = tempdir().unwrap();
-    let path = dir.into_path();
+    let path = dir.path().to_path_buf();
     let store = GraphStore::init(&path).unwrap();
     store
         .set_workspace_meta("compile_schema_version", "2")
@@ -143,7 +144,7 @@ fn migration_auto_triggers_on_compile_schema_version_mismatch() {
 #[test]
 fn explicit_root_migrate_runs_same_logic() {
     let dir = tempdir().unwrap();
-    let path = dir.into_path();
+    let path = dir.path().to_path_buf();
     {
         // Create the workspace (runs schema migrations but leaves version unset).
         let _store = GraphStore::init(&path).unwrap();
@@ -161,7 +162,7 @@ fn explicit_root_migrate_runs_same_logic() {
 /// when it lands.
 #[test]
 fn migration_resolution_deps_left_empty_until_t5() {
-    let store = make_store();
+    let (_dir, store) = make_store();
     backfill_water_flow_v3(&store).unwrap();
 
     let result = store.raw_db().run_script(

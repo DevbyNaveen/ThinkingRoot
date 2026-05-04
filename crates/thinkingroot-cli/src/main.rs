@@ -115,7 +115,7 @@ enum Commands {
         to_water_flow: bool,
         /// Report what the migration would do without writing anything.
         /// Only valid with `--to-water-flow`.
-        #[arg(long)]
+        #[arg(long, requires = "to_water_flow")]
         dry_run: bool,
     },
     /// Query the compiled knowledge base (raw vector search)

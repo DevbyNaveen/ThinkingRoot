@@ -15,5 +15,5 @@ pub use global_config::{
 };
 pub use id::Id;
 pub use safe_path::{atomic_write, is_loopback_host, safe_join_under, validate_id};
-pub use structural_registry::{pk_rm_script_for_table, STRUCTURAL_TABLES, StructuralTableSpec};
+pub use structural_registry::{STRUCTURAL_TABLES, StructuralTableSpec};
 pub use types::*;
