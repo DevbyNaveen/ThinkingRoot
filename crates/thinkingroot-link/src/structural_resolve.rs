@@ -42,54 +42,91 @@ pub struct ResolutionStats {
 }
 
 /// Run all three resolution passes. Called from `Linker::link`.
+///
+/// T4 (I-W3): every `function_calls` and `code_links` row is revalidated
+/// on each compile, not just unresolved ones.  Previously-resolved rows
+/// whose target claim / source was deleted in a later compile are reset to
+/// `""` (external).  If a live target now exists under the same callee_name
+/// or URL, the row is re-resolved to the new target — covering the case
+/// where a function or file moved between sources between compiles.
 pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     let mut stats = ResolutionStats::default();
 
-    // ── 1. function_calls.callee_claim_id ──────────────────────────────
-    // Build symbol → claim_id map (multi-valued because two functions in
-    // different scopes can share a name; Phase 6.7's callee_name has no
-    // scope info so we resolve to the *first* match for v1. A v1.1
-    // refinement keys on (callee_name, parent_scope) once Phase 6.7
-    // emits caller's parent scope into function_calls).
+    // ── 1. function_calls.callee_claim_id (revalidation) ───────────────
+    // Build symbol → claim_id map (first-write-wins on duplicate symbols;
+    // v1.1 will key on (callee_name, parent_scope) for scope-aware
+    // resolution once Phase 6.7 emits caller parent scope).
     let symbol_pairs = graph.list_claim_symbols()?;
     let mut symbol_to_claim: HashMap<String, String> = HashMap::with_capacity(symbol_pairs.len());
     for (claim_id, symbol) in symbol_pairs {
-        // First-write-wins — duplicates from multiple files keep the
-        // earliest-inserted claim id. Cleaner heuristics ship in v1.1.
         symbol_to_claim.entry(symbol).or_insert(claim_id);
     }
 
-    let unresolved_calls = graph.list_unresolved_function_calls()?;
+    // Build live claim-id set for revalidation of previously-resolved rows.
+    // We query all claims (with or without a symbol) so that a resolved
+    // callee_claim_id pointing at an import-only claim (no symbol) is still
+    // correctly kept alive when that claim still exists.
+    let all_claim_ids = graph.get_all_claim_ids()?;
+    let live_claim_ids: HashSet<String> = all_claim_ids.into_iter().collect();
+
+    // Revalidate ALL function_calls rows (resolved + unresolved).
+    let all_calls = graph.list_all_function_calls()?;
     let mut updated_calls: Vec<FunctionCall> = Vec::new();
-    for mut call in unresolved_calls {
-        if let Some(claim_id) = symbol_to_claim.get(&call.callee_name) {
-            // External callees keep callee_claim_id = "" — only update
-            // when we find a workspace-internal match.
-            call.callee_claim_id = claim_id.clone();
+    for mut call in all_calls {
+        let original = call.callee_claim_id.clone();
+        if !original.is_empty() && !live_claim_ids.contains(&original) {
+            // Was resolved but the target claim is gone — re-resolve by
+            // callee_name (may land on a new live claim, or stay "").
+            call.callee_claim_id = symbol_to_claim
+                .get(&call.callee_name)
+                .cloned()
+                .unwrap_or_default();
             updated_calls.push(call);
+        } else if original.is_empty() {
+            // Was unresolved — attempt fresh resolution.
+            if let Some(claim_id) = symbol_to_claim.get(&call.callee_name) {
+                call.callee_claim_id = claim_id.clone();
+                updated_calls.push(call);
+            }
         }
+        // else: original is non-empty AND still live — no change needed.
     }
     stats.calls_resolved = updated_calls.len();
     if !updated_calls.is_empty() {
         graph.insert_function_calls_batch(&updated_calls)?;
     }
 
-    // ── 2. code_links.is_internal + target_source_id ───────────────────
+    // ── 2. code_links.is_internal + target_source_id (revalidation) ────
     let source_uris = graph.list_source_uris()?;
     let mut uri_lookup: HashMap<String, String> = HashMap::with_capacity(source_uris.len());
     for (sid, uri) in source_uris {
         uri_lookup.insert(normalise_uri(&uri), sid);
     }
+    let live_source_ids: HashSet<String> = uri_lookup.values().cloned().collect();
 
-    let unresolved_links = graph.list_unresolved_code_links()?;
+    // Revalidate ALL code_links rows (resolved + unresolved).
+    let all_links = graph.list_all_code_links()?;
     let mut updated_links: Vec<CodeLink> = Vec::new();
-    for mut link in unresolved_links {
-        let normalised = normalise_uri(&link.url);
-        if let Some(target_id) = uri_lookup.get(&normalised) {
+    for mut link in all_links {
+        let original = link.target_source_id.clone();
+        let new_target = uri_lookup
+            .get(&normalise_uri(&link.url))
+            .cloned()
+            .unwrap_or_default();
+        let new_internal = !new_target.is_empty();
+        if !original.is_empty() && !live_source_ids.contains(&original) {
+            // Was resolved but the target source is gone — re-resolve by
+            // URL (may land on a new live source, or reset to "").
+            link.target_source_id = new_target;
+            link.is_internal = new_internal;
+            updated_links.push(link);
+        } else if original.is_empty() && new_internal {
+            // Was unresolved — attempt fresh resolution.
+            link.target_source_id = new_target;
             link.is_internal = true;
-            link.target_source_id = target_id.clone();
             updated_links.push(link);
         }
+        // else: original non-empty AND still live, or external — no change.
     }
     stats.links_resolved = updated_links.len();
     if !updated_links.is_empty() {
@@ -99,21 +136,20 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     // ── 3. source_references build ─────────────────────────────────────
     let mut references: Vec<SourceReference> = Vec::new();
 
-    // 3a. From resolved code_links → reference_kind = "link".
-    // We re-list the resolved set rather than reuse `updated_links`
-    // because earlier-resolved links from a previous compile also
-    // qualify (idempotency: re-running Phase 7e regenerates source_refs
-    // for every resolved link, not just the newly-resolved ones).
-    let all_links = graph.list_unresolved_code_links()?;
-    // After the Step-2 update, list_unresolved_code_links returns only
-    // genuinely-external links. To get the resolved set we use a
-    // second helper — but since the design needs the full set, the
-    // simpler route is to reuse `updated_links` (this compile's
-    // newly-resolved set) for v1; an older resolved code_links is
-    // already in the source_references table from when it was first
-    // resolved, and `:put` is upsert-safe.
-    drop(all_links); // unused — see comment above
+    // 3a. From newly-(re-)resolved code_links → reference_kind = "link".
+    // `updated_links` contains both freshly-resolved links and dangling
+    // links that were reset.  Only emit source_references for rows that
+    // now have a valid (non-empty) target_source_id; dangling resets have
+    // an empty target and must not produce a source_references row.
+    // Previously-resolved stable links that weren't in `updated_links`
+    // already have a source_references row from when they were first
+    // resolved; `:put` keeps those rows intact and upserts over any
+    // re-resolved rows from this compile.
     for link in &updated_links {
+        if link.target_source_id.is_empty() {
+            // Reset-to-external: no valid target — skip.
+            continue;
+        }
         let id = stable_reference_id(
             &link.source_id,
             &link.target_source_id,
@@ -135,6 +171,8 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     }
 
     // 3b. From cross-source function_calls → reference_kind = "import".
+    // Use the full resolved set (not just updated_calls) so that stable
+    // cross-source calls from prior compiles also appear in source_references.
     let resolved_calls = graph.list_resolved_function_calls()?;
     // Cache claim → source lookups so we don't N+1 query CozoDB.
     let mut claim_to_source: HashMap<String, String> = HashMap::new();
@@ -188,7 +226,7 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     // but two passes + an in-memory roll-up is simpler and runs in one
     // table scan + one HashMap-keyed update). Reads `function_calls`
     // *after* Step 1's resolutions land so callee_claim_id is fresh.
-    let all_calls = graph.list_all_function_calls()?;
+    let all_calls_fresh = graph.list_all_function_calls()?;
 
     // fan_out: per caller_claim_id, the set of distinct callee_names
     // we observed. Includes external callees (any name we saw the
@@ -199,7 +237,7 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     // External callers aren't in the table, so they're absent — fan_in
     // is correctly internal-only.
     let mut fan_in_map: HashMap<String, HashSet<String>> = HashMap::new();
-    for call in &all_calls {
+    for call in &all_calls_fresh {
         if !call.caller_claim_id.is_empty() && !call.callee_name.is_empty() {
             fan_out_map
                 .entry(call.caller_claim_id.clone())

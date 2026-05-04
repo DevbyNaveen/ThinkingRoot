@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use cozo::{DataValue, ScriptMutability};
 use tempfile::tempdir;
 use thinkingroot_core::Source;
-use thinkingroot_core::types::{ContentHash, SourceType};
+use thinkingroot_core::types::{ClaimType, ContentHash, SourceType, WorkspaceId};
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_graph::rows::{
     CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow, DocTagRow,
     FunctionCall, HeadingRow, QuantityRow, ResidualChunk, SourceAnnotation, TestAnnotation,
 };
+use thinkingroot_link::structural_resolve;
 
 fn make_store() -> GraphStore {
     let dir = tempdir().unwrap();
@@ -615,4 +616,189 @@ fn phase_9_passes_after_clean_cascade() {
 
     let orphans = store.query_orphan_structural_rows().unwrap();
     assert!(orphans.is_empty(), "expected no orphans after clean cascade, got: {orphans:?}");
+}
+
+// ── T4: Phase 7e re-resolution tests ─────────────────────────────────────────
+
+/// Pre-T4, `resolve` only re-resolved rows where `callee_claim_id = ""`.
+/// A row already resolved to a claim that was subsequently deleted would
+/// retain the dangling claim id forever.  Post-T4 every row is revalidated
+/// each compile: dangling ids reset to `""` (external) or re-resolve to a
+/// newly-live target.
+#[test]
+fn function_deleted_callsite_dangling_callee_id_re_resolves_to_empty() {
+    let store = make_store();
+
+    // Source A defines fn `target`; source B has a function_calls row
+    // already resolved to A's claim.
+    let src_a = Source::new("test://a.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-a".into()));
+    store.insert_source(&src_a).unwrap();
+
+    let src_b = Source::new("test://b.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-b".into()));
+    let src_b_id = src_b.id.to_string();
+    store.insert_source(&src_b).unwrap();
+
+    // Insert a claim in A with symbol = "target" so Phase 7e can find it.
+    let claim_a = thinkingroot_core::Claim::new(
+        "fn target() { ... }",
+        ClaimType::Fact,
+        src_a.id,
+        WorkspaceId::new(),
+    )
+    .with_symbol("target");
+    let claim_a_id = claim_a.id.to_string();
+    store.insert_claim(&claim_a).unwrap();
+
+    // function_calls row in B, already resolved (post-Phase 7e) to A's claim.
+    let row = FunctionCall {
+        id: "fc-b-calls-a".to_string(),
+        caller_claim_id: "caller-in-b".to_string(),
+        callee_name: "target".to_string(),
+        callee_claim_id: claim_a_id.clone(), // previously resolved
+        source_id: src_b_id.clone(),
+        byte_start: 0,
+        byte_end: 16,
+        content_blake3: "blake-b".to_string(),
+    };
+    store.insert_function_calls_batch(&[row]).unwrap();
+
+    // Delete source A — simulating its source changing in a later compile.
+    // The cascade removes A's source row and its claim rows.
+    store.remove_source_by_uri("test://a.rs").unwrap();
+
+    // Re-run Phase 7e.  Post-T4 it revalidates every row (not just the
+    // ones with callee_claim_id = ""), so the dangling pointer must reset.
+    structural_resolve::resolve(&store).unwrap();
+
+    let mut params = BTreeMap::new();
+    params.insert("id".into(), DataValue::Str("fc-b-calls-a".into()));
+    let result = store
+        .raw_db()
+        .run_script(
+            "?[callee_claim_id] := *function_calls{id: $id, callee_claim_id}",
+            params,
+            ScriptMutability::Immutable,
+        )
+        .unwrap();
+    let resolved = match &result.rows[0][0] {
+        DataValue::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
+    assert_eq!(
+        resolved, "",
+        "dangling callee_claim_id should be reset to external (\"\") after target claim deleted"
+    );
+}
+
+/// When a `code_links` row has `target_source_id` pointing at a source that
+/// was subsequently removed, Phase 7e must reset both `target_source_id` and
+/// `is_internal` to their unresolved defaults.
+#[test]
+fn code_link_target_source_deleted_re_resolves() {
+    let store = make_store();
+
+    let src_x = Source::new("test://x.md".into(), SourceType::File)
+        .with_hash(ContentHash("hash-x".into()));
+    let src_x_id = src_x.id.to_string();
+    store.insert_source(&src_x).unwrap();
+
+    let src_y = Source::new("test://y.md".into(), SourceType::File)
+        .with_hash(ContentHash("hash-y".into()));
+    let src_y_id = src_y.id.to_string();
+    store.insert_source(&src_y).unwrap();
+
+    // Code link already resolved: x → y.
+    let link = CodeLink {
+        id: "cl-1".to_string(),
+        source_id: src_x_id.clone(),
+        chunk_id: String::new(),
+        url: "test://y.md".to_string(),
+        link_text: "see y".to_string(),
+        is_internal: true,
+        target_source_id: src_y_id.clone(),
+        byte_start: 0,
+        byte_end: 8,
+        content_blake3: "blake-link".to_string(),
+    };
+    store.insert_code_links_batch(&[link]).unwrap();
+
+    // Delete source Y.
+    store.remove_source_by_uri("test://y.md").unwrap();
+
+    // Re-run Phase 7e.
+    structural_resolve::resolve(&store).unwrap();
+
+    let mut params = BTreeMap::new();
+    params.insert("id".into(), DataValue::Str("cl-1".into()));
+    let result = store
+        .raw_db()
+        .run_script(
+            "?[target_source_id, is_internal] := *code_links{id: $id, target_source_id, is_internal}",
+            params,
+            ScriptMutability::Immutable,
+        )
+        .unwrap();
+    let target = match &result.rows[0][0] {
+        DataValue::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
+    let internal = matches!(&result.rows[0][1], DataValue::Bool(true));
+    assert_eq!(
+        target, "",
+        "target_source_id must be cleared when target source no longer exists"
+    );
+    assert!(
+        !internal,
+        "is_internal must be false when target source no longer exists"
+    );
+}
+
+/// Pins the upsert semantics of `insert_function_calls_batch`: re-emitting a
+/// function_calls row with the same `id` but a different `callee_name`
+/// overwrites the prior row in place (`:put` semantics keyed on `id`).
+#[test]
+fn function_renamed_in_place_old_row_replaced() {
+    let store = make_store();
+
+    let src = Source::new("test://r.rs".into(), SourceType::File)
+        .with_hash(ContentHash("hash-r".into()));
+    let src_id = src.id.to_string();
+    store.insert_source(&src).unwrap();
+
+    let v1 = FunctionCall {
+        id: "fc-stable".to_string(),
+        caller_claim_id: "caller-r".to_string(),
+        callee_name: "old_name".to_string(),
+        callee_claim_id: String::new(),
+        source_id: src_id.clone(),
+        byte_start: 100,
+        byte_end: 200,
+        content_blake3: "blake-v1".to_string(),
+    };
+    store.insert_function_calls_batch(&[v1.clone()]).unwrap();
+
+    // Upsert the same id with updated callee_name.
+    let v2 = FunctionCall {
+        callee_name: "new_name".to_string(),
+        ..v1
+    };
+    store.insert_function_calls_batch(&[v2]).unwrap();
+
+    let mut params = BTreeMap::new();
+    params.insert("id".into(), DataValue::Str("fc-stable".into()));
+    let result = store
+        .raw_db()
+        .run_script(
+            "?[callee_name] := *function_calls{id: $id, callee_name}",
+            params,
+            ScriptMutability::Immutable,
+        )
+        .unwrap();
+    let name = match &result.rows[0][0] {
+        DataValue::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
+    assert_eq!(name, "new_name", "upsert should overwrite to new_name");
 }
