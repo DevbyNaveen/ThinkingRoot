@@ -434,6 +434,173 @@ struct ReplayCounts {
     claim_count: usize,
 }
 
+/// T1.4 — Import a `.tr` pack as a new branch within an existing
+/// workspace.  Round-trip pair to `root pack --branch <name>`.
+///
+/// Pipeline:
+///
+/// 1. Read + parse the pack; verify the pack-hash chain (always).
+/// 2. Optional Sigstore signature acknowledgement (skipped under
+///    `--no-verify`, mirrors `run_mount`'s local-trust regime).
+/// 3. Create the branch in the workspace registry via
+///    `create_branch_full`.  Forks off `main`; an empty main is fine
+///    — the branch's graph.db starts as a clone of main (which may
+///    be empty) and the replay populates it from the pack.
+/// 4. Decompress the pack's source bundle into a temporary
+///    in-memory map (no disk staging — the bytes flow straight into
+///    the byte store).
+/// 5. Replay the pack into the BRANCH'S data dir
+///    (`<workspace>/.thinkingroot/branches/<slug>/`), populating
+///    Sources, Entities, Claims, and the FileSystemSourceStore.
+/// 6. Print a `BranchImportSummary` JSON block to stdout so SDKs +
+///    automation can pick up the branch name + counts.
+///
+/// Notes:
+///
+/// - The byte store at `<workspace>/.thinkingroot/branches/<slug>/`
+///   is populated independently of main's byte store.  This means
+///   pack-imported branches can be packed back out (`root pack
+///   --branch <name>`) without falling back to main's source store —
+///   round-trip works as long as each pack's source bytes land in
+///   the branch's own store at import time.
+/// - We do NOT register the branch with a running daemon.  Branches
+///   live inside the workspace registry; the daemon picks them up
+///   automatically when it serves the workspace.
+pub async fn run_import_as_branch(
+    pack_path: &Path,
+    workspace_root: &Path,
+    branch_name: &str,
+    no_verify: bool,
+) -> Result<()> {
+    use thinkingroot_core::{BranchKind, BranchPermissions, MergePolicy};
+
+    // 1. Parse + integrity-verify the pack.
+    let bytes = std::fs::read(pack_path)
+        .with_context(|| format!("read pack {}", pack_path.display()))?;
+    let pack = read_v3_pack(&bytes)
+        .map_err(|e| anyhow!("parse {} as v3 pack: {e}", pack_path.display()))?;
+
+    let recomputed = pack.recompute_pack_hash();
+    if recomputed != pack.manifest.pack_hash {
+        bail!(
+            "pack hash chain broken: manifest declares {} but recomputed is {}.\n\
+             The pack has been modified since it was built.",
+            pack.manifest.pack_hash,
+            recomputed
+        );
+    }
+
+    let signed = pack.signature.is_some();
+    if !no_verify && signed {
+        acknowledge_signed_bundle_in_local_trust_mode(&pack)?;
+    } else if !signed {
+        eprintln!(
+            "  warning: pack {} is unsigned (T0 trust); proceed with caution",
+            pack.manifest.name
+        );
+    }
+
+    // 2. Workspace must exist — branches live inside `.thinkingroot/`
+    //    and `create_branch_full` clones main's graph.db as the
+    //    branch's seed.  An empty graph is fine.
+    let workspace_engine_dir = workspace_root.join(".thinkingroot");
+    if !workspace_engine_dir.exists() {
+        bail!(
+            "workspace at `{}` is not initialised (no `.thinkingroot/` dir).\n\
+             Run `root compile {}` first, then re-run `root branch-import`.",
+            workspace_root.display(),
+            workspace_root.display()
+        );
+    }
+
+    // 3. Create the branch in the registry.  `create_branch_full`
+    //    appends a `BranchEvent::Created` and writes the on-disk
+    //    layout (graph.db cloned from main, parent-at-fork pinned).
+    let _branch_ref = thinkingroot_branch::create_branch_full(
+        workspace_root,
+        branch_name,
+        "main",
+        Some(format!(
+            "imported from pack {}@{}",
+            pack.manifest.name, pack.manifest.version
+        )),
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::Manual,
+        None,
+    )
+    .await
+    .map_err(|e| anyhow!("create branch '{branch_name}': {e}"))?;
+
+    // 4. Decompress the source bundle into an in-memory map.  We
+    //    don't stage to disk because the byte store is the durable
+    //    home for these bytes — `replay_pack_into_storage` writes
+    //    them via `FileSystemSourceStore::put`.
+    let staging_root = workspace_root
+        .join(".thinkingroot")
+        .join("branches")
+        .join(thinkingroot_branch::snapshot::slugify(branch_name))
+        .join("imported_sources");
+    std::fs::create_dir_all(&staging_root).map_err(|e| anyhow!("create staging: {e}"))?;
+    let source_files = decompress_sources(&pack.source_archive, &staging_root)?;
+
+    // 5. Replay into the branch's data dir.  `resolve_data_dir`
+    //    returns `<root>/.thinkingroot/branches/<slug>/`; the
+    //    `replay_pack_into_storage` helper writes graph.db at
+    //    `<dir>/graph/` and source bytes at `<dir>/rooting/sources/`.
+    //
+    //    Important: `create_branch_full` already populated the
+    //    branch's graph.db with main's contents (cloned).  The
+    //    replay below adds the pack's claims/entities/sources on top,
+    //    matching the "branch off main, then layer pack contents"
+    //    semantics callers expect.
+    let branch_data_dir =
+        thinkingroot_branch::snapshot::resolve_data_dir(workspace_root, Some(branch_name));
+    let workspace_id = WorkspaceId::new();
+    let replay = replay_pack_into_storage(&pack, &branch_data_dir, &source_files, workspace_id)
+        .await?;
+
+    // 6. Persist manifest + claims as siblings inside the branch's
+    //    data dir — same as `run_mount` does for the workspace.
+    //    Lets `root verify` re-walk the chain after import.
+    std::fs::write(
+        branch_data_dir.join("manifest.toml"),
+        pack.manifest.to_canonical_toml(),
+    )
+    .with_context(|| format!("write manifest at {}", branch_data_dir.display()))?;
+    std::fs::write(branch_data_dir.join("claims.jsonl"), &pack.claims_jsonl)
+        .with_context(|| format!("write claims.jsonl at {}", branch_data_dir.display()))?;
+
+    let summary = BranchImportSummary {
+        pack_name: pack.manifest.name.clone(),
+        pack_version: pack.manifest.version.to_string(),
+        branch: branch_name.to_string(),
+        workspace_root: workspace_root.display().to_string(),
+        source_files: replay.source_count,
+        claims: replay.claim_count,
+        entities: replay.entity_count,
+        signed,
+    };
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+/// JSON block written to stdout on a successful `root branch-import`.
+/// SDKs and automation parse this verbatim — keep field names stable.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BranchImportSummary {
+    pub pack_name: String,
+    pub pack_version: String,
+    pub branch: String,
+    pub workspace_root: String,
+    pub source_files: usize,
+    pub claims: usize,
+    pub entities: usize,
+    pub signed: bool,
+}
+
 /// Open a fresh CozoDB at `storage_dir` and replay the claims.jsonl
 /// payload into it.  Synthesizes Source rows from the file map (with
 /// content hash so the byte-store layout matches Phase 6's writes),

@@ -322,6 +322,28 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
     },
+    /// T1.4 — Import a `.tr` knowledge pack as a new branch in the
+    /// current workspace.  Forks main, replays the pack's claims +
+    /// entities + sources into the branch's graph.db, and registers
+    /// the branch.  Round-trip pair to `root pack --branch <name>`.
+    BranchImport {
+        /// Path to the `.tr` pack to import.
+        pack: PathBuf,
+        /// Name to assign the new branch (must be unique in the
+        /// workspace).
+        branch: String,
+        /// Path to the destination workspace root.  Must already
+        /// contain a `.thinkingroot/` from a prior `root compile`
+        /// (an empty graph is fine — the import path forks off main
+        /// regardless of whether main has data).
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Skip Sigstore signature + revocation checks on the pack.
+        /// The pack-hash chain is still verified — `--no-verify`
+        /// skips trust, not integrity.
+        #[arg(long)]
+        no_verify: bool,
+    },
     /// Manage and switch LLM providers
     Provider {
         #[command(subcommand)]
@@ -441,6 +463,17 @@ enum Commands {
         /// `crates/tr-sigstore/src/live.rs` for the flow.
         #[arg(long, conflicts_with = "sign")]
         sign_keyless: bool,
+        /// T1.4 — pack a specific branch's claim graph instead of the
+        /// workspace's main graph.  When set, the pack opens
+        /// `<workspace>/.thinkingroot/branches/<slug>/graph/graph.db`
+        /// and emits a pack containing only claims that live on that
+        /// branch.  The byte store at `<workspace>/.thinkingroot/`
+        /// remains the source-of-truth for source bytes (branches
+        /// share the byte store with main); content hashes referenced
+        /// by branch-only claims that don't exist in the main store
+        /// are skipped with a warning rather than failing the pack.
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Verify a v3 `.tr` pack's integrity and signature without
     /// installing it. Runs the offline verification chain from spec
@@ -1051,6 +1084,14 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Snapshot { name, path }) => {
             branch_cmd::handle_snapshot(&path, &name).await?;
         }
+        Some(Commands::BranchImport {
+            pack,
+            branch,
+            path,
+            no_verify,
+        }) => {
+            mount_cmd::run_import_as_branch(&pack, &path, &branch, no_verify).await?;
+        }
         Some(Commands::Provider { action }) => match action {
             None => {
                 provider_cmd::run_provider_list(Path::new(".")).await?;
@@ -1160,6 +1201,7 @@ async fn async_main() -> anyhow::Result<()> {
             description,
             sign,
             sign_keyless,
+            branch,
         }) => {
             pack_cmd::run_pack(
                 &workspace,
@@ -1170,6 +1212,7 @@ async fn async_main() -> anyhow::Result<()> {
                 description,
                 sign.as_deref(),
                 sign_keyless,
+                branch.as_deref(),
             )?;
         }
         Some(Commands::Verify {

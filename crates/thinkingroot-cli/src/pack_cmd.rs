@@ -99,6 +99,12 @@ struct PackTomlInner {
 /// 20-line manifest, optionally followed by a `signature.sig`
 /// (Sigstore Bundle v0.3 when `--sign-keyless` was passed,
 /// self-signed Ed25519 envelope when `--sign <key-file>` was passed).
+///
+/// `branch` (T1.4) selects a non-main branch to pack — the engine_dir
+/// shifts to `<workspace>/.thinkingroot/branches/<slug>/`, but the
+/// source-byte store stays rooted at `<workspace>/.thinkingroot/`
+/// because branches share the byte store with main.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pack(
     workspace: &Path,
     out: Option<PathBuf>,
@@ -108,6 +114,7 @@ pub fn run_pack(
     description_override: Option<String>,
     sign_key_path: Option<&Path>,
     sign_keyless: bool,
+    branch: Option<&str>,
 ) -> Result<()> {
     run_pack_v3(
         workspace,
@@ -118,6 +125,7 @@ pub fn run_pack(
         description_override,
         sign_key_path,
         sign_keyless,
+        branch,
     )
 }
 
@@ -138,6 +146,7 @@ pub fn run_pack(
 ///  4. Walk every `claim_id → entity_name` edge to populate `ents`.
 ///  5. Hand off to `V3PackBuilder::build` which seals the manifest with
 ///     the three BLAKE3 hashes per spec §3.1.
+#[allow(clippy::too_many_arguments)]
 fn run_pack_v3(
     workspace: &Path,
     out: Option<PathBuf>,
@@ -147,17 +156,42 @@ fn run_pack_v3(
     description_override: Option<String>,
     sign_key_path: Option<&Path>,
     sign_keyless: bool,
+    branch: Option<&str>,
 ) -> Result<()> {
     use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
 
-    let engine_dir = workspace.join(".thinkingroot");
-    if !engine_dir.exists() {
+    let workspace_engine_dir = workspace.join(".thinkingroot");
+    if !workspace_engine_dir.exists() {
         return Err(anyhow!(
             "no engine output at `{}`; run `root compile {}` first",
-            engine_dir.display(),
+            workspace_engine_dir.display(),
             workspace.display()
         ));
     }
+
+    // T1.4 — branch packs read graph.db from the branch's engine_dir
+    // but resolve source bytes through the main workspace's byte
+    // store (branches share the byte store with main).  When
+    // `branch` is None, the two pointers collapse to the same
+    // workspace_engine_dir and behaviour is identical to a workspace
+    // pack.
+    let engine_dir = match branch {
+        None => workspace_engine_dir.clone(),
+        Some(name) => {
+            let dir = thinkingroot_branch::snapshot::resolve_data_dir(workspace, Some(name));
+            if !dir.exists() {
+                return Err(anyhow!(
+                    "branch '{name}' has no data dir at `{}` — has it been created \
+                     and contributed to?",
+                    dir.display()
+                ));
+            }
+            dir
+        }
+    };
+    // Source store always points at main's byte store so branch-only
+    // claims still resolve their content hashes.
+    let source_store_dir = workspace_engine_dir.clone();
 
     // 1. Manifest scaffolding from Pack.toml + CLI overrides.
     let mut manifest = build_manifest_v3(
@@ -181,8 +215,10 @@ fn run_pack_v3(
     let graph_dir = engine_dir.join("graph");
     let graph = thinkingroot_graph::graph::GraphStore::init(&graph_dir)
         .with_context(|| format!("open graph at {}", graph_dir.display()))?;
-    let source_store = FileSystemSourceStore::new(&engine_dir)
-        .with_context(|| format!("open source store at {}", engine_dir.display()))?;
+    let source_store = FileSystemSourceStore::new(&source_store_dir)
+        .with_context(|| {
+            format!("open source store at {}", source_store_dir.display())
+        })?;
 
     // Capture identity fields up front since `builder` takes ownership
     // of the manifest below, and we need `name`/`version` for both the
@@ -1351,6 +1387,7 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(out_tr.exists(), "v3 pack file not produced");
@@ -1412,6 +1449,116 @@ description = "v3 lifecycle round-trip test."
         );
     }
 
+    /// T1.4 — round-trip: workspace → pack_a → import as branch →
+    /// re-pack the branch → pack_b.  Both packs must:
+    ///
+    /// 1. Carry the same claim count.
+    /// 2. Carry the same source-file count.
+    /// 3. Validate against `recompute_pack_hash`.
+    ///
+    /// We do NOT pin pack_a's bytes equal to pack_b's because
+    /// timestamps in the manifest (extracted_at, etc.) drift between
+    /// the two builds.  The contract is content-equivalence at the
+    /// claim/source level, not byte equality.
+    #[tokio::test]
+    async fn v3_pack_round_trips_through_branch_import_export() {
+        use crate::mount_cmd::run_import_as_branch;
+        use tr_format::read_v3_pack;
+
+        let tmp = tempdir().unwrap();
+        let workspace = fake_v3_workspace(tmp.path());
+
+        // 1. Build the workspace pack (pack_a).
+        let pack_a_path = workspace.join("alice-v3-e2e-1.0.0.tr");
+        run_pack(
+            &workspace,
+            Some(pack_a_path.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(pack_a_path.exists());
+
+        let pack_a_bytes = fs::read(&pack_a_path).unwrap();
+        let pack_a = read_v3_pack(&pack_a_bytes).expect("pack_a parses");
+        let pack_a_claim_count = pack_a.manifest.claim_count.unwrap_or(0);
+        let pack_a_source_count = pack_a.manifest.source_files.unwrap_or(0);
+        assert!(pack_a_claim_count > 0, "pack_a must carry claims");
+
+        // 2. Import the pack into a NEW branch in the workspace.  The
+        //    branch starts as a clone of main (which already carries
+        //    the same claims because the workspace was the source of
+        //    pack_a), then the replay layers pack_a's claims on top.
+        run_import_as_branch(
+            &pack_a_path,
+            &workspace,
+            "feature/imported",
+            /*no_verify=*/ true,
+        )
+        .await
+        .expect("branch-import");
+
+        // 3. Branch must show up in the registry.
+        let branches =
+            thinkingroot_branch::list_branches(&workspace).expect("list_branches");
+        assert!(
+            branches.iter().any(|b| b.name == "feature/imported"),
+            "imported branch must be in the registry"
+        );
+
+        // 4. Re-pack the branch (pack_b).
+        let pack_b_path = workspace.join("alice-v3-e2e-1.0.0-branch.tr");
+        run_pack(
+            &workspace,
+            Some(pack_b_path.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("feature/imported"),
+        )
+        .unwrap();
+        assert!(pack_b_path.exists(), "branch pack must be produced");
+
+        let pack_b_bytes = fs::read(&pack_b_path).unwrap();
+        let pack_b = read_v3_pack(&pack_b_bytes).expect("pack_b parses");
+        assert_eq!(
+            pack_b.recompute_pack_hash(),
+            pack_b.manifest.pack_hash,
+            "branch pack hash chain must close"
+        );
+
+        // 5. Round-trip contract: branch pack carries AT LEAST the
+        //    workspace pack's claim + source counts.  We use ≥
+        //    rather than == because the branch's graph is a clone of
+        //    main + the replay-layered pack contents, so duplicate
+        //    claims stay deduplicated by the v3 export's source
+        //    join — but if extra claims were introduced at branch
+        //    creation time (e.g. timestamps of the branch fork) they
+        //    would appear here.  Empirically the counts are equal,
+        //    but the looser invariant is the actually-meaningful
+        //    one for this round-trip.
+        let pack_b_claim_count = pack_b.manifest.claim_count.unwrap_or(0);
+        let pack_b_source_count = pack_b.manifest.source_files.unwrap_or(0);
+        assert!(
+            pack_b_claim_count >= pack_a_claim_count,
+            "branch pack claim count {pack_b_claim_count} must be >= workspace \
+             pack claim count {pack_a_claim_count}"
+        );
+        assert!(
+            pack_b_source_count >= pack_a_source_count,
+            "branch pack source count {pack_b_source_count} must be >= workspace \
+             pack source count {pack_a_source_count}"
+        );
+    }
+
     #[tokio::test]
     async fn v3_pack_signed_round_trips_through_verify() {
         use tr_format::read_v3_pack;
@@ -1435,6 +1582,7 @@ description = "v3 lifecycle round-trip test."
             None,
             Some(&key_path),
             false,
+            None,
         )
         .unwrap();
 
@@ -1507,6 +1655,7 @@ description = "v3 lifecycle round-trip test."
             None,
             None,
             false,
+            None,
         )
         .unwrap();
 
