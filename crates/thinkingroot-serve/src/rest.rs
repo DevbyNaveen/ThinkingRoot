@@ -985,6 +985,7 @@ async fn compile_stream(
                 cancel: cancel_for_task,
                 no_rooting,
                 skip_byte_audit: false,
+                no_incremental: false,
             },
         )
         .await

@@ -80,6 +80,23 @@ enum Commands {
         /// for piping into `jq` or driving CI dashboards.
         #[arg(long)]
         json: bool,
+        /// Stay running and re-compile when files change. Uses notify-rs
+        /// file watcher with `--debounce` ms quiet window. Press Ctrl-C
+        /// to stop.
+        #[arg(long)]
+        watch: bool,
+        /// Debounce window for `--watch` in milliseconds (default 200).
+        /// Lower values trip more compiles on bursty saves; higher values
+        /// delay the first compile after a final keystroke.
+        #[arg(long, default_value = "200")]
+        debounce: u64,
+        /// Disable all incremental cutoffs; force the full pipeline. Phase
+        /// 1 diff still runs but the fingerprint check is bypassed so every
+        /// potentially-changed source proceeds through Phase 4+. Useful
+        /// when the workspace is in a known-bad state and a clean rebuild
+        /// is wanted without nuking `.thinkingroot/` first.
+        #[arg(long)]
+        no_incremental: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -812,6 +829,9 @@ async fn async_main() -> anyhow::Result<()> {
             branch,
             no_rooting,
             json,
+            watch,
+            debounce,
+            no_incremental,
         }) => {
             // Cortex Protocol: prefer the daemon. Falls back to
             // in-process on `--in-process` or daemon error.
@@ -819,7 +839,58 @@ async fn async_main() -> anyhow::Result<()> {
                 cortex_remote::run_compile_remote(&conn, &path, branch.as_deref(), no_rooting, json)
                     .await?;
             } else {
-                run_compile(&path, branch.as_deref(), use_progress, no_rooting, json).await?;
+                run_compile(&path, branch.as_deref(), use_progress, no_rooting, json, no_incremental).await?;
+            }
+
+            if watch {
+                let watch_path = path.clone();
+                let watch_branch = branch.clone();
+                let options = watch::WatchOptions {
+                    debounce_ms: debounce,
+                    max_ticks: None,
+                };
+
+                eprintln!(
+                    "[watch] watching {} (debounce {}ms) — Ctrl-C to stop",
+                    watch_path.display(),
+                    debounce
+                );
+
+                watch::run_watch_loop(
+                    watch_path.clone(),
+                    options,
+                    move |_changed| {
+                        let p = watch_path.clone();
+                        let b = watch_branch.clone();
+                        let in_process = in_process_flag;
+                        async move {
+                            if let Some(conn) = try_resolve_remote(in_process).await {
+                                cortex_remote::run_compile_remote(
+                                    &conn,
+                                    &p,
+                                    b.as_deref(),
+                                    no_rooting,
+                                    json,
+                                )
+                                .await?;
+                            } else {
+                                run_compile(
+                                    &p,
+                                    b.as_deref(),
+                                    use_progress,
+                                    no_rooting,
+                                    json,
+                                    no_incremental,
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await?;
+
+                eprintln!("\n[watch] stopped");
             }
         }
         Some(Commands::Health { path }) => {
@@ -931,7 +1002,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Watch { path }) => {
             let path = std::fs::canonicalize(&path)
                 .with_context(|| format!("path not found: {}", path.display()))?;
-            watch::run_watch(&path).await?;
+            run_watch_standalone(&path).await?;
         }
         Some(Commands::Branch {
             name,
@@ -1170,7 +1241,7 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
                 cortex_remote::run_compile_remote(&conn, &path, None, false, false).await?;
             } else {
-                run_compile(&path, None, use_progress, false, false).await?;
+                run_compile(&path, None, use_progress, false, false, false).await?;
             }
         }
     }
@@ -1184,6 +1255,7 @@ async fn run_compile(
     use_progress: bool,
     no_rooting: bool,
     json: bool,
+    no_incremental: bool,
 ) -> anyhow::Result<()> {
     // C2: When --json is set, suppress TTY progress bars so the JSON line
     // is the sole stdout output. Pair with `2>/dev/null` to silence stderr
@@ -1222,6 +1294,7 @@ async fn run_compile(
             None,
             pipeline::PipelineOptions {
                 no_rooting,
+                no_incremental,
                 ..Default::default()
             },
         )
@@ -1879,6 +1952,156 @@ fn run_init(path: &Path) -> anyhow::Result<()> {
         "  Run `root compile {}` to compile your knowledge.",
         path.display()
     );
+
+    Ok(())
+}
+
+/// `root watch <path>` — standalone watch subcommand.
+///
+/// Watches a directory for changes and runs incremental compilation.
+/// Respects `.gitignore` and `exclude_patterns` from config.  This
+/// function lives in `main.rs` (not `watch.rs`) so it can call
+/// `pipeline` without exposing it through the lib crate.
+async fn run_watch_standalone(root_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::time::Instant;
+    use notify::RecursiveMode;
+    use notify_debouncer_mini::{DebouncedEventKind, DebounceEventResult, new_debouncer};
+    use thinkingroot_core::config::Config;
+
+    let config = Config::load_merged(root_path)?;
+
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root_path);
+    if config.parsers.respect_gitignore {
+        let gitignore_path = root_path.join(".gitignore");
+        if gitignore_path.exists() {
+            let _ = builder.add(&gitignore_path);
+        }
+    }
+    for pattern in &config.parsers.exclude_patterns {
+        let _ = builder.add_line(None, pattern);
+    }
+    let gitignore = builder.build().unwrap_or_else(|_| {
+        ignore::gitignore::GitignoreBuilder::new(root_path)
+            .build()
+            .expect("empty gitignore builder must succeed")
+    });
+
+    const ALWAYS_IGNORE: &[&str] = &[
+        ".thinkingroot", ".git", "target", "node_modules",
+        ".next", "dist", "build", "__pycache__", ".tox", ".venv",
+    ];
+    let root_canon = root_path.canonicalize().unwrap_or_else(|_| root_path.to_path_buf());
+    let should_ignore = move |path: &std::path::Path| -> bool {
+        for component in path.components() {
+            if ALWAYS_IGNORE.iter().any(|&b| component.as_os_str() == b) {
+                return true;
+            }
+        }
+        match path.canonicalize() {
+            Ok(canon) if canon.starts_with(&root_canon) => {}
+            _ => return true,
+        }
+        gitignore.matched_path_or_any_parents(path, path.is_dir()).is_ignore()
+    };
+
+    println!(
+        "\n  {} watching {} for changes (Ctrl+C to stop)\n",
+        style("ThinkingRoot").green().bold(),
+        style(root_path.display()).white()
+    );
+
+    println!("  {} initial compile...", style(">>").cyan().bold());
+    let start = Instant::now();
+    match pipeline::run_pipeline(root_path, None, None).await {
+        Ok(result) => {
+            println!(
+                "  {} compiled {} files in {:.1}s (health: {}%)\n",
+                style("OK").green().bold(),
+                result.files_parsed,
+                start.elapsed().as_secs_f64(),
+                result.health_score,
+            );
+        }
+        Err(e) => {
+            println!("  {} {e}\n", style("ERR").red().bold());
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DebounceEventResult>();
+    let mut debouncer = new_debouncer(
+        std::time::Duration::from_millis(500),
+        move |result: DebounceEventResult| {
+            let _ = tx.send(result);
+        },
+    )?;
+    debouncer.watcher().watch(root_path, RecursiveMode::Recursive)?;
+
+    println!("  {} waiting for changes...\n", style("--").dim());
+
+    loop {
+        match rx.recv().await {
+            Some(Ok(events)) => {
+                let relevant: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.kind == DebouncedEventKind::Any && !should_ignore(&e.path))
+                    .collect();
+
+                if relevant.is_empty() {
+                    continue;
+                }
+
+                let changed_count = relevant.len();
+                let sample = relevant
+                    .first()
+                    .map(|e| {
+                        e.path
+                            .strip_prefix(root_path)
+                            .unwrap_or(&e.path)
+                            .display()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                let extra = if changed_count > 1 {
+                    format!(" (+{} more)", changed_count - 1)
+                } else {
+                    String::new()
+                };
+
+                println!(
+                    "  {} {}{}",
+                    style(">>").cyan().bold(),
+                    style(&sample).white(),
+                    style(&extra).dim(),
+                );
+
+                let start = Instant::now();
+                match pipeline::run_pipeline(root_path, None, None).await {
+                    Ok(result) => {
+                        println!(
+                            "  {} {:.1}s | {} claims, {} entities, health {}%\n",
+                            style("OK").green().bold(),
+                            start.elapsed().as_secs_f64(),
+                            result.claims_count,
+                            result.entities_count,
+                            result.health_score,
+                        );
+                    }
+                    Err(e) => {
+                        println!("  {} {e}\n", style("ERR").red().bold());
+                    }
+                }
+
+                println!("  {} waiting for changes...\n", style("--").dim());
+            }
+            Some(Err(e)) => {
+                eprintln!("  {} watch error: {e}", style("ERR").red().bold());
+                tracing::warn!("watch error: {e:?}");
+            }
+            None => {
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

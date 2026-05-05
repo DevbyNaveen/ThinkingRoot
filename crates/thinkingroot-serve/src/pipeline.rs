@@ -248,6 +248,14 @@ pub struct PipelineOptions {
     /// `TR_SKIP_BYTE_AUDIT=1` env var, but typed and per-call.
     /// Production callers must leave this `false`.
     pub skip_byte_audit: bool,
+    /// Disable incremental cutoffs: bypass the Phase 3 fingerprint check
+    /// so every potentially-changed source proceeds through Phase 4+.
+    /// Phase 1 diff (mtime/size) still runs and the fingerprint store is
+    /// still updated after each source processes, but `truly_changed` is
+    /// set to the full `potentially_changed` set regardless of fingerprint
+    /// equality.  Use when the workspace is in a known-bad state and a
+    /// guaranteed full rebuild is wanted without nuking `.thinkingroot/`.
+    pub no_incremental: bool,
 }
 
 impl Default for PipelineOptions {
@@ -256,6 +264,7 @@ impl Default for PipelineOptions {
             cancel: CancellationToken::new(),
             no_rooting: false,
             skip_byte_audit: false,
+            no_incremental: false,
         }
     }
 }
@@ -286,7 +295,7 @@ async fn run_pipeline_inner(
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
     options: PipelineOptions,
 ) -> Result<PipelineResult> {
-    let PipelineOptions { cancel, no_rooting, skip_byte_audit } = options;
+    let PipelineOptions { cancel, no_rooting, skip_byte_audit, no_incremental } = options;
     // Helper macro — every long-running phase boundary checks this so
     // Stop / Ctrl-C never has to wait for the next batch to finish.
     macro_rules! bail_if_cancelled {
@@ -754,6 +763,9 @@ async fn run_pipeline_inner(
     // ─── Phase 3: Fingerprint check ────────────────────────────────────
     // For each potentially-changed doc, compute a fingerprint of its extracted
     // claims. If identical to stored fingerprint, skip this source entirely.
+    // When `no_incremental` is set, all potentially-changed docs proceed
+    // regardless of fingerprint equality (fingerprint store is still updated
+    // so the next incremental run can resume normally).
     let mut truly_changed: Vec<_> = Vec::new();
     let mut fingerprint_cutoffs = 0usize;
 
@@ -774,7 +786,7 @@ async fn run_pipeline_inner(
         })?;
         let fp = crate::fingerprint::FingerprintStore::compute(&fp_bytes);
 
-        if fingerprints.is_unchanged(&doc.uri, &fp) {
+        if !no_incremental && fingerprints.is_unchanged(&doc.uri, &fp) {
             fingerprint_cutoffs += 1;
             tracing::debug!("fingerprint early cutoff for {}", doc.uri);
         } else {

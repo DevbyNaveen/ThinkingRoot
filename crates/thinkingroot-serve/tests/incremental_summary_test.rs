@@ -164,6 +164,7 @@ async fn compile(root: &PathBuf) -> thinkingroot_core::Result<thinkingroot_serve
             cancel: CancellationToken::new(),
             no_rooting: true,
             skip_byte_audit: true,
+            no_incremental: false,
         },
     )
     .await
@@ -186,6 +187,7 @@ async fn compile_collect_events(
             cancel: CancellationToken::new(),
             no_rooting: true,
             skip_byte_audit: true,
+            no_incremental: false,
         },
     )
     .await;
