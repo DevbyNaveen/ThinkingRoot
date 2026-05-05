@@ -62,3 +62,8 @@ tower = { version = "0.5", features = ["util"] }
 cozo = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-rooting = { workspace = true }
+
+[[bench]]
+name = "incremental_smoke"
+path = "benches/incremental_smoke.rs"
+harness = false

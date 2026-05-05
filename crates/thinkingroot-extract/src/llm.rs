@@ -480,6 +480,12 @@ enum Provider {
     OpenAi(OpenAiProvider),
     Anthropic(AnthropicProvider),
     Ollama(OllamaProvider),
+    /// No-op provider used when no LLM is configured and the extractor falls
+    /// back to structural-only (Tier 0) extraction.  `chat` and
+    /// `extract_batch_raw` are never called when `llm_work` is empty, but
+    /// the provider variant must exist so `Extractor::new` can construct a
+    /// valid `Arc<LlmClient>` regardless.
+    StructuralOnly,
 }
 
 impl Provider {
@@ -490,6 +496,9 @@ impl Provider {
             Provider::OpenAi(p) => p.chat(system, user).await,
             Provider::Anthropic(p) => p.chat(system, user).await,
             Provider::Ollama(p) => p.chat(system, user).await,
+            Provider::StructuralOnly => Err(thinkingroot_core::Error::MissingConfig(
+                "structural-only extractor cannot make LLM calls".into(),
+            )),
         }
     }
 
@@ -526,6 +535,9 @@ impl Provider {
                 let stream = async_stream::stream! { yield Ok(chunk); };
                 Ok(Box::pin(stream))
             }
+            Provider::StructuralOnly => Err(thinkingroot_core::Error::MissingConfig(
+                "structural-only extractor cannot stream LLM calls".into(),
+            )),
         }
     }
 
@@ -536,6 +548,7 @@ impl Provider {
             Provider::OpenAi(p) => &p.model,
             Provider::Anthropic(p) => &p.model,
             Provider::Ollama(p) => &p.model,
+            Provider::StructuralOnly => "structural-only",
         }
     }
 
@@ -546,6 +559,7 @@ impl Provider {
             Provider::OpenAi(p) => p.provider_name.as_str(),
             Provider::Anthropic(_) => "anthropic",
             Provider::Ollama(_) => "ollama",
+            Provider::StructuralOnly => "structural-only",
         }
     }
 
@@ -582,6 +596,9 @@ impl Provider {
                 p.chat_with_tools(system, messages, tools, tool_choice)
                     .await
             }
+            Provider::StructuralOnly => Err(thinkingroot_core::Error::MissingConfig(
+                "structural-only extractor cannot use tool-calling".into(),
+            )),
         }
     }
 }
@@ -2499,6 +2516,23 @@ fn outer_timeout_secs(inner: u64) -> u64 {
 }
 
 impl LlmClient {
+    /// Create a structural-only no-op LLM client.
+    ///
+    /// Used when no LLM provider is configured and the extractor falls back to
+    /// Tier-0 (structural-only) extraction.  The returned client must never be
+    /// asked to make real LLM calls — `chat`, `chat_stream`, and
+    /// `extract_batch_raw` will all return `Err(MissingConfig)` if called.
+    /// In structural-only mode `llm_work` is always empty, so these methods
+    /// are never invoked in practice.
+    pub fn new_structural_only() -> Result<Self> {
+        Ok(Self {
+            provider: Provider::StructuralOnly,
+            max_retries: 0,
+            timeout_secs: 120,
+            scheduler: None,
+        })
+    }
+
     /// Create a new LLM client from config. Auto-detects provider.
     pub async fn new(config: &LlmConfig) -> Result<Self> {
         if !config.is_configured() {

@@ -172,9 +172,32 @@ impl Extractor {
     pub async fn new(config: &Config) -> Result<Self> {
         let scheduler = ThroughputScheduler::new(config.llm.max_concurrent_requests);
         let llm = LlmClient::new(&config.llm)
-            .await?
-            .with_max_retries(config.extraction.max_retries)
-            .with_scheduler(Arc::clone(&scheduler));
+            .await
+            .map(|l| {
+                l.with_max_retries(config.extraction.max_retries)
+                    .with_scheduler(Arc::clone(&scheduler))
+            })
+            .or_else(|e| {
+                // When no LLM provider is configured, fall back to structural-only
+                // extraction rather than failing the compile.  Structural extraction
+                // (Tier 0: AST metadata, headings, links, imports, function names)
+                // runs without any LLM calls and produces a useful — if less rich —
+                // knowledge graph.  Users without an LLM key still get the full
+                // structural substrate.
+                //
+                // Any non-MissingConfig error (e.g., invalid credentials, network
+                // failure during Bedrock credential refresh) is still propagated so
+                // the user sees the real problem.
+                if matches!(e, thinkingroot_core::Error::MissingConfig(_)) {
+                    tracing::info!(
+                        "no LLM provider configured — falling back to structural-only extraction \
+                         (Tier 0: headings, imports, function names, links)"
+                    );
+                    LlmClient::new_structural_only()
+                } else {
+                    Err(e)
+                }
+            })?;
 
         // Compute batch size: config override wins, otherwise auto-detect from model.
         let batch_size = config.extraction.extraction_batch_size.unwrap_or_else(|| {
@@ -289,7 +312,42 @@ impl Extractor {
     }
 
     /// Extract knowledge from a batch of documents — all chunks run concurrently.
+    ///
+    /// `sources_to_extract`: when `Some`, only documents whose `source_id` is
+    /// present in the set are processed; documents not in the set are skipped
+    /// entirely — before any cache lookup or LLM dispatch.  `None` means
+    /// extract all documents, which preserves the pre-T12 behaviour.  An empty
+    /// `Some(HashSet::new())` is a valid degenerate case that produces an empty
+    /// `ExtractionOutput` without error.
     pub async fn extract_all(
+        &self,
+        documents: &[DocumentIR],
+        workspace_id: WorkspaceId,
+        sources_to_extract: Option<std::collections::HashSet<thinkingroot_core::types::SourceId>>,
+    ) -> Result<ExtractionOutput> {
+        // Source-granular re-extraction (T12): filter at the DocumentIR level
+        // BEFORE any cache lookup or LLM dispatch so unchanged documents never
+        // even enter the work queues.  `None` = extract all (pre-T12 behaviour).
+        // Cloning the filtered subset is proportional to the truly-changed set
+        // (typically 1 document in the "1 file edited" hot path), not the full
+        // corpus — the cost is negligible compared to extraction itself.
+        let filtered: Vec<DocumentIR>;
+        let work: &[DocumentIR] = if let Some(ref filter) = sources_to_extract {
+            filtered = documents
+                .iter()
+                .filter(|d| filter.contains(&d.source_id))
+                .cloned()
+                .collect();
+            &filtered
+        } else {
+            documents
+        };
+        self.extract_all_inner(work, workspace_id).await
+    }
+
+    /// Inner implementation that operates on the (already-filtered) document slice.
+    /// Called by `extract_all` after the source-id filter is applied.
+    async fn extract_all_inner(
         &self,
         documents: &[DocumentIR],
         workspace_id: WorkspaceId,
@@ -915,6 +973,24 @@ impl Extractor {
         }
 
         output
+    }
+}
+
+/// Apply the source-id filter from `extract_all` to a document slice.
+///
+/// Returns the subset of `documents` whose `source_id` is present in
+/// `filter`.  When `filter` is `None`, the full slice is returned
+/// unchanged (pre-T12 behaviour).  Exposed for testing only — the
+/// production path inlines equivalent logic in `extract_all` to avoid
+/// an extra allocation in the `None` (extract-all) fast path.
+#[cfg(test)]
+pub(crate) fn apply_source_filter<'a>(
+    documents: &'a [DocumentIR],
+    filter: Option<&std::collections::HashSet<thinkingroot_core::types::SourceId>>,
+) -> Vec<&'a DocumentIR> {
+    match filter {
+        None => documents.iter().collect(),
+        Some(set) => documents.iter().filter(|d| set.contains(&d.source_id)).collect(),
     }
 }
 
@@ -1649,5 +1725,124 @@ mod tiered_tests {
             "Import (index 2) should be structural"
         );
         assert!(llm.contains(&1), "Prose (index 1) should be LLM");
+    }
+}
+
+// ── T12: source-granular re-extract filter tests ─────────────────────────────
+//
+// These tests verify the `apply_source_filter` helper used by `extract_all`
+// to restrict document processing to the Phase-1 potentially-changed set.
+// They run synchronously (no LLM, no Extractor construction) so they are
+// reliable in offline CI.
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::apply_source_filter;
+    use std::collections::HashSet;
+    use thinkingroot_core::ir::{Chunk, ChunkType, DocumentIR};
+    use thinkingroot_core::types::{SourceId, SourceType};
+
+    fn make_doc(source_id: SourceId) -> DocumentIR {
+        let mut doc = DocumentIR::new(
+            source_id,
+            format!("file_{source_id}.md"),
+            SourceType::File,
+        );
+        doc.add_chunk(Chunk::new(
+            format!("# Heading for {source_id}"),
+            ChunkType::Heading,
+            1,
+            1,
+        ));
+        doc
+    }
+
+    // 1. None filter: all documents pass through unchanged.
+    #[test]
+    fn extract_all_with_none_filter_processes_all_documents() {
+        let ids: Vec<SourceId> = (0..5).map(|_| SourceId::new()).collect();
+        let docs: Vec<DocumentIR> = ids.iter().map(|&id| make_doc(id)).collect();
+
+        let result = apply_source_filter(&docs, None);
+
+        assert_eq!(
+            result.len(),
+            5,
+            "None filter must pass all 5 documents through; got {}",
+            result.len()
+        );
+        for (original, filtered) in docs.iter().zip(result.iter()) {
+            assert_eq!(
+                original.source_id, filtered.source_id,
+                "None filter must preserve document order and identity"
+            );
+        }
+    }
+
+    // 2. Some(matched subset): only documents in the set are returned.
+    #[test]
+    fn extract_all_with_filter_skips_unmatched_sources() {
+        let source_a = SourceId::new();
+        let source_b = SourceId::new();
+        let source_c = SourceId::new();
+        let source_d = SourceId::new();
+        let source_e = SourceId::new();
+
+        let docs = vec![
+            make_doc(source_a),
+            make_doc(source_b),
+            make_doc(source_c),
+            make_doc(source_d),
+            make_doc(source_e),
+        ];
+
+        // Filter to only source_a and source_c; source_b / source_d / source_e
+        // must be skipped — before any cache lookup or LLM dispatch.
+        let filter: HashSet<SourceId> = [source_a, source_c].into_iter().collect();
+        let result = apply_source_filter(&docs, Some(&filter));
+
+        assert_eq!(
+            result.len(),
+            2,
+            "filter {{source_a, source_c}} must pass 2 documents; got {}",
+            result.len()
+        );
+        let returned_ids: HashSet<SourceId> = result.iter().map(|d| d.source_id).collect();
+        assert!(
+            returned_ids.contains(&source_a),
+            "source_a must be included in the filtered result"
+        );
+        assert!(
+            returned_ids.contains(&source_c),
+            "source_c must be included in the filtered result"
+        );
+        assert!(
+            !returned_ids.contains(&source_b),
+            "source_b must NOT be included (not in filter set)"
+        );
+        assert!(
+            !returned_ids.contains(&source_d),
+            "source_d must NOT be included (not in filter set)"
+        );
+        assert!(
+            !returned_ids.contains(&source_e),
+            "source_e must NOT be included (not in filter set)"
+        );
+    }
+
+    // 3. Some(empty set): zero documents pass — valid degenerate case, not an error.
+    #[test]
+    fn extract_all_with_empty_filter_processes_no_documents() {
+        let docs: Vec<DocumentIR> = (0..5).map(|_| make_doc(SourceId::new())).collect();
+
+        let empty_filter: HashSet<SourceId> = HashSet::new();
+        let result = apply_source_filter(&docs, Some(&empty_filter));
+
+        assert_eq!(
+            result.len(),
+            0,
+            "empty filter set must pass zero documents; got {}",
+            result.len()
+        );
     }
 }

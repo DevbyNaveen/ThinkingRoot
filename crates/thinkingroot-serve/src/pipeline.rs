@@ -402,15 +402,32 @@ async fn run_pipeline_inner(
 
     // ─── Phase 1: Identify potentially-changed documents ───────────────
     // (content hash differs from stored — NOT yet removed from graph)
+    //
+    // T12 optimization: load all stored (uri → content_hash) pairs in a
+    // single batch query and build an in-memory lookup map.  Pre-T12 this
+    // was N individual `find_sources_by_uri` queries (one per parsed file),
+    // which dominated Phase 1 latency on workspaces with many files — e.g.
+    // 100 queries × ~20ms each = ~2s even when 99 files were unchanged.
+    // The batched path pays one round-trip regardless of workspace size.
+    let stored_hashes: HashSet<String> = {
+        let pairs = storage.graph.get_sources_with_hashes()?;
+        pairs
+            .into_iter()
+            .map(|(uri, hash)| format!("{uri}\x00{hash}"))
+            .collect()
+    };
+
     let mut potentially_changed: Vec<_> = Vec::new();
     let mut skipped = 0usize;
 
     for doc in &documents {
-        let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
-        if existing_sources.len() == 1
-            && !doc.content_hash.0.is_empty()
-            && existing_sources[0].1 == doc.content_hash.0
-        {
+        // A document is unchanged iff its uri+hash pair is present in the
+        // stored set AND its content_hash is non-empty.  New files (no stored
+        // entry) and modified files (different hash) fall through to
+        // `potentially_changed`.
+        let unchanged = !doc.content_hash.0.is_empty()
+            && stored_hashes.contains(&format!("{}\x00{}", doc.uri, doc.content_hash.0));
+        if unchanged {
             skipped += 1;
         } else {
             potentially_changed.push(doc);
@@ -418,6 +435,8 @@ async fn run_pipeline_inner(
     }
 
     // Detect deleted files (in graph but not in filesystem).
+    // Reuse the `get_all_sources` call (includes source_type) to identify
+    // file-backed sources that are no longer present on disk.
     let current_uris: HashSet<&str> = documents.iter().map(|d| d.uri.as_str()).collect();
     let mut deleted_sources: Vec<(String, String)> = Vec::new(); // (source_id, uri)
     for (source_id, uri, source_type) in storage.graph.get_all_sources()? {
@@ -591,6 +610,31 @@ async fn run_pipeline_inner(
                 e
             }
         };
+        // Source-granular re-extraction (T12).  When incremental cutoffs are
+        // enabled, restrict extraction to the `potentially_changed` set only —
+        // these are the documents that failed the Phase 1 content-hash check.
+        // Unchanged documents have already been filtered out by Phase 1's
+        // content-hash diff, so the extractor never needs to process them.
+        // Using `None` (extract all) when `no_incremental` is set preserves
+        // the "guaranteed full rebuild" semantics of that flag.
+        //
+        // We build the filter from `potentially_changed` (Phase 1 set), NOT
+        // from `truly_changed` (Phase 3 set), because Phase 3's fingerprint
+        // check runs AFTER extraction in the current pipeline ordering.  The
+        // set is small when the user edited 1 file — extracting strictly more
+        // than necessary (vs. truly_changed) is a performance trade-off, not a
+        // correctness bug.
+        let extraction_filter: Option<std::collections::HashSet<thinkingroot_core::types::SourceId>> =
+            if no_incremental {
+                None
+            } else {
+                Some(
+                    potentially_changed
+                        .iter()
+                        .map(|d| d.source_id)
+                        .collect(),
+                )
+            };
         let raw = extractor
             .extract_all(
                 &potentially_changed
@@ -598,6 +642,7 @@ async fn run_pipeline_inner(
                     .map(|d| (*d).clone())
                     .collect::<Vec<_>>(),
                 workspace_id,
+                extraction_filter,
             )
             .await?;
         emit!(ProgressEvent::ExtractionComplete {
