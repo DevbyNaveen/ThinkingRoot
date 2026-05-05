@@ -89,6 +89,7 @@ pub async fn run_compile_remote(
     path: &Path,
     branch: Option<&str>,
     no_rooting: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let url = format!("{}/api/v1/ws/_/compile/stream", base_url(conn)?);
     let body = serde_json::json!({
@@ -125,6 +126,7 @@ pub async fn run_compile_remote(
     let mut stream = resp.bytes_stream().eventsource();
     let mut last_phase = String::new();
     let mut final_summary: Option<serde_json::Value> = None;
+    let mut captured_summary: Option<thinkingroot_core::IncrementalSummary> = None;
 
     let consume = async {
         while let Some(event) = stream.next().await {
@@ -155,6 +157,15 @@ pub async fn run_compile_remote(
                     if phase != last_phase {
                         println!("  {} {}", style("→").cyan(), style(&phase).white().bold());
                         last_phase = phase;
+                    }
+                }
+                "incremental_done" => {
+                    if let Some(summary_value) = payload.get("summary") {
+                        if let Ok(summary) = serde_json::from_value::<thinkingroot_core::IncrementalSummary>(
+                            summary_value.clone(),
+                        ) {
+                            captured_summary = Some(summary);
+                        }
                     }
                 }
                 "completed" | "result" | "done" => {
@@ -214,6 +225,14 @@ pub async fn run_compile_remote(
             style(relations).cyan()
         );
         println!();
+    }
+
+    if let Some(summary) = captured_summary {
+        if json {
+            println!("{}", serde_json::to_string(&summary)?);
+        } else {
+            crate::summary_printer::print(&summary, false);
+        }
     }
 
     Ok(())

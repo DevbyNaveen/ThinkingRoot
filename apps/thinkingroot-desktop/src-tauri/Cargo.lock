@@ -7589,6 +7589,7 @@ dependencies = [
  "dirs 5.0.1",
  "fs2",
  "ordered-float 5.3.0",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_json",

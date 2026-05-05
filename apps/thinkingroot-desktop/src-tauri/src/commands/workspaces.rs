@@ -237,6 +237,13 @@ pub enum CompileProgress {
         failed_batches: usize,
         #[serde(default)]
         failed_chunk_ranges: Vec<(usize, usize)>,
+        /// Full incremental delta (source/claim/structural counts +
+        /// per-phase timings) so the React side can render a summary
+        /// panel without listening to a separate IncrementalDone event.
+        /// Optional because pre-T8 daemons lack the field; the React
+        /// side renders an empty panel when None.
+        #[serde(default)]
+        incremental_summary: Option<thinkingroot_core::IncrementalSummary>,
     },
     /// Caller-initiated stop via `workspace_compile_stop`.  Distinct
     /// from `Failed` so the UI can render a neutral "stopped" state
@@ -425,6 +432,7 @@ pub async fn workspace_compile(
                         cache_dirty,
                         failed_batches: result.failed_batches,
                         failed_chunk_ranges: result.failed_chunk_ranges.clone(),
+                        incremental_summary: Some(result.incremental_summary.clone()),
                     },
                 );
                 // P4 / H6: only drop the desktop's MountedMemory when

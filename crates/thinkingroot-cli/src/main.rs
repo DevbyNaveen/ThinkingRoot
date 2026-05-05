@@ -23,6 +23,7 @@ mod resolver;
 mod rooting_cmd;
 mod serve;
 mod setup;
+mod summary_printer;
 mod update_cmd;
 mod watch;
 mod workspace;
@@ -74,6 +75,11 @@ enum Commands {
         /// stay in the `attested` tier — same as pre-Rooting behavior.
         #[arg(long)]
         no_rooting: bool,
+        /// Emit the IncrementalSummary as JSON (one line, `serde_json`
+        /// canonical) instead of the formatted summary table. Useful
+        /// for piping into `jq` or driving CI dashboards.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -805,14 +811,15 @@ async fn async_main() -> anyhow::Result<()> {
             path,
             branch,
             no_rooting,
+            json,
         }) => {
             // Cortex Protocol: prefer the daemon. Falls back to
             // in-process on `--in-process` or daemon error.
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
-                cortex_remote::run_compile_remote(&conn, &path, branch.as_deref(), no_rooting)
+                cortex_remote::run_compile_remote(&conn, &path, branch.as_deref(), no_rooting, json)
                     .await?;
             } else {
-                run_compile(&path, branch.as_deref(), use_progress, no_rooting).await?;
+                run_compile(&path, branch.as_deref(), use_progress, no_rooting, json).await?;
             }
         }
         Some(Commands::Health { path }) => {
@@ -1161,9 +1168,9 @@ async fn async_main() -> anyhow::Result<()> {
             // `root ./path` shorthand — same as `root compile ./path`.
             let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
-                cortex_remote::run_compile_remote(&conn, &path, None, false).await?;
+                cortex_remote::run_compile_remote(&conn, &path, None, false, false).await?;
             } else {
-                run_compile(&path, None, use_progress, false).await?;
+                run_compile(&path, None, use_progress, false, false).await?;
             }
         }
     }
@@ -1176,6 +1183,7 @@ async fn run_compile(
     branch: Option<&str>,
     use_progress: bool,
     no_rooting: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         let name = path.display().to_string();
@@ -1228,76 +1236,83 @@ async fn run_compile(
         }
     };
 
-    out(String::new());
-    out(format!(
-        "  {} compiled {} files in {:.1}s",
-        style("ThinkingRoot").green().bold(),
-        style(result.files_parsed).white().bold(),
-        elapsed.as_secs_f64()
-    ));
-    out(format!(
-        "  {} {}%",
-        style("Knowledge Health:").white().bold(),
-        style(result.health_score).green().bold()
-    ));
-    out(format!(
-        "  {} {} claims extracted",
-        style("  ├──").dim(),
-        style(result.claims_count).cyan()
-    ));
-    out(format!(
-        "  {} {} entities identified",
-        style("  ├──").dim(),
-        style(result.entities_count).cyan()
-    ));
-    out(format!(
-        "  {} {} relations mapped",
-        style("  ├──").dim(),
-        style(result.relations_count).cyan()
-    ));
-    out(format!(
-        "  {} {} contradictions found",
-        style("  ├──").dim(),
-        style(result.contradictions_count).yellow()
-    ));
-    out(format!(
-        "  {} {} artifacts generated",
-        style("  └──").dim(),
-        style(result.artifacts_count).cyan()
-    ));
-    if result.cache_hits > 0 {
+    if json {
+        let line = serde_json::to_string(&result.incremental_summary)
+            .context("failed to serialize IncrementalSummary as JSON")?;
+        println!("{line}");
+    } else {
+        out(String::new());
         out(format!(
-            "  {} {} extraction cache hits",
+            "  {} compiled {} files in {:.1}s",
+            style("ThinkingRoot").green().bold(),
+            style(result.files_parsed).white().bold(),
+            elapsed.as_secs_f64()
+        ));
+        out(format!(
+            "  {} {}%",
+            style("Knowledge Health:").white().bold(),
+            style(result.health_score).green().bold()
+        ));
+        out(format!(
+            "  {} {} claims extracted",
             style("  ├──").dim(),
-            style(result.cache_hits).green()
+            style(result.claims_count).cyan()
         ));
-    }
-    if result.early_cutoffs > 0 {
         out(format!(
-            "  {} {} sources unchanged (early cutoff)",
+            "  {} {} entities identified",
+            style("  ├──").dim(),
+            style(result.entities_count).cyan()
+        ));
+        out(format!(
+            "  {} {} relations mapped",
+            style("  ├──").dim(),
+            style(result.relations_count).cyan()
+        ));
+        out(format!(
+            "  {} {} contradictions found",
+            style("  ├──").dim(),
+            style(result.contradictions_count).yellow()
+        ));
+        out(format!(
+            "  {} {} artifacts generated",
             style("  └──").dim(),
-            style(result.early_cutoffs).green()
+            style(result.artifacts_count).cyan()
         ));
+        if result.cache_hits > 0 {
+            out(format!(
+                "  {} {} extraction cache hits",
+                style("  ├──").dim(),
+                style(result.cache_hits).green()
+            ));
+        }
+        if result.early_cutoffs > 0 {
+            out(format!(
+                "  {} {} sources unchanged (early cutoff)",
+                style("  └──").dim(),
+                style(result.early_cutoffs).green()
+            ));
+        }
+        if result.failed_batches > 0 {
+            // Pre-fix these failures were silently dropped — the user only
+            // saw "ok" while their compile was incomplete.  Always print
+            // unconditionally (regardless of TTY filter) so users notice.
+            let ranges = result
+                .failed_chunk_ranges
+                .iter()
+                .map(|(s, e)| format!("{s}–{e}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out(format!(
+                "  {} {} batch{} failed permanently (chunks {}) — claims for those chunks are missing; re-run to retry",
+                style("  ⚠").yellow().bold(),
+                style(result.failed_batches).yellow().bold(),
+                if result.failed_batches == 1 { "" } else { "es" },
+                style(ranges).yellow()
+            ));
+        }
+        out(String::new());
+        summary_printer::print(&result.incremental_summary, use_progress);
     }
-    if result.failed_batches > 0 {
-        // Pre-fix these failures were silently dropped — the user only
-        // saw "ok" while their compile was incomplete.  Always print
-        // unconditionally (regardless of TTY filter) so users notice.
-        let ranges = result
-            .failed_chunk_ranges
-            .iter()
-            .map(|(s, e)| format!("{s}–{e}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out(format!(
-            "  {} {} batch{} failed permanently (chunks {}) — claims for those chunks are missing; re-run to retry",
-            style("  ⚠").yellow().bold(),
-            style(result.failed_batches).yellow().bold(),
-            if result.failed_batches == 1 { "" } else { "es" },
-            style(ranges).yellow()
-        ));
-    }
-    out(String::new());
 
     Ok(())
 }
