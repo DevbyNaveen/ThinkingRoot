@@ -127,6 +127,14 @@ pub enum ProgressEvent {
         quarantined: usize,
         rejected: usize,
     },
+    /// Fired immediately after each pipeline phase completes.  Lets SSE
+    /// consumers render real-time per-phase progress instead of waiting
+    /// for the terminal IncrementalDone event.
+    PhaseDone { name: String, elapsed_ms: u64 },
+    /// Fired once at the end of every successful compile, carrying the
+    /// full structured summary.  CLI summary printer + desktop summary
+    /// panel both consume this event.
+    IncrementalDone { summary: thinkingroot_core::IncrementalSummary },
     /// The pipeline returned `Err(_)`. Emitted by the public `run_pipeline`
     /// wrapper before the channel closes, so the bar driver can finalise any
     /// in-flight bars with a failure style instead of the ambiguous "skipped"
@@ -162,6 +170,11 @@ pub struct PipelineResult {
     /// need a second vocabulary.
     #[serde(default)]
     pub failed_chunk_ranges: Vec<(usize, usize)>,
+    /// Structured delta for this compile run.  Always populated — even
+    /// on the early-return path (nothing changed) so consumers never
+    /// branch on presence.
+    #[serde(default)]
+    pub incremental_summary: thinkingroot_core::IncrementalSummary,
 }
 
 /// Run the v3 pipeline: Parse → Extract+Ground+Rooting+Link+SVO →
@@ -284,6 +297,35 @@ async fn run_pipeline_inner(
         };
     }
 
+    // Per-phase timing infrastructure.  `phase_start` anchors the total;
+    // `last_phase_end` rolls forward after each `mark_phase!` call so
+    // the per-phase elapsed is wall-time for that phase only, not
+    // cumulative.  Using `std::collections::BTreeMap` keeps the JSON
+    // wire encoding deterministically ordered — important for snapshot
+    // tests downstream.
+    use std::collections::BTreeMap;
+    let mut phase_timings: BTreeMap<String, u64> = BTreeMap::new();
+    let pipeline_start = std::time::Instant::now();
+    let mut last_phase_end = pipeline_start;
+
+    // Records elapsed time since the previous mark, inserts into
+    // `phase_timings`, and emits a `PhaseDone` SSE event.  For the
+    // split-phase case (entity_relations = Phase 5 + Phase 8), callers
+    // use `+=` via `or_insert(0)` — the macro always *replaces* for
+    // single-phase keys and the entity_relations key is handled inline.
+    macro_rules! mark_phase {
+        ($name:expr) => {{
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_phase_end).as_millis() as u64;
+            last_phase_end = now;
+            phase_timings.insert($name.to_string(), elapsed);
+            emit!(ProgressEvent::PhaseDone {
+                name: $name.to_string(),
+                elapsed_ms: elapsed,
+            });
+        }};
+    }
+
     let config = Config::load_merged(root_path)?;
     let data_dir = thinkingroot_branch::snapshot::resolve_data_dir(root_path, branch);
     std::fs::create_dir_all(&data_dir)?;
@@ -376,11 +418,36 @@ async fn run_pipeline_inner(
         unchanged: skipped,
         deleted: deleted_sources.len(),
     });
+    mark_phase!("diff");
 
     // ─── Early exit: nothing to process ────────────────────────────────
     // Vectors are not built here — `root query` lazy-builds them on
     // first call per v3 final plan §13.1.
     if potentially_changed.is_empty() && deleted_sources.is_empty() {
+        let total_elapsed_ms = pipeline_start.elapsed().as_millis() as u64;
+        let summed: u64 = phase_timings.values().sum();
+        if total_elapsed_ms > summed {
+            phase_timings.insert("other".to_string(), total_elapsed_ms - summed);
+        }
+        let summary = thinkingroot_core::IncrementalSummary {
+            sources_total: documents.len(),
+            sources_unchanged: skipped,
+            sources_truly_changed: 0,
+            sources_deleted: 0,
+            sources_resolution_dirty: 0,
+            claims_added: 0,
+            claims_updated: 0,
+            claims_deleted: 0,
+            structural_rows_emitted: 0,
+            structural_rows_cascaded: 0,
+            bytes_re_extracted: 0,
+            llm_calls: 0,
+            cache_hits: 0,
+            structural_extractions: 0,
+            phase_timings: phase_timings.clone(),
+            total_elapsed_ms,
+        };
+        emit!(ProgressEvent::IncrementalDone { summary: summary.clone() });
         return Ok(PipelineResult {
             files_parsed,
             claims_count: 0,
@@ -396,6 +463,7 @@ async fn run_pipeline_inner(
             cache_dirty: false,
             failed_batches: 0,
             failed_chunk_ranges: Vec::new(),
+            incremental_summary: summary,
         });
     }
 
@@ -534,6 +602,7 @@ async fn run_pipeline_inner(
         cache_hits = raw.cache_hits;
         extraction = raw;
     }
+    mark_phase!("extract");
 
     // Log tiered extraction stats.
     if extraction.structural_extractions > 0 {
@@ -668,6 +737,7 @@ async fn run_pipeline_inner(
         accepted: post_grounding_total,
         rejected: pre_grounding_total.saturating_sub(post_grounding_total),
     });
+    mark_phase!("ground");
 
     // Phase 2c (SVO event extraction) is intentionally deferred to Phase 2c-post-link
     // below.  It must run AFTER Phase 7 (Linker) so that entity names can be resolved
@@ -710,6 +780,7 @@ async fn run_pipeline_inner(
         truly_changed: truly_changed.len(),
         cutoffs: fingerprint_cutoffs,
     });
+    mark_phase!("fingerprint");
 
     bail_if_cancelled!();
 
@@ -741,6 +812,23 @@ async fn run_pipeline_inner(
         resolution_dirty = resolution_dirty_sources.len(),
         "phase 4 resolution-dirty sources (cross-source Phase 7e deps now stale)"
     );
+
+    // Snapshot claim + structural-row counts BEFORE Phase 4 cascades them
+    // away so `IncrementalSummary` can report honest `claims_deleted` and
+    // `structural_rows_cascaded`.  We count per-source id (not per-uri)
+    // to stay consistent with what `remove_source_by_id` actually deletes.
+    let mut phase4_claim_delete_count: usize = 0;
+    let mut phase4_cascade_row_count: usize = 0;
+    for doc in &truly_changed {
+        for (sid, _, _) in storage.graph.find_sources_by_uri(&doc.uri)? {
+            phase4_claim_delete_count += storage.graph.get_claim_ids_for_source(&sid)?.len();
+            phase4_cascade_row_count += storage.graph.count_structural_rows_for_source(&sid)?;
+        }
+    }
+    for (sid, _) in &deleted_sources {
+        phase4_claim_delete_count += storage.graph.get_claim_ids_for_source(sid)?.len();
+        phase4_cascade_row_count += storage.graph.count_structural_rows_for_source(sid)?;
+    }
 
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
 
@@ -787,6 +875,7 @@ async fn run_pipeline_inner(
         storage.graph.remove_source_by_uri(uri)?;
         fingerprints.remove(uri);
     }
+    mark_phase!("remove_sources");
 
     // ─── Phase 5: Incremental entity relation update for removals ──────
     if !affected_triples.is_empty() {
@@ -796,6 +885,18 @@ async fn run_pipeline_inner(
             .graph
             .update_entity_relations_for_triples(&affected_triples)?;
     }
+    // Phase 5 elapsed is the first half of the split entity_relations key.
+    // Phase 8 (post-link entity relation update) contributes the second half.
+    {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(last_phase_end).as_millis() as u64;
+        last_phase_end = now;
+        *phase_timings.entry("entity_relations".to_string()).or_insert(0) += elapsed;
+        emit!(ProgressEvent::PhaseDone {
+            name: "entity_relations".to_string(),
+            elapsed_ms: elapsed,
+        });
+    }
 
     // If only deletions or all fingerprint hits — no new content to link.
     if truly_changed.is_empty() {
@@ -804,6 +905,31 @@ async fn run_pipeline_inner(
             relations: 0,
             contradictions: 0
         });
+
+        let total_elapsed_ms = pipeline_start.elapsed().as_millis() as u64;
+        let summed: u64 = phase_timings.values().sum();
+        if total_elapsed_ms > summed {
+            phase_timings.insert("other".to_string(), total_elapsed_ms - summed);
+        }
+        let summary = thinkingroot_core::IncrementalSummary {
+            sources_total: documents.len(),
+            sources_unchanged: skipped,
+            sources_truly_changed: 0,
+            sources_deleted: deleted_sources.len(),
+            sources_resolution_dirty: resolution_dirty_sources.len(),
+            claims_added: 0,
+            claims_updated: 0,
+            claims_deleted: phase4_claim_delete_count,
+            structural_rows_emitted: 0,
+            structural_rows_cascaded: phase4_cascade_row_count,
+            bytes_re_extracted: 0,
+            llm_calls: 0,
+            cache_hits,
+            structural_extractions: extraction.structural_extractions,
+            phase_timings: phase_timings.clone(),
+            total_elapsed_ms,
+        };
+        emit!(ProgressEvent::IncrementalDone { summary: summary.clone() });
 
         fingerprints.save()?;
         config.save(root_path)?;
@@ -825,6 +951,7 @@ async fn run_pipeline_inner(
             cache_dirty: true,
             failed_batches: extraction.failed_batches,
             failed_chunk_ranges: extraction.failed_batch_ranges.clone(),
+            incremental_summary: summary,
         });
     }
 
@@ -1041,6 +1168,7 @@ async fn run_pipeline_inner(
         elapsed_ms = phase_6_7_stats.elapsed.as_millis() as u64,
         "phase 6.7 structural persist complete"
     );
+    mark_phase!("structural_persist");
 
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();
@@ -1050,6 +1178,8 @@ async fn run_pipeline_inner(
     // the CLI/desktop can render an honest partial-failure summary.
     let failed_batches = filtered_extraction.failed_batches;
     let failed_chunk_ranges = filtered_extraction.failed_batch_ranges.clone();
+    // Snapshot chunks_processed for llm_calls computation in IncrementalSummary.
+    let extraction_chunks_processed = filtered_extraction.chunks_processed;
 
     // Retain a lightweight clone of the filtered claims for Phase 2c-post-link
     // (SVO event extraction).  We clone before the linker takes ownership so that
@@ -1079,6 +1209,7 @@ async fn run_pipeline_inner(
         relations: link_output.relations_linked,
         contradictions: link_output.contradictions_detected,
     });
+    mark_phase!("link");
 
     // ─── Phase 2c-post-link: SVO Event Calendar ──────────────────────────
     // Now that Phase 7 has written all entities to CozoDB, we can build the
@@ -1169,6 +1300,14 @@ async fn run_pipeline_inner(
     storage
         .graph
         .update_entity_relations_for_triples(&new_triples)?;
+    // Phase 8 elapsed is the second half of the split entity_relations key.
+    // Phase 5 (removal-side) contributed the first half earlier.
+    {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(last_phase_end).as_millis() as u64;
+        last_phase_end = now;
+        *phase_timings.entry("entity_relations".to_string()).or_insert(0) += elapsed;
+    }
 
     // Vector index, markdown artifacts, and post-compile health
     // verification are NOT part of `root compile` in v3 — they live
@@ -1245,6 +1384,7 @@ async fn run_pipeline_inner(
              do not use this in CI"
         );
     }
+    mark_phase!("audit");
 
     fingerprints.save()?;
     config.save(root_path)?;
@@ -1257,6 +1397,34 @@ async fn run_pipeline_inner(
     if let Err(e) = thinkingroot_extract::InFlightCheckpoint::clear(&data_dir) {
         tracing::warn!("failed to clear in-flight checkpoint after Phase 7: {e}");
     }
+
+    let total_elapsed_ms = pipeline_start.elapsed().as_millis() as u64;
+    let summed: u64 = phase_timings.values().sum();
+    if total_elapsed_ms > summed {
+        phase_timings.insert("other".to_string(), total_elapsed_ms - summed);
+    }
+
+    let summary = thinkingroot_core::IncrementalSummary {
+        sources_total: documents.len(),
+        sources_unchanged: skipped,
+        sources_truly_changed: truly_changed.len(),
+        sources_deleted: deleted_sources.len(),
+        sources_resolution_dirty: resolution_dirty_sources.len(),
+        claims_added: claims_count,
+        // I-W4: per-source rebuild is always delete-then-insert; no in-place updates.
+        claims_updated: 0,
+        claims_deleted: phase4_claim_delete_count,
+        structural_rows_emitted: phase_6_7_stats.structural_rows_emitted,
+        structural_rows_cascaded: phase4_cascade_row_count,
+        bytes_re_extracted: truly_changed.iter().map(|d| d.total_chars() as u64).sum(),
+        llm_calls: extraction_chunks_processed
+            .saturating_sub(cache_hits + structural_extractions),
+        cache_hits,
+        structural_extractions,
+        phase_timings: phase_timings.clone(),
+        total_elapsed_ms,
+    };
+    emit!(ProgressEvent::IncrementalDone { summary: summary.clone() });
 
     Ok(PipelineResult {
         files_parsed,
@@ -1273,6 +1441,7 @@ async fn run_pipeline_inner(
         cache_dirty: true,
         failed_batches,
         failed_chunk_ranges,
+        incremental_summary: summary,
     })
 }
 

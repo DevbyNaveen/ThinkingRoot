@@ -698,6 +698,20 @@ pub async fn run_compile_progress(
                         // render here — keeping the bar layout clean.
                     }
 
+                    ProgressEvent::PhaseDone { .. } => {
+                        // T10 (CLI summary printer) consumes IncrementalDone
+                        // for the structured summary.  PhaseDone is reserved
+                        // for the desktop SSE consumer; the CLI bar driver
+                        // already times each phase via indicatif finish_*
+                        // calls and does not need a secondary render here.
+                    }
+
+                    ProgressEvent::IncrementalDone { .. } => {
+                        // T10 (CLI summary printer) will render this.
+                        // The bar driver discards it so the indicatif layout
+                        // is not disturbed by a second summary section.
+                    }
+
                     ProgressEvent::PipelineFailed { error: _ } => {
                         // Don't render here — the cleanup loop after the channel
                         // closes will paint every unfinished bar with

@@ -55,6 +55,21 @@ fn b(value: bool) -> DataValue {
     DataValue::Bool(value)
 }
 
+/// Return a column that is reliably non-null per row for the given
+/// structural table, used as the counting projection in
+/// `count_structural_rows_for_source`.  Composite-key tables must
+/// project a column other than the generic `id` because they don't
+/// have one.
+fn structural_count_pk(table: &str) -> &'static str {
+    match table {
+        "code_signatures" => "claim_id",
+        "config_tree"     => "dotted_path",
+        "git_commits"     => "commit_sha",
+        "git_blame"       => "line_start",
+        _                 => "id",
+    }
+}
+
 fn dv_to_string(v: &DataValue) -> String {
     match v {
         DataValue::Str(s) => s.to_string(),
@@ -938,6 +953,32 @@ impl GraphStore {
         }
 
         Ok(orphans)
+    }
+
+    /// Count the total number of rows across all 16 structural tables that
+    /// belong to `source_id`.  Used by the pipeline to snapshot the cascade
+    /// row count BEFORE Phase 4 removes the source, so `IncrementalSummary`
+    /// can report an honest `structural_rows_cascaded` rather than 0.
+    pub fn count_structural_rows_for_source(&self, source_id: &str) -> Result<usize> {
+        use thinkingroot_core::structural_registry::STRUCTURAL_TABLES;
+        let mut total = 0usize;
+        for spec in STRUCTURAL_TABLES {
+            let mut params = BTreeMap::new();
+            params.insert("sid".into(), DataValue::Str(source_id.into()));
+            let script = format!(
+                "?[count(x)] := *{name}{{{sid_col}: $sid, {pk}: x}}",
+                name = spec.name,
+                sid_col = spec.source_id_column,
+                pk = structural_count_pk(spec.name),
+            );
+            let result = self.query(&script, params)?;
+            if let Some(row) = result.rows.first() {
+                if let Some(v) = row.first() {
+                    total += dv_to_u64(v) as usize;
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// Detect structural rows whose `source_id` does not exist in the `sources`
