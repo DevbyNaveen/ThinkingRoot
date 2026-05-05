@@ -247,6 +247,13 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/llm/health", get(llm_health_handler))
             .route("/ws/{ws}/search", get(search))
             .route("/ws/{ws}/search/hybrid", post(hybrid_search_handler))
+            // T3.2 — cross-branch reflect.  Body is `{ branches: [...] }`;
+            // returns a `CrossBranchReflectResult` JSON with per-branch
+            // outcomes + divergent-pattern rows.
+            .route(
+                "/ws/{ws}/reflect/across-branches",
+                post(reflect_across_branches_handler),
+            )
             // RARP / Active Engram Protocol — engram lifecycle endpoints
             // mirror the 4 MCP tools (`materialize_engram`, `probe_engram`,
             // `list_engrams`, `expire_engram`) so HTTP-only consumers
@@ -992,6 +999,27 @@ async fn hybrid_search_handler(
     let engine = state.engine.read().await;
     match engine.hybrid_retrieve(&ws, req, Some(cancel)).await {
         Ok(resp) => ok_response(resp).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// T3.2 — `POST /api/v1/ws/{ws}/reflect/across-branches`.  Body:
+/// `{ "branches": ["main", "feature/foo", ...] }`.  Runs reflect
+/// against each named branch and returns the union of per-branch
+/// results plus divergent patterns.
+#[derive(Deserialize)]
+struct ReflectAcrossBranchesRequest {
+    branches: Vec<String>,
+}
+
+async fn reflect_across_branches_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<ReflectAcrossBranchesRequest>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.reflect_across_branches(&ws, &req.branches).await {
+        Ok(result) => ok_response(result).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

@@ -36,5 +36,6 @@ pub use engine::{
     reflect_across_graphs,
 };
 pub use types::{
-    CrossReflectResult, GapReport, GapStatus, KnownUnknown, ReflectResult, StructuralPattern,
+    CrossBranchReflectResult, CrossReflectResult, DivergentPattern, GapReport, GapStatus,
+    KnownUnknown, ReflectResult, StructuralPattern,
 };

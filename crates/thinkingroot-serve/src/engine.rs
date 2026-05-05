@@ -3716,6 +3716,98 @@ Rules: \
             .await
     }
 
+    /// T3.2 — Cross-branch reflect.  Runs `reflect_branched` on each
+    /// named branch in sequence (sequential, not parallel — every
+    /// branch's `BranchEngineCache` lookup needs a write lock to
+    /// open if the engine isn't cached, and racing those would just
+    /// serialise on the same lock anyway).  Surfaces divergent
+    /// patterns: pattern ids that fired in some branches but not
+    /// others.
+    ///
+    /// Pass `branches.is_empty()` to get an error rather than a
+    /// trivially-empty result — the no-branches case is almost
+    /// always a caller bug, not a useful query.
+    ///
+    /// `branches` may include `"main"` (or `None`'s convention) to
+    /// include the workspace's primary graph alongside named
+    /// branches in the comparison.
+    pub async fn reflect_across_branches(
+        &self,
+        ws: &str,
+        branches: &[String],
+    ) -> Result<thinkingroot_reflect::CrossBranchReflectResult> {
+        if branches.is_empty() {
+            return Err(Error::Config(
+                "reflect_across_branches: at least one branch required".into(),
+            ));
+        }
+
+        let mut per_branch = std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::with_capacity(branches.len());
+        for raw in branches {
+            let key = raw.clone();
+            order.push(key.clone());
+            // Treat "main" identically to the None branch — both
+            // resolve to the workspace's primary graph in
+            // `reflect_branched`.
+            let result = if key == "main" {
+                self.reflect_branched(ws, None).await?
+            } else {
+                self.reflect_branched(ws, Some(&key)).await?
+            };
+            per_branch.insert(key, result);
+        }
+
+        // Walk every distinct pattern id; classify each branch as
+        // present/absent based on whether the pattern appears in
+        // that branch's `patterns` vec.  A pattern present in every
+        // branch is NOT divergent — only union-but-not-intersection
+        // rows land in the output.
+        let mut all_pattern_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for r in per_branch.values() {
+            for p in &r.patterns {
+                all_pattern_ids.insert(p.id.clone());
+            }
+        }
+        let mut divergent: Vec<thinkingroot_reflect::DivergentPattern> = Vec::new();
+        for pid in &all_pattern_ids {
+            let mut present_in: Vec<String> = Vec::new();
+            let mut absent_from: Vec<String> = Vec::new();
+            let mut aggregate_sample_size: usize = 0;
+            for branch_name in &order {
+                let branch_result = per_branch.get(branch_name).unwrap();
+                if let Some(p) = branch_result.patterns.iter().find(|p| p.id == *pid) {
+                    present_in.push(branch_name.clone());
+                    aggregate_sample_size += p.sample_size;
+                } else {
+                    absent_from.push(branch_name.clone());
+                }
+            }
+            // Skip patterns shared by every branch — they aren't
+            // divergent; they're the consensus.
+            if absent_from.is_empty() {
+                continue;
+            }
+            divergent.push(thinkingroot_reflect::DivergentPattern {
+                pattern_id: pid.clone(),
+                present_in,
+                absent_from,
+                aggregate_sample_size,
+            });
+        }
+        // Sort by aggregate_sample_size descending so the largest
+        // signal lands first in dashboards.
+        divergent.sort_by(|a, b| b.aggregate_sample_size.cmp(&a.aggregate_sample_size));
+
+        Ok(thinkingroot_reflect::CrossBranchReflectResult {
+            workspace: ws.to_string(),
+            branches: order,
+            per_branch,
+            divergent_patterns: divergent,
+        })
+    }
+
     /// Branch-aware variant of `list_gaps`.
     pub async fn list_gaps_branched(
         &self,

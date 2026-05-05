@@ -111,6 +111,55 @@ pub struct CrossReflectResult {
     pub workspaces: Vec<String>,
 }
 
+/// T3.2 — Cross-branch reflect result.
+///
+/// One per-branch `ReflectResult` plus a list of `DivergentPattern`
+/// rows naming patterns that fired in some branches but not others.
+/// Useful for spotting "branch A consistently rooted but branch B
+/// always quarantined" or "main has the API-auth pattern but
+/// feature/proto-y is missing it."
+///
+/// We do NOT aggregate samples across branches the way
+/// `CrossReflectResult` does for cross-workspace — branches share a
+/// substrate and aggregating would double-count claims that survive
+/// a fork.  Divergence is the actually-novel signal cross-branch
+/// reflect surfaces.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CrossBranchReflectResult {
+    /// Workspace name the branches live in.
+    pub workspace: String,
+    /// Branches scanned, in the order they were requested.  Includes
+    /// `"main"` when the caller passed it; the order is preserved
+    /// so consumers can pin which branch is "ours" vs "theirs" in a
+    /// pairwise diff.
+    pub branches: Vec<String>,
+    /// Per-branch reflect outcome.  Same shape as
+    /// `engine.reflect_branched(ws, Some(branch))` would have
+    /// returned standalone.
+    pub per_branch: std::collections::HashMap<String, ReflectResult>,
+    /// Patterns that fired in at least one branch but not in every
+    /// branch.  Empty when every branch surfaces an identical
+    /// pattern set — the common case for unmodified forks.
+    pub divergent_patterns: Vec<DivergentPattern>,
+}
+
+/// One row of `CrossBranchReflectResult::divergent_patterns`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergentPattern {
+    /// Stable identifier (`pattern.id`) of the diverging pattern.
+    pub pattern_id: String,
+    /// Branches where this pattern fired (sample_size ≥ threshold,
+    /// frequency ≥ threshold).
+    pub present_in: Vec<String>,
+    /// Branches where this pattern did NOT fire.  Disjoint from
+    /// `present_in`; together they cover every branch in the result.
+    pub absent_from: Vec<String>,
+    /// Aggregate sample size across `present_in` branches — useful
+    /// for sorting "weakly-diverging" rows (small sample) below
+    /// "strongly-diverging" rows (large sample).
+    pub aggregate_sample_size: usize,
+}
+
 /// A gap surfaced via the `gaps` MCP tool — denormalized for agent display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapReport {
