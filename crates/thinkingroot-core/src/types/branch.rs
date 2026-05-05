@@ -55,6 +55,125 @@ pub struct BranchRef {
     /// existed; only new branches gain three-way semantics.
     #[serde(default)]
     pub parent_commit_hash: Option<String>,
+    /// Optional time-to-live in seconds (T2.3).  When set, the
+    /// background maintenance pass auto-abandons the branch when
+    /// `now - created_at > max_age_secs`.  `None` (the default) means
+    /// "never expire on age" — preserves pre-T2.3 behaviour for every
+    /// branch that doesn't opt in.
+    ///
+    /// The TTL gate is *additional* to the existing Stream-cleanup
+    /// idle-session pass; an explicit `max_age_secs` always wins over
+    /// any inferred lifecycle.  Branches carrying agent-contributed
+    /// claims are still safety-downgraded from purge to abandon (same
+    /// rule as stream cleanup) so TTL never silently destroys agent
+    /// work.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    /// Append-only audit log of mutations against this branch (T1.3).
+    /// Every state change — create, merge, abandon, redaction set,
+    /// permission change, contribute-bulk — appends one entry here.
+    /// Pre-T1.3 branches have an empty `events` vec; the
+    /// `#[serde(default)]` keeps `branches.toml` round-trippable.
+    ///
+    /// Capped to the last `MAX_EVENTS` entries per branch
+    /// (oldest-first dropped) so a long-lived branch's TOML doesn't
+    /// grow unbounded.  When you need permanent audit, mirror to an
+    /// external sink — this log is hot-path observability, not
+    /// compliance storage.
+    #[serde(default)]
+    pub events: Vec<BranchEvent>,
+}
+
+/// Maximum [`BranchEvent`] entries kept on a single [`BranchRef`].
+/// When the cap is hit, [`BranchRef::append_event`] drops the oldest
+/// entry (FIFO) so the newest activity is always retained.
+pub const MAX_EVENTS: usize = 1000;
+
+/// One audit-log entry on a [`BranchRef`] (T1.3).
+///
+/// Each variant carries the minimum data needed to reconstruct the
+/// "who did what when" for downstream consumers: the lineage DAG
+/// (T1.7), webhooks (T3.3), and the desktop branches surface SSE
+/// stream (T1.6) all read from this log.
+///
+/// `actor` is a `Principal::identity()` string when known; "system"
+/// for maintenance-driven mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchEvent {
+    /// Branch was created.
+    Created {
+        at: DateTime<Utc>,
+        actor: String,
+        parent: String,
+    },
+    /// Branch was merged into its parent or another branch.  The
+    /// `into` field disambiguates main-merges from cross-branch
+    /// merges; an `authorising_proposal_id` is set when the merge was
+    /// gated by a `RequiresProposal` policy (T0.4 path).
+    Merged {
+        at: DateTime<Utc>,
+        actor: String,
+        into: String,
+        #[serde(default)]
+        authorising_proposal_id: Option<String>,
+    },
+    /// Branch was abandoned without merging (or via Ephemeral
+    /// short-circuit).
+    Abandoned { at: DateTime<Utc>, actor: String },
+    /// Per-branch redaction policy was set or cleared.  `enabled`
+    /// records whether the new policy is `Some(_)` (true) or `None`
+    /// (false) so consumers don't need to inline-decode the policy
+    /// shape from the log.
+    RedactionUpdated {
+        at: DateTime<Utc>,
+        actor: String,
+        enabled: bool,
+    },
+    /// Branch permissions were changed (readers / writers / mergers).
+    PermissionsUpdated { at: DateTime<Utc>, actor: String },
+    /// Connector-attributed bulk contribute landed claims on this
+    /// branch (T0.7).  `count` is the number of claims accepted (0 on
+    /// idempotent replay).
+    ContributeBulk {
+        at: DateTime<Utc>,
+        actor: String,
+        count: usize,
+    },
+}
+
+impl BranchEvent {
+    /// Wall-clock timestamp of the event — used by the lineage DAG
+    /// (T1.7) and SSE stream (T1.6) to order entries across branches.
+    pub fn at(&self) -> DateTime<Utc> {
+        match self {
+            BranchEvent::Created { at, .. }
+            | BranchEvent::Merged { at, .. }
+            | BranchEvent::Abandoned { at, .. }
+            | BranchEvent::RedactionUpdated { at, .. }
+            | BranchEvent::PermissionsUpdated { at, .. }
+            | BranchEvent::ContributeBulk { at, .. } => *at,
+        }
+    }
+}
+
+impl BranchRef {
+    /// Append an audit-log entry, FIFO-trimming to [`MAX_EVENTS`].
+    ///
+    /// Call this from every mutation site in `thinkingroot-branch`
+    /// (`create_branch_full`, `mark_merged`, `abandon_branch`,
+    /// `set_redaction`, …) so the log stays in lockstep with the
+    /// `BranchStatus` field — a branch in `BranchStatus::Merged` MUST
+    /// have a matching `BranchEvent::Merged` as its tail entry.
+    pub fn append_event(&mut self, event: BranchEvent) {
+        self.events.push(event);
+        if self.events.len() > MAX_EVENTS {
+            // Drop oldest events so the cap is steady-state, not just
+            // a panic-on-bound.
+            let drop = self.events.len() - MAX_EVENTS;
+            self.events.drain(..drop);
+        }
+    }
 }
 
 /// First-class branch classification.
@@ -363,6 +482,9 @@ mod tests {
             kind: BranchKind::default(),
             merge_policy: MergePolicy::default(),
             redaction: None,
+            parent_commit_hash: None,
+            max_age_secs: None,
+            events: Vec::new(),
         };
         assert_eq!(b.name, "feature/x");
         assert!(matches!(b.status, BranchStatus::Active));
@@ -444,6 +566,90 @@ mod tests {
         assert_eq!(b.merge_policy, MergePolicy::Manual);
         assert!(b.redaction.is_none());
         assert!(b.owner.is_none());
+        assert!(
+            b.events.is_empty(),
+            "T1.3 events field must default to empty so legacy toml keeps loading"
+        );
+    }
+
+    #[test]
+    fn branch_event_round_trips_through_toml() {
+        // T1.3 — events serialize as an array of inline tables under
+        // `[[events]]`. Pin the wire shape so a future field addition
+        // catches downstream TOML consumers.
+        let now: DateTime<Utc> = "2026-05-06T12:00:00Z".parse().unwrap();
+        let mut b = BranchRef {
+            name: "feature/x".into(),
+            slug: "feature-x".into(),
+            parent: "main".into(),
+            created_at: now,
+            status: BranchStatus::Active,
+            description: None,
+            owner: None,
+            permissions: BranchPermissions::default(),
+            kind: BranchKind::Feature,
+            merge_policy: MergePolicy::Manual,
+            redaction: None,
+            parent_commit_hash: None,
+            max_age_secs: None,
+            events: Vec::new(),
+        };
+        b.append_event(BranchEvent::Created {
+            at: now,
+            actor: "alice".into(),
+            parent: "main".into(),
+        });
+        b.append_event(BranchEvent::Merged {
+            at: now,
+            actor: "alice".into(),
+            into: "main".into(),
+            authorising_proposal_id: Some("01HZN12345ABCDEFGHJKMNPQRS".into()),
+        });
+
+        let s = toml::to_string_pretty(&b).expect("serialise");
+        assert!(s.contains("[[events]]"), "expected [[events]] in:\n{s}");
+        assert!(s.contains("kind = \"created\""), "expected created kind");
+        assert!(s.contains("kind = \"merged\""), "expected merged kind");
+        assert!(
+            s.contains("authorising_proposal_id = \"01HZN12345ABCDEFGHJKMNPQRS\""),
+            "expected proposal id passthrough"
+        );
+
+        let b2: BranchRef = toml::from_str(&s).expect("round-trip must succeed");
+        assert_eq!(b2.events.len(), 2);
+        assert_eq!(b2.events[0].at(), now);
+    }
+
+    #[test]
+    fn branch_event_log_caps_at_max_events() {
+        let now: DateTime<Utc> = "2026-05-06T12:00:00Z".parse().unwrap();
+        let mut b = BranchRef {
+            name: "feature/x".into(),
+            slug: "feature-x".into(),
+            parent: "main".into(),
+            created_at: now,
+            status: BranchStatus::Active,
+            description: None,
+            owner: None,
+            permissions: BranchPermissions::default(),
+            kind: BranchKind::Feature,
+            merge_policy: MergePolicy::Manual,
+            redaction: None,
+            parent_commit_hash: None,
+            max_age_secs: None,
+            events: Vec::new(),
+        };
+        for _ in 0..(MAX_EVENTS + 50) {
+            b.append_event(BranchEvent::PermissionsUpdated {
+                at: now,
+                actor: "alice".into(),
+            });
+        }
+        assert_eq!(
+            b.events.len(),
+            MAX_EVENTS,
+            "events must be FIFO-capped, not unbounded"
+        );
     }
 
     #[test]

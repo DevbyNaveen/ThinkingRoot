@@ -457,6 +457,67 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["workspace", "connector_id", "install_id", "idempotency_key", "claims"]
                 }
             },
+            // ── T0.4 Knowledge Proposal tools ─────────────────────────────
+            // The `RequiresProposal` merge gate (`thinkingroot-branch::merge::execute_merge_into:336`)
+            // refuses raw merges and points users at these tools.  An
+            // approved proposal lets the same merge call succeed.
+            {
+                "name": "open_proposal",
+                "description": "Open a Knowledge Proposal against a `RequiresProposal`-gated branch. Returns the new proposal (with its ULID id) which the merge gate looks up via `find_approved_proposal`. The proposal freezes `min_reviewers` + `required_checks` from the source branch's policy at open time so a later policy change cannot loosen this proposal's gate.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":      { "type": "string" },
+                        "source_branch":  { "type": "string", "description": "Branch the proposal asks to merge from." },
+                        "target_branch":  { "type": "string", "description": "Branch to merge into; omit or 'main' for main." },
+                        "author":         { "type": "string", "description": "Principal::identity() of the author." },
+                        "description":    { "type": "string" },
+                        "min_reviewers":  { "type": "integer", "minimum": 0, "description": "Override the source branch's policy default." },
+                        "required_checks":{ "type": "array",   "items": { "type": "string" } }
+                    },
+                    "required": ["workspace", "source_branch", "author"]
+                }
+            },
+            {
+                "name": "review_proposal",
+                "description": "Record a review on an open proposal. `decision` is one of approve|request_changes|comment. Approves count distinct non-author reviewers; once the count reaches `min_reviewers` AND no reviewer is in RequestChanges, status flips to Approved and the merge gate will allow the merge.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string" },
+                        "proposal_id": { "type": "string", "description": "ULID returned by open_proposal." },
+                        "reviewer":    { "type": "string" },
+                        "decision":    { "type": "string", "enum": ["approve", "request_changes", "comment"] },
+                        "comment":     { "type": "string" }
+                    },
+                    "required": ["workspace", "proposal_id", "reviewer", "decision"]
+                }
+            },
+            {
+                "name": "list_proposals",
+                "description": "List Knowledge Proposals for a workspace, oldest-first by ULID. Optionally filter by `source_branch`. Includes status, reviews, required_checks, and (when merged) merged_at.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":     { "type": "string" },
+                        "source_branch": { "type": "string", "description": "Filter to proposals from this source branch." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "close_proposal",
+                "description": "Author-initiated close. Drops a non-terminal proposal into Closed (terminal). Only the proposal's author can close. No-op when the proposal is already Merged or Closed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string" },
+                        "proposal_id": { "type": "string" },
+                        "closer":      { "type": "string", "description": "Must equal the proposal author." }
+                    },
+                    "required": ["workspace", "proposal_id", "closer"]
+                }
+            },
             // ── Rooting tools (Phase 6.5 admission gate) ──────────────────
             {
                 "name": "query_rooted",
@@ -1802,7 +1863,278 @@ pub async fn handle_call(
 
         "hybrid_retrieve" => handle_hybrid_retrieve(id, &arguments, engine, ws, session_id).await,
 
+        // ── T0.4 Knowledge Proposal tools ─────────────────────────────
+        "open_proposal" => handle_open_proposal(id, &arguments, engine, ws).await,
+        "review_proposal" => handle_review_proposal(id, &arguments, engine, ws).await,
+        "list_proposals" => handle_list_proposals(id, &arguments, engine, ws).await,
+        "close_proposal" => handle_close_proposal(id, &arguments, engine, ws).await,
+
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+    }
+}
+
+// ─── T0.4 Knowledge Proposal handlers (MCP) ──────────────────────────
+//
+// These mirror the REST routes in `rest.rs` against the same
+// `thinkingroot-pr` crate.  The `refs_dir` is derived from the
+// workspace handle's root path so a daemon hosting multiple
+// workspaces keeps each workspace's proposals isolated under its own
+// `.thinkingroot-refs/proposals/`.
+
+fn refs_dir_for_ws(engine: &QueryEngine, ws: &str) -> Result<std::path::PathBuf, String> {
+    engine
+        .workspace_root_path(ws)
+        .map(|root| root.join(".thinkingroot-refs"))
+        .ok_or_else(|| format!("workspace `{ws}` not mounted"))
+}
+
+async fn handle_open_proposal(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let refs_dir = match refs_dir_for_ws(engine, ws) {
+        Ok(d) => d,
+        Err(e) => return JsonRpcResponse::error(id, -32602, e),
+    };
+    let source_branch = match arguments.get("source_branch").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "Missing or empty 'source_branch'".to_string(),
+            );
+        }
+    };
+    let target_branch = arguments
+        .get("target_branch")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "main")
+        .map(String::from);
+    let author = match arguments.get("author").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'author'".to_string());
+        }
+    };
+    let description = arguments
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Resolve policy defaults from the source branch.  Mirrors the REST
+    // handler's `proposal_policy_defaults` so the two surfaces freeze
+    // the same numbers on the proposal.
+    let (default_min, default_checks) = {
+        use thinkingroot_branch::branch::BranchRegistry;
+        use thinkingroot_core::MergePolicy;
+        if let Ok(registry) = BranchRegistry::load_or_create(&refs_dir)
+            && let Some(branch) = registry.get(&source_branch)
+            && let MergePolicy::RequiresProposal {
+                min_reviewers,
+                required_checks,
+            } = &branch.merge_policy
+        {
+            (*min_reviewers, required_checks.clone())
+        } else {
+            (1, Vec::new())
+        }
+    };
+
+    let min_reviewers = arguments
+        .get("min_reviewers")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(u8::MAX as u64) as u8)
+        .unwrap_or(default_min);
+    let required_checks: Vec<String> = arguments
+        .get("required_checks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or(default_checks);
+
+    match thinkingroot_pr::open_proposal(
+        &refs_dir,
+        &source_branch,
+        target_branch.as_deref(),
+        &author,
+        description,
+        min_reviewers,
+        required_checks,
+    ) {
+        Ok(p) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Proposal opened: {} (source={}, target={}, min_reviewers={})",
+                        p.id,
+                        p.source_branch,
+                        p.target_branch.as_deref().unwrap_or("main"),
+                        p.min_reviewers,
+                    )
+                }],
+                "proposal": p,
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_review_proposal(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let refs_dir = match refs_dir_for_ws(engine, ws) {
+        Ok(d) => d,
+        Err(e) => return JsonRpcResponse::error(id, -32602, e),
+    };
+    let proposal_id = match arguments.get("proposal_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "Missing or empty 'proposal_id'".to_string(),
+            );
+        }
+    };
+    let reviewer = match arguments.get("reviewer").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'reviewer'".to_string());
+        }
+    };
+    let decision = match arguments
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("approve") => thinkingroot_pr::ReviewDecision::Approve,
+        Some("request_changes") | Some("request-changes") | Some("changes_requested") => {
+            thinkingroot_pr::ReviewDecision::RequestChanges
+        }
+        Some("comment") => thinkingroot_pr::ReviewDecision::Comment,
+        other => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!(
+                    "decision must be one of approve|request_changes|comment, got {:?}",
+                    other
+                ),
+            );
+        }
+    };
+    let comment = arguments
+        .get("comment")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    match thinkingroot_pr::review_proposal(&refs_dir, &proposal_id, &reviewer, decision, comment) {
+        Ok(p) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Review recorded on {} → status now {:?}",
+                        p.id, p.status
+                    )
+                }],
+                "proposal": p,
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_list_proposals(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let refs_dir = match refs_dir_for_ws(engine, ws) {
+        Ok(d) => d,
+        Err(e) => return JsonRpcResponse::error(id, -32602, e),
+    };
+    let source_filter = arguments
+        .get("source_branch")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    match thinkingroot_pr::list_proposals(&refs_dir) {
+        Ok(all) => {
+            let filtered: Vec<_> = match &source_filter {
+                Some(src) => all.into_iter().filter(|p| &p.source_branch == src).collect(),
+                None => all,
+            };
+            let count = filtered.len();
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("{} proposal(s)", count)
+                    }],
+                    "proposals": filtered,
+                }),
+            )
+        }
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_close_proposal(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let refs_dir = match refs_dir_for_ws(engine, ws) {
+        Ok(d) => d,
+        Err(e) => return JsonRpcResponse::error(id, -32602, e),
+    };
+    let proposal_id = match arguments.get("proposal_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "Missing or empty 'proposal_id'".to_string(),
+            );
+        }
+    };
+    let closer = match arguments.get("closer").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'closer'".to_string());
+        }
+    };
+
+    match thinkingroot_pr::close_proposal(&refs_dir, &proposal_id, &closer) {
+        Ok(p) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Proposal {} closed by {}", p.id, closer)
+                }],
+                "proposal": p,
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
     }
 }
 

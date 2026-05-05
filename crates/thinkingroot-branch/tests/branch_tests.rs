@@ -383,6 +383,149 @@ async fn requires_proposal_blocks_raw_merge() {
     }
 }
 
+// T2.3 — TTL gate set + read round-trip.
+#[tokio::test]
+async fn set_branch_max_age_secs_round_trips() {
+    use thinkingroot_branch::set_branch_max_age_secs;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    create_branch(root, "feature/short-lived", "main", None)
+        .await
+        .unwrap();
+
+    // Set a 1-day TTL.
+    let updated = set_branch_max_age_secs(root, "feature/short-lived", Some(86_400)).unwrap();
+    assert_eq!(updated.max_age_secs, Some(86_400));
+
+    // Reload from disk.
+    let refs = root.join(".thinkingroot-refs");
+    let reg = BranchRegistry::load_or_create(&refs).unwrap();
+    assert_eq!(
+        reg.get("feature/short-lived").unwrap().max_age_secs,
+        Some(86_400)
+    );
+
+    // Clearing.
+    set_branch_max_age_secs(root, "feature/short-lived", None).unwrap();
+    let reg2 = BranchRegistry::load_or_create(&refs).unwrap();
+    assert!(reg2.get("feature/short-lived").unwrap().max_age_secs.is_none());
+}
+
+// T2.5 — tag create + immutability.
+#[tokio::test]
+async fn create_tag_round_trips_and_is_listed() {
+    use thinkingroot_branch::{create_tag, list_tags};
+    use thinkingroot_core::BranchKind;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+
+    let tag = create_tag(
+        root,
+        "v1.0.0",
+        "refs/tags/v1.0.0",
+        "deadbeefcafebabe",
+        Some("alice".into()),
+        Some("First stable release".into()),
+    )
+    .unwrap();
+    assert_eq!(tag.name, "v1.0.0");
+    assert!(matches!(tag.kind, BranchKind::Tag { .. }));
+
+    let listed = list_tags(root).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "v1.0.0");
+
+    // Re-creating fails — name conflict.
+    let dup = create_tag(
+        root,
+        "v1.0.0",
+        "refs/tags/v1.0.0",
+        "anything",
+        None,
+        None,
+    );
+    assert!(dup.is_err(), "duplicate tag must error");
+}
+
+// T2.2 — protected-branches gate (configured opt-in).
+//
+// Negative-only: we verify the gate *fires* on a configured protected
+// target.  Confirming that `force=true` lets a real merge proceed all
+// the way through is covered by the `requires_proposal_merge_succeeds`
+// test, which uses a real GraphStore-backed workspace.
+#[tokio::test]
+async fn protected_target_blocks_merge_without_force() {
+    use thinkingroot_branch::merge::execute_merge_into;
+    use thinkingroot_core::error::Error;
+    use thinkingroot_core::{
+        AutoResolution, ContradictionPair, HealthScore, KnowledgeDiff, MergedBy,
+    };
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".thinkingroot/graph")).unwrap();
+    std::fs::write(root.join(".thinkingroot/graph/graph.db"), b"placeholder").unwrap();
+    // Opt the workspace into "main is protected" via config.toml.
+    std::fs::write(
+        root.join(".thinkingroot/config.toml"),
+        r#"
+[merge]
+protected_branches = ["main"]
+"#,
+    )
+    .unwrap();
+
+    create_branch_full(
+        root,
+        "feature/will-be-blocked",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::Manual,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let diff = KnowledgeDiff {
+        from_branch: "feature/will-be-blocked".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    // Without force the gate fires.
+    match execute_merge_into(root, "feature/will-be-blocked", None, &diff, MergedBy::System, false)
+        .await
+    {
+        Err(Error::MergeBlocked(msg)) => {
+            assert!(
+                msg.contains("protected"),
+                "expected protected-branches message, got: {msg}"
+            );
+        }
+        other => panic!("expected protected-branches MergeBlocked, got: {other:?}"),
+    }
+
+}
+
 #[tokio::test]
 async fn set_branch_redaction_persists() {
     use thinkingroot_branch::set_branch_redaction;

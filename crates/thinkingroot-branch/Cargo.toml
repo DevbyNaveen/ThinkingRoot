@@ -27,6 +27,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+# T2.1 — APFS clonefile (macOS) and FICLONE ioctl (Linux) for O(1)
+# branch creation.  Listed unconditionally because libc is a tiny,
+# zero-deps facade and its non-Unix builds compile to a no-op shim.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["vector"]
 vector = ["thinkingroot-graph/vector"]

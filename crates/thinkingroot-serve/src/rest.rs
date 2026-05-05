@@ -225,6 +225,39 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/branches/{branch}/redaction",
                 post(set_branch_redaction_handler),
             )
+            // T1.3 — branch audit log. Every state-changing mutation
+            // appends a `BranchEvent` to the BranchRef's events vec;
+            // this route exposes that log read-only.
+            .route("/branches/{branch}/events", get(list_branch_events_handler))
+            // T1.2 — fast per-branch stats (claims/entities/sources)
+            // without running a full diff.
+            .route("/branches/{branch}/stats", get(branch_stats_handler))
+            // T1.7 — lineage DAG aggregating fork/merge edges across
+            // every branch in the registry (active + merged +
+            // abandoned).
+            .route("/branches/lineage", get(branch_lineage_handler))
+            // T2.5 — tag create + list. Writes are rejected by the
+            // immutability gate at `engine::ensure_branch_permission`
+            // (lives since T0.6); this surface is what gives the gate
+            // live data to gate against.
+            .route("/tags", get(list_tags_handler).post(create_tag_handler))
+            .route("/tags/{name}", get(get_tag_handler))
+            // T0.4 — Knowledge Proposal lifecycle. The
+            // `RequiresProposal` merge gate (`merge.rs:336`) consults
+            // `find_approved_proposal` on these files; routes here are
+            // the only way to advance a proposal through the
+            // open→review→approve states.
+            .route(
+                "/branches/{branch}/proposals",
+                get(list_branch_proposals_handler).post(open_proposal_handler),
+            )
+            .route("/proposals", get(list_all_proposals_handler))
+            .route("/proposals/{id}", get(get_proposal_handler))
+            .route(
+                "/proposals/{id}/reviews",
+                post(review_proposal_handler),
+            )
+            .route("/proposals/{id}/close", post(close_proposal_handler))
             .route("/head", get(get_head_handler));
         router = router.nest("/api/v1", api_routes);
     }
@@ -1257,6 +1290,652 @@ async fn set_branch_redaction_handler(
         Err(e) => err_response(
             StatusCode::BAD_REQUEST,
             "REDACTION_UPDATE_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+// ─── T1.3: Branch audit log ──────────────────────────────────────────
+//
+// Returns the append-only `events` vec on a `BranchRef`, oldest-first.
+// Useful for "who changed this branch when?" UX and as the source of
+// truth for the lineage DAG (T1.7) and SSE stream (T1.6).
+
+async fn list_branch_events_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::branch::BranchRegistry;
+    let registry = match BranchRegistry::load_or_create(&refs_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BRANCH_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    // Look across both active + abandoned + merged so a merged branch
+    // still answers its history (lineage UI walks merged branches).
+    let events = registry
+        .all()
+        .into_iter()
+        .find(|b| b.name == branch)
+        .map(|b| b.events.clone())
+        .unwrap_or_default();
+    ok_response(serde_json::json!({
+        "branch": branch,
+        "events": events,
+    }))
+    .into_response()
+}
+
+// ─── T1.2: Branch stats ──────────────────────────────────────────────
+//
+// Cheap per-branch probe — claim / entity / source counts — without
+// running a full `compute_diff`.  Reads the branch's own GraphStore;
+// avoids the AEP path so the substrate cost is bounded by table
+// scans, not Datalog.
+
+#[derive(Serialize)]
+struct BranchStatsResponse {
+    branch: String,
+    /// Number of claims in the branch's graph.db (post any merges).
+    claim_count: usize,
+    /// Number of entities.
+    entity_count: usize,
+    /// Number of source rows.
+    source_count: usize,
+    /// Number of audit-log entries currently retained on this branch
+    /// (capped by `MAX_EVENTS`).
+    event_count: usize,
+    /// Lifecycle state (active / merged / abandoned) for the row.
+    status: String,
+}
+
+async fn branch_stats_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    use thinkingroot_branch::branch::BranchRegistry;
+    use thinkingroot_branch::snapshot::resolve_data_dir;
+    use thinkingroot_graph::graph::GraphStore;
+
+    let refs_dir = root.join(".thinkingroot-refs");
+    let registry = match BranchRegistry::load_or_create(&refs_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BRANCH_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    let branch_ref = match registry.all().into_iter().find(|b| b.name == branch) {
+        Some(b) => b.clone(),
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "BRANCH_NOT_FOUND",
+                &format!("branch '{branch}' not found"),
+            );
+        }
+    };
+
+    let branch_arg = if branch == "main" { None } else { Some(branch.as_str()) };
+    let data_dir = resolve_data_dir(&root, branch_arg);
+    if !data_dir.exists() {
+        // Branch entry exists but data dir is gone (abandoned branches
+        // have their dir removed by gc).  Report what we know about
+        // the audit-log without lying about substrate counts.
+        return ok_response(BranchStatsResponse {
+            branch: branch.clone(),
+            claim_count: 0,
+            entity_count: 0,
+            source_count: 0,
+            event_count: branch_ref.events.len(),
+            status: branch_status_label(&branch_ref.status),
+        })
+        .into_response();
+    }
+
+    let graph = match GraphStore::init(&data_dir.join("graph")) {
+        Ok(g) => g,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+    let claims = graph.get_all_claims_with_sources().unwrap_or_default();
+    let entities = graph.get_all_entities().unwrap_or_default();
+    let sources = graph.get_all_sources().unwrap_or_default();
+
+    ok_response(BranchStatsResponse {
+        branch: branch.clone(),
+        claim_count: claims.len(),
+        entity_count: entities.len(),
+        source_count: sources.len(),
+        event_count: branch_ref.events.len(),
+        status: branch_status_label(&branch_ref.status),
+    })
+    .into_response()
+}
+
+fn branch_status_label(status: &thinkingroot_core::BranchStatus) -> String {
+    use thinkingroot_core::BranchStatus;
+    match status {
+        BranchStatus::Active => "active".into(),
+        BranchStatus::Merged { .. } => "merged".into(),
+        BranchStatus::Abandoned { .. } => "abandoned".into(),
+    }
+}
+
+// ─── T2.5: Tag create / list / get ───────────────────────────────────
+//
+// `POST /api/v1/tags` registers an immutable [`BranchKind::Tag`].
+// `GET /api/v1/tags` lists every active tag.
+// `GET /api/v1/tags/{name}` returns one.
+
+#[derive(Deserialize)]
+struct CreateTagRequest {
+    /// User-visible tag name (e.g. `"v1.0.0"`, `"q1-snapshot"`).
+    name: String,
+    /// Internal ref pointer (e.g. `"refs/tags/v1.0.0"`); free-form.
+    ref_name: String,
+    /// Pinned target — typically a BLAKE3 commit hash matching
+    /// `BranchRef::parent_commit_hash`.
+    target: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+async fn create_tag_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateTagRequest>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    match thinkingroot_branch::create_tag(
+        &root,
+        &body.name,
+        &body.ref_name,
+        &body.target,
+        request_user(&headers),
+        body.description,
+    ) {
+        Ok(tag) => ok_response(serde_json::json!({ "tag": tag })).into_response(),
+        Err(thinkingroot_core::Error::BranchAlreadyExists(_)) => err_response(
+            StatusCode::CONFLICT,
+            "TAG_ALREADY_EXISTS",
+            &format!("tag '{}' already exists", body.name),
+        ),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "TAG_CREATE_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn list_tags_handler(State(state): State<Arc<AppState>>) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            // Empty list rather than error — matches list_branches
+            // behaviour and lets unconfigured daemons stay
+            // 200-OK-with-empty for monitoring scrapers.
+            return ok_response(serde_json::json!({ "tags": Vec::<()>::new() }))
+                .into_response();
+        }
+    };
+    match thinkingroot_branch::list_tags(&root) {
+        Ok(tags) => ok_response(serde_json::json!({ "tags": tags })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TAG_LIST_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn get_tag_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    match thinkingroot_branch::list_tags(&root) {
+        Ok(tags) => match tags.into_iter().find(|t| t.name == name) {
+            Some(t) => ok_response(serde_json::json!({ "tag": t })).into_response(),
+            None => err_response(
+                StatusCode::NOT_FOUND,
+                "TAG_NOT_FOUND",
+                &format!("tag '{name}' not found"),
+            ),
+        },
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TAG_LOOKUP_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+// ─── T1.7: Branch lineage DAG ────────────────────────────────────────
+//
+// Aggregates `(parent, child)` fork edges + `(child, into)` merge
+// edges across every branch in the registry.  Consumers (Brain
+// surface, dashboards) render this as a DAG; the layout is theirs to
+// pick — we just hand back the edge list with timestamps so they can
+// time-order siblings.
+
+#[derive(Serialize)]
+struct LineageEdge {
+    /// `"fork"` or `"merge"`.
+    kind: &'static str,
+    from: String,
+    to: String,
+    at: chrono::DateTime<chrono::Utc>,
+    /// For merge edges: the proposal id (when the merge was gated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorising_proposal_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LineageNode {
+    name: String,
+    status: String,
+    kind: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct LineageResponse {
+    nodes: Vec<LineageNode>,
+    edges: Vec<LineageEdge>,
+}
+
+async fn branch_lineage_handler(State(state): State<Arc<AppState>>) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    use thinkingroot_branch::branch::BranchRegistry;
+    use thinkingroot_core::BranchEvent;
+
+    let refs_dir = root.join(".thinkingroot-refs");
+    let registry = match BranchRegistry::load_or_create(&refs_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BRANCH_ERROR",
+                &e.to_string(),
+            );
+        }
+    };
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for branch in registry.all() {
+        nodes.push(LineageNode {
+            name: branch.name.clone(),
+            status: branch_status_label(&branch.status),
+            kind: kind_label(&branch.kind),
+            created_at: branch.created_at,
+        });
+        // Fork edge: parent → branch, timestamped at the Created event
+        // when present (T1.3 wires this on every new branch); falls
+        // back to `created_at` when reading a pre-T1.3 registry.
+        let forked_at = branch
+            .events
+            .iter()
+            .find_map(|e| match e {
+                BranchEvent::Created { at, .. } => Some(*at),
+                _ => None,
+            })
+            .unwrap_or(branch.created_at);
+        edges.push(LineageEdge {
+            kind: "fork",
+            from: branch.parent.clone(),
+            to: branch.name.clone(),
+            at: forked_at,
+            authorising_proposal_id: None,
+        });
+        // Merge edges: one per Merged event (typically only one, but
+        // a branch could in theory be merged-then-reopened in a future
+        // workflow; loop covers the general case).
+        for ev in &branch.events {
+            if let BranchEvent::Merged {
+                at,
+                into,
+                authorising_proposal_id,
+                ..
+            } = ev
+            {
+                edges.push(LineageEdge {
+                    kind: "merge",
+                    from: branch.name.clone(),
+                    to: into.clone(),
+                    at: *at,
+                    authorising_proposal_id: authorising_proposal_id.clone(),
+                });
+            }
+        }
+    }
+
+    ok_response(LineageResponse { nodes, edges }).into_response()
+}
+
+fn kind_label(kind: &thinkingroot_core::BranchKind) -> String {
+    use thinkingroot_core::BranchKind;
+    match kind {
+        BranchKind::Main => "main".into(),
+        BranchKind::Feature => "feature".into(),
+        BranchKind::Stream { .. } => "stream".into(),
+        BranchKind::Sandbox { .. } => "sandbox".into(),
+        BranchKind::Tag { .. } => "tag".into(),
+    }
+}
+
+// ─── T0.4: Knowledge Proposal handlers ────────────────────────────────
+//
+// These five routes wire the `thinkingroot-pr` crate (the proposal
+// lifecycle layer) into HTTP. A workspace's proposals all live under
+// `<workspace>/.thinkingroot-refs/proposals/`; routes that need a
+// `refs_dir` derive it from `state.workspace_root` and bail early if
+// the daemon was started without `--path`.
+
+#[derive(Deserialize)]
+struct OpenProposalRequest {
+    /// Optional explicit target branch; `None` (or omitted) means main.
+    #[serde(default)]
+    target_branch: Option<String>,
+    /// Free-form description supplied by the proposing principal.
+    #[serde(default)]
+    description: Option<String>,
+    /// Distinct approving reviewers required. Reads from the source
+    /// branch's `MergePolicy::RequiresProposal { min_reviewers }` when
+    /// omitted (`None`); falls back to `1` if no policy is set so this
+    /// route stays usable for branches that haven't opted into proposal
+    /// gating yet.
+    #[serde(default)]
+    min_reviewers: Option<u8>,
+    /// Required-checks list to freeze on the proposal at open time.
+    /// When omitted, copied from the source branch's policy if set,
+    /// otherwise empty.
+    #[serde(default)]
+    required_checks: Option<Vec<String>>,
+}
+
+fn refs_dir_from_state(state: &AppState) -> std::result::Result<PathBuf, Response> {
+    let root = state.workspace_root.as_ref().ok_or_else(|| {
+        err_response(
+            StatusCode::BAD_REQUEST,
+            "NOT_CONFIGURED",
+            "workspace_root not set",
+        )
+    })?;
+    Ok(root.join(".thinkingroot-refs"))
+}
+
+/// Look up the source branch's `RequiresProposal` policy values so
+/// callers don't have to mirror them on every open request. Returns
+/// `(min_reviewers, required_checks)`. Defaults to `(1, vec![])` when
+/// the branch has any other policy or when it can't be loaded — the
+/// proposal still gets created, the merge gate just won't honour it
+/// unless the policy is also `RequiresProposal`.
+fn proposal_policy_defaults(
+    refs_dir: &std::path::Path,
+    source_branch: &str,
+) -> (u8, Vec<String>) {
+    use thinkingroot_branch::branch::BranchRegistry;
+    use thinkingroot_core::MergePolicy;
+    if let Ok(registry) = BranchRegistry::load_or_create(refs_dir)
+        && let Some(branch) = registry.get(source_branch)
+        && let MergePolicy::RequiresProposal {
+            min_reviewers,
+            required_checks,
+        } = &branch.merge_policy
+    {
+        return (*min_reviewers, required_checks.clone());
+    }
+    (1, Vec::new())
+}
+
+async fn open_proposal_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(branch): Path<String>,
+    Json(body): Json<OpenProposalRequest>,
+) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let author = match request_user(&headers) {
+        Some(u) => u,
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "MISSING_PRINCIPAL",
+                "X-TR-User header is required to open a proposal",
+            );
+        }
+    };
+
+    let (default_min, default_checks) =
+        proposal_policy_defaults(&refs_dir, &branch);
+    let min_reviewers = body.min_reviewers.unwrap_or(default_min);
+    let required_checks = body.required_checks.unwrap_or(default_checks);
+
+    match thinkingroot_pr::open_proposal(
+        &refs_dir,
+        &branch,
+        body.target_branch.as_deref(),
+        &author,
+        body.description,
+        min_reviewers,
+        required_checks,
+    ) {
+        Ok(p) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "PROPOSAL_OPEN_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn list_branch_proposals_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    match thinkingroot_pr::list_proposals(&refs_dir) {
+        Ok(all) => {
+            let filtered: Vec<_> = all
+                .into_iter()
+                .filter(|p| p.source_branch == branch)
+                .collect();
+            ok_response(serde_json::json!({ "proposals": filtered })).into_response()
+        }
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PROPOSAL_LIST_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn list_all_proposals_handler(State(state): State<Arc<AppState>>) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    match thinkingroot_pr::list_proposals(&refs_dir) {
+        Ok(all) => ok_response(serde_json::json!({ "proposals": all })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "PROPOSAL_LIST_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn get_proposal_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    match thinkingroot_pr::read_proposal(&refs_dir, &id) {
+        Ok(Some(p)) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "PROPOSAL_NOT_FOUND",
+            &format!("proposal `{id}` not found"),
+        ),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "PROPOSAL_READ_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ReviewProposalRequest {
+    /// `"approve"`, `"request_changes"`, or `"comment"`.
+    decision: String,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+async fn review_proposal_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReviewProposalRequest>,
+) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let reviewer = match request_user(&headers) {
+        Some(u) => u,
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "MISSING_PRINCIPAL",
+                "X-TR-User header is required to review a proposal",
+            );
+        }
+    };
+    let decision = match body.decision.to_ascii_lowercase().as_str() {
+        "approve" => thinkingroot_pr::ReviewDecision::Approve,
+        "request_changes" | "request-changes" | "changes_requested" => {
+            thinkingroot_pr::ReviewDecision::RequestChanges
+        }
+        "comment" => thinkingroot_pr::ReviewDecision::Comment,
+        other => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_DECISION",
+                &format!(
+                    "decision must be one of approve|request_changes|comment, got `{other}`"
+                ),
+            );
+        }
+    };
+    match thinkingroot_pr::review_proposal(&refs_dir, &id, &reviewer, decision, body.comment) {
+        Ok(p) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "PROPOSAL_REVIEW_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn close_proposal_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let refs_dir = match refs_dir_from_state(&state) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let closer = match request_user(&headers) {
+        Some(u) => u,
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "MISSING_PRINCIPAL",
+                "X-TR-User header is required to close a proposal",
+            );
+        }
+    };
+    match thinkingroot_pr::close_proposal(&refs_dir, &id, &closer) {
+        Ok(p) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Err(e) => err_response(
+            StatusCode::FORBIDDEN,
+            "PROPOSAL_CLOSE_FAILED",
             &e.to_string(),
         ),
     }

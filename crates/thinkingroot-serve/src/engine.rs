@@ -3487,7 +3487,7 @@ Rules: \
         merged_by: thinkingroot_core::MergedBy,
     ) -> Result<thinkingroot_core::KnowledgeDiff> {
         use thinkingroot_branch::diff::compute_diff_into;
-        use thinkingroot_branch::merge::execute_merge_into;
+        use thinkingroot_branch::merge::execute_merge_into_with_options;
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_graph::graph::GraphStore;
 
@@ -3550,13 +3550,14 @@ Rules: \
         drop(target_graph);
         drop(source_graph);
 
-        execute_merge_into(
+        execute_merge_into_with_options(
             root,
             source_branch_name,
             target_branch,
             &diff,
             merged_by,
             propagate_deletions,
+            force,
         )
         .await?;
 

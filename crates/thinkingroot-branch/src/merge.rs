@@ -315,8 +315,52 @@ pub async fn execute_merge_into(
     merged_by: MergedBy,
     propagate_deletions: bool,
 ) -> Result<()> {
+    execute_merge_into_with_options(
+        root_path,
+        source_branch_name,
+        target_branch,
+        diff,
+        merged_by,
+        propagate_deletions,
+        false,
+    )
+    .await
+}
+
+/// Force-aware variant of [`execute_merge_into`].
+///
+/// `force=true` bypasses the T2.2 protected-branches gate (and matches
+/// the existing `force=true` semantics on `compute_diff` for the
+/// health-score gate).  Tag immutability is enforced separately at
+/// `engine::ensure_branch_permission` and is NOT bypassed by `force`.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_merge_into_with_options(
+    root_path: &Path,
+    source_branch_name: &str,
+    target_branch: Option<&str>,
+    diff: &KnowledgeDiff,
+    merged_by: MergedBy,
+    propagate_deletions: bool,
+    force: bool,
+) -> Result<()> {
     if !diff.merge_allowed {
         return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
+    }
+
+    // T2.2 — protected-branches gate (default protects "main").  Run
+    // BEFORE the merge-policy gate so the error is descriptive: a
+    // protected target rejects the merge regardless of source policy.
+    if !force {
+        use thinkingroot_core::config::Config;
+        if let Ok(config) = Config::load_merged(root_path) {
+            let resolved_target = target_branch.unwrap_or("main");
+            if config.merge.is_protected(resolved_target) {
+                return Err(Error::MergeBlocked(format!(
+                    "target branch '{resolved_target}' is protected by `merge.protected_branches` — \
+                     pass force=true (and accept responsibility) or remove it from the config to merge"
+                )));
+            }
+        }
     }
 
     // T0.6 — read merge_policy off the source branch and gate.
@@ -400,7 +444,11 @@ pub async fn execute_merge_into(
     // and a re-run of the same merge would be allowed (idempotent in
     // theory, but expensive — best avoided).
     let mut registry = BranchRegistry::load_or_create(&refs_dir)?;
-    registry.mark_merged(source_branch_name, merged_by)?;
+    registry.mark_merged_into(
+        source_branch_name,
+        merged_by,
+        authorising_proposal_id.clone(),
+    )?;
 
     // T0.4 — when a Knowledge Proposal authorised this merge, flip its
     // status to Merged so list_proposals reflects truth and a future

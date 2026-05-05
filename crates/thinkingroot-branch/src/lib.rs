@@ -123,6 +123,109 @@ pub async fn create_branch_full(
     Ok(branch_ref)
 }
 
+/// Create an immutable tag pointing at a target commit (T2.5).
+///
+/// Tags are first-class branches with [`BranchKind::Tag`] so the
+/// existing immutability gate at
+/// `thinkingroot-serve::engine::ensure_branch_permission` rejects any
+/// write/merge/rebase/delete attempt against them — even by the
+/// owner.  The `target` is typically a BLAKE3 commit hash
+/// (matches the format `parent_commit_hash` uses), but any opaque
+/// 1..=128-char identifier is accepted; the engine never tries to
+/// resolve it back to substrate state, so tag semantics stay decoupled
+/// from any future commit log.
+///
+/// Returns `Error::BranchAlreadyExists` if a branch / tag with the
+/// same name already exists.
+pub fn create_tag(
+    root_path: &Path,
+    name: &str,
+    ref_name: &str,
+    target: &str,
+    owner: Option<String>,
+    description: Option<String>,
+) -> Result<BranchRef> {
+    if name.trim().is_empty() {
+        return Err(thinkingroot_core::Error::Config(
+            "tag name must not be empty".into(),
+        ));
+    }
+    if ref_name.trim().is_empty() {
+        return Err(thinkingroot_core::Error::Config(
+            "tag ref_name must not be empty".into(),
+        ));
+    }
+    if target.is_empty() || target.len() > 128 {
+        return Err(thinkingroot_core::Error::Config(
+            "tag target must be 1..=128 chars".into(),
+        ));
+    }
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    std::fs::create_dir_all(&refs_dir)?;
+    let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
+    // Tags fork conceptually from `main` (so the lineage DAG draws an
+    // edge `main → tag`) but they share no substrate with main —
+    // `create_branch_full` here is registry-only; we do NOT call
+    // `snapshot::create_branch_layout` because Tags are name pins, not
+    // substrate forks.
+    registry.create_branch_full(
+        name,
+        "main",
+        description,
+        owner,
+        BranchPermissions::default(),
+        BranchKind::Tag {
+            ref_name: ref_name.to_string(),
+            target: target.to_string(),
+        },
+        // Tags never merge — Manual is the safe default; the immutability
+        // gate hard-rejects merge attempts regardless of policy, so this
+        // is just for the registry payload.
+        MergePolicy::Manual,
+        None,
+    )
+}
+
+/// List every active [`BranchKind::Tag`] in the workspace.  Order is
+/// the underlying `branches.toml` order (insertion-time on most
+/// workspaces).
+pub fn list_tags(root_path: &Path) -> Result<Vec<BranchRef>> {
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    if !refs_dir.exists() {
+        return Ok(vec![]);
+    }
+    let registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
+    Ok(registry
+        .list_active()
+        .into_iter()
+        .filter(|b| matches!(b.kind, BranchKind::Tag { .. }))
+        .cloned()
+        .collect())
+}
+
+/// Set or clear the T2.3 TTL on an existing branch.
+///
+/// `Some(secs)` opts the branch into auto-abandon by the maintenance
+/// pass after `secs` seconds since `created_at`.  `None` clears the
+/// TTL.  Tag branches refuse this — they're immutable.
+pub fn set_branch_max_age_secs(
+    root_path: &Path,
+    name: &str,
+    max_age_secs: Option<u64>,
+) -> Result<BranchRef> {
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
+    if let Some(b) = registry.get(name)
+        && matches!(b.kind, BranchKind::Tag { .. })
+    {
+        return Err(thinkingroot_core::Error::PermissionDenied {
+            actor: "system".into(),
+            action: format!("set TTL on tag '{name}' (tags are immutable)"),
+        });
+    }
+    registry.set_max_age_secs(name, max_age_secs)
+}
+
 /// Update the redaction policy on an existing branch and persist.
 pub fn set_branch_redaction(
     root_path: &Path,

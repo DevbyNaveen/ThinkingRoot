@@ -22,6 +22,7 @@ vector = ["thinkingroot-graph/vector", "thinkingroot-branch/vector", "thinkingro
 thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-branch = { workspace = true }
+thinkingroot-pr = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
 thinkingroot-link = { workspace = true }

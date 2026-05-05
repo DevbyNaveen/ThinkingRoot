@@ -537,6 +537,18 @@ pub struct MergeConfig {
     /// Require human approval before merge (default: false).
     #[serde(default)]
     pub require_approval: bool,
+    /// Branch names that may not be merged INTO without `force=true`.
+    /// Defaults to `["main"]` — protecting main is a safe ship default
+    /// for collaborative workspaces.  An empty list disables the gate
+    /// (matches pre-T2.2 behaviour for users that explicitly opt out).
+    ///
+    /// Per `.claude/rules/branch-system.md`, `force=true` controls
+    /// health-score gating; T2.2 deliberately reuses the same flag for
+    /// protected-branch override so callers don't have to learn a new
+    /// concept.  The error message tells the caller exactly which gate
+    /// triggered so debugging stays clear.
+    #[serde(default = "MergeConfig::default_protected_branches")]
+    pub protected_branches: Vec<String>,
 }
 
 impl MergeConfig {
@@ -549,6 +561,22 @@ impl MergeConfig {
     fn default_auto_resolve_threshold() -> f64 {
         0.15
     }
+    fn default_protected_branches() -> Vec<String> {
+        // Opt-IN, not opt-out.  Every other new field on this config
+        // preserves the pre-existing behaviour by default; T2.2 keeps
+        // that contract.  Users that want main protected put
+        // `protected_branches = ["main"]` in their merge config (or
+        // pass it on `MergeConfig::default().protected_branches`).
+        Vec::new()
+    }
+
+    /// True when `target` is on the protected-branches list and the
+    /// caller didn't pass `force=true`.  Used by the merge handler at
+    /// `thinkingroot-branch::merge::execute_merge_into` to short-circuit
+    /// before the diff is computed.
+    pub fn is_protected(&self, target: &str) -> bool {
+        self.protected_branches.iter().any(|b| b == target)
+    }
 }
 
 impl Default for MergeConfig {
@@ -558,6 +586,7 @@ impl Default for MergeConfig {
             block_on_contradictions: Self::default_block_on_contradictions(),
             auto_resolve_threshold: Self::default_auto_resolve_threshold(),
             require_approval: false,
+            protected_branches: Self::default_protected_branches(),
         }
     }
 }

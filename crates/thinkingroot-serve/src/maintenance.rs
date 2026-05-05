@@ -205,6 +205,82 @@ pub struct CleanupStats {
     pub kept: usize,
 }
 
+/// T2.3 — TTL cleanup pass.
+///
+/// Walks every Active branch in the workspace; abandons each one whose
+/// `max_age_secs` opt-in TTL has expired (`now - created_at >
+/// max_age_secs`).  Tag branches are skipped — they're immutable name
+/// pins and should outlive arbitrary expiry windows.  Branches with
+/// agent-contributed claims still abandon (data dir kept) rather than
+/// purge — same safety as stream cleanup.
+///
+/// Returns counters for telemetry.  The pass is idempotent: a second
+/// call after the first is a no-op (already-Abandoned branches are
+/// skipped at the registry layer).
+pub async fn ttl_cleanup_once(
+    workspace_root: &std::path::Path,
+    branch_engines: Option<&BranchEngineCache>,
+) -> thinkingroot_core::Result<CleanupStats> {
+    let mut stats = CleanupStats::default();
+
+    let branches = thinkingroot_branch::list_branches(workspace_root)
+        .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("list_branches: {e}")))?;
+    let now = chrono::Utc::now();
+
+    for branch in branches {
+        if !matches!(branch.status, BranchStatus::Active) {
+            continue;
+        }
+        // Tags never auto-expire — they're name pins.
+        if matches!(branch.kind, BranchKind::Tag { .. }) {
+            continue;
+        }
+        let Some(max_age_secs) = branch.max_age_secs else {
+            stats.kept += 1;
+            continue;
+        };
+        stats.branches_scanned += 1;
+
+        let age_secs = (now - branch.created_at).num_seconds().max(0) as u64;
+        if age_secs <= max_age_secs {
+            stats.kept += 1;
+            continue;
+        }
+
+        // Drop cached engine handle BEFORE abandoning so the next
+        // reader gets a fresh open and doesn't hold the disk open.
+        if let Some(cache) = branch_engines {
+            cache.invalidate(workspace_root, &branch.name).await;
+        }
+        match thinkingroot_branch::delete_branch(workspace_root, &branch.name) {
+            Ok(_) => {
+                stats.abandoned += 1;
+                tracing::info!(
+                    branch = %branch.name,
+                    age_secs,
+                    max_age_secs,
+                    "ttl_cleanup: abandoned"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    branch = %branch.name,
+                    "ttl_cleanup: abandon failed: {e}"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        target: "ttl_cleanup",
+        branches_scanned = stats.branches_scanned,
+        abandoned = stats.abandoned,
+        kept = stats.kept,
+        "ttl cleanup tick complete"
+    );
+    Ok(stats)
+}
+
 /// Detect whether a branch has agent-contributed claims. Agent contributes
 /// create a synthetic source with URI `mcp://agent/{session_id}` at
 /// engine.rs:1493; their presence means the branch holds in-flight work.

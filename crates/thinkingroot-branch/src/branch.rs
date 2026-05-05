@@ -13,6 +13,22 @@ use thinkingroot_core::{
 const REGISTRY_FILE: &str = "branches.toml";
 const HEAD_FILE: &str = "HEAD";
 
+/// Project a [`MergedBy`] to the canonical "actor" string used in
+/// [`thinkingroot_core::BranchEvent`] audit-log entries.  Mirrors
+/// `Principal::identity()` shape so consumers (audit tail, lineage
+/// DAG) can join on the same key set without a second lookup.
+fn merger_identity(merged_by: &MergedBy) -> String {
+    match merged_by {
+        MergedBy::Human { user } => user.clone(),
+        MergedBy::Agent { agent_id } => agent_id.clone(),
+        MergedBy::Connector {
+            connector_id,
+            install_id,
+        } => format!("{connector_id}:{install_id}"),
+        MergedBy::System => "system".to_string(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct RegistryFile {
     #[serde(default, rename = "branch")]
@@ -143,14 +159,15 @@ impl BranchRegistry {
         {
             return Err(Error::BranchAlreadyExists(name.to_string()));
         }
-        let branch = BranchRef {
+        let now = Utc::now();
+        let mut branch = BranchRef {
             name: name.to_string(),
             slug: slugify(name),
             parent: parent.to_string(),
-            created_at: Utc::now(),
+            created_at: now,
             status: BranchStatus::Active,
             description,
-            owner,
+            owner: owner.clone(),
             permissions,
             kind,
             merge_policy,
@@ -160,10 +177,46 @@ impl BranchRegistry {
             // been hashed.  Defaults to None so legacy callers (and
             // tests) continue to compile without LCA tracking.
             parent_commit_hash: None,
+            // T2.3 — opt-in TTL.  `None` preserves pre-T2.3 default
+            // ("never expire on age").  Callers that want a TTL on a
+            // brand-new branch use [`Self::set_max_age_secs`] right
+            // after creation.
+            max_age_secs: None,
+            // T1.3 — audit log starts with a single Created entry so
+            // the lineage DAG (T1.7) can answer "when was this branch
+            // forked?" without consulting `created_at` separately.
+            events: Vec::new(),
         };
+        branch.append_event(thinkingroot_core::BranchEvent::Created {
+            at: now,
+            actor: owner.unwrap_or_else(|| "system".to_string()),
+            parent: parent.to_string(),
+        });
         self.data.branches.push(branch.clone());
         self.save()?;
         Ok(branch)
+    }
+
+    /// Set the T2.3 TTL on an existing active branch.  `None` clears
+    /// the TTL.  Returns the updated branch.  Lock-protected.
+    pub fn set_max_age_secs(
+        &mut self,
+        name: &str,
+        max_age_secs: Option<u64>,
+    ) -> Result<BranchRef> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
+            .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
+            .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        branch.max_age_secs = max_age_secs;
+        let updated = branch.clone();
+        self.save()?;
+        Ok(updated)
     }
 
     /// Set the T0.5 LCA pointer on an existing active branch.
@@ -215,7 +268,14 @@ impl BranchRegistry {
             .iter_mut()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
             .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        let now = Utc::now();
+        let enabled = policy.is_some();
         branch.redaction = policy;
+        branch.append_event(thinkingroot_core::BranchEvent::RedactionUpdated {
+            at: now,
+            actor: "system".into(),
+            enabled,
+        });
         let updated = branch.clone();
         self.save()?;
         Ok(updated)
@@ -226,17 +286,46 @@ impl BranchRegistry {
     /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
     /// reloads the on-disk state before mutating.
     pub fn mark_merged(&mut self, name: &str, merged_by: MergedBy) -> Result<()> {
+        self.mark_merged_into(name, merged_by, None)
+    }
+
+    /// Like [`Self::mark_merged`] but threads through an
+    /// `authorising_proposal_id` so the audit log captures the T0.4
+    /// proposal that authorised this merge (when one was used).
+    pub fn mark_merged_into(
+        &mut self,
+        name: &str,
+        merged_by: MergedBy,
+        authorising_proposal_id: Option<String>,
+    ) -> Result<()> {
         let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
         self.data = Self::read_registry_file(&self.refs_dir)?;
 
+        let now = Utc::now();
+        let actor = merger_identity(&merged_by);
+        let parent = {
+            let parent_branch = self
+                .data
+                .branches
+                .iter()
+                .find(|b| b.name == name)
+                .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+            parent_branch.parent.clone()
+        };
         let branch = self
             .data
             .branches
             .iter_mut()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
             .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        branch.append_event(thinkingroot_core::BranchEvent::Merged {
+            at: now,
+            actor,
+            into: parent,
+            authorising_proposal_id,
+        });
         branch.status = BranchStatus::Merged {
-            merged_at: Utc::now(),
+            merged_at: now,
             merged_by,
         };
         self.save()
@@ -256,9 +345,12 @@ impl BranchRegistry {
             .iter_mut()
             .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
             .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
-        branch.status = BranchStatus::Abandoned {
-            abandoned_at: Utc::now(),
-        };
+        let now = Utc::now();
+        branch.append_event(thinkingroot_core::BranchEvent::Abandoned {
+            at: now,
+            actor: "system".into(),
+        });
+        branch.status = BranchStatus::Abandoned { abandoned_at: now };
         self.save()
     }
 
@@ -269,6 +361,13 @@ impl BranchRegistry {
             .iter()
             .filter(|b| matches!(b.status, BranchStatus::Active))
             .collect()
+    }
+
+    /// Get every branch in the registry (active + merged + abandoned).
+    /// Used by audit-log + lineage views that need to walk historical
+    /// state, not just live branches.
+    pub fn all(&self) -> Vec<&BranchRef> {
+        self.data.branches.iter().collect()
     }
 
     /// Get a branch by name (active only).
