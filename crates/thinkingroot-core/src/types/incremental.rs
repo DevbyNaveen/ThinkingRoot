@@ -44,12 +44,16 @@ pub struct IncrementalSummary {
 }
 
 /// Canonical phase name list — the keys IncrementalSummary.phase_timings
-/// carries.  Adding a new phase requires extending this list.  The
-/// pipeline emits these in order; "other" is the residual that captures
-/// any time spent outside an instrumented region (config load, drop
-/// guards, etc.).
+/// carries (when the phase actually ran on this compile).  Adding a new
+/// phase requires extending this list.  "other" is the residual that
+/// captures any time spent outside an instrumented region.
+///
+/// Note: Phase 7e (`structural_resolve`) is not listed here — it runs
+/// inside `Linker::link()` and its elapsed time is subsumed under the
+/// `link` key.  Splitting it out would require instrumenting the linker
+/// crate; deferred until a downstream consumer asks for the breakdown.
 pub const PHASE_NAMES: &[&str] = &[
     "diff", "extract", "ground", "fingerprint", "remove_sources",
     "entity_relations", "link", "structural_persist",
-    "structural_resolve", "audit", "other",
+    "audit", "other",
 ];

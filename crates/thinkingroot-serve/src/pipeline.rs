@@ -242,6 +242,12 @@ pub struct PipelineOptions {
     /// `unsafe { std::env::set_var(...) }`; this field replaces that
     /// hazard with explicit plumbing.
     pub no_rooting: bool,
+    /// For tests + local iteration: skip the Phase 9 byte-coverage +
+    /// structural-orphan audit so a fixture that doesn't satisfy 100%
+    /// byte coverage can still drive the pipeline.  Equivalent to
+    /// `TR_SKIP_BYTE_AUDIT=1` env var, but typed and per-call.
+    /// Production callers must leave this `false`.
+    pub skip_byte_audit: bool,
 }
 
 impl Default for PipelineOptions {
@@ -249,6 +255,7 @@ impl Default for PipelineOptions {
         Self {
             cancel: CancellationToken::new(),
             no_rooting: false,
+            skip_byte_audit: false,
         }
     }
 }
@@ -279,7 +286,7 @@ async fn run_pipeline_inner(
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
     options: PipelineOptions,
 ) -> Result<PipelineResult> {
-    let PipelineOptions { cancel, no_rooting } = options;
+    let PipelineOptions { cancel, no_rooting, skip_byte_audit } = options;
     // Helper macro — every long-running phase boundary checks this so
     // Stop / Ctrl-C never has to wait for the next batch to finish.
     macro_rules! bail_if_cancelled {
@@ -1302,11 +1309,20 @@ async fn run_pipeline_inner(
         .update_entity_relations_for_triples(&new_triples)?;
     // Phase 8 elapsed is the second half of the split entity_relations key.
     // Phase 5 (removal-side) contributed the first half earlier.
+    // CONTRACT: two PhaseDone events are emitted for "entity_relations" —
+    // one from Phase 5 (removals) and one here (additions).  SSE consumers
+    // that want a unified bar sum them; consumers that want the split keep
+    // them separate.  IncrementalSummary.phase_timings["entity_relations"]
+    // is the combined total of both.
     {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(last_phase_end).as_millis() as u64;
         last_phase_end = now;
         *phase_timings.entry("entity_relations".to_string()).or_insert(0) += elapsed;
+        emit!(ProgressEvent::PhaseDone {
+            name: "entity_relations".to_string(),
+            elapsed_ms: elapsed,
+        });
     }
 
     // Vector index, markdown artifacts, and post-compile health
@@ -1321,9 +1337,10 @@ async fn run_pipeline_inner(
     // source has uncovered bytes. Per-compile escape hatch:
     // `TR_SKIP_BYTE_AUDIT=1` (intended for local iteration; CI must
     // keep it on).
-    let phase_9_skip = std::env::var("TR_SKIP_BYTE_AUDIT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let phase_9_skip = skip_byte_audit
+        || std::env::var("TR_SKIP_BYTE_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     if !phase_9_skip {
         let phase_9_started = std::time::Instant::now();
         let orphans = storage.graph.query_orphan_bytes()?;

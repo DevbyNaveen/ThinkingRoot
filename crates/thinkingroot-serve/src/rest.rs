@@ -984,6 +984,7 @@ async fn compile_stream(
             PipelineOptions {
                 cancel: cancel_for_task,
                 no_rooting,
+                skip_byte_audit: false,
             },
         )
         .await

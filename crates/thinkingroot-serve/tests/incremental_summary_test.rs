@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 #[test]
 fn phase_names_constant_is_complete() {
+    // "structural_resolve" (Phase 7e) is intentionally absent — it runs
+    // inside Linker::link() and its time is subsumed under "link".
     let expected = [
         "diff",
         "extract",
@@ -28,14 +30,13 @@ fn phase_names_constant_is_complete() {
         "entity_relations",
         "link",
         "structural_persist",
-        "structural_resolve",
         "audit",
         "other",
     ];
     assert_eq!(
         PHASE_NAMES.len(),
         expected.len(),
-        "PHASE_NAMES must have exactly 11 stable keys"
+        "PHASE_NAMES must have exactly 10 stable keys"
     );
     for name in &expected {
         assert!(
@@ -152,8 +153,8 @@ fn make_workspace(root: &PathBuf, files: &[(&str, &str)]) {
 
 async fn compile(root: &PathBuf) -> thinkingroot_core::Result<thinkingroot_serve::pipeline::PipelineResult> {
     // Force structural-only: no real LLM calls in tests.
-    // SAFETY: single-threaded test; no concurrent reads of this env var.
-    unsafe { std::env::set_var("TR_SKIP_BYTE_AUDIT", "1") };
+    // skip_byte_audit=true avoids the unsafe set_var race; env-var back-compat
+    // is preserved for CI scripts that still set TR_SKIP_BYTE_AUDIT=1.
     let (tx, _rx) = mpsc::unbounded_channel();
     run_pipeline_with_options(
         root,
@@ -162,6 +163,7 @@ async fn compile(root: &PathBuf) -> thinkingroot_core::Result<thinkingroot_serve
         PipelineOptions {
             cancel: CancellationToken::new(),
             no_rooting: true,
+            skip_byte_audit: true,
         },
     )
     .await
@@ -173,8 +175,8 @@ async fn compile_collect_events(
     thinkingroot_core::Result<thinkingroot_serve::pipeline::PipelineResult>,
     Vec<ProgressEvent>,
 ) {
-    // SAFETY: single-threaded test; no concurrent reads of this env var.
-    unsafe { std::env::set_var("TR_SKIP_BYTE_AUDIT", "1") };
+    // skip_byte_audit=true avoids the unsafe set_var race; env-var back-compat
+    // is preserved for CI scripts that still set TR_SKIP_BYTE_AUDIT=1.
     let (tx, mut rx) = mpsc::unbounded_channel();
     let result = run_pipeline_with_options(
         root,
@@ -183,6 +185,7 @@ async fn compile_collect_events(
         PipelineOptions {
             cancel: CancellationToken::new(),
             no_rooting: true,
+            skip_byte_audit: true,
         },
     )
     .await;
