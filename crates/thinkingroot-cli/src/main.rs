@@ -5,6 +5,7 @@ use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use console::style;
 use tracing_subscriber::EnvFilter;
+use thinkingroot_cli::summary_printer;
 
 mod branch_cmd;
 mod cloud;
@@ -23,7 +24,6 @@ mod resolver;
 mod rooting_cmd;
 mod serve;
 mod setup;
-mod summary_printer;
 mod update_cmd;
 mod watch;
 mod workspace;
@@ -1185,6 +1185,10 @@ async fn run_compile(
     no_rooting: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // C2: When --json is set, suppress TTY progress bars so the JSON line
+    // is the sole stdout output. Pair with `2>/dev/null` to silence stderr
+    // entirely if you need a clean pipe.
+    let use_progress = use_progress && !json;
     if !path.exists() {
         let name = path.display().to_string();
         anyhow::bail!(

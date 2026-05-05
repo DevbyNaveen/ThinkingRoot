@@ -57,3 +57,59 @@ pub const PHASE_NAMES: &[&str] = &[
     "entity_relations", "link", "structural_persist",
     "audit", "other",
 ];
+
+/// Format a byte count using IEC binary units (KiB/MiB/GiB).
+///
+/// Below 1024 bytes shows the raw count (e.g. `"512 B"`); above shows
+/// two decimals (e.g. `"1.50 MiB"`). Uses IEC labels (1 KiB = 1024 bytes)
+/// rather than SI labels (1 KB = 1000 bytes) to avoid confusion.
+/// Canonical implementation — used by the CLI summary printer and
+/// tr-render markdown summaries. Both must call this to guarantee
+/// consistent output for the same byte count.
+pub fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+    if n >= TIB {
+        format!("{:.2} TiB", n as f64 / TIB as f64)
+    } else if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.2} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.2} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_bytes;
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn format_bytes_below_kib() {
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_bytes_exact_kib() {
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+    }
+
+    #[test]
+    fn format_bytes_mib_range() {
+        assert_eq!(format_bytes(1_500_000), "1.43 MiB");
+    }
+
+    #[test]
+    fn format_bytes_exact_gib() {
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GiB");
+    }
+}

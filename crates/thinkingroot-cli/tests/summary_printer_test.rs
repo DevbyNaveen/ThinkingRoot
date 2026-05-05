@@ -68,27 +68,28 @@ fn render_phase_timings_in_canonical_order() {
         .expect("'Phase timings' header not found in output");
     let timings_section = &out[timings_start..];
 
-    let diff_pos = timings_section.find("diff").expect("'diff' not found in phase timings");
-    let extract_pos = timings_section.find("extract").expect("'extract' not found in phase timings");
-    let ground_pos = timings_section.find("ground").expect("'ground' not found in phase timings");
-    let audit_pos = timings_section.find("audit").expect("'audit' not found in phase timings");
-
-    assert!(
-        diff_pos < extract_pos,
-        "'diff' must appear before 'extract' in phase timings; positions: {diff_pos} vs {extract_pos}"
-    );
-    assert!(
-        extract_pos < ground_pos,
-        "'extract' must appear before 'ground' in phase timings; positions: {extract_pos} vs {ground_pos}"
-    );
-    assert!(
-        ground_pos < audit_pos,
-        "'ground' must appear before 'audit' (BTreeMap would put audit first); positions: {ground_pos} vs {audit_pos}"
-    );
+    // Full contract test: assert ALL 9 adjacent pairs from PHASE_NAMES appear
+    // in the correct pipeline order. This catches any BTreeMap-alphabetic
+    // ordering regression (e.g. "audit" < "diff" alphabetically).
+    for window in PHASE_NAMES.windows(2) {
+        let prev_name = window[0];
+        let next_name = window[1];
+        let prev_pos = timings_section
+            .find(prev_name)
+            .unwrap_or_else(|| panic!("phase '{}' missing from phase timings section", prev_name));
+        let next_pos = timings_section
+            .find(next_name)
+            .unwrap_or_else(|| panic!("phase '{}' missing from phase timings section", next_name));
+        assert!(
+            prev_pos < next_pos,
+            "'{}' (pos {}) must appear before '{}' (pos {}) in phase timings",
+            prev_name, prev_pos, next_name, next_pos
+        );
+    }
 }
 
 #[test]
-fn render_format_bytes_kb_mb() {
+fn render_format_bytes_iec_labels() {
     use thinkingroot_cli::summary_printer;
 
     let case = |bytes: u64, expected: &str| {
@@ -105,8 +106,9 @@ fn render_format_bytes_kb_mb() {
 
     case(0, "0 B");
     case(1023, "1023 B");
-    case(1024, "1.0 KB");
-    case(1_500_000, "1.4 MB");
+    case(1024, "1.00 KiB");
+    case(1_500_000, "1.43 MiB");
+    case(1_073_741_824, "1.00 GiB");
 }
 
 #[test]

@@ -1,20 +1,4 @@
-use thinkingroot_core::{IncrementalSummary, types::PHASE_NAMES};
-
-/// Format a byte count as a human-readable string.
-fn format_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * 1024;
-    const GB: u64 = 1024 * 1024 * 1024;
-    if n >= GB {
-        format!("{:.1} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
+use thinkingroot_core::{IncrementalSummary, format_bytes, types::PHASE_NAMES};
 
 const DIVIDER: &str = "─────────────────────────────────────────────";
 
@@ -85,7 +69,9 @@ pub fn print(summary: &IncrementalSummary, to_stderr: bool) {
     if to_stderr {
         eprint!("{text}");
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), text.as_bytes())
-            .expect("write to stdout failed");
+        // Use print! rather than write_all so that a closed pipe (e.g.
+        // `root compile … | head -5`) is handled silently instead of
+        // panicking with a BrokenPipe backtrace.
+        print!("{text}");
     }
 }

@@ -18,7 +18,7 @@ pub use contradiction::*;
 pub use diff::*;
 pub use entity::*;
 pub use event::*;
-pub use incremental::{IncrementalSummary, PHASE_NAMES};
+pub use incremental::{format_bytes, IncrementalSummary, PHASE_NAMES};
 pub use predicate::*;
 pub use relation::*;
 pub use source::*;

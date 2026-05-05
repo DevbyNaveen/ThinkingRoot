@@ -67,11 +67,19 @@ fn signature_label(pack: &V3Pack) -> &'static str {
     }
 }
 
+/// Thin wrapper — delegates to the canonical IEC implementation in
+/// `thinkingroot_core::format_bytes` via copy of the same algorithm so
+/// `tr-render` stays dep-free of the engine crate.  Both must produce
+/// identical output for the same byte count; keep them in sync when
+/// changing precision or thresholds.
 fn format_bytes(n: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * KIB;
     const GIB: u64 = 1024 * MIB;
-    if n >= GIB {
+    const TIB: u64 = 1024 * GIB;
+    if n >= TIB {
+        format!("{:.2} TiB", n as f64 / TIB as f64)
+    } else if n >= GIB {
         format!("{:.2} GiB", n as f64 / GIB as f64)
     } else if n >= MIB {
         format!("{:.2} MiB", n as f64 / MIB as f64)

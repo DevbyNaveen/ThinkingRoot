@@ -161,10 +161,15 @@ pub async fn run_compile_remote(
                 }
                 "incremental_done" => {
                     if let Some(summary_value) = payload.get("summary") {
-                        if let Ok(summary) = serde_json::from_value::<thinkingroot_core::IncrementalSummary>(
+                        match serde_json::from_value::<thinkingroot_core::IncrementalSummary>(
                             summary_value.clone(),
                         ) {
-                            captured_summary = Some(summary);
+                            Ok(summary) => captured_summary = Some(summary),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                raw = %summary_value,
+                                "failed to deserialize IncrementalSummary from incremental_done event — daemon/CLI version mismatch?"
+                            ),
                         }
                     }
                 }
