@@ -410,6 +410,17 @@ pub async fn merge_into_cancellable(
         diff.merge_allowed = true;
         diff.blocking_reasons.clear();
     }
+
+    // T3.6 — schema migration.  When the target's claim_schema_version
+    // is ahead of the source's, walk every new claim through the
+    // registered migration chain to bring it up to the target's
+    // schema before the merge applies.  Skipped silently when both
+    // sides are at the same version, when the registry is empty (no
+    // consumer registered any migrations), or when the workspace
+    // graph has no `claim_schema_version` row (pre-T3.6 workspaces
+    // default to v1 on both sides).
+    apply_claim_schema_migrations(&target_graph, &source_graph, &mut diff)?;
+
     merge::execute_merge_into_cancellable(
         root_path,
         source_branch,
@@ -422,6 +433,53 @@ pub async fn merge_into_cancellable(
     )
     .await?;
     Ok(diff)
+}
+
+/// T3.6 — apply registered claim migrations to the diff's new claims.
+///
+/// Reads `claim_schema_version` from both sides' `workspace_meta`
+/// (defaults to `1` when absent — preserves pre-T3.6 behaviour for
+/// every workspace that doesn't opt in).  When source's version is
+/// strictly less than target's, walks each new claim through the
+/// registered chain.  No-op when source ≥ target or when the
+/// registry is empty.
+///
+/// Errors propagate out — a missing migration row in the chain or
+/// a failing migration aborts the merge so a stale-version claim is
+/// never applied to the target without being migrated.
+fn apply_claim_schema_migrations(
+    target_graph: &GraphStore,
+    source_graph: &GraphStore,
+    diff: &mut thinkingroot_core::KnowledgeDiff,
+) -> Result<()> {
+    use thinkingroot_core::CLAIM_SCHEMA_VERSION_META_KEY;
+
+    let target_version = read_claim_schema_version(target_graph)?;
+    let source_version = read_claim_schema_version(source_graph)?;
+    if source_version >= target_version {
+        return Ok(());
+    }
+
+    for diff_claim in &mut diff.new_claims {
+        thinkingroot_core::migrate_claim(
+            &mut diff_claim.claim,
+            source_version,
+            target_version,
+        )?;
+    }
+    let _ = CLAIM_SCHEMA_VERSION_META_KEY; // keep the import live
+    Ok(())
+}
+
+fn read_claim_schema_version(graph: &GraphStore) -> Result<u32> {
+    use thinkingroot_core::CLAIM_SCHEMA_VERSION_META_KEY;
+    let raw = graph
+        .get_workspace_meta(CLAIM_SCHEMA_VERSION_META_KEY)
+        .ok()
+        .flatten();
+    Ok(raw
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(thinkingroot_core::CURRENT_CLAIM_SCHEMA_VERSION))
 }
 
 /// T1.5 — compute the merge diff WITHOUT executing the merge.

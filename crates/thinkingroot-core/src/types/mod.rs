@@ -1,6 +1,7 @@
 mod artifact;
 mod branch;
 mod claim;
+pub mod claim_migration;
 mod contradiction;
 mod diff;
 mod entity;
@@ -14,6 +15,10 @@ mod workspace;
 pub use artifact::*;
 pub use branch::*;
 pub use claim::*;
+pub use claim_migration::{
+    CLAIM_SCHEMA_VERSION_META_KEY, CURRENT_CLAIM_SCHEMA_VERSION, ClaimMigration,
+    MigrationRegistry, clear_global_registry_for_test, migrate_claim, register_migration,
+};
 pub use contradiction::*;
 pub use diff::*;
 pub use entity::*;
