@@ -1,6 +1,7 @@
 // crates/thinkingroot-branch/src/merge.rs
 use crate::branch::BranchRegistry;
 use crate::lock::MergeLock;
+use crate::recovery::{self, MergeIntent};
 use crate::snapshot::{resolve_data_dir, slugify};
 use std::path::Path;
 use thinkingroot_core::error::Error;
@@ -177,15 +178,35 @@ async fn apply_branch_diff(
                     }
 
                     if !vec_ids.is_empty() {
-                        if let Ok(mut target_vec) =
-                            thinkingroot_graph::vector::VectorStore::init(&target_data_dir).await
-                        {
-                            let id_refs: Vec<&str> = vec_ids.iter().map(|s| s.as_str()).collect();
-                            target_vec.remove_by_ids(&id_refs);
-                            if let Err(e) = target_vec.save() {
-                                tracing::warn!("vector purge save failed (non-fatal): {e}");
-                            }
-                        }
+                        // Vector-index errors during deletion propagation are NOT
+                        // non-fatal: a merge that succeeds with stale embeddings
+                        // silently corrupts hybrid retrieval and AEP probes for the
+                        // affected claim ids.  The pre-merge snapshot at the top of
+                        // this function is the recovery anchor — surface the failure
+                        // so the caller can `root branch rollback` rather than ship a
+                        // corrupt index.
+                        let mut target_vec =
+                            thinkingroot_graph::vector::VectorStore::init(&target_data_dir)
+                                .await
+                                .map_err(|e| {
+                                    Error::VectorStorage(format!(
+                                        "merge: failed to open target vector store for purge \
+                                         after propagating deletion of '{uri}' from branch \
+                                         '{source_branch_name}': {e} (run \
+                                         `root branch rollback {source_branch_name}` to restore \
+                                         pre-merge state)"
+                                    ))
+                                })?;
+                        let id_refs: Vec<&str> = vec_ids.iter().map(|s| s.as_str()).collect();
+                        target_vec.remove_by_ids(&id_refs);
+                        target_vec.save().map_err(|e| {
+                            Error::VectorStorage(format!(
+                                "merge: failed to persist vector purge after deleting source \
+                                 '{uri}' from target during merge of '{source_branch_name}': \
+                                 {e} (run `root branch rollback {source_branch_name}` to \
+                                 restore pre-merge state)"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -194,34 +215,55 @@ async fn apply_branch_diff(
 
     target_graph.rebuild_entity_relations()?;
 
+    // Vector reconciliation: any failure here means the target's vector
+    // index is missing the branch's embeddings, which would cause hybrid
+    // retrieval and AEP probes to silently miss those claims.  Promote
+    // every failure to a hard error so the caller can roll back to the
+    // pre-merge snapshot instead of shipping a corrupt index.  Skipped
+    // entirely when the source has no `vectors.bin` (fresh branches).
     if source_data_dir.join("vectors.bin").exists() {
-        match (
-            thinkingroot_graph::vector::VectorStore::init(&source_data_dir).await,
-            thinkingroot_graph::vector::VectorStore::init(&target_data_dir).await,
-        ) {
-            (Ok(source_vec), Ok(mut target_vec)) => {
-                let items = source_vec.all_items();
-                if !items.is_empty() {
-                    match target_vec.upsert_raw_batch(items) {
-                        Ok(n) => {
-                            if let Err(e) = target_vec.save() {
-                                tracing::warn!("merge vector save failed (non-fatal): {e}");
-                            } else {
-                                tracing::info!(
-                                    "merge: reconciled {n} branch vector embeddings into '{}'",
-                                    target_branch.unwrap_or("main")
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("merge vector reconciliation failed (non-fatal): {e}");
-                        }
-                    }
-                }
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::warn!("merge vector store init failed (non-fatal): {e}");
-            }
+        let source_vec = thinkingroot_graph::vector::VectorStore::init(&source_data_dir)
+            .await
+            .map_err(|e| {
+                Error::VectorStorage(format!(
+                    "merge: failed to open source vector store for branch \
+                     '{source_branch_name}': {e} (run `root branch rollback \
+                     {source_branch_name}` to restore pre-merge state)"
+                ))
+            })?;
+        let mut target_vec = thinkingroot_graph::vector::VectorStore::init(&target_data_dir)
+            .await
+            .map_err(|e| {
+                Error::VectorStorage(format!(
+                    "merge: failed to open target vector store while reconciling \
+                     embeddings from branch '{source_branch_name}': {e} (run \
+                     `root branch rollback {source_branch_name}` to restore pre-merge \
+                     state)"
+                ))
+            })?;
+        let items = source_vec.all_items();
+        let item_count = items.len();
+        if item_count > 0 {
+            let n = target_vec.upsert_raw_batch(items).map_err(|e| {
+                Error::VectorStorage(format!(
+                    "merge: failed to upsert {item_count} branch embeddings into \
+                     target during merge of '{source_branch_name}': {e} (run \
+                     `root branch rollback {source_branch_name}` to restore pre-merge \
+                     state)"
+                ))
+            })?;
+            target_vec.save().map_err(|e| {
+                Error::VectorStorage(format!(
+                    "merge: failed to persist target vector store after upserting {n} \
+                     branch embeddings during merge of '{source_branch_name}': {e} \
+                     (run `root branch rollback {source_branch_name}` to restore \
+                     pre-merge state)"
+                ))
+            })?;
+            tracing::info!(
+                "merge: reconciled {n} branch vector embeddings into '{}'",
+                target_branch.unwrap_or("main")
+            );
         }
     }
 
@@ -257,12 +299,14 @@ pub async fn execute_merge(
 ///   to reclaim. Merge would be a contract violation, not a config
 ///   slip — `Error::MergeBlocked` carries the reason so callers can
 ///   surface it instead of silently swallowing the merge.
-/// - **`MergePolicy::RequiresProposal` source** — until T0.4 (Knowledge
-///   PR object) ships the proposal layer, raw merges against a
-///   proposal-gated branch are rejected. The diff already needed to
-///   pass through `compute_diff_into`, so the gate fires only on
-///   actual merge intent — `dry_run` callers (T1.5) and the
-///   diff-display path remain functional.
+/// - **`MergePolicy::RequiresProposal` source** (T0.4) — the source
+///   branch's policy demands an approved Knowledge Proposal before
+///   merge.  We look up `find_approved_proposal(source, target)`; if
+///   none exists, raw merges are rejected with a message pointing the
+///   caller at `open_proposal`.  When an approved proposal is found
+///   it is captured here and `mark_proposal_merged` is called after
+///   the apply succeeds, keeping the proposal status honest with the
+///   branch registry.
 pub async fn execute_merge_into(
     root_path: &Path,
     source_branch_name: &str,
@@ -278,6 +322,7 @@ pub async fn execute_merge_into(
     // T0.6 — read merge_policy off the source branch and gate.
     let refs_dir = root_path.join(".thinkingroot-refs");
     let registry_for_policy = BranchRegistry::load_or_create(&refs_dir)?;
+    let mut authorising_proposal_id: Option<String> = None;
     if let Some(branch_ref) = registry_for_policy.get(source_branch_name) {
         if branch_ref.merge_policy.is_ephemeral() {
             // Ephemeral never merges — abandon and return without
@@ -292,14 +337,52 @@ pub async fn execute_merge_into(
             )));
         }
         if branch_ref.merge_policy.requires_proposal() {
-            return Err(Error::MergeBlocked(format!(
-                "branch '{source_branch_name}' has MergePolicy::RequiresProposal — \
-                 open a Knowledge Proposal (T0.4) instead of a raw merge"
-            )));
+            // T0.4 — consult the proposal layer.  Approved proposal
+            // for this exact (source, target) pair authorises the
+            // merge; otherwise the gate rejects with a helpful
+            // pointer to `open_proposal` so the caller can drive the
+            // review flow.
+            match thinkingroot_pr::find_approved_proposal(
+                &refs_dir,
+                source_branch_name,
+                target_branch,
+            )? {
+                Some(proposal) => {
+                    authorising_proposal_id = Some(proposal.id);
+                }
+                None => {
+                    return Err(Error::MergeBlocked(format!(
+                        "branch '{source_branch_name}' has MergePolicy::RequiresProposal — \
+                         open a Knowledge Proposal via `thinkingroot_pr::open_proposal` and \
+                         collect approvals before merging (no approved proposal found for \
+                         source='{source_branch_name}', target={:?})",
+                        target_branch
+                    )));
+                }
+            }
         }
     }
     drop(registry_for_policy);
 
+    // T2.7 — record the in-flight intent BEFORE any graph mutation so
+    // a crash mid-`apply_branch_diff` (or a hard process kill, or a
+    // panic during vector reconciliation) leaves a recoverable record.
+    // The intent is cleared only on the success path, after `mark_merged`
+    // has updated the registry.  See `crate::recovery` for the recovery
+    // pass that runs at workspace startup.
+    let intent = MergeIntent {
+        source_branch: source_branch_name.to_string(),
+        target_branch: target_branch.map(|s| s.to_string()),
+        started_at: chrono::Utc::now(),
+        snapshot_subject: source_branch_name.to_string(),
+        snapshot_prefix: "pre-merge".to_string(),
+    };
+    std::fs::create_dir_all(&refs_dir)?;
+    recovery::write_merge_intent(&refs_dir, &intent)?;
+
+    // `?` propagates apply failures with the intent file still in place —
+    // the next `recover_orphan_merges` call will roll the target back from
+    // the pre-merge snapshot.  The early-return is the recovery anchor.
     apply_branch_diff(
         root_path,
         source_branch_name,
@@ -311,10 +394,33 @@ pub async fn execute_merge_into(
     )
     .await?;
 
-    // Mark branch as merged in registry
-    std::fs::create_dir_all(&refs_dir)?;
+    // Mark branch as merged in registry, then clear the intent.  Order
+    // matters: if we clear the intent first and crash before
+    // `mark_merged`, the registry would still show the branch as Active
+    // and a re-run of the same merge would be allowed (idempotent in
+    // theory, but expensive — best avoided).
     let mut registry = BranchRegistry::load_or_create(&refs_dir)?;
     registry.mark_merged(source_branch_name, merged_by)?;
+
+    // T0.4 — when a Knowledge Proposal authorised this merge, flip its
+    // status to Merged so list_proposals reflects truth and a future
+    // gate lookup doesn't see the same proposal as still Approved.
+    // A failed mark_proposal_merged is logged but does not unwind the
+    // merge — the registry already says merged, so the proposal
+    // status drift is recoverable manually whereas unwinding the
+    // merge here is not.
+    if let Some(proposal_id) = &authorising_proposal_id {
+        if let Err(e) = thinkingroot_pr::mark_proposal_merged(&refs_dir, proposal_id) {
+            tracing::warn!(
+                proposal_id = %proposal_id,
+                error = %e,
+                "knowledge-pr: merge succeeded but mark_proposal_merged failed — \
+                 proposal status will show stale `Approved` until manually fixed"
+            );
+        }
+    }
+
+    recovery::clear_merge_intent(&refs_dir, source_branch_name, intent.started_at)?;
 
     Ok(())
 }
@@ -329,6 +435,23 @@ pub async fn execute_rebase(
     if !diff.merge_allowed {
         return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
     }
+
+    // T2.7 — same intent lifecycle as `execute_merge_into`.  Subject is
+    // the rebase target (the branch being updated); prefix is "pre-rebase"
+    // so recovery can disambiguate from merge snapshots.
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    std::fs::create_dir_all(&refs_dir)?;
+    let intent = MergeIntent {
+        source_branch: parent_branch_name.to_string(),
+        target_branch: Some(branch_name.to_string()),
+        started_at: chrono::Utc::now(),
+        snapshot_subject: branch_name.to_string(),
+        snapshot_prefix: "pre-rebase".to_string(),
+    };
+    recovery::write_merge_intent(&refs_dir, &intent)?;
+
+    // `?` propagates apply failures with the intent file in place —
+    // recovery on next startup will restore the rebase target.
     apply_branch_diff(
         root_path,
         parent_branch_name,
@@ -338,7 +461,10 @@ pub async fn execute_rebase(
         "pre-rebase",
         branch_name,
     )
-    .await
+    .await?;
+
+    recovery::clear_merge_intent(&refs_dir, parent_branch_name, intent.started_at)?;
+    Ok(())
 }
 
 /// Roll back a merge by restoring the pre-merge snapshot of graph.db.

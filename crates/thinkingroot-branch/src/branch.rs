@@ -28,28 +28,37 @@ pub struct BranchRegistry {
 impl BranchRegistry {
     /// Load registry from disk, or create an empty one if it doesn't exist.
     pub fn load_or_create(refs_dir: &Path) -> Result<Self> {
-        let path = refs_dir.join(REGISTRY_FILE);
-        let data = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            toml::from_str(&content).map_err(|e| Error::Config(e.to_string()))?
-        } else {
-            RegistryFile::default()
-        };
+        let data = Self::read_registry_file(refs_dir)?;
         Ok(Self {
             refs_dir: refs_dir.to_path_buf(),
             data,
         })
     }
 
+    /// Read `branches.toml` from disk, returning an empty registry if
+    /// the file is absent.  Used both by [`Self::load_or_create`] and
+    /// by every mutating method to refresh the in-memory copy *inside*
+    /// the registry lock — so concurrent processes / threads always
+    /// observe the latest persisted state before they mutate.
+    fn read_registry_file(refs_dir: &Path) -> Result<RegistryFile> {
+        let path = refs_dir.join(REGISTRY_FILE);
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            toml::from_str(&content).map_err(|e| Error::Config(e.to_string()))
+        } else {
+            Ok(RegistryFile::default())
+        }
+    }
+
     /// Save registry to disk atomically (tmp + rename).
     ///
-    /// Concurrent `root branch create` / `root merge` invocations
-    /// against the same workspace previously raced on a non-atomic
-    /// write that could leave an empty registry.toml on a crash.
-    /// The rename here makes the file change visible all-or-nothing;
-    /// the read-modify-write window between two concurrent callers
-    /// is still last-writer-wins, but neither produces a corrupt
-    /// file.
+    /// Atomicity at the file-system level (the rename) gives readers
+    /// an all-or-nothing view; cross-process and cross-thread write
+    /// safety is provided by [`crate::lock::RegistryLock`], which
+    /// every mutating method on this struct acquires before reloading
+    /// + saving.  Calling `save()` directly without holding the lock
+    /// will not corrupt the file but can lose concurrent writes — use
+    /// the higher-level mutating methods instead.
     pub fn save(&self) -> Result<()> {
         let path = self.refs_dir.join(REGISTRY_FILE);
         let content =
@@ -106,6 +115,11 @@ impl BranchRegistry {
     /// Callers that don't care about kind/policy/redaction should keep
     /// using [`Self::create_branch_with_owner`] — the defaults match
     /// the historical behaviour.
+    ///
+    /// Cross-process / cross-thread safe: acquires
+    /// [`crate::lock::RegistryLock`] before reloading the registry from
+    /// disk.  Two concurrent callers each see the other's prior writes
+    /// and never lose a branch to a load-modify-save race.
     #[allow(clippy::too_many_arguments)]
     pub fn create_branch_full(
         &mut self,
@@ -118,6 +132,9 @@ impl BranchRegistry {
         merge_policy: MergePolicy,
         redaction: Option<RedactionPolicy>,
     ) -> Result<BranchRef> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
         if self
             .data
             .branches
@@ -138,19 +155,60 @@ impl BranchRegistry {
             kind,
             merge_policy,
             redaction,
+            // T0.5 — set separately by lib.rs::create_branch_full via
+            // `set_parent_commit_hash` after the parent's graph.db has
+            // been hashed.  Defaults to None so legacy callers (and
+            // tests) continue to compile without LCA tracking.
+            parent_commit_hash: None,
         };
         self.data.branches.push(branch.clone());
         self.save()?;
         Ok(branch)
     }
 
+    /// Set the T0.5 LCA pointer on an existing active branch.
+    ///
+    /// Called from `lib.rs::create_branch_full` immediately after the
+    /// parent's `graph.db` has been BLAKE3-hashed and copied to the
+    /// branch's `graph.db.parent-at-fork`.  Splitting this from the
+    /// main create path keeps `BranchRegistry::create_branch_full`'s
+    /// signature small (no 10th argument) and lets legacy create
+    /// paths leave `parent_commit_hash = None`.
+    ///
+    /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
+    /// reloads the on-disk state before mutating, mirroring every
+    /// other mutating method on this struct.
+    pub fn set_parent_commit_hash(
+        &mut self,
+        name: &str,
+        hash: String,
+    ) -> Result<()> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
+            .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
+            .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        branch.parent_commit_hash = Some(hash);
+        self.save()
+    }
+
     /// Update the redaction policy on an existing active branch and
     /// persist. Returns the updated branch.
+    ///
+    /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
+    /// reloads the on-disk state before mutating.
     pub fn set_redaction(
         &mut self,
         name: &str,
         policy: Option<RedactionPolicy>,
     ) -> Result<BranchRef> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
         let branch = self
             .data
             .branches
@@ -164,7 +222,13 @@ impl BranchRegistry {
     }
 
     /// Mark a branch as merged.
+    ///
+    /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
+    /// reloads the on-disk state before mutating.
     pub fn mark_merged(&mut self, name: &str, merged_by: MergedBy) -> Result<()> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
         let branch = self
             .data
             .branches
@@ -179,7 +243,13 @@ impl BranchRegistry {
     }
 
     /// Mark a branch as abandoned (soft delete — data dir kept).
+    ///
+    /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
+    /// reloads the on-disk state before mutating.
     pub fn abandon_branch(&mut self, name: &str) -> Result<()> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
         let branch = self
             .data
             .branches

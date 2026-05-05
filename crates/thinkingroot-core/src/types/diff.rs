@@ -115,4 +115,37 @@ pub struct ContradictionPair {
     pub branch_statement: String,
     /// Explanation of why these claims are considered contradictory.
     pub explanation: String,
+    /// Three-way merge classification of why this pair conflicts (T0.5).
+    ///
+    /// `None` for two-way diff results (the historical path); `Some`
+    /// when produced by [`compute_three_way_diff`] which has access
+    /// to the LCA and can distinguish "both modified the same thing"
+    /// from "one side deleted what the other modified" etc.
+    #[serde(default)]
+    pub conflict_kind: Option<ConflictKind>,
+}
+
+/// Three-way merge conflict classification (T0.5).
+///
+/// Produced only by `thinkingroot_branch::diff::compute_three_way_diff`,
+/// which has access to a base / LCA graph in addition to the two
+/// sides of the merge.  Two-way diff cannot reliably distinguish
+/// these cases — they are exactly the silent-last-writer-wins class
+/// that T0.5 fixes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConflictKind {
+    /// Same claim id added in both branches with different content
+    /// (impossible in practice with content-addressed claim ids, but
+    /// retained as a defensive case for sources that share a stable
+    /// id but differ in statement text).
+    AddAdd,
+    /// Both `ours` and `theirs` modified the same claim differently
+    /// since the LCA.  The two-way merge would silently pick whichever
+    /// branch's change was processed last; three-way surfaces it for
+    /// review.
+    ModifyModify,
+    /// `ours` deleted a claim that `theirs` modified — or vice versa.
+    /// The intent of one side conflicts with the other.
+    DeleteModify,
 }

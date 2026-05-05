@@ -101,19 +101,48 @@ pub fn migrate_legacy_layout(root_path: &Path) -> Result<usize> {
     Ok(migrated)
 }
 
+/// Subdirectory name under `{branch_data_dir}/graph/` that holds the
+/// immutable T0.5 LCA snapshot.  Layout:
+///
+/// ```text
+/// {branch_data_dir}/graph/graph.db                     ← mutable working copy
+/// {branch_data_dir}/graph/parent-at-fork/graph.db      ← immutable LCA
+/// ```
+///
+/// Putting it in its own subdirectory lets `GraphStore::init` open it
+/// directly without temp-file gymnastics.
+pub const PARENT_AT_FORK_DIR: &str = "parent-at-fork";
+
+/// Resolve the directory `GraphStore::init` should be called with to
+/// open the T0.5 LCA snapshot for a branch.  Returns
+/// `<branch_data_dir>/graph/parent-at-fork`.
+pub fn parent_at_fork_dir(branch_data_dir: &Path) -> PathBuf {
+    branch_data_dir.join("graph").join(PARENT_AT_FORK_DIR)
+}
+
 /// Create the directory layout for a new branch:
 /// - Copy `{parent_data_dir}/graph/graph.db` → `{branch_data_dir}/graph/graph.db`
+/// - Copy that same file → `{branch_data_dir}/graph/parent-at-fork/graph.db`
+///   (immutable T0.5 LCA snapshot — see [`PARENT_AT_FORK_DIR`])
 /// - Symlink `{parent_data_dir}/models` → `{branch_data_dir}/models`
 /// - Symlink `{parent_data_dir}/cache`  → `{branch_data_dir}/cache`
 pub fn create_branch_layout(parent_data_dir: &Path, branch_data_dir: &Path) -> Result<()> {
     let branch_graph_dir = branch_data_dir.join("graph");
     fs::create_dir_all(&branch_graph_dir)?;
 
-    // Copy graph.db
+    // Copy graph.db (mutable working copy) AND the same bytes to a
+    // separate immutable subdirectory the merge gate can open as a
+    // GraphStore via the LCA.  T0.5 §"Snapshot at fork" — without
+    // this, three-way merge cannot identify the lowest common
+    // ancestor and would silently last-writer-win on concurrent
+    // edits to the same claim.
     let src_db = parent_data_dir.join("graph").join("graph.db");
     let dst_db = branch_graph_dir.join("graph.db");
+    let parent_at_fork_root = branch_graph_dir.join(PARENT_AT_FORK_DIR);
     if src_db.exists() {
         fs::copy(&src_db, &dst_db)?;
+        fs::create_dir_all(&parent_at_fork_root)?;
+        fs::copy(&src_db, parent_at_fork_root.join("graph.db"))?;
     }
 
     // Copy vectors.bin — must be a physical copy, not a symlink.

@@ -1,0 +1,24 @@
+[package]
+name = "thinkingroot-pr"
+description = "Knowledge Proposal (T0.4) — proposal layer that gates RequiresProposal merges through review-and-approve, mirroring GitHub PR for facts."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace        = true
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+keywords.workspace      = true
+categories.workspace    = true
+rust-version.workspace  = true
+
+[dependencies]
+thinkingroot-core = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

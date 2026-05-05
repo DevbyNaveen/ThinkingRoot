@@ -1,8 +1,6 @@
 import {
   MessageSquareText,
   Cpu,
-  Orbit,
-  Activity,
   ShieldCheck,
   SlidersHorizontal,
 } from "lucide-react";
@@ -26,9 +24,12 @@ interface RailItem {
 const TOP: RailItem[] = [
   { id: "chats", label: "Conversations", Icon: MessageSquareText, hint: "⌘1" },
   { id: "brain", label: "Brain", Icon: Cpu, hint: "⌘2" },
-  { id: "satellites", label: "Satellites", Icon: Orbit, hint: "⌘3" },
-  { id: "trace", label: "Trace", Icon: Activity, hint: "⌘4" },
-  { id: "privacy", label: "Privacy", Icon: ShieldCheck, hint: "⌘5" },
+  // "satellites" (multi-agent orbit view) and "trace" (Ed25519 trace
+  // log) lived here pre-transplant; both are helloroot-only concepts
+  // (see CLAUDE.md "Desktop transplant uses helloroot's shell, NOT
+  // its multi-agent framework").  Removed as part of the v0.1
+  // residue-cleanup pass.
+  { id: "privacy", label: "Privacy", Icon: ShieldCheck, hint: "⌘3" },
 ];
 
 const BOTTOM: RailItem[] = [
@@ -36,9 +37,9 @@ const BOTTOM: RailItem[] = [
 ];
 
 /**
- * Left-most vertical rail of five surface icons. Active surface gets a
- * subtle accent pill + bold icon. Keyboard shortcuts are surfaced in
- * tooltips.
+ * Left-most vertical rail of three top surface icons + one bottom
+ * (Settings).  Active surface gets a subtle accent pill + bold icon.
+ * Keyboard shortcuts are surfaced in tooltips.
  */
 export function IconRail() {
   const surface = useApp((s) => s.surface);

@@ -319,7 +319,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       Icon: FolderPlus,
       argLabel: "workspace path",
       argPlaceholder: "/path/to/folder",
-      keywords: ["workspace", "add", "register", "satellites"],
+      keywords: ["workspace", "add", "register"],
       run: async (c, arg) => {
         if (!arg) return;
         try {
@@ -376,7 +376,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
           await workspaceCompile({ target: arg });
           toast("Compile started", {
             kind: "info",
-            body: "Watch progress in the Satellites surface.",
+            body: "Watch progress in the Brain surface.",
           });
           c.setSurface("brain");
         } catch (e) {
@@ -393,14 +393,14 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       label: "List workspaces",
       group: "Info",
       Icon: FileSearch,
-      keywords: ["workspace", "satellites", "list"],
+      keywords: ["workspace", "list"],
       run: async (c) => {
         try {
           const ws = await workspaceList();
           if (ws.length === 0) {
             toast("No workspaces registered", {
               kind: "info",
-              body: "Use 'Add workspace from path' or visit Satellites.",
+              body: "Use 'Add workspace from path' to register one.",
             });
           } else {
             toast(`${ws.length} workspace${ws.length === 1 ? "" : "s"}`, {
@@ -616,7 +616,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       run: phase("/exit", "D-9"),
     },
 
-    // ─── Moat (8) — capsule entries land with Action Capsules in a later phase ───
+    // ─── Moat (8) ────────────────────────────────────────────────────────
     {
       id: "rooted",
       label: "View rooted claims",

@@ -418,3 +418,634 @@ async fn set_branch_redaction_persists() {
     let reg2 = BranchRegistry::load_or_create(&refs).unwrap();
     assert!(reg2.get("feature/with-policy").unwrap().redaction.is_none());
 }
+
+// ─── T0.4: Knowledge Proposal authorises RequiresProposal merge ───
+//
+// Sister test to `requires_proposal_blocks_raw_merge` (which proves
+// the negative path).  This one proves the positive path: when an
+// approved Knowledge Proposal exists for the (source, target) pair,
+// `execute_merge_into` lets the merge through and flips the proposal
+// status to Merged.  Closes the production-blocking gap where the
+// RequiresProposal gate previously had no lifecycle path forward.
+
+#[tokio::test]
+async fn requires_proposal_merge_succeeds_with_approved_proposal() {
+    use thinkingroot_branch::merge::execute_merge_into;
+    use thinkingroot_core::{
+        AutoResolution, BranchKind, ContradictionPair, HealthScore, KnowledgeDiff, MergePolicy,
+        MergedBy,
+    };
+    use thinkingroot_graph::graph::GraphStore;
+    use thinkingroot_pr::{
+        find_approved_proposal, list_proposals, mark_proposal_merged, open_proposal,
+        review_proposal, ProposalStatus, ReviewDecision,
+    };
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let main_graph_dir = root.join(".thinkingroot").join("graph");
+    std::fs::create_dir_all(&main_graph_dir).unwrap();
+    {
+        let _g = GraphStore::init(&main_graph_dir).expect("init main graph");
+    }
+
+    create_branch_full(
+        root,
+        "feature/governed",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::RequiresProposal {
+            min_reviewers: 2,
+            required_checks: vec!["health_score".into()],
+        },
+        None,
+    )
+    .await
+    .expect("create branch");
+
+    let refs_dir = root.join(".thinkingroot-refs");
+
+    let diff = KnowledgeDiff {
+        from_branch: "feature/governed".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    // 1. Without any proposal, the gate must reject.
+    let blocked = execute_merge_into(
+        root,
+        "feature/governed",
+        None,
+        &diff,
+        MergedBy::System,
+        false,
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(thinkingroot_core::error::Error::MergeBlocked(_))),
+        "raw merge of RequiresProposal branch must be blocked when no approved proposal \
+         exists, got: {blocked:?}"
+    );
+
+    // 2. Open + collect 2 distinct approves to satisfy min_reviewers.
+    let proposal = open_proposal(
+        &refs_dir,
+        "feature/governed",
+        None,
+        "alice",
+        Some("Adds governed change.".into()),
+        2,
+        vec!["health_score".into()],
+    )
+    .expect("open proposal");
+    review_proposal(&refs_dir, &proposal.id, "bob", ReviewDecision::Approve, None)
+        .expect("first approve");
+    let approved = review_proposal(
+        &refs_dir,
+        &proposal.id,
+        "carol",
+        ReviewDecision::Approve,
+        None,
+    )
+    .expect("second approve");
+    assert!(
+        matches!(approved.status, ProposalStatus::Approved),
+        "two distinct approves must advance status to Approved, got {:?}",
+        approved.status
+    );
+
+    // 3. find_approved_proposal must surface this proposal.
+    let found = find_approved_proposal(&refs_dir, "feature/governed", None)
+        .expect("find_approved_proposal")
+        .expect("approved proposal exists");
+    assert_eq!(found.id, proposal.id);
+
+    // 4. With the approved proposal in place, the merge must succeed.
+    execute_merge_into(
+        root,
+        "feature/governed",
+        None,
+        &diff,
+        MergedBy::Human {
+            user: "carol".into(),
+        },
+        false,
+    )
+    .await
+    .expect("merge with approved proposal must succeed");
+
+    // 5. Proposal status must now be Merged (the gate called
+    //    mark_proposal_merged on success).
+    let after_merge = list_proposals(&refs_dir).expect("list proposals");
+    assert_eq!(after_merge.len(), 1);
+    assert!(
+        matches!(after_merge[0].status, ProposalStatus::Merged),
+        "proposal status must flip to Merged after successful merge, got {:?}",
+        after_merge[0].status
+    );
+    assert!(
+        after_merge[0].merged_at.is_some(),
+        "merged_at must be set on the proposal"
+    );
+
+    // 6. mark_proposal_merged is idempotent — calling again is a no-op.
+    let again = mark_proposal_merged(&refs_dir, &proposal.id)
+        .expect("mark_proposal_merged is idempotent");
+    assert!(matches!(again.status, ProposalStatus::Merged));
+}
+
+// ─── A3: branch-registry write race ──────────────────────────────────
+//
+// Pre-fix, `BranchRegistry::create_branch_full` did load → check →
+// push → save with no lock around the sequence.  Two concurrent
+// callers (separate processes OR separate threads inside one
+// process) could both load the same registry, both push their
+// distinct new branch, and the second `save()` would atomically
+// rename a file containing only its own branch over the first
+// caller's write — silently losing the first branch.
+//
+// This test pins the new contract: 32 concurrent threads each
+// creating a uniquely-named branch must all 32 land in the
+// persisted registry.  Loop helps to catch flakiness — the lock has
+// to hold under repeated attempts, not just one lucky run.
+
+#[test]
+fn create_branch_full_serialises_concurrent_writes() {
+    use std::sync::Arc;
+    use std::thread;
+    use thinkingroot_core::{BranchKind, MergePolicy};
+
+    const THREAD_COUNT: usize = 32;
+    const ITERATIONS: usize = 5;
+
+    for iteration in 0..ITERATIONS {
+        let dir = tempdir().unwrap();
+        let refs_dir = Arc::new(dir.path().join(".thinkingroot-refs"));
+        std::fs::create_dir_all(refs_dir.as_path()).unwrap();
+
+        let mut handles = Vec::with_capacity(THREAD_COUNT);
+        for tid in 0..THREAD_COUNT {
+            let refs_dir = Arc::clone(&refs_dir);
+            handles.push(thread::spawn(move || {
+                let mut reg = BranchRegistry::load_or_create(refs_dir.as_path()).unwrap();
+                reg.create_branch_full(
+                    &format!("feature/concurrent-{tid}"),
+                    "main",
+                    None,
+                    None,
+                    BranchPermissions::default(),
+                    BranchKind::Feature,
+                    MergePolicy::Manual,
+                    None,
+                )
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let reg = BranchRegistry::load_or_create(refs_dir.as_path()).unwrap();
+        let active = reg.list_active();
+        assert_eq!(
+            active.len(),
+            THREAD_COUNT,
+            "iteration {iteration}: expected {THREAD_COUNT} branches after concurrent \
+             create_branch_full, got {}: {:?}",
+            active.len(),
+            active.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+
+        // Every distinct name must be present — last-writer-wins would
+        // silently drop branches with no duplicate-name collision.
+        let mut names: Vec<&str> = active.iter().map(|b| b.name.as_str()).collect();
+        names.sort();
+        for tid in 0..THREAD_COUNT {
+            let expected = format!("feature/concurrent-{tid}");
+            assert!(
+                names.iter().any(|n| *n == expected),
+                "iteration {iteration}: branch '{expected}' missing from final \
+                 registry — concurrent write was silently lost. Got: {names:?}"
+            );
+        }
+    }
+}
+
+// ─── T0.5: three-way merge surfaces real conflicts ───────────────────
+//
+// Two-way `compute_diff_into` cannot distinguish "added on theirs"
+// from "removed from ours" — it only sees what's in each graph at
+// merge time, not how each got there.  Three-way uses the LCA to
+// classify true conflicts.  Pre-T0.5, two concurrent edits to the
+// same claim id silently last-writer-won; this test pins the new
+// contract: a `ModifyModify` conflict is surfaced and `merge_allowed`
+// flips to false.
+
+#[test]
+fn compute_three_way_diff_surfaces_modify_modify_conflict() {
+    use thinkingroot_branch::diff::compute_three_way_diff;
+    use thinkingroot_core::{
+        Claim, ClaimType, ConflictKind, ContentHash, Source, SourceType, TrustLevel,
+        WorkspaceId,
+    };
+    use thinkingroot_graph::graph::GraphStore;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let base_dir = root.join("base");
+    let ours_dir = root.join("ours");
+    let theirs_dir = root.join("theirs");
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&ours_dir).unwrap();
+    std::fs::create_dir_all(&theirs_dir).unwrap();
+
+    let base = GraphStore::init(&base_dir).expect("init base graph");
+    let ours = GraphStore::init(&ours_dir).expect("init ours graph");
+    let theirs = GraphStore::init(&theirs_dir).expect("init theirs graph");
+
+    let workspace = WorkspaceId::new();
+
+    // Seed one shared source + one shared claim into all three so they
+    // share an LCA on this claim id.  Same id, same statement → no
+    // conflict yet.
+    let source = Source::new("file:///auth.md".to_string(), SourceType::Document)
+        .with_trust(TrustLevel::Trusted)
+        .with_hash(ContentHash("hash-base".to_string()));
+    let mut shared_claim = Claim::new(
+        "AuthService uses JWT tokens",
+        ClaimType::Fact,
+        source.id,
+        workspace,
+    );
+    // Pin the id so we can upsert it on each side.
+    let shared_id = shared_claim.id;
+
+    for g in [&base, &ours, &theirs] {
+        g.insert_source(&source).expect("insert source");
+        g.insert_claim(&shared_claim).expect("insert claim");
+        // get_all_claims_with_sources joins on claim_source_edges, so
+        // a claim without this junction is invisible to the diff —
+        // mirror the merge_cache_reload_test setup pattern.
+        g.link_claim_to_source(&shared_claim.id.to_string(), &source.id.to_string())
+            .expect("link claim to source");
+    }
+
+    // Now diverge: `ours` modifies the same claim id to one statement;
+    // `theirs` modifies it to a different statement.  Both differ
+    // from base — exactly the silent-LWW class T0.5 fixes.
+    shared_claim.statement = "AuthService uses OAuth2 authorization codes".to_string();
+    shared_claim.id = shared_id; // keep id stable
+    ours.insert_claim(&shared_claim)
+        .expect("upsert claim in ours");
+
+    shared_claim.statement = "AuthService uses session cookies".to_string();
+    shared_claim.id = shared_id; // keep id stable
+    theirs
+        .insert_claim(&shared_claim)
+        .expect("upsert claim in theirs");
+
+    let diff = compute_three_way_diff(
+        &base,
+        &ours,
+        &theirs,
+        "feature/branch",
+        Some("main"),
+        0.5,  // auto_resolve_threshold
+        0.25, // max_health_drop
+        false, // block_on_contradictions
+    )
+    .expect("compute three-way diff");
+
+    // The conflict must be in needs_review with conflict_kind set.
+    let modify_modify: Vec<_> = diff
+        .needs_review
+        .iter()
+        .filter(|c| matches!(c.conflict_kind, Some(ConflictKind::ModifyModify)))
+        .collect();
+    assert_eq!(
+        modify_modify.len(),
+        1,
+        "expected exactly one ModifyModify conflict, got {} entries: {:?}",
+        modify_modify.len(),
+        diff.needs_review
+            .iter()
+            .map(|c| (&c.main_claim_id, &c.conflict_kind))
+            .collect::<Vec<_>>()
+    );
+    let conflict = modify_modify[0];
+    assert_eq!(
+        conflict.main_claim_id,
+        shared_id.to_string(),
+        "conflict must reference the shared claim id"
+    );
+
+    // Three-way conflicts must block the merge.
+    assert!(
+        !diff.merge_allowed,
+        "merge_allowed must flip to false when ModifyModify conflict exists"
+    );
+    assert!(
+        diff.blocking_reasons
+            .iter()
+            .any(|r| r.contains("three-way conflict")),
+        "blocking_reasons must explain the conflict; got: {:?}",
+        diff.blocking_reasons
+    );
+}
+
+// ─── A2: vector-store error promotion in merge ────────────────────────
+//
+// Pre-fix, `apply_branch_diff` swallowed `VectorStore::init` /
+// `upsert_raw_batch` / `save` failures via `tracing::warn!("(non-fatal):
+// {e}")` and continued on success.  A merge that completed with stale
+// embeddings silently corrupted hybrid retrieval and AEP probes for the
+// affected claim ids — exactly the silent-failure class CLAUDE.md
+// honesty rule #1 forbids.
+//
+// This test pins the new contract: when target-side vector save fails
+// during reconciliation, the merge returns `Error::VectorStorage` and
+// the error message points the operator at `root branch rollback` so
+// they can recover via the pre-merge snapshot.
+
+#[tokio::test]
+async fn merge_fails_loud_on_vector_save_error() {
+    use thinkingroot_branch::merge::execute_merge;
+    use thinkingroot_core::error::Error;
+    use thinkingroot_core::{
+        AutoResolution, BranchKind, ContradictionPair, HealthScore, KnowledgeDiff, MergePolicy,
+        MergedBy,
+    };
+    use thinkingroot_graph::graph::GraphStore;
+    use thinkingroot_graph::vector::VectorStore;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let main_data = root.join(".thinkingroot");
+    let main_graph_dir = main_data.join("graph");
+    std::fs::create_dir_all(&main_graph_dir).unwrap();
+
+    // Real (empty) main graph store so apply_branch_diff can open it.
+    {
+        let _g = GraphStore::init(&main_graph_dir).expect("init main graph");
+    }
+
+    create_branch_full(
+        root,
+        "feature/withvectors",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::Manual,
+        None,
+    )
+    .await
+    .expect("create branch");
+
+    // Seed the branch's vector store with one entry so the
+    // `if source_data_dir.join("vectors.bin").exists()` gate at the top
+    // of the reconciliation block fires and items.len() > 0 forces the
+    // (poisoned) save() call below.
+    let branch_data = root
+        .join(".thinkingroot")
+        .join("branches")
+        .join("feature-withvectors");
+    {
+        let mut vec_store = VectorStore::init(&branch_data)
+            .await
+            .expect("init branch vector store");
+        vec_store
+            .upsert_raw_batch(vec![(
+                "claim:test".into(),
+                vec![0.1f32; 384],
+                "{}".into(),
+            )])
+            .expect("seed branch vector");
+        vec_store.save().expect("save branch vector");
+    }
+    assert!(
+        branch_data.join("vectors.bin").exists(),
+        "branch vectors.bin must exist for the reconciliation gate to fire"
+    );
+
+    // Poison the target's save path: pre-create vectors.bin.tmp as a
+    // directory so VectorStore::save()'s atomic `write tmp + rename`
+    // step fails on the write (cannot open a directory for write).
+    // Pre-fix the merge would log a warn and return Ok.  Post-fix it
+    // must return Err(Error::VectorStorage).
+    let target_tmp_path = main_data.join("vectors.bin.tmp");
+    std::fs::create_dir_all(&target_tmp_path).expect("poison target vectors.bin.tmp");
+
+    // Empty diff with merge_allowed=true so the policy gate passes and
+    // graph mutation steps are no-ops; the only work apply_branch_diff
+    // performs is the (poisoned) vector reconciliation.
+    let diff = KnowledgeDiff {
+        from_branch: "feature/withvectors".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    let result = execute_merge(root, "feature/withvectors", &diff, MergedBy::System, false).await;
+
+    match result {
+        Err(Error::VectorStorage(msg)) => {
+            assert!(
+                msg.contains("rollback"),
+                "VectorStorage error message must point operators at \
+                 `root branch rollback` to restore the pre-merge snapshot, \
+                 got: {msg}"
+            );
+            assert!(
+                msg.contains("feature/withvectors"),
+                "VectorStorage error message must name the source branch, \
+                 got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected Err(Error::VectorStorage(_)) when target vector save \
+             fails — merge must fail loud, never silently corrupt the index. \
+             Got: {other:?}"
+        ),
+    }
+}
+
+// ─── A2 × A5 end-to-end: failed merge leaves intent + recovers cleanly
+//
+// The strongest contract: a merge that fails mid-pipeline must leave
+// the merges_in_flight.toml intent file in place AND a pre-merge
+// snapshot on disk.  A subsequent `recover_orphan_merges` call must
+// find both, restore the target's `graph.db` from the snapshot, and
+// remove the intent — leaving the workspace in the same state as if
+// the merge had never been attempted.
+//
+// Without this end-to-end coverage, the A2 (loud-fail) and A5
+// (recovery) fixes would be tested in isolation, and a regression in
+// either side could silently break the cross-cutting story.
+
+#[tokio::test]
+async fn failed_merge_leaves_intent_and_recovers() {
+    use thinkingroot_branch::merge::execute_merge;
+    use thinkingroot_branch::recovery::{recover_orphan_merges, INTENTS_FILE};
+    use thinkingroot_core::error::Error;
+    use thinkingroot_core::{
+        AutoResolution, BranchKind, ContradictionPair, HealthScore, KnowledgeDiff, MergePolicy,
+        MergedBy,
+    };
+    use thinkingroot_graph::graph::GraphStore;
+    use thinkingroot_graph::vector::VectorStore;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let main_data = root.join(".thinkingroot");
+    let main_graph_dir = main_data.join("graph");
+    std::fs::create_dir_all(&main_graph_dir).unwrap();
+
+    // Initialize main and write recognisable bytes so we can verify
+    // recovery actually restored the pre-merge snapshot.
+    {
+        let _g = GraphStore::init(&main_graph_dir).expect("init main graph");
+    }
+    let main_db = main_graph_dir.join("graph.db");
+    let main_db_content_before = std::fs::read(&main_db).expect("read main graph.db");
+
+    create_branch_full(
+        root,
+        "feature/recover",
+        "main",
+        None,
+        None,
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::Manual,
+        None,
+    )
+    .await
+    .expect("create branch");
+
+    // Seed branch vectors so reconciliation runs.
+    let branch_data = root
+        .join(".thinkingroot")
+        .join("branches")
+        .join("feature-recover");
+    {
+        let mut vec_store = VectorStore::init(&branch_data).await.expect("init branch");
+        vec_store
+            .upsert_raw_batch(vec![("claim:r1".into(), vec![0.5f32; 384], "{}".into())])
+            .expect("seed branch vector");
+        vec_store.save().expect("save branch vector");
+    }
+
+    // Poison the target vector save path AFTER snapshot would be taken.
+    std::fs::create_dir_all(main_data.join("vectors.bin.tmp"))
+        .expect("poison target vectors.bin.tmp");
+
+    let diff = KnowledgeDiff {
+        from_branch: "feature/recover".into(),
+        to_branch: "main".into(),
+        computed_at: chrono::Utc::now(),
+        new_claims: vec![],
+        new_entities: vec![],
+        new_relations: vec![],
+        auto_resolved: Vec::<AutoResolution>::new(),
+        needs_review: Vec::<ContradictionPair>::new(),
+        health_before: HealthScore::default(),
+        health_after: HealthScore::default(),
+        merge_allowed: true,
+        blocking_reasons: vec![],
+    };
+
+    // 1. Run merge — must fail with VectorStorage (A2 contract).
+    let result = execute_merge(root, "feature/recover", &diff, MergedBy::System, false).await;
+    assert!(
+        matches!(result, Err(Error::VectorStorage(_))),
+        "merge must fail loud on vector save error, got: {result:?}"
+    );
+
+    // 2. Intent must persist after failed merge.
+    let intent_path = root.join(".thinkingroot-refs").join(INTENTS_FILE);
+    assert!(
+        intent_path.exists(),
+        "merges_in_flight.toml must persist after failed merge so recovery \
+         can roll back; expected file at {}",
+        intent_path.display()
+    );
+
+    // 3. Pre-merge snapshot must exist on disk (taken before the poison
+    //    triggered the failure).
+    let snapshots: Vec<_> = std::fs::read_dir(&main_graph_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("graph.db.pre-merge-feature-recover-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "exactly one pre-merge snapshot expected, got {}: {:?}",
+        snapshots.len(),
+        snapshots.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+
+    // 4. Clear the poison so recovery's `std::fs::copy` over graph.db
+    //    can succeed (otherwise the test would re-fail at recovery).
+    std::fs::remove_dir_all(main_data.join("vectors.bin.tmp")).ok();
+
+    // 5. Recovery must roll back and clear the intent.
+    let report = recover_orphan_merges(root).expect("recovery must succeed");
+    assert_eq!(
+        report.recovered.len(),
+        1,
+        "expected exactly one recovered merge, got: {:?}",
+        report.recovered
+    );
+    assert_eq!(report.recovered[0].source_branch, "feature/recover");
+    assert_eq!(report.orphaned_intents_cleared.len(), 0);
+
+    // 6. Intent file must be gone.
+    assert!(
+        !intent_path.exists(),
+        "intents file must be removed after successful recovery"
+    );
+
+    // 7. Live graph.db must match pre-merge content (idempotent: the
+    //    apply_branch_diff in our test made no graph mutations because
+    //    the diff was empty, so pre and post bytes match — but recovery
+    //    still copied the snapshot back, exercising the contract).
+    let main_db_content_after = std::fs::read(&main_db).expect("read main graph.db");
+    assert_eq!(
+        main_db_content_before, main_db_content_after,
+        "after recovery, main graph.db must match its pre-merge bytes \
+         (recovery uses the snapshot, not the corrupt mid-merge state)"
+    );
+
+    // 8. Idempotent re-run — recovery on a clean workspace is a no-op.
+    let report2 = recover_orphan_merges(root).expect("recovery must be idempotent");
+    assert_eq!(report2.recovered.len(), 0);
+    assert_eq!(report2.orphaned_intents_cleared.len(), 0);
+}

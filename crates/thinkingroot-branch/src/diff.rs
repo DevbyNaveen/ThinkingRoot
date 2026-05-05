@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use thinkingroot_core::{
-    AutoResolution, Claim, ClaimId, ClaimType, Confidence, ContradictionPair, DiffClaim,
-    DiffEntity, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion, Result, Sensitivity,
-    SourceId, WorkspaceId, config::Config,
+    AutoResolution, Claim, ClaimId, ClaimType, Confidence, ConflictKind, ContradictionPair,
+    DiffClaim, DiffEntity, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion, Result,
+    Sensitivity, SourceId, WorkspaceId, config::Config,
 };
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_health::Verifier;
@@ -183,6 +183,10 @@ pub fn compute_diff_into(
                             "Contradiction: '{}' vs '{}' (confidence delta {:.2} below threshold)",
                             main_stmt, statement, delta
                         ),
+                        // 2-way diff cannot classify the conflict
+                        // shape — only `compute_three_way_diff` has
+                        // the LCA needed to set this field.
+                        conflict_kind: None,
                     });
                 }
                 break;
@@ -293,6 +297,9 @@ pub fn compute_diff_into(
                             "Potentially conflicting claims about the same subject (Jaccard={:.2}, confidence delta {:.2} below threshold)",
                             sim, delta
                         ),
+                        // 2-way diff path; see compute_three_way_diff
+                        // for LCA-aware classification.
+                        conflict_kind: None,
                     });
                 }
             }
@@ -393,4 +400,157 @@ pub fn compute_rebase_diff(
         max_health_drop,
         block_on_contradictions,
     )
+}
+
+/// T0.5 three-way merge with lowest common ancestor (LCA).
+///
+/// Two-way `compute_diff_into` cannot distinguish "added on theirs"
+/// from "removed from ours" — it only sees what's in each graph at
+/// merge time, not how each got there.  Three-way uses the LCA
+/// (`base_graph` — the parent's `graph.db` snapshotted at fork time
+/// and stored at `<branch>/graph/graph.db.parent-at-fork`) to
+/// classify true conflicts:
+///
+/// | Case | Outcome |
+/// |---|---|
+/// | In `base` only | Removed-on-both — no-op |
+/// | In `theirs` only | Add to target (clean) — handled by 2-way |
+/// | In `ours` only | Keep in target (clean) — handled by 2-way |
+/// | In `theirs` and `ours`, identical | No-op |
+/// | In `theirs` and `ours`, different | **`ModifyModify` conflict** |
+/// | In `base` and `theirs`, removed in `ours` | **`DeleteModify` conflict** |
+///
+/// Conflicts are pushed to `KnowledgeDiff::needs_review` with
+/// `conflict_kind: Some(ConflictKind::*)` set; `merge_allowed` flips
+/// to `false` when any conflict is recorded.  Auto-resolved /
+/// non-conflicting deltas come straight from the underlying 2-way
+/// diff so the existing semantic-hash + Jaccard contradiction
+/// detection still applies.
+///
+/// Reference: `docs/branch-system-improvements.md` §T0.5 +
+/// DSMCompare three-way semantic diff (Springer 2025).
+pub fn compute_three_way_diff(
+    base_graph: &GraphStore,
+    target_graph: &GraphStore,
+    source_graph: &GraphStore,
+    from_branch: &str,
+    target_branch: Option<&str>,
+    auto_resolve_threshold: f64,
+    max_health_drop: f64,
+    block_on_contradictions: bool,
+) -> Result<KnowledgeDiff> {
+    // Start from the existing 2-way diff so all the auto-resolution,
+    // Jaccard contradiction, and source-id mapping logic continues to
+    // apply.  Three-way is purely additive — it tightens the
+    // `needs_review` list with LCA-aware classifications.
+    let mut diff = compute_diff_into(
+        target_graph,
+        source_graph,
+        from_branch,
+        target_branch,
+        auto_resolve_threshold,
+        max_health_drop,
+        block_on_contradictions,
+    )?;
+
+    // Build (claim_id → statement) maps for all three graphs.  We
+    // compare on claim_id (stable across branches when the claim was
+    // forked from a common parent) and on statement text (the bit
+    // each side might have edited).
+    let base_map: HashMap<String, String> = base_graph
+        .get_all_claims_with_sources()?
+        .into_iter()
+        .map(|(id, stmt, _, _, _, _)| (id, stmt))
+        .collect();
+    let ours_map: HashMap<String, String> = target_graph
+        .get_all_claims_with_sources()?
+        .into_iter()
+        .map(|(id, stmt, _, _, _, _)| (id, stmt))
+        .collect();
+    let theirs_map: HashMap<String, String> = source_graph
+        .get_all_claims_with_sources()?
+        .into_iter()
+        .map(|(id, stmt, _, _, _, _)| (id, stmt))
+        .collect();
+
+    let mut three_way_conflicts: Vec<ContradictionPair> = Vec::new();
+
+    // Case 1: same id in both ours and theirs, statements differ →
+    // both modified the same claim differently since the LCA.
+    for (id, theirs_stmt) in &theirs_map {
+        let Some(ours_stmt) = ours_map.get(id) else {
+            continue;
+        };
+        if theirs_stmt == ours_stmt {
+            continue;
+        }
+        let base_stmt = base_map.get(id);
+        let kind = match base_stmt {
+            // Both modified relative to a common base.  Even if one
+            // side happens to match base — that's a no-op for that
+            // side, but the OTHER side's change still needs to land,
+            // and the standard 2-way diff already handles the clean
+            // "only theirs changed" case, so skip when ours == base.
+            Some(b) if b == ours_stmt => continue,
+            // Symmetric: theirs is a no-op vs base; clean change on
+            // ours alone — 2-way diff path handles it.
+            Some(b) if b == theirs_stmt => continue,
+            // Both differ from base — real ModifyModify conflict.
+            Some(_) => ConflictKind::ModifyModify,
+            // No base entry but same id in both — defensive case.
+            // Treat as AddAdd so an operator can audit.
+            None => ConflictKind::AddAdd,
+        };
+        three_way_conflicts.push(ContradictionPair {
+            main_claim_id: id.clone(),
+            branch_claim_id: id.clone(),
+            main_statement: ours_stmt.clone(),
+            branch_statement: theirs_stmt.clone(),
+            explanation: format!(
+                "Three-way {kind:?} conflict on claim {id}: both sides diverged \
+                 from the lowest common ancestor"
+            ),
+            conflict_kind: Some(kind),
+        });
+    }
+
+    // Case 2: id present in base AND theirs, but missing from ours →
+    // ours deleted something theirs modified (or kept).
+    for (id, theirs_stmt) in &theirs_map {
+        if !base_map.contains_key(id) {
+            continue;
+        }
+        if ours_map.contains_key(id) {
+            continue;
+        }
+        // Skip when theirs is a no-op vs base — clean delete on ours,
+        // nothing to merge.
+        if base_map.get(id) == Some(theirs_stmt) {
+            continue;
+        }
+        let base_stmt = base_map.get(id).cloned().unwrap_or_default();
+        three_way_conflicts.push(ContradictionPair {
+            main_claim_id: id.clone(),
+            branch_claim_id: id.clone(),
+            main_statement: format!("(deleted in ours; was: {base_stmt})"),
+            branch_statement: theirs_stmt.clone(),
+            explanation: format!(
+                "Three-way DeleteModify conflict on claim {id}: ours deleted \
+                 what theirs modified relative to the LCA"
+            ),
+            conflict_kind: Some(ConflictKind::DeleteModify),
+        });
+    }
+
+    if !three_way_conflicts.is_empty() {
+        let count = three_way_conflicts.len();
+        diff.needs_review.extend(three_way_conflicts);
+        diff.merge_allowed = false;
+        diff.blocking_reasons.push(format!(
+            "{count} three-way conflict(s) require resolution before merge \
+             (see needs_review entries with conflict_kind set)"
+        ));
+    }
+
+    Ok(diff)
 }

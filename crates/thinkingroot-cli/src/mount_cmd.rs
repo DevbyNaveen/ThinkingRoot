@@ -109,13 +109,21 @@ pub async fn run_mount(
     // 2. Signature — only when present and only when the user did not
     //    pass --no-verify.  Unsigned packs are accepted with a warning
     //    when --no-verify is implied (matches `root install --allow-unsigned`).
+    //
+    //    NOTE on the trust regime — `mount` runs in local-trust mode by
+    //    design (per `.claude/rules/tr-mount-sdk.md` "mount is replay-by-
+    //    default"): mount does NOT perform the strict Sigstore handshake
+    //    (Fulcio cert-chain validation + Rekor inclusion proof + revocation
+    //    snapshot lookup), because those require network round-trips and
+    //    would defeat the "60-second secondary brain" promise.  Strict
+    //    verification is the responsibility of `root install <ref>`, which
+    //    is what users run before mounting if they want full trust.  The
+    //    `acknowledge_signed_bundle_in_local_trust_mode` helper below
+    //    records that intent in the audit log without actually verifying
+    //    — its name is the honest description of what it does.
     let signed = pack.signature.is_some();
     if !no_verify && signed {
-        // Defer to tr-verify for the actual Sigstore check (cert chain,
-        // Rekor inclusion, transparency log).  This crate already
-        // ships and is the canonical signature verifier; replicating
-        // it here would invite drift.
-        verify_signature(&pack)?;
+        acknowledge_signed_bundle_in_local_trust_mode(&pack)?;
     } else if !signed {
         eprintln!(
             "  warning: pack {} is unsigned (T0 trust); proceed with caution",
@@ -267,19 +275,51 @@ pub async fn run_mount(
     Ok(())
 }
 
-/// Verify a signed pack via `tr-verify`.  Returns `Ok(())` when the
-/// signature, certificate chain, and Rekor inclusion all check out.
-fn verify_signature(_pack: &V3Pack) -> Result<()> {
-    // Deferring the full Sigstore handshake to `tr-verify` would
-    // require lifting the signed-pack bytes back through that crate's
-    // public API.  We have the parsed pack already; the canonical
-    // policy is "pack-hash chain holds + signature bundle parses".
-    // Strict Sigstore verification requires network access to
-    // Fulcio + Rekor — too slow for a hot-path mount.  The user
-    // ran `root install <ref>` before mounting if they wanted full
-    // chain verification; mount runs in the local-trust regime.
-    //
-    // We still log the cert subject so the operator can audit.
+/// Record in the audit log that `mount` observed a signed pack and is
+/// **deliberately** running in local-trust mode (no Sigstore handshake).
+///
+/// # Trust regime
+///
+/// `mount` is the secondary-brain replay path (see
+/// `.claude/rules/tr-mount-sdk.md` "mount is replay-by-default").  By
+/// design it does **not** perform:
+///
+/// - Fulcio certificate-chain validation
+/// - Rekor inclusion-proof check against the transparency log
+/// - Revocation-snapshot lookup
+///
+/// All three require network access and would defeat the "60-second
+/// secondary brain" promise.  Strict verification is the responsibility
+/// of `root install <ref>`, which is what users run when they need full
+/// chain trust before mounting.
+///
+/// Pre-rename this function was called `verify_signature` and its body
+/// was a bare `Ok(())`.  The name implied verification; the body did
+/// nothing.  That ambiguity violated CLAUDE.md honesty rule #6 (never
+/// claim something was verified when it wasn't).  The current name
+/// describes the actual contract, and the body now emits a tracing
+/// `info!` so the local-trust mode is visible in operator logs.
+///
+/// To upgrade `mount` to strict verification (Phase F++ work), wire
+/// `tr_verify::verify_pack` here behind an `--strict` flag and add a
+/// `RegistryCache` for offline-grace revocation lookup.  Do not change
+/// the *default* behaviour without re-reading the secondary-brain spec.
+fn acknowledge_signed_bundle_in_local_trust_mode(pack: &V3Pack) -> Result<()> {
+    // The bundle has already been parsed by `tr_format::reader_v3` (the
+    // reader returns `Error::Invalid { what: "signature.sig", ... }` on
+    // a malformed bundle), so reaching this function means the bytes
+    // are at least well-formed.  Record the regime so an operator
+    // running with `RUST_LOG=info` can audit which pack was mounted
+    // under local trust and which under strict (when `root install`
+    // is the upstream).
+    tracing::info!(
+        target: "thinkingroot::mount::trust",
+        pack_name = %pack.manifest.name,
+        pack_version = %pack.manifest.version,
+        "mount: signed pack accepted in local-trust mode \
+         (Sigstore cert chain + Rekor inclusion + revocation NOT verified; \
+         run `root install` for strict verification)"
+    );
     Ok(())
 }
 
@@ -699,6 +739,31 @@ mod tests {
         assert_eq!(sanitize_path_component("../../etc"), ".._.._etc");
         assert_eq!(sanitize_path_component("alice"), "alice");
         assert_eq!(sanitize_path_component("alice-1.0"), "alice-1.0");
+    }
+
+    /// A1 regime pin — `acknowledge_signed_bundle_in_local_trust_mode`
+    /// is a deliberate no-op (returns `Ok(())`) that exists *only* to
+    /// emit an audit-log entry recording mount's local-trust regime.
+    /// This test fixes the contract so future refactors cannot
+    /// silently re-introduce strict Sigstore verification on the
+    /// hot-path mount without re-reading the secondary-brain spec
+    /// + updating `docs/2026-05-03-secondary-brain-quickstart.md`.
+    ///
+    /// The function MUST stay a no-op until a deliberate `--strict`
+    /// flag is added; conversely, the function MUST exist (don't
+    /// inline the call site) so the regime stays a single auditable
+    /// hook with one place to upgrade.
+    #[test]
+    fn acknowledge_signed_bundle_in_local_trust_mode_returns_ok() {
+        let pack = fixture_pack();
+        let result = acknowledge_signed_bundle_in_local_trust_mode(&pack);
+        assert!(
+            result.is_ok(),
+            "local-trust mode must always return Ok — strict Sigstore \
+             verification is the responsibility of `root install`, not \
+             `root mount`. Got: {:?}",
+            result
+        );
     }
 
     #[test]

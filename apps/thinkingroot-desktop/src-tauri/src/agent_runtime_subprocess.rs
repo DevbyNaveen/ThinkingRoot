@@ -500,10 +500,32 @@ async fn wait_for_sidecar_ready(
 ) -> bool {
     use tokio::time::{Duration, Instant, sleep};
 
-    let client = reqwest::Client::builder()
+    // Pre-fix: `.build().unwrap_or_default()` would silently fall back to
+    // a default reqwest client with NO request timeout if builder
+    // construction failed (e.g. corrupted system root-cert store on a
+    // freshly-imaged box, broken DNS resolver init).  The deadline-based
+    // poll loop would then call `client.get(livez_url).send()` on a
+    // timeout-less client and could hang forever, never reaching the
+    // outer `Instant::now() >= deadline` check.  Treat client-init
+    // failure as a hard "sidecar not ready" — same contract as a child
+    // crash or timeout, just with a clearer log line so the user knows
+    // *why* startup failed.
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-        .unwrap_or_default();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                url = %livez_url,
+                error = %e,
+                "sidecar readiness probe: failed to build reqwest client — \
+                 aborting (likely corrupted system root-cert store or \
+                 invalid system clock)"
+            );
+            return false;
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut attempt = 0u32;

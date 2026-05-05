@@ -42,6 +42,19 @@ pub struct BranchRef {
     /// behaviour for every branch that pre-dates this field.
     #[serde(default)]
     pub redaction: Option<RedactionPolicy>,
+    /// BLAKE3 hash of the parent's `graph.db` at fork time (T0.5,
+    /// branch-system-improvements §T0.5).  Pinned so a three-way merge
+    /// can identify the lowest common ancestor (LCA) and surface real
+    /// conflicts where two-way diff would silently last-writer-win.
+    ///
+    /// `None` for branches created before T0.5 shipped — those keep
+    /// using the existing two-way `compute_diff_into` path on merge,
+    /// which is correct for the >99% of merges with no concurrent
+    /// edits to the same claim.  Pre-T0.5 branches that DO have
+    /// concurrent edits behave exactly as they did before this field
+    /// existed; only new branches gain three-way semantics.
+    #[serde(default)]
+    pub parent_commit_hash: Option<String>,
 }
 
 /// First-class branch classification.

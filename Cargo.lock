@@ -6165,6 +6165,7 @@ dependencies = [
  "thinkingroot-core",
  "thinkingroot-graph",
  "thinkingroot-health",
+ "thinkingroot-pr",
  "thiserror 2.0.18",
  "tokio",
  "toml",
@@ -6401,6 +6402,19 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "thinkingroot-pr"
+version = "0.9.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "tempfile",
+ "thinkingroot-core",
+ "toml",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ interface Props {
  *
  * Confirm is a deliberate no-op for v0.1 — the actual install path
  * lives in the OSS `root install` CLI; integrating that flow with
- * extraction progress + capsule undo is the next phase. The sheet's
+ * extraction progress + pack undo is the next phase. The sheet's
  * job today is to decode the pack honestly and let the user decide
  * whether to proceed.
  */
@@ -65,7 +65,7 @@ export function InstallTrSheet({ path, onClose }: Props) {
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Install ThinkingRoot capsule"
+      aria-label="Install ThinkingRoot pack"
       className="fixed inset-0 z-[55] flex items-center justify-center bg-background/70 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -76,7 +76,7 @@ export function InstallTrSheet({ path, onClose }: Props) {
           <div className="flex min-w-0 items-center gap-2">
             <FileWarning className="size-4 text-accent" />
             <h2 className="truncate text-sm font-medium tracking-tight">
-              Install capsule
+              Install pack
             </h2>
             <code
               className="truncate font-mono text-[10px] text-muted-foreground"
@@ -143,7 +143,7 @@ function Loading() {
   return (
     <div className="flex h-40 items-center justify-center gap-2 text-sm text-muted-foreground">
       <Loader2 className="size-4 animate-spin" />
-      <span>Reading capsule…</span>
+      <span>Reading pack…</span>
     </div>
   );
 }
@@ -153,7 +153,7 @@ function ErrorCard({ message }: { message: string }) {
     <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
       <AlertTriangle className="mt-0.5 size-4 shrink-0" />
       <div className="min-w-0">
-        <p className="font-medium">Could not read capsule</p>
+        <p className="font-medium">Could not read pack</p>
         <p className="mt-1 break-words font-mono text-[11px]">{message}</p>
       </div>
     </div>

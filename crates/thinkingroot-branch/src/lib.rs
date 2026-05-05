@@ -3,6 +3,7 @@ pub mod branch;
 pub mod diff;
 pub mod lock;
 pub mod merge;
+pub mod recovery;
 pub mod snapshot;
 
 use std::path::Path;
@@ -64,7 +65,15 @@ pub async fn create_branch_with_owner(
 }
 
 /// Create a new branch with the full T0.6 attribute set
-/// (kind + merge policy) plus the T2.6 redaction policy.
+/// (kind + merge policy) plus the T2.6 redaction policy AND the T0.5
+/// `parent_commit_hash` LCA pointer.
+///
+/// Sets `BranchRef::parent_commit_hash` to the BLAKE3 of the parent's
+/// `graph.db` at fork time.  Combined with the immutable
+/// `graph.db.parent-at-fork` snapshot (saved by
+/// [`snapshot::create_branch_layout`]), this gives `compute_three_way_diff`
+/// the LCA it needs to surface real conflicts where two-way merge
+/// would silently last-writer-win.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_branch_full(
     root_path: &Path,
@@ -85,7 +94,7 @@ pub async fn create_branch_full(
     let refs_dir = root_path.join(".thinkingroot-refs");
     std::fs::create_dir_all(&refs_dir)?;
     let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
-    registry.create_branch_full(
+    let mut branch_ref = registry.create_branch_full(
         name,
         parent,
         description,
@@ -94,7 +103,24 @@ pub async fn create_branch_full(
         kind,
         merge_policy,
         redaction,
-    )
+    )?;
+
+    // T0.5 — record the LCA pointer.  We hash the parent's graph.db
+    // (which is what we just copied to graph.db.parent-at-fork) so a
+    // future merge can verify the snapshot still represents the same
+    // bytes.  A missing parent graph.db (fresh workspace, parent was
+    // empty) is recorded as None — the three-way merge gate falls
+    // back to two-way for those.
+    let parent_db = parent_data_dir.join("graph").join("graph.db");
+    if parent_db.exists() {
+        let bytes = std::fs::read(&parent_db)
+            .map_err(|e| thinkingroot_core::Error::io_path(&parent_db, e))?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        registry.set_parent_commit_hash(name, hash.clone())?;
+        branch_ref.parent_commit_hash = Some(hash);
+    }
+
+    Ok(branch_ref)
 }
 
 /// Update the redaction policy on an existing branch and persist.
@@ -184,6 +210,15 @@ pub fn rollback_merge(root_path: &Path, branch_name: &str) -> Result<()> {
 }
 
 /// Merge `source_branch` into `target_branch`.
+///
+/// When the source branch has a T0.5 parent-at-fork snapshot on disk
+/// (the immutable LCA copy created by `create_branch_layout`), the
+/// merge dispatches to [`diff::compute_three_way_diff`] which surfaces
+/// real conflicts where two-way diff would silently last-writer-win.
+/// Branches predating T0.5 fall back to the historical
+/// [`diff::compute_diff_into`] path — preserves the existing
+/// behaviour for every workspace that has not yet recreated its
+/// branches.
 pub async fn merge_into(
     root_path: &Path,
     source_branch: &str,
@@ -198,15 +233,36 @@ pub async fn merge_into(
     let target_data_dir = snapshot::resolve_data_dir(root_path, Some(target_branch));
     let target_graph = GraphStore::init(&target_data_dir.join("graph"))?;
     let source_graph = GraphStore::init(&source_data_dir.join("graph"))?;
-    let mut diff = diff::compute_diff_into(
-        &target_graph,
-        &source_graph,
-        source_branch,
-        Some(target_branch),
-        merge_cfg.auto_resolve_threshold,
-        merge_cfg.max_health_drop,
-        merge_cfg.block_on_contradictions,
-    )?;
+
+    // T0.5 — dispatch to three-way diff when the parent-at-fork
+    // snapshot is present.  `parent_at_fork_dir` returns
+    // `<source>/graph/parent-at-fork`; that directory contains a
+    // graph.db copy of the LCA at fork time.  Existence check skips
+    // the dispatch cleanly for legacy branches.
+    let lca_dir = snapshot::parent_at_fork_dir(&source_data_dir);
+    let mut diff = if lca_dir.join("graph.db").exists() {
+        let base_graph = GraphStore::init(&lca_dir)?;
+        diff::compute_three_way_diff(
+            &base_graph,
+            &target_graph,
+            &source_graph,
+            source_branch,
+            Some(target_branch),
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )?
+    } else {
+        diff::compute_diff_into(
+            &target_graph,
+            &source_graph,
+            source_branch,
+            Some(target_branch),
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )?
+    };
     if force {
         diff.merge_allowed = true;
         diff.blocking_reasons.clear();
@@ -262,4 +318,16 @@ pub async fn rebase_branch(
 /// Returns the number of directories migrated.
 pub fn migrate_legacy_layout(root_path: &Path) -> Result<usize> {
     snapshot::migrate_legacy_layout(root_path)
+}
+
+/// Recover any merges interrupted by a crash before they could update
+/// the registry.  Reads `<root>/.thinkingroot-refs/merges_in_flight.toml`
+/// and rolls each in-flight target back from its pre-merge snapshot.
+///
+/// Idempotent + safe to call from every startup path; on a clean
+/// workspace it stats one file and returns.  See [`recovery`] for the
+/// underlying state machine and [`recovery::RecoveryReport`] for the
+/// caller-visible outcome.
+pub fn recover_orphan_merges(root_path: &Path) -> Result<recovery::RecoveryReport> {
+    recovery::recover_orphan_merges(root_path)
 }
