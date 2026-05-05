@@ -1,5 +1,6 @@
 // crates/thinkingroot-branch/src/diff.rs
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use chrono::Utc;
 use thinkingroot_core::{
@@ -8,7 +9,22 @@ use thinkingroot_core::{
     Sensitivity, SourceId, WorkspaceId, config::Config,
 };
 use thinkingroot_graph::graph::GraphStore;
+use thinkingroot_graph::vector::VectorStore;
 use thinkingroot_health::Verifier;
+
+/// T1.1 — third-pass cosine threshold above which a candidate is treated
+/// as a potential semantic contradiction.  0.75 is the same gate used by
+/// the hybrid retrieval recall tier; well above the chance baseline for
+/// 384-dim AllMiniLML6V2 embeddings (≈0.1) but below the deduplication
+/// threshold (≈0.95) at which the negation/Jaccard passes already
+/// classify rows as the same claim.
+pub const VECTOR_CONTRADICTION_THRESHOLD: f32 = 0.75;
+
+/// How many target neighbours to fetch per branch claim during the
+/// vector contradiction pass.  Three is enough to surface the closest
+/// semantic match plus the next two candidates in case the closest is
+/// a duplicate caught by an earlier pass.
+const VECTOR_CONTRADICTION_TOP_K: usize = 3;
 
 /// Compute a BLAKE3 hash of a normalised claim statement.
 /// Normalisation: lowercase + collapse whitespace.
@@ -59,6 +75,23 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
     intersection as f64 / union as f64
+}
+
+/// Test-only re-export of the negation-pair predicate so unit tests
+/// can pin the pre-condition that pass 1 misses a given pair before
+/// asserting that the third (vector) pass catches it.  Keep the name
+/// suffixed with `_for_test` so production callers stay on the public
+/// `compute_diff_into` entry point.
+#[doc(hidden)]
+pub fn is_contradiction_pair_for_test(a: &str, b: &str) -> bool {
+    is_contradiction_pair(a, b)
+}
+
+/// Test-only re-export of the Jaccard token-similarity helper.  Same
+/// rationale as `is_contradiction_pair_for_test`.
+#[doc(hidden)]
+pub fn jaccard_similarity_for_test(a: &str, b: &str) -> f64 {
+    jaccard_similarity(a, b)
 }
 
 fn parse_claim_type(s: &str) -> ClaimType {
@@ -550,6 +583,271 @@ pub fn compute_three_way_diff(
             "{count} three-way conflict(s) require resolution before merge \
              (see needs_review entries with conflict_kind set)"
         ));
+    }
+
+    Ok(diff)
+}
+
+/// T1.1 — vector-embedding contradiction pass.
+///
+/// The third detection pass on top of the negation-pair pass (`is`/`is
+/// not`, …) and the Jaccard-token-similarity pass.  Catches semantic
+/// conflicts where:
+///
+/// - cosine similarity between branch and target embedding > 0.75,
+/// - the pair shares at least one entity context,
+/// - the pair has different semantic hashes (i.e. the rows survived the
+///   pass-0 dedup), AND
+/// - neither pass 1 (negation) nor pass 2 (Jaccard) already flagged it.
+///
+/// Examples this pass catches that the earlier passes miss:
+///
+/// | Target claim                  | Branch claim                      | Why earlier passes miss      |
+/// |-------------------------------|-----------------------------------|------------------------------|
+/// | "uses JWT for authentication" | "migrated to OAuth2"              | low Jaccard, no negation kw  |
+/// | "scales horizontally"         | "vertically scaled deployment"    | distinct vocabulary          |
+/// | "stores tokens server-side"   | "tokens persisted to localStorage"| paraphrase, no antonym pair  |
+///
+/// `branch_claims` and `target_claims` carry the same shape returned by
+/// `GraphStore::get_all_claims_with_sources` — `(id, statement,
+/// claim_type, confidence, uri, _)`.  The function is sync because it
+/// expects already-opened vector stores; the async I/O sits in the
+/// `compute_diff_into_with_vector_dirs` wrapper below.
+///
+/// Returns `Ok(count)` where `count` is the number of new conflicts
+/// added to `diff.needs_review` / `diff.auto_resolved`.  When `count >
+/// 0` and `block_on_contradictions` was true at diff time, the caller
+/// is responsible for re-checking `needs_review` and flipping
+/// `merge_allowed` — the function intentionally does not mutate that
+/// gate so the pass composes cleanly with the existing two-way and
+/// three-way diff outputs.
+pub fn apply_vector_contradiction_pass(
+    diff: &mut KnowledgeDiff,
+    target_vec: &VectorStore,
+    source_vec: &VectorStore,
+    target_claims: &[(String, String, String, f64, String, f64)],
+    branch_claims: &[(String, String, String, f64, String, f64)],
+    target_entity_map: &HashMap<String, Vec<String>>,
+    branch_entity_map: &HashMap<String, Vec<String>>,
+    auto_resolve_threshold: f64,
+    cosine_threshold: f32,
+) -> Result<usize> {
+    if target_vec.is_empty() || source_vec.is_empty() {
+        // Either side hasn't been embedded yet — happens on fresh
+        // workspaces and during tests that haven't pre-seeded vectors.
+        // Nothing to compare against; skip silently.
+        return Ok(0);
+    }
+
+    // Index target rows by id for O(1) statement / confidence lookup.
+    let target_by_id: HashMap<&str, (&str, f64)> = target_claims
+        .iter()
+        .map(|(id, stmt, _, conf, _, _)| (id.as_str(), (stmt.as_str(), *conf)))
+        .collect();
+
+    // Build the set of (branch_id, target_id) pairs already flagged by
+    // earlier passes so the third pass never duplicates them.  Both
+    // auto_resolved and needs_review are checked because pass 1+2 may
+    // have classified the same logical pair into either bucket.
+    let mut already_flagged: HashSet<(String, String)> = HashSet::new();
+    for r in &diff.auto_resolved {
+        already_flagged.insert((r.branch_claim_id.clone(), r.main_claim_id.clone()));
+    }
+    for p in &diff.needs_review {
+        already_flagged.insert((p.branch_claim_id.clone(), p.main_claim_id.clone()));
+    }
+
+    let mut added = 0usize;
+
+    for (branch_id, statement, _, confidence, _, _) in branch_claims {
+        // Only run the pass on rows that the two-way diff classified as
+        // genuinely new.  Rows that already match a target claim by
+        // semantic hash are deduped at pass 0 and never reach the
+        // contradiction passes.
+        let is_new = diff
+            .new_claims
+            .iter()
+            .any(|c| c.claim.id.to_string() == *branch_id);
+        if !is_new {
+            continue;
+        }
+
+        let branch_entities = branch_entity_map
+            .get(branch_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        if branch_entities.is_empty() {
+            // Without entity context we cannot scope the search; the
+            // global vector neighbourhood is too noisy for a useful
+            // contradiction signal.
+            continue;
+        }
+
+        // Reuse the embedding stored in the source vector store rather
+        // than re-embedding the same text — saves an `ensure_model()`
+        // round trip per row.  Source rows that lack an embedding (e.g.
+        // claims contributed before the index was rebuilt) are skipped.
+        let Some(query_vec) = source_vec.get_embedding(branch_id.as_str()) else {
+            continue;
+        };
+
+        let neighbours = target_vec.search_by_vector(query_vec, VECTOR_CONTRADICTION_TOP_K);
+        for (target_id, _, sim) in neighbours {
+            if sim < cosine_threshold {
+                continue;
+            }
+            // Skip already-flagged pairs (negation or Jaccard caught it).
+            if already_flagged.contains(&(branch_id.clone(), target_id.clone())) {
+                continue;
+            }
+            // Look up the target claim — the search hit's id is the
+            // canonical claim id; if the target graph has been mutated
+            // since the index was built, drop the row rather than
+            // surface a stale conflict.
+            let Some((target_stmt, target_conf)) = target_by_id.get(target_id.as_str()) else {
+                continue;
+            };
+            // Same semantic hash means the negation/Jaccard passes
+            // already deduped this pair; do not double-flag.
+            if semantic_hash(statement) == semantic_hash(target_stmt) {
+                continue;
+            }
+            // Require shared entity context — without it, two unrelated
+            // claims that happen to share embedding-space proximity
+            // would generate noise.
+            let target_entities = target_entity_map
+                .get(target_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let shared = branch_entities
+                .iter()
+                .filter(|e| target_entities.contains(e))
+                .count();
+            if shared == 0 {
+                continue;
+            }
+
+            let delta = (confidence - target_conf).abs();
+            if delta > auto_resolve_threshold {
+                let winner = if confidence > target_conf {
+                    branch_id.clone()
+                } else {
+                    target_id.clone()
+                };
+                diff.auto_resolved.push(AutoResolution {
+                    main_claim_id: target_id.clone(),
+                    branch_claim_id: branch_id.clone(),
+                    winner,
+                    confidence_delta: delta,
+                    reason: format!(
+                        "Vector cosine {sim:.2} > {cosine_threshold:.2} with confidence \
+                         delta {delta:.2} > threshold {auto_resolve_threshold:.2}"
+                    ),
+                });
+            } else {
+                diff.needs_review.push(ContradictionPair {
+                    main_claim_id: target_id.clone(),
+                    branch_claim_id: branch_id.clone(),
+                    main_statement: target_stmt.to_string(),
+                    branch_statement: statement.clone(),
+                    explanation: format!(
+                        "Semantic contradiction by embedding (cosine {sim:.2} > \
+                         {cosine_threshold:.2}, confidence delta {delta:.2} below \
+                         auto-resolution threshold {auto_resolve_threshold:.2})"
+                    ),
+                    // 2-way path; LCA-aware classification stays the
+                    // domain of `compute_three_way_diff`.
+                    conflict_kind: None,
+                });
+            }
+            already_flagged.insert((branch_id.clone(), target_id.clone()));
+            added += 1;
+            // One conflict per branch claim is enough to stop the merge
+            // and surface the issue; subsequent neighbours rarely add
+            // signal beyond noise.
+            break;
+        }
+    }
+
+    Ok(added)
+}
+
+/// Async wrapper around [`compute_diff_into`] that opens the per-branch
+/// vector stores and runs [`apply_vector_contradiction_pass`] as a
+/// third detection pass.  Used by `merge_into` in this crate's `lib.rs`.
+///
+/// Skips the pass entirely when either `vectors.bin` is missing — fresh
+/// workspaces and tests that disable embeddings keep the existing
+/// two-pass behaviour.
+pub async fn compute_diff_into_with_vector_dirs(
+    target_graph: &GraphStore,
+    source_graph: &GraphStore,
+    target_data_dir: &Path,
+    source_data_dir: &Path,
+    from_branch: &str,
+    target_branch: Option<&str>,
+    auto_resolve_threshold: f64,
+    max_health_drop: f64,
+    block_on_contradictions: bool,
+) -> Result<KnowledgeDiff> {
+    let mut diff = compute_diff_into(
+        target_graph,
+        source_graph,
+        from_branch,
+        target_branch,
+        auto_resolve_threshold,
+        max_health_drop,
+        block_on_contradictions,
+    )?;
+
+    if !target_data_dir.join("vectors.bin").exists()
+        || !source_data_dir.join("vectors.bin").exists()
+    {
+        return Ok(diff);
+    }
+
+    let target_vec = VectorStore::init(target_data_dir).await?;
+    let source_vec = VectorStore::init(source_data_dir).await?;
+
+    let target_claims = target_graph.get_all_claims_with_sources()?;
+    let branch_claims = source_graph.get_all_claims_with_sources()?;
+
+    let branch_ids: Vec<&str> = branch_claims.iter().map(|(id, ..)| id.as_str()).collect();
+    let target_ids: Vec<&str> = target_claims.iter().map(|(id, ..)| id.as_str()).collect();
+    let branch_entity_map = source_graph.get_entity_names_for_claims(&branch_ids)?;
+    let target_entity_map = target_graph.get_entity_names_for_claims(&target_ids)?;
+
+    let added = apply_vector_contradiction_pass(
+        &mut diff,
+        &target_vec,
+        &source_vec,
+        &target_claims,
+        &branch_claims,
+        &target_entity_map,
+        &branch_entity_map,
+        auto_resolve_threshold,
+        VECTOR_CONTRADICTION_THRESHOLD,
+    )?;
+
+    if added > 0 && block_on_contradictions {
+        // Refresh the merge gate — the pass intentionally does not
+        // mutate `merge_allowed` so it composes with two-way + three-way
+        // outputs.  Re-evaluate based on the now-extended needs_review.
+        if !diff.needs_review.is_empty() {
+            diff.merge_allowed = false;
+            // Avoid duplicating an existing reason if the earlier diff
+            // already added one for unresolved contradictions.
+            let already_blocked = diff
+                .blocking_reasons
+                .iter()
+                .any(|r| r.contains("contradiction"));
+            if !already_blocked {
+                diff.blocking_reasons.push(format!(
+                    "{} unresolved contradiction(s) require review",
+                    diff.needs_review.len()
+                ));
+            }
+        }
     }
 
     Ok(diff)

@@ -252,6 +252,36 @@ mod inner {
             Ok(count)
         }
 
+        /// Search using a pre-computed query embedding (no model inference).
+        /// Used by the branch contradiction pass which already has the source
+        /// claim's embedding cached in the source store — re-embedding the
+        /// same text would force two `ensure_model()` calls per pair.
+        pub fn search_by_vector(
+            &self,
+            query_vec: &[f32],
+            top_k: usize,
+        ) -> Vec<(String, String, f32)> {
+            if self.index.is_empty() {
+                return Vec::new();
+            }
+            let mut scores: Vec<(String, String, f32)> = self
+                .index
+                .iter()
+                .map(|(id, (vec, meta))| {
+                    let sim = cosine_similarity(query_vec, vec);
+                    (id.clone(), meta.clone(), sim)
+                })
+                .collect();
+            scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(top_k);
+            scores
+        }
+
+        /// Borrow the stored embedding for a given id, if present.
+        pub fn get_embedding(&self, id: &str) -> Option<&[f32]> {
+            self.index.get(id).map(|(vec, _)| vec.as_slice())
+        }
+
         /// Number of stored embeddings.
         pub fn len(&self) -> usize {
             self.index.len()
@@ -527,6 +557,18 @@ mod inner {
             _items: Vec<(String, Vec<f32>, String)>,
         ) -> Result<usize> {
             Ok(0)
+        }
+
+        pub fn search_by_vector(
+            &self,
+            _query_vec: &[f32],
+            _top_k: usize,
+        ) -> Vec<(String, String, f32)> {
+            Vec::new()
+        }
+
+        pub fn get_embedding(&self, _id: &str) -> Option<&[f32]> {
+            None
         }
 
         pub fn len(&self) -> usize {

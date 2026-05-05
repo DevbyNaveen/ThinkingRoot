@@ -175,7 +175,7 @@ notify-debouncer-mini = "0.6"
 strsim = "0.11"
 unicode-segmentation = "1.12"
 ordered-float = { version = "5", features = ["serde"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Async stream plumbing for LLM SSE streaming. `futures` provides the
 # `Stream` trait; `eventsource-stream` parses `text/event-stream` over

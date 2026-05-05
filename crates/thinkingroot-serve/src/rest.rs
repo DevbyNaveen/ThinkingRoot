@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,10 +11,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::engine::{ClaimFilter, QueryEngine};
+use thinkingroot_core::BranchEvent;
 
 // ─── App State ───────────────────────────────────────────────
 
@@ -41,6 +43,16 @@ pub struct AppState {
     /// RARP / Active Engram Protocol manager — owns per-session
     /// materialised Engrams and serves the 4 new MCP tools.
     pub engram_manager: Arc<crate::intelligence::engram::EngramManager>,
+    /// T1.6 — per-branch broadcast channels for live SSE event streams.
+    /// Keyed by branch name within `workspace_root`.  Each channel is
+    /// created lazily on first subscriber, has capacity 64 (branch
+    /// events are infrequent — one per merge / abandon /
+    /// redaction-update — so the small buffer keeps slow consumers from
+    /// blocking the writer), and is reused across reconnects.  The
+    /// previously-shipped `BranchEvent` log on `BranchRef` remains the
+    /// source of truth; this hub is a fan-out for clients that prefer
+    /// live updates over polling `/branches/{branch}/events`.
+    pub branch_event_hub: Arc<RwLock<HashMap<String, broadcast::Sender<BranchEvent>>>>,
 }
 
 impl AppState {
@@ -66,8 +78,62 @@ impl AppState {
             engram_manager: crate::intelligence::engram::EngramManager::new(
                 crate::intelligence::engram::EngramConfig::default(),
             ),
+            branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
         })
     }
+
+    /// T1.6 — get-or-create the broadcast channel for a branch.  The
+    /// returned `Sender` is cloneable; subscribers call `subscribe()`
+    /// on it to obtain a `Receiver`.  Capacity is fixed at 64; on
+    /// overflow the oldest events are dropped and slow subscribers see
+    /// `RecvError::Lagged` — surfaced to the SSE client as a `lagged`
+    /// event so they can refetch via the polling endpoint.
+    pub async fn branch_event_sender(&self, branch: &str) -> broadcast::Sender<BranchEvent> {
+        if let Some(tx) = self.branch_event_hub.read().await.get(branch).cloned() {
+            return tx;
+        }
+        let mut map = self.branch_event_hub.write().await;
+        map.entry(branch.to_string())
+            .or_insert_with(|| broadcast::channel(64).0)
+            .clone()
+    }
+}
+
+/// T1.6 — read the latest event for a branch from the on-disk
+/// registry and broadcast it on the corresponding channel.
+///
+/// Called after every successful branch mutation handler.  No-op when
+/// the branch has no events (defensive — registries written before
+/// the audit log shipped have an empty `events` vector and round-trip
+/// via `#[serde(default)]`).
+///
+/// `broadcast::Sender::send` only fails when the channel has zero
+/// receivers; we ignore that error because subscribers may attach at
+/// any time and the polling endpoint serves them the full history.
+///
+/// `pub` so integration tests can drive it directly without wiring
+/// every mutation handler into the test setup.  Production code
+/// already calls it from inside the rest crate after every successful
+/// branch mutation.
+pub async fn publish_latest_branch_event(state: &AppState, branch: &str) {
+    let Some(root) = state.workspace_root.as_ref() else {
+        return;
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::branch::BranchRegistry;
+    let Ok(registry) = BranchRegistry::load_or_create(&refs_dir) else {
+        return;
+    };
+    let Some(event) = registry
+        .all()
+        .into_iter()
+        .find(|b| b.name == branch)
+        .and_then(|b| b.events.last().cloned())
+    else {
+        return;
+    };
+    let tx = state.branch_event_sender(branch).await;
+    let _ = tx.send(event);
 }
 
 // ─── Response Envelope ───────────────────────────────────────
@@ -229,6 +295,15 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // appends a `BranchEvent` to the BranchRef's events vec;
             // this route exposes that log read-only.
             .route("/branches/{branch}/events", get(list_branch_events_handler))
+            // T1.6 — live SSE stream of branch events.  Subscribers
+            // attach to a per-branch broadcast channel; mutations in
+            // the registry publish to it after they commit.  Pairs
+            // with `/branches/{branch}/events` (history) so a client
+            // can backfill on connect, then follow the live stream.
+            .route(
+                "/branches/{branch}/events/stream",
+                get(stream_branch_events_handler),
+            )
             // T1.2 — fast per-branch stats (claims/entities/sources)
             // without running a full diff.
             .route("/branches/{branch}/stats", get(branch_stats_handler))
@@ -242,6 +317,18 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // live data to gate against.
             .route("/tags", get(list_tags_handler).post(create_tag_handler))
             .route("/tags/{name}", get(get_tag_handler))
+            // T3.7 — branch templates.  CRUD for the
+            // workspace-scoped `branch_templates.toml`; consumed by
+            // `POST /branches { template: "..." }` to materialise a
+            // pre-baked merge policy / kind / TTL bundle.
+            .route(
+                "/branch-templates",
+                get(list_branch_templates_handler).post(upsert_branch_template_handler),
+            )
+            .route(
+                "/branch-templates/{name}",
+                get(get_branch_template_handler).delete(delete_branch_template_handler),
+            )
             // T0.4 — Knowledge Proposal lifecycle. The
             // `RequiresProposal` merge gate (`merge.rs:336`) consults
             // `find_approved_proposal` on these files; routes here are
@@ -1153,6 +1240,12 @@ struct CreateBranchRequest {
     /// T2.6 — optional redaction policy. Defaults to no redaction.
     #[serde(default)]
     redaction: Option<thinkingroot_core::RedactionPolicy>,
+    /// T3.7 — apply the named template's defaults to any field on
+    /// this request that the caller did not explicitly set.  Explicit
+    /// fields always win — the template never overrides a value the
+    /// caller asked for.
+    #[serde(default)]
+    template: Option<String>,
 }
 
 async fn create_branch_handler(
@@ -1171,20 +1264,86 @@ async fn create_branch_handler(
         }
     };
     let parent = body.parent.as_deref().unwrap_or("main");
+
+    // T3.7 — apply template defaults to any field the caller left
+    // unset.  An invalid template name returns 400 rather than
+    // silently materialising the branch with engine defaults — the
+    // caller asked for a template, give them a clear error.
+    let mut kind = body.kind;
+    let mut merge_policy = body.merge_policy;
+    let mut redaction = body.redaction;
+    let mut permissions: Option<thinkingroot_core::BranchPermissions> = None;
+    let mut max_age_secs: Option<u64> = None;
+    if let Some(template_name) = body.template.as_deref() {
+        use thinkingroot_branch::templates::TemplateRegistry;
+        let refs_dir = root.join(".thinkingroot-refs");
+        let registry = match TemplateRegistry::load_or_seed(&refs_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "TEMPLATE_LOAD_FAILED",
+                    &e.to_string(),
+                );
+            }
+        };
+        let Some(template) = registry.get(template_name) else {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "TEMPLATE_NOT_FOUND",
+                &format!("no branch template named '{template_name}'"),
+            );
+        };
+        kind.get_or_insert_with(|| template.kind.clone());
+        if merge_policy.is_none() {
+            merge_policy = Some(template.merge_policy.clone());
+        }
+        if redaction.is_none() {
+            redaction = template.redaction.clone();
+        }
+        permissions = template.permissions.clone();
+        max_age_secs = template.max_age_secs;
+    }
+
     match thinkingroot_branch::create_branch_full(
         &root,
         &body.name,
         parent,
         body.description,
         request_user(&headers),
-        thinkingroot_core::BranchPermissions::default(),
-        body.kind.unwrap_or_default(),
-        body.merge_policy.unwrap_or_default(),
-        body.redaction,
+        permissions.unwrap_or_default(),
+        kind.unwrap_or_default(),
+        merge_policy.unwrap_or_default(),
+        redaction,
     )
     .await
     {
-        Ok(branch) => ok_response(serde_json::json!({ "branch": branch })).into_response(),
+        Ok(branch) => {
+            // T3.7 — when the template specified a TTL, apply it now
+            // via the post-create setter.  The TTL is the only
+            // template field that can't be passed to
+            // `create_branch_full` directly because the registry path
+            // for it predates templates.
+            if let Some(ttl) = max_age_secs {
+                if let Err(e) = thinkingroot_branch::set_branch_max_age_secs(
+                    &root,
+                    &branch.name,
+                    Some(ttl),
+                ) {
+                    return err_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "TEMPLATE_TTL_APPLY_FAILED",
+                        &e.to_string(),
+                    );
+                }
+            }
+            // T1.6 — publish the `Created` event the registry just
+            // appended on the new broadcast channel so any client
+            // already subscribed to `/branches/{name}/events/stream`
+            // picks it up live.
+            publish_latest_branch_event(&state, &branch.name).await;
+            ok_response(serde_json::json!({ "branch": branch })).into_response()
+        }
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BRANCH_ERROR",
@@ -1253,7 +1412,16 @@ async fn contribute_bulk_handler(
         )
         .await
     {
-        Ok(result) => ok_response(serde_json::json!(result)).into_response(),
+        Ok(result) => {
+            // T1.6 — `contribute_bulk` appends a `ContributeBulk`
+            // BranchEvent on success.  Broadcast it for live
+            // subscribers (only meaningful when contributing to a
+            // named branch — `main` has no per-branch broadcast key,
+            // but we publish anyway for symmetry).
+            drop(engine);
+            publish_latest_branch_event(&state, &branch).await;
+            ok_response(serde_json::json!(result)).into_response()
+        }
         Err(e) => err_response(
             StatusCode::BAD_REQUEST,
             "CONTRIBUTE_BULK_FAILED",
@@ -1286,7 +1454,11 @@ async fn set_branch_redaction_handler(
         }
     };
     match thinkingroot_branch::set_branch_redaction(&root, &branch, body.policy) {
-        Ok(updated) => ok_response(serde_json::json!({ "branch": updated })).into_response(),
+        Ok(updated) => {
+            // T1.6 — `set_branch_redaction` appends `RedactionUpdated`.
+            publish_latest_branch_event(&state, &updated.name).await;
+            ok_response(serde_json::json!({ "branch": updated })).into_response()
+        }
         Err(e) => err_response(
             StatusCode::BAD_REQUEST,
             "REDACTION_UPDATE_FAILED",
@@ -1340,6 +1512,49 @@ async fn list_branch_events_handler(
         "events": events,
     }))
     .into_response()
+}
+
+// ─── T1.6: Live SSE branch events ────────────────────────────────────
+//
+// Subscribers connect to `GET /branches/{branch}/events/stream`,
+// receive the per-branch broadcast channel, and forward every
+// `BranchEvent` published after a successful mutation as one SSE
+// `branch_event` frame.  No backfill — the polling endpoint
+// `/branches/{branch}/events` is the source of historical events.
+// Channel-lag (a slow consumer that fell more than 64 events behind)
+// is surfaced as a `lagged` event so the client can refetch via the
+// polling endpoint and resume.
+
+async fn stream_branch_events_handler(
+    State(state): State<Arc<AppState>>,
+    Path(branch): Path<String>,
+) -> Response {
+    use tokio_stream::StreamExt as _;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let tx = state.branch_event_sender(&branch).await;
+    let rx = tx.subscribe();
+    let stream = BroadcastStream::new(rx).map(move |res| match res {
+        Ok(event) => {
+            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("branch_event").data(payload),
+            )
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Ok(Event::default().event("lagged").data(payload))
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 // ─── T1.2: Branch stats ──────────────────────────────────────────────
@@ -1559,6 +1774,158 @@ async fn get_tag_handler(
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "TAG_LOOKUP_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+// ─── T3.7: Branch templates ──────────────────────────────────────────
+//
+// Read/write surface for `branch_templates.toml`.  POST creates or
+// overwrites a template by name; GET (collection) lists; GET (item)
+// fetches one; DELETE removes one.  Consumers wire `template: "..."`
+// on `POST /branches` to materialise the bundled defaults.
+
+async fn list_branch_templates_handler(State(state): State<Arc<AppState>>) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::templates::TemplateRegistry;
+    match TemplateRegistry::load_or_seed(&refs_dir) {
+        Ok(r) => ok_response(serde_json::json!({ "templates": r.list() })).into_response(),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TEMPLATE_LOAD_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn upsert_branch_template_handler(
+    State(state): State<Arc<AppState>>,
+    Json(template): Json<thinkingroot_branch::templates::BranchTemplate>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::templates::TemplateRegistry;
+    let mut registry = match TemplateRegistry::load_or_seed(&refs_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TEMPLATE_LOAD_FAILED",
+                &e.to_string(),
+            );
+        }
+    };
+    let name = template.name.clone();
+    match registry.upsert(template) {
+        Ok(existed) => {
+            let status_code = if existed {
+                "updated"
+            } else {
+                "created"
+            };
+            ok_response(serde_json::json!({
+                "name": name,
+                "status": status_code,
+            }))
+            .into_response()
+        }
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "TEMPLATE_INVALID",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn get_branch_template_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::templates::TemplateRegistry;
+    match TemplateRegistry::load_or_seed(&refs_dir) {
+        Ok(r) => match r.get(&name) {
+            Some(t) => ok_response(serde_json::json!({ "template": t })).into_response(),
+            None => err_response(
+                StatusCode::NOT_FOUND,
+                "TEMPLATE_NOT_FOUND",
+                &format!("no branch template named '{name}'"),
+            ),
+        },
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TEMPLATE_LOAD_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+async fn delete_branch_template_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let root = match &state.workspace_root {
+        Some(r) => r.clone(),
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let refs_dir = root.join(".thinkingroot-refs");
+    use thinkingroot_branch::templates::TemplateRegistry;
+    let mut registry = match TemplateRegistry::load_or_seed(&refs_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TEMPLATE_LOAD_FAILED",
+                &e.to_string(),
+            );
+        }
+    };
+    match registry.remove(&name) {
+        Ok(true) => ok_response(serde_json::json!({ "deleted": name })).into_response(),
+        Ok(false) => err_response(
+            StatusCode::NOT_FOUND,
+            "TEMPLATE_NOT_FOUND",
+            &format!("no branch template named '{name}'"),
+        ),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TEMPLATE_DELETE_FAILED",
             &e.to_string(),
         ),
     }
@@ -1961,7 +2328,14 @@ async fn delete_branch_handler(
         .map(crate::engine::BranchActor::User)
         .unwrap_or(crate::engine::BranchActor::System);
     match engine.delete_branch_as(&root, &branch, actor).await {
-        Ok(_) => ok_response(serde_json::json!({ "deleted": branch })).into_response(),
+        Ok(_) => {
+            // T1.6 — `delete_branch_as` calls `abandon_branch` which
+            // appended an `Abandoned` event; broadcast it before
+            // dropping the engine read-lock.
+            drop(engine);
+            publish_latest_branch_event(&state, &branch).await;
+            ok_response(serde_json::json!({ "deleted": branch })).into_response()
+        }
         Err(e) => err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &e.to_string()),
     }
 }
@@ -2113,13 +2487,22 @@ async fn merge_branch_handler(
         )
         .await
     {
-        Ok(diff) => ok_response(serde_json::json!({
-            "merged": branch,
-            "new_claims": diff.new_claims.len(),
-            "new_entities": diff.new_entities.len(),
-            "auto_resolved": diff.auto_resolved.len(),
-        }))
-        .into_response(),
+        Ok(diff) => {
+            // T1.6 — merge_into_branch appends a `Merged` event to the
+            // source branch.  Drop the engine lock before publishing so
+            // a subscriber holding a write-lock never deadlocks on the
+            // broadcast send (broadcast::send is sync but the
+            // surrounding registry-load future awaits).
+            drop(engine);
+            publish_latest_branch_event(&state, &branch).await;
+            ok_response(serde_json::json!({
+                "merged": branch,
+                "new_claims": diff.new_claims.len(),
+                "new_entities": diff.new_entities.len(),
+                "auto_resolved": diff.auto_resolved.len(),
+            }))
+            .into_response()
+        }
         Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
             err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
         }
@@ -2169,14 +2552,21 @@ async fn merge_into_branch_handler(
         )
         .await
     {
-        Ok(diff) => ok_response(serde_json::json!({
-            "merged": source,
-            "target": target,
-            "new_claims": diff.new_claims.len(),
-            "new_entities": diff.new_entities.len(),
-            "auto_resolved": diff.auto_resolved.len(),
-        }))
-        .into_response(),
+        Ok(diff) => {
+            // T1.6 — broadcast `Merged` event for the source branch
+            // (mark_merged_into adds it).  The target branch isn't
+            // mutated by `mark_merged_into`, so no second broadcast.
+            drop(engine);
+            publish_latest_branch_event(&state, &source).await;
+            ok_response(serde_json::json!({
+                "merged": source,
+                "target": target,
+                "new_claims": diff.new_claims.len(),
+                "new_entities": diff.new_entities.len(),
+                "auto_resolved": diff.auto_resolved.len(),
+            }))
+            .into_response()
+        }
         Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
             err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
         }

@@ -1192,3 +1192,328 @@ async fn failed_merge_leaves_intent_and_recovers() {
     assert_eq!(report2.recovered.len(), 0);
     assert_eq!(report2.orphaned_intents_cleared.len(), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// T1.1 — Vector-embedding contradiction pass
+//
+// Pinned exit criterion from the plan: "test pair flags semantic
+// contradiction that existing 10 negation pairs miss."  The test below
+// drives `apply_vector_contradiction_pass` directly with synthetic
+// embeddings so it runs without the ~30 MB fastembed model download —
+// keeping this pass a real unit test rather than `#[ignore]`-gated
+// integration.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vector_contradiction_pass_flags_semantic_conflict_missed_by_negation_and_jaccard() {
+    use std::collections::HashMap;
+    use thinkingroot_branch::diff::{
+        VECTOR_CONTRADICTION_THRESHOLD, apply_vector_contradiction_pass, is_contradiction_pair_for_test,
+        jaccard_similarity_for_test,
+    };
+    use thinkingroot_core::{KnowledgeDiff, types::HealthScore};
+    use thinkingroot_graph::vector::VectorStore;
+
+    // Pre-conditions on the test pair: Pass 1 (negation pair scan) and
+    // Pass 2 (Jaccard token similarity) must both miss it.  This pins
+    // the exit criterion: the third pass is the only one catching it.
+    let target_stmt = "uses JWT for authentication";
+    let branch_stmt = "migrated to OAuth2 for authentication";
+    assert!(
+        !is_contradiction_pair_for_test(target_stmt, branch_stmt),
+        "negation-pair pass must NOT catch this pair (or the third \
+         pass would not be exercised)"
+    );
+    let jaccard = jaccard_similarity_for_test(
+        &target_stmt.to_lowercase(),
+        &branch_stmt.to_lowercase(),
+    );
+    assert!(
+        jaccard <= 0.6,
+        "Jaccard pass must NOT catch this pair (jaccard={jaccard:.2})"
+    );
+
+    // ── Build two minimal in-memory vector stores with synthetic
+    //     embeddings.  Two parallel unit vectors in the same direction
+    //     give cosine 1.0 — well above the 0.75 threshold.  Real
+    //     fastembed embeddings from sibling tests show "uses JWT" /
+    //     "migrated to OAuth2" landing around 0.78-0.82 for the
+    //     auth-context pair, so the synthetic 1.0 is on-distribution.
+    let target_dir = tempfile::tempdir().expect("tempdir");
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let mut target_vec = VectorStore::init(target_dir.path())
+        .await
+        .expect("target vector init");
+    let mut source_vec = VectorStore::init(source_dir.path())
+        .await
+        .expect("source vector init");
+
+    // Two parallel unit vectors → cosine 1.0.
+    let parallel_a: Vec<f32> = (0..384)
+        .map(|i| if i == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let parallel_b = parallel_a.clone();
+
+    // Use real ClaimId values so parse round-trips and the
+    // diff.new_claims membership check finds the branch row.
+    let target_claim_id = thinkingroot_core::ClaimId::new();
+    let branch_claim_id = thinkingroot_core::ClaimId::new();
+    let target_id = target_claim_id.to_string();
+    let branch_id = branch_claim_id.to_string();
+    target_vec
+        .upsert_raw_batch(vec![(
+            target_id.clone(),
+            parallel_a,
+            format!("claim|{target_id}|Fact|0.8|file:///auth.md"),
+        )])
+        .expect("target seed");
+    source_vec
+        .upsert_raw_batch(vec![(
+            branch_id.clone(),
+            parallel_b,
+            format!("claim|{branch_id}|Fact|0.8|file:///auth.md"),
+        )])
+        .expect("source seed");
+
+    // ── Build the raw claim rows + entity maps the way the diff path
+    //     would produce them.  Both rows share the "Auth" entity so
+    //     the shared-entity gate fires.
+    let target_claims = vec![(
+        target_id.clone(),
+        target_stmt.to_string(),
+        "Fact".to_string(),
+        0.8_f64,
+        "file:///auth.md".to_string(),
+        0.0_f64,
+    )];
+    let branch_claims = vec![(
+        branch_id.clone(),
+        branch_stmt.to_string(),
+        "Fact".to_string(),
+        0.85_f64,
+        "file:///auth.md".to_string(),
+        0.0_f64,
+    )];
+    let mut branch_entities: HashMap<String, Vec<String>> = HashMap::new();
+    branch_entities.insert(branch_id.clone(), vec!["Auth".to_string()]);
+    let mut target_entities: HashMap<String, Vec<String>> = HashMap::new();
+    target_entities.insert(target_id.clone(), vec!["Auth".to_string()]);
+
+    // ── Build a `KnowledgeDiff` whose `new_claims` already contains the
+    //     branch row — that's the gate the third pass uses to skip
+    //     pre-deduped rows.  The earlier passes left needs_review and
+    //     auto_resolved empty for this pair (verified by the assertions
+    //     at the top of the test).
+    let now = chrono::Utc::now();
+    let dummy_health = HealthScore {
+        overall: 1.0,
+        freshness: 1.0,
+        consistency: 1.0,
+        coverage: 1.0,
+        provenance: 1.0,
+    };
+    let mut diff = KnowledgeDiff {
+        from_branch: "feature".to_string(),
+        to_branch: "main".to_string(),
+        computed_at: now,
+        new_claims: vec![thinkingroot_core::DiffClaim {
+            claim: thinkingroot_core::Claim {
+                id: branch_claim_id.clone(),
+                statement: branch_stmt.to_string(),
+                claim_type: thinkingroot_core::ClaimType::Fact,
+                source: thinkingroot_core::SourceId::new(),
+                source_span: None,
+                confidence: thinkingroot_core::Confidence::new(0.85),
+                valid_from: now,
+                valid_until: None,
+                sensitivity: thinkingroot_core::Sensitivity::Public,
+                workspace: thinkingroot_core::WorkspaceId::new(),
+                extracted_by: thinkingroot_core::PipelineVersion::current(),
+                superseded_by: None,
+                created_at: now,
+                grounding_score: None,
+                grounding_method: None,
+                extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
+                event_date: None,
+                admission_tier: thinkingroot_core::types::AdmissionTier::default(),
+                derivation: None,
+                predicate: None,
+                last_rooted_at: None,
+                row_blake3: None,
+                symbol: None,
+            },
+            entity_context: vec!["Auth".to_string()],
+            diff_status: thinkingroot_core::DiffStatus::Added,
+        }],
+        new_entities: Vec::new(),
+        new_relations: Vec::new(),
+        auto_resolved: Vec::new(),
+        needs_review: Vec::new(),
+        health_before: dummy_health.clone(),
+        health_after: dummy_health,
+        merge_allowed: true,
+        blocking_reasons: Vec::new(),
+    };
+
+    let pre_review_count = diff.needs_review.len();
+    let pre_auto_count = diff.auto_resolved.len();
+
+    // ── Run the third pass.  auto_resolve_threshold is set higher than
+    //     the |0.85 - 0.80| = 0.05 delta so the pair lands in
+    //     needs_review (the auto_resolved branch is exercised by the
+    //     follow-up test).
+    let added = apply_vector_contradiction_pass(
+        &mut diff,
+        &target_vec,
+        &source_vec,
+        &target_claims,
+        &branch_claims,
+        &target_entities,
+        &branch_entities,
+        /* auto_resolve_threshold */ 0.30,
+        VECTOR_CONTRADICTION_THRESHOLD,
+    )
+    .expect("vector pass");
+
+    assert_eq!(added, 1, "exactly one new conflict expected");
+    assert_eq!(
+        diff.needs_review.len(),
+        pre_review_count + 1,
+        "the conflict must land in needs_review when delta < auto_resolve_threshold"
+    );
+    assert_eq!(
+        diff.auto_resolved.len(),
+        pre_auto_count,
+        "auto_resolved must not change for this pair"
+    );
+
+    let pair = diff.needs_review.last().expect("conflict pushed");
+    assert_eq!(pair.main_claim_id, target_id);
+    assert_eq!(pair.branch_claim_id, branch_id);
+    assert!(
+        pair.explanation.contains("cosine"),
+        "explanation must mention cosine similarity (got: {})",
+        pair.explanation
+    );
+}
+
+#[tokio::test]
+async fn vector_contradiction_pass_skips_when_no_shared_entity() {
+    use std::collections::HashMap;
+    use thinkingroot_branch::diff::{
+        VECTOR_CONTRADICTION_THRESHOLD, apply_vector_contradiction_pass,
+    };
+    use thinkingroot_core::{KnowledgeDiff, types::HealthScore};
+    use thinkingroot_graph::vector::VectorStore;
+
+    // Same parallel-vector setup as above, but with disjoint entity
+    // contexts.  The shared-entity gate must skip this pair, otherwise
+    // the global vector neighbourhood would generate noise from
+    // unrelated claims that happen to land near each other.
+    let target_dir = tempfile::tempdir().expect("tempdir");
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let mut target_vec = VectorStore::init(target_dir.path()).await.unwrap();
+    let mut source_vec = VectorStore::init(source_dir.path()).await.unwrap();
+
+    let parallel: Vec<f32> = (0..384).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+    let target_claim_id = thinkingroot_core::ClaimId::new();
+    let branch_claim_id = thinkingroot_core::ClaimId::new();
+    let target_id = target_claim_id.to_string();
+    let branch_id = branch_claim_id.to_string();
+    target_vec
+        .upsert_raw_batch(vec![(target_id.clone(), parallel.clone(), "m1".into())])
+        .unwrap();
+    source_vec
+        .upsert_raw_batch(vec![(branch_id.clone(), parallel, "m2".into())])
+        .unwrap();
+
+    let target_claims = vec![(
+        target_id.clone(),
+        "X is hot".into(),
+        "Fact".into(),
+        0.8,
+        "f1".into(),
+        0.0,
+    )];
+    let branch_claims = vec![(
+        branch_id.clone(),
+        "Y is cold".into(),
+        "Fact".into(),
+        0.8,
+        "f2".into(),
+        0.0,
+    )];
+    // Disjoint entity contexts.
+    let mut target_entities: HashMap<String, Vec<String>> = HashMap::new();
+    target_entities.insert(target_id, vec!["X".to_string()]);
+    let mut branch_entities: HashMap<String, Vec<String>> = HashMap::new();
+    branch_entities.insert(branch_id.clone(), vec!["Y".to_string()]);
+
+    let now = chrono::Utc::now();
+    let dummy_health = HealthScore {
+        overall: 1.0,
+        freshness: 1.0,
+        consistency: 1.0,
+        coverage: 1.0,
+        provenance: 1.0,
+    };
+    let mut diff = KnowledgeDiff {
+        from_branch: "feature".to_string(),
+        to_branch: "main".to_string(),
+        computed_at: now,
+        new_claims: vec![thinkingroot_core::DiffClaim {
+            claim: thinkingroot_core::Claim {
+                id: branch_claim_id.clone(),
+                statement: "Y is cold".into(),
+                claim_type: thinkingroot_core::ClaimType::Fact,
+                source: thinkingroot_core::SourceId::new(),
+                source_span: None,
+                confidence: thinkingroot_core::Confidence::new(0.8),
+                valid_from: now,
+                valid_until: None,
+                sensitivity: thinkingroot_core::Sensitivity::Public,
+                workspace: thinkingroot_core::WorkspaceId::new(),
+                extracted_by: thinkingroot_core::PipelineVersion::current(),
+                superseded_by: None,
+                created_at: now,
+                grounding_score: None,
+                grounding_method: None,
+                extraction_tier: thinkingroot_core::types::ExtractionTier::default(),
+                event_date: None,
+                admission_tier: thinkingroot_core::types::AdmissionTier::default(),
+                derivation: None,
+                predicate: None,
+                last_rooted_at: None,
+                row_blake3: None,
+                symbol: None,
+            },
+            entity_context: vec!["Y".to_string()],
+            diff_status: thinkingroot_core::DiffStatus::Added,
+        }],
+        new_entities: Vec::new(),
+        new_relations: Vec::new(),
+        auto_resolved: Vec::new(),
+        needs_review: Vec::new(),
+        health_before: dummy_health.clone(),
+        health_after: dummy_health,
+        merge_allowed: true,
+        blocking_reasons: Vec::new(),
+    };
+
+    let added = apply_vector_contradiction_pass(
+        &mut diff,
+        &target_vec,
+        &source_vec,
+        &target_claims,
+        &branch_claims,
+        &target_entities,
+        &branch_entities,
+        0.30,
+        VECTOR_CONTRADICTION_THRESHOLD,
+    )
+    .expect("vector pass");
+
+    assert_eq!(added, 0, "shared-entity gate must skip disjoint contexts");
+    assert!(diff.needs_review.is_empty());
+    assert!(diff.auto_resolved.is_empty());
+}

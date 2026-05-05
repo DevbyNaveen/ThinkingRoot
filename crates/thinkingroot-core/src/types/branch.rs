@@ -262,7 +262,7 @@ impl MergePolicy {
 }
 
 /// Per-branch collaborative permissions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BranchPermissions {
     /// Identities allowed to read the branch when read-gating is enabled.
     #[serde(default)]

@@ -5,6 +5,7 @@ pub mod lock;
 pub mod merge;
 pub mod recovery;
 pub mod snapshot;
+pub mod templates;
 
 use std::path::Path;
 use thinkingroot_core::{
@@ -356,15 +357,22 @@ pub async fn merge_into(
             merge_cfg.block_on_contradictions,
         )?
     } else {
-        diff::compute_diff_into(
+        // T1.1 — async wrapper opens both branches' vector stores and
+        // runs the embedding-cosine contradiction pass on top of the
+        // two-way diff.  Falls back to a vector-free diff inside the
+        // wrapper when either side is missing `vectors.bin`.
+        diff::compute_diff_into_with_vector_dirs(
             &target_graph,
             &source_graph,
+            &target_data_dir,
+            &source_data_dir,
             source_branch,
             Some(target_branch),
             merge_cfg.auto_resolve_threshold,
             merge_cfg.max_health_drop,
             merge_cfg.block_on_contradictions,
-        )?
+        )
+        .await?
     };
     if force {
         diff.merge_allowed = true;
