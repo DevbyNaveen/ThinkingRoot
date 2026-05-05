@@ -254,6 +254,12 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/reflect/across-branches",
                 post(reflect_across_branches_handler),
             )
+            // T2.4 — bitemporal "as-of" claim list.  Query parameter
+            // `as_of` carries an ISO-8601 timestamp; the optional
+            // `branch` query parameter scopes to a non-main branch.
+            // Returns the claims that existed at or before that
+            // moment (i.e. their `created_at <= as_of`).
+            .route("/ws/{ws}/claims/as-of", get(claims_as_of_handler))
             // RARP / Active Engram Protocol — engram lifecycle endpoints
             // mirror the 4 MCP tools (`materialize_engram`, `probe_engram`,
             // `list_engrams`, `expire_engram`) so HTTP-only consumers
@@ -999,6 +1005,49 @@ async fn hybrid_search_handler(
     let engine = state.engine.read().await;
     match engine.hybrid_retrieve(&ws, req, Some(cancel)).await {
         Ok(resp) => ok_response(resp).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// T2.4 — `GET /api/v1/ws/{ws}/claims/as-of?as_of=2026-04-15T00:00:00Z[&branch=feat/x]`.
+/// Returns claims whose `created_at` ≤ the supplied timestamp.
+#[derive(Deserialize)]
+struct AsOfQuery {
+    as_of: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+async fn claims_as_of_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(query): Query<AsOfQuery>,
+) -> Response {
+    let parsed: chrono::DateTime<chrono::Utc> = match query.as_of.parse() {
+        Ok(ts) => ts,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "INVALID_AS_OF",
+                &format!(
+                    "as_of parameter must be ISO-8601 (e.g. 2026-04-15T00:00:00Z): {e}"
+                ),
+            );
+        }
+    };
+    let engine = state.engine.read().await;
+    match engine
+        .list_claims_as_of_branched(&ws, query.branch.as_deref(), parsed)
+        .await
+    {
+        Ok(claims) => ok_response(serde_json::json!({
+            "workspace": ws,
+            "branch": query.branch.unwrap_or_else(|| "main".to_string()),
+            "as_of": query.as_of,
+            "claim_count": claims.len(),
+            "claims": claims,
+        }))
+        .into_response(),
         Err(e) => match_engine_error(e),
     }
 }

@@ -3317,6 +3317,77 @@ impl GraphStore {
             .collect())
     }
 
+    /// T2.4 — bitemporal "as-of" claim query.  Returns every claim
+    /// whose `created_at` is at or before `tx_time` (Unix seconds
+    /// since epoch).  `created_at` here serves as the transaction
+    /// time — the moment the claim row entered the graph — because
+    /// the v3 substrate has stamped this column on every insert
+    /// since CCC shipped.
+    ///
+    /// Note on the bitemporal model: `claim_temporal.valid_from /
+    /// valid_until` already covers VALID time (when the fact is
+    /// true in the world).  This method covers TRANSACTION time
+    /// (when the fact was recorded).  Together they answer the two
+    /// canonical bitemporal questions:
+    ///
+    /// 1. "What did the brain know on 2026-04-15?" → call this with
+    ///    `tx_time = 2026-04-15T00:00:00Z`.
+    /// 2. "What was true between 2025-Q4 and now?" → filter the
+    ///    result by `valid_from / valid_until` from
+    ///    `claim_temporal`.
+    ///
+    /// We intentionally do NOT introduce a separate `tx_time`
+    /// column at this stage: the existing `created_at` is
+    /// equivalent for every claim inserted by the engine, and a
+    /// schema bump for the distinction would force every workspace
+    /// through a v3 → v4 migration.  When use cases emerge that
+    /// require recording `tx_time != created_at` (e.g. retroactive
+    /// inserts representing a rollback), a follow-up can add the
+    /// column behind a `compile_schema_version = "4"` gate.
+    pub fn get_claims_with_sources_as_of(
+        &self,
+        tx_time: f64,
+    ) -> Result<Vec<(String, String, String, f64, String, f64)>> {
+        let mut params = BTreeMap::new();
+        params.insert("ts".into(), DataValue::Num(Num::Float(tx_time)));
+
+        let result = self
+            .db
+            .run_script(
+                r#"?[id, statement, claim_type, confidence, uri, event_date] :=
+                    *claims{id, statement, claim_type, confidence, created_at, event_date},
+                    created_at <= $ts,
+                    *claim_source_edges{claim_id: id, source_id: sid},
+                    *sources{id: sid, uri}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("as-of query failed: {e}")))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    match &row[3] {
+                        DataValue::Num(Num::Float(f)) => *f,
+                        DataValue::Num(Num::Int(i)) => *i as f64,
+                        _ => 0.8,
+                    },
+                    dv_to_string(&row[4]),
+                    match &row[5] {
+                        DataValue::Num(Num::Float(f)) => *f,
+                        DataValue::Num(Num::Int(i)) => *i as f64,
+                        _ => 0.0,
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Get relations for a specific entity (by name).
     pub fn get_relations_for_entity(
         &self,

@@ -3716,6 +3716,59 @@ Rules: \
             .await
     }
 
+    /// T2.4 — bitemporal "as-of" claim list for a branch.
+    ///
+    /// Returns every claim whose `created_at` is at or before
+    /// `tx_time` (a `chrono::DateTime<Utc>` from the caller).  Pairs
+    /// with the engine's `list_claims_branched` for the live view —
+    /// `list_claims_as_of` is the time-travel query.
+    ///
+    /// `branch = None | Some("main")` runs against the workspace's
+    /// primary graph; `branch = Some(name)` runs against the
+    /// branch's COW graph through the `BranchEngineCache`.
+    pub async fn list_claims_as_of_branched(
+        &self,
+        ws: &str,
+        branch: Option<&str>,
+        tx_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::engine::ClaimInfo>> {
+        let handle = self.get_workspace(ws)?;
+        let ts = tx_time.timestamp() as f64;
+        let rows = match branch {
+            None | Some("main") => {
+                let storage = handle.storage.lock().await;
+                storage.graph.get_claims_with_sources_as_of(ts)?
+            }
+            Some(branch_name) => {
+                let bh = self
+                    .branch_engines
+                    .get_or_open(&handle.root_path, branch_name)
+                    .await?;
+                bh.graph.get_claims_with_sources_as_of(ts)?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, statement, claim_type, confidence, source_uri, event_date)| {
+                    crate::engine::ClaimInfo {
+                        id,
+                        statement,
+                        claim_type,
+                        confidence,
+                        source_uri,
+                        event_date: if event_date > 0.0 {
+                            Some(event_date)
+                        } else {
+                            None
+                        },
+                    }
+                },
+            )
+            .collect())
+    }
+
     /// T3.2 — Cross-branch reflect.  Runs `reflect_branched` on each
     /// named branch in sequence (sequential, not parallel — every
     /// branch's `BranchEngineCache` lookup needs a write lock to
