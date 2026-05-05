@@ -81,6 +81,10 @@ pub struct PerSourceRows {
     pub chunks_residual: Vec<ResidualChunk>,
     pub quantities: Vec<QuantityRow>,
     pub source_annotations: Vec<SourceAnnotation>,
+    /// `source_references` is left empty by Phase 6.7's structural emit
+    /// path — Phase 7e (post-resolution) is the canonical writer.  The
+    /// cascade portion of `transactional_rebuild_source` still clears
+    /// any prior rows for this source so Phase 7e can emit cleanly.
     pub source_references: Vec<SourceReference>,
     pub code_markers: Vec<CodeMarker>,
     pub test_annotations: Vec<TestAnnotation>,
@@ -688,10 +692,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn make_store() -> GraphStore {
+    /// Returns `(TempDir, GraphStore)` — the caller must bind the `TempDir`
+    /// guard so it outlives the `GraphStore` and the temp directory is
+    /// cleaned up on drop.  Use `let (_dir, store) = make_store();`.
+    fn make_store() -> (tempfile::TempDir, GraphStore) {
         let dir = tempdir().unwrap();
-        let path = dir.into_path();
-        GraphStore::init(&path).unwrap()
+        let store = GraphStore::init(dir.path()).unwrap();
+        (dir, store)
     }
 
     #[test]
@@ -718,7 +725,7 @@ mod tests {
 
     #[test]
     fn empty_rebuild_just_cascades() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         // Cascade against a brand-new source_id with nothing to put — the
         // call must still succeed (no rows to clean, but no error).
         let rows = PerSourceRows::default();
@@ -729,7 +736,7 @@ mod tests {
 
     #[test]
     fn rebuild_inserts_new_rows() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let mut rows = PerSourceRows::default();
         rows.function_calls.push(FunctionCall {
             id: "fc-rb-1".into(),
@@ -768,7 +775,7 @@ mod tests {
 
     #[test]
     fn rebuild_clears_then_inserts() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         // First compile: 3 function_calls.
         let mut rows = PerSourceRows::default();
         for k in 0..3 {
@@ -815,7 +822,7 @@ mod tests {
 
     #[test]
     fn rebuild_only_touches_target_source() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         // Insert rows for source A.
         let mut rows_a = PerSourceRows::default();
         rows_a.function_calls.push(FunctionCall {

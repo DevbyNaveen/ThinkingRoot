@@ -518,78 +518,71 @@ fn flush_buckets(
     buckets: &mut PerTableBuckets,
     stats: &mut Phase67Stats,
 ) -> Result<()> {
-    // Move every bucket into PerSourceRows; the per-table counts are
-    // recorded BEFORE the move so the stats reflect what we attempted to
-    // emit even if the rebuild later fails.
-    let mut rows = PerSourceRows::default();
+    // Capture per-table counts BEFORE the std::mem::take moves so the
+    // counts survive the move into PerSourceRows.  Stats are recorded
+    // AFTER transactional_rebuild_source returns Ok so we never claim
+    // rows that were rolled back on error (the ? operator short-circuits
+    // before the record() calls when the rebuild fails).
+    let function_calls_n = buckets.function_calls.len();
+    let doc_tags_n = buckets.doc_tags.len();
+    let code_links_n = buckets.code_links.len();
+    let code_signatures_n = buckets.code_signatures.len();
+    let config_tree_n = buckets.config_tree.len();
+    let data_rows_n = buckets.data_rows.len();
+    let headings_n = buckets.headings.len();
+    let chunks_residual_n = buckets.chunks_residual.len();
+    let quantities_n = buckets.quantities.len();
+    let source_annotations_n = buckets.source_annotations.len();
+    let code_markers_n = buckets.code_markers.len();
+    let test_annotations_n = buckets.test_annotations.len();
+    let code_metrics_n = buckets.code_metrics.len();
+    let git_blame_n = buckets.git_blame.len();
+    let git_commits_n = buckets.git_commits.len();
 
-    if !buckets.function_calls.is_empty() {
-        stats.record("function_calls", buckets.function_calls.len());
-        rows.function_calls = std::mem::take(&mut buckets.function_calls);
-    }
-    if !buckets.doc_tags.is_empty() {
-        stats.record("doc_tags", buckets.doc_tags.len());
-        rows.doc_tags = std::mem::take(&mut buckets.doc_tags);
-    }
-    if !buckets.code_links.is_empty() {
-        stats.record("code_links", buckets.code_links.len());
-        rows.code_links = std::mem::take(&mut buckets.code_links);
-    }
-    if !buckets.code_signatures.is_empty() {
-        stats.record("code_signatures", buckets.code_signatures.len());
-        rows.code_signatures = std::mem::take(&mut buckets.code_signatures);
-    }
-    if !buckets.config_tree.is_empty() {
-        stats.record("config_tree", buckets.config_tree.len());
-        rows.config_tree = std::mem::take(&mut buckets.config_tree);
-    }
-    if !buckets.data_rows.is_empty() {
-        stats.record("data_rows", buckets.data_rows.len());
-        rows.data_rows = std::mem::take(&mut buckets.data_rows);
-    }
-    if !buckets.headings.is_empty() {
-        stats.record("headings", buckets.headings.len());
-        rows.headings = std::mem::take(&mut buckets.headings);
-    }
-    if !buckets.chunks_residual.is_empty() {
-        stats.record("chunks_residual", buckets.chunks_residual.len());
-        rows.chunks_residual = std::mem::take(&mut buckets.chunks_residual);
-    }
-    if !buckets.quantities.is_empty() {
-        stats.record("quantities", buckets.quantities.len());
-        rows.quantities = std::mem::take(&mut buckets.quantities);
-    }
-    if !buckets.source_annotations.is_empty() {
-        stats.record("source_annotations", buckets.source_annotations.len());
-        rows.source_annotations = std::mem::take(&mut buckets.source_annotations);
-    }
-    if !buckets.code_markers.is_empty() {
-        stats.record("code_markers", buckets.code_markers.len());
-        rows.code_markers = std::mem::take(&mut buckets.code_markers);
-    }
-    if !buckets.test_annotations.is_empty() {
-        stats.record("test_annotations", buckets.test_annotations.len());
-        rows.test_annotations = std::mem::take(&mut buckets.test_annotations);
-    }
-    if !buckets.code_metrics.is_empty() {
-        stats.record("code_metrics", buckets.code_metrics.len());
-        rows.code_metrics = std::mem::take(&mut buckets.code_metrics);
-    }
-    if !buckets.git_blame.is_empty() {
-        stats.record("git_blame", buckets.git_blame.len());
-        rows.git_blame = std::mem::take(&mut buckets.git_blame);
-    }
-    if !buckets.git_commits.is_empty() {
-        stats.record("git_commits", buckets.git_commits.len());
-        rows.git_commits = std::mem::take(&mut buckets.git_commits);
-    }
-    // `source_references` is not emitted by Phase 6.7 — Phase 7e
-    // (`thinkingroot_link::structural_resolve`) builds it.  The rebuild
-    // still cascades source_references for this source so any stale
-    // reference rows from a prior compile are cleared; the linker
-    // re-inserts after we return.
+    let rows = PerSourceRows {
+        function_calls: std::mem::take(&mut buckets.function_calls),
+        doc_tags: std::mem::take(&mut buckets.doc_tags),
+        code_links: std::mem::take(&mut buckets.code_links),
+        code_signatures: std::mem::take(&mut buckets.code_signatures),
+        config_tree: std::mem::take(&mut buckets.config_tree),
+        data_rows: std::mem::take(&mut buckets.data_rows),
+        headings: std::mem::take(&mut buckets.headings),
+        chunks_residual: std::mem::take(&mut buckets.chunks_residual),
+        quantities: std::mem::take(&mut buckets.quantities),
+        source_annotations: std::mem::take(&mut buckets.source_annotations),
+        code_markers: std::mem::take(&mut buckets.code_markers),
+        test_annotations: std::mem::take(&mut buckets.test_annotations),
+        code_metrics: std::mem::take(&mut buckets.code_metrics),
+        git_blame: std::mem::take(&mut buckets.git_blame),
+        git_commits: std::mem::take(&mut buckets.git_commits),
+        // `source_references` is not emitted by Phase 6.7 — Phase 7e
+        // (`thinkingroot_link::structural_resolve`) builds it.  The rebuild
+        // still cascades source_references for this source so any stale
+        // reference rows from a prior compile are cleared; the linker
+        // re-inserts after we return.
+        source_references: Vec::new(),
+    };
 
     graph.transactional_rebuild_source(source_id, &rows)?;
+
+    // Record stats only after the commit succeeded — counts reflect what
+    // is durably written, not what was attempted.
+    stats.record("function_calls", function_calls_n);
+    stats.record("doc_tags", doc_tags_n);
+    stats.record("code_links", code_links_n);
+    stats.record("code_signatures", code_signatures_n);
+    stats.record("config_tree", config_tree_n);
+    stats.record("data_rows", data_rows_n);
+    stats.record("headings", headings_n);
+    stats.record("chunks_residual", chunks_residual_n);
+    stats.record("quantities", quantities_n);
+    stats.record("source_annotations", source_annotations_n);
+    stats.record("code_markers", code_markers_n);
+    stats.record("test_annotations", test_annotations_n);
+    stats.record("code_metrics", code_metrics_n);
+    stats.record("git_blame", git_blame_n);
+    stats.record("git_commits", git_commits_n);
+
     Ok(())
 }
 
