@@ -331,6 +331,38 @@ pub async fn merge_into(
     force: bool,
     propagate_deletions: bool,
 ) -> Result<thinkingroot_core::KnowledgeDiff> {
+    merge_into_cancellable(
+        root_path,
+        source_branch,
+        target_branch,
+        merged_by,
+        force,
+        propagate_deletions,
+        None,
+    )
+    .await
+}
+
+/// T1.5 — cancellable variant of [`merge_into`].
+///
+/// Computes the diff first (non-mutating), then runs the merge under
+/// the supplied [`CancellationToken`].  See
+/// [`merge::execute_merge_into_cancellable`] for the exact phase
+/// boundaries at which the token is honoured — once the registry
+/// write begins the token is intentionally ignored so on-disk state
+/// stays consistent.
+///
+/// Pass `None` to opt out (matches [`merge_into`] semantics).
+#[allow(clippy::too_many_arguments)]
+pub async fn merge_into_cancellable(
+    root_path: &Path,
+    source_branch: &str,
+    target_branch: &str,
+    merged_by: MergedBy,
+    force: bool,
+    propagate_deletions: bool,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> Result<thinkingroot_core::KnowledgeDiff> {
     let config = Config::load_merged(root_path)?;
     let merge_cfg = &config.merge;
     let source_data_dir = snapshot::resolve_data_dir(root_path, Some(source_branch));
@@ -378,15 +410,76 @@ pub async fn merge_into(
         diff.merge_allowed = true;
         diff.blocking_reasons.clear();
     }
-    merge::execute_merge_into(
+    merge::execute_merge_into_cancellable(
         root_path,
         source_branch,
         Some(target_branch),
         &diff,
         merged_by,
         propagate_deletions,
+        false,
+        cancel,
     )
     .await?;
+    Ok(diff)
+}
+
+/// T1.5 — compute the merge diff WITHOUT executing the merge.
+///
+/// Returns the same `KnowledgeDiff` that [`merge_into`] would have
+/// fed to `execute_merge_into`, but never touches the target graph,
+/// the registry, or the intent file.  Used by the dry-run merge REST
+/// path so callers can preview the diff (claim/entity counts,
+/// auto-resolved set, needs-review conflicts, health gates) before
+/// committing.
+///
+/// Honour-`force`: same semantics as [`merge_into`] — when `force`
+/// is true the gate flags are flipped on the returned diff so the
+/// caller sees what the merge would have allowed if forced.
+pub async fn dry_run_merge_into(
+    root_path: &Path,
+    source_branch: &str,
+    target_branch: &str,
+    force: bool,
+) -> Result<thinkingroot_core::KnowledgeDiff> {
+    let config = Config::load_merged(root_path)?;
+    let merge_cfg = &config.merge;
+    let source_data_dir = snapshot::resolve_data_dir(root_path, Some(source_branch));
+    let target_data_dir = snapshot::resolve_data_dir(root_path, Some(target_branch));
+    let target_graph = GraphStore::init(&target_data_dir.join("graph"))?;
+    let source_graph = GraphStore::init(&source_data_dir.join("graph"))?;
+
+    let lca_dir = snapshot::parent_at_fork_dir(&source_data_dir);
+    let mut diff = if lca_dir.join("graph.db").exists() {
+        let base_graph = GraphStore::init(&lca_dir)?;
+        diff::compute_three_way_diff(
+            &base_graph,
+            &target_graph,
+            &source_graph,
+            source_branch,
+            Some(target_branch),
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )?
+    } else {
+        diff::compute_diff_into_with_vector_dirs(
+            &target_graph,
+            &source_graph,
+            &target_data_dir,
+            &source_data_dir,
+            source_branch,
+            Some(target_branch),
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )
+        .await?
+    };
+    if force {
+        diff.merge_allowed = true;
+        diff.blocking_reasons.clear();
+    }
     Ok(diff)
 }
 

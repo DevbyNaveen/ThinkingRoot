@@ -343,6 +343,61 @@ pub async fn execute_merge_into_with_options(
     propagate_deletions: bool,
     force: bool,
 ) -> Result<()> {
+    execute_merge_into_cancellable(
+        root_path,
+        source_branch_name,
+        target_branch,
+        diff,
+        merged_by,
+        propagate_deletions,
+        force,
+        None,
+    )
+    .await
+}
+
+/// T1.5 — cancellable merge.
+///
+/// Same contract as [`execute_merge_into_with_options`], plus an
+/// optional `cancel: CancellationToken` that is checked at every
+/// phase boundary that has not yet committed durable target-graph
+/// state:
+///
+/// 1. before the protected-branches gate,
+/// 2. before the merge-policy gate,
+/// 3. before writing the in-flight intent,
+/// 4. before `apply_branch_diff` (the first mutation step), and
+/// 5. between `apply_branch_diff` and `mark_merged_into` (the only
+///    point where the intent file is still in place — recovery will
+///    roll back from the pre-merge snapshot if we exit here).
+///
+/// Once `mark_merged_into` is reached the merge is durable; we
+/// neither check nor honour the token after that point so a late
+/// cancel cannot leave the registry inconsistent with the target
+/// graph.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_merge_into_cancellable(
+    root_path: &Path,
+    source_branch_name: &str,
+    target_branch: Option<&str>,
+    diff: &KnowledgeDiff,
+    merged_by: MergedBy,
+    propagate_deletions: bool,
+    force: bool,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    macro_rules! check_cancel {
+        () => {
+            if let Some(t) = &cancel {
+                if t.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
+        };
+    }
+
+    check_cancel!();
+
     if !diff.merge_allowed {
         return Err(Error::MergeBlocked(diff.blocking_reasons.join("; ")));
     }
@@ -362,6 +417,8 @@ pub async fn execute_merge_into_with_options(
             }
         }
     }
+
+    check_cancel!();
 
     // T0.6 — read merge_policy off the source branch and gate.
     let refs_dir = root_path.join(".thinkingroot-refs");
@@ -408,6 +465,8 @@ pub async fn execute_merge_into_with_options(
     }
     drop(registry_for_policy);
 
+    check_cancel!();
+
     // T2.7 — record the in-flight intent BEFORE any graph mutation so
     // a crash mid-`apply_branch_diff` (or a hard process kill, or a
     // panic during vector reconciliation) leaves a recoverable record.
@@ -437,6 +496,14 @@ pub async fn execute_merge_into_with_options(
         source_branch_name,
     )
     .await?;
+
+    // Late-window cancel check — `apply_branch_diff` has finished but
+    // the registry hasn't been updated yet.  Cancelling here leaves the
+    // intent file in place; recovery will roll the target back from the
+    // pre-merge snapshot on next workspace open.  Past this point we
+    // do NOT honour the token: the registry write must complete to
+    // keep on-disk state consistent with the post-apply target graph.
+    check_cancel!();
 
     // Mark branch as merged in registry, then clear the intent.  Order
     // matters: if we clear the intent first and crash before

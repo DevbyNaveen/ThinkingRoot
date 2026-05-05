@@ -3486,8 +3486,36 @@ Rules: \
         propagate_deletions: bool,
         merged_by: thinkingroot_core::MergedBy,
     ) -> Result<thinkingroot_core::KnowledgeDiff> {
+        self.merge_into_branch_cancellable(
+            root,
+            source_branch_name,
+            target_branch,
+            force,
+            propagate_deletions,
+            merged_by,
+            None,
+        )
+        .await
+    }
+
+    /// T1.5 — cancellable variant of [`Self::merge_into_branch`].
+    /// Pass `Some(token)` to plumb a `CancellationToken` through to
+    /// `execute_merge_into_cancellable`; phase boundaries inside the
+    /// merge return `Error::Cancelled` if the token trips before the
+    /// registry write completes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_into_branch_cancellable(
+        &self,
+        root: &std::path::Path,
+        source_branch_name: &str,
+        target_branch: Option<&str>,
+        force: bool,
+        propagate_deletions: bool,
+        merged_by: thinkingroot_core::MergedBy,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<thinkingroot_core::KnowledgeDiff> {
         use thinkingroot_branch::diff::compute_diff_into;
-        use thinkingroot_branch::merge::execute_merge_into_with_options;
+        use thinkingroot_branch::merge::execute_merge_into_cancellable;
         use thinkingroot_branch::snapshot::resolve_data_dir;
         use thinkingroot_graph::graph::GraphStore;
 
@@ -3550,7 +3578,7 @@ Rules: \
         drop(target_graph);
         drop(source_graph);
 
-        execute_merge_into_with_options(
+        execute_merge_into_cancellable(
             root,
             source_branch_name,
             target_branch,
@@ -3558,6 +3586,7 @@ Rules: \
             merged_by,
             propagate_deletions,
             force,
+            cancel,
         )
         .await?;
 

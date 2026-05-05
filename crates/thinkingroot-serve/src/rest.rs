@@ -53,6 +53,14 @@ pub struct AppState {
     /// source of truth; this hub is a fan-out for clients that prefer
     /// live updates over polling `/branches/{branch}/events`.
     pub branch_event_hub: Arc<RwLock<HashMap<String, broadcast::Sender<BranchEvent>>>>,
+    /// T1.5 — in-flight merge `CancellationToken`s keyed by merge id
+    /// (a ULID generated at handler entry).  `POST /merges/{id}/cancel`
+    /// looks up and trips the matching token; the merge phase-boundary
+    /// check inside `execute_merge_into_cancellable` returns
+    /// `Error::Cancelled` at the next safe point.  Tokens are removed
+    /// from the map on every exit path (success, failure, cancellation)
+    /// by the merge handler so a long-cancelled merge never leaks.
+    pub active_merges: Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 impl AppState {
@@ -79,6 +87,7 @@ impl AppState {
                 crate::intelligence::engram::EngramConfig::default(),
             ),
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
+            active_merges: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -277,6 +286,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/branches/{source}/merge-into/{target}",
                 post(merge_into_branch_handler),
             )
+            // T1.5 — cancel an in-flight merge by id.  The id is the
+            // ULID returned in the merge response; cancellation flips
+            // the token so the merge exits with `Error::Cancelled` at
+            // the next phase boundary.
+            .route("/merges/{id}/cancel", post(cancel_merge_handler))
             .route("/branches/{branch}/rebase", post(rebase_branch_handler))
             .route("/branches/{branch}/rollback", post(rollback_merge_handler))
             .route("/branches/{branch}/checkout", post(checkout_branch_handler))
@@ -2449,10 +2463,20 @@ struct MergeBranchRequest {
     propagate_deletions: Option<bool>,
 }
 
+#[derive(Deserialize, Default)]
+struct MergeQuery {
+    /// T1.5 — when true, compute the diff that would land in target
+    /// without mutating anything.  Returns the same shape as the
+    /// committing path plus the diff body so callers can preview.
+    #[serde(default)]
+    dry_run: bool,
+}
+
 async fn merge_branch_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(branch): Path<String>,
+    Query(query): Query<MergeQuery>,
     body: Option<Json<MergeBranchRequest>>,
 ) -> impl IntoResponse {
     let root = match &state.workspace_root {
@@ -2473,9 +2497,52 @@ async fn merge_branch_handler(
         .and_then(|b| b.propagate_deletions)
         .unwrap_or(false);
 
+    // T1.5 — dry-run path.  `dry_run_merge_into` runs the same
+    // diff-computation chain (two-way + vector pass, three-way when
+    // an LCA is present) the committing merge would, but never
+    // touches the target graph or the registry.  Default `target`
+    // matches the committing path's `None → "main"`.
+    if query.dry_run {
+        match thinkingroot_branch::dry_run_merge_into(&root, &branch, "main", force).await {
+            Ok(diff) => return ok_response(serde_json::json!({
+                "dry_run": true,
+                "diff": diff,
+                "merge_allowed": diff.merge_allowed,
+                "blocking_reasons": diff.blocking_reasons,
+                "new_claims": diff.new_claims.len(),
+                "new_entities": diff.new_entities.len(),
+                "auto_resolved": diff.auto_resolved.len(),
+                "needs_review": diff.needs_review.len(),
+            }))
+            .into_response(),
+            Err(e) => {
+                return err_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "DRY_RUN_FAILED",
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+
+    // T1.5 — register a CancellationToken so `POST /merges/{id}/cancel`
+    // can trip it.  The id is returned to the caller in the success
+    // response and surfaced in error responses too so a hung merge can
+    // be aborted by an out-of-band client.
+    let merge_id = format!(
+        "merge_{}",
+        chrono::Utc::now().timestamp_micros().to_string()
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    state
+        .active_merges
+        .write()
+        .await
+        .insert(merge_id.clone(), cancel.clone());
+
     let engine = state.engine.read().await;
-    match engine
-        .merge_into_branch(
+    let result = engine
+        .merge_into_branch_cancellable(
             &root,
             &branch,
             None,
@@ -2484,19 +2551,22 @@ async fn merge_branch_handler(
             MergedBy::Human {
                 user: request_user(&headers).unwrap_or_else(|| "api".to_string()),
             },
+            Some(cancel.clone()),
         )
-        .await
-    {
+        .await;
+    drop(engine);
+
+    // Always remove the token so the map doesn't grow unbounded — we
+    // do this before deciding response shape so a slow publish below
+    // can't leak the entry.
+    state.active_merges.write().await.remove(&merge_id);
+
+    match result {
         Ok(diff) => {
-            // T1.6 — merge_into_branch appends a `Merged` event to the
-            // source branch.  Drop the engine lock before publishing so
-            // a subscriber holding a write-lock never deadlocks on the
-            // broadcast send (broadcast::send is sync but the
-            // surrounding registry-load future awaits).
-            drop(engine);
             publish_latest_branch_event(&state, &branch).await;
             ok_response(serde_json::json!({
                 "merged": branch,
+                "merge_id": merge_id,
                 "new_claims": diff.new_claims.len(),
                 "new_entities": diff.new_entities.len(),
                 "auto_resolved": diff.auto_resolved.len(),
@@ -2506,6 +2576,11 @@ async fn merge_branch_handler(
         Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
             err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
         }
+        Err(e) if e.is_cancelled() => err_response(
+            StatusCode::GONE,
+            "MERGE_CANCELLED",
+            &format!("merge {merge_id} cancelled before completion"),
+        ),
         Err(e) => err_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "MERGE_BLOCKED",
@@ -2518,6 +2593,7 @@ async fn merge_into_branch_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((source, target)): Path<(String, String)>,
+    Query(query): Query<MergeQuery>,
     body: Option<Json<MergeBranchRequest>>,
 ) -> impl IntoResponse {
     let root = match &state.workspace_root {
@@ -2538,9 +2614,46 @@ async fn merge_into_branch_handler(
         .and_then(|b| b.propagate_deletions)
         .unwrap_or(false);
 
+    // T1.5 — dry-run path mirrors `merge_branch_handler`.
+    if query.dry_run {
+        match thinkingroot_branch::dry_run_merge_into(&root, &source, &target, force).await {
+            Ok(diff) => return ok_response(serde_json::json!({
+                "dry_run": true,
+                "source": source,
+                "target": target,
+                "diff": diff,
+                "merge_allowed": diff.merge_allowed,
+                "blocking_reasons": diff.blocking_reasons,
+                "new_claims": diff.new_claims.len(),
+                "new_entities": diff.new_entities.len(),
+                "auto_resolved": diff.auto_resolved.len(),
+                "needs_review": diff.needs_review.len(),
+            }))
+            .into_response(),
+            Err(e) => {
+                return err_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "DRY_RUN_FAILED",
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+
+    let merge_id = format!(
+        "merge_{}",
+        chrono::Utc::now().timestamp_micros().to_string()
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    state
+        .active_merges
+        .write()
+        .await
+        .insert(merge_id.clone(), cancel.clone());
+
     let engine = state.engine.read().await;
-    match engine
-        .merge_into_branch(
+    let result = engine
+        .merge_into_branch_cancellable(
             &root,
             &source,
             Some(&target),
@@ -2549,18 +2662,19 @@ async fn merge_into_branch_handler(
             MergedBy::Human {
                 user: request_user(&headers).unwrap_or_else(|| "api".to_string()),
             },
+            Some(cancel.clone()),
         )
-        .await
-    {
+        .await;
+    drop(engine);
+    state.active_merges.write().await.remove(&merge_id);
+
+    match result {
         Ok(diff) => {
-            // T1.6 — broadcast `Merged` event for the source branch
-            // (mark_merged_into adds it).  The target branch isn't
-            // mutated by `mark_merged_into`, so no second broadcast.
-            drop(engine);
             publish_latest_branch_event(&state, &source).await;
             ok_response(serde_json::json!({
                 "merged": source,
                 "target": target,
+                "merge_id": merge_id,
                 "new_claims": diff.new_claims.len(),
                 "new_entities": diff.new_entities.len(),
                 "auto_resolved": diff.auto_resolved.len(),
@@ -2570,11 +2684,34 @@ async fn merge_into_branch_handler(
         Err(thinkingroot_core::Error::EntityNotFound(msg)) => {
             err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &msg)
         }
+        Err(e) if e.is_cancelled() => err_response(
+            StatusCode::GONE,
+            "MERGE_CANCELLED",
+            &format!("merge {merge_id} cancelled before completion"),
+        ),
         Err(e) => err_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "MERGE_BLOCKED",
             &e.to_string(),
         ),
+    }
+}
+
+// ─── T1.5 — cancel an in-flight merge by id ──────────────────────────
+
+async fn cancel_merge_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(token) = state.active_merges.read().await.get(&id).cloned() {
+        token.cancel();
+        ok_response(serde_json::json!({ "cancelled": id })).into_response()
+    } else {
+        err_response(
+            StatusCode::NOT_FOUND,
+            "MERGE_NOT_ACTIVE",
+            &format!("no in-flight merge with id '{id}' (already finished or never started)"),
+        )
     }
 }
 
