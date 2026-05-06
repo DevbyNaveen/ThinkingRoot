@@ -7,11 +7,16 @@ use console::style;
 use tracing_subscriber::EnvFilter;
 use thinkingroot_cli::summary_printer;
 
+mod brain_cmd;
 mod branch_cmd;
+mod branch_data_cmd;
 mod branch_extras_cmd;
+mod branch_template_cmd;
+mod claims_cmd;
 mod cloud;
 mod cortex_client;
 mod cortex_remote;
+mod engram_cmd;
 mod eval_cmd;
 mod mcp_config;
 mod mount_cmd;
@@ -23,6 +28,7 @@ mod provider_cmd;
 mod reflect_cmd;
 mod render_cmd;
 mod resolver;
+mod retrieve_cmd;
 mod rooting_cmd;
 mod serve;
 mod setup;
@@ -660,11 +666,216 @@ enum Commands {
         action: TagAction,
     },
 
-    /// Extra branch operations (events, stats, lineage, rebase, rollback).
-    /// The base `root branch` subcommand still handles list/create/delete.
+    /// Extra branch operations (events, stats, lineage, rebase, rollback,
+    /// contribute-bulk, redaction-set). The base `root branch` subcommand
+    /// still handles list/create/delete.
     BranchOp {
         #[command(subcommand)]
         action: BranchOpAction,
+    },
+
+    /// Workspace orientation — token-efficient summary of counts, top
+    /// entities, and recent decisions. Parity with the MCP `brief` tool.
+    Brief {
+        /// Path to the compiled workspace.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Branch name to scope the summary against (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Emit raw JSON instead of the formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Full graph context for one entity — relations (both directions),
+    /// claims with provenance, and active contradictions. Parity with
+    /// the MCP `investigate` tool.
+    Investigate {
+        /// Entity name to investigate (case-sensitive).
+        entity: String,
+        /// Path to the compiled workspace.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Branch name to scope the lookup against (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Emit raw JSON instead of the formatted context.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hybrid retrieve — vector recall fused with 11-component score
+    /// across the typed Datalog substrate, with per-row BLAKE3 verification.
+    Retrieve {
+        /// The query string.
+        query: String,
+        /// Path to the compiled workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Number of hits to return.
+        #[arg(short = 'n', long, default_value = "20")]
+        top_k: usize,
+        /// Branch name to scope the retrieve against (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Scoring profile name. `default` or `compliance`.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Emit raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect compiled claims — list, filter, or query as-of a moment.
+    Claims {
+        /// Path to the compiled workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// T2.4 — return claims that existed at or before this ISO-8601
+        /// timestamp (e.g. `2026-04-15T00:00:00Z`).
+        #[arg(long, value_name = "TIMESTAMP")]
+        as_of: Option<String>,
+        /// Restrict to trust-Rooted claims (the production-consumer view).
+        #[arg(long, conflicts_with = "as_of")]
+        rooted: bool,
+        /// Branch name to scope against.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Filter by claim_type (Decision, Fact, Quantity, etc.).
+        #[arg(long, conflicts_with_all = ["as_of", "rooted"])]
+        r#type: Option<String>,
+        /// Filter by entity name.
+        #[arg(long, conflicts_with_all = ["as_of", "rooted"])]
+        entity: Option<String>,
+        /// Filter by minimum confidence in [0.0, 1.0].
+        #[arg(long, conflicts_with_all = ["as_of", "rooted"])]
+        min_confidence: Option<f64>,
+        /// Maximum claims to return.
+        #[arg(long, conflicts_with_all = ["as_of", "rooted"])]
+        limit: Option<u32>,
+        /// Pagination offset.
+        #[arg(long, conflicts_with_all = ["as_of", "rooted"])]
+        offset: Option<u32>,
+        /// Emit raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Branch templates (T3.7) — pre-baked merge policy / kind / TTL
+    /// bundles. Apply with `branch-template apply <template> --to <branch>`.
+    BranchTemplate {
+        #[command(subcommand)]
+        action: BranchTemplateAction,
+    },
+
+    /// Active Engram Protocol — RARP lifecycle (materialize, list, probe,
+    /// expire). Each invocation mints a fresh session id unless
+    /// `--session <id>` ties multiple calls together.
+    Engram {
+        #[command(subcommand)]
+        action: EngramAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchTemplateAction {
+    /// List every template registered in the workspace.
+    List,
+    /// Print full BranchTemplate JSON for one template.
+    Get {
+        /// Template name.
+        name: String,
+    },
+    /// Create or overwrite a template by reading a BranchTemplate JSON
+    /// blob from `<file>`. The `name` field inside the JSON is the
+    /// template id.
+    Upsert {
+        /// Path to a JSON file describing the BranchTemplate.
+        file: PathBuf,
+    },
+    /// Delete a template.
+    Delete {
+        /// Template name.
+        name: String,
+    },
+    /// Materialise a new branch from the template.
+    Apply {
+        /// Template name to apply.
+        template: String,
+        /// New branch name.
+        #[arg(long = "to", value_name = "BRANCH")]
+        branch: String,
+        /// Optional description for the new branch.
+        #[arg(long)]
+        description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EngramAction {
+    /// Materialise an engram for a topic. The daemon picks seed
+    /// entities via vector search unless `--seed <id>` is passed
+    /// (repeatable).
+    Materialize {
+        /// Free-text topic.
+        topic: String,
+        /// Path to the workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Explicit seed entity ids (repeatable).
+        #[arg(long = "seed", value_name = "ENTITY_ID")]
+        seeds: Vec<String>,
+        /// Optional scope override (e.g. `1-cluster`, `5-cluster`).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Reuse an existing session id instead of minting a new one.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// List engrams currently held by a session.
+    List {
+        /// Path to the workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Session id to query (required for any non-empty result).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Probe an engram with a question.
+    Probe {
+        /// Pointer (`0xXXXX`) returned by `materialize`.
+        pointer: String,
+        /// Free-text question.
+        question: String,
+        /// Path to the workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Clearance levels (Public/Internal/Confidential/Restricted).
+        /// Repeatable.
+        #[arg(long = "clearance")]
+        clearance: Vec<String>,
+        /// Force a probe-kind (overrides regex routing).
+        #[arg(long)]
+        probe_kind: Option<String>,
+        /// Compose with hybrid scoring (reorders the answer rows in
+        /// lockstep using the 11-component fused score).
+        #[arg(long)]
+        score_with_hybrid: bool,
+        /// Reuse an existing session id.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Expire an engram (frees the pointer).
+    Expire {
+        /// Pointer to expire.
+        pointer: String,
+        /// Path to the workspace.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Session id that owns the pointer.
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -759,6 +970,42 @@ enum BranchOpAction {
     Rollback {
         /// Branch name whose merge should be rolled back.
         branch: String,
+    },
+    /// T0.7 — bulk-contribute claims under a Connector principal with
+    /// idempotency. Reads the batch from a JSON file shaped as
+    /// `{ session_id?, backfill?, workspace?, claims: [...] }`.
+    ContributeBulk {
+        /// Branch name to contribute into.
+        branch: String,
+        /// Path to the workspace whose name to compute (defaults to `.`)
+        /// when the input file does not pin `workspace`.
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Connector identifier (`github`, `slack`, ...).
+        #[arg(long = "connector-id", value_name = "ID")]
+        connector_id: String,
+        /// Per-install identifier (`alice-acme-prod`).
+        #[arg(long = "install-id", value_name = "ID")]
+        install_id: String,
+        /// Idempotency key (typically the upstream event id).
+        #[arg(long = "idempotency-key", value_name = "KEY")]
+        idempotency_key: String,
+        /// JSON file shaped as `BulkInputFile` (see branch_data_cmd.rs).
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// T2.6 — set or clear a branch's outbound redaction policy. Reads
+    /// the policy from a JSON file unless `--clear` is set.
+    RedactionSet {
+        /// Branch name to set the policy on.
+        branch: String,
+        /// Path to a JSON file shaped as `RedactionPolicy`. Required
+        /// unless `--clear` is set.
+        #[arg(long, value_name = "FILE", conflicts_with = "clear")]
+        file: Option<PathBuf>,
+        /// Clear the existing policy.
+        #[arg(long, conflicts_with = "file")]
+        clear: bool,
     },
 }
 
@@ -1511,6 +1758,167 @@ async fn async_main() -> anyhow::Result<()> {
                 }
                 BranchOpAction::Rollback { branch } => {
                     branch_extras_cmd::run_rollback(&conn, &branch).await?;
+                }
+                BranchOpAction::ContributeBulk {
+                    branch,
+                    path,
+                    connector_id,
+                    install_id,
+                    idempotency_key,
+                    file,
+                } => {
+                    branch_data_cmd::run_contribute_bulk(
+                        &conn,
+                        &path,
+                        &branch,
+                        &connector_id,
+                        &install_id,
+                        &idempotency_key,
+                        &file,
+                    )
+                    .await?;
+                }
+                BranchOpAction::RedactionSet { branch, file, clear } => {
+                    branch_data_cmd::run_redaction_set(
+                        &conn,
+                        &branch,
+                        file.as_deref(),
+                        clear,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Some(Commands::Brief { path, branch, json }) => {
+            let conn = require_remote(in_process_flag).await?;
+            brain_cmd::run_brief(&conn, &path, branch.as_deref(), json).await?;
+        }
+        Some(Commands::Investigate {
+            entity,
+            path,
+            branch,
+            json,
+        }) => {
+            let conn = require_remote(in_process_flag).await?;
+            brain_cmd::run_investigate(&conn, &path, &entity, branch.as_deref(), json).await?;
+        }
+        Some(Commands::Retrieve {
+            query,
+            path,
+            top_k,
+            branch,
+            profile,
+            json,
+        }) => {
+            let conn = require_remote(in_process_flag).await?;
+            retrieve_cmd::run_retrieve(
+                &conn,
+                &path,
+                &query,
+                top_k,
+                branch.as_deref(),
+                profile.as_deref(),
+                json,
+            )
+            .await?;
+        }
+        Some(Commands::Claims {
+            path,
+            as_of,
+            rooted,
+            branch,
+            r#type,
+            entity,
+            min_confidence,
+            limit,
+            offset,
+            json,
+        }) => {
+            let conn = require_remote(in_process_flag).await?;
+            claims_cmd::run(
+                &conn,
+                &path,
+                as_of.as_deref(),
+                rooted,
+                branch.as_deref(),
+                r#type.as_deref(),
+                entity.as_deref(),
+                min_confidence,
+                limit,
+                offset,
+                json,
+            )
+            .await?;
+        }
+        Some(Commands::BranchTemplate { action }) => {
+            let conn = require_remote(in_process_flag).await?;
+            match action {
+                BranchTemplateAction::List => {
+                    branch_template_cmd::run_list(&conn).await?;
+                }
+                BranchTemplateAction::Get { name } => {
+                    branch_template_cmd::run_get(&conn, &name).await?;
+                }
+                BranchTemplateAction::Upsert { file } => {
+                    branch_template_cmd::run_upsert(&conn, &file).await?;
+                }
+                BranchTemplateAction::Delete { name } => {
+                    branch_template_cmd::run_delete(&conn, &name).await?;
+                }
+                BranchTemplateAction::Apply {
+                    template,
+                    branch,
+                    description,
+                } => {
+                    branch_template_cmd::run_apply(&conn, &template, &branch, description).await?;
+                }
+            }
+        }
+        Some(Commands::Engram { action }) => {
+            let conn = require_remote(in_process_flag).await?;
+            match action {
+                EngramAction::Materialize {
+                    topic,
+                    path,
+                    seeds,
+                    scope,
+                    session,
+                } => {
+                    engram_cmd::run_materialize(
+                        &conn, &path, &topic, seeds, scope, session,
+                    )
+                    .await?;
+                }
+                EngramAction::List { path, session } => {
+                    engram_cmd::run_list(&conn, &path, session).await?;
+                }
+                EngramAction::Probe {
+                    pointer,
+                    question,
+                    path,
+                    clearance,
+                    probe_kind,
+                    score_with_hybrid,
+                    session,
+                } => {
+                    engram_cmd::run_probe(
+                        &conn,
+                        &path,
+                        &pointer,
+                        &question,
+                        clearance,
+                        probe_kind,
+                        score_with_hybrid,
+                        session,
+                    )
+                    .await?;
+                }
+                EngramAction::Expire {
+                    pointer,
+                    path,
+                    session,
+                } => {
+                    engram_cmd::run_expire(&conn, &path, &pointer, session).await?;
                 }
             }
         }

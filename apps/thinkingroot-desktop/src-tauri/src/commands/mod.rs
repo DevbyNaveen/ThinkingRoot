@@ -8,10 +8,15 @@
 //! but hide the macro-generated helper.
 
 pub mod auth;
+pub mod brain;
 pub mod branch;
+pub mod branch_data;
 pub mod branch_extras;
+pub mod branch_template;
 pub mod chat;
+pub mod claims;
 pub mod conversations;
+pub mod engram;
 pub mod fs;
 pub mod git;
 pub mod install_tr;
@@ -20,6 +25,7 @@ pub mod memory;
 pub mod meta;
 pub mod privacy;
 pub mod proposal;
+pub mod retrieve;
 pub mod scan;
 pub mod settings;
 pub mod sidecar_client;

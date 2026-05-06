@@ -108,7 +108,6 @@ pub async fn post_json(
 }
 
 /// DELETE a daemon endpoint. Returns the `data` field value.
-#[allow(dead_code)] // Used by future tag/template delete subcommands.
 pub async fn delete_json(
     conn: &EngineConnection,
     path: &str,
@@ -116,6 +115,58 @@ pub async fn delete_json(
     let url = format!("{}{path}", base_url(conn)?);
     let resp = client(UNARY_TIMEOUT)?
         .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    decode_envelope(resp).await
+}
+
+/// Same as `post_json` but threads an `X-TR-Session-Id` header through.
+/// Used by AEP / engram routes which require a session id per call —
+/// the engine's `EngramManager` pins TTL + per-session quotas to that id.
+pub async fn post_json_with_session(
+    conn: &EngineConnection,
+    path: &str,
+    session_id: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .post(&url)
+        .header("X-TR-Session-Id", session_id)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    decode_envelope(resp).await
+}
+
+/// Same as `get_json` but threads an `X-TR-Session-Id` header through.
+pub async fn get_json_with_session(
+    conn: &EngineConnection,
+    path: &str,
+    session_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .get(&url)
+        .header("X-TR-Session-Id", session_id)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    decode_envelope(resp).await
+}
+
+/// Same as `delete_json` but threads an `X-TR-Session-Id` header through.
+pub async fn delete_json_with_session(
+    conn: &EngineConnection,
+    path: &str,
+    session_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .delete(&url)
+        .header("X-TR-Session-Id", session_id)
         .send()
         .await
         .with_context(|| format!("DELETE {url}"))?;
@@ -688,13 +739,50 @@ pub async fn run_status_remote(
     Ok(())
 }
 
+/// Mount the workspace at `root` into the daemon under its basename
+/// and return the resolved workspace id. Idempotent — the daemon's
+/// `mount_workspace_handler` overwrites under the same name.
+///
+/// Used by every workspace-scoped remote command (brain probes,
+/// retrieve, claims, engrams, ...) so the daemon's `state.engine`
+/// has a graph to query against. `run_status_remote` and the
+/// command stream commands have their own inline mount call — when
+/// touching them, prefer this helper to avoid duplication.
+pub async fn ensure_mounted_remote(
+    conn: &EngineConnection,
+    root: &Path,
+) -> anyhow::Result<String> {
+    let abs = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let ws = workspace_id_for(&abs);
+    let url = format!("{}/api/v1/workspaces", base_url(conn)?);
+    let body = serde_json::json!({
+        "name": &ws,
+        "root_path": abs.display().to_string(),
+    });
+    let resp = client(UNARY_TIMEOUT)?
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "daemon mount failed ({status}): {}",
+            extract_error_message(&txt)
+        );
+    }
+    Ok(ws)
+}
+
 /// Workspace identifier used in REST URLs. The daemon mounts a
 /// workspace by name on first reference; we pass the basename of
 /// the path so multi-workspace daemons can route correctly.
 ///
 /// When the basename is empty (root-level path) we fall back to
 /// `default` to match the in-process CLI's existing behaviour.
-fn workspace_id_for(path: &Path) -> String {
+pub fn workspace_id_for(path: &Path) -> String {
     path.canonicalize()
         .ok()
         .and_then(|abs| {
@@ -707,7 +795,7 @@ fn workspace_id_for(path: &Path) -> String {
 /// Minimal URL-encoder — sufficient for the `q=` query-string param.
 /// Avoids a full `url` crate import on a hot path that only needs a
 /// shallow encode of spaces, quotes, and a few common metachars.
-fn urlencoding(s: &str) -> String {
+pub fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

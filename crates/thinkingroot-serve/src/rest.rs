@@ -288,6 +288,17 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // Returns the claims that existed at or before that
             // moment (i.e. their `created_at <= as_of`).
             .route("/ws/{ws}/claims/as-of", get(claims_as_of_handler))
+            // Brain probes (parity with MCP `brief` / `investigate`).
+            // CLI + Tauri consumers reach the intelligent serve layer over
+            // HTTP without needing the MCP SSE transport.  Focus is
+            // intentionally not exposed — it mutates per-session
+            // `SessionContext.focus_entity`, which is meaningful only to
+            // the LLM-mediated MCP loop, never to a stateless caller.
+            .route("/ws/{ws}/brain/brief", post(brain_brief_handler))
+            .route(
+                "/ws/{ws}/brain/investigate",
+                post(brain_investigate_handler),
+            )
             // RARP / Active Engram Protocol — engram lifecycle endpoints
             // mirror the 4 MCP tools (`materialize_engram`, `probe_engram`,
             // `list_engrams`, `expire_engram`) so HTTP-only consumers
@@ -1143,6 +1154,76 @@ async fn claims_as_of_handler(
             "claims": claims,
         }))
         .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/brain/brief` — workspace-level orientation.
+/// Stateless equivalent of the MCP `brief` tool: returns the raw
+/// `WorkspaceSummary` (counts + top entities + recent decisions +
+/// contradiction count) so a CLI / Tauri caller can format it locally.
+/// The MCP path additionally resets `SessionContext.token_budget` —
+/// that is meaningless without an LLM session, so we omit it here.
+#[derive(Debug, Default, Deserialize)]
+struct BrainBriefRequest {
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+async fn brain_brief_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<BrainBriefRequest>>,
+) -> Response {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let engine = state.engine.read().await;
+    match engine
+        .get_workspace_brief_branched(&ws, req.branch.as_deref())
+        .await
+    {
+        Ok(summary) => ok_response(summary).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/brain/investigate` — full graph context for
+/// one entity, optionally scoped to a branch. Returns the raw
+/// `EntityContext` (relations, claims, contradictions). The MCP
+/// counterpart additionally compresses against a session's
+/// already-delivered claim budget; that compression is intentionally
+/// not exposed over REST — the caller has the structured data to
+/// project however it wants.
+#[derive(Debug, Deserialize)]
+struct BrainInvestigateRequest {
+    entity: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+async fn brain_investigate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<BrainInvestigateRequest>,
+) -> Response {
+    let entity = req.entity.trim();
+    if entity.is_empty() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "entity is required",
+        );
+    }
+    let engine = state.engine.read().await;
+    match engine
+        .get_entity_context_branched(&ws, entity, req.branch.as_deref())
+        .await
+    {
+        Ok(Some(ctx)) => ok_response(ctx).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "ENTITY_NOT_FOUND",
+            &format!("entity '{entity}' not found in workspace '{ws}'"),
+        ),
         Err(e) => match_engine_error(e),
     }
 }

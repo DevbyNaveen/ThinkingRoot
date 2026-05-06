@@ -148,6 +148,59 @@ impl SidecarClient {
             .map_err(|e| format!("DELETE {url}: {e}"))?;
         decode_envelope(resp).await
     }
+
+    /// GET with `X-TR-Session-Id`. AEP / engram routes require it.
+    pub async fn get_with_session<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        session_id: &str,
+    ) -> Result<T, String> {
+        let url = self.url(path);
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-TR-Session-Id", session_id)
+            .send()
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        decode_envelope(resp).await
+    }
+
+    /// POST with `X-TR-Session-Id`.
+    pub async fn post_with_session<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        session_id: &str,
+        body: &B,
+    ) -> Result<T, String> {
+        let url = self.url(path);
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-TR-Session-Id", session_id)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        decode_envelope(resp).await
+    }
+
+    /// DELETE with `X-TR-Session-Id`.
+    pub async fn delete_with_session<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        session_id: &str,
+    ) -> Result<T, String> {
+        let url = self.url(path);
+        let resp = self
+            .client
+            .delete(&url)
+            .header("X-TR-Session-Id", session_id)
+            .send()
+            .await
+            .map_err(|e| format!("DELETE {url}: {e}"))?;
+        decode_envelope(resp).await
+    }
 }
 
 /// Wait for the sidecar metadata slot to populate, returning host/port.

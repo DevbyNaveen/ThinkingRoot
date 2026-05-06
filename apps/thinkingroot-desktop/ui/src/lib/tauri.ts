@@ -840,6 +840,222 @@ export async function proposalClose(id: string): Promise<void> {
   return invoke<void>("proposal_close", { id });
 }
 
+// ─── Brain probes (REST parity) ──────────────────────────────────────
+
+export interface WorkspaceBrief {
+  workspace: string;
+  entity_count: number;
+  claim_count: number;
+  source_count: number;
+  top_entities: Array<{ name: string; entity_type: string; claim_count: number }>;
+  recent_decisions: Array<[string, number]>;
+  contradiction_count: number;
+}
+
+export async function brainBrief(branch?: string): Promise<WorkspaceBrief> {
+  return invoke<WorkspaceBrief>("brain_brief", { branch: branch ?? null });
+}
+
+export interface EntityContext {
+  id: string;
+  name: string;
+  entity_type: string;
+  description: string;
+  aliases: string[];
+  outgoing_relations: Array<[string, string, number]>;
+  incoming_relations: Array<[string, string, number]>;
+  claims: unknown[];
+  contradictions: unknown[];
+}
+
+export async function brainInvestigate(args: {
+  entity: string;
+  branch?: string;
+}): Promise<EntityContext> {
+  return invoke<EntityContext>("brain_investigate", {
+    entity: args.entity,
+    branch: args.branch ?? null,
+  });
+}
+
+// ─── Hybrid retrieve ─────────────────────────────────────────────────
+
+export interface HybridHit {
+  claim_id: string;
+  statement: string;
+  fused_score: number;
+  admission_tier: string;
+  provenance_verified?: boolean;
+}
+
+export interface HybridResponse {
+  hits: HybridHit[];
+  total_candidates: number;
+}
+
+export async function retrieveHybrid(args: {
+  query: string;
+  topK?: number;
+  branch?: string;
+  profile?: string;
+}): Promise<HybridResponse> {
+  return invoke<HybridResponse>("retrieve_hybrid", {
+    query: args.query,
+    topK: args.topK ?? null,
+    branch: args.branch ?? null,
+    profile: args.profile ?? null,
+  });
+}
+
+// ─── Claims listing ──────────────────────────────────────────────────
+
+export async function claimsList(args: {
+  claimType?: string;
+  entity?: string;
+  minConfidence?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<unknown> {
+  return invoke<unknown>("claims_list", {
+    claimType: args.claimType ?? null,
+    entity: args.entity ?? null,
+    minConfidence: args.minConfidence ?? null,
+    limit: args.limit ?? null,
+    offset: args.offset ?? null,
+  });
+}
+
+export async function claimsAsOf(args: {
+  asOf: string;
+  branch?: string;
+}): Promise<unknown> {
+  return invoke<unknown>("claims_as_of", {
+    asOf: args.asOf,
+    branch: args.branch ?? null,
+  });
+}
+
+export async function claimsRooted(): Promise<unknown> {
+  return invoke<unknown>("claims_rooted");
+}
+
+// ─── Branch templates (T3.7) ─────────────────────────────────────────
+
+export interface BranchTemplateInfo {
+  name: string;
+  description: string | null;
+  kind?: unknown;
+  merge_policy?: unknown;
+}
+
+export async function branchTemplateList(): Promise<{ templates: BranchTemplateInfo[] }> {
+  return invoke<{ templates: BranchTemplateInfo[] }>("branch_template_list");
+}
+
+export async function branchTemplateGet(name: string): Promise<{ template: unknown }> {
+  return invoke<{ template: unknown }>("branch_template_get", { name });
+}
+
+export async function branchTemplateUpsert(template: unknown): Promise<unknown> {
+  return invoke<unknown>("branch_template_upsert", { template });
+}
+
+export async function branchTemplateDelete(name: string): Promise<unknown> {
+  return invoke<unknown>("branch_template_delete", { name });
+}
+
+export async function branchTemplateApply(args: {
+  template: string;
+  branch: string;
+  description?: string;
+}): Promise<unknown> {
+  return invoke<unknown>("branch_template_apply", {
+    template: args.template,
+    branch: args.branch,
+    description: args.description ?? null,
+  });
+}
+
+// ─── Connector bulk-contribute + redaction policy ────────────────────
+
+export async function branchContributeBulk(args: {
+  branch: string;
+  connectorId: string;
+  installId: string;
+  idempotencyKey: string;
+  sessionId?: string;
+  backfill?: boolean;
+  claims: unknown[];
+}): Promise<unknown> {
+  return invoke<unknown>("branch_contribute_bulk", {
+    branch: args.branch,
+    connectorId: args.connectorId,
+    installId: args.installId,
+    idempotencyKey: args.idempotencyKey,
+    sessionId: args.sessionId ?? null,
+    backfill: args.backfill ?? null,
+    claims: args.claims,
+  });
+}
+
+export async function branchRedactionSet(args: {
+  branch: string;
+  policy: unknown | null;
+}): Promise<unknown> {
+  return invoke<unknown>("branch_redaction_set", {
+    branch: args.branch,
+    policy: args.policy,
+  });
+}
+
+// ─── Engrams (Active Engram Protocol) ────────────────────────────────
+
+export async function engramMaterialize(args: {
+  sessionId: string;
+  topic: string;
+  seedEntityIds?: string[];
+  scope?: string;
+}): Promise<{ pointer: string; summary: unknown }> {
+  return invoke<{ pointer: string; summary: unknown }>("engram_materialize", {
+    sessionId: args.sessionId,
+    topic: args.topic,
+    seedEntityIds: args.seedEntityIds ?? null,
+    scope: args.scope ?? null,
+  });
+}
+
+export async function engramList(sessionId: string): Promise<unknown> {
+  return invoke<unknown>("engram_list", { sessionId });
+}
+
+export async function engramProbe(args: {
+  sessionId: string;
+  pointer: string;
+  question: string;
+  clearance?: string[];
+  probeKind?: string;
+  scoreWithHybrid?: boolean;
+}): Promise<unknown> {
+  return invoke<unknown>("engram_probe", {
+    sessionId: args.sessionId,
+    pointer: args.pointer,
+    question: args.question,
+    clearance: args.clearance ?? null,
+    probeKind: args.probeKind ?? null,
+    scoreWithHybrid: args.scoreWithHybrid ?? null,
+  });
+}
+
+export async function engramExpire(args: {
+  sessionId: string;
+  pointer: string;
+}): Promise<{ expired: boolean; pointer: string }> {
+  return invoke<{ expired: boolean; pointer: string }>("engram_expire", {
+    sessionId: args.sessionId,
+    pointer: args.pointer,
+  });
+}
+
 // ─── Auth state (honest local/cloud read) ────────────────────────────
 
 export interface AuthState {
