@@ -122,6 +122,18 @@ pub fn run() {
             commands::branch::branch_checkout,
             commands::branch::branch_merge,
             commands::branch::branch_delete,
+            commands::branch_extras::branch_events,
+            commands::branch_extras::branch_stats,
+            commands::branch_extras::branch_lineage,
+            commands::branch_extras::branch_rebase,
+            commands::branch_extras::branch_rollback,
+            commands::tag::tag_create,
+            commands::tag::tag_list,
+            commands::tag::tag_get,
+            commands::proposal::proposal_open,
+            commands::proposal::proposal_list,
+            commands::proposal::proposal_review,
+            commands::proposal::proposal_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

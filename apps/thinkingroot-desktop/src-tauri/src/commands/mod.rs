@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod branch;
+pub mod branch_extras;
 pub mod chat;
 pub mod conversations;
 pub mod fs;
@@ -18,7 +19,9 @@ pub mod mcp_local;
 pub mod memory;
 pub mod meta;
 pub mod privacy;
+pub mod proposal;
 pub mod scan;
 pub mod settings;
 pub mod sidecar_client;
+pub mod tag;
 pub mod workspaces;

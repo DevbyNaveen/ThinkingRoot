@@ -727,6 +727,119 @@ export async function branchDelete(workspace: string, name: string): Promise<boo
   return invoke<boolean>("branch_delete", { args: { workspace, name } });
 }
 
+// ─── Branch extras (T1.2 / T1.3 / T1.6 / T1.7 / T0.5) ────────────────
+
+export interface BranchStats {
+  branch: string;
+  claim_count: number;
+  entity_count: number;
+  source_count: number;
+  event_count: number;
+  status: string;
+}
+
+export async function branchStats(branch: string): Promise<BranchStats> {
+  return invoke<BranchStats>("branch_stats", { branch });
+}
+
+export async function branchEvents(branch: string): Promise<unknown[]> {
+  return invoke<unknown[]>("branch_events", { branch });
+}
+
+export async function branchLineage(): Promise<unknown> {
+  return invoke<unknown>("branch_lineage");
+}
+
+export async function branchRebase(branch: string): Promise<void> {
+  return invoke<void>("branch_rebase", { branch });
+}
+
+export async function branchRollback(branch: string): Promise<void> {
+  return invoke<void>("branch_rollback", { branch });
+}
+
+// ─── Tags (T2.5) ─────────────────────────────────────────────────────
+
+export interface TagView {
+  name: string;
+  target_commit_hash: string;
+  message: string | null;
+  created_at: string | null;
+}
+
+export async function tagList(): Promise<TagView[]> {
+  return invoke<TagView[]>("tag_list");
+}
+
+export async function tagGet(name: string): Promise<TagView> {
+  return invoke<TagView>("tag_get", { name });
+}
+
+export async function tagCreate(args: {
+  name: string;
+  branch: string;
+  message?: string;
+}): Promise<TagView> {
+  return invoke<TagView>("tag_create", {
+    args: {
+      name: args.name,
+      branch: args.branch,
+      message: args.message ?? null,
+    },
+  });
+}
+
+// ─── Knowledge Proposals (T0.4) ──────────────────────────────────────
+
+export interface ProposalView {
+  id: string;
+  source_branch: string;
+  target_branch: string;
+  status: string;
+}
+
+export async function proposalOpen(args: {
+  branch: string;
+  target?: string;
+  description?: string;
+  minReviewers?: number;
+}): Promise<ProposalView> {
+  return invoke<ProposalView>("proposal_open", {
+    args: {
+      branch: args.branch,
+      target: args.target ?? "main",
+      description: args.description ?? null,
+      min_reviewers: args.minReviewers ?? null,
+    },
+  });
+}
+
+export async function proposalList(branch?: string): Promise<ProposalView[]> {
+  return invoke<ProposalView[]>("proposal_list", {
+    branch: branch ?? null,
+  });
+}
+
+export type ProposalDecision = "approve" | "request_changes" | "comment";
+
+export async function proposalReview(args: {
+  id: string;
+  decision: ProposalDecision;
+  note?: string;
+}): Promise<void> {
+  return invoke<void>("proposal_review", {
+    args: {
+      id: args.id,
+      decision: args.decision,
+      note: args.note ?? null,
+    },
+  });
+}
+
+export async function proposalClose(id: string): Promise<void> {
+  return invoke<void>("proposal_close", { id });
+}
+
 // ─── Auth state (honest local/cloud read) ────────────────────────────
 
 export interface AuthState {

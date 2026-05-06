@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use thinkingroot_cli::summary_printer;
 
 mod branch_cmd;
+mod branch_extras_cmd;
 mod cloud;
 mod cortex_client;
 mod cortex_remote;
@@ -17,6 +18,7 @@ mod mount_cmd;
 mod pack_cmd;
 mod pipeline;
 mod progress;
+mod proposal_cmd;
 mod provider_cmd;
 mod reflect_cmd;
 mod render_cmd;
@@ -24,6 +26,7 @@ mod resolver;
 mod rooting_cmd;
 mod serve;
 mod setup;
+mod tag_cmd;
 mod update_cmd;
 mod watch;
 mod workspace;
@@ -640,6 +643,123 @@ enum Commands {
         #[arg(long, env = "TR_SERVER")]
         server: Option<String>,
     },
+
+    /// Knowledge Proposal (T0.4) operations.
+    ///
+    /// Knowledge Proposals gate `MergePolicy::RequiresProposal` merges.
+    /// `root proposal open` against the source branch, gather reviews,
+    /// then merge once the policy's `min_reviewers` threshold is met.
+    Proposal {
+        #[command(subcommand)]
+        action: ProposalAction,
+    },
+
+    /// Tag operations (T2.5 immutable snapshot tags).
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
+
+    /// Extra branch operations (events, stats, lineage, rebase, rollback).
+    /// The base `root branch` subcommand still handles list/create/delete.
+    BranchOp {
+        #[command(subcommand)]
+        action: BranchOpAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProposalAction {
+    /// Open a Knowledge Proposal on a branch.
+    Open {
+        /// Source branch the proposal is opened on.
+        branch: String,
+        /// Target branch (defaults to `main`).
+        #[arg(long, default_value = "main")]
+        target: String,
+        /// Optional human-readable description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Override the source branch's `min_reviewers` policy.
+        #[arg(long)]
+        min_reviewers: Option<u8>,
+    },
+    /// List proposals — workspace-wide unless `--branch` is set.
+    List {
+        /// Filter to one branch.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Record a review on a proposal.
+    Review {
+        /// Proposal id (ULID).
+        id: String,
+        /// Approve the proposal.
+        #[arg(long, conflicts_with_all = ["request_changes", "comment"])]
+        approve: bool,
+        /// Request changes (blocks merge until updated).
+        #[arg(long, conflicts_with_all = ["approve", "comment"])]
+        request_changes: bool,
+        /// Leave a non-blocking comment.
+        #[arg(long, conflicts_with_all = ["approve", "request_changes"])]
+        comment: bool,
+        /// Optional review note.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Author-initiated close (terminal — no further reviews accepted).
+    Close {
+        /// Proposal id (ULID).
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// Create a tag from a branch's current state.
+    Create {
+        /// Tag name (immutable once created).
+        name: String,
+        /// Branch whose snapshot the tag points to.
+        #[arg(long)]
+        branch: String,
+        /// Optional message attached to the tag.
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// List all tags in the workspace.
+    List,
+    /// Print full tag JSON for inspection.
+    Get {
+        /// Tag name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchOpAction {
+    /// Show audit-log events for a branch.
+    Events {
+        /// Branch name.
+        branch: String,
+    },
+    /// Show claim/entity/source/event counts for a branch.
+    Stats {
+        /// Branch name.
+        branch: String,
+    },
+    /// Print the fork/merge DAG across all branches as JSON.
+    Lineage,
+    /// Sync a branch with its parent (apply parent-only claims).
+    Rebase {
+        /// Branch name.
+        branch: String,
+    },
+    /// Restore the parent from the pre-merge snapshot of `branch`.
+    Rollback {
+        /// Branch name whose merge should be rolled back.
+        branch: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -759,6 +879,19 @@ enum WorkspaceAction {
         /// Workspace name to remove
         name: String,
     },
+    /// Auto-discover workspaces by walking the filesystem.
+    ///
+    /// Walks each `--root <path>` (or sensible defaults: `~/Desktop`,
+    /// `~/Documents`, `~/code`, `~/dev`, `~/projects`, `~/src`,
+    /// `~/workspace`) up to depth 4, registering any directory that
+    /// contains a `.thinkingroot/` marker. Existing entries are
+    /// preserved. Same logic the desktop's auto-scan uses, exposed
+    /// to the CLI for parity (Stream G).
+    Scan {
+        /// Override the scan roots. Repeatable.
+        #[arg(long = "root", value_name = "PATH")]
+        roots: Vec<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -811,6 +944,22 @@ async fn try_resolve_remote(
             None
         }
     }
+}
+
+/// Stream C — `try_resolve_remote` returns `None` when no daemon is
+/// running. The new parity subcommands (proposals, tags, branch
+/// extras) require a daemon because their REST routes are the only
+/// implementation; falling back to in-process would silently mean
+/// "did nothing." This wrapper surfaces a clear error.
+async fn require_remote(
+    in_process_flag: bool,
+) -> anyhow::Result<thinkingroot_core::cortex::EngineConnection> {
+    try_resolve_remote(in_process_flag).await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this subcommand requires a running daemon — start one with `root serve` \
+             in another terminal (or remove --in-process)."
+        )
+    })
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -1022,6 +1171,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
             WorkspaceAction::Remove { name } => {
                 workspace::run_workspace_remove(&name)?;
+            }
+            WorkspaceAction::Scan { roots } => {
+                workspace::run_workspace_scan(roots)?;
             }
         },
         Some(Commands::Connect {
@@ -1281,6 +1433,86 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Jobs { limit, server }) => {
             cloud::status::run(limit, server).await?;
+        }
+        Some(Commands::Proposal { action }) => {
+            let conn = require_remote(in_process_flag).await?;
+            match action {
+                ProposalAction::Open {
+                    branch,
+                    target,
+                    description,
+                    min_reviewers,
+                } => {
+                    proposal_cmd::run_open(
+                        &conn,
+                        &branch,
+                        &target,
+                        description,
+                        min_reviewers,
+                    )
+                    .await?;
+                }
+                ProposalAction::List { branch } => {
+                    proposal_cmd::run_list(&conn, branch.as_deref()).await?;
+                }
+                ProposalAction::Review {
+                    id,
+                    approve,
+                    request_changes,
+                    comment,
+                    note,
+                } => {
+                    let decision = if approve {
+                        "approve"
+                    } else if request_changes {
+                        "request_changes"
+                    } else if comment {
+                        "comment"
+                    } else {
+                        anyhow::bail!(
+                            "review requires --approve, --request-changes, or --comment"
+                        );
+                    };
+                    proposal_cmd::run_review(&conn, &id, decision, note).await?;
+                }
+                ProposalAction::Close { id } => {
+                    proposal_cmd::run_close(&conn, &id).await?;
+                }
+            }
+        }
+        Some(Commands::Tag { action }) => {
+            let conn = require_remote(in_process_flag).await?;
+            match action {
+                TagAction::Create {
+                    name,
+                    branch,
+                    message,
+                } => {
+                    tag_cmd::run_create(&conn, &name, &branch, message).await?;
+                }
+                TagAction::List => tag_cmd::run_list(&conn).await?,
+                TagAction::Get { name } => tag_cmd::run_get(&conn, &name).await?,
+            }
+        }
+        Some(Commands::BranchOp { action }) => {
+            let conn = require_remote(in_process_flag).await?;
+            match action {
+                BranchOpAction::Events { branch } => {
+                    branch_extras_cmd::run_events(&conn, &branch).await?;
+                }
+                BranchOpAction::Stats { branch } => {
+                    branch_extras_cmd::run_stats(&conn, &branch).await?;
+                }
+                BranchOpAction::Lineage => {
+                    branch_extras_cmd::run_lineage(&conn).await?;
+                }
+                BranchOpAction::Rebase { branch } => {
+                    branch_extras_cmd::run_rebase(&conn, &branch).await?;
+                }
+                BranchOpAction::Rollback { branch } => {
+                    branch_extras_cmd::run_rollback(&conn, &branch).await?;
+                }
+            }
         }
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.

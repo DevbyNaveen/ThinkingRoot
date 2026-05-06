@@ -70,6 +70,76 @@ fn extract_error_message(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
+/// Stream C — generic helpers used by the new parity commands
+/// (`tag_cmd`, `proposal_cmd`, branch extras, brain probes). All three
+/// share the same shape: GET/POST a JSON-enveloped REST endpoint, peel
+/// off the `data` field, and pretty-print the result for the user.
+
+/// GET a daemon endpoint and return the raw JSON body of the `data`
+/// field on the `{ok, data, error}` envelope. The caller decides how
+/// to render — tables vs JSON vs counts.
+pub async fn get_json(
+    conn: &EngineConnection,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    decode_envelope(resp).await
+}
+
+/// POST a daemon endpoint with a JSON body. Same envelope decoding.
+pub async fn post_json(
+    conn: &EngineConnection,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .post(&url)
+        .json(body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    decode_envelope(resp).await
+}
+
+/// DELETE a daemon endpoint. Returns the `data` field value.
+#[allow(dead_code)] // Used by future tag/template delete subcommands.
+pub async fn delete_json(
+    conn: &EngineConnection,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let resp = client(UNARY_TIMEOUT)?
+        .delete(&url)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url}"))?;
+    decode_envelope(resp).await
+}
+
+async fn decode_envelope(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "daemon request failed ({status}): {}",
+            extract_error_message(&body)
+        );
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse response envelope: {body}"))?;
+    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !ok {
+        anyhow::bail!("daemon returned ok=false: {}", extract_error_message(&body));
+    }
+    Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
+}
+
 /// `root compile` over the daemon's `/compile/stream` SSE endpoint.
 ///
 /// Cancellation contract: the SSE body stream is held inside a
