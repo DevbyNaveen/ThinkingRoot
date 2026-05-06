@@ -1,24 +1,51 @@
 /**
  * Brain workbench. Two-pane: graph on top, virtualised claim table
  * below. Loads from `brain_load`, which fans out to claims +
- * entities + relations + rooted ids in one Tauri trip.
+ * entities + relations + rooted ids in one Tauri trip. Header pulls
+ * `brainBrief` separately so the count line is the daemon's
+ * authoritative summary (with top entities + recent decisions),
+ * not the front-end's count of whatever happens to be loaded.
+ *
+ * Split position is persisted to localStorage so the graph/table
+ * ratio survives a reload.
  */
 import { useEffect, useState, useRef } from "react";
 import { Folder, RefreshCw, AlertTriangle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/store/app";
-import { brainLoad, type BrainSnapshot } from "@/lib/tauri";
+import {
+  brainBrief,
+  brainLoad,
+  type BrainSnapshot,
+  type WorkspaceBrief,
+} from "@/lib/tauri";
 import { BrainGraph } from "./BrainGraph";
 import { BrainTable } from "./BrainTable";
+
+const SPLIT_STORAGE_KEY = "brain_split_v1";
+
+function readPersistedSplit(): number {
+  if (typeof window === "undefined") return 55;
+  try {
+    const raw = window.localStorage.getItem(SPLIT_STORAGE_KEY);
+    if (!raw) return 55;
+    const n = Number.parseFloat(raw);
+    if (!Number.isFinite(n)) return 55;
+    return Math.max(10, Math.min(90, n));
+  } catch {
+    return 55;
+  }
+}
 
 export function BrainView() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [snap, setSnap] = useState<BrainSnapshot | null>(null);
+  const [brief, setBrief] = useState<WorkspaceBrief | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [topHeight, setTopHeight] = useState(55);
+  const [topHeight, setTopHeight] = useState<number>(() => readPersistedSplit());
   const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -29,11 +56,20 @@ export function BrainView() {
     setLoading(true);
     setError(null);
     try {
-      const s = await brainLoad();
+      const [s, b] = await Promise.all([
+        brainLoad(),
+        // Brief is best-effort: an unmounted workspace returns an
+        // error, but the underlying brainLoad already covers that
+        // path. We keep the brief query independent so a slow
+        // brief never blocks the table.
+        brainBrief().catch(() => null),
+      ]);
       setSnap(s);
+      setBrief(b);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSnap(null);
+      setBrief(null);
     } finally {
       setLoading(false);
     }
@@ -42,6 +78,15 @@ export function BrainView() {
   useEffect(() => {
     if (activeWorkspace) void load();
   }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(SPLIT_STORAGE_KEY, topHeight.toFixed(2));
+    } catch {
+      /* localStorage may be disabled in private mode — non-fatal */
+    }
+  }, [topHeight]);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -87,6 +132,15 @@ export function BrainView() {
           <span className="ml-2 text-[10px] text-muted-foreground">
             {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
             {snap.relations.length} relations
+            {brief && brief.contradiction_count > 0 && (
+              <>
+                {" · "}
+                <span className="text-amber-600 dark:text-amber-400">
+                  {brief.contradiction_count} contradiction
+                  {brief.contradiction_count === 1 ? "" : "s"}
+                </span>
+              </>
+            )}
           </span>
         )}
         <Button
@@ -100,6 +154,26 @@ export function BrainView() {
           <RefreshCw className={loading ? "size-3.5 animate-spin" : "size-3.5"} />
         </Button>
       </header>
+      {brief && brief.top_entities.length > 0 && (
+        <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/10 px-4 py-1.5">
+          <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+            Top
+          </span>
+          {brief.top_entities.slice(0, 8).map((e) => (
+            <button
+              key={e.name}
+              type="button"
+              onClick={() => setSearchQuery(e.name)}
+              className="flex shrink-0 items-center gap-1 rounded-full bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              title={`Filter table for ${e.name} (${e.entity_type})`}
+            >
+              <span className="font-medium">{e.name}</span>
+              <span>·</span>
+              <span>{e.claim_count}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       {error && (
         <div className="flex items-start gap-2 border-b border-destructive/20 bg-destructive/10 px-4 py-2 text-xs text-destructive">

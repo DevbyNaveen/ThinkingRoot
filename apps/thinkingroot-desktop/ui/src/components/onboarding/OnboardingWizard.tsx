@@ -20,6 +20,7 @@ import {
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
 import { Button } from "@/components/ui/button";
+import { PasswordInput } from "@/components/ui/password-input";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -117,6 +118,27 @@ export function OnboardingWizard({ open, onComplete, onSkip }: Props) {
       if (provider === "openai") return openaiKey.trim().length > 0;
     }
     return true;
+  })();
+
+  /** Inline hint shown next to the Next button when canAdvance is false on
+   *  step 2. Tells the user exactly which field is empty so they don't
+   *  guess why the button is disabled. */
+  const advanceHint = (() => {
+    if (step !== 2 || canAdvance) return null;
+    if (provider === "azure") {
+      const missing: string[] = [];
+      if (!azureKey.trim()) missing.push("API key");
+      if (!azureResource.trim()) missing.push("resource name");
+      if (!azureDeployment.trim()) missing.push("deployment");
+      return missing.length > 0 ? `Missing: ${missing.join(", ")}` : null;
+    }
+    if (provider === "anthropic" && !anthropicKey.trim()) {
+      return "Paste your Anthropic API key to continue";
+    }
+    if (provider === "openai" && !openaiKey.trim()) {
+      return "Paste your OpenAI API key to continue";
+    }
+    return null;
   })();
 
   async function finish() {
@@ -272,6 +294,11 @@ export function OnboardingWizard({ open, onComplete, onSkip }: Props) {
             </Button>
           </div>
           <div className="flex items-center gap-2">
+            {advanceHint && (
+              <span className="mr-1 text-[10px] text-amber-600 dark:text-amber-400">
+                {advanceHint}
+              </span>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -287,6 +314,7 @@ export function OnboardingWizard({ open, onComplete, onSkip }: Props) {
                 onClick={() => setStep((s) => Math.min(STEPS.length, s + 1))}
                 disabled={!canAdvance}
                 className="h-8 gap-1 text-xs"
+                title={advanceHint ?? undefined}
               >
                 Next <ArrowRight className="size-3" />
               </Button>
@@ -410,13 +438,11 @@ function ProviderStep(props: {
         {props.provider === "azure" && (
           <>
             <Field label="Azure OpenAI API key">
-              <input
-                type="password"
+              <PasswordInput
                 value={props.azureKey}
                 onChange={(e) => props.setAzureKey(e.target.value)}
                 placeholder="paste your Azure subscription key"
                 className={inputClass}
-                autoComplete="off"
               />
             </Field>
             <Field
@@ -453,25 +479,21 @@ function ProviderStep(props: {
         )}
         {props.provider === "anthropic" && (
           <Field label="Anthropic API key">
-            <input
-              type="password"
+            <PasswordInput
               value={props.anthropicKey}
               onChange={(e) => props.setAnthropicKey(e.target.value)}
               placeholder="sk-ant-…"
               className={inputClass}
-              autoComplete="off"
             />
           </Field>
         )}
         {props.provider === "openai" && (
           <Field label="OpenAI API key">
-            <input
-              type="password"
+            <PasswordInput
               value={props.openaiKey}
               onChange={(e) => props.setOpenaiKey(e.target.value)}
               placeholder="sk-…"
               className={inputClass}
-              autoComplete="off"
             />
           </Field>
         )}

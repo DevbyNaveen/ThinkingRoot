@@ -30,6 +30,7 @@ import {
   FileSearch,
   FileText,
   FolderPlus,
+  GitBranch,
   GitFork,
   Globe,
   Hash,
@@ -112,11 +113,12 @@ export interface CommandDef {
   keywords?: string[];
 }
 
-const SURFACE_IDS: Surface[] = ["chats", "brain", "privacy", "settings"];
+const SURFACE_IDS: Surface[] = ["chats", "brain", "branches", "privacy", "settings"];
 
 const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   chats: Activity,
   brain: Brain,
+  branches: GitBranch,
   privacy: ShieldCheck,
   settings: SettingsIcon,
 };
@@ -124,7 +126,8 @@ const SURFACE_ICONS: Record<Surface, LucideIcon> = {
 const SURFACE_HINT: Partial<Record<Surface, string>> = {
   chats: "⌘1",
   brain: "⌘2",
-  privacy: "⌘3",
+  branches: "⌘3",
+  privacy: "⌘4",
   settings: "⌘,",
 };
 

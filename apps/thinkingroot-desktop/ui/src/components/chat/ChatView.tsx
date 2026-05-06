@@ -387,7 +387,11 @@ export function ChatView() {
               <code className="rounded bg-muted px-1 py-0.5 font-mono">/</code>{" "}
               for slash commands.
             </p>
-            <LlmHealthBanner health={health} workspace={activeWorkspace} />
+            <LlmHealthBanner
+              health={health}
+              workspace={activeWorkspace}
+              openSettings={() => useApp.getState().setSurface("settings")}
+            />
             <div className="w-full">
               <Composer
                 workspace={activeWorkspace}
@@ -513,7 +517,11 @@ export function ChatView() {
       </div>
 
       <div className="mx-auto w-full max-w-3xl px-8">
-        <LlmHealthBanner health={health} workspace={activeWorkspace} />
+        <LlmHealthBanner
+          health={health}
+          workspace={activeWorkspace}
+          openSettings={() => useApp.getState().setSurface("settings")}
+        />
       </div>
       <Composer
         workspace={activeWorkspace}
@@ -580,9 +588,11 @@ export function ChatView() {
 function LlmHealthBanner({
   health,
   workspace,
+  openSettings,
 }: {
   health: LlmHealth | null;
   workspace: string;
+  openSettings: () => void;
 }) {
   if (!health) return null;
   if (!health.mounted) {
@@ -601,12 +611,18 @@ function LlmHealthBanner({
     return (
       <div className="flex w-full items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-200">
         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
-        <div>
+        <div className="flex-1">
           No LLM configured for <code className="font-mono">{workspace}</code>.
-          Set <code className="font-mono">ANTHROPIC_API_KEY</code> (or your
-          provider's key) and restart, or run{" "}
-          <code className="font-mono">root setup</code> in the workspace
-          directory. Without a provider, answers fall back to the
+          Add a provider key under{" "}
+          <button
+            type="button"
+            onClick={openSettings}
+            className="font-medium underline underline-offset-2 hover:text-yellow-100"
+          >
+            Settings → Credentials
+          </button>{" "}
+          (or run <code className="font-mono">root setup</code> in the
+          workspace directory). Without a provider, answers fall back to the
           highest-confidence claim verbatim.
         </div>
       </div>

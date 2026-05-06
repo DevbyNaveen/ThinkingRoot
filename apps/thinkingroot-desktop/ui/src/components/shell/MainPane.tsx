@@ -1,5 +1,6 @@
 import { ChatView } from "@/components/chat/ChatView";
 import { BrainView } from "@/components/brain/BrainView";
+import { BranchesView } from "@/components/branches/BranchesView";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { PrivacyDashboard } from "@/components/privacy/PrivacyDashboard";
 import { useApp } from "@/store/app";
@@ -21,6 +22,8 @@ export function MainPane() {
           <ChatView />
         ) : surface === "brain" ? (
           <BrainView />
+        ) : surface === "branches" ? (
+          <BranchesView />
         ) : surface === "privacy" ? (
           <PrivacyDashboard />
         ) : (

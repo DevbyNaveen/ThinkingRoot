@@ -38,6 +38,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { useApp } from "@/store/app";
 import { toast } from "@/store/toast";
 import { Button } from "@/components/ui/button";
+import { PasswordInput } from "@/components/ui/password-input";
 import { cn } from "@/lib/utils";
 import type { Theme } from "@/types";
 
@@ -322,8 +323,7 @@ export function SettingsView() {
                 }
               >
                 <div className="flex gap-2">
-                  <input
-                    type="password"
+                  <PasswordInput
                     placeholder={providerMeta.placeholder}
                     value={keyDraft[providerMeta.env_var] ?? ""}
                     onChange={(e) =>
@@ -332,7 +332,6 @@ export function SettingsView() {
                         [providerMeta.env_var]: e.target.value,
                       }))
                     }
-                    autoComplete="off"
                     className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
                   />
                   {credForActive?.persisted && (

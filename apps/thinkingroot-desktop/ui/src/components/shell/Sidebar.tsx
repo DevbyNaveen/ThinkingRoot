@@ -23,6 +23,7 @@ import {
   ChevronRight,
   Folder,
   FolderPlus,
+  GitBranch,
   MessageSquarePlus,
   RefreshCw,
   ShieldCheck,
@@ -388,6 +389,12 @@ function PrimaryActions({
         label="Brain"
         active={surface === "brain"}
         onClick={() => setSurface("brain")}
+      />
+      <NavRow
+        Icon={GitBranch}
+        label="Branches"
+        active={surface === "branches"}
+        onClick={() => setSurface("branches")}
       />
       <NavRow
         Icon={ShieldCheck}
