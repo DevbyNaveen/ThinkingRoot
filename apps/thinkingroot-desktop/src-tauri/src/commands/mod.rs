@@ -20,4 +20,5 @@ pub mod meta;
 pub mod privacy;
 pub mod scan;
 pub mod settings;
+pub mod sidecar_client;
 pub mod workspaces;

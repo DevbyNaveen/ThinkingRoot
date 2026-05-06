@@ -7555,13 +7555,16 @@ dependencies = [
  "blake3",
  "chrono",
  "fs2",
+ "libc",
  "serde",
  "serde_json",
  "thinkingroot-core",
  "thinkingroot-graph",
  "thinkingroot-health",
+ "thinkingroot-pr",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml 0.8.2",
  "tracing",
 ]
@@ -7763,6 +7766,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-pr"
+version = "0.9.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "thinkingroot-core",
+ "toml 0.8.2",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "thinkingroot-reflect"
 version = "0.9.0"
 dependencies = [
@@ -7827,6 +7842,7 @@ dependencies = [
  "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-parse",
+ "thinkingroot-pr",
  "thinkingroot-reflect",
  "thinkingroot-rooting",
  "thiserror 2.0.18",
@@ -8069,6 +8085,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

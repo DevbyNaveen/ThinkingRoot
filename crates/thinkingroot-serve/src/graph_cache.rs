@@ -42,6 +42,9 @@ pub struct CachedSource {
     pub id: String,
     pub uri: String,
     pub source_type: String,
+    /// BLAKE3 hash of the source bytes when known. Empty for
+    /// agent-contributed claims that have no underlying file.
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +105,7 @@ pub struct KnowledgeGraph {
 /// doing CPU-intensive HashMap construction. This eliminates the ~1-2 s
 /// storage lock contention that blocked vector searches during cache reload.
 pub(crate) struct RawGraphData {
-    pub sources: Vec<(String, String, String)>, // (id, uri, source_type)
+    pub sources: Vec<(String, String, String, String)>, // (id, uri, source_type, content_hash)
     pub source_hashes: Vec<(String, String)>,   // (uri, content_hash)
     pub entities: Vec<(String, String, String)>, // (id, canonical_name, entity_type)
     pub aliases: Vec<(String, String)>,         // (entity_id, alias)
@@ -154,10 +157,11 @@ impl KnowledgeGraph {
         let sources: Vec<CachedSource> = raw
             .sources
             .iter()
-            .map(|(id, uri, source_type)| CachedSource {
+            .map(|(id, uri, source_type, content_hash)| CachedSource {
                 id: id.clone(),
                 uri: uri.clone(),
                 source_type: source_type.clone(),
+                content_hash: content_hash.clone(),
             })
             .collect();
 

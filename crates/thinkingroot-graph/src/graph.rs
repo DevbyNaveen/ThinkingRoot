@@ -3497,9 +3497,10 @@ impl GraphStore {
         Ok(map)
     }
 
-    pub fn get_all_sources(&self) -> Result<Vec<(String, String, String)>> {
-        let result =
-            self.query_read("?[id, uri, source_type] := *sources{id, uri, source_type}")?;
+    pub fn get_all_sources(&self) -> Result<Vec<(String, String, String, String)>> {
+        let result = self.query_read(
+            "?[id, uri, source_type, content_hash] := *sources{id, uri, source_type, content_hash}",
+        )?;
         Ok(result
             .rows
             .iter()
@@ -3508,6 +3509,7 @@ impl GraphStore {
                     dv_to_string(&row[0]),
                     dv_to_string(&row[1]),
                     dv_to_string(&row[2]),
+                    dv_to_string(&row[3]),
                 )
             })
             .collect())

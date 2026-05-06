@@ -303,5 +303,5 @@ fn branch_has_agent_contributes(
     let sources = graph.get_all_sources()?;
     Ok(sources
         .iter()
-        .any(|(_, uri, _)| uri.starts_with("mcp://agent/")))
+        .any(|(_, uri, _, _)| uri.starts_with("mcp://agent/")))
 }

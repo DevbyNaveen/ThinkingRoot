@@ -1,20 +1,23 @@
 //! Branch slash commands — `/branch`, `/checkout`, `/merge`,
 //! `/branches`.
 //!
-//! These are thin wrappers around `thinkingroot_branch` (for the
-//! plumbing that doesn't touch the merged graph) and the mounted
-//! [`QueryEngine`] (for `merge_branch` / `delete_branch`, which need
-//! the graph cache invalidated atomically). Following the
-//! `thinkingroot-cli` convention, branch names are validated by the
-//! `BranchRegistry` itself — we don't pre-validate here.
-
-use std::path::PathBuf;
+//! Stream A — every branch command now routes through the sidecar's
+//! REST surface. `branch_merge` and `branch_delete` were previously
+//! in-process graph mutations racing against the daemon; both now
+//! route through `POST /api/v1/branches/{branch}/merge` and
+//! `DELETE /api/v1/branches/{branch}` so the daemon stays the single
+//! owner of `graph.db`. `branch_list`, `branch_create`, and
+//! `branch_checkout` use the parallel REST endpoints; the daemon
+//! reads `branches.toml` directly so these do not require the
+//! workspace to be mounted, but they still go through HTTP for a
+//! single source of truth.
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
-use thinkingroot_core::WorkspaceRegistry;
 
-#[derive(Debug, Serialize, Clone)]
+use crate::commands::sidecar_client::SidecarClient;
+
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct BranchView {
     pub name: String,
     pub parent: String,
@@ -23,12 +26,40 @@ pub struct BranchView {
     pub description: Option<String>,
 }
 
-fn status_label(status: &thinkingroot_core::BranchStatus) -> &'static str {
-    use thinkingroot_core::BranchStatus;
-    match status {
-        BranchStatus::Active => "active",
-        BranchStatus::Merged { .. } => "merged",
-        BranchStatus::Abandoned { .. } => "abandoned",
+/// Wire shape of `BranchRef` as serialized by `list_branches_handler`
+/// (rest.rs:1318). Only the fields the desktop UI surfaces are decoded.
+#[derive(Debug, Deserialize)]
+struct BranchRefWire {
+    name: String,
+    parent: String,
+    status: serde_json::Value,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchesResponse {
+    branches: Vec<BranchRefWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadResponse {
+    head: String,
+}
+
+fn status_label(value: &serde_json::Value) -> &'static str {
+    if value == "active" {
+        "active"
+    } else if let Some(obj) = value.as_object() {
+        if obj.contains_key("Merged") {
+            "merged"
+        } else if obj.contains_key("Abandoned") {
+            "abandoned"
+        } else {
+            "active"
+        }
+    } else {
+        "active"
     }
 }
 
@@ -38,17 +69,22 @@ pub struct BranchListArgs {
 }
 
 #[tauri::command]
-pub fn branch_list(args: BranchListArgs) -> Result<Vec<BranchView>, String> {
-    let path = workspace_path(&args.workspace)?;
-    let head = thinkingroot_branch::read_head_branch(&path).unwrap_or_else(|_| "main".to_string());
-    let branches = thinkingroot_branch::list_branches(&path).map_err(|e| e.to_string())?;
-    Ok(branches
+pub async fn branch_list(
+    app: AppHandle,
+    args: BranchListArgs,
+) -> Result<Vec<BranchView>, String> {
+    let _ = args.workspace; // accepted for backward-compat; daemon resolves from workspace_root
+    let client = SidecarClient::ensure_active_for_branches(&app).await?;
+    let head: HeadResponse = client.get("/api/v1/head").await?;
+    let resp: BranchesResponse = client.get("/api/v1/branches").await?;
+    Ok(resp
+        .branches
         .into_iter()
         .map(|b| BranchView {
-            current: b.name == head,
-            parent: b.parent.clone(),
+            current: b.name == head.head,
+            parent: b.parent,
             status: status_label(&b.status).to_string(),
-            description: b.description.clone(),
+            description: b.description,
             name: b.name,
         })
         .collect())
@@ -63,26 +99,24 @@ pub struct BranchCreateArgs {
 }
 
 #[tauri::command]
-pub async fn branch_create(args: BranchCreateArgs) -> Result<BranchView, String> {
-    let path = workspace_path(&args.workspace)?;
-    let parent = args.parent.unwrap_or_else(|| "main".to_string());
-    let owner = std::env::var("USER").ok();
-    let branch = thinkingroot_branch::create_branch_with_owner(
-        &path,
-        &args.name,
-        &parent,
-        args.description,
-        owner,
-        thinkingroot_core::BranchPermissions::default(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+pub async fn branch_create(
+    app: AppHandle,
+    args: BranchCreateArgs,
+) -> Result<BranchView, String> {
+    let _ = args.workspace;
+    let client = SidecarClient::ensure_active_for_branches(&app).await?;
+    let body = serde_json::json!({
+        "name": args.name,
+        "parent": args.parent,
+        "description": args.description,
+    });
+    let created: BranchRefWire = client.post("/api/v1/branches", &body).await?;
     Ok(BranchView {
         current: false,
-        parent: branch.parent.clone(),
-        status: status_label(&branch.status).to_string(),
-        description: branch.description.clone(),
-        name: branch.name,
+        parent: created.parent,
+        status: status_label(&created.status).to_string(),
+        description: created.description,
+        name: created.name,
     })
 }
 
@@ -92,11 +126,21 @@ pub struct BranchCheckoutArgs {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CheckoutResponse {
+    head: String,
+}
+
 #[tauri::command]
-pub fn branch_checkout(args: BranchCheckoutArgs) -> Result<String, String> {
-    let path = workspace_path(&args.workspace)?;
-    thinkingroot_branch::write_head_branch(&path, &args.name).map_err(|e| e.to_string())?;
-    Ok(args.name)
+pub async fn branch_checkout(
+    app: AppHandle,
+    args: BranchCheckoutArgs,
+) -> Result<String, String> {
+    let _ = args.workspace;
+    let client = SidecarClient::ensure_active_for_branches(&app).await?;
+    let path = format!("/api/v1/branches/{}/checkout", urlencode(&args.name));
+    let resp: CheckoutResponse = client.post(&path, &serde_json::json!({})).await?;
+    Ok(resp.head)
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,44 +162,50 @@ pub struct MergeOutcome {
     pub blocking_reasons: Vec<String>,
 }
 
+/// Wire shape of the merge response — `merge_branch_handler` returns
+/// the `KnowledgeDiff` shape directly. We only extract the counts the
+/// desktop UI surfaces.
+#[derive(Debug, Deserialize)]
+struct MergeResponse {
+    #[serde(default)]
+    merge_allowed: bool,
+    #[serde(default)]
+    new_claims: serde_json::Value,
+    #[serde(default)]
+    auto_resolved: serde_json::Value,
+    #[serde(default)]
+    needs_review: serde_json::Value,
+    #[serde(default)]
+    blocking_reasons: Vec<String>,
+}
+
+fn count_or_len(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => a.len(),
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+        _ => 0,
+    }
+}
+
 #[tauri::command]
 pub async fn branch_merge(
     app: AppHandle,
     args: BranchMergeArgs,
 ) -> Result<MergeOutcome, String> {
-    use crate::state::AppState;
-    use tauri::Manager;
-    let path = workspace_path(&args.workspace)?;
-    let state = app.state::<AppState>();
-    let engine = {
-        let guard = state.memory.lock().await;
-        let Some(mounted) = guard.as_ref() else {
-            return Err(
-                "no workspace mounted — open the workspace in Brain first".to_string(),
-            );
-        };
-        mounted.engine.clone()
-    };
-    let engine = engine.read().await;
-    let merged_by = thinkingroot_core::MergedBy::Human {
-        user: std::env::var("USER").unwrap_or_else(|_| "desktop".to_string()),
-    };
-    let diff = engine
-        .merge_branch(
-            &path,
-            &args.name,
-            args.force,
-            args.propagate_deletions,
-            merged_by,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let _ = args.workspace;
+    let client = SidecarClient::ensure_active_for_branches(&app).await?;
+    let path = format!("/api/v1/branches/{}/merge", urlencode(&args.name));
+    let body = serde_json::json!({
+        "force": args.force,
+        "propagate_deletions": args.propagate_deletions,
+    });
+    let resp: MergeResponse = client.post(&path, &body).await?;
     Ok(MergeOutcome {
-        merged: diff.merge_allowed,
-        new_claims: diff.new_claims.len(),
-        auto_resolved: diff.auto_resolved.len(),
-        conflicts: diff.needs_review.len(),
-        blocking_reasons: diff.blocking_reasons,
+        merged: resp.merge_allowed,
+        new_claims: count_or_len(&resp.new_claims),
+        auto_resolved: count_or_len(&resp.auto_resolved),
+        conflicts: count_or_len(&resp.needs_review),
+        blocking_reasons: resp.blocking_reasons,
     })
 }
 
@@ -165,43 +215,34 @@ pub struct BranchDeleteArgs {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeletedResponse {
+    #[allow(dead_code)]
+    deleted: String,
+}
+
 #[tauri::command]
 pub async fn branch_delete(
     app: AppHandle,
     args: BranchDeleteArgs,
 ) -> Result<bool, String> {
-    use crate::state::AppState;
-    use tauri::Manager;
-    let path = workspace_path(&args.workspace)?;
-    let state = app.state::<AppState>();
-    let engine_opt = {
-        let guard = state.memory.lock().await;
-        guard.as_ref().map(|m| m.engine.clone())
-    };
-    if let Some(engine) = engine_opt {
-        let engine = engine.read().await;
-        engine
-            .delete_branch_as(
-                &path,
-                &args.name,
-                thinkingroot_serve::engine::BranchActor::User(
-                    std::env::var("USER").unwrap_or_else(|_| "desktop".to_string()),
-                ),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-    } else {
-        thinkingroot_branch::delete_branch(&path, &args.name).map_err(|e| e.to_string())?;
-    }
+    let _ = args.workspace;
+    let client = SidecarClient::ensure_active_for_branches(&app).await?;
+    let path = format!("/api/v1/branches/{}", urlencode(&args.name));
+    let _: DeletedResponse = client.delete(&path).await?;
     Ok(true)
 }
 
-fn workspace_path(name: &str) -> Result<PathBuf, String> {
-    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    registry
-        .workspaces
-        .iter()
-        .find(|w| w.name == name)
-        .map(|w| w.path.clone())
-        .ok_or_else(|| format!("workspace `{name}` not found"))
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+        {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }

@@ -1,24 +1,26 @@
 //! Memory commands.
 //!
-//! | Command       | Backend call                                      |
-//! |---------------|---------------------------------------------------|
-//! | `memory_list` | `QueryEngine::list_claims(ws, filter)`            |
-//! | `brain_load`  | Single round-trip fanning out claims + entities + |
-//! |               | relations + rooted-claim ids for the Brain view.  |
+//! Stream A — these were previously implemented by mounting a second
+//! in-process [`thinkingroot_serve::engine::QueryEngine`] inside the
+//! desktop process. That violated the Cortex Protocol invariant that
+//! the `root serve` daemon is the single owner of `graph.db` and
+//! caused the silent-corruption class the protocol was built to
+//! prevent. They now route every read through the sidecar's HTTP
+//! REST surface.
 //!
-//! Both reuse the lazily-mounted [`QueryEngine`] held in [`AppState`].
-//! The first call in a fresh session pays the mount cost; subsequent
-//! calls reuse the cached handle until the workspace pointer changes.
+//! | Command       | Daemon route                                        |
+//! |---------------|-----------------------------------------------------|
+//! | `memory_list` | `GET /api/v1/ws/{ws}/claims?claim_type=…`           |
+//! | `brain_load`  | `GET /claims` + `/entities` + `/relations` + `/claims/rooted` |
+//!
+//! `brain_load` issues four sequential GETs in `tokio::try_join!` so
+//! a single Brain mount pays the round-trip cost in parallel rather
+//! than serially.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
-use serde::Serialize;
-use tauri::{AppHandle, Manager};
-use thinkingroot_serve::engine::{ClaimFilter, ClaimInfo, EntityInfo, QueryEngine};
-use tokio::sync::RwLock;
-
-use crate::state::{AppState, MountedMemory};
+use crate::commands::sidecar_client::SidecarClient;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ClaimRow {
@@ -30,17 +32,22 @@ pub struct ClaimRow {
     pub claim_type: String,
 }
 
-impl From<ClaimInfo> for ClaimRow {
-    fn from(c: ClaimInfo) -> Self {
-        Self {
-            id: c.id,
-            tier: "unknown".to_string(),
-            confidence: c.confidence,
-            statement: c.statement,
-            source: c.source_uri,
-            claim_type: c.claim_type,
-        }
-    }
+/// Wire shape returned by `GET /claims`. Matches
+/// `thinkingroot_serve::engine::ClaimInfo`.
+#[derive(Debug, Deserialize)]
+struct ClaimInfoWire {
+    id: String,
+    statement: String,
+    confidence: f64,
+    claim_type: String,
+    source_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityInfoWire {
+    name: String,
+    entity_type: String,
+    claim_count: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -50,22 +57,22 @@ pub struct EntityRow {
     pub claim_count: usize,
 }
 
-impl From<EntityInfo> for EntityRow {
-    fn from(e: EntityInfo) -> Self {
-        Self {
-            name: e.name,
-            entity_type: e.entity_type,
-            claim_count: e.claim_count,
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Clone)]
 pub struct RelationEdge {
     pub source: String,
     pub target: String,
     pub relation_type: String,
     pub strength: f64,
+}
+
+/// Wire shape returned by `GET /relations` — mirrors the JSON body the
+/// rest.rs handler emits (lines 909-918): `{from, to, relation_type, strength}`.
+#[derive(Debug, Deserialize)]
+struct RelationWire {
+    from: String,
+    to: String,
+    relation_type: String,
+    strength: f64,
 }
 
 /// Combined payload for the Brain view — one round trip populates
@@ -83,156 +90,114 @@ pub async fn memory_list(
     app: AppHandle,
     filter: Option<String>,
 ) -> Result<Vec<ClaimRow>, String> {
-    let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
-    load_claims(&engine, &ws, filter.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    let client = SidecarClient::ensure_active(&app).await?;
+    let path = match filter {
+        Some(f) if !f.trim().is_empty() => format!(
+            "/api/v1/ws/{}/claims?claim_type={}",
+            urlencode(&client.workspace),
+            urlencode(&f),
+        ),
+        _ => format!("/api/v1/ws/{}/claims", urlencode(&client.workspace)),
+    };
+    let claims: Vec<ClaimInfoWire> = client.get(&path).await?;
+    Ok(claims
+        .into_iter()
+        .map(|c| ClaimRow {
+            id: c.id,
+            tier: tier_for(c.confidence, false),
+            confidence: c.confidence,
+            statement: c.statement,
+            source: c.source_uri,
+            claim_type: c.claim_type,
+        })
+        .collect())
 }
 
 #[tauri::command]
 pub async fn brain_load(app: AppHandle) -> Result<BrainSnapshot, String> {
-    let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
+    let client = SidecarClient::ensure_active(&app).await?;
+    let ws = urlencode(&client.workspace);
 
-    let engine_guard = engine.read().await;
-    // P6 / H3: no SQL-side cap on the brain view.  The d3 graph
-    // needs every claim to compute correct entity-claim counts and
-    // link weights; truncating to 500 silently dropped relations and
-    // misled users who scrolled past the cliff.  The React side
-    // virtualises the rendered list, so the wire payload size is
-    // the only real constraint — and even at 100K claims that's a
-    // few MB over loopback IPC, fast enough for a one-time load.
-    let claims = engine_guard
-        .list_claims(
-            &ws,
-            ClaimFilter {
-                claim_type: None,
-                entity_name: None,
-                min_confidence: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // Issue all four reads in parallel — the d3 graph + claim table
+    // need every shape before the user sees anything.
+    let claims_path = format!("/api/v1/ws/{ws}/claims");
+    let entities_path = format!("/api/v1/ws/{ws}/entities");
+    let relations_path = format!("/api/v1/ws/{ws}/relations");
+    let rooted_path = format!("/api/v1/ws/{ws}/claims/rooted");
 
-    let entities = engine_guard
-        .list_entities(&ws)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (claims, entities, relations, rooted) = tokio::try_join!(
+        client.get::<Vec<ClaimInfoWire>>(&claims_path),
+        client.get::<Vec<EntityInfoWire>>(&entities_path),
+        client.get::<Vec<RelationWire>>(&relations_path),
+        client.get::<Vec<ClaimInfoWire>>(&rooted_path),
+    )?;
 
-    let relations = engine_guard
-        .get_all_relations(&ws)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // M2: surface rooted-claims fetch failures to the UI rather than
-    // silently misclassifying every rooted claim as "attested" or
-    // "unknown".  Pre-fix `unwrap_or_default()` swallowed transient
-    // CozoDB errors and the user had no way to know their tier badges
-    // were wrong.
-    let rooted: Vec<String> = match engine_guard
-        .list_rooted_claims(&ws, None, None, None)
-        .await
-    {
-        Ok(rr) => rr.into_iter().map(|c| c.id).collect(),
-        Err(e) => {
-            tracing::error!(workspace = %ws, "list_rooted_claims failed: {e}");
-            return Err(format!(
-                "rooted-tier load failed for {ws}: {e}"
-            ));
-        }
-    };
-    drop(engine_guard);
-
+    let rooted_ids: Vec<String> = rooted.iter().map(|c| c.id.clone()).collect();
     let rooted_set: std::collections::HashSet<&str> =
-        rooted.iter().map(String::as_str).collect();
+        rooted_ids.iter().map(String::as_str).collect();
 
-    let mut claim_rows: Vec<ClaimRow> = claims.into_iter().map(ClaimRow::from).collect();
-    for row in &mut claim_rows {
-        if rooted_set.contains(row.id.as_str()) {
-            row.tier = "rooted".to_string();
-        } else if row.confidence >= 0.7 {
-            row.tier = "attested".to_string();
-        } else {
-            row.tier = "unknown".to_string();
-        }
-    }
+    let claim_rows: Vec<ClaimRow> = claims
+        .into_iter()
+        .map(|c| {
+            let is_rooted = rooted_set.contains(c.id.as_str());
+            ClaimRow {
+                id: c.id,
+                tier: tier_for(c.confidence, is_rooted),
+                confidence: c.confidence,
+                statement: c.statement,
+                source: c.source_uri,
+                claim_type: c.claim_type,
+            }
+        })
+        .collect();
 
     Ok(BrainSnapshot {
         claims: claim_rows,
-        entities: entities.into_iter().map(EntityRow::from).collect(),
-        relations: relations
+        entities: entities
             .into_iter()
-            .map(|(src, tgt, ty, strength)| RelationEdge {
-                source: src,
-                target: tgt,
-                relation_type: ty,
-                strength,
+            .map(|e| EntityRow {
+                name: e.name,
+                entity_type: e.entity_type,
+                claim_count: e.claim_count,
             })
             .collect(),
-        rooted_ids: rooted,
+        relations: relations
+            .into_iter()
+            .map(|r| RelationEdge {
+                source: r.from,
+                target: r.to,
+                relation_type: r.relation_type,
+                strength: r.strength,
+            })
+            .collect(),
+        rooted_ids,
     })
 }
 
-/// Mount or reuse a [`QueryEngine`] for the configured workspace and
-/// return a shared handle plus the workspace name. The engine is
-/// constructed directly via `thinkingroot-serve` — no runtime wrapper
-/// sits between the desktop and the engine.
-async fn mount_engine(
-    app: &AppHandle,
-) -> anyhow::Result<(Arc<RwLock<QueryEngine>>, String)> {
-    // Resolve the active workspace via the shared registry — the same
-    // pointer the workspaces sidebar's "active" tick is keyed on.
-    let registry = thinkingroot_core::WorkspaceRegistry::load()
-        .map_err(|e| anyhow::anyhow!("load workspace registry: {e}"))?;
-    let entry = registry
-        .active_entry()
-        .ok_or_else(|| anyhow::anyhow!("no active workspace selected"))?;
-    let root_path: PathBuf = entry.path.clone();
-    let workspace = entry.name.clone();
-
-    let state = app.state::<AppState>();
-    let mut guard = state.memory.lock().await;
-    let needs_mount = match guard.as_ref() {
-        Some(m) => m.root_path != root_path || m.workspace != workspace,
-        None => true,
-    };
-    if needs_mount {
-        let mut engine = QueryEngine::new();
-        engine
-            .mount(workspace.clone(), root_path.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("mount engine: {e}"))?;
-        *guard = Some(MountedMemory {
-            root_path: root_path.clone(),
-            workspace: workspace.clone(),
-            engine: Arc::new(RwLock::new(engine)),
-        });
+fn tier_for(confidence: f64, is_rooted: bool) -> String {
+    if is_rooted {
+        "rooted".to_string()
+    } else if confidence >= 0.7 {
+        "attested".to_string()
+    } else {
+        "unknown".to_string()
     }
-    let engine = guard.as_ref().expect("just mounted").engine.clone();
-    drop(guard);
-    Ok((engine, workspace))
 }
 
-async fn load_claims(
-    engine: &Arc<RwLock<QueryEngine>>,
-    workspace: &str,
-    filter_type: Option<&str>,
-) -> anyhow::Result<Vec<ClaimRow>> {
-    let guard = engine.read().await;
-    // P6 / H3: no SQL-side cap.  Match brain_load — the React side
-    // virtualises the rendered list.
-    let claims = guard
-        .list_claims(
-            workspace,
-            ClaimFilter {
-                claim_type: filter_type.map(ToString::to_string),
-                entity_name: None,
-                min_confidence: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await?;
-    Ok(claims.into_iter().map(ClaimRow::from).collect())
+fn urlencode(s: &str) -> String {
+    // Workspace names + claim_type values are kept tight in this codebase
+    // (alphanumeric + underscore + hyphen). Use a minimal percent-encoder
+    // so we don't add a percent_encoding workspace dep just for two
+    // commands.  Anything outside the safe set gets %xx-encoded.
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+        {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }

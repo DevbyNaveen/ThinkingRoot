@@ -152,6 +152,13 @@ pub struct SourceInfo {
     pub id: String,
     pub uri: String,
     pub source_type: String,
+    /// BLAKE3 content hash of the source bytes when known. Empty for
+    /// agent-contributed claims that have no underlying file. Stream B
+    /// added this field so `root status` can compare against the
+    /// daemon's `GET /api/v1/ws/{ws}/sources` without needing a
+    /// dedicated status endpoint.
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1358,6 +1365,7 @@ impl QueryEngine {
                 id: s.id.clone(),
                 uri: s.uri.clone(),
                 source_type: s.source_type.clone(),
+                content_hash: s.content_hash.clone(),
             })
             .collect())
     }

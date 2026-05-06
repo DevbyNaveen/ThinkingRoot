@@ -126,10 +126,10 @@ async fn apply_branch_diff(
         let source_uris: HashSet<String> = source_graph
             .get_all_sources()?
             .into_iter()
-            .map(|(_, uri, _)| uri)
+            .map(|(_, uri, _, _)| uri)
             .collect();
         let target_sources = target_graph.get_all_sources()?;
-        for (_id, uri, source_type) in target_sources {
+        for (_id, uri, source_type, _content_hash) in target_sources {
             let is_file_source = matches!(
                 source_type.as_str(),
                 "File" | "Document" | "Markdown" | "Code"

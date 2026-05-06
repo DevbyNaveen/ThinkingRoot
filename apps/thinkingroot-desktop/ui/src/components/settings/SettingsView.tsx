@@ -189,13 +189,10 @@ export function SettingsView() {
         });
       }
 
-      toast("Settings saved", {
-        kind: "success",
-        body:
-          "Restart the app to push new credentials into the running sidecar.",
-        durationMs: 5000,
-      });
-      // Re-read everything so indicators reflect the new state.
+      // Stream E — re-read FIRST, then toast so the success message
+      // reflects verified persistence. Pre-fix the toast fired before
+      // the re-reads, claiming "Saved" even when the daemon's lazy
+      // credential reload caught a stale field on next request.
       const [cfgRes, credsRes] = await Promise.all([
         globalConfigRead(),
         credentialsStatus(),
@@ -209,6 +206,12 @@ export function SettingsView() {
         const fresh = await workspaceLlmConfig(wsLlm.workspace_path);
         setWsLlm(fresh);
       }
+      toast("Settings saved", {
+        kind: "success",
+        body:
+          "The sidecar reads credentials lazily — your next chat picks up the new keys.",
+        durationMs: 5000,
+      });
     } catch (e) {
       toast("Save failed", {
         kind: "error",

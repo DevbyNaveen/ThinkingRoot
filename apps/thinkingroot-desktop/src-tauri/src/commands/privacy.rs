@@ -1,40 +1,34 @@
 //! Privacy dashboard backend.
 //!
-//! Two commands back the dashboard:
+//! Stream A — these were previously implemented by mounting a second
+//! in-process `QueryEngine` inside the desktop process. `privacy_forget`
+//! in particular was a **graph-mutating write** racing against the
+//! daemon's reads — exactly the silent-corruption class the Cortex
+//! Protocol forbids. They now route through the sidecar's REST surface
+//! so the daemon stays the single owner of `graph.db`.
 //!
-//! | Command           | Backend call                                        |
-//! |-------------------|-----------------------------------------------------|
-//! | `privacy_summary` | `QueryEngine::list_{sources,claims,entities}` ×3    |
-//! | `privacy_forget`  | `QueryEngine::forget_source(ws, source_uri)`        |
+//! | Command           | Daemon route                                       |
+//! |-------------------|----------------------------------------------------|
+//! | `privacy_summary` | `GET /sources` + `/claims` + `/entities`           |
+//! | `privacy_forget`  | `POST /api/v1/ws/{ws}/sources/forget`              |
 //!
-//! Both reuse the lazily-mounted [`QueryEngine`] held in [`AppState`]
-//! (the same handle that backs the Brain view).
-//!
-//! Forgetting a source is a graph mutation: it removes the source row
-//! plus every claim/entity-edge/vector/contradiction descendant, then
-//! rebuilds the read cache so the dashboard immediately reflects the
-//! redaction. There is no soft-delete tombstone — the row is gone.
+//! Forgetting a source is a graph mutation: the daemon's
+//! `forget_source` removes the source row plus every claim/entity-edge/
+//! vector/contradiction descendant, then atomically swaps the read
+//! cache. There is no soft-delete tombstone — the row is gone.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
-use serde::Serialize;
-use tauri::{AppHandle, Manager};
-use thinkingroot_serve::engine::{ClaimFilter, QueryEngine};
-use tokio::sync::RwLock;
+use crate::commands::sidecar_client::SidecarClient;
 
-use crate::state::{AppState, MountedMemory};
-
-/// One source listed in the dashboard. Mirrors
-/// `thinkingroot_serve::engine::SourceInfo`.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct PrivacySource {
     pub id: String,
     pub uri: String,
     pub source_type: String,
 }
 
-/// Aggregate counts shown above the table.
 #[derive(Debug, Serialize, Clone)]
 pub struct PrivacySummary {
     pub workspace: String,
@@ -44,47 +38,41 @@ pub struct PrivacySummary {
     pub entity_count: usize,
 }
 
-/// Read counts + source list for the active workspace. Returns an
-/// empty summary when no workspace is mounted (the dashboard renders
-/// an honest "no workspace" state rather than fabricating numbers).
+#[derive(Debug, Deserialize)]
+struct ClaimWire {
+    #[allow(dead_code)]
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EntityWire {
+    #[allow(dead_code)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgetResponse {
+    removed: usize,
+}
+
+/// Read counts + source list for the active workspace.
 #[tauri::command]
 pub async fn privacy_summary(app: AppHandle) -> Result<PrivacySummary, String> {
-    let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
-    let guard = engine.read().await;
+    let client = SidecarClient::ensure_active(&app).await?;
+    let ws = urlencode(&client.workspace);
 
-    let sources = guard
-        .list_sources(&ws)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|s| PrivacySource {
-            id: s.id,
-            uri: s.uri,
-            source_type: s.source_type,
-        })
-        .collect::<Vec<_>>();
+    let sources_path = format!("/api/v1/ws/{ws}/sources");
+    let claims_path = format!("/api/v1/ws/{ws}/claims");
+    let entities_path = format!("/api/v1/ws/{ws}/entities");
 
-    let claims = guard
-        .list_claims(
-            &ws,
-            ClaimFilter {
-                claim_type: None,
-                entity_name: None,
-                min_confidence: None,
-                limit: None,
-                offset: None,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let entities = guard
-        .list_entities(&ws)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (sources, claims, entities) = tokio::try_join!(
+        client.get::<Vec<PrivacySource>>(&sources_path),
+        client.get::<Vec<ClaimWire>>(&claims_path),
+        client.get::<Vec<EntityWire>>(&entities_path),
+    )?;
 
     Ok(PrivacySummary {
-        workspace: ws,
+        workspace: client.workspace.clone(),
         source_count: sources.len(),
         claim_count: claims.len(),
         entity_count: entities.len(),
@@ -94,59 +82,28 @@ pub async fn privacy_summary(app: AppHandle) -> Result<PrivacySummary, String> {
 
 /// Forget every claim/edge/vector descended from `source_uri`. Returns
 /// the number of source rows removed (0 if no match).
-///
-/// Acquires the engine `RwLock` in **write mode** because this is a
-/// graph mutation: the underlying `QueryEngine::forget_source` runs
-/// `remove_source_by_uri`, refetches raw rows, and atomically swaps
-/// the in-memory cache.  Pre-fix this command held a read lock over
-/// a write operation — type-safe by accident (every actual mutation
-/// inside `forget_source` flows through the inner `Mutex<StorageEngine>`)
-/// but semantically wrong: it let concurrent `privacy_summary` /
-/// `brain_load` readers observe the cache mid-rebuild between the
-/// `remove_source_by_uri` and the cache swap.  Switching to
-/// `write()` linearises the redaction against every other engine
-/// reader, which is the contract the user-facing "Forget" button
-/// promises.
 #[tauri::command]
 pub async fn privacy_forget(app: AppHandle, source_uri: String) -> Result<usize, String> {
-    let (engine, ws) = mount_engine(&app).await.map_err(|e| e.to_string())?;
-    let guard = engine.write().await;
-    guard
-        .forget_source(&ws, &source_uri)
-        .await
-        .map_err(|e| e.to_string())
+    let client = SidecarClient::ensure_active(&app).await?;
+    let path = format!(
+        "/api/v1/ws/{}/sources/forget",
+        urlencode(&client.workspace),
+    );
+    let body = serde_json::json!({ "source_uri": source_uri });
+    let resp: ForgetResponse = client.post(&path, &body).await?;
+    Ok(resp.removed)
 }
 
-async fn mount_engine(
-    app: &AppHandle,
-) -> anyhow::Result<(Arc<RwLock<QueryEngine>>, String)> {
-    let registry = thinkingroot_core::WorkspaceRegistry::load()
-        .map_err(|e| anyhow::anyhow!("load workspace registry: {e}"))?;
-    let entry = registry
-        .active_entry()
-        .ok_or_else(|| anyhow::anyhow!("no active workspace selected"))?;
-    let root_path: PathBuf = entry.path.clone();
-    let workspace = entry.name.clone();
-
-    let state = app.state::<AppState>();
-    let mut guard = state.memory.lock().await;
-    let needs_mount = match guard.as_ref() {
-        Some(m) => m.root_path != root_path || m.workspace != workspace,
-        None => true,
-    };
-    if needs_mount {
-        let mut engine = QueryEngine::new();
-        engine
-            .mount(workspace.clone(), root_path.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("mount engine: {e}"))?;
-        *guard = Some(MountedMemory {
-            root_path: root_path.clone(),
-            workspace: workspace.clone(),
-            engine: Arc::new(RwLock::new(engine)),
-        });
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+        {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
     }
-    let engine = guard.as_ref().expect("just mounted").engine.clone();
-    drop(guard);
-    Ok((engine, workspace))
+    out
 }

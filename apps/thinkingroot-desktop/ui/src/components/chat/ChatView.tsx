@@ -194,8 +194,13 @@ export function ChatView() {
     let running = true;
     onChatEvent((ev: ChatEvent) => {
       if (!running) return;
-      // eslint-disable-next-line no-console
-      console.log("[chat-event]", ev.type, ev.turn_id, ev);
+      // Stream E — keep this as debug-level so it's silenced in
+      // shipped builds. Open DevTools and set the log level to debug
+      // to re-enable for troubleshooting agent tool-use flows.
+      if (import.meta.env.DEV) {
+        // eslint-disable-next-line no-console
+        console.debug("[chat-event]", ev.type, ev.turn_id, ev);
+      }
 
       const cur = useApp.getState();
       const fromMap = cur.turnCtx[ev.turn_id];
@@ -313,8 +318,10 @@ export function ChatView() {
       }
     }).then((u) => {
       unlisten = u;
-      // eslint-disable-next-line no-console
-      console.log("[chat-event] listener registered");
+      if (import.meta.env.DEV) {
+        // eslint-disable-next-line no-console
+        console.debug("[chat-event] listener registered");
+      }
     });
     return () => {
       running = false;
@@ -407,6 +414,13 @@ export function ChatView() {
                   const cid = useApp.getState().activeConversationId;
                   if (!cid) return;
                   const id = `m-${Date.now()}-u`;
+                  // Stream E — render optimistically so the user sees
+                  // their message immediately, but on persist failure
+                  // remove the local row and surface an error toast.
+                  // Honesty rule #6: never claim something synced when
+                  // it didn't.  Pre-fix the optimistic row stayed in
+                  // the UI even after the file write failed, leading
+                  // the user to believe the message was saved.
                   appendMessage(ws, cid, {
                     id,
                     kind: "user",
@@ -419,8 +433,9 @@ export function ChatView() {
                     role: "user",
                     content,
                   }).catch((e) => {
-                    toast("Persist user message failed", {
-                      kind: "warn",
+                    useApp.getState().removeMessage(ws, cid, id);
+                    toast("Could not save your message — try again", {
+                      kind: "error",
                       body: e instanceof Error ? e.message : String(e),
                     });
                   });

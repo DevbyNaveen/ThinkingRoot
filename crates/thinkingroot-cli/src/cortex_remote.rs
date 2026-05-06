@@ -443,6 +443,181 @@ pub async fn run_reflect_remote(conn: &EngineConnection, path: &Path) -> anyhow:
     run_render_remote(conn, path).await
 }
 
+/// `root status` over the daemon's `GET /api/v1/ws/{ws}/sources` plus
+/// a local filesystem walk to detect modified/untracked/deleted files.
+///
+/// The hash-comparison happens client-side — the CLI walks the disk
+/// (which the daemon can't do) and only the source-list-with-hashes
+/// comes from the daemon. Mounts the workspace if the daemon hasn't
+/// seen it yet.
+pub async fn run_status_remote(
+    conn: &EngineConnection,
+    root: &Path,
+) -> anyhow::Result<()> {
+    use console::style;
+    use std::collections::{HashMap, HashSet};
+    use thinkingroot_core::{Config, types::ContentHash};
+
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let ws = workspace_id_for(&root);
+    let base = base_url(conn)?;
+    let client = client(UNARY_TIMEOUT)?;
+
+    // Stream B — ensure the daemon has the workspace mounted before
+    // querying its sources. `mount_workspace_handler` is idempotent
+    // (overwrites under the same name) and also pins
+    // `state.workspace_root` (Stream A).
+    let mount_url = format!("{base}/api/v1/workspaces");
+    let mount_body = serde_json::json!({
+        "name": &ws,
+        "root_path": root.display().to_string(),
+    });
+    let resp = client
+        .post(&mount_url)
+        .json(&mount_body)
+        .send()
+        .await
+        .context("failed to POST /workspaces from daemon")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "daemon mount failed ({status}): {}",
+            extract_error_message(&body)
+        );
+    }
+
+    // Resolve the active branch via `/api/v1/head` so the header we
+    // print matches what `git status`-style consumers expect.
+    let head_url = format!("{base}/api/v1/head");
+    let head: String = match client.get(&head_url).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.unwrap_or_default();
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("data")
+                        .and_then(|d| d.get("head"))
+                        .and_then(|h| h.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| "main".to_string())
+        }
+        _ => "main".to_string(),
+    };
+
+    println!(
+        "\n  {} {}",
+        style("On branch:").white().bold(),
+        style(&head).cyan().bold()
+    );
+
+    // Pull the daemon's view of compiled sources (uri + content_hash).
+    let sources_url = format!("{base}/api/v1/ws/{ws}/sources");
+    let resp = client
+        .get(&sources_url)
+        .send()
+        .await
+        .context("failed to GET sources from daemon")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "daemon status failed ({status}): {}",
+            extract_error_message(&body)
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SourceWire {
+        uri: String,
+        #[serde(default)]
+        content_hash: String,
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).context("unparsable sources response")?;
+    let sources_value = payload
+        .get("data")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("sources response missing data field"))?;
+    let sources: Vec<SourceWire> = serde_json::from_value(sources_value)
+        .context("unable to decode sources list")?;
+
+    // (uri → stored_content_hash) — match handle_status's local pattern.
+    let graph_sources: HashMap<String, String> = sources
+        .into_iter()
+        .map(|s| (s.uri, s.content_hash))
+        .collect();
+
+    let config = Config::load_merged(&root).unwrap_or_default();
+    let files_on_disk =
+        thinkingroot_parse::walker::walk(&root, &config.parsers).unwrap_or_default();
+
+    let mut modified: Vec<String> = Vec::new();
+    let mut untracked: Vec<String> = Vec::new();
+
+    for file_path in &files_on_disk {
+        let uri = file_path.to_string_lossy().to_string();
+        match graph_sources.get(&uri) {
+            Some(stored_hash) => match std::fs::read(file_path) {
+                Ok(bytes) => {
+                    if !stored_hash.is_empty()
+                        && ContentHash::from_bytes(&bytes).0 != *stored_hash
+                    {
+                        modified.push(uri);
+                    }
+                }
+                Err(_) => modified.push(uri),
+            },
+            None => untracked.push(uri),
+        }
+    }
+
+    let disk_uris: HashSet<String> = files_on_disk
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let mut deleted: Vec<String> = graph_sources
+        .keys()
+        .filter(|uri| !disk_uris.contains(uri.as_str()))
+        .cloned()
+        .collect();
+
+    modified.sort();
+    untracked.sort();
+    deleted.sort();
+
+    if modified.is_empty() && untracked.is_empty() && deleted.is_empty() {
+        println!(
+            "  {}\n",
+            style("Working tree clean — graph is in sync with disk").green()
+        );
+        return Ok(());
+    }
+
+    if !modified.is_empty() {
+        println!("\n  {}", style("Modified files:").yellow().bold());
+        for f in &modified {
+            println!("    {} {}", style("M").yellow().bold(), f);
+        }
+    }
+    if !untracked.is_empty() {
+        println!("\n  {}", style("Untracked files:").red().bold());
+        for f in &untracked {
+            println!("    {} {}", style("?").red().bold(), f);
+        }
+    }
+    if !deleted.is_empty() {
+        println!("\n  {}", style("Deleted from disk:").magenta().bold());
+        for f in &deleted {
+            println!("    {} {}", style("D").magenta().bold(), f);
+        }
+    }
+    println!();
+    Ok(())
+}
+
 /// Workspace identifier used in REST URLs. The daemon mounts a
 /// workspace by name on first reference; we pass the basename of
 /// the path so multi-workspace daemons can route correctly.

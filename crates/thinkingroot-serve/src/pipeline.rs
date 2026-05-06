@@ -439,7 +439,7 @@ async fn run_pipeline_inner(
     // file-backed sources that are no longer present on disk.
     let current_uris: HashSet<&str> = documents.iter().map(|d| d.uri.as_str()).collect();
     let mut deleted_sources: Vec<(String, String)> = Vec::new(); // (source_id, uri)
-    for (source_id, uri, source_type) in storage.graph.get_all_sources()? {
+    for (source_id, uri, source_type, _content_hash) in storage.graph.get_all_sources()? {
         let is_file_backed = matches!(source_type.as_str(), "File" | "Document");
         if is_file_backed && !current_uris.contains(uri.as_str()) {
             deleted_sources.push((source_id, uri));

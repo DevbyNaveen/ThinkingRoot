@@ -19,10 +19,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
-use thinkingroot_serve::pipeline::{
-    PipelineResult, ProgressEvent, run_pipeline_with_cancel,
-};
-use tokio::sync::mpsc;
+use thinkingroot_serve::pipeline::{PipelineResult, ProgressEvent};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AppState, CompileHandle};
@@ -119,17 +116,15 @@ pub struct WorkspaceSetActiveArgs {
 /// resolve to. Persists into the shared `WorkspaceRegistry.active` pointer
 /// — single source of truth.
 ///
-/// Drops the cached [`MountedMemory`] so the next memory read remounts
-/// against the new workspace's data directory. Pre-fix the in-process
-/// `MountedMemory` survived the registry change; calls to `brain_load`
-/// or `memory_list` immediately after switching workspaces saw the
-/// previous workspace's claims for the duration of the cache lifetime.
+/// Stream A — the next call into `SidecarClient::ensure_active` will
+/// pick up the new active workspace from the registry and remount it
+/// on the daemon side via `POST /api/v1/workspaces`.  No desktop-side
+/// cache to invalidate.
 #[tauri::command]
 pub async fn workspace_set_active(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     args: WorkspaceSetActiveArgs,
 ) -> Result<String, String> {
-    use tauri::Manager;
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
     let abs = registry
         .workspaces
@@ -141,15 +136,6 @@ pub async fn workspace_set_active(
         .set_active(&args.name)
         .map_err(|e| e.to_string())?;
     registry.save().map_err(|e| e.to_string())?;
-
-    // Invalidate the desktop's cached MountedMemory so the next read
-    // remounts against the freshly-active workspace.  Same pattern
-    // the dirty-compile path uses (see `workspace_compile`).
-    let state = app.state::<crate::state::AppState>();
-    let mut guard = state.memory.lock().await;
-    *guard = None;
-    drop(guard);
-
     Ok(abs)
 }
 
@@ -435,20 +421,10 @@ pub async fn workspace_compile(
                         incremental_summary: Some(result.incremental_summary.clone()),
                     },
                 );
-                // P4 / H6: only drop the desktop's MountedMemory when
-                // the pipeline actually wrote.  A noop compile (every
-                // file fingerprint-identical) leaves the cached engine
-                // valid — re-mounting would burn the QueryEngine
-                // construction cost for nothing.  When cache_dirty is
-                // true the mounted engine's connection-level views are
-                // stale; dropping it forces the next memory_list /
-                // brain_load to remount fresh against the post-compile
-                // graph.db.
-                if cache_dirty {
-                    let state = app_for_task.state::<AppState>();
-                    let mut guard = state.memory.lock().await;
-                    *guard = None;
-                }
+                // Stream A — no desktop-side cache to invalidate. The
+                // daemon's engine sees the post-compile state directly;
+                // `cache_dirty` is left in the wire payload for UI
+                // reasons (the Brain panel re-fetches when set).
             }
             Err(CompileDriveError::Cancelled) => {
                 let _ = app_for_task
@@ -480,39 +456,12 @@ enum CompileDriveError {
     Failed(String),
 }
 
-/// In-process pipeline driver — the pre-P4 behaviour.  Used when the
-/// sidecar handle is `None` (the bundled `root` binary failed to
-/// resolve at startup).  Pumps `ProgressEvent`s through the same
-/// mapper the SSE driver uses so the UI sees identical events
-/// regardless of which path actually ran the pipeline.
-async fn drive_compile_in_process(
-    app: AppHandle,
-    path: PathBuf,
-    label: String,
-    branch: Option<String>,
-    cancel: CancellationToken,
-) -> Result<PipelineResult, CompileDriveError> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
-    let app_for_progress = app.clone();
-    let label_for_progress = label.clone();
-    let pump = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if let Some(payload) = map_progress(&label_for_progress, event) {
-                let _ = app_for_progress.emit("workspace_compile_progress", payload);
-            }
-        }
-    });
-
-    let outcome =
-        run_pipeline_with_cancel(&path, branch.as_deref(), Some(tx), cancel).await;
-    let _ = pump.await;
-
-    match outcome {
-        Ok(result) => Ok(result),
-        Err(e) if e.is_cancelled() => Err(CompileDriveError::Cancelled),
-        Err(e) => Err(CompileDriveError::Failed(e.to_string())),
-    }
-}
+// Stream A — `drive_compile_in_process` removed. Cortex Protocol
+// rule "Compile runs in the sidecar, not in the desktop process"
+// forbids the in-process fallback. When the sidecar is unavailable
+// the dispatcher emits a clear "Engine sidecar did not finish booting"
+// error rather than silently falling back to writing graph.db from
+// the desktop process.
 
 /// Sidecar pipeline driver — POST `/api/v1/ws/{ws}/compile/stream`,
 /// parse the SSE stream, fan progress out to the UI, and yield the

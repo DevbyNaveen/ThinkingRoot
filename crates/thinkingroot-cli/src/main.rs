@@ -1079,7 +1079,16 @@ async fn async_main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Status { path }) => {
-            branch_cmd::handle_status(&path).await?;
+            // Stream B — try the daemon first per cortex protocol;
+            // fall back to in-process when --in-process is set or no
+            // daemon is running. The daemon path POSTs the workspace
+            // mount + GETs its source list (with content hashes); the
+            // CLI walks the filesystem locally for the diff.
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_status_remote(&conn, &path).await?;
+            } else {
+                branch_cmd::handle_status(&path).await?;
+            }
         }
         Some(Commands::Snapshot { name, path }) => {
             branch_cmd::handle_snapshot(&path, &name).await?;
@@ -1168,19 +1177,14 @@ async fn async_main() -> anyhow::Result<()> {
             .await?;
         }
         Some(Commands::Reflect { path, json }) => {
-            // The `--json` mode emits to a local file path; that
-            // step is purely local and does not touch CozoDB. The
-            // upstream daemon serves the JSON; we do that
-            // resolve-or-fall-back here, then the local emit step
-            // runs unconditionally. For the no-`--json` branch
-            // (terminal pretty-print) the in-process path stays
-            // canonical so progress streams to the same TTY.
-            if json.is_some() {
-                if let Some(conn) = try_resolve_remote(in_process_flag).await {
-                    cortex_remote::run_reflect_remote(&conn, &path).await?;
-                } else {
-                    reflect_cmd::run(&path, json.as_ref())?;
-                }
+            // Stream B — both --json and the terminal pretty-print
+            // path go through `try_resolve_remote` first.  The cortex
+            // protocol single-writer rule applies regardless of
+            // output format; only the rendering differs.  When no
+            // daemon is running (CI without a sidecar, --in-process),
+            // fall back to the local pipeline.
+            if let Some(conn) = try_resolve_remote(in_process_flag).await {
+                cortex_remote::run_reflect_remote(&conn, &path).await?;
             } else {
                 reflect_cmd::run(&path, json.as_ref())?;
             }

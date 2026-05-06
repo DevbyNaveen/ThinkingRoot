@@ -31,8 +31,13 @@ pub struct AppState {
     pub mcp_sessions: crate::mcp::sse::SseSessionMap,
     /// Per-agent session state for the intelligent serve layer.
     pub sessions: crate::intelligence::session::SessionStore,
-    /// Workspace root path for branch operations (None when multiple workspaces are mounted).
-    pub workspace_root: Option<PathBuf>,
+    /// Workspace root path for branch operations.
+    ///
+    /// Wrapped in `RwLock` so the desktop's mount handler can update it
+    /// when the user switches workspaces — branch operations always
+    /// target the most-recently-mounted workspace. Read via
+    /// `current_workspace_root()`; written via `set_workspace_root()`.
+    pub workspace_root: tokio::sync::RwLock<Option<PathBuf>>,
     /// Pending agent-tool approvals, keyed by `tool_use_id`. The
     /// streaming `/ask/stream` handler inserts one entry per write
     /// tool the agent proposes; the `/ask/approval/{id}` POST handler
@@ -81,7 +86,7 @@ impl AppState {
             api_key,
             mcp_sessions: crate::mcp::sse::new_session_map(),
             sessions: crate::intelligence::session::new_session_store(),
-            workspace_root,
+            workspace_root: tokio::sync::RwLock::new(workspace_root),
             pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
             engram_manager: crate::intelligence::engram::EngramManager::new(
                 crate::intelligence::engram::EngramConfig::default(),
@@ -89,6 +94,26 @@ impl AppState {
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
             active_merges: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Read the current workspace_root path.
+    ///
+    /// Stream A — replaces direct `&state.workspace_root` reads. Returns
+    /// an owned `Option<PathBuf>` so the read lock is released before
+    /// the caller does anything with the result.
+    pub async fn current_workspace_root(&self) -> Option<PathBuf> {
+        self.workspace_root.read().await.clone()
+    }
+
+    /// Update the active workspace root.
+    ///
+    /// Stream A — called by `mount_workspace_handler` after a successful
+    /// mount so branch operations target the most-recently-mounted
+    /// workspace. The desktop calls `POST /api/v1/workspaces` with the
+    /// active workspace path on every `workspace_set_active`, which
+    /// transitively flips this pointer.
+    pub async fn set_workspace_root(&self, root: Option<PathBuf>) {
+        *self.workspace_root.write().await = root;
     }
 
     /// T1.6 — get-or-create the broadcast channel for a branch.  The
@@ -125,7 +150,7 @@ impl AppState {
 /// already calls it from inside the rest crate after every successful
 /// branch mutation.
 pub async fn publish_latest_branch_event(state: &AppState, branch: &str) {
-    let Some(root) = state.workspace_root.as_ref() else {
+    let Some(root) = state.current_workspace_root().await else {
         return;
     };
     let refs_dir = root.join(".thinkingroot-refs");
@@ -239,6 +264,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/entities", get(list_entities))
             .route("/ws/{ws}/entities/{name}", get(get_entity))
             .route("/ws/{ws}/claims", get(list_claims))
+            .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
+            .route("/ws/{ws}/sources", get(list_sources_handler))
+            .route("/ws/{ws}/sources/forget", post(forget_source_handler))
             .route("/ws/{ws}/relations", get(get_all_relations))
             .route("/ws/{ws}/relations/{entity}", get(get_entity_relations))
             .route("/ws/{ws}/artifacts", get(list_artifacts))
@@ -590,6 +618,13 @@ async fn mount_workspace_handler(
     // "remount under the same name returns stale claim ids" case.
     state.engram_manager.invalidate_workspace(&name).await;
 
+    // Stream A — flip the daemon's workspace_root pointer so branch
+    // operations target the most-recently-mounted workspace. The desktop
+    // calls this on every workspace_set_active so the daemon and the
+    // desktop's idea of "active workspace" stay in lockstep without
+    // requiring a daemon restart.
+    state.set_workspace_root(Some(root_path.clone())).await;
+
     let rest_url = format!("/api/v1/ws/{name}/");
     let mcp_url = "/mcp/sse".to_string();
     ok_response(MountWorkspaceResponse {
@@ -858,6 +893,66 @@ async fn list_entities(State(state): State<Arc<AppState>>, Path(ws): Path<String
     let engine = state.engine.read().await;
     match engine.list_entities(&ws).await {
         Ok(entities) => ok_response(entities).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Stream A — `GET /api/v1/ws/{ws}/sources`. Lists every source row in
+/// the workspace (id, uri, source_type). Backs the desktop's privacy
+/// dashboard and any consumer that needs to enumerate sources without
+/// loading their claims.
+async fn list_sources_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_sources(&ws).await {
+        Ok(sources) => ok_response(sources).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ForgetSourceRequest {
+    source_uri: String,
+}
+
+/// Stream A — `POST /api/v1/ws/{ws}/sources/forget`. Removes every
+/// claim/edge/vector descended from `source_uri` and atomically rebuilds
+/// the in-memory cache. Returns `{ "removed": usize }` (0 when the URI
+/// did not match any source). Idempotent — second call is a no-op.
+async fn forget_source_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<ForgetSourceRequest>,
+) -> Response {
+    if body.source_uri.trim().is_empty() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "source_uri is required",
+        );
+    }
+    let engine = state.engine.read().await;
+    match engine.forget_source(&ws, &body.source_uri).await {
+        Ok(removed) => {
+            ok_response(serde_json::json!({ "removed": removed })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Stream A — `GET /api/v1/ws/{ws}/claims/rooted`. Returns the rooted-
+/// tier claims (Phase 6.5 admission gate passed) for the workspace.
+/// Backs the Brain view's tier badging without forcing a second
+/// round-trip through `list_claims` + a separate rooted-id lookup.
+async fn list_rooted_claims_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_rooted_claims(&ws, None, None, None).await {
+        Ok(claims) => ok_response(claims).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
@@ -1153,9 +1248,9 @@ async fn compile_stream(
     use crate::pipeline::{PipelineOptions, ProgressEvent, run_pipeline_with_options};
     use tokio_util::sync::CancellationToken;
 
-    let root_path = match (body.root_path.as_deref(), state.workspace_root.as_ref()) {
+    let root_path = match (body.root_path.as_deref(), state.current_workspace_root().await) {
         (Some(p), _) => PathBuf::from(p),
-        (None, Some(r)) => r.clone(),
+        (None, Some(r)) => r,
         (None, None) => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1282,8 +1377,8 @@ async fn verify_ws(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -
 // ─── Branch Handlers ─────────────────────────────────────────
 
 async fn list_branches_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             // No workspace root set — return empty list (server started without --path)
             let empty: Vec<serde_json::Value> = vec![];
@@ -1301,8 +1396,8 @@ async fn list_branches_handler(State(state): State<Arc<AppState>>) -> impl IntoR
 }
 
 async fn get_head_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return ok_response(serde_json::json!({ "head": "main" })).into_response();
         }
@@ -1344,8 +1439,8 @@ async fn create_branch_handler(
     headers: HeaderMap,
     Json(body): Json<CreateBranchRequest>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1534,8 +1629,8 @@ async fn set_branch_redaction_handler(
     Path(branch): Path<String>,
     Json(body): Json<SetRedactionRequest>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1568,8 +1663,8 @@ async fn list_branch_events_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1675,8 +1770,8 @@ async fn branch_stats_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1786,8 +1881,8 @@ async fn create_tag_handler(
     headers: HeaderMap,
     Json(body): Json<CreateTagRequest>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1819,8 +1914,8 @@ async fn create_tag_handler(
 }
 
 async fn list_tags_handler(State(state): State<Arc<AppState>>) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             // Empty list rather than error — matches list_branches
             // behaviour and lets unconfigured daemons stay
@@ -1843,8 +1938,8 @@ async fn get_tag_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1878,8 +1973,8 @@ async fn get_tag_handler(
 // on `POST /branches` to materialise the bundled defaults.
 
 async fn list_branch_templates_handler(State(state): State<Arc<AppState>>) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1904,8 +1999,8 @@ async fn upsert_branch_template_handler(
     State(state): State<Arc<AppState>>,
     Json(template): Json<thinkingroot_branch::templates::BranchTemplate>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1952,8 +2047,8 @@ async fn get_branch_template_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1985,8 +2080,8 @@ async fn delete_branch_template_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2057,8 +2152,8 @@ struct LineageResponse {
 }
 
 async fn branch_lineage_handler(State(state): State<Arc<AppState>>) -> Response {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2175,8 +2270,8 @@ struct OpenProposalRequest {
     required_checks: Option<Vec<String>>,
 }
 
-fn refs_dir_from_state(state: &AppState) -> std::result::Result<PathBuf, Response> {
-    let root = state.workspace_root.as_ref().ok_or_else(|| {
+async fn refs_dir_from_state(state: &AppState) -> std::result::Result<PathBuf, Response> {
+    let root = state.current_workspace_root().await.ok_or_else(|| {
         err_response(
             StatusCode::BAD_REQUEST,
             "NOT_CONFIGURED",
@@ -2216,7 +2311,7 @@ async fn open_proposal_handler(
     Path(branch): Path<String>,
     Json(body): Json<OpenProposalRequest>,
 ) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2258,7 +2353,7 @@ async fn list_branch_proposals_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2279,7 +2374,7 @@ async fn list_branch_proposals_handler(
 }
 
 async fn list_all_proposals_handler(State(state): State<Arc<AppState>>) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2297,7 +2392,7 @@ async fn get_proposal_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2330,7 +2425,7 @@ async fn review_proposal_handler(
     Path(id): Path<String>,
     Json(body): Json<ReviewProposalRequest>,
 ) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2375,7 +2470,7 @@ async fn close_proposal_handler(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let refs_dir = match refs_dir_from_state(&state) {
+    let refs_dir = match refs_dir_from_state(&state).await {
         Ok(d) => d,
         Err(resp) => return resp,
     };
@@ -2404,8 +2499,8 @@ async fn delete_branch_handler(
     headers: HeaderMap,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2435,8 +2530,8 @@ async fn checkout_branch_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2459,8 +2554,8 @@ async fn diff_branch_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2556,8 +2651,8 @@ async fn merge_branch_handler(
     Query(query): Query<MergeQuery>,
     body: Option<Json<MergeBranchRequest>>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2673,8 +2768,8 @@ async fn merge_into_branch_handler(
     Query(query): Query<MergeQuery>,
     body: Option<Json<MergeBranchRequest>>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2797,8 +2892,8 @@ async fn rebase_branch_handler(
     headers: HeaderMap,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2836,8 +2931,8 @@ async fn rollback_merge_handler(
     State(state): State<Arc<AppState>>,
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
-    let root = match &state.workspace_root {
-        Some(r) => r.clone(),
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
         None => {
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -2993,9 +3088,8 @@ async fn ask_handler(
     // Resolve workspace root for sessions directory.
     // Prefer AppState.workspace_root (set by --path), fall back to engine's per-workspace root.
     let sessions_dir = state
-        .workspace_root
-        .as_ref()
-        .cloned()
+        .current_workspace_root()
+        .await
         .or_else(|| engine.workspace_root_path(&ws))
         .map(|p| p.join("sessions"))
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"));
@@ -3127,9 +3221,8 @@ async fn ask_stream_handler(
     let engine = state.engine.read().await;
 
     let sessions_dir = state
-        .workspace_root
-        .as_ref()
-        .cloned()
+        .current_workspace_root()
+        .await
         .or_else(|| engine.workspace_root_path(&ws))
         .map(|p| p.join("sessions"))
         .unwrap_or_else(|| std::path::PathBuf::from("sessions"));
@@ -3332,9 +3425,8 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         }
     };
     let workspace_root = state
-        .workspace_root
-        .as_ref()
-        .cloned()
+        .current_workspace_root()
+        .await
         .or_else(|| engine.workspace_root_path(&ws));
     let snapshot = engine.workspace_chat_snapshot(&ws).await;
     let chat = snapshot

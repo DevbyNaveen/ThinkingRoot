@@ -52,6 +52,14 @@ interface AppStore {
     messageId: string,
     patch: Partial<ChatMessage>,
   ) => void;
+  /** Stream E — remove a single message from the local cache. Used by
+   *  the chat composer to roll back optimistic user-message inserts
+   *  when `conversationsAppendMessage` fails (honesty rule #6). */
+  removeMessage: (
+    workspace: string,
+    conversationId: string,
+    messageId: string,
+  ) => void;
   setMessages: (workspace: string, conversationId: string, msgs: ChatMessage[]) => void;
   streaming: StreamState | null;
   setStreaming: (s: StreamState | null) => void;
@@ -163,6 +171,17 @@ export const useApp = create<AppStore>()(
             m.id === messageId ? { ...m, ...patch } : m,
           );
           return { messages: { ...s.messages, [k]: next } };
+        }),
+      removeMessage: (workspace, conversationId, messageId) =>
+        set((s) => {
+          const k = key(workspace, conversationId);
+          const current = s.messages[k] ?? [];
+          return {
+            messages: {
+              ...s.messages,
+              [k]: current.filter((m) => m.id !== messageId),
+            },
+          };
         }),
       setMessages: (workspace, conversationId, msgs) =>
         set((s) => ({
