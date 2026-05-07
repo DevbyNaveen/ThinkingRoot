@@ -595,7 +595,11 @@ impl Extractor {
                     Vec<ChunkWork>,
                     Vec<crate::batch::BatchChunkResult>,
                 );
-                type BatchFail = (usize, usize);
+                // (range_start, range_end, is_permanent, error_fingerprint)
+                // — `is_permanent` lets the collector bail fast when N
+                // consecutive batches all fail with permanent errors
+                // (typically a stale API key 401'ing every call).
+                type BatchFail = (usize, usize, bool, String);
                 let meta = BatchMeta {
                     batch_idx,
                     range_start,
@@ -607,7 +611,12 @@ impl Extractor {
                     Err(_) => {
                         // Semaphore closed (normally only on shutdown).
                         // Treat as a permanent failure so the caller knows.
-                        return Err::<BatchOk, BatchFail>((range_start, range_end));
+                        return Err::<BatchOk, BatchFail>((
+                            range_start,
+                            range_end,
+                            true,
+                            "extractor semaphore closed (shutdown)".into(),
+                        ));
                     }
                 };
                 let _permit = permit;
@@ -651,12 +660,19 @@ impl Extractor {
                         Ok((meta, batch_work, batch_results))
                     }
                     Err(e) => {
+                        let is_permanent = e.is_permanent();
                         tracing::warn!(
                             range_start,
                             range_end,
+                            permanent = is_permanent,
                             "batch extraction failed permanently: {e}"
                         );
-                        Err((range_start, range_end))
+                        // Capture a short error fingerprint so the
+                        // mass-permanent-failure bail-out can quote the
+                        // upstream provider's actual message instead of
+                        // a generic "all batches failed".
+                        let msg: String = e.to_string().chars().take(240).collect();
+                        Err((range_start, range_end, is_permanent, msg))
                     }
                 }
             });
@@ -671,6 +687,18 @@ impl Extractor {
         // `join_next().await` and the desktop's Stop button could
         // wait minutes against a slow-completing batch before the
         // pipeline acknowledged the cancel.
+        //
+        // Mass-permanent-failure bail-out: when the LLM key is dead
+        // every batch returns the same 401/403/404 instantly.  Pre-fix
+        // the pipeline still issued all `total_batches` (could be
+        // 477+) requests, taking ~30 minutes to "complete" with zero
+        // claims.  Now we bail after `MAX_CONSECUTIVE_PERMANENT_FAILURES`
+        // back-to-back permanent errors with a clear actionable error
+        // quoting the upstream message.
+        const MAX_CONSECUTIVE_PERMANENT_FAILURES: usize =
+            crate::extractor_consts::MAX_CONSECUTIVE_PERMANENT_FAILURES;
+        let mut consecutive_permanent: usize = 0;
+        let mut last_permanent_msg: Option<String> = None;
         loop {
             let join_result = match self.cancel.as_ref() {
                 Some(tok) => {
@@ -702,10 +730,42 @@ impl Extractor {
                 }
             };
             let (batch_meta, batch_work, batch_results) = match batch_outcome {
-                Ok(triple) => triple,
-                Err((rs, re)) => {
+                Ok(triple) => {
+                    // A single successful batch means auth + endpoint
+                    // are working — reset the consecutive-failure run
+                    // so a sporadic transient error mid-compile cannot
+                    // accidentally trip the bail-out threshold.
+                    consecutive_permanent = 0;
+                    last_permanent_msg = None;
+                    triple
+                }
+                Err((rs, re, is_permanent, msg)) => {
                     output.failed_batches += 1;
                     output.failed_batch_ranges.push((rs, re));
+                    if is_permanent {
+                        consecutive_permanent += 1;
+                        last_permanent_msg = Some(msg);
+                        if consecutive_permanent >= MAX_CONSECUTIVE_PERMANENT_FAILURES {
+                            join_set.shutdown().await;
+                            let detail = last_permanent_msg.as_deref().unwrap_or("(no detail)");
+                            tracing::error!(
+                                consecutive = consecutive_permanent,
+                                "extraction aborted: {consecutive_permanent} consecutive batches \
+                                 failed with permanent (auth / endpoint) errors — bailing instead \
+                                 of burning the remaining batches"
+                            );
+                            return Err(thinkingroot_core::Error::LlmProvider {
+                                provider: "extractor".into(),
+                                message: format!(
+                                    "extraction aborted after {consecutive_permanent} consecutive \
+                                     permanent batch failures (likely a stale or revoked LLM key, \
+                                     wrong region/endpoint, or a deleted deployment).  Fix the \
+                                     provider config and re-run `root compile`.  Last upstream \
+                                     error: {detail}"
+                                ),
+                            });
+                        }
+                    }
                     continue;
                 }
             };

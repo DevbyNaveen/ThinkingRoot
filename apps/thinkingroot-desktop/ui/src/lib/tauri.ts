@@ -355,6 +355,27 @@ export async function workspaceCompile(args: WorkspaceCompileArgs): Promise<stri
   });
 }
 
+/**
+ * Stop the in-flight compile.  Returns `true` if a compile was running
+ * and was signalled to cancel; `false` if no compile was in flight.
+ * The Tauri side fires the `CancellationToken` registered in
+ * `AppState.active_compile`; the pipeline exits at the next phase
+ * boundary with `Error::Cancelled`.
+ */
+export async function workspaceCompileStop(): Promise<boolean> {
+  return invoke<boolean>("workspace_compile_stop");
+}
+
+export interface CompileStatus {
+  running: boolean;
+  workspace: string | null;
+}
+
+/** Snapshot whether a compile is currently running (and for which workspace). */
+export async function workspaceCompileStatus(): Promise<CompileStatus> {
+  return invoke<CompileStatus>("workspace_compile_status");
+}
+
 export type CompileProgress =
   | { phase: "started"; workspace: string }
   // Emitted while the desktop is waiting for the bundled `root`

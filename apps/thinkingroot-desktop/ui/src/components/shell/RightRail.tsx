@@ -22,6 +22,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Loader2,
+  Square,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -32,6 +33,7 @@ import {
   branchCheckout,
   branchList,
   workspaceCompile,
+  workspaceCompileStop,
   workspaceList,
   type BranchView,
   type WorkspaceView,
@@ -304,7 +306,31 @@ function SettingsHelp() {
 
 function CompilationProgressIndicator() {
   const progress = useApp((s) => s.compileProgress);
+  const [stopping, setStopping] = useState(false);
   if (!progress) return null;
+
+  async function handleStop() {
+    setStopping(true);
+    try {
+      const ran = await workspaceCompileStop();
+      if (ran) {
+        toast("Stopping compile…", {
+          kind: "info",
+          body: "Pipeline will exit at the next phase boundary.",
+        });
+      } else {
+        // No active compile — likely already finished/failed.
+        toast("No compile in flight", { kind: "info" });
+      }
+    } catch (e) {
+      toast("Stop failed", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setStopping(false);
+    }
+  }
 
   let title = "Compiling...";
   let details = "";
@@ -385,9 +411,26 @@ function CompilationProgressIndicator() {
         )}
         <h3 className="font-medium tracking-tight text-foreground">{title}</h3>
         {!isDone && !isError && (
-          <span className="ml-auto font-mono text-[9px] text-accent font-medium">
-            {percent}%
-          </span>
+          <>
+            <span className="ml-auto font-mono text-[9px] text-accent font-medium">
+              {percent}%
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={handleStop}
+              disabled={stopping}
+              aria-label="Stop compile"
+              title="Stop compile"
+              className="h-5 w-5 text-muted-foreground hover:text-destructive"
+            >
+              {stopping ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <Square className="size-3" />
+              )}
+            </Button>
+          </>
         )}
       </header>
       <div className="flex flex-col gap-1.5 relative z-10 mt-1">
