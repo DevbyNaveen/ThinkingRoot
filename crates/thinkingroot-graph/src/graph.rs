@@ -79,10 +79,16 @@ impl GraphStore {
     /// Run the schema-creation step against a `from_db_for_testing` store
     /// so fixture tests can `:put` against the live shape without mounting
     /// a workspace. No migrations — the fresh schema already matches the
-    /// post-Compile-Completeness-Contract layout.
+    /// post-Compile-Completeness-Contract layout.  Indexes are created
+    /// to mirror the production `init` path so query-planner behaviour
+    /// is identical between tests and the daemon (a bug surfaced
+    /// 2026-05-07 when an AEP query parsed differently with vs without
+    /// indexes attached).
     #[doc(hidden)]
     pub fn init_for_testing(&self) -> Result<()> {
-        self.create_schema()
+        self.create_schema()?;
+        self.create_indexes()?;
+        Ok(())
     }
 
     /// Open or create a CozoDB database at the given path and initialize the schema.
@@ -855,6 +861,68 @@ impl GraphStore {
             }
         }
 
+        // ── Migration 0 (pre-tier): add grounding_method column for very
+        // old workspaces that predate the grounding pipeline.  Without
+        // this step, Migration 1's `:replace` script would fail with
+        // "stored relation 'claims' does not have field 'grounding_method'"
+        // and the daemon would refuse to mount the workspace at all.
+        let probe_grounding = self.db.run_script(
+            "?[grounding_method] := *claims{id: 'probe-noop', grounding_method}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if probe_grounding.is_err() {
+            // Probe `grounding_score` too; if it's also missing we have
+            // a pre-grounding schema entirely.  Both columns share the
+            // same era so they migrate together.
+            let probe_gscore = self.db.run_script(
+                "?[grounding_score] := *claims{id: 'probe-noop', grounding_score}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            );
+            let migration_grounding = if probe_gscore.is_err() {
+                // No grounding_score either — pre-grounding schema.
+                r#"
+                {
+                    ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method] :=
+                        *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at},
+                        grounding_score = -1.0,
+                        grounding_method = ""
+                    :replace claims {id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String}
+                }
+            "#
+            } else {
+                // grounding_score present, grounding_method missing.
+                r#"
+                {
+                    ?[id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score, grounding_method] :=
+                        *claims{id, statement, claim_type, source_id, confidence, sensitivity, workspace_id, created_at, grounding_score},
+                        grounding_method = ""
+                    :replace claims {id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String}
+                }
+            "#
+            };
+            match self.db.run_default(migration_grounding) {
+                Ok(_) => {
+                    tracing::info!(
+                        "claims grounding_method migration applied (legacy pre-grounding workspace)"
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("not found")
+                        && !msg.contains("does not exist")
+                        && !msg.contains("does not have field")
+                    {
+                        return Err(Error::GraphStorage(format!(
+                            "claims grounding_method migration failed (workspace too old to \
+                             auto-migrate): {msg}"
+                        )));
+                    }
+                }
+            }
+        }
+
         // ── Migration 1: add extraction_tier column ──────────────────────────
         let probe = self.db.run_script(
             "?[extraction_tier] := *claims{id: 'probe-noop', extraction_tier}",
@@ -876,7 +944,15 @@ impl GraphStore {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                    // Cozo errors come in three idiomatic shapes for missing
+                    // schema: "not found", "does not exist", "does not have
+                    // field".  Match all three so the migration silently
+                    // no-ops on any flavor of legacy schema rather than
+                    // crashing the daemon's mount loop.
+                    if !msg.contains("not found")
+                        && !msg.contains("does not exist")
+                        && !msg.contains("does not have field")
+                    {
                         return Err(Error::GraphStorage(format!(
                             "claims extraction_tier migration failed: {msg}"
                         )));
@@ -907,7 +983,10 @@ impl GraphStore {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                    if !msg.contains("not found")
+                        && !msg.contains("does not exist")
+                        && !msg.contains("does not have field")
+                    {
                         return Err(Error::GraphStorage(format!(
                             "claims event_date migration failed: {msg}"
                         )));
@@ -952,7 +1031,10 @@ impl GraphStore {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !msg.contains("not found") && !msg.contains("does not exist") {
+                    if !msg.contains("not found")
+                        && !msg.contains("does not exist")
+                        && !msg.contains("does not have field")
+                    {
                         return Err(Error::GraphStorage(format!(
                             "claims rooting migration failed: {msg}"
                         )));
@@ -1037,7 +1119,10 @@ impl GraphStore {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if !msg.contains("not found") && !msg.contains("does not exist") {
+                if !msg.contains("not found")
+                    && !msg.contains("does not exist")
+                    && !msg.contains("does not have field")
+                {
                     return Err(Error::GraphStorage(format!(
                         "claims byte_range migration failed: {msg}"
                     )));
@@ -1138,7 +1223,10 @@ impl GraphStore {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if !msg.contains("not found") && !msg.contains("does not exist") {
+                if !msg.contains("not found")
+                    && !msg.contains("does not exist")
+                    && !msg.contains("does not have field")
+                {
                     return Err(Error::GraphStorage(format!(
                         "claims content_blake3 migration failed: {msg}"
                     )));

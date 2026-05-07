@@ -257,12 +257,14 @@ pub const Q_SENSITIVITY_FILTER: &str = r#"
 // (A, A). Same shape as `Q_SUPERSESSION_CHAIN` — see that doc-comment.
 // ---------------------------------------------------------------------------
 pub const Q_DERIVATION_ROOT: &str = r#"
+    edge[parent, child] := *derivation_edges{parent_claim_id: parent, child_claim_id: child}
+    has_parent[c] := edge[_parent, c]
     droot[child, root] :=
-        *derivation_edges{parent_claim_id: root, child_claim_id: child},
+        edge[root, child],
         root != child,
-        not *derivation_edges{child_claim_id: root}
+        not has_parent[root]
     droot[child, root] :=
-        *derivation_edges{parent_claim_id: mid, child_claim_id: child},
+        edge[mid, child],
         mid != child,
         droot[mid, root],
         root != child
@@ -418,6 +420,10 @@ pub fn dv_str_list<S: AsRef<str>>(items: &[S]) -> DataValue {
 /// Convenience: run a parameterised AEP query against the given store.
 /// Wraps `db.run_script` with the immutable script flag so callers can
 /// stay focused on the query string + params.
+///
+/// On failure the error message includes the first 80 chars of the query
+/// itself so log readers can identify which AEP query went wrong without
+/// having to instrument every call site.
 pub fn run_aep(
     graph: &GraphStore,
     query: &str,
@@ -426,7 +432,23 @@ pub fn run_aep(
     graph
         .raw_db()
         .run_script(query, params, ScriptMutability::Immutable)
-        .map_err(|e| Error::GraphStorage(format!("aep query failed: {e}")))
+        .map_err(|e| {
+            // First non-empty trimmed line gives a recognisable preview
+            // (e.g. `?[id, statement, sensitivity] :=`).
+            let preview = query
+                .lines()
+                .map(|s| s.trim())
+                .find(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 100 {
+                        format!("{}…", &s[..100])
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "(empty query)".to_string());
+            Error::GraphStorage(format!("aep query failed [{preview}]: {e}"))
+        })
 }
 
 // ===========================================================================
@@ -834,6 +856,25 @@ mod tests {
             .map(|row| (dv_to_string(&row[0]), dv_to_string(&row[1])))
             .collect();
         assert!(pairs.contains(&("c-1".to_string(), "c-3".to_string())));
+    }
+
+    #[test]
+    fn q_derivation_root_handles_empty_derivation_edges() {
+        // Pins the production bug surfaced 2026-05-07: when
+        // derivation_edges has zero rows (the common case for a fresh
+        // workspace that's never had Reflect compose claims),
+        // Q_DERIVATION_ROOT must return zero rows without raising
+        // "Symbol '~1' in rule head is unbound".
+        let store = mem_store();
+        // No seeding — derivation_edges schema exists from `init_for_testing`
+        // but has no rows.
+        let r = run_aep(&store, Q_DERIVATION_ROOT, cluster_set())
+            .expect("Q_DERIVATION_ROOT must run cleanly against empty derivation_edges");
+        assert_eq!(
+            r.rows.len(),
+            0,
+            "empty derivation_edges must produce zero roots, not crash the rule"
+        );
     }
 
     #[test]

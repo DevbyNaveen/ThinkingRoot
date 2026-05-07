@@ -85,6 +85,32 @@ pub async fn handle_branch(
     }
 
     if let Some(branch_name) = name {
+        // Reject names that look like subcommand verbs the user likely
+        // meant to invoke as a flag.  `root branch list` parsed as
+        // "create a branch literally named 'list'" was a real footgun —
+        // git users especially expect verb-style sub-subcommands.
+        const RESERVED_VERBS: &[(&str, &str)] = &[
+            ("list", "--list"),
+            ("ls", "--list"),
+            ("show", "--list"),
+            ("delete", "--delete <NAME>"),
+            ("rm", "--delete <NAME>"),
+            ("remove", "--delete <NAME>"),
+            ("purge", "--purge <NAME>"),
+            ("gc", "--gc"),
+        ];
+        if let Some((_, flag)) = RESERVED_VERBS
+            .iter()
+            .find(|(verb, _)| verb.eq_ignore_ascii_case(branch_name))
+        {
+            anyhow::bail!(
+                "'{branch_name}' is reserved — did you mean `root branch {flag}`?  \
+                 (`root branch <NAME>` creates a branch with that name; common verbs \
+                 like 'list', 'delete', 'rm', 'gc' are rejected to prevent the silent \
+                 footgun of accidentally creating a branch named after a verb.)"
+            );
+        }
+
         let parent = read_head_branch(root).unwrap_or_else(|_| "main".to_string());
         let branch = create_branch(root, branch_name, &parent, description)
             .await
@@ -613,6 +639,36 @@ mod tests {
         assert!(
             result.is_ok(),
             "branch --list on empty workspace should succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_verb_names_are_rejected() {
+        // Pins the UX guard against `root branch list` silently creating
+        // a branch named "list" (the original footgun this guard fixes).
+        let dir = TempDir::new().unwrap();
+        for verb in &["list", "ls", "delete", "rm", "remove", "purge", "gc", "show"] {
+            let result =
+                handle_branch(dir.path(), Some(*verb), false, None, None, false, None).await;
+            let err = result.expect_err(&format!(
+                "creating a branch named '{verb}' should be rejected"
+            ));
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("reserved") && msg.contains("did you mean"),
+                "error for '{verb}' should hint at the right flag, got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_verb_check_is_case_insensitive() {
+        let dir = TempDir::new().unwrap();
+        let result =
+            handle_branch(dir.path(), Some("LIST"), false, None, None, false, None).await;
+        assert!(
+            result.is_err(),
+            "case-insensitive verb 'LIST' must be rejected"
         );
     }
 }

@@ -1197,15 +1197,25 @@ async fn try_resolve_remote(
 /// running. The new parity subcommands (proposals, tags, branch
 /// extras) require a daemon because their REST routes are the only
 /// implementation; falling back to in-process would silently mean
-/// "did nothing." This wrapper surfaces a clear error.
+/// "did nothing." This wrapper surfaces a clear error tailored to
+/// whether the user explicitly opted into `--in-process` or just hit
+/// the daemon-not-running case.
 async fn require_remote(
     in_process_flag: bool,
 ) -> anyhow::Result<thinkingroot_core::cortex::EngineConnection> {
     try_resolve_remote(in_process_flag).await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "this subcommand requires a running daemon — start one with `root serve` \
-             in another terminal (or remove --in-process)."
-        )
+        if in_process_flag {
+            anyhow::anyhow!(
+                "this subcommand has no in-process implementation — it is REST-only. \
+                 Drop the `--in-process` flag and start a daemon with `root serve` in \
+                 another terminal."
+            )
+        } else {
+            anyhow::anyhow!(
+                "this subcommand requires a running daemon. Start one with `root serve` \
+                 in another terminal."
+            )
+        }
     })
 }
 

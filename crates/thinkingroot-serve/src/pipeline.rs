@@ -289,6 +289,13 @@ pub async fn run_pipeline_with_options(
     result
 }
 
+// `#[allow(unused_assignments)]` is intentional: the `mark_phase!` macro
+// updates `last_phase_end = now;` for the next invocation, so the very
+// last `mark_phase!("audit")` call records `last_phase_end` for nobody.
+// rustc's unused-assignment lint does not understand this control-flow
+// pattern (it is correct in general, just not for an instrumentation
+// macro emitted at every phase boundary).
+#[allow(unused_assignments)]
 async fn run_pipeline_inner(
     root_path: &Path,
     branch: Option<&str>,

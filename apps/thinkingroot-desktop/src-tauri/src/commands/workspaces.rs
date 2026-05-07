@@ -329,7 +329,7 @@ pub async fn workspace_compile(
         let sidecar = {
             let state = app_for_task.state::<AppState>();
             let mut result = None;
-            for attempt in 0u32..SIDECAR_BOOT_MAX_ATTEMPTS {
+            for _attempt in 0u32..SIDECAR_BOOT_MAX_ATTEMPTS {
                 {
                     let guard = state.sidecar.lock().await;
                     if let Some(h) = guard.as_ref() {

@@ -138,17 +138,14 @@ async fn apply_branch_diff(
                 let mut candidate_claims = Vec::new();
                 let mut candidate_entities = HashSet::new();
 
-                for (sid, _, _) in target_graph.find_sources_by_uri(&uri).unwrap_or_default() {
-                    candidate_claims.extend(
-                        target_graph
-                            .get_claim_ids_for_source(&sid)
-                            .unwrap_or_default(),
-                    );
-                    candidate_entities.extend(
-                        target_graph
-                            .get_entity_ids_for_source(&sid)
-                            .unwrap_or_default(),
-                    );
+                // Graph-query failures here are NOT non-fatal: a silent
+                // empty list would skip the vector-index purge below, leaving
+                // dangling embeddings for claims/entities we are about to
+                // delete from the graph — the same silent-corruption mode
+                // documented in the comment block ~40 lines below.  Propagate.
+                for (sid, _, _) in target_graph.find_sources_by_uri(&uri)? {
+                    candidate_claims.extend(target_graph.get_claim_ids_for_source(&sid)?);
+                    candidate_entities.extend(target_graph.get_entity_ids_for_source(&sid)?);
                 }
 
                 let removed = target_graph.remove_source_by_uri(&uri)?;
@@ -164,16 +161,11 @@ async fn apply_branch_diff(
                         vec_ids.push(format!("claim:{cid}"));
                     }
                     for eid in candidate_entities {
-                        match target_graph.get_entity_by_id(&eid) {
-                            Ok(None) => vec_ids.push(format!("entity:{eid}")),
-                            Ok(Some(_)) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    "merge: failed to check existence of candidate entity '{}' (non-fatal): {}",
-                                    eid,
-                                    e
-                                );
-                            }
+                        // Existence-check failure must propagate: a silent
+                        // skip leaves a dangling vector entry for an entity
+                        // we are about to consider orphaned.
+                        if target_graph.get_entity_by_id(&eid)?.is_none() {
+                            vec_ids.push(format!("entity:{eid}"));
                         }
                     }
 

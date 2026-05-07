@@ -1914,9 +1914,39 @@ async fn branch_stats_handler(
             );
         }
     };
-    let claims = graph.get_all_claims_with_sources().unwrap_or_default();
-    let entities = graph.get_all_entities().unwrap_or_default();
-    let sources = graph.get_all_sources().unwrap_or_default();
+    // Stats queries must propagate graph errors — returning 0s on a query
+    // failure would lie to the caller (a stats response with all zeros is
+    // indistinguishable from an empty branch).
+    let claims = match graph.get_all_claims_with_sources() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &format!("branch_stats: failed to read claims for branch '{branch}': {e}"),
+            );
+        }
+    };
+    let entities = match graph.get_all_entities() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &format!("branch_stats: failed to read entities for branch '{branch}': {e}"),
+            );
+        }
+    };
+    let sources = match graph.get_all_sources() {
+        Ok(rows) => rows,
+        Err(e) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GRAPH_ERROR",
+                &format!("branch_stats: failed to read sources for branch '{branch}': {e}"),
+            );
+        }
+    };
 
     ok_response(BranchStatsResponse {
         branch: branch.clone(),

@@ -980,15 +980,26 @@ impl QueryEngine {
             )));
         }
 
-        // One-time silent migration: move any legacy `.thinkingroot-{slug}/` sibling
+        // One-time migration: move any legacy `.thinkingroot-{slug}/` sibling
         // dirs to the new nested layout `.thinkingroot/branches/{slug}/`.
+        // Hard-fails on error so we don't open the workspace with a registry
+        // that points at the new layout while branch data still lives at the
+        // legacy paths (would silently surface those branches as missing).
         match thinkingroot_branch::migrate_legacy_layout(&root_path) {
             Ok(0) => {}
             Ok(n) => tracing::info!(
                 "migrated {n} legacy branch director{} to .thinkingroot/branches/",
                 if n == 1 { "y" } else { "ies" }
             ),
-            Err(e) => tracing::warn!("branch layout migration failed (non-fatal): {e}"),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "branch layout migration from legacy `.thinkingroot-{{slug}}/` to nested \
+                     `.thinkingroot/branches/{{slug}}/` failed for workspace at '{}': {e} \
+                     (legacy branches are still on disk; mount aborted to avoid surfacing them \
+                     as missing — fix the underlying error and re-mount)",
+                    root_path.display()
+                )));
+            }
         }
 
         let config = Config::load_merged(&root_path)?;
@@ -1053,10 +1064,18 @@ impl QueryEngine {
                 "migrated {n} legacy branch director{} to .thinkingroot/branches/",
                 if n == 1 { "y" } else { "ies" }
             ),
-            Err(e) => tracing::warn!("branch layout migration failed (non-fatal): {e}"),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "branch layout migration from legacy `.thinkingroot-{{slug}}/` to nested \
+                     `.thinkingroot/branches/{{slug}}/` failed for workspace at '{}': {e} \
+                     (legacy branches are still on disk; mount aborted to avoid surfacing them \
+                     as missing — fix the underlying error and re-mount)",
+                    root_path.display()
+                )));
+            }
         }
 
-        let config = Config::load_merged(&root_path).unwrap_or_default();
+        let config = Config::load_merged(&root_path)?;
         let storage = StorageEngine::init(&data_dir).await?;
         let cache = KnowledgeGraph::load_from_graph(&storage.graph)?;
 
@@ -1812,15 +1831,22 @@ impl QueryEngine {
         }
 
         // Phase 3: Fetch raw rows from CozoDB — hold storage Mutex only for I/O.
+        // Cache fetch failure is a hard error: the compile already wrote to
+        // graph.db, but if we returned Ok with the in-memory cache stale,
+        // the next query would lie about the workspace's contents (the
+        // exact "silent partial success" CLAUDE.md no-silent-failure
+        // contract forbids).
         let raw_data: RawGraphData = {
             let storage = handle.storage.lock().await;
-            match KnowledgeGraph::fetch_raw(&storage.graph) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    tracing::warn!("cache fetch after compile failed (non-fatal): {e}");
-                    return Ok(result);
-                }
-            }
+            KnowledgeGraph::fetch_raw(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "compile: graph write succeeded but in-memory cache rebuild failed for \
+                     workspace '{ws_name}' — your data is durable on disk, but reads will \
+                     see stale results until the cache reloads.  Re-run `root compile` or \
+                     remount the workspace.  Underlying error: {e}",
+                    ws_name = handle.name
+                ))
+            })?
         }; // ← storage Mutex released here; vector searches can resume immediately
 
         // Phase 4: Build in-memory indexes — pure CPU, zero locks held.
@@ -2175,11 +2201,26 @@ impl QueryEngine {
         let branch_data_dir = resolve_data_dir(&handle.root_path, Some(branch_name));
 
         // ── 1. Search branch vector index ─────────────────────────────────────
+        // Vector failures here are hard errors: returning an empty hit list
+        // would silently mask a corrupt/locked vector index and lie to the
+        // caller about what the branch contains.  When the data dir exists
+        // we must succeed or surface the failure.
         let branch_vector_hits: Vec<(String, String, f32)> = if branch_data_dir.exists() {
-            match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
-                Ok(mut bv) => run_blocking(|| bv.search(query, top_k * 2)).unwrap_or_default(),
-                Err(_) => vec![],
-            }
+            let mut bv = thinkingroot_graph::vector::VectorStore::init(&branch_data_dir)
+                .await
+                .map_err(|e| {
+                    Error::VectorStorage(format!(
+                        "search_branched: failed to open branch vector store at '{}' for \
+                         branch '{branch_name}' in workspace '{ws}': {e}",
+                        branch_data_dir.display()
+                    ))
+                })?;
+            run_blocking(|| bv.search(query, top_k * 2)).map_err(|e| {
+                Error::VectorStorage(format!(
+                    "search_branched: vector search failed for branch '{branch_name}' in \
+                     workspace '{ws}': {e}"
+                ))
+            })?
         } else {
             vec![]
         };
@@ -2717,7 +2758,11 @@ Rules: \
                     }
                 }
 
-                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                serde_json::to_string_pretty(&result).map_err(|e| {
+                    Error::Config(format!(
+                        "ask: failed to serialize SearchResult to JSON for workspace '{ws}': {e}"
+                    ))
+                })
             }
             QueryPath::Agentic => {
                 let llm = self.workspace_llm(ws);
@@ -2865,11 +2910,17 @@ Rules: \
                 .branch_engines
                 .get_or_open(&handle.root_path, branch_name)
                 .await?;
-            let (accepted_ids, warnings) =
+            let (accepted_ids, mut warnings) =
                 Self::write_agent_claims_to_graph(&branch_handle.graph, &source, &agent_claims)?;
 
             // Upsert accepted claims into the branch vector index so they are
-            // searchable in the branch without a full recompile.
+            // searchable in the branch without a full recompile.  Vector
+            // failures surface in `warnings`: the graph write is already
+            // durable, but a silent failure here would corrupt hybrid
+            // retrieval for the just-accepted claim ids without telling the
+            // caller their search is degraded.  CLI/desktop must render
+            // these warnings yellow (same contract as pipeline LLM
+            // failed-batch warnings).
             if !accepted_ids.is_empty() {
                 match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
                     Ok(mut branch_vector) => {
@@ -2888,16 +2939,34 @@ Rules: \
                             .collect();
                         // block_in_place: upsert_batch runs batched ONNX
                         // embedding (most expensive sync call in the crate).
-                        run_blocking(|| {
+                        let vector_warnings: Vec<String> = run_blocking(|| {
+                            let mut out = Vec::new();
                             if let Err(e) = branch_vector.upsert_batch(&items) {
-                                tracing::warn!("branch vector upsert failed (non-fatal): {e}");
+                                out.push(format!(
+                                    "branch '{branch_name}' vector index degraded: upsert of \
+                                     {n} embeddings failed ({e}) — hybrid retrieval will miss \
+                                     these claims until you re-run `root compile --branch \
+                                     {branch_name}`",
+                                    n = items.len()
+                                ));
                             } else if let Err(e) = branch_vector.save() {
-                                tracing::warn!("branch vector save failed (non-fatal): {e}");
+                                out.push(format!(
+                                    "branch '{branch_name}' vector index degraded: save after \
+                                     upsert failed ({e}) — embeddings are in-memory only and \
+                                     will be lost on next mount; re-run `root compile --branch \
+                                     {branch_name}` to persist"
+                                ));
                             }
+                            out
                         });
+                        warnings.extend(vector_warnings);
                     }
                     Err(e) => {
-                        tracing::warn!("branch vector init failed (non-fatal): {e}");
+                        warnings.push(format!(
+                            "branch '{branch_name}' vector index unavailable: init failed \
+                             ({e}) — these claims are durable in the graph but invisible to \
+                             hybrid retrieval; re-run `root compile --branch {branch_name}`"
+                        ));
                     }
                 }
             }
@@ -3043,14 +3112,20 @@ Rules: \
 
             // Reload while still holding storage lock so no concurrent write
             // can slip in between the CozoDB write and the cache update.
-            match KnowledgeGraph::load_from_graph(&storage.graph) {
-                Ok(new_cache) => {
-                    *handle.cache.write().await = new_cache;
-                }
-                Err(e) => {
-                    tracing::warn!("cache reload after contribute failed (non-fatal): {e}");
-                }
-            }
+            // Cache-reload failure is a hard error: claims are durable in
+            // the graph, but if we returned Ok with stale cache the next
+            // read would lie to the caller about the workspace contents.
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "contribute: claims accepted but in-memory cache reload failed for \
+                     workspace '{ws_name}' — your contributions are durable, but reads \
+                     will see stale results until the cache reloads.  Remount the \
+                     workspace via `DELETE /api/v1/workspaces/{ws_name}` then `POST \
+                     /api/v1/workspaces` to refresh.  Underlying error: {e}",
+                    ws_name = handle.name
+                ))
+            })?;
+            *handle.cache.write().await = new_cache;
         }
 
         // ── Turn calendar: record which claims were contributed this turn ────
@@ -3338,36 +3413,60 @@ Rules: \
                 .branch_engines
                 .get_or_open(&handle.root_path, branch_name)
                 .await?;
-            let (accepted_ids, warnings) =
+            let (accepted_ids, mut warnings) =
                 Self::write_agent_claims_to_graph(&branch_handle.graph, &source, &agent_claims)?;
 
-            // Branch vector index update (same as the canonical path).
+            // Branch vector index update — surface failures via warnings
+            // so callers know hybrid retrieval is degraded for the
+            // bulk-contributed claim ids until a recompile.  Same contract
+            // as `contribute_claims_as`; previously these failures were
+            // silently swallowed via `if let Ok(...)` (silent missing-Err
+            // arm) plus tracing::warn!.
             if !accepted_ids.is_empty() {
-                if let Ok(mut branch_vector) =
-                    thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await
-                {
-                    let items: Vec<(String, String, String)> = agent_claims
-                        .iter()
-                        .zip(accepted_ids.iter())
-                        .map(|(ac, id)| {
-                            let ctype = &ac.claim_type;
-                            let conf = ac.confidence.unwrap_or(0.7);
-                            (
-                                format!("claim:{id}"),
-                                ac.statement.clone(),
-                                format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
-                            )
-                        })
-                        .collect();
-                    run_blocking(|| {
-                        if let Err(e) = branch_vector.upsert_batch(&items) {
-                            tracing::warn!(
-                                "branch vector upsert failed (non-fatal): {e}"
-                            );
-                        } else if let Err(e) = branch_vector.save() {
-                            tracing::warn!("branch vector save failed (non-fatal): {e}");
-                        }
-                    });
+                match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
+                    Ok(mut branch_vector) => {
+                        let items: Vec<(String, String, String)> = agent_claims
+                            .iter()
+                            .zip(accepted_ids.iter())
+                            .map(|(ac, id)| {
+                                let ctype = &ac.claim_type;
+                                let conf = ac.confidence.unwrap_or(0.7);
+                                (
+                                    format!("claim:{id}"),
+                                    ac.statement.clone(),
+                                    format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                                )
+                            })
+                            .collect();
+                        let vector_warnings: Vec<String> = run_blocking(|| {
+                            let mut out = Vec::new();
+                            if let Err(e) = branch_vector.upsert_batch(&items) {
+                                out.push(format!(
+                                    "branch '{branch_name}' vector index degraded: bulk \
+                                     upsert of {n} embeddings failed ({e}) — hybrid retrieval \
+                                     will miss these claims until you re-run `root compile \
+                                     --branch {branch_name}`",
+                                    n = items.len()
+                                ));
+                            } else if let Err(e) = branch_vector.save() {
+                                out.push(format!(
+                                    "branch '{branch_name}' vector index degraded: save after \
+                                     bulk upsert failed ({e}) — re-run `root compile --branch \
+                                     {branch_name}` to persist embeddings"
+                                ));
+                            }
+                            out
+                        });
+                        warnings.extend(vector_warnings);
+                    }
+                    Err(e) => {
+                        warnings.push(format!(
+                            "branch '{branch_name}' vector index unavailable: init failed \
+                             ({e}) — bulk-contributed claims are durable in the graph but \
+                             invisible to hybrid retrieval; re-run `root compile --branch \
+                             {branch_name}`"
+                        ));
+                    }
                 }
             }
 
@@ -3406,15 +3505,21 @@ Rules: \
                 // coupled to the storage lock guard scope.
             }
 
-            // Reload cache while holding the storage lock.
-            match KnowledgeGraph::load_from_graph(&storage.graph) {
-                Ok(new_cache) => {
-                    *handle.cache.write().await = new_cache;
-                }
-                Err(e) => {
-                    tracing::warn!("cache reload after contribute_bulk failed (non-fatal): {e}");
-                }
-            }
+            // Reload cache while holding the storage lock.  Hard-error on
+            // failure: bulk claims are durable but a stale cache lies to
+            // the next read.  Connector retries are idempotent (replay log
+            // dedup) so it's safe for the caller to re-invoke after a
+            // remount.
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "contribute_bulk: connector batch accepted but in-memory cache \
+                     reload failed for workspace '{ws_name}' — your batch is durable, \
+                     but reads will see stale results until the cache reloads.  Remount \
+                     the workspace to refresh.  Underlying error: {e}",
+                    ws_name = handle.name
+                ))
+            })?;
+            *handle.cache.write().await = new_cache;
         }
 
         // Turn calendar — record this connector batch as one logical turn.
@@ -3602,14 +3707,21 @@ Rules: \
             && target_branch.unwrap_or("main") == "main"
         {
             let storage = handle.storage.lock().await;
-            match KnowledgeGraph::load_from_graph(&storage.graph) {
-                Ok(new_cache) => {
-                    *handle.cache.write().await = new_cache;
-                }
-                Err(e) => {
-                    tracing::warn!("cache reload after merge failed (non-fatal): {e}");
-                }
-            }
+            // Cache reload after merge into main is a hard error: the merge
+            // already mutated graph.db but the in-memory cache is stale,
+            // so the next list/search would mis-report what's been merged.
+            // The pre-merge snapshot is the recovery anchor — caller can
+            // `root branch rollback` if remount also fails.
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "merge: target main updated on disk but in-memory cache reload \
+                     failed for workspace '{ws_name}' — remount the workspace to \
+                     refresh, or run `root branch rollback` to revert to the \
+                     pre-merge snapshot.  Underlying error: {e}",
+                    ws_name = handle.name
+                ))
+            })?;
+            *handle.cache.write().await = new_cache;
         }
 
         if let Some(target_branch_name) = target_branch.filter(|b| *b != "main") {
@@ -3974,14 +4086,19 @@ Rules: \
 
         if let Some(handle) = self.workspaces.values().find(|h| h.root_path == root) {
             let storage = handle.storage.lock().await;
-            match KnowledgeGraph::load_from_graph(&storage.graph) {
-                Ok(new_cache) => {
-                    *handle.cache.write().await = new_cache;
-                }
-                Err(e) => {
-                    tracing::warn!("cache reload after rollback failed (non-fatal): {e}");
-                }
-            }
+            // Cache reload after rollback is a hard error: the rollback
+            // restored graph.db from the snapshot but the in-memory cache
+            // still reflects the post-merge state, so subsequent reads
+            // would lie about what the rollback achieved.
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "rollback: snapshot restored to graph.db but in-memory cache reload \
+                     failed for workspace '{ws_name}' — remount the workspace to refresh.  \
+                     Underlying error: {e}",
+                    ws_name = handle.name
+                ))
+            })?;
+            *handle.cache.write().await = new_cache;
         }
         Ok(())
     }
