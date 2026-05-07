@@ -39,8 +39,14 @@ pub fn extract(text: &str) -> Vec<ExtractedQuantity> {
         };
 
         // Find the surrounding window for qualifier + is_live detection.
-        let span_start = value_match.start().saturating_sub(24);
-        let span_end = (unit_match.end() + 32).min(text.len());
+        // The byte offsets must land on UTF-8 char boundaries — text may
+        // contain multi-byte chars like '→' (3 bytes) and slicing inside
+        // one panics ("byte index N is not a char boundary").  Walk
+        // outward to the nearest boundary so we always slice cleanly.
+        let raw_start = value_match.start().saturating_sub(24);
+        let raw_end = (unit_match.end() + 32).min(text.len());
+        let span_start = floor_char_boundary(text, raw_start);
+        let span_end = ceil_char_boundary(text, raw_end);
         let window = &text[span_start..span_end];
 
         let qualifier = detect_qualifier(window);
@@ -58,6 +64,26 @@ pub fn extract(text: &str) -> Vec<ExtractedQuantity> {
         });
     }
     out
+}
+
+/// Walk left until we land on a UTF-8 char boundary.  Stable equivalent
+/// of nightly `str::floor_char_boundary` so we can safely slice text
+/// that contains multi-byte chars like `→`.
+fn floor_char_boundary(text: &str, idx: usize) -> usize {
+    let mut i = idx.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Walk right until we land on a UTF-8 char boundary.
+fn ceil_char_boundary(text: &str, idx: usize) -> usize {
+    let mut i = idx.min(text.len());
+    while i < text.len() && !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn quantity_regex() -> &'static Regex {
@@ -163,6 +189,39 @@ mod tests {
     #[test]
     fn empty_input() {
         assert!(extract("").is_empty());
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_char_near_match_boundary() {
+        // Pins the production panic surfaced 2026-05-07 from the
+        // thinkingroot-cloud workspace compile: "byte index 55 is not a
+        // char boundary; it is inside '→' (bytes 53..56) of …".  The
+        // window slice around the matched quantity (`60 minutes`) was
+        // landing 24 bytes upstream — straight inside the 3-byte `→`.
+        let text = "Integration tests must cover publish pack → revoke → client refuses within 60 minutes";
+        let qs = extract(text); // must not panic
+        assert_eq!(qs.len(), 1, "expected one quantity (60 minutes)");
+        assert_eq!(qs[0].value, 60.0);
+        assert_eq!(qs[0].unit, "min"); // normalise_unit: minutes → min
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_char_around_match() {
+        // Stress: the `→` arrow is in the trailing window too.
+        let text = "Within 30 seconds → user gets receipt → push notification fires";
+        let qs = extract(text);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].value, 30.0);
+        assert_eq!(qs[0].unit, "s"); // normalise_unit: seconds → s
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_at_text_start() {
+        // Match at the very start with multibyte chars at end.
+        let text = "5 ms → upstream → downstream";
+        let qs = extract(text); // must not panic
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].value, 5.0);
     }
 
     #[test]

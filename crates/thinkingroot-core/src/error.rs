@@ -191,17 +191,31 @@ impl Error {
             // common HTTP-status fingerprints upstream surfaces emit.
             // Anything we don't explicitly recognise is treated as
             // transient (the existing default).
+            //
+            // Match shapes seen in the wild:
+            //   "got HTTP 401 from openai"            (CLI-readable form)
+            //   `{"error":{"code":"401","message":…}` (JSON-embedded — Azure)
+            //   "Access denied due to invalid subscription key" (Azure prose)
+            //   "invalid_api_key"                     (OpenAI machine code)
+            // The space-prefix check (`" 401"`) misses the JSON-embedded
+            // form; we now also accept the quoted form (`"401"`).
             Self::LlmProvider { message, .. } => {
                 let m = message.to_ascii_lowercase();
                 m.contains(" 401")
                     || m.contains(" 403")
                     || m.contains(" 404")
+                    || m.contains("\"401\"")
+                    || m.contains("\"403\"")
+                    || m.contains("\"404\"")
                     || m.contains("unauthorized")
                     || m.contains("forbidden")
                     || m.contains("not found")
                     || m.contains("invalid api key")
                     || m.contains("invalid_api_key")
+                    || m.contains("invalid subscription key")
+                    || m.contains("access denied")
                     || m.contains("authentication")
+                    || m.contains("api endpoint")
             }
             _ => false,
         }
@@ -256,6 +270,22 @@ mod tests {
             ("network connection reset", false),
             ("read timeout after 90s", false),
             ("503 service unavailable", false),
+            // 2026-05-07: Azure's JSON-embedded error wasn't caught by
+            // the original space-prefix matcher.  These three strings
+            // are verbatim from /tmp/tr-daemon.log when AZURE_OPENAI_API_KEY
+            // was stale.
+            (
+                r#"azure: unexpected response: {"error":{"code":"401","message":"Access denied due to invalid subscription key or wrong API endpoint."}}"#,
+                true,
+            ),
+            (
+                "Access denied due to invalid subscription key or wrong API endpoint.",
+                true,
+            ),
+            (
+                r#"{"error":{"code":"403","message":"Forbidden"}}"#,
+                true,
+            ),
         ];
         for (msg, expected) in cases {
             let err = Error::LlmProvider {
