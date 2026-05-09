@@ -93,6 +93,15 @@ zstd = { version = "0.13", default-features = false }
 blake3 = { workspace = true }
 ulid = { workspace = true }
 
+# Constant-time byte comparison for the BLAKE3 cross-check in
+# `resolver/http.rs` (defense-in-depth against an oracle that could
+# leak the registry-advertised hash bit-by-bit through timing).  The
+# practical attack surface is small (one comparison per `root install`,
+# no remote oracle), but the §10.1 security checklist says "constant-
+# time everywhere we can," and `subtle::ConstantTimeEq` costs nothing
+# beyond the dep.
+subtle = "2"
+
 # Pluggable resolvers for `root install` (Phase C).
 async-trait = "0.1"
 notify = { workspace = true }

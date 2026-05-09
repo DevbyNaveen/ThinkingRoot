@@ -13,6 +13,16 @@ pub fn insert_verdicts_batch(graph: &GraphStore, verdicts: &[TrialVerdict]) -> R
     if verdicts.is_empty() {
         return Ok(());
     }
+    // `trial_verdicts` declares `certificate_hash` + `failure_reason` as
+    // `String default ''` (see graph.rs schema).  Cozo string columns are
+    // non-nullable, so the schema's empty-string default IS the canonical
+    // "absent" sentinel for both fields.  A real `certificate_hash` is
+    // always 64-char BLAKE3 hex and a real `failure_reason` is always
+    // non-empty by construction in `rooter.rs`, so `""` cannot collide
+    // with a legitimate value.  We turn that domain invariant into a
+    // defensive assertion: if a regression ever stamps `Some("".into())`
+    // into a verdict we want to fail the test, not silently round-trip a
+    // confusing sentinel.
     let rows: Vec<(
         String,
         String,
@@ -44,8 +54,8 @@ pub fn insert_verdicts_batch(graph: &GraphStore, verdicts: &[TrialVerdict]) -> R
                 pred,
                 topo,
                 temp,
-                v.certificate_hash.clone().unwrap_or_default(),
-                v.failure_reason.clone().unwrap_or_default(),
+                option_to_sentinel("certificate_hash", v.certificate_hash.as_deref()),
+                option_to_sentinel("failure_reason", v.failure_reason.as_deref()),
                 v.rooter_version.clone(),
             )
         })
@@ -54,6 +64,25 @@ pub fn insert_verdicts_batch(graph: &GraphStore, verdicts: &[TrialVerdict]) -> R
     graph
         .insert_trial_verdicts_batch(&rows)
         .map_err(|e| RootingError::Graph(format!("insert_trial_verdicts_batch: {e}")))
+}
+
+/// Encode an `Option<&str>` into the schema's empty-string sentinel.
+///
+/// Asserts that real values are never empty — pre-empts the failure mode
+/// where downstream readers cannot tell `Some("")` from `None`.  In debug
+/// builds an empty `Some` panics; in release builds it round-trips as the
+/// sentinel, the same outcome the legacy `unwrap_or_default()` produced.
+fn option_to_sentinel(field: &'static str, value: Option<&str>) -> String {
+    match value {
+        Some(s) => {
+            debug_assert!(
+                !s.is_empty(),
+                "{field}: real values must never be empty — empty maps to the schema sentinel"
+            );
+            s.to_string()
+        }
+        None => String::new(),
+    }
 }
 
 /// Persist a batch of verification certificates. Idempotent — rows with the
@@ -82,11 +111,33 @@ pub fn insert_certificates_batch(graph: &GraphStore, certificates: &[Certificate
         .map_err(|e| RootingError::Graph(format!("insert_certificates_batch: {e}")))
 }
 
+/// Resolve a probe score for the given name from a verdict, encoding "did
+/// not run" as the schema's sentinel `-1.0` (see `trial_verdicts` schema:
+/// every `*_score` column declares `Float default -1.0`).
+///
+/// Probes use two values to communicate "no signal":
+/// - `ProbeResult::skipped(...)` returns the `-1.0` sentinel directly
+///   (e.g. predicate probe with no predicate attached, temporal probe
+///   on a claim with no event date).
+/// - "no row in `verdict.probes` at all" — the probe never ran (a fatal
+///   probe short-circuited before reaching it).
+///
+/// Both collapse to `-1.0` on persistence.  In debug builds we assert
+/// real, active probe scores stay in `[0.0, 1.0]` so a regression in
+/// any probe that produces NaN / out-of-band values is caught loudly;
+/// the schema sentinel `-1.0` is exempted from the bound check.
 fn find_score(verdict: &TrialVerdict, name: crate::probes::ProbeName) -> f64 {
-    verdict
-        .probes
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| p.score)
-        .unwrap_or(-1.0)
+    match verdict.probes.iter().find(|p| p.name == name) {
+        Some(p) => {
+            debug_assert!(
+                p.score == -1.0 || (0.0..=1.0).contains(&p.score),
+                "probe `{name:?}` produced score {} outside [0.0, 1.0] and \
+                 not equal to the `-1.0` skipped sentinel — schema invariant \
+                 violated",
+                p.score
+            );
+            p.score
+        }
+        None => -1.0,
+    }
 }

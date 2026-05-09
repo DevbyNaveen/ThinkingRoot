@@ -171,6 +171,13 @@ impl Fixture {
             "related_to",
         ];
 
+        // Pre-fix these calls used `let _ =` and silently swallowed any
+        // graph error.  A failure to link entities or insert a
+        // contradiction here corrupts the fixture in a way that makes
+        // downstream benchmark numbers meaningless — the whole point of
+        // this fixture is to populate a known shape.  Now we panic with
+        // an explicit invariant message so a benchmark can never report
+        // a number derived from a half-built graph.
         for i in 0..relation_count {
             let from_idx = if rng.random_range(0..100_u32) < 5 {
                 rng.random_range(0..entity_count.min(25))
@@ -183,12 +190,19 @@ impl Fixture {
             }
             let rel_type = rel_types[i % rel_types.len()];
             let strength: f64 = rng.random_range(0.3..1.0_f64);
-            let _ = graph.link_entities(
-                &entity_ids[from_idx],
-                &entity_ids[to_idx],
-                rel_type,
-                strength,
-            );
+            graph
+                .link_entities(
+                    &entity_ids[from_idx],
+                    &entity_ids[to_idx],
+                    rel_type,
+                    strength,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "bench fixture invariant: link_entities {} -> {} ({}) must succeed: {e}",
+                        entity_ids[from_idx], entity_ids[to_idx], rel_type
+                    )
+                });
         }
 
         // Generate contradictions (1% of claims)
@@ -197,12 +211,18 @@ impl Fixture {
             let a = &claim_ids[i * 2 % claim_ids.len()];
             let b = &claim_ids[(i * 2 + 1) % claim_ids.len()];
             let contra_id = ContradictionId::new().to_string();
-            let _ = graph.insert_contradiction(
-                &contra_id,
-                a,
-                b,
-                &format!("Contradiction {i}: conflicting claims"),
-            );
+            graph
+                .insert_contradiction(
+                    &contra_id,
+                    a,
+                    b,
+                    &format!("Contradiction {i}: conflicting claims"),
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "bench fixture invariant: insert_contradiction {a} ↔ {b} must succeed: {e}"
+                    )
+                });
         }
 
         // Pick sample values

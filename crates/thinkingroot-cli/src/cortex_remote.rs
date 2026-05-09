@@ -175,7 +175,7 @@ pub async fn delete_json_with_session(
 
 async fn decode_envelope(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
     if !status.is_success() {
         anyhow::bail!(
             "daemon request failed ({status}): {}",
@@ -236,7 +236,7 @@ pub async fn run_compile_remote(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
         anyhow::bail!(
             "daemon rejected compile request: {} — {}",
             status,
@@ -375,7 +375,7 @@ pub async fn run_health_remote(conn: &EngineConnection, path: &Path) -> anyhow::
         .context("failed to GET health from daemon")?;
 
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
     if !status.is_success() {
         anyhow::bail!(
             "daemon health check failed ({status}): {}",
@@ -423,7 +423,7 @@ pub async fn run_query_remote(
         .context("failed to GET search results from daemon")?;
 
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
     if !status.is_success() {
         anyhow::bail!(
             "daemon search failed ({status}): {}",
@@ -500,7 +500,7 @@ pub async fn run_ask_remote(
             .await
             .context("failed to POST ask to daemon")?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
         if !status.is_success() {
             anyhow::bail!(
                 "daemon ask failed ({status}): {}",
@@ -545,7 +545,7 @@ pub async fn run_render_remote(conn: &EngineConnection, path: &Path) -> anyhow::
         .await
         .context("failed to GET artifacts from daemon")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
     if !status.is_success() {
         anyhow::bail!(
             "daemon render failed ({status}): {}",
@@ -601,7 +601,7 @@ pub async fn run_status_remote(
         .context("failed to POST /workspaces from daemon")?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
         anyhow::bail!(
             "daemon mount failed ({status}): {}",
             extract_error_message(&body)
@@ -613,7 +613,7 @@ pub async fn run_status_remote(
     let head_url = format!("{base}/api/v1/head");
     let head: String = match client.get(&head_url).send().await {
         Ok(r) if r.status().is_success() => {
-            let body = r.text().await.unwrap_or_default();
+            let body = r.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
             serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| {
@@ -641,7 +641,7 @@ pub async fn run_status_remote(
         .await
         .context("failed to GET sources from daemon")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
     if !status.is_success() {
         anyhow::bail!(
             "daemon status failed ({status}): {}",
@@ -767,7 +767,7 @@ pub async fn ensure_mounted_remote(
         .with_context(|| format!("POST {url}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let txt = resp.text().await.unwrap_or_else(|e| format!("<read body failed: {e}>"));
         anyhow::bail!(
             "daemon mount failed ({status}): {}",
             extract_error_message(&txt)

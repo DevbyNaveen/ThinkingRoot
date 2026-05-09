@@ -495,20 +495,24 @@ impl Compiler {
         let all_claims = graph.get_all_claims_with_sources()?;
 
         // Entity summary with claim counts.
+        //
+        // Pre-fix this used `.unwrap_or(0)` on `get_claims_for_entity`,
+        // so a Cozo storage error silently rendered "0 claims" in the
+        // user-facing agent_brief artifact — a §15 honesty-rule
+        // violation.  Propagating via `Result` keeps the artifact honest:
+        // either every entity gets a real count or the compile fails
+        // loudly with the underlying storage error.
         let entity_data: Vec<serde_json::Value> = entities
             .iter()
-            .map(|(id, name, etype)| {
-                let claim_count = graph
-                    .get_claims_for_entity(id)
-                    .map(|c| c.len())
-                    .unwrap_or(0);
-                serde_json::json!({
+            .map(|(id, name, etype)| -> Result<serde_json::Value> {
+                let claim_count = graph.get_claims_for_entity(id)?.len();
+                Ok(serde_json::json!({
                     "name": name,
                     "entity_type": etype,
                     "claim_count": claim_count,
-                })
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // High-confidence claims (>= 0.85).
         let high_conf: Vec<serde_json::Value> = all_claims
@@ -574,10 +578,15 @@ impl Compiler {
         let contradictions_raw = graph.get_contradictions()?;
 
         let system_types = ["System", "Service", "Api", "Database", "Library", "Module"];
+        // Pre-fix `get_claims_with_sources_for_entity(id).unwrap_or_default()`
+        // silently produced an empty entity-claim list in the runbook
+        // artifact whenever the Cozo query failed.  Now propagate via
+        // `Result` so a storage fault surfaces as a compile failure
+        // rather than a honest-looking but factually empty runbook.
         let systems: Vec<serde_json::Value> = entities
             .iter()
             .filter(|(_, _, etype)| system_types.iter().any(|t| etype.contains(t)))
-            .map(|(id, name, etype)| {
+            .map(|(id, name, etype)| -> Result<serde_json::Value> {
                 let entity_rels: Vec<serde_json::Value> = relations
                     .iter()
                     .filter(|(from, _, _, _, _, _)| from == name)
@@ -587,8 +596,7 @@ impl Compiler {
                     .collect();
 
                 let entity_claims: Vec<serde_json::Value> = graph
-                    .get_claims_with_sources_for_entity(id)
-                    .unwrap_or_default()
+                    .get_claims_with_sources_for_entity(id)?
                     .iter()
                     .take(10)
                     .map(|(_, stmt, _, uri, conf)| {
@@ -600,15 +608,15 @@ impl Compiler {
                     })
                     .collect();
 
-                serde_json::json!({
+                Ok(serde_json::json!({
                     "name": name,
                     "entity_type": etype,
                     "description": "",
                     "relations": entity_rels,
                     "claims": entity_claims,
-                })
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let requirements = self.claims_by_type_to_json(graph, "Requirement")?;
 

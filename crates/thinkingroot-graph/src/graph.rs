@@ -1269,10 +1269,21 @@ impl GraphStore {
             "source_type".into(),
             DataValue::Str(format!("{:?}", source.source_type).into()),
         );
-        params.insert(
-            "author".into(),
-            DataValue::Str(source.author.clone().unwrap_or_default().into()),
-        );
+        // `sources.author` is schema `String default ''` (graph.rs:194).
+        // `None` is encoded as the empty-string sentinel; assert that
+        // real values are never `Some("".to_string())` so a regression
+        // cannot silently round-trip a confusing sentinel.
+        let author_sentinel = match source.author.as_deref() {
+            Some(s) => {
+                debug_assert!(
+                    !s.is_empty(),
+                    "sources.author: empty Some() must use None — empty maps to the schema sentinel"
+                );
+                s.to_string()
+            }
+            None => String::new(),
+        };
+        params.insert("author".into(), DataValue::Str(author_sentinel.into()));
         params.insert(
             "content_hash".into(),
             DataValue::Str(source.content_hash.0.clone().into()),
@@ -1477,10 +1488,21 @@ impl GraphStore {
             "admission_tier".into(),
             DataValue::Str(claim.admission_tier.as_str().into()),
         );
+        // `claims.derivation_parents` is JSON-encoded array of claim ids;
+        // serializing a `Vec<String>` cannot fail by construction
+        // (no trait object, no NaN floats, no cyclic references), so we
+        // surface any failure as a hard graph error rather than silently
+        // writing `""` and corrupting `Q_DERIVATION_ROOT` downstream.
         let derivation_parents_json = match &claim.derivation {
             Some(d) => {
-                let ids: Vec<String> = d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
-                serde_json::to_string(&ids).unwrap_or_default()
+                let ids: Vec<String> =
+                    d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
+                serde_json::to_string(&ids).map_err(|e| {
+                    Error::GraphStorage(format!(
+                        "encode derivation_parents for claim {}: {e}",
+                        claim.id
+                    ))
+                })?
             }
             None => String::new(),
         };
@@ -1488,8 +1510,17 @@ impl GraphStore {
             "derivation_parents".into(),
             DataValue::Str(derivation_parents_json.into()),
         );
+        // `claims.predicate_json` is the JSON form of `Predicate`;
+        // serialization failure here would mean a malformed
+        // `Predicate` value reached this point, which is a real bug we
+        // want surfaced rather than masked as `""`.
         let predicate_json = match &claim.predicate {
-            Some(p) => serde_json::to_string(p).unwrap_or_default(),
+            Some(p) => serde_json::to_string(p).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "encode predicate_json for claim {}: {e}",
+                    claim.id
+                ))
+            })?,
             None => String::new(),
         };
         params.insert(

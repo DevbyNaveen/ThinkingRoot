@@ -511,3 +511,57 @@ fn strength_threshold_is_configurable() {
         "under a 0.95 strength threshold, even a tight match should demote"
     );
 }
+
+#[test]
+fn rooting_refuses_to_mint_certificate_when_source_row_is_missing() {
+    // Regression: pre-fix, build_certificate fell back to
+    // `source_content_hash = ""` via `unwrap_or_default()` when the graph
+    // `sources` row was absent (deleted source, race with branch GC,
+    // post-migration schema gap).  Two missing-source claims with
+    // otherwise identical canonical inputs would then collide on the
+    // SAME certificate hash — a corruption of the trust-anchored chain
+    // and a violation of the I-W4 snapshot-consistency invariant.
+    //
+    // Post-fix the rooter returns a hard `RootingError::Graph` rather
+    // than fabricate an empty hash.  The provenance probe's own
+    // fail-open path (skip on missing source row) lets the claim reach
+    // the certificate-build step; it is `build_certificate` that now
+    // refuses.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let graph = thinkingroot_graph::graph::GraphStore::init(dir.path()).expect("graph init");
+    let store = FileSystemSourceStore::new(dir.path()).expect("byte store");
+
+    // Construct a Source value to obtain a stable id, but DO NOT insert
+    // its row into the graph.  This is the exact post-GC race state we
+    // are guarding against.
+    let phantom_source = Source::new(
+        "file:///gc-evicted.rs".into(),
+        SourceType::File,
+    )
+    .with_hash(ContentHash::from_bytes(b"orphaned"));
+
+    let claim = Claim::new(
+        "claim whose source row no longer exists",
+        ClaimType::Fact,
+        phantom_source.id,
+        WorkspaceId::new(),
+    );
+
+    let candidates = [CandidateClaim {
+        claim: &claim,
+        predicate: None,
+        derivation: None,
+    }];
+
+    let rooter = Rooter::new(&graph, &store, RootingConfig::default());
+    let result = rooter.root_batch(&candidates);
+
+    let err = result.expect_err(
+        "rooter must hard-fail when build_certificate cannot locate the source row",
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("required for certificate") && msg.contains("absent from the graph"),
+        "error message must explain the trust-chain refusal, got: {msg}"
+    );
+}

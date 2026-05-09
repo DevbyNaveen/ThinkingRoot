@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 use tr_format::digest::blake3_hex;
 
 use super::PackResolver;
@@ -188,9 +189,26 @@ impl PackResolver for HttpRegistryResolver {
         // 4. Defense-in-depth hash check. If the registry put a hash
         // in the response header, verify the body matches before we
         // even hand it to `tr_format::read_v3_pack`.
+        //
+        // Comparison goes through `subtle::ConstantTimeEq` over the
+        // raw byte slices to avoid leaking the registry-advertised
+        // hash one byte at a time via timing.  The practical attack
+        // surface is narrow (one comparison per `root install`, no
+        // remote timing oracle) so this is hygiene rather than a hot
+        // hardening — but it lets the §10.1 security checklist read
+        // "constant-time everywhere we can" without an asterisk, and
+        // the cost over `==` on 64 hex chars is irrelevant.
         if let Some(expected) = &advertised_hash {
             let actual = blake3_hex(&bytes);
-            if &actual != expected {
+            // ConstantTimeEq returns 1 on equal, 0 on differ; only
+            // when lengths match does the comparison run, so we still
+            // produce a useful error on length mismatches.
+            let equal = if actual.len() == expected.len() {
+                actual.as_bytes().ct_eq(expected.as_bytes()).into()
+            } else {
+                false
+            };
+            if !equal {
                 return Err(anyhow!(
                     "content hash mismatch for {}/{}@{}: registry advertised `{}`, computed `{}`",
                     self.owner,

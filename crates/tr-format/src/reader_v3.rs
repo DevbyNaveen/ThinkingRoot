@@ -63,9 +63,26 @@ impl V3Pack {
     }
 }
 
-/// Read a v3 pack from raw outer-tar bytes.
+/// Default in-memory size cap for `read_v3_pack`.  Matches the v3 spec
+/// §6.4 single-pack ceiling and the HTTP resolver's default
+/// `max_pack_bytes`.  Callers that need a different limit (e.g. a
+/// registry that advertises a higher cap in its discovery doc) should
+/// invoke [`read_v3_pack_with_cap`] directly.
+pub const DEFAULT_PACK_SIZE_CAP_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Read a v3 pack from raw outer-tar bytes, refusing archives larger
+/// than [`DEFAULT_PACK_SIZE_CAP_BYTES`].
+///
+/// Pre-fix this function had no in-memory size cap and the local-install
+/// path (`LocalFsResolver` → `read_v3_pack`) inherited the defect:
+/// pointing `root install ./100gb.tr` at a hostile or accidentally-large
+/// file would `Vec`-grow until the process OOM'd, before any signature
+/// or hash check could run.  The HTTP resolver enforces its own ceiling
+/// (`http.rs:154-186`) so that path was already safe; this guards every
+/// remaining caller via the format crate itself.
 ///
 /// Errors:
+/// - `Error::TooLarge` when `bytes.len()` exceeds the default cap.
 /// - `Error::Invalid` when any of the three required entries
 ///   (`manifest.toml`, `source.tar.zst`, `claims.jsonl`) is missing.
 /// - `Error::Invalid` when `manifest.toml` fails parse (delegated to
@@ -73,6 +90,23 @@ impl V3Pack {
 /// - `Error::Invalid` when `signature.sig` is present but isn't a
 ///   valid Sigstore Bundle JSON.
 pub fn read_v3_pack(bytes: &[u8]) -> Result<V3Pack> {
+    read_v3_pack_with_cap(bytes, DEFAULT_PACK_SIZE_CAP_BYTES)
+}
+
+/// Read a v3 pack from raw outer-tar bytes with an explicit size cap.
+///
+/// Use when a caller has its own policy for the maximum pack size
+/// (e.g. a registry advertising a higher `max_pack_bytes` in its
+/// discovery document).  Returns [`Error::TooLarge`] when `bytes.len()`
+/// exceeds `max_bytes`.
+pub fn read_v3_pack_with_cap(bytes: &[u8], max_bytes: u64) -> Result<V3Pack> {
+    let actual = bytes.len() as u64;
+    if actual > max_bytes {
+        return Err(Error::TooLarge {
+            cap: max_bytes,
+            actual,
+        });
+    }
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut source_bytes: Option<Vec<u8>> = None;
     let mut claims_bytes: Option<Vec<u8>> = None;
@@ -256,6 +290,44 @@ mod tests {
             msg.contains(MANIFEST_NAME),
             "error must mention the missing entry: {msg}"
         );
+    }
+
+    #[test]
+    fn read_v3_pack_with_cap_rejects_oversized_input() {
+        // Regression: pre-fix `read_v3_pack` had no size cap and a
+        // local-install of a 100GB file (hostile or accidental) would
+        // OOM the process before any verification could run.  We cap
+        // the input bytes themselves up-front; downstream parsing
+        // never sees a Vec larger than the configured ceiling.
+        let bytes = fixture_pack_signed(7);
+        let actual = bytes.len() as u64;
+        // Pick a cap one byte below `actual` so the fixture trips the guard.
+        let tight_cap = actual - 1;
+        let err = read_v3_pack_with_cap(&bytes, tight_cap)
+            .expect_err("read_v3_pack_with_cap must refuse input > cap");
+        match err {
+            Error::TooLarge { cap, actual: a } => {
+                assert_eq!(cap, tight_cap);
+                assert_eq!(a, actual);
+            }
+            other => panic!("expected Error::TooLarge, got {other:?}"),
+        }
+
+        // And the same input under a generous cap parses fine.
+        let pack = read_v3_pack_with_cap(&bytes, actual + 1)
+            .expect("input ≤ cap parses normally");
+        assert!(pack.signature.is_some());
+    }
+
+    #[test]
+    fn read_v3_pack_default_cap_accepts_realistic_pack() {
+        // The default cap (100 MiB) must accept any realistic synthetic
+        // fixture this test crate produces.  Pin the relationship so a
+        // future bump that raises the cap still works.
+        let bytes = fixture_pack_signed(8);
+        assert!((bytes.len() as u64) < DEFAULT_PACK_SIZE_CAP_BYTES);
+        let pack = read_v3_pack(&bytes).expect("default cap must accept fixture");
+        assert!(pack.signature.is_some());
     }
 
     #[test]

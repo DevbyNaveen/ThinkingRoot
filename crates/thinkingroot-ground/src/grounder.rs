@@ -123,10 +123,45 @@ impl Grounder {
 
         for (source_id, indices) in &source_to_indices {
             // Take source text OUT of the HashMap — frees memory for this source.
-            let source_text = extraction
-                .source_texts
-                .remove(source_id)
-                .unwrap_or_default();
+            //
+            // Pre-fix this used `unwrap_or_default()`, which silently
+            // substituted `""` when the upstream extractor failed to
+            // populate `source_texts` for a source that had claims.
+            // Every judge then scored 0 against the empty string and
+            // the claim was rejected by threshold — a §15 honesty-rule
+            // violation: the user saw "claim ungrounded" with no
+            // reason, when the truth was "we lost track of the
+            // source".  Now the failure is loud (tracing::error with
+            // source_id) and the affected claims are skipped rather
+            // than silently scored against "".  Skipped claims keep
+            // their default `grounding_score: None` / `grounding_method:
+            // None`, which is the honest representation of "no signal"
+            // — distinguishable downstream from an actively-rejected
+            // claim.  In debug builds we additionally panic so test
+            // suites catch the upstream invariant break.
+            let source_text = match extraction.source_texts.remove(source_id) {
+                Some(t) => t,
+                None => {
+                    debug_assert!(
+                        false,
+                        "grounding invariant: extraction.source_texts must contain text for \
+                         every source that has claims (source_id={source_id})"
+                    );
+                    let n = indices.len();
+                    tracing::error!(
+                        source_id = %source_id,
+                        affected_claims = n,
+                        "grounding skipped: source text missing — extractor invariant violated; \
+                         {n} claim(s) for this source will remain ungrounded (no signal) rather \
+                         than silently rejected against empty text"
+                    );
+                    if let Some(progress) = &self.progress {
+                        done += n;
+                        progress(done, total_claims);
+                    }
+                    continue;
+                }
+            };
 
             for chunk in indices.chunks(512) {
                 let pairs: Vec<(&str, &str)> = chunk

@@ -39,7 +39,9 @@ pub mod writer_v3;
 pub use claims::ClaimRecord;
 pub use error::Error;
 pub use manifest::{FORMAT_VERSION_V3, ManifestV3};
-pub use reader_v3::{V3Pack, read_v3_pack};
+pub use reader_v3::{
+    DEFAULT_PACK_SIZE_CAP_BYTES, V3Pack, read_v3_pack, read_v3_pack_with_cap,
+};
 pub use writer_v3::V3PackBuilder;
 
 // Re-export so consumers don't need a direct `semver` dep just to

@@ -293,15 +293,26 @@ fn build_certificate(
     trial_at: chrono::DateTime<Utc>,
     probes: &[ProbeResult],
 ) -> Result<Certificate> {
-    // Canonical inputs: fields that, if any change, should produce a new hash.
+    // Canonical inputs: fields that, if any change, should produce a new
+    // hash.  `source_content_hash` MUST be a real hash — if the source row
+    // is missing (deleted source, race with branch GC, post-migration
+    // schema gap) we refuse to mint a certificate rather than fabricate
+    // an empty hash.  Two missing-source claims with otherwise identical
+    // canonical inputs would otherwise collide on `""` and the certificate
+    // re-verification path could match a wrong hash if the source were
+    // later rebuilt with non-empty content — a trust-chain corruption.
+    let source_id = ctx.claim.source.to_string();
     let source = ctx
         .graph
-        .get_source_by_id(&ctx.claim.source.to_string())
-        .map_err(|e| crate::RootingError::Graph(format!("source lookup for cert: {e}")))?;
-    let source_content_hash = source
-        .as_ref()
-        .map(|s| s.content_hash.0.clone())
-        .unwrap_or_default();
+        .get_source_by_id(&source_id)
+        .map_err(|e| crate::RootingError::Graph(format!("source lookup for cert: {e}")))?
+        .ok_or_else(|| {
+            crate::RootingError::Graph(format!(
+                "source `{source_id}` required for certificate but is absent from the graph; \
+                 refusing to mint a certificate over an empty content hash"
+            ))
+        })?;
+    let source_content_hash = source.content_hash.0.clone();
 
     let inputs = CertificateInput {
         rooter_version: ROOTER_VERSION,

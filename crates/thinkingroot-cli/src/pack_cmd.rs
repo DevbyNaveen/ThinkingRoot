@@ -54,8 +54,17 @@ pub const EXIT_UNSIGNED: i32 = 70;
 /// Recomputed pack hash diverged from the manifest's declared
 /// `pack_hash`, OR the DSSE signature failed to verify.
 pub const EXIT_TAMPERED: i32 = 71;
-/// Pack hash is on the registry's signed revocation deny-list.
+/// Pack hash is on the registry's signed revocation deny-list — a
+/// confirmed-malicious or confirmed-yanked pack.
 pub const EXIT_REVOKED: i32 = 72;
+/// Revocation status could not be verified (network outage, no
+/// trusted snapshot on disk, registry unreachable).  Distinct from
+/// [`EXIT_REVOKED`] so operators scripting against exit codes can
+/// distinguish a transient registry outage from a confirmed
+/// revocation — pre-fix both rolled up to `72` and the
+/// air-gapped-CI failure mode was indistinguishable from a
+/// supply-chain attack alert.
+pub const EXIT_REVOCATION_UNVERIFIABLE: i32 = 73;
 
 /// Refusal returned by `run_install` when verification rejects the
 /// pack. Carries an exit code so `main.rs` can `process::exit` with the
@@ -470,7 +479,11 @@ fn run_keyless_signing(builder: tr_format::V3PackBuilder, pack_filename: &str) -
 ///   the manifest's declared `pack_hash`, or the DSSE signature
 ///   failed to verify against its trust roots.
 /// - [`EXIT_REVOKED`] (72) — Pack hash is on the registry's signed
-///   revocation deny-list.
+///   revocation deny-list (confirmed-malicious or yanked).
+/// - [`EXIT_REVOCATION_UNVERIFIABLE`] (73) — Revocation status could
+///   not be checked (offline registry, no trusted snapshot).
+///   Distinct from `72` so transient outages don't masquerade as
+///   confirmed revocations in CI.
 ///
 /// When `revocation_check` is true the function constructs a
 /// [`tr_revocation::RevocationCache`] and drives the async
@@ -587,11 +600,17 @@ pub fn run_verify(
             // crypto-verified but whose revocation status is unknown
             // could be revoked-and-malicious; the safe default is to
             // refuse until the registry is reachable again.
+            //
+            // Distinct exit code from EXIT_REVOKED so a script can tell
+            // "the registry told us the pack was revoked" (`72`) apart
+            // from "we couldn't reach the registry" (`73`) — pre-fix
+            // both rolled up to `72` and an air-gapped CI outage was
+            // indistinguishable from a supply-chain attack alert.
             eprintln!(
                 "  refused: revocation status unverifiable — {reason}\n  \
                  (use --no-revocation-check to override on an air-gapped install)"
             );
-            Ok(EXIT_REVOKED)
+            Ok(EXIT_REVOCATION_UNVERIFIABLE)
         }
     }
 }
@@ -1036,7 +1055,7 @@ fn enforce_v3_verdict(pack: &V3Pack, verdict: &V3Verdict, allow_unsigned: bool) 
         }
         .into()),
         V3Verdict::RevocationUnverifiable { reason } => Err(InstallRefused {
-            exit_code: EXIT_REVOKED,
+            exit_code: EXIT_REVOCATION_UNVERIFIABLE,
             message: format!(
                 "✗ refusing to install `{}` — revocation status unverifiable: {reason}",
                 pack.manifest.name

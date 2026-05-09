@@ -65,7 +65,15 @@ impl Verifier {
         //               compatible for workspaces that have never run Reflect).
         //
         // Composite multiplies: filling gaps directly improves the score.
-        let open_gaps = graph.reflect_count_open_known_unknowns().unwrap_or(0);
+        //
+        // Pre-fix this used `unwrap_or(0)` which silently set
+        // `gap_factor = 1.0` when the underlying Cozo query failed,
+        // letting the user read "Knowledge Health: 92%" while the
+        // truth was "I cannot tell".  The verifier's whole point is to
+        // be honest about what we know, so a Cozo error here propagates
+        // upward.  Empty graphs still produce 0 gaps via the normal
+        // query path — this branch only fires on real storage faults.
+        let open_gaps = graph.reflect_count_open_known_unknowns()?;
         let base_coverage = if entities > 0 {
             (claims as f64 / entities as f64).min(1.0)
         } else {

@@ -492,27 +492,46 @@ fn rekor_entry_to_tlog(entry: &RekorRestLogEntry) -> Result<TlogEntry, Error> {
         hex_decode(&entry.log_id).map_err(|e| Error::CertParse(format!("Rekor logID hex: {e}")))?;
     let log_id_b64 = b64.encode(&log_id_bytes);
 
-    let inclusion_proof = entry.verification.inclusion_proof.as_ref().map(|p| {
-        let root_bytes = hex_decode(&p.root_hash).unwrap_or_default();
-        let root_b64 = b64.encode(&root_bytes);
-        let hashes_b64: Vec<String> = p
-            .hashes
-            .iter()
-            .map(|h| {
-                let bytes = hex_decode(h).unwrap_or_default();
-                b64.encode(&bytes)
+    // Inclusion-proof field decoding.  Pre-fix `unwrap_or_default()` on
+    // each `hex_decode` produced empty `Vec<u8>` on malformed Rekor REST
+    // responses; downstream verification then failed with a misleading
+    // "inclusion proof failed" message instead of the truthful "Rekor
+    // returned bad hex".  Now we surface the underlying parse error
+    // verbatim so operators can distinguish a Rekor-side data fault
+    // from a genuine signature mismatch.
+    let inclusion_proof = match entry.verification.inclusion_proof.as_ref() {
+        Some(p) => {
+            let root_bytes = hex_decode(&p.root_hash).map_err(|e| {
+                Error::CertParse(format!("Rekor inclusion_proof.root_hash hex: {e}"))
+            })?;
+            let root_b64 = b64.encode(&root_bytes);
+            let hashes_b64: Vec<String> = p
+                .hashes
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    hex_decode(h)
+                        .map(|bytes| b64.encode(&bytes))
+                        .map_err(|e| {
+                            Error::CertParse(format!(
+                                "Rekor inclusion_proof.hashes[{i}] hex: {e}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(RekorInclusionProof {
+                log_index: p.log_index,
+                tree_size: p.tree_size,
+                root_hash: root_b64,
+                hashes: hashes_b64,
+                checkpoint: p
+                    .checkpoint
+                    .as_ref()
+                    .map(|c| RekorCheckpoint { envelope: c.clone() }),
             })
-            .collect();
-        RekorInclusionProof {
-            log_index: p.log_index,
-            tree_size: p.tree_size,
-            root_hash: root_b64,
-            hashes: hashes_b64,
-            checkpoint: p.checkpoint.as_ref().map(|c| RekorCheckpoint {
-                envelope: c.clone(),
-            }),
         }
-    });
+        None => None,
+    };
 
     let inclusion_promise = entry
         .verification
