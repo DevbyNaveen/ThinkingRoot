@@ -238,6 +238,24 @@ pub fn model_max_output_tokens(model: &str) -> i32 {
     if m.contains("sonnet") || m.contains("opus") {
         return 8_192;
     }
+    // GPT-5 / GPT-6 / o-series reasoning family — 100k output.
+    // GPT-5 deployments on Azure expose `max_completion_tokens` up to
+    // 100_000 for the chat completion path.  The o-series (o1, o3, o4)
+    // share the same limit.  Pre-fix, these dropped through to the 8k
+    // unknown-model fallback, causing every multi-chunk extraction
+    // batch to truncate at 8k and the JSON parser to fail with
+    // `returning empty for all chunks` — a silent claims drop.  Match
+    // BEFORE the gpt-4.1 branch so the prefix-overlap (`gpt-`) doesn't
+    // matter — the contains() checks here are anchored on family-
+    // specific substrings.
+    if m.starts_with("gpt-5")
+        || m.starts_with("gpt-6")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+    {
+        return 100_000;
+    }
     // GPT-4.1 family (2025) — 32k output
     if m.contains("gpt-4.1") || m.contains("gpt-4-1") {
         return 32_768;
@@ -289,6 +307,18 @@ pub fn model_context_window(model: &str) -> usize {
     // Haiku 3 — 200K context
     if m.contains("haiku") {
         return 200_000;
+    }
+
+    // GPT-5 / GPT-6 / o-series reasoning — 400K context (Azure standard).
+    // Anchored with starts_with to avoid the gpt-4.1 substring crashing
+    // into the gpt-5 family rule via shared prefix.
+    if m.starts_with("gpt-5")
+        || m.starts_with("gpt-6")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+    {
+        return 400_000;
     }
 
     // ── OpenAI / Azure gpt-4.1 family (2025) — 1M on direct, 300K on Azure standard ──
@@ -909,9 +939,25 @@ impl BedrockProvider {
 struct AzureProvider {
     client: reqwest::Client,
     api_key: String,
-    model: String,        // deployment name; used for display/logging
+    /// User-facing model name from `[llm].extraction_model` —
+    /// used for display, logging, and `model_max_output_tokens` lookup.
+    /// May or may not match the Azure deployment name (often doesn't:
+    /// users name deployments after a different model than the one
+    /// actually backing them).
+    model: String,
     endpoint_url: String, // pre-built full URL with api-version query param
     max_output_tokens: i32,
+    /// Pre-computed at construction so all six chat methods don't have
+    /// to recompute it per-request.  True when EITHER the model name
+    /// OR the deployment name matches the gpt-5.x / o-series reasoning
+    /// family (see `requires_max_completion_tokens`).  Pre-fix, only
+    /// the model name was checked, so a workspace whose
+    /// `extraction_model` was a legacy gpt-4 family name but whose
+    /// Azure deployment was actually a reasoning model would emit
+    /// `max_tokens` and get a 400 `unsupported_parameter` back on
+    /// every batch.  See `Error::is_permanent` for the bail-fast
+    /// guard against that mismatch.
+    uses_new_completion_param: bool,
 }
 
 impl AzureProvider {
@@ -939,16 +985,32 @@ impl AzureProvider {
             "{base}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
         );
         let max_output_tokens = model_max_output_tokens(model);
+        let uses_new_completion_param =
+            requires_max_completion_tokens(model) || requires_max_completion_tokens(deployment);
+
+        // Pre-fix `Client::builder().build().unwrap_or_default()` silently
+        // dropped the configured timeout if `Client::build()` failed (e.g.
+        // missing native TLS root store at boot).  The fall-back default
+        // client has NO timeout, so the next chat() call would hang
+        // indefinitely instead of failing loudly.  Surface the build
+        // failure as `Error::LlmProvider` so the user sees the underlying
+        // reqwest cause and the daemon can refuse to start the provider
+        // rather than ship a half-built client.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| Error::LlmProvider {
+                provider: "azure".into(),
+                message: format!("reqwest client build failed: {e}"),
+            })?;
 
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
+            client,
             api_key: api_key.to_string(),
             model: model.to_string(),
             endpoint_url,
             max_output_tokens,
+            uses_new_completion_param,
         })
     }
 
@@ -960,7 +1022,7 @@ impl AzureProvider {
         // and reject the latter with an "Unsupported parameter" 400. Detect
         // by model / deployment name so existing GPT-4.x callers are
         // unchanged.
-        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let uses_new_param = self.uses_new_completion_param;
         let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
@@ -1043,7 +1105,7 @@ impl AzureProvider {
         use eventsource_stream::Eventsource;
         use futures::StreamExt;
 
-        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let uses_new_param = self.uses_new_completion_param;
         let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
@@ -1173,7 +1235,7 @@ impl AzureProvider {
         tools: &[Tool],
         tool_choice: &ToolChoice,
     ) -> Result<ToolUseResponse> {
-        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let uses_new_param = self.uses_new_completion_param;
         let mut body = serde_json::json!({
             "messages": openai_messages_array(system, messages),
             "tools": openai_tools_array(tools),
@@ -1247,7 +1309,7 @@ impl OpenAiProvider {
         base_url: &str,
         provider_name: &str,
         timeout_secs: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         let max_output_tokens = model_max_output_tokens(model);
         // Strip trailing /v1 so providers that store "https://host/v1" in config
         // don't end up with a double /v1 when chat() appends /v1/chat/completions.
@@ -1256,22 +1318,31 @@ impl OpenAiProvider {
             .trim_end_matches("/v1")
             .trim_end_matches('/')
             .to_string();
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
+        // Surface `Client::build()` failures as a typed error rather than
+        // silently substituting the default client (which has no
+        // configured timeout — see the AzureProvider note above).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| Error::LlmProvider {
+                provider: provider_name.to_string(),
+                message: format!("reqwest client build failed: {e}"),
+            })?;
+        Ok(Self {
+            client,
             api_key: api_key.to_string(),
             model: model.to_string(),
             base_url,
             provider_name: provider_name.to_string(),
             max_output_tokens,
-        }
+        })
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
         // Same max_tokens → max_completion_tokens switch as the Azure
         // provider: GPT-5.x / o-series require the newer field.
+        // OpenAI addresses by model name directly (no deployment
+        // indirection), so the single-name check is correct here.
         let uses_new_param = requires_max_completion_tokens(&self.model);
         let mut body = serde_json::json!({
             "model": self.model,
@@ -1365,6 +1436,7 @@ impl OpenAiProvider {
         use eventsource_stream::Eventsource;
         use futures::StreamExt;
 
+        // OpenAI: single-name check; model name is the routing key.
         let uses_new_param = requires_max_completion_tokens(&self.model);
         let mut body = serde_json::json!({
             "model": self.model,
@@ -1506,6 +1578,7 @@ impl OpenAiProvider {
         tools: &[Tool],
         tool_choice: &ToolChoice,
     ) -> Result<ToolUseResponse> {
+        // OpenAI: single-name check; model name is the routing key.
         let uses_new_param = requires_max_completion_tokens(&self.model);
         let mut body = serde_json::json!({
             "model": self.model,
@@ -1573,17 +1646,24 @@ struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    fn new(api_key: &str, model: &str, timeout_secs: u64) -> Self {
+    fn new(api_key: &str, model: &str, timeout_secs: u64) -> Result<Self> {
         let max_output_tokens = model_max_output_tokens(model);
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
+        // Surface `Client::build()` failures as a typed error rather than
+        // silently substituting the default client (which has no
+        // configured timeout — see the AzureProvider note above).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| Error::LlmProvider {
+                provider: "anthropic".into(),
+                message: format!("reqwest client build failed: {e}"),
+            })?;
+        Ok(Self {
+            client,
             api_key: api_key.to_string(),
             model: model.to_string(),
             max_output_tokens,
-        }
+        })
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
@@ -1923,17 +2003,24 @@ struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    fn new(model: &str, base_url: &str, timeout_secs: u64) -> Self {
+    fn new(model: &str, base_url: &str, timeout_secs: u64) -> Result<Self> {
         let max_output_tokens = model_max_output_tokens(model);
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .build()
-                .unwrap_or_default(),
+        // Surface `Client::build()` failures as a typed error rather than
+        // silently substituting the default client (which has no
+        // configured timeout — see the AzureProvider note above).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| Error::LlmProvider {
+                provider: "ollama".into(),
+                message: format!("reqwest client build failed: {e}"),
+            })?;
+        Ok(Self {
+            client,
             model: model.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             max_output_tokens,
-        }
+        })
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
@@ -2568,7 +2655,7 @@ impl LlmClient {
                     &base_url,
                     "openai",
                     timeout_secs,
-                ))
+                )?)
             }
             "azure" => {
                 let azure_cfg = config.providers.azure.as_ref().ok_or_else(|| {
@@ -2604,7 +2691,7 @@ impl LlmClient {
                     &key,
                     &config.extraction_model,
                     timeout_secs,
-                ))
+                )?)
             }
             "ollama" => {
                 let base_url =
@@ -2613,7 +2700,7 @@ impl LlmClient {
                     &config.extraction_model,
                     &base_url,
                     timeout_secs,
-                ))
+                )?)
             }
             "groq" => {
                 let key = resolve_key(config.providers.groq.as_ref(), "GROQ_API_KEY")?;
@@ -2627,7 +2714,7 @@ impl LlmClient {
                     &base_url,
                     "groq",
                     timeout_secs,
-                ))
+                )?)
             }
             "deepseek" => {
                 let key = resolve_key(config.providers.deepseek.as_ref(), "DEEPSEEK_API_KEY")?;
@@ -2641,7 +2728,7 @@ impl LlmClient {
                     &base_url,
                     "deepseek",
                     timeout_secs,
-                ))
+                )?)
             }
             "openrouter" => {
                 let key = resolve_key(config.providers.openrouter.as_ref(), "OPENROUTER_API_KEY")?;
@@ -2655,7 +2742,7 @@ impl LlmClient {
                     &base_url,
                     "openrouter",
                     timeout_secs,
-                ))
+                )?)
             }
             "together" => {
                 let key = resolve_key(config.providers.together.as_ref(), "TOGETHER_API_KEY")?;
@@ -2669,7 +2756,7 @@ impl LlmClient {
                     &base_url,
                     "together",
                     timeout_secs,
-                ))
+                )?)
             }
             "perplexity" => {
                 let key = resolve_key(config.providers.perplexity.as_ref(), "PERPLEXITY_API_KEY")?;
@@ -2683,7 +2770,7 @@ impl LlmClient {
                     &base_url,
                     "perplexity",
                     timeout_secs,
-                ))
+                )?)
             }
             "litellm" => {
                 let key = resolve_key_optional(config.providers.litellm.as_ref());
@@ -2695,7 +2782,7 @@ impl LlmClient {
                     &base_url,
                     "litellm",
                     timeout_secs,
-                ))
+                )?)
             }
             "custom" => {
                 let key = resolve_key(config.providers.custom.as_ref(), "CUSTOM_LLM_API_KEY")?;
@@ -2707,7 +2794,7 @@ impl LlmClient {
                     &base_url,
                     "custom",
                     timeout_secs,
-                ))
+                )?)
             }
             other => {
                 return Err(Error::MissingConfig(format!(
@@ -3652,8 +3739,66 @@ mod tests {
     }
 
     #[test]
+    fn model_max_tokens_gpt5_and_oseries() {
+        // 2026-05-07: pre-fix these dropped through to the 8k unknown
+        // fallback, which made every multi-chunk extraction batch
+        // truncate at 8k and silently drop claims via "returning empty
+        // for all chunks". The branch now matches GPT-5+, GPT-6+, and
+        // the o-series reasoning models at 100k.
+        assert_eq!(model_max_output_tokens("gpt-5"), 100_000);
+        assert_eq!(model_max_output_tokens("gpt-5.4"), 100_000);
+        assert_eq!(model_max_output_tokens("gpt-5-turbo"), 100_000);
+        assert_eq!(model_max_output_tokens("gpt-6"), 100_000);
+        assert_eq!(model_max_output_tokens("o1-mini"), 100_000);
+        assert_eq!(model_max_output_tokens("o3"), 100_000);
+        assert_eq!(model_max_output_tokens("o4-mini"), 100_000);
+        // The gpt-4.x family must NOT collide with the gpt-5 prefix
+        // anchor — pin both sides of the boundary.
+        assert_eq!(model_max_output_tokens("gpt-4.1"), 32_768);
+        assert_eq!(model_max_output_tokens("gpt-4o"), 16_384);
+    }
+
+    #[test]
     fn model_max_tokens_unknown_falls_back() {
         assert_eq!(model_max_output_tokens("some-unknown-model-v99"), 8_192);
+    }
+
+    // ── requires_max_completion_tokens (dual-name detection) ──────
+    //
+    // 2026-05-07: Pre-fix, the chat methods called
+    // `requires_max_completion_tokens(&self.model)` only.  When the
+    // user's `extraction_model` was a legacy name like "gpt-4-1-mini"
+    // but the Azure deployment was actually a reasoning model
+    // ("gpt-5.4"), every batch sent the deprecated `max_tokens` field
+    // and Azure 400'd with `unsupported_parameter`.  The fix caches
+    // the OR of model and deployment in `AzureProvider`; this test
+    // pins the construction-time dual-name evaluation directly.
+
+    #[test]
+    fn requires_new_param_matches_either_model_or_deployment() {
+        // Both legacy → use legacy `max_tokens`.
+        assert!(
+            !(requires_max_completion_tokens("gpt-4-1-mini")
+                || requires_max_completion_tokens("gpt-4o"))
+        );
+        // Either name in the reasoning family → switch to `max_completion_tokens`.
+        assert!(
+            requires_max_completion_tokens("gpt-4-1-mini")
+                || requires_max_completion_tokens("gpt-5.4"),
+            "deployment-only match should fire — root12 fresh-compile case"
+        );
+        assert!(
+            requires_max_completion_tokens("o1-mini")
+                || requires_max_completion_tokens("gpt-4-1-mini"),
+            "model-only match should still fire"
+        );
+        assert!(requires_max_completion_tokens("gpt-5.4"));
+        assert!(requires_max_completion_tokens("gpt-6"));
+        assert!(requires_max_completion_tokens("o1-preview"));
+        assert!(requires_max_completion_tokens("o3"));
+        assert!(requires_max_completion_tokens("o4-mini"));
+        assert!(!requires_max_completion_tokens("gpt-4o"));
+        assert!(!requires_max_completion_tokens("gpt-4.1"));
     }
 
     // ── model_context_window ──────────────────────────────────────
@@ -3676,6 +3821,22 @@ mod tests {
         assert_eq!(model_context_window("gpt-4.1"), 300_000);
         assert_eq!(model_context_window("gpt-4.1-mini"), 300_000);
         assert_eq!(model_context_window("gpt-4-1-mini"), 300_000);
+    }
+
+    #[test]
+    fn context_window_gpt5_and_oseries() {
+        // 2026-05-07: pre-fix gpt-5 / gpt-6 / o-series fell through to
+        // the conservative unknown-model default. Anchored on
+        // starts_with to avoid the gpt-4.x substring colliding via the
+        // shared `gpt-` prefix.
+        assert_eq!(model_context_window("gpt-5"), 400_000);
+        assert_eq!(model_context_window("gpt-5.4"), 400_000);
+        assert_eq!(model_context_window("gpt-6"), 400_000);
+        assert_eq!(model_context_window("o1-mini"), 400_000);
+        assert_eq!(model_context_window("o3"), 400_000);
+        assert_eq!(model_context_window("o4-mini"), 400_000);
+        // Boundary check vs gpt-4.x family.
+        assert_eq!(model_context_window("gpt-4.1"), 300_000);
     }
 
     #[test]
@@ -3861,7 +4022,8 @@ mod tests {
             "https://openrouter.ai/api/v1",
             "openrouter",
             120,
-        );
+        )
+        .expect("provider construction in test must succeed");
         assert_eq!(p.base_url, "https://openrouter.ai/api");
 
         let p2 = OpenAiProvider::new(
@@ -3870,15 +4032,18 @@ mod tests {
             "https://api.together.xyz/v1",
             "together",
             120,
-        );
+        )
+        .expect("provider construction in test must succeed");
         assert_eq!(p2.base_url, "https://api.together.xyz");
 
         // Providers without /v1 suffix must be unchanged.
-        let p3 = OpenAiProvider::new("key", "model", "https://api.openai.com", "openai", 120);
+        let p3 = OpenAiProvider::new("key", "model", "https://api.openai.com", "openai", 120)
+            .expect("provider construction in test must succeed");
         assert_eq!(p3.base_url, "https://api.openai.com");
 
         // Groq's /openai path must not be stripped.
-        let p4 = OpenAiProvider::new("key", "model", "https://api.groq.com/openai", "groq", 120);
+        let p4 = OpenAiProvider::new("key", "model", "https://api.groq.com/openai", "groq", 120)
+            .expect("provider construction in test must succeed");
         assert_eq!(p4.base_url, "https://api.groq.com/openai");
     }
 

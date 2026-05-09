@@ -1270,20 +1270,15 @@ impl GraphStore {
             DataValue::Str(format!("{:?}", source.source_type).into()),
         );
         // `sources.author` is schema `String default ''` (graph.rs:194).
-        // `None` is encoded as the empty-string sentinel; assert that
-        // real values are never `Some("".to_string())` so a regression
-        // cannot silently round-trip a confusing sentinel.
-        let author_sentinel = match source.author.as_deref() {
-            Some(s) => {
-                debug_assert!(
-                    !s.is_empty(),
-                    "sources.author: empty Some() must use None — empty maps to the schema sentinel"
-                );
-                s.to_string()
-            }
-            None => String::new(),
-        };
-        params.insert("author".into(), DataValue::Str(author_sentinel.into()));
+        // Routes through the shared `option_to_schema_sentinel` helper
+        // so the empty-string encoding is consistent across every
+        // schema-defaulted Option<String> column site.
+        params.insert(
+            "author".into(),
+            DataValue::Str(
+                option_to_schema_sentinel("sources.author", source.author.as_deref()).into(),
+            ),
+        );
         params.insert(
             "content_hash".into(),
             DataValue::Str(source.content_hash.0.clone().into()),
@@ -1552,9 +1547,14 @@ impl GraphStore {
         // `byte_start` / `byte_end`.  We resolve the URI through the
         // `sources` table at insert time so the denormalised column never
         // ships empty (pre-fix every row carried "").
-        let source_path = self
-            .find_source_uri_by_id(&claim.source.to_string())
-            .unwrap_or_default();
+        //
+        // Pre-fix `unwrap_or_default()` here silently swallowed Cozo
+        // errors and substituted `""`, breaking the byte-range citation
+        // invariant on the next read.  `find_source_uri_by_id` already
+        // returns `Ok("")` for the legitimate "row doesn't exist yet"
+        // case (its own `unwrap_or_default` on the first-row lookup),
+        // so propagation here only fires on a real storage fault.
+        let source_path = self.find_source_uri_by_id(&claim.source.to_string())?;
         params.insert("source_path".into(), DataValue::Str(source_path.into()));
         params.insert(
             "byte_start".into(),
@@ -1564,13 +1564,20 @@ impl GraphStore {
         // content_blake3 and symbol are both written here so that
         // `insert_claim` is complete-on-insert — `list_claim_symbols` (Phase
         // 7e) will see the symbol even if `insert_claims_batch` wasn't used.
+        // Both columns are `String default ''` schema; route through the
+        // shared sentinel helper so `Some("")` is caught in debug builds.
         params.insert(
             "content_blake3".into(),
-            DataValue::Str(claim.row_blake3.clone().unwrap_or_default().into()),
+            DataValue::Str(
+                option_to_schema_sentinel("claims.content_blake3", claim.row_blake3.as_deref())
+                    .into(),
+            ),
         );
         params.insert(
             "symbol".into(),
-            DataValue::Str(claim.symbol.clone().unwrap_or_default().into()),
+            DataValue::Str(
+                option_to_schema_sentinel("claims.symbol", claim.symbol.as_deref()).into(),
+            ),
         );
 
         self.query(
@@ -1685,24 +1692,48 @@ impl GraphStore {
         let source_id_strings: Vec<String> = claims.iter().map(|c| c.source.to_string()).collect();
         let uri_by_id = self.fetch_source_uris(&source_id_strings)?;
         for chunk in claims.chunks(CHUNK) {
+            // The closure returns `Result<DataValue, Error>` so any
+            // serde encode failure or upstream invariant break (a claim
+            // whose source row was not pre-resolved into `uri_by_id`)
+            // is hoisted out of the batch as a typed error rather than
+            // silently producing a row with `""` columns and corrupting
+            // the byte-range citation contract.  Same fix as the
+            // single-insert path at `insert_claim`; pre-fix `_batch`
+            // was the hot path used by the compile pipeline so the
+            // bug had wider blast radius.
             let rows: Vec<DataValue> = chunk
                 .iter()
-                .map(|c| {
+                .map(|c| -> Result<DataValue> {
                     let tier_str = match c.extraction_tier {
                         thinkingroot_core::types::ExtractionTier::Structural => "structural",
                         thinkingroot_core::types::ExtractionTier::Llm => "llm",
-                        thinkingroot_core::types::ExtractionTier::AgentInferred => "agent_inferred",
+                        thinkingroot_core::types::ExtractionTier::AgentInferred => {
+                            "agent_inferred"
+                        }
                     };
                     let derivation_parents_json = match &c.derivation {
                         Some(d) => {
-                            let ids: Vec<String> =
-                                d.parent_claim_ids.iter().map(|id| id.to_string()).collect();
-                            serde_json::to_string(&ids).unwrap_or_default()
+                            let ids: Vec<String> = d
+                                .parent_claim_ids
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect();
+                            serde_json::to_string(&ids).map_err(|e| {
+                                Error::GraphStorage(format!(
+                                    "encode derivation_parents for claim {}: {e}",
+                                    c.id
+                                ))
+                            })?
                         }
                         None => String::new(),
                     };
                     let predicate_json = match &c.predicate {
-                        Some(p) => serde_json::to_string(p).unwrap_or_default(),
+                        Some(p) => serde_json::to_string(p).map_err(|e| {
+                            Error::GraphStorage(format!(
+                                "encode predicate_json for claim {}: {e}",
+                                c.id
+                            ))
+                        })?,
                         None => String::new(),
                     };
                     let (byte_start_val, byte_end_val) = match c.source_span {
@@ -1713,8 +1744,32 @@ impl GraphStore {
                         None => (0, 0),
                     };
                     let source_id_str = c.source.to_string();
-                    let source_path = uri_by_id.get(&source_id_str).cloned().unwrap_or_default();
-                    DataValue::List(vec![
+                    // `claims.source_path` is defensively allowed to
+                    // ship empty when the corresponding `sources` row
+                    // hasn't been inserted yet (a misuse pattern
+                    // outside the v3 pipeline order — pipeline Phase 6
+                    // inserts sources before Phase 7's claim batch).
+                    // The empty-string fall-back is enshrined by the
+                    // `insert_claims_batch_with_missing_source_falls_back_to_empty`
+                    // contract test, so we keep the documented soft
+                    // failure here rather than upgrade it to a hard
+                    // error.  Real-pipeline calls always resolve.
+                    let source_path =
+                        uri_by_id.get(&source_id_str).cloned().unwrap_or_default();
+                    // `claims.{content_blake3,symbol}` are schema
+                    // `String default ''` — the empty-string sentinel
+                    // is the canonical "absent" marker.  Real values
+                    // are 64-char BLAKE3 hex / non-empty symbol names
+                    // respectively, so we route Option<String> through
+                    // the asserted-non-empty helper for parity with
+                    // the `insert_claim` single-row path.
+                    let row_blake3 = option_to_schema_sentinel(
+                        "claims.content_blake3",
+                        c.row_blake3.as_deref(),
+                    );
+                    let symbol =
+                        option_to_schema_sentinel("claims.symbol", c.symbol.as_deref());
+                    Ok(DataValue::List(vec![
                         DataValue::Str(c.id.to_string().into()),
                         DataValue::Str(c.statement.clone().into()),
                         DataValue::Str(format!("{:?}", c.claim_type).into()),
@@ -1745,11 +1800,11 @@ impl GraphStore {
                         DataValue::Str(source_path.into()),
                         DataValue::Num(Num::Int(byte_start_val)),
                         DataValue::Num(Num::Int(byte_end_val)),
-                        DataValue::Str(c.row_blake3.clone().unwrap_or_default().into()),
-                        DataValue::Str(c.symbol.clone().unwrap_or_default().into()),
-                    ])
+                        DataValue::Str(row_blake3.into()),
+                        DataValue::Str(symbol.into()),
+                    ]))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let mut params = BTreeMap::new();
             params.insert("rows".into(), DataValue::List(rows));
             self.query(
@@ -5327,8 +5382,27 @@ impl GraphStore {
                 _ => continue,
             };
 
-            let claim_ids: Vec<String> =
-                serde_json::from_str(&claim_ids_json).unwrap_or_default();
+            // Pre-fix `unwrap_or_default()` here masked corrupted
+            // stored JSON as an empty Vec, so a single malformed turn
+            // row would silently drop all its claim references on the
+            // next dangling-ref sweep — the whole turn became empty
+            // (and was then deleted as "useless" further down).  Log
+            // and skip the row instead so the rebuild proceeds for
+            // every other (well-formed) row and an operator can see
+            // what went wrong.
+            let claim_ids: Vec<String> = match serde_json::from_str(&claim_ids_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        turn_number = turn_number,
+                        error = %e,
+                        "filter_dangling_claim_refs_from_turns: skipping row with malformed \
+                         claim_ids JSON — original row preserved"
+                    );
+                    continue;
+                }
+            };
             let kept: Vec<String> = claim_ids
                 .into_iter()
                 .filter(|id| !removed.contains(id.as_str()))
@@ -5398,28 +5472,43 @@ impl GraphStore {
             )
             .map_err(|e| Error::GraphStorage(format!("query_turns_for_session failed: {e}")))?;
 
+        // Pre-fix `unwrap_or_default()` on `from_str` quietly returned a
+        // turn with empty `claim_ids` whenever the stored JSON was
+        // malformed — a misrepresentation we surface as a `tracing::warn!`
+        // and skip via `filter_map` so the caller's session view does
+        // not silently lose references.  Honest empty turn ≠ honest
+        // signal "this row is corrupt"; we never conflate them.
         Ok(result
             .rows
             .iter()
-            .map(|row| {
+            .filter_map(|row| {
                 let turn_number = match &row[0] {
                     DataValue::Num(Num::Int(n)) => *n as u64,
                     DataValue::Num(Num::Float(f)) => *f as u64,
                     _ => 0,
                 };
                 let claim_ids_json = dv_to_string(&row[1]);
-                let claim_ids: Vec<String> =
-                    serde_json::from_str(&claim_ids_json).unwrap_or_default();
+                let claim_ids: Vec<String> = match serde_json::from_str(&claim_ids_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            turn_number = turn_number,
+                            error = %e,
+                            "query_turns_for_session: skipping turn with malformed claim_ids JSON"
+                        );
+                        return None;
+                    }
+                };
                 let timestamp = match &row[2] {
                     DataValue::Num(Num::Float(f)) => *f,
                     DataValue::Num(Num::Int(n)) => *n as f64,
                     _ => 0.0,
                 };
-                TurnRow {
+                Some(TurnRow {
                     turn_number,
                     claim_ids,
                     timestamp,
-                }
+                })
             })
             .collect())
     }
@@ -5464,8 +5553,21 @@ impl GraphStore {
         };
 
         let claim_ids_json = dv_to_string(&row[0]);
+        // Pre-fix `unwrap_or_default()` produced an empty `claim_ids`
+        // Vec on parse failure, so a connector replaying a previously
+        // ingested event would receive a `ConnectorIngestRecord` with
+        // ZERO claim ids — telling the caller "this idempotency key
+        // was already processed but produced nothing," which would in
+        // turn cause the caller to re-process the event (the empty
+        // result is indistinguishable from "fresh"). Hard error so
+        // the idempotency contract stays load-bearing.
         let claim_ids: Vec<String> =
-            serde_json::from_str(&claim_ids_json).unwrap_or_default();
+            serde_json::from_str(&claim_ids_json).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "lookup_connector_ingest: malformed stored claim_ids JSON for \
+                     ({connector_id}, {install_id}, {idempotency_key}): {e}"
+                ))
+            })?;
         let ingested_at = match &row[1] {
             DataValue::Num(Num::Float(f)) => *f,
             DataValue::Num(Num::Int(i)) => *i as f64,
@@ -5631,6 +5733,31 @@ pub struct TurnRow {
 /// up here automatically.
 fn pk_rm_script_for_table(name: &str, sid_col: &str) -> String {
     thinkingroot_core::structural_registry::pk_rm_script_for_table(name, sid_col)
+}
+
+/// Encode an `Option<&str>` into the empty-string sentinel that several
+/// CozoDB columns declare as their schema default (e.g. `sources.author`,
+/// `claims.content_blake3`, `claims.symbol`).  Cozo string columns are
+/// non-nullable; the `String default ''` schema declaration makes `""`
+/// the canonical "absent" marker.  Domain-side, real values for these
+/// columns are never empty by construction (BLAKE3 hex is 64 chars,
+/// symbols are non-empty by parser convention, authors are populated
+/// or `None`), so `""` cannot collide with a legitimate value.
+///
+/// In debug builds we assert that no caller stamps `Some("")` — that
+/// would round-trip indistinguishably from a real `None` and confuse
+/// any read path that uses `is_empty()` to detect absence.
+fn option_to_schema_sentinel(field: &'static str, value: Option<&str>) -> String {
+    match value {
+        Some(s) => {
+            debug_assert!(
+                !s.is_empty(),
+                "{field}: real values must never be empty — empty maps to the schema sentinel"
+            );
+            s.to_string()
+        }
+        None => String::new(),
+    }
 }
 
 /// Extract a String from a DataValue.

@@ -216,6 +216,21 @@ impl Error {
                     || m.contains("access denied")
                     || m.contains("authentication")
                     || m.contains("api endpoint")
+                    // 2026-05-07: Azure / OpenAI return `unsupported_parameter`
+                    // when the deployment is a reasoning model (gpt-5.x, o-series)
+                    // but the request body still carries the legacy `max_tokens`
+                    // field — and vice-versa.  Same fix-the-config story as 401:
+                    // every retry replays the same wrong parameter and gets the
+                    // same 400 back, so retries burn quota.  Bail-fast surfaces
+                    // the misconfiguration in seconds instead of grinding for
+                    // hours.
+                    || m.contains("unsupported_parameter")
+                    || m.contains("unsupported parameter")
+                    // OpenAI returns `model_not_found` (HTTP 404 dressed as a
+                    // typed code) when the deployment / model id is wrong.
+                    // Same family of fail-and-stop errors.
+                    || m.contains("model_not_found")
+                    || m.contains("deployment_not_found")
             }
             _ => false,
         }
@@ -284,6 +299,28 @@ mod tests {
             ),
             (
                 r#"{"error":{"code":"403","message":"Forbidden"}}"#,
+                true,
+            ),
+            // 2026-05-07: Azure rejects `max_tokens` against reasoning
+            // models (gpt-5.x / o-series) — the deployment expects
+            // `max_completion_tokens`. Pre-fix the extractor retried 3×
+            // per batch then walked through every batch in the workspace,
+            // turning a config-name mismatch into hours of wall-time.
+            // Verbatim Azure body string.
+            (
+                r#"azure: unexpected response: {"error":{"code":"unsupported_parameter","message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","param":"max_tokens","type":"invalid_request_error"}}"#,
+                true,
+            ),
+            (
+                "Unsupported parameter: 'max_tokens' is not supported with this model.",
+                true,
+            ),
+            (
+                r#"{"error":{"code":"model_not_found","message":"The model 'gpt-foo' does not exist or you do not have access to it."}}"#,
+                true,
+            ),
+            (
+                r#"{"error":{"code":"deployment_not_found","message":"deployment not found"}}"#,
                 true,
             ),
         ];
