@@ -76,6 +76,49 @@ impl SidecarClient {
         Self::ensure_active(app).await
     }
 
+    /// Like [`Self::ensure_active`] but mounts a *named* workspace
+    /// rather than whatever `WorkspaceRegistry::active_entry` picks.
+    ///
+    /// Used by the chat surface's `llm_health` pre-flight: when a
+    /// workspace's substrate exists on disk (compiled badge says
+    /// COMPILED) but the daemon hasn't loaded it into
+    /// `engine.workspaces` yet, the daemon's `/llm/health` returns
+    /// `mounted: false` and the chat banner falsely refuses to send.
+    /// Calling this before the probe converges the two views — disk
+    /// state and daemon state — without waiting for some other code
+    /// path (Brain view, compile, etc.) to incidentally trigger a
+    /// mount first.
+    pub async fn ensure_workspace(
+        app: &AppHandle,
+        workspace_name: &str,
+    ) -> Result<Self, String> {
+        let (host, port) = resolve_sidecar(app).await?;
+        let registry = WorkspaceRegistry::load()
+            .map_err(|e| format!("load workspace registry: {e}"))?;
+        let entry = registry
+            .workspaces
+            .iter()
+            .find(|w| w.name == workspace_name)
+            .ok_or_else(|| {
+                format!(
+                    "workspace '{workspace_name}' not in registry — run `root workspace add` or remove the stale entry"
+                )
+            })?;
+        let root_path = entry.path.clone();
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| format!("build http client: {e}"))?;
+        let me = Self {
+            host,
+            port,
+            workspace: workspace_name.to_string(),
+            client,
+        };
+        me.ensure_workspace_mounted(&root_path).await?;
+        Ok(me)
+    }
+
     /// Idempotent — POST /api/v1/workspaces with the desktop's active
     /// workspace name + path. Daemon's `mount_workspace_handler` is a
     /// remount-overwrite so calling repeatedly is safe; it also pins

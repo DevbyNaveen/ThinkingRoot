@@ -526,33 +526,43 @@ pub struct LlmHealth {
 /// a banner so users with an unconfigured workspace know *before* they
 /// type 200 chars why the answer won't come.
 ///
-/// Uses the lightweight cortex-aware resolver so a daemon started
-/// outside this desktop session (e.g. CLI `root serve`, launchd, the
-/// "Restart local engine" palette command) is detected without
-/// requiring the user to reload — pre-fix this command short-circuited
-/// to `mounted: false` whenever the desktop's `state.sidecar` slot was
-/// empty, even when the daemon was healthy on the canonical port.
+/// Production-grade behavior: this *actively* mounts the named workspace
+/// on the daemon before probing `/llm/health`, so the "compiled on
+/// disk" view (right-rail badge) and the "mounted in engine" view
+/// (chat banner) cannot disagree. Pre-fix the chat banner falsely
+/// claimed `mounted: false` whenever the desktop hadn't already
+/// triggered a mount via some *other* code path (Brain view,
+/// workspace_compile, branch list, …) — purely a function of which
+/// panel the user clicked first.
 #[tauri::command]
 pub async fn llm_health(app: AppHandle, workspace: String) -> Result<LlmHealth, String> {
-    let Some((host, port)) =
-        crate::commands::sidecar_client::try_resolve_endpoint(&app).await
-    else {
-        // No daemon reachable anywhere — treat as "not configured" so
-        // the UI can render the same banner shape rather than
-        // spinning. This is the only scenario where the banner's
-        // "isn't mounted in the engine" copy is the truth.
-        return Ok(LlmHealth {
-            configured: false,
-            provider: None,
-            model: None,
-            claim_count: 0,
-            mounted: false,
-        });
+    use crate::commands::sidecar_client::SidecarClient;
+
+    // Mount the named workspace on the daemon before probing. If
+    // `ensure_workspace` fails (no daemon reachable, workspace not in
+    // registry, mount handler errored) we surface honest emptiness
+    // rather than fabricating a misleading `mounted: true`.
+    let sc = match SidecarClient::ensure_workspace(&app, &workspace).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                workspace = workspace.as_str(),
+                error = %e,
+                "llm_health: ensure_workspace failed — surfacing not-mounted"
+            );
+            return Ok(LlmHealth {
+                configured: false,
+                provider: None,
+                model: None,
+                claim_count: 0,
+                mounted: false,
+            });
+        }
     };
 
     let url = format!(
         "http://{}:{}/api/v1/ws/{}/llm/health",
-        host, port, workspace
+        sc.host, sc.port, workspace
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

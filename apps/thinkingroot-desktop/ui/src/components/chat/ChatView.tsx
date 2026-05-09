@@ -642,8 +642,12 @@ function LlmHealthBanner({
         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none text-amber-300" />
         <div className="leading-relaxed text-muted-foreground">
           Workspace <code className="font-mono">{workspace}</code> isn't
-          mounted in the engine yet. Compile it from the Workspaces panel
-          before chatting.
+          loaded by the engine. Try{" "}
+          <strong className="font-medium text-foreground/90">
+            Restart local engine
+          </strong>{" "}
+          (⌘K) — that respawns the sidecar and remounts. If the workspace
+          has never been compiled, run Compile Workspace first.
         </div>
       </div>
     );

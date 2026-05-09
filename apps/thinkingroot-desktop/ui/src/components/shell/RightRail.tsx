@@ -271,12 +271,18 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         <Folder className="size-3.5 text-muted-foreground" />
         <span className="truncate font-medium">{activeWorkspace}</span>
         {w?.compiled ? (
-          <span className="ml-auto rounded-full bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-emerald-400">
+          <span
+            className="ml-auto rounded-full bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-emerald-400"
+            title="Workspace has been compiled at least once (graph.db present)."
+          >
             compiled
           </span>
         ) : (
-          <span className="ml-auto rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-amber-400">
-            pending
+          <span
+            className="ml-auto rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-amber-400"
+            title="Workspace has not been compiled yet — click Compile Workspace to build the substrate."
+          >
+            uncompiled
           </span>
         )}
       </div>
