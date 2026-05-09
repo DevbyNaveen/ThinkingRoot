@@ -303,10 +303,7 @@ async fn attach(
                     .write()
                     .await
                     .insert(workspace.to_string(), snap.clone());
-                let _ = app.emit(
-                    &format!("{SNAPSHOT_EVENT_PREFIX}:{workspace}"),
-                    snap,
-                );
+                let _ = app.emit(&format!("{SNAPSHOT_EVENT_PREFIX}:{workspace}"), snap);
             }
             WorkspaceStatusEvent::Heartbeat { at, .. } => {
                 let _ = app.emit(

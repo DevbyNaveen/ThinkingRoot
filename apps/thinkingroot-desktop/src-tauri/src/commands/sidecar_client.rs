@@ -88,13 +88,10 @@ impl SidecarClient {
     /// state and daemon state — without waiting for some other code
     /// path (Brain view, compile, etc.) to incidentally trigger a
     /// mount first.
-    pub async fn ensure_workspace(
-        app: &AppHandle,
-        workspace_name: &str,
-    ) -> Result<Self, String> {
+    pub async fn ensure_workspace(app: &AppHandle, workspace_name: &str) -> Result<Self, String> {
         let (host, port) = resolve_sidecar(app).await?;
-        let registry = WorkspaceRegistry::load()
-            .map_err(|e| format!("load workspace registry: {e}"))?;
+        let registry =
+            WorkspaceRegistry::load().map_err(|e| format!("load workspace registry: {e}"))?;
         let entry = registry
             .workspaces
             .iter()
@@ -139,13 +136,7 @@ impl SidecarClient {
             "root_path": root_path.display().to_string(),
         });
 
-        let send_once = || async {
-            self.client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-        };
+        let send_once = || async { self.client.post(&url).json(&body).send().await };
 
         let resp = match send_once().await {
             Ok(r) => r,
@@ -398,8 +389,8 @@ pub async fn try_resolve_endpoint(app: &AppHandle) -> Option<(String, u16)> {
 }
 
 fn resolve_active_workspace() -> Result<(String, PathBuf), String> {
-    let registry = WorkspaceRegistry::load()
-        .map_err(|e| format!("load workspace registry: {e}"))?;
+    let registry =
+        WorkspaceRegistry::load().map_err(|e| format!("load workspace registry: {e}"))?;
     let entry = registry
         .active_entry()
         .ok_or_else(|| "no active workspace selected".to_string())?;
@@ -446,6 +437,5 @@ async fn decode_envelope<T: DeserializeOwned>(resp: reqwest::Response) -> Result
         .get("data")
         .cloned()
         .ok_or_else(|| "response envelope missing data field".to_string())?;
-    serde_json::from_value(data)
-        .map_err(|e| format!("parse response data ({body}): {e}"))
+    serde_json::from_value(data).map_err(|e| format!("parse response data ({body}): {e}"))
 }

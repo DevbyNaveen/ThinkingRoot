@@ -39,9 +39,7 @@ pub enum BridgeError {
 /// returns `Ok(InProcess)` to signal "you should spawn one" rather
 /// than auto-spawning. The desktop's sidecar manager handles the
 /// spawn itself because it needs the resulting `Child` handle.
-pub async fn resolve_engine(
-    intent: EngineIntent,
-) -> Result<EngineConnection, BridgeError> {
+pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, BridgeError> {
     if matches!(intent, EngineIntent::McpStdio) {
         return Ok(EngineConnection::Stdio);
     }

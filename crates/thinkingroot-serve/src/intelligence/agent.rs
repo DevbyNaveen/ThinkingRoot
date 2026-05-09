@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 
 use crate::intelligence::approval::{ApprovalDecision, ApprovalGate};
 use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
+use crate::intelligence::token_budget::{DEFAULT_TOOL_RESULT_TOKEN_BUDGET, truncate_tool_result};
 use crate::intelligence::tools::ToolRegistry;
 use crate::intelligence::trace::{SharedTraceLog, event_to_trace};
 
@@ -156,11 +157,41 @@ pub enum AgentEvent {
     Error { message: String },
 }
 
+/// Refresh the system prompt at the top of each agent iteration.
+///
+/// The streaming REST path (rest.rs::agent_stream_response) supplies a
+/// refresher so the workspace identity block (`<system-reminder>`
+/// claim_count, source_kinds, today, project_doc) stays current across
+/// long agent runs — particularly when a `compile` lands mid-stream
+/// and the snapshot we captured at request entry is no longer accurate.
+/// Tests and CLI flows that don't need refresh pass `None` and the
+/// agent reuses `req.system` unchanged each iteration. Cheap by design:
+/// the typical implementation reads from `engine.workspace_chat_snapshot`
+/// which is an in-memory cache. (C5 fix, plan 2026-05-09.)
+#[async_trait]
+pub trait SystemPromptRefresher: Send + Sync {
+    /// Return the system prompt to use for the next LLM call. The
+    /// returned `String` replaces `req.system` for that single
+    /// iteration. `iteration` is 1-based.
+    async fn refresh(&self, iteration: usize) -> String;
+}
+
 /// Inputs to one agent run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentRequest {
     /// System prompt to pass to every `chat_with_tools` call.
+    /// Used unchanged when `system_refresher` is `None`. When a
+    /// refresher is set, this string is the fallback returned if
+    /// the refresher panics or errors.
     pub system: String,
+    /// Optional per-iteration refresher. When set, called at the
+    /// top of every iteration to re-render the system prompt with
+    /// fresh ambient context (workspace identity, branch state,
+    /// reactive `<system-reminder>` blocks). When `None`, the agent
+    /// reuses `system` unchanged across iterations — the right
+    /// default for tests, CLI flows, and any caller that doesn't
+    /// care about within-conversation drift.
+    pub system_refresher: Option<Arc<dyn SystemPromptRefresher>>,
     /// Initial message history. The caller is responsible for
     /// putting the user's most-recent question at the end (typically
     /// as the last `ChatMessage::User`). Subsequent turns are appended
@@ -171,6 +202,20 @@ pub struct AgentRequest {
     /// a tool on the first turn — useful for "investigate" CLI flows.
     /// `None` disables tools entirely on this run.
     pub tool_choice: ToolChoice,
+}
+
+impl std::fmt::Debug for AgentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRequest")
+            .field("system", &self.system)
+            .field(
+                "system_refresher",
+                &self.system_refresher.as_ref().map(|_| "<refresher>"),
+            )
+            .field("history", &self.history)
+            .field("tool_choice", &self.tool_choice)
+            .finish()
+    }
 }
 
 /// Configuration knobs for the agent. Defaults match the safe
@@ -288,9 +333,19 @@ impl Agent {
         while iterations < self.max_iterations {
             iterations += 1;
 
+            // C5: refresh system prompt at the top of each iteration
+            // when a refresher is configured. Keeps workspace identity
+            // (claim_count, source_kinds, today) current across long
+            // agent runs and post-mid-stream-compile scenarios. Static
+            // `req.system` is the fallback when no refresher is wired.
+            let current_system: String = match &req.system_refresher {
+                Some(refresher) => refresher.refresh(iterations).await,
+                None => req.system.clone(),
+            };
+
             let response = match self
                 .llm
-                .chat_with_tools(&req.system, &history, &tools, &tool_choice)
+                .chat_with_tools(&current_system, &history, &tools, &tool_choice)
                 .await
             {
                 Ok(r) => r,
@@ -471,19 +526,27 @@ impl Agent {
             )
             .await;
             let res = self.registry.dispatch(&call.name, call.input.clone()).await;
+            // C6: bound the per-result content so a single oversized
+            // tool output (large file read, 50-hit search) cannot
+            // starve subsequent iterations of context. The full
+            // result is still emitted to the UI/trace via
+            // ToolCallFinished — only the LLM-facing history copy is
+            // truncated. (plan 2026-05-09)
+            let bounded_content =
+                truncate_tool_result(res.content.clone(), DEFAULT_TOOL_RESULT_TOKEN_BUDGET);
             self.emit(
                 sink,
                 AgentEvent::ToolCallFinished {
                     id: call.id.clone(),
                     name: call.name.clone(),
-                    content: res.content.clone(),
+                    content: res.content,
                     is_error: res.is_error,
                 },
             )
             .await;
             results.push(ToolResult {
                 tool_use_id: call.id.clone(),
-                content: res.content,
+                content: bounded_content,
                 is_error: res.is_error,
             });
         }
@@ -602,6 +665,7 @@ mod tests {
     struct ScriptedLlm {
         script: Mutex<Vec<ToolUseResponse>>,
         calls_seen: Mutex<Vec<Vec<ChatMessage>>>,
+        systems_seen: Mutex<Vec<String>>,
     }
 
     impl ScriptedLlm {
@@ -609,11 +673,18 @@ mod tests {
             Self {
                 script: Mutex::new(script),
                 calls_seen: Mutex::new(Vec::new()),
+                systems_seen: Mutex::new(Vec::new()),
             }
         }
 
         fn calls_seen(&self) -> Vec<Vec<ChatMessage>> {
             self.calls_seen.lock().unwrap().clone()
+        }
+
+        /// Every system-prompt string this LLM saw, in call order.
+        /// Used by the C5 refresher test (`agent_calls_system_refresher_per_iteration`).
+        fn systems_seen(&self) -> Vec<String> {
+            self.systems_seen.lock().unwrap().clone()
         }
     }
 
@@ -621,12 +692,13 @@ mod tests {
     impl LlmBackend for ScriptedLlm {
         async fn chat_with_tools(
             &self,
-            _system: &str,
+            system: &str,
             messages: &[ChatMessage],
             _tools: &[Tool],
             _tool_choice: &ToolChoice,
         ) -> Result<ToolUseResponse> {
             self.calls_seen.lock().unwrap().push(messages.to_vec());
+            self.systems_seen.lock().unwrap().push(system.to_string());
             let mut script = self.script.lock().unwrap();
             if script.is_empty() {
                 return Err(Error::Extraction {
@@ -635,6 +707,35 @@ mod tests {
                 });
             }
             Ok(script.remove(0))
+        }
+    }
+
+    /// Test refresher that emits a unique string per iteration so the
+    /// C5 regression test can assert the agent loop calls
+    /// [`SystemPromptRefresher::refresh`] at the top of every turn.
+    /// Captures every iteration number it was asked about so the test
+    /// can verify `iteration` is 1-based and monotonic.
+    struct SeqRefresher {
+        prefix: String,
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl SeqRefresher {
+        fn new(prefix: &str) -> (Arc<Self>, Arc<Mutex<Vec<usize>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let r = Arc::new(Self {
+                prefix: prefix.to_string(),
+                seen: seen.clone(),
+            });
+            (r, seen)
+        }
+    }
+
+    #[async_trait]
+    impl SystemPromptRefresher for SeqRefresher {
+        async fn refresh(&self, iteration: usize) -> String {
+            self.seen.lock().unwrap().push(iteration);
+            format!("{}-iter-{iteration}", self.prefix)
         }
     }
 
@@ -682,6 +783,7 @@ mod tests {
 
         let req = AgentRequest {
             system: "you are helpful".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("how many providers")],
             tool_choice: ToolChoice::Auto,
         };
@@ -731,6 +833,7 @@ mod tests {
         let agent = Agent::new(llm.clone(), registry, Arc::new(AutoApprove));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("how many providers")],
             tool_choice: ToolChoice::Auto,
         };
@@ -806,6 +909,7 @@ mod tests {
         let agent = Agent::new(llm, registry, Arc::new(DenyAll));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("create a branch please")],
             tool_choice: ToolChoice::Auto,
         };
@@ -870,6 +974,7 @@ mod tests {
         let agent = Agent::new(llm, registry, gate);
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("look it up")],
             tool_choice: ToolChoice::Auto,
         };
@@ -916,6 +1021,7 @@ mod tests {
         let agent = Agent::new(llm.clone(), registry, Arc::new(AutoApprove));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("hi")],
             tool_choice: ToolChoice::Auto,
         };
@@ -977,6 +1083,7 @@ mod tests {
         );
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("loop forever")],
             tool_choice: ToolChoice::Auto,
         };
@@ -996,6 +1103,7 @@ mod tests {
         let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("hi")],
             tool_choice: ToolChoice::Auto,
         };
@@ -1016,6 +1124,7 @@ mod tests {
         let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("write me something long")],
             tool_choice: ToolChoice::Auto,
         };
@@ -1109,6 +1218,7 @@ mod tests {
 
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("how many providers")],
             tool_choice: ToolChoice::Auto,
         };
@@ -1154,6 +1264,7 @@ mod tests {
 
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("look it up")],
             tool_choice: ToolChoice::Auto,
         };
@@ -1203,6 +1314,7 @@ mod tests {
 
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("create one")],
             tool_choice: ToolChoice::Auto,
         };
@@ -1229,11 +1341,275 @@ mod tests {
         let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove));
         let req = AgentRequest {
             system: "sys".to_string(),
+            system_refresher: None,
             history: vec![ChatMessage::user("hi")],
             tool_choice: ToolChoice::Auto,
         };
         let run = run_to_completion(&agent, req).await;
         assert_eq!(run.final_text().as_deref(), Some("ok"));
         assert!(run.first_error().is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // C5 regression: refresh WorkspaceIdentity per agent iteration
+    // (Task 2, plan 2026-05-09). Mocks an LLM that runs three iterations
+    // (tool, tool, text) and a refresher that returns a unique string
+    // per iteration. Asserts every chat_with_tools call received the
+    // refresher's output instead of the static `req.system` fallback,
+    // and that iteration numbers are 1-based + monotonic.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_calls_system_refresher_per_iteration() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::new().register_read(
+            fixture_tool("search"),
+            Arc::new(CapturingHandler {
+                name: "search",
+                captured: captured.clone(),
+                reply: "no results".to_string(),
+                is_error: false,
+            }),
+        );
+
+        // Iter 1+2: tool call. Iter 3: terminal text.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "t1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "auth"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "t2".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "auth bug"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "Looked into it.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+
+        let agent = Agent::new(llm.clone(), registry, Arc::new(AutoApprove));
+        let (refresher, refresh_calls) = SeqRefresher::new("ws-pulse");
+
+        let req = AgentRequest {
+            system: "stale fallback that must NOT appear".to_string(),
+            system_refresher: Some(refresher),
+            history: vec![ChatMessage::user("fix the auth bug")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+
+        // Sanity: agent ran three iterations and finished cleanly.
+        assert_eq!(run.iterations(), 3);
+        assert_eq!(run.final_text().as_deref(), Some("Looked into it."));
+
+        // The refresher was called once per iteration, in order, 1-based.
+        let seen = refresh_calls.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![1, 2, 3],
+            "refresher must be called exactly once per iteration, 1-based"
+        );
+
+        // Every LLM call received the refreshed system prompt — not
+        // the stale fallback. C5 contract: an out-of-date
+        // `WorkspaceIdentity` snapshot from the request entry must not
+        // leak into post-iteration-1 LLM calls.
+        let systems = llm.systems_seen();
+        assert_eq!(
+            systems,
+            vec![
+                "ws-pulse-iter-1".to_string(),
+                "ws-pulse-iter-2".to_string(),
+                "ws-pulse-iter-3".to_string(),
+            ],
+            "each chat_with_tools call must use the refresher's output, \
+             not the static AgentRequest.system fallback"
+        );
+        assert!(
+            !systems.iter().any(|s| s.contains("stale fallback")),
+            "static fallback must never reach the LLM when a refresher is set"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // C6 regression: token budget on agent loop tool results
+    // (Task 3, plan 2026-05-09). Mocks a tool returning a 50K-byte
+    // payload (~12K tokens) and asserts the next iteration's
+    // ToolResults message is truncated below the default 2K-token
+    // budget — while the UI-facing ToolCallFinished event still
+    // carries the full content (so trace logs and claim cards stay
+    // accurate).
+    // ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_calls_truncates_oversized_tool_results_for_llm_only() {
+        use crate::intelligence::token_budget::DEFAULT_TOOL_RESULT_TOKEN_BUDGET;
+
+        // 50,000 bytes ≈ 12,500 tokens at 4-cpt. Well over the 2,048
+        // default budget. Distinct head/tail markers let us verify
+        // the truncation preserves boundary signal.
+        let huge_body = "Z".repeat(50_000);
+        let huge_payload = format!("HEAD-MARK{huge_body}TAIL-MARK");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::new().register_read(
+            fixture_tool("read_file"),
+            Arc::new(CapturingHandler {
+                name: "read_file",
+                captured: captured.clone(),
+                reply: huge_payload.clone(),
+                is_error: false,
+            }),
+        );
+
+        // Iter 1: tool call. Iter 2: terminal text.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "rf1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "big.txt"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "Read it.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+
+        let agent = Agent::new(llm.clone(), registry, Arc::new(AutoApprove));
+        let req = AgentRequest {
+            system: "sys".to_string(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("read it")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+        assert_eq!(run.iterations(), 2);
+
+        // The LLM history on iteration 2 must contain the truncation
+        // marker (the bounded copy), not the raw 50K-byte payload.
+        let calls = llm.calls_seen();
+        assert_eq!(calls.len(), 2, "expected two LLM calls (tool, then text)");
+        let iter2_history = &calls[1];
+        let tool_results_msg = iter2_history
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::ToolResults(r) => Some(r),
+                _ => None,
+            })
+            .expect("iteration 2 must include ToolResults");
+        assert_eq!(tool_results_msg.len(), 1);
+        let bounded = &tool_results_msg[0].content;
+        assert!(
+            bounded.contains("truncated for token budget"),
+            "LLM-facing tool result must carry the truncation marker"
+        );
+        assert!(
+            bounded.len() < huge_payload.len(),
+            "LLM-facing tool result must be smaller than the raw payload \
+             ({} bytes vs {} raw)",
+            bounded.len(),
+            huge_payload.len()
+        );
+        // Defense-in-depth: ensure the budget was actually respected.
+        let est = bounded.len() / 4;
+        assert!(
+            est <= DEFAULT_TOOL_RESULT_TOKEN_BUDGET * 2,
+            "bounded result still {est} tokens — over 2× budget"
+        );
+
+        // The UI-facing ToolCallFinished event must carry the FULL
+        // content (so trace logs, claim cards, and the verifier see
+        // exactly what the tool produced). CapturingHandler decorates
+        // its reply as `{name}:{reply}` (line ~669), so the expected
+        // event content is the full prefixed string.
+        let expected_full = format!("read_file:{huge_payload}");
+        let finished = run
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCallFinished { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("ToolCallFinished must be emitted");
+        assert_eq!(
+            finished, &expected_full,
+            "UI-facing event must keep the FULL tool result \
+             (truncation only applies to the LLM-history copy)"
+        );
+        assert!(
+            finished.len() > bounded.len(),
+            "full UI content ({}) must be larger than bounded LLM copy ({})",
+            finished.len(),
+            bounded.len()
+        );
+    }
+
+    /// Without a refresher, the agent reuses `req.system` for every
+    /// iteration — preserving the existing contract for tests, CLI
+    /// flows, and any caller that doesn't need within-conversation
+    /// freshness. Pin this so a future "refresh by default" change
+    /// doesn't silently break LongMemEval / single-turn callers.
+    #[tokio::test]
+    async fn agent_without_refresher_reuses_static_system_each_iteration() {
+        let registry = ToolRegistry::new().register_read(
+            fixture_tool("search"),
+            Arc::new(CapturingHandler {
+                name: "search",
+                captured: Arc::new(Mutex::new(Vec::new())),
+                reply: "ok".to_string(),
+                is_error: false,
+            }),
+        );
+
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "t1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "x"}),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "done".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+
+        let agent = Agent::new(llm.clone(), registry, Arc::new(AutoApprove));
+        let req = AgentRequest {
+            system: "static-sys".to_string(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("go")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let _ = run_to_completion(&agent, req).await;
+
+        let systems = llm.systems_seen();
+        assert_eq!(
+            systems,
+            vec!["static-sys".to_string(), "static-sys".to_string()],
+            "without a refresher, every iteration must see the same \
+             AgentRequest.system string byte-identical"
+        );
     }
 }

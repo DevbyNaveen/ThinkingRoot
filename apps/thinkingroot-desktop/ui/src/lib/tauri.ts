@@ -364,6 +364,18 @@ export async function mcpGetConfigSnippet(tool: McpToolKey): Promise<string> {
   return invoke<string>("mcp_get_config_snippet", { tool });
 }
 
+export interface McpConfigureResult {
+  tool: string;
+  path: string;
+  restart_required: boolean;
+}
+
+export async function mcpConfigureTool(
+  tool: McpToolKey,
+): Promise<McpConfigureResult> {
+  return invoke<McpConfigureResult>("mcp_configure_tool", { tool });
+}
+
 export interface McpServerRow {
   name: string;
   transport: string;
@@ -459,6 +471,37 @@ export async function workspaceReadme(): Promise<string> {
   return invoke<string>("workspace_readme");
 }
 
+/**
+ * Mirror of Rust `thinkingroot_core::IncrementalSummary` — the structured
+ * delta surfaced at the end of every successful compile. Always populated
+ * (even on the no-edits-since-last-compile early-return path), so React
+ * code can render a summary panel without branching on presence.
+ *
+ * `bytes_re_extracted` is `bigint` because the Rust side is `u64` and
+ * a multi-GiB workspace can exceed JavaScript's safe-integer range
+ * (2⁵³−1 ≈ 8 PiB, but serde-json emits as a JSON number which loses
+ * precision past 2⁵³); upstream serializer keeps it numeric.
+ */
+export interface IncrementalSummary {
+  sources_total: number;
+  sources_unchanged: number;
+  sources_truly_changed: number;
+  sources_deleted: number;
+  sources_resolution_dirty: number;
+  claims_added: number;
+  claims_updated: number;
+  claims_deleted: number;
+  structural_rows_emitted: number;
+  structural_rows_cascaded: number;
+  bytes_re_extracted: number;
+  llm_calls: number;
+  cache_hits: number;
+  structural_extractions: number;
+  /** Per-phase wall-clock in milliseconds, keyed by canonical phase name. */
+  phase_timings: Record<string, number>;
+  total_elapsed_ms: number;
+}
+
 export type CompileProgress =
   | { phase: "started"; workspace: string }
   // Emitted while the desktop is waiting for the bundled `root`
@@ -498,6 +541,15 @@ export type CompileProgress =
       artifacts: number;
       health_score: number;
       cache_dirty: boolean;
+      // Carried through from PipelineResult so the result panel can
+      // render a "compile finished but N batches failed" warning
+      // without listening to a separate ExtractionPartial event.
+      failed_batches?: number;
+      failed_chunk_ranges?: Array<[number, number]>;
+      // Full incremental delta (per-phase timings + claim/source/structural
+      // counts).  Optional because pre-T8 daemons don't include it; renderer
+      // skips the breakdown panel when undefined.
+      incremental_summary?: IncrementalSummary;
     }
   | { phase: "failed"; error: string }
   // The Rust `CompileProgress::Cancelled` variant fires when the user
@@ -514,6 +566,11 @@ export function onWorkspaceCompileProgress(
   return listen<CompileProgress>("workspace_compile_progress", (e) =>
     handler(e.payload),
   );
+}
+
+/** Emitted from Rust when `workspaces.toml` or post-compile graph state should reload in the UI. */
+export function onWorkspacesChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen<boolean>("workspaces-changed", () => handler());
 }
 
 // ─── Workspace auto-scan ─────────────────────────────────────────────
@@ -683,7 +740,66 @@ export type ChatEvent =
       id: string;
       name: string;
       reason: string;
+    }
+  | {
+      /** Post-stream verifier verdict, one per turn. Engine wire side
+       *  lives at intelligence/verifier.rs::Verdict; serialised via
+       *  Verdict::to_sse_payload and emitted on `event: trust_receipt`
+       *  after `event: final`. */
+      type: "trust_receipt";
+      turn_id: string;
+      kind:
+        | "fully_grounded"
+        | "partially_grounded"
+        | "unverified_citations"
+        | "skipped_chitchat"
+        | "skipped_rejection"
+        | "skipped_bench";
+      claims_used: string[];
+      auto_cited_count?: number;
+      related_count?: number;
+      bad_claim_ids?: string[];
+    }
+  | {
+      /** Per-turn engram activation. Emitted by the engine when the
+       *  agent calls `materialize_engram` or `probe_engram`. The
+       *  `tool` discriminator selects which optional fields are
+       *  populated. Engine wire side: rest.rs::parse_engram_activation. */
+      type: "engram_activated";
+      turn_id: string;
+      tool: "materialize_engram" | "probe_engram" | (string & {});
+      pointer: string;
+      ts_ms: number;
+      /** materialize_engram only — best-effort EngramSummary payload. */
+      summary?: unknown;
+      /** materialize_engram only. */
+      source_count?: number;
+      /** probe_engram only. */
+      answer_count?: number;
+    }
+  | {
+      /** Reflection gaps surfaced when the agent calls the `gaps` MCP
+       *  tool. Each entry mirrors thinkingroot_reflect::types::GapReport:
+       *  pre-baked `reason` text + entity context + sample size. The
+       *  engine pre-filters by min_confidence — UI renders all gaps
+       *  in the array. Wire side: rest.rs::parse_gaps_surfacing. */
+      type: "gaps_surfaced";
+      turn_id: string;
+      ts_ms: number;
+      gaps: GapEntry[];
     };
+
+/** One reflection gap, mirroring `thinkingroot_reflect::types::GapReport`.
+ *  Field names match the engine's serde shape so the wire payload
+ *  travels through unchanged. */
+export interface GapEntry {
+  entity_name: string;
+  entity_type: string;
+  expected_claim_type: string;
+  confidence: number;
+  sample_size: number;
+  reason: string;
+}
 
 export async function chatSendStream(args: ChatStreamArgs): Promise<ChatStreamAck> {
   return invoke<ChatStreamAck>("chat_send_stream", {
@@ -874,6 +990,113 @@ export async function branchRebase(branch: string): Promise<void> {
 
 export async function branchRollback(branch: string): Promise<void> {
   return invoke<void>("branch_rollback", { branch });
+}
+
+// ─── Cross-branch belief diff (T28) ──────────────────────────────────
+//
+// Wraps the daemon's `GET /api/v1/branches/{branch}/diff`. The
+// returned shape mirrors `thinkingroot_core::types::diff::KnowledgeDiff`
+// — see crates/thinkingroot-core/src/types/diff.rs for the
+// authoritative definition. We mirror the fields BeliefDiffPanel
+// renders; less-used fields (e.g. relation diffs, full claim records)
+// are kept as `unknown` to avoid coupling the desktop to every shape
+// change in the engine.
+
+export type DiffStatus = "Added" | "Modified" | "Removed";
+
+export interface KnowledgeDiff {
+  from_branch: string;
+  to_branch: string;
+  computed_at: string;
+  new_claims: DiffClaimEntry[];
+  new_entities: DiffEntityEntry[];
+  new_relations: DiffRelationEntry[];
+  auto_resolved: AutoResolutionEntry[];
+  needs_review: ContradictionPairEntry[];
+  health_before: unknown;
+  health_after: unknown;
+  merge_allowed: boolean;
+  blocking_reasons: string[];
+}
+
+export interface DiffClaimEntry {
+  /** Full Claim shape — opaque here. The fields BeliefDiffPanel
+   *  reads (id, statement, confidence, sensitivity) all live on it. */
+  claim: {
+    id: string;
+    statement: string;
+    confidence: number;
+    sensitivity?: string;
+  } & Record<string, unknown>;
+  entity_context: string[];
+  diff_status: DiffStatus;
+}
+
+export interface DiffEntityEntry {
+  entity: { id: string; canonical_name: string; entity_type: string } & Record<
+    string,
+    unknown
+  >;
+  diff_status: DiffStatus;
+}
+
+export interface DiffRelationEntry {
+  from_name: string;
+  to_name: string;
+  relation_type: string;
+  strength: number;
+  diff_status: DiffStatus;
+}
+
+export interface AutoResolutionEntry {
+  main_claim_id: string;
+  branch_claim_id: string;
+  winner: string;
+  confidence_delta: number;
+}
+
+export interface ContradictionPairEntry {
+  /** Wire shape varies — main_claim / branch_claim as full Claim
+   *  records. Renders the statements + ids; nothing more. */
+  main_claim: { id: string; statement: string } & Record<string, unknown>;
+  branch_claim: { id: string; statement: string } & Record<string, unknown>;
+  reason?: string;
+}
+
+export async function branchDiff(branch: string): Promise<KnowledgeDiff> {
+  return invoke<KnowledgeDiff>("branch_diff", { branch });
+}
+
+// ─── Live aggregate branch-event subscription ───────────────────────
+//
+// Wire path: daemon `/branch-events/stream` (SSE) →
+// Tauri sidecar `branch_event_subscribe` (background task) →
+// `branch-event` Tauri channel → `onBranchEvent` listener.
+//
+// The Rust shape is `BranchEventEnvelope` (see
+// `apps/thinkingroot-desktop/src-tauri/src/commands/branch_extras.rs`).
+// `kind` is the discriminator; the optional fields are populated per
+// variant (`event` only for `event`, `missed` only for `lagged`,
+// `reason` only for `disconnected`).
+
+export type BranchEventEnvelope =
+  | { kind: "event"; branch: string; event: unknown }
+  | { kind: "lagged"; missed: number }
+  | { kind: "disconnected"; reason: string };
+
+/** Idempotent — calling twice while a subscriber is running is a no-op. */
+export async function branchEventSubscribe(): Promise<void> {
+  return invoke<void>("branch_event_subscribe");
+}
+
+export async function branchEventUnsubscribe(): Promise<void> {
+  return invoke<void>("branch_event_unsubscribe");
+}
+
+export function onBranchEvent(
+  handler: (e: BranchEventEnvelope) => void,
+): Promise<UnlistenFn> {
+  return listen<BranchEventEnvelope>("branch-event", (ev) => handler(ev.payload));
 }
 
 // ─── Tags (T2.5) ─────────────────────────────────────────────────────
@@ -1185,4 +1408,174 @@ export interface AuthState {
 
 export async function authState(): Promise<AuthState> {
   return invoke<AuthState>("auth_state");
+}
+
+// ─── Embedded terminal (PTY) ─────────────────────────────────────────
+//
+// Mirror of `apps/.../src-tauri/src/commands/terminal.rs`. Each method
+// is a thin invoke wrapper; the raw event subscription used by the
+// xterm controller lives in `lib/terminal.ts` because it owns the
+// addon lifecycle.
+
+export interface TerminalOpenArgs {
+  /** Working directory; falls back to `$HOME` when absent. */
+  cwd?: string | null;
+  /** Override the shell binary. Falls back to `$SHELL` / pwsh. */
+  shell?: string | null;
+  cols?: number | null;
+  rows?: number | null;
+  env?: Record<string, string> | null;
+  title?: string | null;
+}
+
+export interface TerminalSessionInfo {
+  id: string;
+  title: string;
+  shell: string;
+  cwd: string;
+  pid: number | null;
+  /** ISO-8601 timestamp from chrono::Utc. */
+  created_at: string;
+  /** Tauri event topic for raw PTY output (base64). */
+  data_event: string;
+  /** Tauri event topic for shell exit. */
+  exit_event: string;
+}
+
+export interface TerminalDataEvent {
+  /** Base64-encoded raw PTY bytes. */
+  data: string;
+}
+
+export interface TerminalExitEvent {
+  code: number;
+  success: boolean;
+}
+
+export async function terminalOpen(opts: TerminalOpenArgs = {}): Promise<TerminalSessionInfo> {
+  return invoke<TerminalSessionInfo>("terminal_open", {
+    opts: {
+      cwd: opts.cwd ?? null,
+      shell: opts.shell ?? null,
+      cols: opts.cols ?? null,
+      rows: opts.rows ?? null,
+      env: opts.env ?? null,
+      title: opts.title ?? null,
+    },
+  });
+}
+
+export async function terminalWrite(id: string, data: string): Promise<void> {
+  return invoke("terminal_write", { id, data });
+}
+
+export async function terminalResize(id: string, cols: number, rows: number): Promise<void> {
+  return invoke("terminal_resize", { id, cols, rows });
+}
+
+export async function terminalClose(id: string): Promise<void> {
+  return invoke("terminal_close", { id });
+}
+
+export async function terminalList(): Promise<TerminalSessionInfo[]> {
+  return invoke<TerminalSessionInfo[]>("terminal_list");
+}
+
+export async function listenTerminalData(
+  topic: string,
+  handler: (chunk: TerminalDataEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<TerminalDataEvent>(topic, (e) => handler(e.payload));
+}
+
+export async function listenTerminalExit(
+  topic: string,
+  handler: (info: TerminalExitEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<TerminalExitEvent>(topic, (e) => handler(e.payload));
+}
+
+// ─── Embedded browser (native child WebView) ─────────────────────────
+
+export interface BrowserBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserSessionInfo {
+  id: string;
+  title: string;
+  url: string;
+  event: string;
+}
+
+export type BrowserEvent =
+  | { kind: "loading"; url: string }
+  | { kind: "loaded"; url: string }
+  | { kind: "title"; title: string }
+  | { kind: "navigation"; url: string }
+  | { kind: "new_window"; url: string }
+  | { kind: "download"; url: string; path?: string | null; success?: boolean | null };
+
+export async function browserOpen(args: {
+  url: string;
+  bounds: BrowserBounds;
+  title?: string | null;
+}): Promise<BrowserSessionInfo> {
+  return invoke<BrowserSessionInfo>("browser_open", {
+    req: {
+      url: args.url,
+      bounds: args.bounds,
+      title: args.title ?? null,
+    },
+  });
+}
+
+export async function browserNavigate(id: string, url: string): Promise<string> {
+  return invoke<string>("browser_navigate", { id, url });
+}
+
+export async function browserReload(id: string): Promise<void> {
+  return invoke("browser_reload", { id });
+}
+
+export async function browserBack(id: string): Promise<void> {
+  return invoke("browser_back", { id });
+}
+
+export async function browserForward(id: string): Promise<void> {
+  return invoke("browser_forward", { id });
+}
+
+export async function browserSetBounds(id: string, bounds: BrowserBounds): Promise<void> {
+  return invoke("browser_set_bounds", { id, bounds });
+}
+
+export async function browserShow(id: string): Promise<void> {
+  return invoke("browser_show", { id });
+}
+
+export async function browserHide(id: string): Promise<void> {
+  return invoke("browser_hide", { id });
+}
+
+export async function browserFocus(id: string): Promise<void> {
+  return invoke("browser_focus", { id });
+}
+
+export async function browserClose(id: string): Promise<void> {
+  return invoke("browser_close", { id });
+}
+
+export async function browserList(): Promise<BrowserSessionInfo[]> {
+  return invoke<BrowserSessionInfo[]>("browser_list");
+}
+
+export async function listenBrowserEvent(
+  topic: string,
+  handler: (event: BrowserEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<BrowserEvent>(topic, (e) => handler(e.payload));
 }

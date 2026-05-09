@@ -65,7 +65,7 @@ export function BrainTable({
             placeholder="Filter by id, statement, source, or type"
             className={cn(
               "h-8 w-full rounded-md border border-input bg-background pl-7 pr-2 text-xs",
-              "placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40",
+              "placeholder:text-muted-foreground focus:outline-none",
             )}
           />
         </div>

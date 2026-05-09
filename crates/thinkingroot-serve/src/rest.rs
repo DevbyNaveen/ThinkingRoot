@@ -61,6 +61,15 @@ pub struct AppState {
     /// source of truth; this hub is a fan-out for clients that prefer
     /// live updates over polling `/branches/{branch}/events`.
     pub branch_event_hub: Arc<RwLock<HashMap<String, broadcast::Sender<BranchEvent>>>>,
+    /// Task 15 — single broadcast channel that fans every branch
+    /// event into one aggregate stream. The desktop's left-rail
+    /// branch tree subscribes here once and gets create / merge /
+    /// abandon events for ALL branches without N per-branch
+    /// connections. Capacity 256 because the aggregate sees every
+    /// branch's traffic; slow consumers still surface as `lagged`
+    /// SSE events. Per-branch fan-out at `branch_event_hub` is
+    /// preserved for clients that want a focused stream.
+    pub branch_event_aggregate: broadcast::Sender<(String, BranchEvent)>,
     /// T1.5 — in-flight merge `CancellationToken`s keyed by merge id
     /// (a ULID generated at handler entry).  `POST /merges/{id}/cancel`
     /// looks up and trips the matching token; the merge phase-boundary
@@ -110,6 +119,7 @@ impl AppState {
                 crate::intelligence::engram::EngramConfig::default(),
             ),
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
+            branch_event_aggregate: broadcast::channel(256).0,
             active_merges: Arc::new(RwLock::new(HashMap::new())),
             workspace_watcher: Arc::new(RwLock::new(None)),
             workspace_status: Arc::new(WorkspaceStateRegistry::new()),
@@ -214,7 +224,14 @@ pub async fn publish_latest_branch_event(state: &AppState, branch: &str) {
         return;
     };
     let tx = state.branch_event_sender(branch).await;
-    let _ = tx.send(event);
+    let _ = tx.send(event.clone());
+    // Task 15: also fan into the aggregate channel so the
+    // `/branch-events/stream` subscriber sees every branch's events
+    // without N per-branch connections. send() returns Err only when
+    // there are zero subscribers — harmless to ignore.
+    let _ = state
+        .branch_event_aggregate
+        .send((branch.to_string(), event));
 }
 
 // ─── Response Envelope ───────────────────────────────────────
@@ -443,6 +460,15 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route(
                 "/branches/{branch}/events/stream",
                 get(stream_branch_events_handler),
+            )
+            // Task 15 — aggregate SSE stream across ALL branches.
+            // Pairs with the per-branch stream above; named
+            // `/branch-events/stream` (not `/branches/events/stream`)
+            // to avoid Axum routing the literal segment "events"
+            // into the {branch} path param of the per-branch route.
+            .route(
+                "/branch-events/stream",
+                get(stream_all_branch_events_handler),
             )
             // T1.2 — fast per-branch stats (claims/entities/sources)
             // without running a full diff.
@@ -2162,6 +2188,55 @@ async fn stream_branch_events_handler(
         .into_response()
 }
 
+/// Task 15 — aggregate SSE stream of every branch event. The
+/// desktop's left-rail branch tree subscribes once here and sees
+/// `Created` / `Merged` / `Abandoned` / `RedactionUpdated` /
+/// `ContributeBulk` events for every branch in the workspace
+/// without holding N per-branch connections.
+///
+/// Wire format mirrors the per-branch stream — `event:
+/// branch_event` data is `{branch: "...", event: <BranchEvent
+/// JSON>}`. Slow consumers see `event: lagged` with a `missed`
+/// counter so they can refetch via `/branches/{branch}/events`.
+///
+/// Lifecycle: `branch_event_aggregate` is a single broadcast
+/// channel created at AppState init (capacity 256) — every
+/// successful branch mutation publishes here in addition to the
+/// per-branch hub, so the aggregate stream is always live.
+async fn stream_all_branch_events_handler(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    use tokio_stream::StreamExt as _;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let rx = state.branch_event_aggregate.subscribe();
+    let stream = BroadcastStream::new(rx).map(move |res| match res {
+        Ok((branch, event)) => {
+            let payload = serde_json::json!({
+                "branch": branch,
+                "event": event,
+            })
+            .to_string();
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("branch_event").data(payload),
+            )
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Ok(Event::default().event("lagged").data(payload))
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
 // ─── T1.2: Branch stats ──────────────────────────────────────────────
 //
 // Cheap per-branch probe — claim / entity / source counts — without
@@ -3847,6 +3922,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     use crate::intelligence::agent_streaming::{
         StreamAgentDeps, StreamAgentRequest, agent_event_to_sse, spawn_agent_run,
     };
+    use crate::intelligence::identity::build_workspace_identity;
     use crate::intelligence::skills::SkillRegistry;
     use crate::intelligence::synthesizer::{
         AskRequest as SynthAskRequest, ChatRole, ChatTurn, build_system_prompt,
@@ -3882,6 +3958,15 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         .as_ref()
         .map(|s| s.config.chat.resolve(&s.source_kinds))
         .unwrap_or_else(SynthAskRequest::default_chat);
+    // C2 (Task 5, plan 2026-05-09): build the workspace identity here
+    // so the agent's first user message can carry the same
+    // <system-reminder> ambient-context block the non-agent path has
+    // shipped since v0.9.0. Prior to this fix the agent literally did
+    // not know which workspace it was answering about, how many claims
+    // were indexed, or today's date — the audit's C2 critical bug.
+    let identity = snapshot
+        .as_ref()
+        .map(|s| build_workspace_identity(s, &s.config.chat));
     drop(engine);
 
     let Some(workspace_root) = workspace_root else {
@@ -3943,13 +4028,80 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // C2 (Task 5) + Task 9: build the reactive `<system-reminder>` bus
+    // payload. The agent path now emits the FULL bus — workspace +
+    // branch_state + session_state + engram_state + tool_budget — with
+    // each emitter checking its own precondition (only blocks where the
+    // substrate state warrants emission actually appear in the prompt).
+    //
+    // - identity: workspace pulse (always emitted when present)
+    // - session_snapshot: focus_entity + delivered_claim_count
+    // - branch: surfaces only when session is on a non-default branch
+    // - engram_handles: surfaces only when engrams are materialised
+    // - tool_budget: NOT wired yet (needs agent-loop iteration plumbing —
+    //   v1.1 work). Passes None so the budget block stays suppressed.
+    use crate::intelligence::reminder_bus::{
+        BranchSummary, EngramHandle, ReminderContext, render_reactive_reminders,
+    };
+    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let session_snapshot: Option<crate::intelligence::session::SessionContext> = {
+        let map = state.sessions.lock().await;
+        map.get(&conversation_id).cloned()
+    };
+    let engram_handles: Vec<EngramHandle> = state
+        .engram_manager
+        .list_engrams(&conversation_id)
+        .await
+        .into_iter()
+        .map(|r| EngramHandle {
+            pointer: r.pointer,
+            topic: r.topic,
+        })
+        .collect();
+    let branch_summary: Option<BranchSummary> = session_snapshot
+        .as_ref()
+        .and_then(|s| s.active_branch.clone())
+        .map(|name| BranchSummary {
+            name,
+            parent: None, // Branch registry lookup deferred to v1.1
+            kind: None,
+        });
+    // Sandbox-by-default classifier (Task 17, plan 2026-05-09): the
+    // user's question is run through `intelligence/sandbox_classifier`
+    // and any RecommendSandbox reason is forwarded to the reactive
+    // bus. Keeps the recommendation advisory — the model decides
+    // whether to actually fork. Pure function, no I/O, sub-µs runtime.
+    let sandbox_reason: Option<&'static str> = match crate::intelligence::sandbox_classifier::classify(&body.question) {
+        crate::intelligence::sandbox_classifier::SandboxIntent::RecommendSandbox { reason } => {
+            Some(reason)
+        }
+        crate::intelligence::sandbox_classifier::SandboxIntent::NoAction => None,
+    };
+    let bus_ctx = ReminderContext {
+        identity: identity.as_ref(),
+        today: Some(&today_str),
+        session: session_snapshot.as_ref(),
+        branch: branch_summary,
+        engrams: &engram_handles,
+        engram_budget: 100, // mirrors EngramConfig::default().max_engrams_per_session
+        tool_budget_remaining: None,
+        tool_budget_max: None,
+        sandbox_recommendation: sandbox_reason,
+    };
+    let bus_prefix = render_reactive_reminders(&bus_ctx);
+    let user_question = if bus_prefix.is_empty() {
+        body.question.clone()
+    } else {
+        format!("{}{}", bus_prefix, body.question)
+    };
+
     let req = StreamAgentRequest {
         workspace: ws.clone(),
         workspace_root,
         session_id: conversation_id,
         agent_id: "thinkingroot".to_string(),
         system_prompt,
-        user_question: body.question.clone(),
+        user_question,
         history: agent_messages,
         skills,
     };
@@ -3970,7 +4122,25 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // so the desktop UI can render its claim card. The matching
     // POST to `/ask/approval/{id}` resolves the oneshot and the
     // agent unblocks.
+    // State that survives across the stream loop so the post-`Done`
+    // verifier has the inputs it needs:
+    //   * `capture` — folds every search_claims / hybrid_retrieve
+    //     result into RetrievalHits (intelligence/retrieval_capture.rs)
+    //   * `last_rejection` — flips on when the agent's last action
+    //     before Done was a rejected write tool. Drives
+    //     VerifyKind::SkippedRejection so the trust receipt renders
+    //     "no claim made" instead of trying to ground "user declined".
+    //   * `final_text_for_verify` — the agent's final answer text,
+    //     captured from `Done`. The substantive path can't run
+    //     without it.
+    let engine_for_verify = state.engine.clone();
+    let workspace_for_verify = ws.clone();
     let stream = async_stream::stream! {
+        use crate::intelligence::retrieval_capture::{HashSetSubstrate, RetrievalCapture};
+        use crate::intelligence::verifier::{
+            DEFAULT_AUTO_CITE_THRESHOLD, VerifyInput, VerifyKind, verify,
+        };
+
         // Surface a cheap meta event up front so UIs that show a
         // "category" header have something to render before tokens
         // start flowing. claims_used is unknown from the agent
@@ -3982,6 +4152,10 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         yield Ok::<Event, std::convert::Infallible>(
             Event::default().event("meta").data(meta.to_string())
         );
+
+        let mut capture = RetrievalCapture::new();
+        let mut last_was_rejection = false;
+        let mut final_text_for_verify: Option<String> = None;
 
         while let Some(event) = rx.recv().await {
             // Side effect: write proposals need a pending-id
@@ -4004,13 +4178,101 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                 }
             }
 
+            // Side effect: fold retrieval results into the capture
+            // BEFORE we yield the SSE event. Tools that aren't
+            // retrieval-shaped no-op inside observe_tool_finished.
+            //
+            // Engram-tool side effect: when the agent calls
+            // `materialize_engram` or `probe_engram` we additionally
+            // emit an `engram_activated` SSE event so the desktop's
+            // EngramTimeline scrubber can render the per-turn
+            // activation footprint without re-parsing every tool
+            // result on the UI side. This is a strictly additive
+            // event — clients that don't recognise the type ignore
+            // it (per SSE spec).
+            let mut engram_activation: Option<serde_json::Value> = None;
+            let mut gap_surfacing: Option<serde_json::Value> = None;
+            match &event {
+                AgentEvent::ToolCallFinished { name, content, is_error, .. } => {
+                    capture.observe_tool_finished(name, content, *is_error);
+                    last_was_rejection = false;
+                    if !*is_error
+                        && (name == "materialize_engram" || name == "probe_engram")
+                    {
+                        engram_activation = parse_engram_activation(name, content);
+                    }
+                    if !*is_error && name == "gaps" {
+                        gap_surfacing = parse_gaps_surfacing(content);
+                    }
+                }
+                AgentEvent::ToolCallRejected { .. } => {
+                    last_was_rejection = true;
+                }
+                AgentEvent::Text { .. } | AgentEvent::ToolCallExecuting { .. } => {
+                    // These don't change rejection state; only a
+                    // ToolCallFinished can clear it.
+                }
+                AgentEvent::Done { final_text, .. } => {
+                    final_text_for_verify = Some(final_text.clone());
+                }
+                _ => {}
+            }
+
             let (kind, payload) = agent_event_to_sse(&event);
             yield Ok(
                 Event::default().event(kind).data(payload.to_string())
             );
+            if let Some(activation) = engram_activation {
+                yield Ok(
+                    Event::default().event("engram_activated").data(activation.to_string())
+                );
+            }
+            if let Some(gaps) = gap_surfacing {
+                yield Ok(
+                    Event::default().event("gaps_surfaced").data(gaps.to_string())
+                );
+            }
 
-            // Terminal events end the stream.
+            // Terminal events end the stream after we emit the
+            // trust-receipt follow-up.
             if matches!(event, AgentEvent::Done { .. }) {
+                // Build the Substrate by batching claim_exists across
+                // every captured retrieval hit. Cheap (one DbInstance
+                // clone + per-id Cozo lookups; bounded by retrieval
+                // top-K). Skipped when capture is empty — the
+                // VerifyKind::SkippedRejection / SkippedChitchat paths
+                // don't need a substrate at all.
+                let kind_for_verify = if last_was_rejection {
+                    VerifyKind::SkippedRejection
+                } else {
+                    VerifyKind::Substantive
+                };
+                let candidate_ids: Vec<String> =
+                    capture.claim_ids().cloned().collect();
+                let existing = if candidate_ids.is_empty() {
+                    std::collections::HashSet::new()
+                } else {
+                    let eng = engine_for_verify.read().await;
+                    eng.claim_exists_batch(&workspace_for_verify, &candidate_ids).await
+                };
+                let substrate = HashSetSubstrate::new(existing);
+                let final_text =
+                    final_text_for_verify.clone().unwrap_or_default();
+                let top_k = capture.into_hits();
+                let verdict = verify(&VerifyInput {
+                    kind: kind_for_verify,
+                    text: &final_text,
+                    agent_citations: &[],
+                    top_k: &top_k,
+                    substrate: &substrate,
+                    auto_cite_threshold: DEFAULT_AUTO_CITE_THRESHOLD,
+                });
+                let payload = verdict.to_sse_payload();
+                yield Ok(
+                    Event::default()
+                        .event("trust_receipt")
+                        .data(payload.to_string())
+                );
                 break;
             }
         }
@@ -4312,6 +4574,110 @@ async fn resolve_workspace_path(state: &AppState, name: &str) -> Option<PathBuf>
     list.into_iter()
         .find(|w| w.name == name)
         .map(|w| PathBuf::from(w.path))
+}
+
+// ─── Engram-activation SSE shim ──────────────────────────────────────
+//
+// Parses the JSON-string output of the `materialize_engram` and
+// `probe_engram` MCP tools into a flat wire shape the desktop's
+// EngramTimeline scrubber can consume directly:
+//
+//   materialize_engram → { tool: "materialize_engram", pointer: "0x7F9A",
+//                          summary: { ... },
+//                          source_count: N, ts_ms: <epoch> }
+//   probe_engram      → { tool: "probe_engram", pointer: "0x7F9A",
+//                         answer_count: M, ts_ms: <epoch> }
+//
+// `ts_ms` is the wall-clock time at which we forwarded the event —
+// the engine doesn't yet thread a timestamp through the agent's
+// ToolCallFinished payload. Honest scope: the timeline shows when the
+// SSE relay observed the activation, not when the EngramManager
+// internally cached the row.
+//
+// `source_count` for materialize_engram is best-effort: we read it
+// from `summary.source_count` if present, else `summary.sources.len()`,
+// else 0 (the wire shape is owned by `intelligence/engram.rs::EngramSummary`
+// and may evolve). The UI treats 0 as "unknown" rather than "empty".
+fn parse_engram_activation(name: &str, content: &str) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match name {
+        "materialize_engram" => {
+            let pointer = parsed.get("pointer")?.as_str()?.to_string();
+            let summary = parsed.get("summary").cloned().unwrap_or(serde_json::Value::Null);
+            let source_count = summary
+                .get("source_count")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    summary
+                        .get("sources")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len() as u64)
+                })
+                .unwrap_or(0);
+            Some(serde_json::json!({
+                "tool": "materialize_engram",
+                "pointer": pointer,
+                "summary": summary,
+                "source_count": source_count,
+                "ts_ms": now_ms,
+            }))
+        }
+        "probe_engram" => {
+            let pointer = parsed
+                .get("pointer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let answer_count = parsed
+                .get("answers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() as u64)
+                .unwrap_or_else(|| {
+                    parsed
+                        .get("answer_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                });
+            Some(serde_json::json!({
+                "tool": "probe_engram",
+                "pointer": pointer,
+                "answer_count": answer_count,
+                "ts_ms": now_ms,
+            }))
+        }
+        _ => None,
+    }
+}
+
+// ─── Gap-surfacing SSE shim ──────────────────────────────────────────
+//
+// Parses the JSON-string output of the `gaps` MCP tool into a flat
+// per-gap wire shape the desktop's GapCards component renders inline:
+//
+//   { gaps: [
+//       { entity_name, entity_type, expected_claim_type,
+//         confidence, sample_size, reason },
+//       ...
+//     ],
+//     ts_ms: <epoch> }
+//
+// Honest scope: the daemon's `gaps` MCP arm already filters by the
+// caller's `min_confidence`. We trust that filter — no further
+// confidence pruning here. Empty-gap responses are dropped so the UI
+// never renders a "no gaps found" toast (the chat surface is the
+// wrong place for null-result feedback).
+fn parse_gaps_surfacing(content: &str) -> Option<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+    let gaps_arr = parsed.get("gaps").and_then(|v| v.as_array())?;
+    if gaps_arr.is_empty() {
+        return None;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    Some(serde_json::json!({
+        "gaps": gaps_arr,
+        "ts_ms": now_ms,
+    }))
 }
 
 // ─── Error Mapping ───────────────────────────────────────────

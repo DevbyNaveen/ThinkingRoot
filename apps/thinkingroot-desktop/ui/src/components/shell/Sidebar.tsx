@@ -12,15 +12,17 @@
  *      the live `/livez` status for the local SSE transport.
  *   5. Footer — Settings, auth state, app version.
  *
- * The whole sidebar refreshes when the `workspaces-changed` Tauri
- * event fires (today emitted by `workspace_set_active`; the auto-scan
- * triggers a manual refresh too).
+ * The workspace list reloads when the `workspaces-changed` Tauri event
+ * fires (after `workspace_set_active`, `workspace_remove`, `workspace_scan`
+ * when new folders are registered, and after a compile finishes so the
+ * compiled / new badges stay honest).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import {
   ChevronDown,
   ChevronRight,
+  BookOpen,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -46,6 +48,7 @@ import {
   workspaceList,
   workspaceScan,
   workspaceSetActive,
+  onWorkspacesChanged,
   type AuthState,
   type ConversationSummary,
   type McpServerRow,
@@ -119,6 +122,7 @@ export function Sidebar() {
 
   const refresh = useCallback(async () => {
     try {
+      const active = useApp.getState().activeWorkspace;
       const [list, allConvs] = await Promise.all([
         workspaceList(),
         conversationsList(),
@@ -126,7 +130,7 @@ export function Sidebar() {
       const grouped: WorkspaceWithConvs[] = list.map((w) => ({
         ...w,
         conversations: allConvs.filter((c) => c.workspace === w.name),
-        expanded: w.name === activeWorkspace,
+        expanded: w.name === active,
       }));
       setWorkspaces(grouped);
     } catch (e) {
@@ -135,7 +139,32 @@ export function Sidebar() {
         body: e instanceof Error ? e.message : String(e),
       });
     }
+  }, []);
+
+  // Keep conversation-tree expansion aligned with the store's active
+  // workspace (selection is updated before some `workspace_list` calls).
+  useEffect(() => {
+    setWorkspaces((prev) =>
+      prev.map((w) => ({
+        ...w,
+        expanded: w.name === activeWorkspace,
+      })),
+    );
   }, [activeWorkspace]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    onWorkspacesChanged(() => {
+      if (!cancelled) void refresh();
+    }).then((fn) => {
+      if (!cancelled) unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refresh]);
 
   // First load: auto-scan disk + populate. Auto-scan is one-shot per
   // app launch; user can re-trigger via the ⟳ button.
@@ -279,8 +308,19 @@ export function Sidebar() {
                           multiple: false,
                         });
                         if (typeof picked !== "string") return;
-                        await workspaceAdd({ path: picked });
-                        await refresh();
+                        const previousActive = useApp.getState().activeWorkspace;
+                        const w = await workspaceAdd({ path: picked });
+                        useApp.getState().setActiveWorkspace(w.name);
+                        try {
+                          await workspaceSetActive(w.name);
+                        } catch (e) {
+                          useApp.getState().setActiveWorkspace(previousActive);
+                          toast("Set active failed", {
+                            kind: "error",
+                            body: e instanceof Error ? e.message : String(e),
+                          });
+                          await refresh();
+                        }
                       } catch (e) {
                         toast("Add failed", {
                           kind: "error",
@@ -656,6 +696,12 @@ function Footer({
         label="Settings"
         active={surface === "settings"}
         onClick={() => setSurface("settings")}
+      />
+      <NavRow
+        Icon={BookOpen}
+        label="Docs"
+        active={surface === "docs"}
+        onClick={() => setSurface("docs")}
       />
       <div
         className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[10px] text-muted-foreground"

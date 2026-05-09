@@ -12,9 +12,14 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 use thinkingroot_core::{WorkspaceEntry, WorkspaceRegistry};
 
 use crate::config::DesktopState;
+
+fn emit_workspaces_changed(app: &AppHandle) {
+    let _ = app.emit("workspaces-changed", true);
+}
 
 /// Maximum directory depth we descend when looking for `.thinkingroot/`.
 /// Scanning is best-effort; users with deeply-nested project trees can
@@ -59,7 +64,7 @@ pub struct ScanArgs {
 }
 
 #[tauri::command]
-pub fn workspace_scan(args: Option<ScanArgs>) -> Result<ScanResult, String> {
+pub fn workspace_scan(app: AppHandle, args: Option<ScanArgs>) -> Result<ScanResult, String> {
     let roots = resolve_scan_roots(args.unwrap_or_default().roots);
 
     let mut discovered: Vec<PathBuf> = Vec::new();
@@ -70,11 +75,7 @@ pub fn workspace_scan(args: Option<ScanArgs>) -> Result<ScanResult, String> {
     }
 
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    let known: HashSet<PathBuf> = registry
-        .workspaces
-        .iter()
-        .map(|w| w.path.clone())
-        .collect();
+    let known: HashSet<PathBuf> = registry.workspaces.iter().map(|w| w.path.clone()).collect();
 
     let mut registered = Vec::new();
     for path in &discovered {
@@ -95,6 +96,7 @@ pub fn workspace_scan(args: Option<ScanArgs>) -> Result<ScanResult, String> {
     }
     if !registered.is_empty() {
         registry.save().map_err(|e| e.to_string())?;
+        emit_workspaces_changed(&app);
     }
 
     Ok(ScanResult {

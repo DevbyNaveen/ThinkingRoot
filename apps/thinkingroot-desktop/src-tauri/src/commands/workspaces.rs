@@ -5,8 +5,9 @@
 //! `tr compile`; the desktop app exposes the same operations through
 //! Tauri commands so non-CLI users can:
 //!
-//! 1. Register an existing compiled folder ([`workspace_add`])
-//! 2. Compile a fresh folder from a file picker ([`workspace_compile`])
+//! 1. Register a folder ([`workspace_add`]) — creates `.thinkingroot/`
+//!    when missing (same as `root init`) so the engine can mount immediately
+//! 2. Compile a folder ([`workspace_compile`])
 //! 3. List, set-active, or remove registered workspaces
 //!
 //! Compilation streams live progress as `workspace_compile_progress`
@@ -15,6 +16,8 @@
 //! render the same progression with no schema change.
 
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -23,6 +26,22 @@ use thinkingroot_serve::pipeline::{PipelineResult, ProgressEvent};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{AppState, CompileHandle};
+
+/// Notify the webview that `workspaces.toml` changed so the sidebar can
+/// re-fetch `workspace_list` (compiled badges, ordering, etc.).
+fn emit_workspaces_changed(app: &AppHandle) {
+    let _ = app.emit("workspaces-changed", true);
+}
+
+/// Create `<root>/.thinkingroot/` when absent — matches `root init` (directory
+/// only; config inherits from global). Idempotent.
+fn ensure_thinkingroot_data_dir(workspace_root: &std::path::Path) -> Result<(), String> {
+    let dir = workspace_root.join(".thinkingroot");
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))
+}
 
 /// One workspace as the UI sees it. Mirrors [`WorkspaceEntry`] plus
 /// derived fields the surface uses to colour the row (compiled badge,
@@ -65,9 +84,10 @@ pub struct WorkspaceAddArgs {
 }
 
 #[tauri::command]
-pub fn workspace_add(args: WorkspaceAddArgs) -> Result<WorkspaceView, String> {
+pub fn workspace_add(app: AppHandle, args: WorkspaceAddArgs) -> Result<WorkspaceView, String> {
     let abs = std::fs::canonicalize(&args.path)
         .map_err(|e| format!("path not found: {} ({e})", args.path))?;
+    ensure_thinkingroot_data_dir(&abs)?;
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
     let name = args.name.unwrap_or_else(|| {
         abs.file_name()
@@ -81,6 +101,7 @@ pub fn workspace_add(args: WorkspaceAddArgs) -> Result<WorkspaceView, String> {
         port,
     });
     registry.save().map_err(|e| e.to_string())?;
+    emit_workspaces_changed(&app);
 
     let active = registry.active.as_deref() == Some(name.as_str());
     Ok(WorkspaceView {
@@ -98,11 +119,16 @@ pub struct WorkspaceRemoveArgs {
 }
 
 #[tauri::command]
-pub fn workspace_remove(args: WorkspaceRemoveArgs) -> Result<bool, String> {
+pub fn workspace_remove(app: AppHandle, args: WorkspaceRemoveArgs) -> Result<bool, String> {
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
+    let removed_active = registry.active.as_deref() == Some(args.name.as_str());
     let removed = registry.remove(&args.name);
     if removed {
+        if removed_active {
+            registry.clear_active();
+        }
         registry.save().map_err(|e| e.to_string())?;
+        emit_workspaces_changed(&app);
     }
     Ok(removed)
 }
@@ -122,20 +148,21 @@ pub struct WorkspaceSetActiveArgs {
 /// cache to invalidate.
 #[tauri::command]
 pub async fn workspace_set_active(
-    _app: tauri::AppHandle,
+    app: AppHandle,
     args: WorkspaceSetActiveArgs,
 ) -> Result<String, String> {
     let mut registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    let abs = registry
+    let root_path = registry
         .workspaces
         .iter()
         .find(|w| w.name == args.name)
-        .map(|e| e.path.display().to_string())
+        .map(|e| e.path.clone())
         .ok_or_else(|| format!("workspace `{}` not found", args.name))?;
-    registry
-        .set_active(&args.name)
-        .map_err(|e| e.to_string())?;
+    ensure_thinkingroot_data_dir(&root_path)?;
+    let abs = root_path.display().to_string();
+    registry.set_active(&args.name).map_err(|e| e.to_string())?;
     registry.save().map_err(|e| e.to_string())?;
+    emit_workspaces_changed(&app);
     Ok(abs)
 }
 
@@ -308,24 +335,62 @@ pub async fn workspace_compile(
     let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
     let path: PathBuf = match registry.workspaces.iter().find(|w| w.name == args.target) {
         Some(e) => e.path.clone(),
-        None => std::fs::canonicalize(&args.target)
-            .map_err(|e| format!("not a registered workspace and not a path: {} ({e})", args.target))?,
+        None => std::fs::canonicalize(&args.target).map_err(|e| {
+            format!(
+                "not a registered workspace and not a path: {} ({e})",
+                args.target
+            )
+        })?,
     };
     let workspace_label = path.display().to_string();
     let branch = args.branch;
 
-    // Refuse to start a second compile on top of an active one — the
-    // pipeline doesn't itself coordinate two runs against the same
-    // workspace, so racing CozoDB writes would just confuse the user.
+    // One in-flight compile slot for the whole desktop process. A second
+    // workspace must wait or call `workspace_compile_stop`. For the *same*
+    // workspace root, treat a repeat `workspace_compile` as supersede:
+    // cancel the tracked run and wait for the slot to clear so a wedged
+    // sidecar / lost SSE `finally` does not brick the UI until restart.
     {
         let state = app.state::<AppState>();
-        let guard = state.active_compile.lock().await;
+        let mut guard = state.active_compile.lock().await;
         if let Some(handle) = guard.as_ref() {
-            return Err(format!(
-                "compile already in progress for {}; call workspace_compile_stop first",
-                handle.workspace_label
-            ));
+            if handle.workspace_label != workspace_label {
+                return Err(format!(
+                    "compile already in progress for {}; call workspace_compile_stop first or wait for it to finish",
+                    handle.workspace_label
+                ));
+            }
+            tracing::warn!(
+                workspace = %workspace_label,
+                "workspace_compile superseding prior run for same workspace — cancelling tracked compile"
+            );
+            handle.cancel.cancel();
         }
+    }
+    let wait_started = Instant::now();
+    const SLOT_CLEAR_MAX_WAIT: Duration = Duration::from_secs(5);
+    loop {
+        let slot_free = {
+            let state = app.state::<AppState>();
+            let guard = state.active_compile.lock().await;
+            guard.is_none()
+        };
+        if slot_free {
+            break;
+        }
+        if wait_started.elapsed() >= SLOT_CLEAR_MAX_WAIT {
+            let state = app.state::<AppState>();
+            let mut guard = state.active_compile.lock().await;
+            if guard.is_some() {
+                tracing::error!(
+                    workspace = %workspace_label,
+                    "active_compile still set after supersede cancel + 5s wait — forcing clear (zombie compile)"
+                );
+                *guard = None;
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
     // Register the compile so workspace_compile_stop can find the
@@ -470,20 +535,20 @@ pub async fn workspace_compile(
                         incremental_summary: Some(result.incremental_summary.clone()),
                     },
                 );
-                // Stream A — no desktop-side cache to invalidate. The
-                // daemon's engine sees the post-compile state directly;
-                // `cache_dirty` is left in the wire payload for UI
-                // reasons (the Brain panel re-fetches when set).
+                // `graph.db` / README may have changed — sidebar compiled
+                // badge reads `workspace_list`, not the compile payload.
+                emit_workspaces_changed(&app_for_task);
             }
             Err(CompileDriveError::Cancelled) => {
-                let _ = app_for_task
-                    .emit("workspace_compile_progress", CompileProgress::Cancelled);
+                let _ = app_for_task.emit("workspace_compile_progress", CompileProgress::Cancelled);
+                emit_workspaces_changed(&app_for_task);
             }
             Err(CompileDriveError::Failed(msg)) => {
                 let _ = app_for_task.emit(
                     "workspace_compile_progress",
                     CompileProgress::Failed { error: msg },
                 );
+                emit_workspaces_changed(&app_for_task);
             }
         }
 
@@ -531,9 +596,7 @@ async fn drive_compile_via_sidecar(
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
 
-    let url = format!(
-        "http://{host}:{port}/api/v1/ws/desktop/compile/stream"
-    );
+    let url = format!("http://{host}:{port}/api/v1/ws/desktop/compile/stream");
     let body = serde_json::json!({
         "root_path": path.display().to_string(),
         "branch": branch,
@@ -692,12 +755,9 @@ async fn drive_compile_via_sidecar(
         return Err(CompileDriveError::Failed(err));
     }
     final_result.ok_or_else(|| {
-        CompileDriveError::Failed(
-            "sidecar SSE stream ended without `done` event".to_string(),
-        )
+        CompileDriveError::Failed("sidecar SSE stream ended without `done` event".to_string())
     })
 }
-
 
 /// Stop an in-progress compile.  Returns `true` when a compile was
 /// active and the cancellation token was tripped; `false` when no
@@ -871,4 +931,3 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
         _ => None,
     }
 }
-

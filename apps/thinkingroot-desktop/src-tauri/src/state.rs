@@ -13,6 +13,9 @@ use thinkingroot_core::types::WorkspaceStatus;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::commands::browser::BrowserSession;
+use crate::commands::terminal::TerminalSession;
+
 /// All process-wide state owned by Tauri's `app.manage(...)`.
 #[derive(Default)]
 pub struct AppState {
@@ -43,6 +46,29 @@ pub struct AppState {
     /// fresh handle (cancelling the previous one) when the active
     /// workspace changes.
     pub workspace_status_subscriber: AsyncMutex<Option<WorkspaceStatusSubscriberHandle>>,
+    /// Substrate Console — handle for the live SSE subscriber that
+    /// mirrors the daemon's aggregate `/branch-events/stream` into
+    /// the `branch-event` Tauri channel. The slot is `Some` while a
+    /// subscriber is running; `branch_event_subscribe` is idempotent
+    /// (re-entry returns the existing handle without spawning a
+    /// duplicate). Cancelled on workspace unmount or app shutdown.
+    pub branch_event_subscriber: AsyncMutex<Option<BranchEventSubscriberHandle>>,
+    /// Terminal panel — open PTY sessions keyed by session id (uuid v4
+    /// minted by the open command). The desktop's right-rail Terminal
+    /// tab spawns one [`TerminalSession`] per UI tab; the entries are
+    /// removed on `terminal_close` and on window destroy. Each session
+    /// owns its own read thread (PTY → IPC) and a writer half guarded
+    /// by a `std::sync::Mutex`. We lean on a sync `RwLock` here because
+    /// every consumer is a sync IPC handler; an async lock would pull
+    /// us through `block_on` for no benefit.
+    pub terminals: Arc<RwLock<HashMap<String, Arc<TerminalSession>>>>,
+    /// Browser panel — native child webviews keyed by tab id. These
+    /// are real WebViews attached to the main Tauri window, not iframes
+    /// inside the app webview, which means sites that block framing
+    /// still work. The UI owns the chrome (address bar, tabs, history);
+    /// this map owns the native surfaces and keeps them hidden/shown as
+    /// the right-rail tab changes.
+    pub browsers: Arc<RwLock<HashMap<String, Arc<BrowserSession>>>>,
 }
 
 /// Live handle for an in-progress workspace compile.
@@ -83,6 +109,17 @@ pub struct SidecarHandle {
 pub struct WorkspaceStatusSubscriberHandle {
     /// Workspace name the subscriber is currently bound to.
     pub workspace: String,
+    /// Cancellation token; cancelled to stop the subscriber.
+    pub cancel: CancellationToken,
+}
+
+/// Substrate Console — handle for the live SSE subscriber to the
+/// daemon's aggregate `/branch-events/stream` endpoint. Singleton
+/// per process: every BranchTree / Branch chip in the UI listens to
+/// the same `branch-event` Tauri channel; one underlying SSE
+/// connection fans out to all of them.
+#[derive(Debug)]
+pub struct BranchEventSubscriberHandle {
     /// Cancellation token; cancelled to stop the subscriber.
     pub cancel: CancellationToken,
 }

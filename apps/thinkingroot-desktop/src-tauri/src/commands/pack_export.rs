@@ -221,9 +221,7 @@ pub async fn pack_export(req: PackExportRequest) -> Result<PackExportResult, Str
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {bin} pack: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {bin} pack: {e}"))?;
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");

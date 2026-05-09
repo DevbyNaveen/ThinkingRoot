@@ -113,58 +113,65 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             // ── Classic CRUD tools ────────────────────────────────────────
             {
                 "name": "search",
-                "description": "Semantic + keyword search across entities and claims",
+                "description": "Semantic + keyword search over the workspace's compiled claims and entities. Use when the user asks about something specific (a function, a concept, a past decision) and you don't yet know the exact entity name. Combines vector recall with substring matching; tolerates typos and synonyms. Prefer `query_claims` when you already know the entity name and want filtered results, `hybrid_retrieve` when you need ranked provenance with byte spans, or `probe_engram` when you have a materialised cluster pointer.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query":     { "type": "string" },
-                        "top_k":    { "type": "integer", "default": 10 },
-                        "workspace": { "type": "string" }
+                        "query":     { "type": "string", "description": "Free-text query. Phrases like 'authentication flow' or 'payment retry logic' work well." },
+                        "top_k":    { "type": "integer", "default": 10, "description": "Max results to return. Default 10. Bound: 1–50." },
+                        "workspace": { "type": "string", "description": "Workspace name from the mount config (e.g. 'thinkingroot')." },
+                        "branch":    { "type": "string", "description": "Optional branch name to read from. When omitted, uses the session's active branch (set via checkout_branch); when no active branch is set, reads from main." }
                     },
                     "required": ["query", "workspace"]
                 }
             },
             {
                 "name": "query_claims",
-                "description": "Filter claims by type, entity, or confidence threshold",
+                "description": "Filtered retrieval of structured claims by type, entity, or minimum confidence. Use when you already know what you're looking for (e.g. all `decision` claims about `WebhookHandler`, or every claim with confidence > 0.8 on a specific entity). Returns raw claim records with confidence + source path. Prefer `search` when the user's intent is fuzzy and `hybrid_retrieve` when you need full provenance bundles.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "type":           { "type": "string" },
-                        "entity":         { "type": "string" },
-                        "min_confidence": { "type": "number" },
-                        "workspace":      { "type": "string" }
+                        "type":           { "type": "string", "description": "Claim type — one of: fact, decision, opinion, plan, requirement, metric, definition, dependency, api_signature, architecture, preference. Omit to match all types." },
+                        "entity":         { "type": "string", "description": "Entity name to scope the query to. Case-sensitive; matches against the canonical name in the entity table." },
+                        "min_confidence": { "type": "number", "description": "Floor on claim confidence (0.0–1.0). 0.7 is a reasonable strict floor; omit for all confidences." },
+                        "workspace":      { "type": "string", "description": "Workspace name." },
+                        "branch":         { "type": "string", "description": "Optional branch name to read from. When omitted, uses the session's active branch (set via checkout_branch); when no active branch is set, reads from main." }
                     },
                     "required": ["workspace"]
                 }
             },
             {
                 "name": "get_relations",
-                "description": "Get all relations for a specific entity",
+                "description": "Return every relation edge incident on a specific entity — both inbound (e.g. 'X is called by Y') and outbound (e.g. 'X depends on Z'). Use when you need to understand how an entity connects to the rest of the substrate: who calls it, what it calls, what it inherits from, what depends on it. Most useful as a follow-up to `search` once you have an entity name.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "entity":    { "type": "string" },
-                        "workspace": { "type": "string" }
+                        "entity":    { "type": "string", "description": "Exact entity name (case-sensitive). Use the name returned by `search` or `query_claims`, not a guess." },
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "branch":    { "type": "string", "description": "Optional branch name to read from. When omitted, uses the session's active branch (set via checkout_branch); when no active branch is set, reads from main." }
                     },
                     "required": ["entity", "workspace"]
                 }
             },
             {
                 "name": "compile",
-                "description": "Trigger full pipeline recompilation (requires LLM credentials)",
+                "description": "Run the full v3 pipeline (parse → extract → ground → link → root → reflect → branch → serve → verify) over the workspace's source files. EXPENSIVE: spends LLM credits, may take seconds to minutes depending on workspace size. Use only when source files have changed since the last compile and the user explicitly asked for a refresh. Side effects: invalidates engram caches, increments claim_count, may produce contradictions that need review. Do NOT call as part of normal Q&A.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "workspace": { "type": "string" } },
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name. The workspace's `[llm]` config provides the credentials used for extraction." }
+                    },
                     "required": ["workspace"]
                 }
             },
             {
                 "name": "health_check",
-                "description": "Run verification and return knowledge health score",
+                "description": "Compute a 0–100 health score for the workspace's knowledge graph. Score combines: claim coverage of source files, contradiction count, gap density, derivation completeness, and rooted-tier proportion. Use when the user asks 'how good is the knowledge?' or 'what's wrong?'. Returns the score plus a per-axis breakdown so you can explain why. Cheap (no LLM call); safe to run frequently.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "workspace": { "type": "string" } },
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." }
+                    },
                     "required": ["workspace"]
                 }
             },
@@ -547,7 +554,7 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             // ── RARP / Active Engram Protocol v2 (4 tools) ────────────────
             {
                 "name": "materialize_engram",
-                "description": "Build an Engram (typed sub-graph) for a topic. Returns an EngramSummary plus a pointer (e.g. '0x7F9A') the caller holds for subsequent probes. Default depth_hops=2, event_window_days=90, clearance=['public']. Optional seed_claim_ids skips vector seeding when the caller already has IDs.",
+                "description": "Build an Engram — a typed sub-graph of ~30-token cluster handle pointing at the substrate rows relevant to a topic. Returns an EngramSummary (entities, claim counts by tier, source authority, temporal window, contradictions) PLUS a pointer (e.g. '0x7F9A') you keep and pass to `probe_engram` for follow-up questions. Use this when the user's question implies repeated drilling into one subject area — first materialize, then probe multiple times. Single-shot questions are better served by `search` or `hybrid_retrieve`. Cache discipline: at most 100 engrams per session, evicted by TTL. Default depth_hops=2, event_window_days=90, clearance=['public'].",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -569,7 +576,7 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "probe_engram",
-                "description": "Probe a materialised Engram with a typed question. Returns a ProbeAnswer with answer rows + per-row provenance (claim_ids, byte spans, BLAKE3, trial_scores, certificate_hash, turn_provenance, derivation_root) + caveats (UnresolvedContradiction, StaleRow, LowConfidence, DerivedFromTest, SupersededByNewerClaim, GapAdjacent, SensitivityRedaction). Optional probe_kind overrides the regex router; turn_provenance lookup is bounded to the most recent 200 turns of the session. Optional score_with_hybrid routes the answer rows through Hybrid Retrieval scoring (vector × Datalog × BLAKE3 × 11-component fusion) for re-ranking before caveat enrichment.",
+                "description": "Drill into a materialised Engram with a typed question. Returns answer rows with full provenance: claim_ids, byte spans, BLAKE3 hashes, certificate_hash, trial_scores, derivation_root, turn_provenance. Also returns caveats — unresolved contradictions, stale rows, low-confidence routing, test-derived facts, superseded claims, sensitivity redactions, gap-adjacency notes. Use AFTER `materialize_engram` once you hold a pointer; for one-off questions without a pointer, prefer `search` or `hybrid_retrieve`. Set `score_with_hybrid: true` to re-rank rows through the 11-component hybrid score. Set `probe_kind` to override the regex router when you know the question category (e.g. 'temporal' for time-based questions).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -585,45 +592,45 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             },
             {
                 "name": "list_engrams",
-                "description": "List active Engram pointers for the current session.",
+                "description": "List every Engram pointer currently materialised for this session, with its topic, age, and TTL. Use to recover from 'I had a pointer but lost track of it' or to decide whether to evict before materializing a new one (cap is 100 per session). Cheap, no I/O beyond an in-memory map read.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "workspace": { "type": "string" }
+                        "workspace": { "type": "string", "description": "Workspace name." }
                     },
                     "required": ["workspace"]
                 }
             },
             {
                 "name": "expire_engram",
-                "description": "Explicitly evict an Engram from the session. Returns { expired: bool }.",
+                "description": "Explicitly evict an Engram from the session cache so its pointer slot can be reused. Returns `{ expired: bool }` — `false` means the pointer was already gone (TTL expiry, session reset, or wrong pointer). Use when you're done with a topic and approaching the 100-engram cap, or when a `compile` invalidated the underlying claims and you want a fresh pointer on next materialize.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "pointer":   { "type": "string" },
-                        "workspace": { "type": "string" }
+                        "pointer":   { "type": "string", "description": "Engram pointer issued by materialize_engram (e.g. '0x7F9A')." },
+                        "workspace": { "type": "string", "description": "Workspace name." }
                     },
                     "required": ["pointer", "workspace"]
                 }
             },
             {
                 "name": "hybrid_retrieve",
-                "description": "World-class hybrid retrieval over the 33-table substrate. Combines vector recall + Datalog filters + per-row BLAKE3 verification + 11-component score fusion. Returns ranked hits with full provenance bundles (byte spans, source authority, admission tier, trial scores, certificate hash, derivation lineage), plus caveats (StaleRow, UnresolvedContradiction, SupersededByNewerClaim, DerivedFromTest, GapAdjacent, SensitivityRedaction, LowConfidence, DroppedQuarantined, BytesUnavailable). Use 'typed_predicates' to filter by entity, doc-tag, marker, code-metric range, authorship, heading path, or supersession. Use 'scoring_profile' = 'compliance' (rooted-only, doubled penalties) for legal/audit queries. Spec: docs/2026-05-02-hybrid-retrieval-spec.md.",
+                "description": "Top-tier retrieval over the 33-table substrate: vector recall + Datalog filters + per-row BLAKE3 verification + 11-component score fusion. Returns ranked hits with full provenance (byte spans, source authority, admission tier, trial scores, certificate_hash, derivation lineage) plus typed caveats (stale, contradicted, superseded, test-derived, gap-adjacent, redacted, low-confidence, quarantined, bytes-unavailable). Use when the user wants the BEST evidence for a question and you need verifiable provenance — e.g. before answering a precise factual question, or when grounding a write. Prefer `search` for fuzzy exploration and `query_claims` for filtered list queries. Set `scoring_profile: 'compliance'` for legal/audit (rooted-tier only, doubled penalties).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "workspace":                 { "type": "string" },
-                        "query_text":                { "type": "string", "description": "Free-text query for vector recall. Empty when only typed predicates apply." },
-                        "typed_predicates":          { "type": "array", "default": [], "items": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["entity_type", "entity_name", "claim_type", "source_trust_at_least", "authored_by", "authored_after", "in_call_graph_of", "has_doc_tag", "has_marker", "quantity_range", "in_heading_path", "supersedes_claim", "referenced_by"] } }, "required": ["kind"] }, "description": "Structured filters. Multiple predicates AND-combined." },
-                        "session_id":                { "type": "string" },
-                        "clearance":                 { "type": "array", "default": ["public"], "items": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] } },
-                        "top_k":                     { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
-                        "scoring_profile":           { "type": "string", "enum": ["default", "compliance", "custom"], "default": "default" },
-                        "scoring_profile_custom":    { "type": "object", "description": "Required when scoring_profile=custom; same shape as ScoringProfile." },
-                        "require_certificate":       { "type": "boolean", "default": false },
-                        "include_test_origin":       { "type": "boolean", "default": false },
-                        "include_quarantined":       { "type": "boolean", "default": false },
-                        "require_provenance_verified": { "type": "boolean", "default": false }
+                        "workspace":                 { "type": "string", "description": "Workspace name." },
+                        "query_text":                { "type": "string", "description": "Free-text query for vector recall. Empty string when only typed_predicates apply." },
+                        "typed_predicates":          { "type": "array", "default": [], "items": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["entity_type", "entity_name", "claim_type", "source_trust_at_least", "authored_by", "authored_after", "in_call_graph_of", "has_doc_tag", "has_marker", "quantity_range", "in_heading_path", "supersedes_claim", "referenced_by"] } }, "required": ["kind"] }, "description": "Structured filters AND-combined. E.g. [{kind: 'entity_name', value: 'WebhookHandler'}, {kind: 'claim_type', value: 'decision'}]." },
+                        "session_id":                { "type": "string", "description": "Per-session identifier — REQUIRED. Use the same value across calls in one conversation so retrieval can dedupe against previously-delivered claims (`SessionContext.delivered_claim_ids`). If you don't have one, mint a stable UUID at conversation start and reuse it. Mismatched session_ids cause repeat results." },
+                        "clearance":                 { "type": "array", "default": ["public"], "items": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] }, "description": "Sensitivity tiers the caller is cleared for. Anything stricter is dropped or redacted." },
+                        "top_k":                     { "type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "Max ranked results. Default 50 is a good general-purpose value; use 10–20 for tight prompts, 100+ for analytical workloads." },
+                        "scoring_profile":           { "type": "string", "enum": ["default", "compliance", "custom"], "default": "default", "description": "'default' = balanced; 'compliance' = rooted-only + doubled penalties (legal/audit); 'custom' = caller supplies scoring_profile_custom." },
+                        "scoring_profile_custom":    { "type": "object", "description": "Required when scoring_profile='custom'. Same shape as ScoringProfile. Omit otherwise." },
+                        "require_certificate":       { "type": "boolean", "default": false, "description": "Drop hits that lack a signed certificate_hash. Use for high-trust answers." },
+                        "include_test_origin":       { "type": "boolean", "default": false, "description": "Allow claims derived from test files. Off by default to reduce noise." },
+                        "include_quarantined":       { "type": "boolean", "default": false, "description": "Allow claims rejected by the rooting battery. Off by default." },
+                        "require_provenance_verified": { "type": "boolean", "default": false, "description": "Only return hits that pass eager BLAKE3 verification. Slows retrieval slightly; raises trust." }
                     },
                     "required": ["workspace", "session_id"]
                 }
@@ -791,15 +798,26 @@ pub async fn handle_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            let session_snapshot = {
+            // Task 13: explicit `branch` overrides the session's
+            // active branch when present. Falls back to the session
+            // snapshot otherwise so existing call sites keep their
+            // current behaviour (set via `checkout_branch`).
+            let explicit_branch: Option<String> = arguments
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let mut session_snapshot = {
                 let store = sessions.lock().await;
                 store.get(session_id).cloned()
-            };
-            let session_ctx = session_snapshot.unwrap_or_else(|| {
+            }
+            .unwrap_or_else(|| {
                 crate::intelligence::session::SessionContext::new(session_id, ws)
             });
+            if let Some(b) = explicit_branch {
+                session_snapshot.active_branch = Some(b);
+            }
             match engine
-                .search_with_routing(ws, query, top_k, &session_ctx)
+                .search_with_routing(ws, query, top_k, &session_snapshot)
                 .await
             {
                 Ok(content) => JsonRpcResponse::success(
@@ -812,9 +830,18 @@ pub async fn handle_call(
 
         // ── Classic claim filter ──────────────────────────────────────────
         "query_claims" => {
-            let active_branch: Option<String> = {
-                let store = sessions.lock().await;
-                store.get(session_id).and_then(|s| s.active_branch.clone())
+            // Task 13: explicit `branch` overrides session's active
+            // branch when supplied; falls back to session otherwise.
+            let active_branch: Option<String> = match arguments
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                Some(b) => Some(b),
+                None => {
+                    let store = sessions.lock().await;
+                    store.get(session_id).and_then(|s| s.active_branch.clone())
+                }
             };
             let filter = ClaimFilter {
                 claim_type: arguments
@@ -840,9 +867,18 @@ pub async fn handle_call(
 
         // ── Classic relations ─────────────────────────────────────────────
         "get_relations" => {
-            let active_branch: Option<String> = {
-                let store = sessions.lock().await;
-                store.get(session_id).and_then(|s| s.active_branch.clone())
+            // Task 13: explicit `branch` overrides session's active
+            // branch when supplied; falls back to session otherwise.
+            let active_branch: Option<String> = match arguments
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                Some(b) => Some(b),
+                None => {
+                    let store = sessions.lock().await;
+                    store.get(session_id).and_then(|s| s.active_branch.clone())
+                }
             };
             let entity = match arguments.get("entity").and_then(|v| v.as_str()) {
                 Some(e) => e,

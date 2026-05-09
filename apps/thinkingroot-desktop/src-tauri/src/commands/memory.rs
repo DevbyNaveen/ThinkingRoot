@@ -86,10 +86,7 @@ pub struct BrainSnapshot {
 }
 
 #[tauri::command]
-pub async fn memory_list(
-    app: AppHandle,
-    filter: Option<String>,
-) -> Result<Vec<ClaimRow>, String> {
+pub async fn memory_list(app: AppHandle, filter: Option<String>) -> Result<Vec<ClaimRow>, String> {
     let client = SidecarClient::ensure_active(&app).await?;
     let path = match filter {
         Some(f) if !f.trim().is_empty() => format!(
@@ -191,9 +188,7 @@ fn urlencode(s: &str) -> String {
     // commands.  Anything outside the safe set gets %xx-encoded.
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));

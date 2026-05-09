@@ -4193,6 +4193,38 @@ Rules: \
         Some(storage.graph.clone())
     }
 
+    /// Batched claim-existence check used by the post-stream verifier
+    /// (intelligence/verifier.rs). Returns the subset of `ids` that
+    /// resolve to a claim row in this workspace's graph.
+    ///
+    /// Implementation: clones the per-workspace `GraphStore` (O(1),
+    /// shares the same `DbInstance`), then hits `get_claim_by_id` once
+    /// per id off the engine lock. Cheap enough for the typical
+    /// post-stream call (≤ retrieval top-K ≈ 50). Missing rows simply
+    /// don't appear in the returned set — non-existence is silent
+    /// (callers compare set membership, never expecting a row).
+    ///
+    /// Used during agent_stream_response's trust-receipt emit to build
+    /// the `Substrate` impl the verifier consumes. Stays on the engine
+    /// surface so future cloud-mode replacements can override the impl
+    /// without retrofitting every call site.
+    pub async fn claim_exists_batch(
+        &self,
+        ws: &str,
+        ids: &[String],
+    ) -> std::collections::HashSet<String> {
+        let mut found = std::collections::HashSet::new();
+        let Some(graph) = self.graph_store(ws).await else {
+            return found;
+        };
+        for id in ids {
+            if matches!(graph.get_claim_by_id(id), Ok(Some(_))) {
+                found.insert(id.clone());
+            }
+        }
+        found
+    }
+
     /// Construct a workspace-scoped source byte-store for content-hash-keyed
     /// range reads (RARP's BLAKE3 verification path). Mirrors the on-demand
     /// construction at engine.rs:2226 — `FileSystemSourceStore::new` is

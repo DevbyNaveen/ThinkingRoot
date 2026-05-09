@@ -190,12 +190,11 @@ pub async fn sign_canonical_bytes_keyless(
     signed_at: SystemTime,
     options: SignKeylessOptions,
 ) -> Result<SigstoreBundle, Error> {
-    use openidconnect::core::CoreIdToken;
-    use sigstore::crypto::SigningScheme;
-    use sigstore::fulcio::{FulcioClient, TokenProvider};
-    use std::str::FromStr as _;
-
-    // ─── Step 1: Build in-toto statement with dual-algorithm subject. ──
+    // Build the v3-pack-shaped in-toto statement, serialize it, and
+    // hand the bytes to the predicate-agnostic keyless signer. The
+    // statement structure is byte-identical to what this function
+    // produced before the refactor — existing v3 verifiers continue
+    // to round-trip without any wire change.
     let blake3_hex = blake3::hash(canonical_bytes).to_hex().to_string();
     let sha256_subject = sha256_hex(canonical_bytes);
 
@@ -224,6 +223,49 @@ pub async fn sign_canonical_bytes_keyless(
     };
     let payload_bytes = serde_json::to_vec(&statement)?;
 
+    sign_dsse_payload_keyless(DSSE_PAYLOAD_TYPE, &payload_bytes, jwt, options).await
+}
+
+/// Sign arbitrary DSSE payload bytes via Sigstore-keyless. Generic
+/// over the predicate type — the caller pre-serializes any in-toto
+/// statement (or, for direct DSSE callers, any other DSSE payload)
+/// and chooses its own `payload_type` IANA media type.
+///
+/// Use-cases:
+///
+/// - **v3 pack signing:** [`sign_canonical_bytes_keyless`] delegates
+///   here after building a [`PackPredicate`] in-toto statement.
+/// - **Grounded Diff Certificate:** `thinkingroot-serve` builds a
+///   `GroundedDiffPredicate` in-toto statement and calls this
+///   directly with `payload_type = "application/vnd.in-toto+json"`.
+///
+/// Pipeline (steps mirror the inline doc on
+/// [`sign_canonical_bytes_keyless`], starting at step 2):
+///
+/// 2. JWT → `TokenProvider::Static((CoreIdToken, challenge))`.
+/// 3. Fulcio `request_cert(ECDSA_P256_SHA256_ASN1)` issues an
+///    ephemeral signer + leaf cert.
+/// 4. DSSE-PAE encode `(payload_type, payload_bytes)` and sign.
+/// 5. Build a Rekor `intoto v0.0.2` proposed entry, POST to
+///    `${rekor_url}/api/v1/log/entries`.
+/// 6. Convert Rekor's REST response into a [`TlogEntry`].
+/// 7. Assemble the [`SigstoreBundle`].
+///
+/// The same offline verifiers ([`crate::verify_bundle_offline`] et
+/// al.) accept the result regardless of payload type — chain
+/// validation, ECDSA-P256-SHA256 signature check over the DSSE PAE,
+/// and Rekor inclusion-proof replay are all payload-agnostic.
+pub async fn sign_dsse_payload_keyless(
+    payload_type: &str,
+    payload_bytes: &[u8],
+    jwt: &str,
+    options: SignKeylessOptions,
+) -> Result<SigstoreBundle, Error> {
+    use openidconnect::core::CoreIdToken;
+    use sigstore::crypto::SigningScheme;
+    use sigstore::fulcio::{FulcioClient, TokenProvider};
+    use std::str::FromStr as _;
+
     // ─── Step 2: JWT → TokenProvider::Static. ──────────────────────────
     let challenge = challenge_from_jwt(jwt)?;
     let core_token = CoreIdToken::from_str(jwt)
@@ -240,7 +282,7 @@ pub async fn sign_canonical_bytes_keyless(
         .map_err(|e| Error::CertParse(format!("Fulcio request_cert: {e}")))?;
 
     // ─── Step 4: DSSE-PAE encode + sign with ephemeral key. ────────────
-    let pae = dsse_pae(DSSE_PAYLOAD_TYPE, &payload_bytes);
+    let pae = dsse_pae(payload_type, payload_bytes);
     let sig_bytes = signer
         .sign(&pae)
         .map_err(|e| Error::CertParse(format!("ephemeral DSSE sign: {e}")))?;
@@ -253,7 +295,7 @@ pub async fn sign_canonical_bytes_keyless(
 
     // ─── Step 6: Build + POST Rekor proposed entry. ───────────────────
     let b64 = base64::engine::general_purpose::STANDARD;
-    let payload_b64 = b64.encode(&payload_bytes);
+    let payload_b64 = b64.encode(payload_bytes);
     let sig_b64 = b64.encode(&sig_bytes);
     let leaf_pem_b64 = b64.encode(leaf_cert_pem.as_bytes());
 
@@ -263,7 +305,7 @@ pub async fn sign_canonical_bytes_keyless(
         "spec": {
             "content": {
                 "envelope": {
-                    "payloadType": DSSE_PAYLOAD_TYPE,
+                    "payloadType": payload_type,
                     "payload": payload_b64,
                     "signatures": [{
                         "sig": sig_b64,
@@ -298,7 +340,7 @@ pub async fn sign_canonical_bytes_keyless(
         },
         dsse_envelope: DsseEnvelope {
             payload: payload_b64,
-            payload_type: DSSE_PAYLOAD_TYPE.to_string(),
+            payload_type: payload_type.to_string(),
             signatures: vec![DsseSignature { sig: sig_b64 }],
         },
     })

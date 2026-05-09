@@ -5,16 +5,20 @@
 //! the MCP HTTP / SSE / stdio surfaces from `thinkingroot-serve`.
 //! This module surfaces the sidecar's status to the UI and renders
 //! ready-to-paste config snippets for the half-dozen AI tools that
-//! support MCP today.
+//! support MCP today. It also exposes a one-click writer for the same
+//! config shapes so desktop users do not have to hand-edit JSON/TOML.
 //!
 //! The snippets shape matches the OSS CLI's `root connect` output
 //! — both ultimately point Claude Desktop / Cursor / Zed / VS Code
 //! at a `root serve --mcp-stdio --path <workspace>` subprocess that
 //! the AI tool spawns per session.
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
+use thinkingroot_core::{atomic_write, global_config::Credentials};
 
 use crate::state::AppState;
 
@@ -78,10 +82,7 @@ pub async fn mcp_status(app: AppHandle) -> Result<McpStatus, String> {
 /// bundled `root` binary (resolved via the same logic as the
 /// sidecar). HTTP-only Gemini CLI gets the loopback SSE URL.
 #[tauri::command]
-pub async fn mcp_get_config_snippet(
-    app: AppHandle,
-    tool: String,
-) -> Result<String, String> {
+pub async fn mcp_get_config_snippet(app: AppHandle, tool: String) -> Result<String, String> {
     let bin_path = resolve_root_binary().unwrap_or_else(|| "root".to_string());
     let workspace_path = workspace_path().unwrap_or_else(|| "<your-workspace>".to_string());
 
@@ -140,6 +141,353 @@ pub async fn mcp_get_config_snippet(
     serde_json::to_string_pretty(&pretty).map_err(|e| format!("serialize snippet: {e}"))
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct McpConfigureResult {
+    pub tool: String,
+    pub path: String,
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigFormat {
+    McpServers,
+    Servers,
+    ContextServers,
+    ClaudeCode,
+    CodexToml,
+    GeminiCli,
+}
+
+struct ToolConfig {
+    label: &'static str,
+    path: PathBuf,
+    format: ConfigFormat,
+}
+
+/// Write the selected tool's MCP config directly, preserving any existing
+/// settings and only replacing the `thinkingroot` server entry.
+#[tauri::command]
+pub async fn mcp_configure_tool(
+    app: AppHandle,
+    tool: String,
+) -> Result<McpConfigureResult, String> {
+    let config = tool_config(&tool).ok_or_else(|| format!("unsupported MCP tool `{tool}`"))?;
+    let bin_path = resolve_root_binary().unwrap_or_else(|| "root".to_string());
+    let workspace_path = workspace_path().unwrap_or_else(|| "<your-workspace>".to_string());
+
+    let state = app.state::<AppState>();
+    let guard = state.sidecar.lock().await;
+    let port = guard.as_ref().map(|h| h.port).unwrap_or(31760);
+    drop(guard);
+
+    match config.format {
+        ConfigFormat::CodexToml => write_codex_config(&config.path, &bin_path, &workspace_path)?,
+        _ => write_json_config(
+            &config.path,
+            config.format,
+            &bin_path,
+            &workspace_path,
+            port,
+        )?,
+    }
+
+    Ok(McpConfigureResult {
+        tool: config.label.to_string(),
+        path: config.path.display().to_string(),
+        restart_required: true,
+    })
+}
+
+fn tool_config(tool: &str) -> Option<ToolConfig> {
+    let key = tool.to_ascii_lowercase();
+    match key.as_str() {
+        "claude-desktop" => Some(ToolConfig {
+            label: "Claude Desktop",
+            path: dirs::config_dir()?
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+            format: ConfigFormat::McpServers,
+        }),
+        "cursor" => Some(ToolConfig {
+            label: "Cursor",
+            path: dirs::home_dir()?.join(".cursor").join("mcp.json"),
+            format: ConfigFormat::McpServers,
+        }),
+        "windsurf" => Some(ToolConfig {
+            label: "Windsurf",
+            path: dirs::home_dir()?
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+            format: ConfigFormat::McpServers,
+        }),
+        "cline" => Some(ToolConfig {
+            label: "Cline",
+            path: dirs::config_dir()?
+                .join("Code")
+                .join("User")
+                .join("globalStorage")
+                .join("saoudrizwan.claude-dev")
+                .join("settings")
+                .join("cline_mcp_settings.json"),
+            format: ConfigFormat::McpServers,
+        }),
+        "zed" => Some(ToolConfig {
+            label: "Zed",
+            path: zed_settings_path()?,
+            format: ConfigFormat::ContextServers,
+        }),
+        "vs-code" | "vscode" => Some(ToolConfig {
+            label: "VS Code",
+            path: dirs::config_dir()?
+                .join("Code")
+                .join("User")
+                .join("mcp.json"),
+            format: ConfigFormat::Servers,
+        }),
+        "claude-code" => Some(ToolConfig {
+            label: "Claude Code",
+            path: dirs::home_dir()?.join(".claude.json"),
+            format: ConfigFormat::ClaudeCode,
+        }),
+        "gemini-cli" => Some(ToolConfig {
+            label: "Gemini CLI",
+            path: dirs::home_dir()?.join(".gemini").join("settings.json"),
+            format: ConfigFormat::GeminiCli,
+        }),
+        "codex" => Some(ToolConfig {
+            label: "Codex",
+            path: dirs::home_dir()?.join(".codex").join("config.toml"),
+            format: ConfigFormat::CodexToml,
+        }),
+        _ => None,
+    }
+}
+
+fn zed_settings_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir().map(|d| d.join(".config").join("zed").join("settings.json"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dirs::config_dir().map(|d| d.join("zed").join("settings.json"))
+    }
+}
+
+fn write_json_config(
+    path: &Path,
+    format: ConfigFormat,
+    bin_path: &str,
+    workspace_path: &str,
+    port: u16,
+) -> Result<(), String> {
+    let mut existing: Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    match format {
+        ConfigFormat::ClaudeCode => {
+            apply_claude_code_entry(&mut existing, bin_path, workspace_path)
+        }
+        ConfigFormat::GeminiCli => {
+            if !existing["mcpServers"].is_object() {
+                existing["mcpServers"] = json!({});
+            }
+            existing["mcpServers"]["thinkingroot"] = json!({
+                "httpUrl": format!("http://127.0.0.1:{port}/mcp/sse"),
+            });
+        }
+        ConfigFormat::Servers => {
+            if !existing["servers"].is_object() {
+                existing["servers"] = json!({});
+            }
+            existing["servers"]["thinkingroot"] = stdio_entry(bin_path, workspace_path, true);
+        }
+        ConfigFormat::ContextServers => {
+            if !existing["context_servers"].is_object() {
+                existing["context_servers"] = json!({});
+            }
+            existing["context_servers"]["thinkingroot"] =
+                stdio_entry(bin_path, workspace_path, false);
+        }
+        ConfigFormat::McpServers => {
+            if !existing["mcpServers"].is_object() {
+                existing["mcpServers"] = json!({});
+            }
+            existing["mcpServers"]["thinkingroot"] = stdio_entry(bin_path, workspace_path, false);
+        }
+        ConfigFormat::CodexToml => unreachable!("handled by write_codex_config"),
+    }
+
+    let out = serde_json::to_string_pretty(&existing)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    write_config_atomic(path, out.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+fn apply_claude_code_entry(existing: &mut Value, bin_path: &str, workspace_path: &str) {
+    if !existing["projects"].is_object() {
+        existing["projects"] = json!({});
+    }
+    if !existing["projects"][workspace_path].is_object() {
+        existing["projects"][workspace_path] = json!({});
+    }
+    if !existing["projects"][workspace_path]["mcpServers"].is_object() {
+        existing["projects"][workspace_path]["mcpServers"] = json!({});
+    }
+    existing["projects"][workspace_path]["mcpServers"]["thinkingroot"] =
+        stdio_entry(bin_path, workspace_path, false);
+}
+
+fn stdio_entry(bin_path: &str, workspace_path: &str, needs_type_field: bool) -> Value {
+    let mut entry = if needs_type_field {
+        json!({
+            "type": "stdio",
+            "command": bin_path,
+            "args": ["serve", "--mcp-stdio", "--path", workspace_path],
+        })
+    } else {
+        json!({
+            "command": bin_path,
+            "args": ["serve", "--mcp-stdio", "--path", workspace_path],
+        })
+    };
+    let env = credential_env_json(true);
+    if !env.is_empty() {
+        entry["env"] = json!(env);
+    }
+    entry
+}
+
+fn write_codex_config(path: &Path, bin_path: &str, workspace_path: &str) -> Result<(), String> {
+    let mut doc: toml::Value = if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        raw.parse()
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    if !matches!(doc, toml::Value::Table(_)) {
+        doc = toml::Value::Table(toml::map::Map::new());
+    }
+    let root = doc
+        .as_table_mut()
+        .expect("doc was normalised to a TOML table");
+    if !root.contains_key("mcp_servers") {
+        root.insert(
+            "mcp_servers".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let mcp_servers = root
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| "mcp_servers exists but is not a TOML table".to_string())?;
+
+    let mut entry = toml::map::Map::new();
+    entry.insert(
+        "command".to_string(),
+        toml::Value::String(bin_path.to_string()),
+    );
+    entry.insert(
+        "args".to_string(),
+        toml::Value::Array(vec![
+            toml::Value::String("serve".to_string()),
+            toml::Value::String("--mcp-stdio".to_string()),
+            toml::Value::String("--path".to_string()),
+            toml::Value::String(workspace_path.to_string()),
+        ]),
+    );
+    let env = credential_env_toml();
+    if !env.is_empty() {
+        entry.insert("env".to_string(), toml::Value::Table(env));
+    }
+    mcp_servers.insert("thinkingroot".to_string(), toml::Value::Table(entry));
+
+    let out = toml::to_string_pretty(&doc)
+        .map_err(|e| format!("failed to serialize {}: {e}", path.display()))?;
+    write_config_atomic(path, out.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+const CREDENTIAL_VARS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "TOGETHER_API_KEY",
+    "PERPLEXITY_API_KEY",
+    "LITELLM_API_KEY",
+    "CUSTOM_LLM_API_KEY",
+];
+
+fn credential_env_json(tool_supports_var_expansion: bool) -> serde_json::Map<String, Value> {
+    let stored = Credentials::load().unwrap_or_default();
+    let mut map = serde_json::Map::new();
+    for var in CREDENTIAL_VARS {
+        let parent_has = std::env::var(var).is_ok_and(|v| !v.is_empty());
+        let cred_has = stored.get(var).is_some_and(|v| !v.is_empty());
+        if !parent_has && !cred_has {
+            continue;
+        }
+        let value = if tool_supports_var_expansion && parent_has {
+            json!(format!("${{{var}}}"))
+        } else {
+            json!("")
+        };
+        map.insert((*var).to_string(), value);
+    }
+    map
+}
+
+fn credential_env_toml() -> toml::map::Map<String, toml::Value> {
+    let stored = Credentials::load().unwrap_or_default();
+    let mut map = toml::map::Map::new();
+    for var in CREDENTIAL_VARS {
+        let parent_has = std::env::var(var).is_ok_and(|v| !v.is_empty());
+        let cred_has = stored.get(var).is_some_and(|v| !v.is_empty());
+        if !parent_has && !cred_has {
+            continue;
+        }
+        let value = if parent_has {
+            format!("${{{var}}}")
+        } else {
+            String::new()
+        };
+        map.insert((*var).to_string(), toml::Value::String(value));
+    }
+    map
+}
+
+fn write_config_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    let mode = Some(0o600u32);
+    #[cfg(not(unix))]
+    let mode = None::<u32>;
+    atomic_write(path, contents, mode).map_err(|e| match e {
+        thinkingroot_core::Error::Io { source, .. } => source,
+        other => std::io::Error::other(other.to_string()),
+    })
+}
+
 fn resolve_root_binary() -> Option<String> {
     if let Ok(override_path) = std::env::var("THINKINGROOT_ROOT_BINARY") {
         if !override_path.is_empty() {
@@ -191,8 +539,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
     // when a daemon was started outside this desktop session (e.g.
     // CLI `root serve`, launchd, or a fresh sidecar respawn). Returns
     // None only when no daemon is genuinely reachable.
-    let Some((host, port)) =
-        crate::commands::sidecar_client::try_resolve_endpoint(&app).await
+    let Some((host, port)) = crate::commands::sidecar_client::try_resolve_endpoint(&app).await
     else {
         return Ok(Vec::new());
     };
@@ -216,10 +563,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
         Err(_) => "unreachable",
     };
 
-    let manifest_url = format!(
-        "http://{}:{}/.well-known/mcp",
-        host, port
-    );
+    let manifest_url = format!("http://{}:{}/.well-known/mcp", host, port);
     let resp = match client.get(&manifest_url).send().await {
         Ok(r) => r,
         Err(_) => {
@@ -227,10 +571,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
                 name: "local sidecar".to_string(),
                 transport: "sse".to_string(),
                 status: self_status.to_string(),
-                description: Some(format!(
-                    "Manifest unavailable — sidecar {}:{}",
-                    host, port
-                )),
+                description: Some(format!("Manifest unavailable — sidecar {}:{}", host, port)),
             }]);
         }
     };

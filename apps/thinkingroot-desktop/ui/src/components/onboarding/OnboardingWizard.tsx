@@ -19,6 +19,7 @@ import {
   workspaceSetActive,
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
+import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { PasswordInput } from "@/components/ui/password-input";
 import { cn } from "@/lib/utils";
@@ -188,6 +189,7 @@ export function OnboardingWizard({ open, onComplete, onSkip }: Props) {
           path: workspace,
           name: workspaceName.trim() || undefined,
         });
+        useApp.getState().setActiveWorkspace(view.name);
         await workspaceSetActive(view.name);
       }
 
@@ -645,4 +647,4 @@ function Field({
 }
 
 const inputClass =
-  "h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40";
+  "h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none";

@@ -205,18 +205,18 @@ pub fn global_config_write(args: GlobalLlmWriteArgs) -> Result<String, String> {
     }
 
     if let Some(patch) = args.azure {
-        let azure = cfg
-            .llm
-            .providers
-            .azure
-            .get_or_insert_with(|| thinkingroot_core::config::AzureConfig {
-                resource_name: None,
-                endpoint_base: None,
-                deployment: None,
-                api_version: None,
-                api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
-                api_key: None,
-            });
+        let azure =
+            cfg.llm
+                .providers
+                .azure
+                .get_or_insert_with(|| thinkingroot_core::config::AzureConfig {
+                    resource_name: None,
+                    endpoint_base: None,
+                    deployment: None,
+                    api_version: None,
+                    api_key_env: Some("AZURE_OPENAI_API_KEY".to_string()),
+                    api_key: None,
+                });
         apply_optional(&mut azure.resource_name, patch.resource_name);
         apply_optional(&mut azure.endpoint_base, patch.endpoint_base);
         apply_optional(&mut azure.deployment, patch.deployment);
@@ -582,10 +582,12 @@ fn env_present(name: &str) -> bool {
 /// reading `.thinkingroot/config.toml` from a path the user never
 /// granted access to via `workspace_llm_config`.
 fn ensure_registered_workspace(raw_path: &str) -> Result<PathBuf, String> {
-    let registry = WorkspaceRegistry::load()
-        .map_err(|e| format!("load workspace registry: {e}"))?;
+    let registry =
+        WorkspaceRegistry::load().map_err(|e| format!("load workspace registry: {e}"))?;
     let candidate = PathBuf::from(raw_path);
-    let candidate_canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+    let candidate_canon = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.clone());
     for ws in &registry.workspaces {
         let ws_canon = ws.path.canonicalize().unwrap_or_else(|_| ws.path.clone());
         if candidate_canon == ws_canon {

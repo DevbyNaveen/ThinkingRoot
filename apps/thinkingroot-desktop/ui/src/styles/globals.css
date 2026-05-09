@@ -29,10 +29,36 @@
     user-select: text;
   }
 
-  /* Disable the browser outline everywhere; we paint our own. */
-  :focus { outline: none; }
-  :focus-visible {
-    @apply ring-2 ring-ring ring-offset-2 ring-offset-background;
+  /* No default browser outline — use minimal, non-stacked cues below. */
+  :focus {
+    outline: none;
+  }
+
+  /*
+   * Text fields: no Tailwind ring / offset (those stack on top of border and
+   * look like a second coloured frame). Caret + unchanged border only.
+   */
+  input:focus,
+  input:focus-visible,
+  textarea:focus,
+  textarea:focus-visible,
+  select:focus,
+  select:focus-visible,
+  [cmdk-input]:focus,
+  [cmdk-input]:focus-visible {
+    outline: none;
+    box-shadow: none;
+    @apply ring-0 ring-offset-0;
+  }
+
+  /* Keyboard focus for buttons, links, tabs — single thin ring, no offset halo */
+  button:focus-visible,
+  a:focus-visible,
+  [role="tab"]:focus-visible,
+  [role="menuitem"]:focus-visible,
+  [role="option"]:focus-visible {
+    outline: none;
+    @apply ring-1 ring-ring/45 ring-offset-0;
   }
 
   /* Removed custom webkit scrollbar rules to allow native OS auto-hiding overlay scrollbars. */
@@ -67,5 +93,45 @@
   }
   .surface-elevated {
     @apply bg-surface-elevated shadow-elevated;
+  }
+
+  /*
+   * Brain-graph live activity — DOM consumers (citation chips, claim
+   * cards in chat) wear these classes; the canvas-side BrainGraph mirrors
+   * the same hue per `ActivationKind` so a node halo and an inline
+   * citation chip read as the same event. Keep the kind names + color
+   * tokens aligned with `store/brain.ts::ActivationKind`.
+   */
+  @keyframes brain-pulse {
+    0% {
+      box-shadow: 0 0 0 0 var(--brain-pulse-color, hsl(200 80% 65% / 0.55));
+    }
+    70% {
+      box-shadow: 0 0 0 8px var(--brain-pulse-color, hsl(200 80% 65% / 0));
+    }
+    100% {
+      box-shadow: 0 0 0 0 var(--brain-pulse-color, hsl(200 80% 65% / 0));
+    }
+  }
+
+  .brain-pulse-cited {
+    --brain-pulse-color: hsl(200 80% 65% / 0.55); /* sky blue — model citing */
+    animation: brain-pulse 1.6s ease-out infinite;
+  }
+  .brain-pulse-retrieved {
+    --brain-pulse-color: hsl(150 70% 60% / 0.55); /* emerald — fresh retrieval */
+    animation: brain-pulse 1.6s ease-out infinite;
+  }
+  .brain-pulse-anticipated {
+    --brain-pulse-color: hsl(50 90% 60% / 0.55); /* amber — speculative pre-fetch */
+    animation: brain-pulse 2s ease-out infinite;
+  }
+  .brain-pulse-cascade {
+    --brain-pulse-color: hsl(280 70% 65% / 0.45); /* purple — spreading activation */
+    animation: brain-pulse 2.4s ease-out infinite;
+  }
+  .brain-pulse-memory {
+    --brain-pulse-color: hsl(30 80% 65% / 0.45); /* orange — long-term memory */
+    animation: brain-pulse 3s ease-out infinite;
   }
 }

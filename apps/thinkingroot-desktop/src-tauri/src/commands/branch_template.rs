@@ -7,7 +7,8 @@ use crate::commands::sidecar_client::SidecarClient;
 #[tauri::command]
 pub async fn branch_template_list(app: AppHandle) -> Result<serde_json::Value, String> {
     let sc = SidecarClient::ensure_active_for_branches(&app).await?;
-    sc.get::<serde_json::Value>("/api/v1/branch-templates").await
+    sc.get::<serde_json::Value>("/api/v1/branch-templates")
+        .await
 }
 
 #[tauri::command]

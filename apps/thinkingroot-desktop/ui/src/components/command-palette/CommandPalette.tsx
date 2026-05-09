@@ -130,7 +130,7 @@ export function CommandPalette() {
               <Command.Input
                 autoFocus
                 placeholder="Type a command or search…"
-                className="h-11 w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+                className="h-11 w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:ring-0"
               />
               <kbd className="hidden shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">
                 Esc
@@ -320,7 +320,7 @@ function ArgDrillDown({
           placeholder={command.argPlaceholder ?? command.argLabel}
           className={cn(
             "h-10 w-full rounded-md border border-input bg-background px-3 text-sm",
-            "placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40",
+            "placeholder:text-muted-foreground focus:outline-none",
           )}
         />
         <button

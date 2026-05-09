@@ -507,6 +507,12 @@ impl ToolHandler for SearchClaimsTool {
         // range columns CozoDB persists (W1). Falls back to (file: "",
         // byte_start: 0, byte_end: 0) when read_source can't resolve —
         // the agent then knows to use list_claims for richer metadata.
+        //
+        // `confidence` and `relevance` ride along so the post-stream
+        // verifier (intelligence/verifier.rs) has score data when it
+        // auto-cites against this tool's output. Both fields are
+        // additive on the wire — old agents ignore them, the verifier's
+        // retrieval-capture parser reads them when present.
         let mut records: Vec<serde_json::Value> = Vec::with_capacity(result.claims.len());
         for c in result.claims.iter().take(limit) {
             let (file, byte_start, byte_end) =
@@ -520,6 +526,8 @@ impl ToolHandler for SearchClaimsTool {
                 "file": file,
                 "byte_start": byte_start,
                 "byte_end": byte_end,
+                "confidence": c.confidence,
+                "relevance": c.relevance,
             }));
         }
         match serde_json::to_string(&json!({ "claims": records })) {
@@ -953,6 +961,195 @@ impl ToolHandler for AbandonBranchTool {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Substrate Bus tool — invoke_external_agent
+// ─────────────────────────────────────────────────────────────────
+
+/// `invoke_external_agent` — delegates one prompt to an external
+/// coding agent (Claude Code or Cursor) running in a worktree the
+/// caller specifies. Streams events from the adapter, accumulates
+/// them into a structured summary, returns the summary as JSON.
+///
+/// Marked **write** because spawning an external process with
+/// substrate access is the kind of side effect the ApprovalGate must
+/// approve. The desktop UI shows the user "Claude Code wants to run
+/// in /path/to/worktree on prompt: '...'" before any subprocess
+/// starts.
+///
+/// v1.0 contract: caller passes an existing `worktree` path. The
+/// tool does NOT auto-create a `git worktree add` — that's the
+/// caller's responsibility (typically a `create_branch` →
+/// `git worktree add` sequence orchestrated outside this tool, or a
+/// future v1.1 `create_sandbox_worktree` tool).
+pub struct InvokeExternalAgentTool {
+    _ctx: ToolContext,
+    /// Adapter selector → factory. Lets tests inject mock adapters
+    /// without touching real binaries. Production wires this via
+    /// `register_builtin_tools` to the env-driven defaults.
+    factory: std::sync::Arc<dyn ExternalAgentFactory>,
+}
+
+/// Factory that resolves an adapter name (`"claude_code"`, `"cursor"`)
+/// into an `AgentAdapter` instance. Pulled out so tests can substitute
+/// adapters with deterministic event streams without touching real
+/// binaries; production gets `DefaultExternalAgentFactory`.
+pub trait ExternalAgentFactory: Send + Sync {
+    fn build(
+        &self,
+        name: &str,
+    ) -> Option<Box<dyn crate::intelligence::adapters::AgentAdapter>>;
+}
+
+/// Production factory: maps `"claude_code"` →
+/// [`crate::intelligence::adapters::claude_code::ClaudeCodeAdapter`]
+/// configured from env, and `"cursor"` → [`crate::intelligence::
+/// adapters::cursor::CursorAdapter`] configured from env. Unknown
+/// names return `None` so the tool surfaces a clean error.
+#[derive(Default)]
+pub struct DefaultExternalAgentFactory;
+
+impl ExternalAgentFactory for DefaultExternalAgentFactory {
+    fn build(
+        &self,
+        name: &str,
+    ) -> Option<Box<dyn crate::intelligence::adapters::AgentAdapter>> {
+        match name {
+            "claude_code" | "claude" => Some(Box::new(
+                crate::intelligence::adapters::claude_code::ClaudeCodeAdapter::from_env(),
+            )),
+            "cursor" => Some(Box::new(
+                crate::intelligence::adapters::cursor::CursorAdapter::from_env(),
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl InvokeExternalAgentTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self {
+            _ctx: ctx,
+            factory: std::sync::Arc::new(DefaultExternalAgentFactory),
+        }
+    }
+
+    pub fn with_factory(
+        ctx: ToolContext,
+        factory: std::sync::Arc<dyn ExternalAgentFactory>,
+    ) -> Self {
+        Self { _ctx: ctx, factory }
+    }
+
+    pub fn spec() -> Tool {
+        Tool::new(
+            "invoke_external_agent",
+            "Delegate a prompt to an external coding agent (Claude Code or Cursor) running in a sandbox worktree. The external agent reads its own MCP config and may query this substrate during the run. Returns a JSON summary with token count, tool count, final answer text, and (if reported) cost in USD. Use this for code-change tasks where the user wants the substrate's grounding fed to a different agent harness.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Which external agent to invoke. Allowed values: 'claude_code', 'cursor'.",
+                        "enum": ["claude_code", "cursor"]
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Free-form prompt the external agent receives. Should describe the change task in the same shape Claude Code or Cursor users send directly."
+                    },
+                    "worktree": {
+                        "type": "string",
+                        "description": "Absolute path to an existing directory the external agent runs in. The directory must already exist; this tool does NOT create or git-worktree-add. Typically a sandbox worktree the caller created via `create_branch` + `git worktree add`."
+                    }
+                },
+                "required": ["agent", "prompt", "worktree"]
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for InvokeExternalAgentTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let agent_name = match input.get("agent").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => return ToolHandlerResult::error("missing required field: agent"),
+        };
+        let prompt = match input.get("prompt").and_then(|v| v.as_str()) {
+            Some(p) => p.to_string(),
+            None => return ToolHandlerResult::error("missing required field: prompt"),
+        };
+        let worktree = match input.get("worktree").and_then(|v| v.as_str()) {
+            Some(w) => std::path::PathBuf::from(w),
+            None => return ToolHandlerResult::error("missing required field: worktree"),
+        };
+
+        let Some(adapter) = self.factory.build(&agent_name) else {
+            return ToolHandlerResult::error(format!(
+                "unknown external agent: '{agent_name}' (allowed: claude_code, cursor)"
+            ));
+        };
+
+        let mut rx = match adapter.spawn(&prompt, &worktree, None).await {
+            Ok(r) => r,
+            Err(e) => return ToolHandlerResult::error(format!("spawn failed: {e}")),
+        };
+
+        let mut token_count: usize = 0;
+        let mut tool_count: usize = 0;
+        let mut final_text: Option<String> = None;
+        let mut error_message: Option<String> = None;
+        let mut cost_usd: Option<f64> = None;
+        while let Some(ev) = rx.recv().await {
+            use crate::intelligence::adapters::AdapterEvent;
+            match ev {
+                AdapterEvent::Token { content } => {
+                    token_count += 1;
+                    let _ = content;
+                }
+                AdapterEvent::ToolUse { .. } => {
+                    tool_count += 1;
+                }
+                AdapterEvent::ToolResult { .. } => {
+                    // tool_use already counted; result flows through
+                    // for completeness but doesn't bump counters.
+                }
+                AdapterEvent::Done {
+                    final_text: f,
+                    cost_usd: c,
+                } => {
+                    final_text = Some(f);
+                    cost_usd = c;
+                    break;
+                }
+                AdapterEvent::Error { message } => {
+                    error_message = Some(message);
+                    break;
+                }
+            }
+        }
+
+        if let Some(msg) = error_message {
+            return ToolHandlerResult::error(format!(
+                "{agent_name} failed: {msg} (token_events={token_count}, tool_events={tool_count})"
+            ));
+        }
+
+        let summary = json!({
+            "agent": agent_name,
+            "token_events": token_count,
+            "tool_events": tool_count,
+            "final_text": final_text.unwrap_or_default(),
+            "cost_usd": cost_usd,
+        });
+        match serde_json::to_string(&summary) {
+            Ok(s) => ToolHandlerResult::ok(s),
+            Err(e) => ToolHandlerResult::error(format!(
+                "serialize invoke_external_agent summary: {e}"
+            )),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Wire-up
 // ─────────────────────────────────────────────────────────────────
 
@@ -1010,7 +1207,11 @@ pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
         )
         .register_write(
             AbandonBranchTool::spec(),
-            Arc::new(AbandonBranchTool::new(ctx)),
+            Arc::new(AbandonBranchTool::new(ctx.clone())),
+        )
+        .register_write(
+            InvokeExternalAgentTool::spec(),
+            Arc::new(InvokeExternalAgentTool::new(ctx)),
         )
 }
 
@@ -1144,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn register_builtin_tools_produces_twelve_tools() {
+    fn register_builtin_tools_produces_thirteen_tools() {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx);
         let mut names = registry.tool_names();
@@ -1155,6 +1356,7 @@ mod tests {
                 "abandon_branch",
                 "contribute_claim",
                 "create_branch",
+                "invoke_external_agent",
                 "list_branches",
                 "list_claims",
                 "merge_branch",
@@ -1191,9 +1393,168 @@ mod tests {
             "contribute_claim",
             "merge_branch",
             "abandon_branch",
+            "invoke_external_agent",
         ] {
             assert!(registry.is_write(name), "{name} should be a write");
         }
+    }
+
+    /// Stub adapter factory for invoke_external_agent tests. Each
+    /// `build` call returns a `StubAdapter` configured with a list of
+    /// scripted events the adapter will emit when `spawn` is called.
+    struct StubFactory {
+        scripts: std::collections::HashMap<String, Vec<crate::intelligence::adapters::AdapterEvent>>,
+    }
+    struct StubAdapter {
+        name: &'static str,
+        events: Vec<crate::intelligence::adapters::AdapterEvent>,
+    }
+
+    #[async_trait]
+    impl crate::intelligence::adapters::AgentAdapter for StubAdapter {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn spawn(
+            &self,
+            _prompt: &str,
+            _worktree: &std::path::Path,
+            _pack: Option<&std::path::Path>,
+        ) -> Result<
+            tokio::sync::mpsc::Receiver<crate::intelligence::adapters::AdapterEvent>,
+            crate::intelligence::adapters::AdapterError,
+        > {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                for ev in events {
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    impl ExternalAgentFactory for StubFactory {
+        fn build(
+            &self,
+            name: &str,
+        ) -> Option<Box<dyn crate::intelligence::adapters::AgentAdapter>> {
+            self.scripts.get(name).cloned().map(|events| {
+                Box::new(StubAdapter {
+                    name: "stub_adapter",
+                    events,
+                }) as Box<dyn crate::intelligence::adapters::AgentAdapter>
+            })
+        }
+    }
+
+    fn stub_factory_with(
+        name: &str,
+        events: Vec<crate::intelligence::adapters::AdapterEvent>,
+    ) -> std::sync::Arc<StubFactory> {
+        let mut scripts = std::collections::HashMap::new();
+        scripts.insert(name.to_string(), events);
+        std::sync::Arc::new(StubFactory { scripts })
+    }
+
+    #[tokio::test]
+    async fn invoke_external_agent_returns_summary_on_success() {
+        use crate::intelligence::adapters::AdapterEvent;
+        let factory = stub_factory_with(
+            "claude_code",
+            vec![
+                AdapterEvent::Token {
+                    content: "thinking…".into(),
+                },
+                AdapterEvent::ToolUse {
+                    id: "u1".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                AdapterEvent::Done {
+                    final_text: "edited 3 files".into(),
+                    cost_usd: Some(0.07),
+                },
+            ],
+        );
+        let tool = InvokeExternalAgentTool::with_factory(fixture_ctx(), factory);
+        let res = tool
+            .handle(serde_json::json!({
+                "agent": "claude_code",
+                "prompt": "p",
+                "worktree": "/tmp",
+            }))
+            .await;
+        assert!(!res.is_error, "unexpected error: {}", res.content);
+        let v: serde_json::Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(v["agent"], "claude_code");
+        assert_eq!(v["token_events"], 1);
+        assert_eq!(v["tool_events"], 1);
+        assert_eq!(v["final_text"], "edited 3 files");
+        assert!((v["cost_usd"].as_f64().unwrap() - 0.07).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn invoke_external_agent_returns_error_on_adapter_error_event() {
+        use crate::intelligence::adapters::AdapterEvent;
+        let factory = stub_factory_with(
+            "claude_code",
+            vec![
+                AdapterEvent::Token {
+                    content: "starting".into(),
+                },
+                AdapterEvent::Error {
+                    message: "max turns exceeded".into(),
+                },
+            ],
+        );
+        let tool = InvokeExternalAgentTool::with_factory(fixture_ctx(), factory);
+        let res = tool
+            .handle(serde_json::json!({
+                "agent": "claude_code",
+                "prompt": "p",
+                "worktree": "/tmp",
+            }))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("max turns exceeded"));
+        // Counters are still rendered so the receipt is informative.
+        assert!(res.content.contains("token_events=1"));
+    }
+
+    #[tokio::test]
+    async fn invoke_external_agent_rejects_unknown_agent_name() {
+        let factory = stub_factory_with("claude_code", vec![]);
+        let tool = InvokeExternalAgentTool::with_factory(fixture_ctx(), factory);
+        let res = tool
+            .handle(serde_json::json!({
+                "agent": "antigravity",
+                "prompt": "p",
+                "worktree": "/tmp",
+            }))
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("unknown external agent"));
+    }
+
+    #[tokio::test]
+    async fn invoke_external_agent_rejects_missing_required_fields() {
+        let tool = InvokeExternalAgentTool::new(fixture_ctx());
+        let r1 = tool
+            .handle(serde_json::json!({"prompt": "p", "worktree": "/tmp"}))
+            .await;
+        assert!(r1.is_error && r1.content.contains("agent"));
+        let r2 = tool
+            .handle(serde_json::json!({"agent": "claude_code", "worktree": "/tmp"}))
+            .await;
+        assert!(r2.is_error && r2.content.contains("prompt"));
+        let r3 = tool
+            .handle(serde_json::json!({"agent": "claude_code", "prompt": "p"}))
+            .await;
+        assert!(r3.is_error && r3.content.contains("worktree"));
     }
 
     #[tokio::test]

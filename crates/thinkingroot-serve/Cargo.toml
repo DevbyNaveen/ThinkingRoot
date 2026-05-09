@@ -17,6 +17,11 @@ rust-version.workspace  = true
 ## lightweight test binaries that don't link fastembed + ONNX Runtime.
 default = ["vector"]
 vector = ["thinkingroot-graph/vector", "thinkingroot-branch/vector", "thinkingroot-ground/vector"]
+## Enable Sigstore keyless signing for the Grounded Diff Certificate
+## (`intelligence::diff_cert::sign_statement_keyless`). Pulls in
+## `sigstore-rs` + `reqwest` + `tokio` + `openidconnect` via
+## `tr-sigstore/live`. Off by default — `cargo build` stays lean.
+live = ["tr-sigstore/live"]
 
 [dependencies]
 thinkingroot-core = { workspace = true }
@@ -31,6 +36,7 @@ thinkingroot-health = { workspace = true }
 thinkingroot-ground = { workspace = true }
 thinkingroot-rooting = { workspace = true }
 thinkingroot-reflect = { workspace = true }
+tr-sigstore = { workspace = true }
 blake3 = { workspace = true }
 cozo = { workspace = true }
 serde = { workspace = true }

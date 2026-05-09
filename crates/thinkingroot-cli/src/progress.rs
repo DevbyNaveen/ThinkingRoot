@@ -43,26 +43,24 @@ struct ActiveExtractionBatch {
     accounted_done: usize,
 }
 
-/// Run the pipeline with a live progress display.
+/// Drain a `ProgressEvent` stream and render it as a live multi-phase
+/// indicatif display. Returns when the channel closes.
 ///
-/// Returns the same `PipelineResult` as `run_pipeline`. Callers print their
-/// own pre/post output (banner, summary) — this function only drives the bars.
-pub async fn run_compile_progress(
-    root_path: &Path,
-    branch: Option<&str>,
-    no_rooting: bool,
-) -> anyhow::Result<PipelineResult> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
-
-    let mp = MultiProgress::new();
-
-    // All bars — including Parsing — are created lazily inside the driver as
-    // each phase begins. This way every bar's elapsed time reflects only the
-    // work of that phase, never the gap between two events.
-
-    // ── Bar driver ──────────────────────────────────────────────────────────
+/// Used by both compile paths so neither can drift from the other:
+///   * In-process (`run_compile_progress`): the pipeline sends events
+///     directly into the channel.
+///   * Remote (`cortex_remote::run_compile_remote`): the SSE consumer
+///     parses each `progress` event back into a typed `ProgressEvent`
+///     and forwards it.
+///
+/// `mp` is exposed so callers that print their own banner above the
+/// bars can keep the layout coherent (otherwise indicatif and the raw
+/// `println!` lines fight for the cursor).
+pub async fn drive_progress_bars(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>,
+    mp: MultiProgress,
+) {
     let bar_driver = {
-        let mp = mp.clone();
         async move {
             let mut parse_bar: Option<ProgressBar> = None;
             let mut diffing_bar: Option<ProgressBar> = None;
@@ -760,17 +758,27 @@ pub async fn run_compile_progress(
         }
     };
 
-    // ── Run pipeline and driver concurrently ───────────────────────────────
-    // bar_driver must be a separate spawned task — NOT tokio::join! with the pipeline.
-    //
-    // Why: grounder.ground() and upsert_batch() are long synchronous operations that
-    // block the tokio worker thread.  tokio::join! runs both futures in the same task
-    // (same thread), so when the pipeline blocks, bar_driver never gets polled and
-    // progress events pile up in the channel unseen.
-    //
-    // spawn() makes bar_driver a fully independent task scheduled on any free thread,
-    // so it keeps draining the channel even while the pipeline thread is blocked.
-    let driver_handle = tokio::task::spawn(bar_driver);
+    bar_driver.await;
+}
+
+/// Run the pipeline with a live progress display (in-process path).
+///
+/// Returns the same `PipelineResult` as `run_pipeline`. Callers print their
+/// own pre/post output (banner, summary) — this function only drives the bars.
+///
+/// The bar driver is a separate spawned task — NOT `tokio::join!` with the
+/// pipeline. `grounder.ground()` and `upsert_batch()` are long synchronous
+/// operations that block the tokio worker thread; `tokio::join!` runs both
+/// futures in the same task (same thread), so when the pipeline blocks, the
+/// driver never gets polled and progress events pile up unseen.
+pub async fn run_compile_progress(
+    root_path: &Path,
+    branch: Option<&str>,
+    no_rooting: bool,
+) -> anyhow::Result<PipelineResult> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+    let mp = MultiProgress::new();
+    let driver_handle = tokio::task::spawn(drive_progress_bars(rx, mp));
     let pipeline_result = run_pipeline_with_options(
         root_path,
         branch,

@@ -36,6 +36,7 @@ export default function App() {
   const onboardingDismissed = useApp((s) => s.onboardingDismissed);
   const setOnboardingDismissed = useApp((s) => s.setOnboardingDismissed);
   const setCompileProgress = useApp((s) => s.setCompileProgress);
+  const setCompileRootPath = useApp((s) => s.setCompileRootPath);
   const packExportTarget = useApp((s) => s.packExportTarget);
   const setPackExportTarget = useApp((s) => s.setPackExportTarget);
   const [installTrPath, setInstallTrPath] = useState<string | null>(null);
@@ -44,13 +45,19 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     onWorkspaceCompileProgress((payload) => {
+      if (payload.phase === "started" || payload.phase === "booting") {
+        setCompileRootPath(payload.workspace);
+      }
       setCompileProgress(payload);
       if (
         payload.phase === "done" ||
         payload.phase === "failed" ||
         payload.phase === "cancelled"
       ) {
-        setTimeout(() => setCompileProgress(null), 3000);
+        setTimeout(() => {
+          setCompileProgress(null);
+          setCompileRootPath(null);
+        }, 3000);
       }
     }).then((un) => {
       unlisten = un;
@@ -58,7 +65,7 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, [setCompileProgress]);
+  }, [setCompileProgress, setCompileRootPath]);
 
   // Subscribe to `tr-file-opened` events emitted by the Rust side
   // when a `.tr` file is dropped on the window or routed via the

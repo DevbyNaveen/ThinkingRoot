@@ -43,11 +43,10 @@ pub async fn install_tr_file(path: String) -> Result<InstallPreview, String> {
     .map_err(|e| format!("read task panicked: {e}"))?
     .map_err(|e| format!("read pack {path}: {e}"))?;
 
-    let pack: V3Pack = tr_format::read_v3_pack(&bytes)
-        .map_err(|e| format!("parse v3 pack: {e}"))?;
+    let pack: V3Pack =
+        tr_format::read_v3_pack(&bytes).map_err(|e| format!("parse v3 pack: {e}"))?;
 
-    let preview = tr_render::render_preview(&pack)
-        .map_err(|e| format!("render preview: {e}"))?;
+    let preview = tr_render::render_preview(&pack).map_err(|e| format!("render preview: {e}"))?;
 
     let trust_tier = if pack.signature.is_some() {
         "T1".to_string() // Sigstore-signed; /install gates further verification

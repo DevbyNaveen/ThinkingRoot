@@ -16,7 +16,11 @@ pub struct TagView {
 
 fn tag_view(v: &Value) -> TagView {
     TagView {
-        name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        name: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         target_commit_hash: v
             .get("target_commit_hash")
             .and_then(|x| x.as_str())
@@ -75,9 +79,7 @@ pub async fn tag_get(app: AppHandle, name: String) -> Result<TagView, String> {
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));

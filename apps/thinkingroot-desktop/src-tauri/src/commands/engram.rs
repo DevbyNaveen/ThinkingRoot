@@ -35,10 +35,7 @@ pub async fn engram_materialize(
 }
 
 #[tauri::command]
-pub async fn engram_list(
-    app: AppHandle,
-    session_id: String,
-) -> Result<serde_json::Value, String> {
+pub async fn engram_list(app: AppHandle, session_id: String) -> Result<serde_json::Value, String> {
     let sc = SidecarClient::ensure_active(&app).await?;
     let path = format!("/api/v1/ws/{}/engrams", sc.workspace);
     sc.get_with_session::<serde_json::Value>(&path, &session_id)

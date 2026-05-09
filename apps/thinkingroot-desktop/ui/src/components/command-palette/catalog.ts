@@ -14,6 +14,7 @@ import {
   Archive,
   Bell,
   Bolt,
+  BookOpen,
   Bookmark,
   Brain,
   Bug,
@@ -116,7 +117,7 @@ export interface CommandDef {
   keywords?: string[];
 }
 
-const SURFACE_IDS: Surface[] = ["chats", "brain", "branches", "privacy", "settings"];
+const SURFACE_IDS: Surface[] = ["chats", "brain", "branches", "privacy", "settings", "docs"];
 
 const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   chats: Activity,
@@ -124,6 +125,7 @@ const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   branches: GitBranch,
   privacy: ShieldCheck,
   settings: SettingsIcon,
+  docs: BookOpen,
 };
 
 const SURFACE_HINT: Partial<Record<Surface, string>> = {
@@ -289,6 +291,45 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       run: phase("/export", "D-10"),
     },
     {
+      id: "browser-open",
+      label: "Open browser",
+      group: "Tools",
+      Icon: Globe,
+      keywords: ["browser", "web", "docs", "search", "url", "internet"],
+      run: (c) => {
+        const app = useApp.getState();
+        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailTab("browser");
+        c.close();
+      },
+    },
+    {
+      id: "terminal-open",
+      label: "Open terminal",
+      group: "Tools",
+      Icon: Terminal,
+      keywords: ["terminal", "shell", "console", "tty", "pty", "claude", "cli"],
+      run: (c) => {
+        const app = useApp.getState();
+        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailTab("terminal");
+        c.close();
+      },
+    },
+    {
+      id: "builders-open",
+      label: "Open builders backend panel",
+      group: "Tools",
+      Icon: Code2,
+      keywords: ["builders", "backend", "sdk", "api", "mcp", "rest", "lovable", "cursor"],
+      run: (c) => {
+        const app = useApp.getState();
+        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailTab("builders");
+        c.close();
+      },
+    },
+    {
       id: "pack-export",
       label: "Export workspace as .tr pack",
       group: "Tools",
@@ -366,6 +407,8 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
         if (!arg) return;
         try {
           const w = await workspaceAdd({ path: arg });
+          useApp.getState().setActiveWorkspace(w.name);
+          await workspaceSetActive(w.name);
           toast(`Registered ${w.name}`, {
             kind: "success",
             body: w.compiled

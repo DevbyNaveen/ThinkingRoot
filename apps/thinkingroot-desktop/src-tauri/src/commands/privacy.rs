@@ -85,10 +85,7 @@ pub async fn privacy_summary(app: AppHandle) -> Result<PrivacySummary, String> {
 #[tauri::command]
 pub async fn privacy_forget(app: AppHandle, source_uri: String) -> Result<usize, String> {
     let client = SidecarClient::ensure_active(&app).await?;
-    let path = format!(
-        "/api/v1/ws/{}/sources/forget",
-        urlencode(&client.workspace),
-    );
+    let path = format!("/api/v1/ws/{}/sources/forget", urlencode(&client.workspace),);
     let body = serde_json::json!({ "source_uri": source_uri });
     let resp: ForgetResponse = client.post(&path, &body).await?;
     Ok(resp.removed)
@@ -97,9 +94,7 @@ pub async fn privacy_forget(app: AppHandle, source_uri: String) -> Result<usize,
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));

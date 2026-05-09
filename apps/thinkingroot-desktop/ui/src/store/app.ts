@@ -3,6 +3,8 @@ import { persist } from "zustand/middleware";
 import type {
   AgentStep,
   ChatMessage,
+  EngramActivationEntry,
+  GapEntry,
   RightRailTab,
   StreamState,
   Surface,
@@ -25,6 +27,9 @@ interface AppStore {
   // Compile Progress
   compileProgress: CompileProgress | null;
   setCompileProgress: (p: CompileProgress | null) => void;
+  /** Absolute workspace root from `started` / `booting` events; cleared when compile ends. */
+  compileRootPath: string | null;
+  setCompileRootPath: (p: string | null) => void;
 
   // UI
   surface: Surface;
@@ -77,6 +82,12 @@ interface AppStore {
   /** Patch an existing agent step (status/output/isError). No-op if
    *  the step id isn't tracked yet. */
   patchAgentStep: (id: string, patch: Partial<AgentStep>) => void;
+  /** Append one engram activation observed during the active turn.
+   *  No-op when `streaming` is null (event arrived after final). */
+  appendEngramActivation: (entry: EngramActivationEntry) => void;
+  /** Append reflection gaps observed during the active turn.
+   *  No-op when `streaming` is null. */
+  appendGaps: (gaps: GapEntry[]) => void;
 
   // Per-turn routing context. Survives component re-mounts (React
   // Strict Mode, Vite HMR) so SSE Final/Error events that arrive AFTER
@@ -133,6 +144,8 @@ export const useApp = create<AppStore>()(
     (set, get) => ({
       compileProgress: null,
       setCompileProgress: (compileProgress) => set({ compileProgress }),
+      compileRootPath: null,
+      setCompileRootPath: (compileRootPath) => set({ compileRootPath }),
 
       surface: "chats",
       setSurface: (surface) => set({ surface }),
@@ -244,6 +257,26 @@ export const useApp = create<AppStore>()(
           const next = [...s.streaming.agentSteps];
           next[idx] = { ...prior, ...patch };
           return { streaming: { ...s.streaming, agentSteps: next } };
+        }),
+      appendEngramActivation: (entry) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          return {
+            streaming: {
+              ...s.streaming,
+              engramActivations: [...s.streaming.engramActivations, entry],
+            },
+          };
+        }),
+      appendGaps: (gaps) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          return {
+            streaming: {
+              ...s.streaming,
+              gaps: [...s.streaming.gaps, ...gaps],
+            },
+          };
         }),
 
       turnCtx: {},

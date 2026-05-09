@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { FileTree } from "@/components/shell/FileTree";
+import { FilePreviewContent } from "@/components/shell/filePreview";
 import {
   fsReadText,
   workspaceList,
@@ -182,14 +183,15 @@ export function WorkspaceFilesPanel({
       <div className="flex min-h-0 flex-1 flex-col gap-0 lg:flex-row">
         <div
           className={cn(
-            "flex min-h-0 min-w-0 flex-1 flex-col border-b border-border/40 lg:border-b-0 lg:border-r",
+            "flex min-h-0 w-full shrink-0 flex-col border-b border-border/40",
+            "lg:h-full lg:max-w-[11rem] lg:min-w-[8.75rem] lg:w-[min(28%,11rem)] lg:flex-none lg:border-b-0 lg:border-r",
           )}
         >
           <div className="flex items-center gap-1.5 border-b border-border/30 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
             <FolderTree className="size-3" />
             Files
           </div>
-          <div className="min-h-[140px] flex-1 overflow-y-auto lg:max-h-none">
+          <div className="min-h-[140px] flex-1 overflow-y-auto overflow-x-hidden lg:max-h-none">
             <FileTree
               key={treeRoot}
               rootPath={treeRoot}
@@ -199,40 +201,40 @@ export function WorkspaceFilesPanel({
           </div>
         </div>
 
-        <div className="flex min-h-[120px] min-w-0 flex-1 flex-col bg-muted/10">
-          <div className="border-b border-border/30 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+        <div className="flex min-h-[120px] min-w-0 flex-1 flex-col bg-[#1e1e1e]">
+          <div className="border-b border-border/30 bg-muted/10 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
             Preview
           </div>
-          <div className="min-h-0 flex-1 overflow-auto p-2">
+          <div className="min-h-0 min-w-0 flex-1 overflow-auto">
             {!selected && !loadingPreview && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="px-3 py-3 text-[11px] text-muted-foreground">
                 Select a file to preview (text, ≤ 512 KiB).
               </p>
             )}
             {selected?.kind === "directory" && (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="px-3 py-3 text-[11px] text-muted-foreground">
                 Folder — expand the tree or pick a file.
               </p>
             )}
             {loadingPreview && (
-              <p className="text-[11px] text-muted-foreground">Loading…</p>
+              <p className="px-3 py-3 text-[11px] text-muted-foreground">Loading…</p>
             )}
             {previewMeta?.tooLarge && (
-              <p className="text-[11px] text-amber-600/90">
+              <p className="px-3 py-3 text-[11px] text-amber-600/90">
                 File too large for preview (&gt; 512 KiB). Open it in an
                 external editor.
               </p>
             )}
             {previewMeta?.binary && preview !== null && (
-              <p className="mb-2 text-[10px] text-amber-600/90">
+              <p className="mb-0 px-3 pt-3 text-[10px] text-amber-600/90">
                 Non-UTF8 bytes — shown as lossy decode.
               </p>
             )}
-            {preview !== null && (
-              <pre className="whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-foreground/90">
-                {preview}
-              </pre>
-            )}
+            {preview !== null &&
+              selected &&
+              selected.kind !== "directory" && (
+                <FilePreviewContent path={selected.path} text={preview} />
+              )}
           </div>
         </div>
       </div>

@@ -87,8 +87,8 @@ pub fn fs_list_dir(args: FsListDirArgs) -> Result<Vec<FsEntry>, String> {
         return Err(format!("not a directory: {}", path.display()));
     }
     let mut entries: Vec<FsEntry> = Vec::new();
-    let read = std::fs::read_dir(&path)
-        .map_err(|e| format!("read_dir({}): {e}", path.display()))?;
+    let read =
+        std::fs::read_dir(&path).map_err(|e| format!("read_dir({}): {e}", path.display()))?;
     for dent in read {
         let dent = match dent {
             Ok(d) => d,
@@ -194,8 +194,8 @@ fn should_skip(name: &str) -> bool {
 /// root — still bounded to the workspace; `..` segments in the tail are
 /// rejected.
 fn ensure_under_registered_workspace(raw: &str) -> Result<PathBuf, String> {
-    let registry = WorkspaceRegistry::load()
-        .map_err(|e| format!("load workspace registry: {e}"))?;
+    let registry =
+        WorkspaceRegistry::load().map_err(|e| format!("load workspace registry: {e}"))?;
     if registry.workspaces.is_empty() {
         return Err(
             "no workspace registered yet — set one up before browsing the filesystem".into(),

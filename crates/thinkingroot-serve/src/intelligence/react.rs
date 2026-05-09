@@ -28,27 +28,22 @@ use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc};
 
 use crate::engine::{ClaimFilter, QueryEngine};
 use crate::intelligence::session::SessionContext;
+use crate::intelligence::synthesizer::{AskRequest, build_system_prompt};
 
 const MAX_TURNS: usize = 5;
 
-/// System prompt for the memory-assistant synthesis step.
-const SYNTHESIS_SYSTEM_PROMPT: &str = "\
-You are a precise personal memory assistant. \
-You are given retrieved memory notes and a question. \
-Answer the question using ONLY the information in the notes. \
-Rules: \
-(1) Be concise and specific — answer in 1-3 sentences max. \
-(2) TEMPORAL ORDERING: When the question asks which event happened FIRST or LAST, compare the \
-dates shown in [YYYY-MM-DD] or [X days ago] brackets. The earliest calendar date = happened first. \
-(3) DATE ARITHMETIC: For 'how many days/months between X and Y', compute the difference between \
-the dates shown in the notes. \
-(4) KNOWLEDGE UPDATES: If multiple claims contradict each other, the claim with the HIGHER \
-confidence or MORE RECENT date is correct. Phrases like 'currently', 'now', 'updated' signal \
-the latest value. \
-(5) COUNTING: Count only the distinct items explicitly mentioned in the notes. \
-(6) PREFERENCES: Preference claims tagged [preference] are direct answers to 'what does X like/prefer'. \
-(7) If the answer is genuinely not in the notes, respond with exactly: \
-\"I don't have enough information to answer that.\"";
+// C1 unification (Task 4, plan 2026-05-09): the ReAct synthesis step
+// previously carried its own 7-rule SYNTHESIS_SYSTEM_PROMPT. That
+// string was deleted in this commit and the path now routes through
+// `synthesizer::build_system_prompt(AskRequest::default_chat())` —
+// which returns the v0.9.0 LongMemEval-91.2 % `MEMORY_SYSTEM_PROMPT`
+// (6 detailed strategy blocks, the prompt that actually scored on
+// the bench). This was the audit's Priority-1 finding: hardest
+// queries (Agentic / temporal / multi-hop) were routed to the
+// weakest prompt; post-Task-4 they get the strongest one.
+//
+// Pre-condition is pinned by `synthesizer::prompt_contract_tests::
+// react_path_via_memory_persona_preserves_byte_identity_under_layering`.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -496,7 +491,14 @@ impl<'q> ReActEngine<'q> {
             let user_msg =
                 format!("## Retrieved Memory Notes\n\n{notes_block}\n\n## Question\n\n{query}");
 
-            match llm.chat(SYNTHESIS_SYSTEM_PROMPT, &user_msg).await {
+            // C1 (Task 4): use the unified MEMORY_SYSTEM_PROMPT via
+            // build_system_prompt + default_chat() so the ReAct path
+            // shares the LongMemEval-91.2 % prompt with every other
+            // memory caller. The byte-identity contract is pinned by
+            // `react_path_via_memory_persona_preserves_byte_identity_under_layering`.
+            let system_prompt = build_system_prompt(AskRequest::default_chat());
+
+            match llm.chat(system_prompt, &user_msg).await {
                 Ok(answer) => {
                     return ReActResult {
                         answer,

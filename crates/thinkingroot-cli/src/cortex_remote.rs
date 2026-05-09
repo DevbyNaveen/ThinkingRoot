@@ -356,11 +356,12 @@ async fn decode_envelope(resp: reqwest::Response) -> anyhow::Result<serde_json::
 /// fires the engine's `CancellationToken`, and the pipeline exits at
 /// the next phase boundary with `Error::Cancelled`.
 ///
-/// Progress events are streamed back as JSON-encoded
-/// `ProgressEvent`s; the CLI prints a one-line summary per phase
-/// (matching the in-process `progress::run_compile_progress` UX
-/// closely enough that scripts grepping the output see no
-/// difference).
+/// Each `progress` SSE event carries a JSON-encoded `ProgressEvent`
+/// from `thinkingroot-serve::pipeline`. We deserialize each one back
+/// into the typed enum and feed it into the same `progress::drive_progress_bars`
+/// renderer the in-process path uses — so both surfaces show identical
+/// 10-phase indicatif bars with ETA, instead of the CLI silently
+/// dropping every event.
 pub async fn run_compile_remote(
     conn: &EngineConnection,
     path: &Path,
@@ -368,6 +369,9 @@ pub async fn run_compile_remote(
     no_rooting: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    use crate::pipeline::{PipelineResult, ProgressEvent};
+    use indicatif::MultiProgress;
+
     let url = format!("{}/api/v1/ws/_/compile/stream", base_url(conn)?);
     let body = serde_json::json!({
         "root_path": path.display().to_string(),
@@ -400,120 +404,138 @@ pub async fn run_compile_remote(
         );
     }
 
+    // Spin up the same indicatif renderer the in-process path uses.
+    // The driver task drains the channel until tx is dropped, then
+    // finalizes any unfinished bars.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+    let mp = MultiProgress::new();
+    let driver_handle = tokio::task::spawn(crate::progress::drive_progress_bars(rx, mp));
+
     let mut stream = resp.bytes_stream().eventsource();
-    let mut last_phase = String::new();
-    let mut final_summary: Option<serde_json::Value> = None;
-    let mut captured_summary: Option<thinkingroot_core::IncrementalSummary> = None;
+    let mut final_result: Option<PipelineResult> = None;
+    let mut error_msg: Option<String> = None;
+    let mut cancelled = false;
 
     let consume = async {
         while let Some(event) = stream.next().await {
             let event = event.context("SSE stream error")?;
-            // Each `data:` line in the SSE wire format carries one
-            // serialised ProgressEvent; the wire shape is
-            // tag-on-`kind`, snake_case, per the v3 invariants in
-            // CLAUDE.md.
-            let payload: serde_json::Value = match serde_json::from_str(&event.data) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, raw = %event.data, "unparsable progress event");
-                    continue;
-                }
-            };
-            let kind = payload
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            match kind {
-                "phase_started" => {
-                    let phase = payload
-                        .get("phase")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    if phase != last_phase {
-                        println!("  {} {}", style("→").cyan(), style(&phase).white().bold());
-                        last_phase = phase;
-                    }
-                }
-                "incremental_done" => {
-                    if let Some(summary_value) = payload.get("summary") {
-                        match serde_json::from_value::<thinkingroot_core::IncrementalSummary>(
-                            summary_value.clone(),
-                        ) {
-                            Ok(summary) => captured_summary = Some(summary),
-                            Err(e) => tracing::warn!(
+            match event.event.as_str() {
+                "progress" => {
+                    // Typed deserialize — adding a new ProgressEvent
+                    // variant in pipeline.rs means the bar renderer
+                    // either handles it (no-op fine) or compile-errors
+                    // there. Either way, no silent drop.
+                    match serde_json::from_str::<ProgressEvent>(&event.data) {
+                        Ok(pe) => {
+                            // Forward into the renderer. Send error
+                            // means the driver task panicked; treat as
+                            // fatal because the user is now blind to
+                            // progress.
+                            if tx.send(pe).is_err() {
+                                anyhow::bail!("progress renderer task ended unexpectedly");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
                                 error = %e,
-                                raw = %summary_value,
-                                "failed to deserialize IncrementalSummary from incremental_done event — daemon/CLI version mismatch?"
-                            ),
+                                raw = %event.data,
+                                "unparsable ProgressEvent from daemon — daemon/CLI version mismatch?"
+                            );
                         }
                     }
                 }
-                "completed" | "result" | "done" => {
-                    final_summary = Some(payload);
+                "done" => {
+                    match serde_json::from_str::<PipelineResult>(&event.data) {
+                        Ok(pr) => final_result = Some(pr),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                raw = %event.data,
+                                "unparsable PipelineResult from daemon `done` event"
+                            );
+                        }
+                    }
+                    break;
                 }
-                "error" | "failed" => {
-                    let msg = payload
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("daemon emitted error event with no message");
-                    anyhow::bail!("daemon compile failed: {msg}");
+                "failed" => {
+                    error_msg = Some(extract_error_message(&event.data));
+                    break;
                 }
                 "cancelled" => {
-                    anyhow::bail!("daemon compile cancelled");
+                    cancelled = true;
+                    break;
                 }
-                _ => { /* unknown — preserve forward-compat by ignoring */ }
+                _ => { /* unknown SSE event-type — forward-compat ignore */ }
             }
         }
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::select! {
+    let consume_result = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
-            // Drop the request future so the body stream tears
-            // down. The daemon's DropGuard sees the disconnect and
-            // cancels the pipeline.
+            // Dropping tx + the stream tears down the body. The
+            // daemon's DropGuard sees the disconnect and cancels the
+            // pipeline. We still await the driver so the indicatif
+            // teardown writes its final bytes before we return.
+            drop(tx);
+            let _ = driver_handle.await;
             anyhow::bail!("compile cancelled by user (Ctrl-C)");
         }
-        result = consume => {
-            result?;
-        }
+        result = consume => result,
+    };
+
+    // Close the channel so the bar driver finalizes any in-flight bars
+    // (skipped/failed visual depending on whether we saw a `failed`).
+    drop(tx);
+    let _ = driver_handle.await;
+    eprintln!();
+
+    consume_result?;
+
+    if let Some(msg) = error_msg {
+        anyhow::bail!("daemon compile failed: {msg}");
+    }
+    if cancelled {
+        anyhow::bail!("daemon compile cancelled");
     }
 
-    if let Some(summary) = final_summary {
-        let files = summary.get("files_parsed").and_then(|v| v.as_u64()).unwrap_or(0);
-        let claims = summary.get("claims_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let entities = summary.get("entities_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let relations = summary.get("relations_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let health = summary.get("health_score").and_then(|v| v.as_u64()).unwrap_or(0);
+    if let Some(result) = final_result {
+        // Headline summary — same shape as the in-process path's
+        // post-bar print so script greppers see identical output.
         println!();
         println!(
             "  {} compiled {} files",
             style("ThinkingRoot").green().bold(),
-            style(files).white().bold()
+            style(result.files_parsed).white().bold()
         );
         println!(
             "  {} {}%",
             style("Knowledge Health:").white().bold(),
-            style(health).green().bold()
+            style(result.health_score).green().bold()
         );
         println!(
             "  {} {} claims  {} entities  {} relations",
             style("  ├──").dim(),
-            style(claims).cyan(),
-            style(entities).cyan(),
-            style(relations).cyan()
+            style(result.claims_count).cyan(),
+            style(result.entities_count).cyan(),
+            style(result.relations_count).cyan()
         );
+        if result.failed_batches > 0 {
+            println!(
+                "  {} {} LLM batches failed — knowledge graph is partial",
+                style("  ⚠").yellow().bold(),
+                style(result.failed_batches).yellow().bold()
+            );
+        }
         println!();
-    }
 
-    if let Some(summary) = captured_summary {
+        // Structured incremental delta — same renderer the in-process
+        // path uses, so JSON / human output is byte-identical.
         if json {
-            println!("{}", serde_json::to_string(&summary)?);
+            println!("{}", serde_json::to_string(&result.incremental_summary)?);
         } else {
-            crate::summary_printer::print(&summary, false);
+            crate::summary_printer::print(&result.incremental_summary, false);
         }
     }
 

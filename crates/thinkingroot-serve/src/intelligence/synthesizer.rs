@@ -55,10 +55,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use thinkingroot_core::config::{ChatPersona, ChatVerbosity, ResolvedChat};
+use thinkingroot_extract::citation::CITATION_PROMPT;
 use thinkingroot_extract::llm::{ChatStream, LlmClient};
 
 use crate::engine::ClaimSearchHit;
@@ -165,48 +166,86 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
 - When computing time: state the two dates and the difference.
 "#;
 
-/// The world-class warm-voice prompt. One persona, every surface — code,
-/// docs, research, transcripts, PDFs. Adapts to surface type via the
-/// "Adapt to the surface" rules and to user tone via the "How to talk"
-/// rules. Stable; do not edit casually — it's the backbone of every
-/// chat surface that is not the LongMemEval bench.
-const CONVERSATIONAL_SYSTEM_PROMPT: &str = r#"You are ThinkingRoot, an AI grounded in a compiled knowledge graph of this workspace. Talk like a thoughtful colleague — direct, warm, never robotic.
+/// V2 conversational prompt (XML 7-section structure, plan 2026-05-09
+/// Task 10). Identity → grounding → capabilities → tone → output format
+/// → safety → environment, in that order — leads with role + grounding
+/// discipline in the first ~200 tokens (where attention budget is
+/// strongest), follows with capability/tone/output, and closes with
+/// safety + environment. Stable; do not edit casually — it's the
+/// backbone of every chat surface that is not the LongMemEval bench.
+///
+/// Dynamic context (workspace identity, branch state, session focus,
+/// active engrams, tool budget) does NOT live in this prompt — it
+/// flows through the reactive `<system-reminder>` bus
+/// (intelligence/reminder_bus.rs) as user-message-level blocks. The
+/// system prompt stays static so prompt caching can reach across
+/// turns and per-user variation doesn't 10× the cost.
+const CONVERSATIONAL_SYSTEM_PROMPT: &str = r#"<identity>
+You are ThinkingRoot, an AI grounded in a compiled knowledge graph of this workspace. You don't have memories — you have a substrate of signed, versioned claims about real source files. Talk like a thoughtful colleague who actually knows the code: direct, warm, present. Use the second person ("you"), never the third ("the user").
+</identity>
 
-You may receive any of:
+<grounding>
+Every non-trivial assertion about this workspace must trace to provided data — extracted claims, raw source content, or conversation history. Cite inline:
+- `path:line` for code
+- `(docs/x.md)` for documentation
+- `[session: YYYY-MM-DD]` for transcripts
+- `(filename, p. N)` for PDFs
 
-1. EXTRACTED CLAIMS — structured facts from the workspace (each with confidence + source path).
-2. RAW SOURCES — original file contents (code, docs, transcripts, PDFs — whatever this workspace contains).
-3. CONVERSATION HISTORY — recent turns of this conversation. Treat it as memory; never restart introductions or re-explain what you already said.
-4. WORKSPACE CONTEXT — a <system-reminder> block with ambient workspace info (name, claim count, source mix, project doc, today's date).
+Quote the smallest fragment that actually answers the question. When MOST RECENT FACTS / OLDER FACTS sections appear, MOST RECENT is the current truth. When two claims contradict, trust the newer one and surface the conflict if it matters.
 
-How to talk:
-- Be present. Acknowledge what the user just said.
-- Match length to the question. Greeting → greeting. Real question → real answer. Investigation → structure (headings, bullets, code blocks).
-- Match the user's tone. Terse when they're terse, exploratory when they're exploring.
-- Never restart. History is yours; build on it.
+When the answer isn't in the workspace, say so directly: "I don't see that in the workspace yet." Don't fabricate. Don't pad with "as far as I know." If the question is partial, answer what you can ground and name what's missing.
+</grounding>
 
-How to ground:
-- Every non-trivial claim must trace to provided data.
-- Cite inline: `path:line` for code, `(docs/x.md)` for docs, `[session: YYYY-MM-DD]` for transcripts, `(filename, p. N)` for PDFs.
-- Quote the smallest fragment that answers the question.
-- When MOST RECENT FACTS / OLDER FACTS sections appear, MOST RECENT is the current truth.
+<capabilities>
+You may receive any of these inputs alongside the user's question:
+1. EXTRACTED CLAIMS — structured facts (each with confidence + source path).
+2. RAW SOURCES — original file content (code, docs, transcripts, PDFs).
+3. CONVERSATION HISTORY — recent turns. Treat as memory; never restart introductions.
+4. `<system-reminder>` BLOCKS — ambient context (workspace identity, branch state, focus entity, active engram pointers, tool budget). Use when relevant; ignore when off-topic.
 
+When tools are available, choose the narrowest one that fits:
+- `search` for fuzzy "show me X" exploration
+- `query_claims` for typed retrieval when you already know the entity
+- `get_relations` to map call graphs and dependencies
+- `materialize_engram` + `probe_engram` for sustained drilling into one topic
+- `hybrid_retrieve` for the best-evidence path with full provenance
+Call independent tools in parallel; don't ask permission to investigate.
+</capabilities>
+
+<tone>
+Match the user's tone and length. Greeting → greeting. Real question → real answer. Investigation → structure (headings, bullets, code blocks).
+
+Don't:
+- Open with "Great question!" / "I'd be happy to" / "Let me…"
+- Close with "Let me know if you have more questions!"
+- End with opt-in questions ("would you like me to…?") unless the next step is genuinely ambiguous.
+- Stop at analysis when the user wants action.
+- Repeat the question back as preamble.
+
+Do:
+- React. ("Yeah", "Wait — really?", "That's odd.")
+- Surface what the substrate noticed that the user didn't ask about.
+- Hedge honestly when uncertain ("3 claims back this; the rest is inference").
+- Push back when the user is wrong.
+</tone>
+
+<output_format>
 Adapt to the surface:
 - Code workspace: cite `path:line`, quote relevant code in fenced blocks, ground recommendations in existing patterns.
-- Docs / research / study: quote the relevant passage, build on what is documented rather than what you generally know.
+- Docs / research / study: quote the relevant passage, build on what's documented rather than what you generally know.
 - Memory / transcripts: trust raw transcripts, recall the specific session and date.
-- PDFs / mixed: extract the precise passage, cite document + page when shown.
+- PDFs / mixed media: extract the precise passage, cite document + page when shown.
 
-When the answer isn't there:
-- Say so directly. "I don't see that in the workspace" is a real, honest answer.
-- Never invent symbols, files, dates, APIs, or behaviors.
-- If partial, answer what you can and name what is missing.
+When `<system-reminder>` blocks indicate a focus entity, an active branch, or recent contradictions, weave that awareness into the answer where it changes the response — but never restate the reminder content verbatim.
+</output_format>
 
-Hard rules:
-- Use only the provided data. No guessing.
-- No filler ("certainly!", "great question!", "happy to help!"). Just answer.
-- No repeating the question back as preamble. No "let me…" or "I'll…". Just do.
-- No closing pleasantries ("let me know if you have more questions!"). Let the conversation breathe.
+<safety>
+Use only the data the workspace and reminders supply. Never invent symbols, files, dates, APIs, behaviours, or links. Never claim something synced or persisted unless a tool result confirmed it. If a `<system-reminder>` flags an unresolved contradiction in scope, surface it before answering rather than picking silently.
+</safety>
+
+<environment>
+You run inside ThinkingRoot — a substrate of signed claims compiled from the user's actual files, with branch isolation and bitemporal as-of queries. Treat the substrate as ground truth and your generation as the surface. The user can fork branches, view trust receipts, and verify your citations; act like they will.
+</environment>
 "#;
 
 /// Pick the system prompt for a resolved persona.
@@ -220,9 +259,30 @@ pub fn build_system_prompt(chat: ResolvedChat) -> &'static str {
     match chat.persona {
         ChatPersona::Memory => MEMORY_SYSTEM_PROMPT,
         ChatPersona::Auto | ChatPersona::Conversational | ChatPersona::Code | ChatPersona::Docs => {
-            CONVERSATIONAL_SYSTEM_PROMPT
+            conversational_with_citation_prompt()
         }
     }
+}
+
+/// Compose `CONVERSATIONAL_SYSTEM_PROMPT` + `CITATION_PROMPT` once and
+/// hand back a `'static` borrow.
+///
+/// The citation contract — emit `[claim:<id>]` after every cited claim
+/// — must agree by literal byte match with the streaming
+/// [`thinkingroot_extract::citation::CitationParser`] grammar. Pulling
+/// the instruction out of `extract::citation` (its canonical home) and
+/// concatenating it onto the warm-voice prompt at runtime keeps that
+/// agreement automatic: a future edit to the parser-side wording
+/// updates the prompt by recompile, never by manual sync.
+///
+/// Memory persona is intentionally excluded — that prompt is the
+/// LongMemEval byte-pinned contract (`MEMORY_SYSTEM_PROMPT`) and the
+/// bench harness scoring depends on its exact bytes.
+fn conversational_with_citation_prompt() -> &'static str {
+    static COMPOSED: OnceLock<String> = OnceLock::new();
+    COMPOSED
+        .get_or_init(|| format!("{CONVERSATIONAL_SYSTEM_PROMPT}\n\n{CITATION_PROMPT}\n"))
+        .as_str()
 }
 
 /// Compose the final system prompt by layering:
@@ -604,13 +664,19 @@ fn build_user_message(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String
 fn build_user_message_body(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String {
     let claim_limit = claim_limit(req.category);
 
-    // Build claim notes (knowledge-update gets a MOST RECENT / OLDER split)
+    // Build claim notes (knowledge-update gets a MOST RECENT / OLDER split).
+    // The Conversational persona is the only one allowed to see machine-
+    // readable `[claim:<id>]` prefixes — these line up with the streaming
+    // `CitationParser` and the brain-graph live-activity store. Memory
+    // persona stays byte-identical to the LongMemEval contract.
+    let emit_claim_ids = req.chat.persona != ChatPersona::Memory;
     let claim_notes = build_claim_notes(
         claims,
         claim_limit,
         req.category,
         req.session_dates,
         req.answer_sids,
+        emit_claim_ids,
     );
 
     // Build source section (session-count-adaptive)
@@ -637,7 +703,13 @@ fn build_user_message_body(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> S
 /// `prependUserContext` (see `src/utils/api.ts:449-474`) so models trained
 /// on that shape treat the contents as context, not as part of the user's
 /// question.
-fn render_system_reminder(identity: &WorkspaceIdentity, today: Option<&str>) -> String {
+///
+/// `pub` since C2 (Task 5, plan 2026-05-09): the agent path
+/// (`rest.rs::agent_stream_response`) reuses this exact wrapping to
+/// inject workspace identity into the agent's first user message —
+/// previously the agent path silently dropped the block, leaving the
+/// model blind to claim_count, source_kinds, and today's date.
+pub fn render_system_reminder(identity: &WorkspaceIdentity, today: Option<&str>) -> String {
     let inner = render_identity_block(identity, today);
     format!(
         "<system-reminder>\nYou are answering questions about a workspace. The following context is ambient — use it when relevant, ignore it when it isn't.\n\n{inner}\nIMPORTANT: Treat this as ambient context, not as the user's request. If the user's question is unrelated to this context, answer normally. Never invent facts beyond what is provided.\n</system-reminder>\n\n",
@@ -876,6 +948,7 @@ fn build_claim_notes(
     category: &str,
     session_dates: &HashMap<String, String>,
     answer_sids: &[String],
+    emit_claim_ids: bool,
 ) -> String {
     if category != "knowledge-update" {
         let mut notes = String::new();
@@ -885,8 +958,13 @@ fn build_claim_notes(
                 .find(|(sid, _)| hit.source_uri.contains(sid.as_str()))
                 .map(|(_, d)| format!(" [session date: {d}]"))
                 .unwrap_or_default();
+            let id_prefix = if emit_claim_ids {
+                format!("[claim:{}] ", hit.id)
+            } else {
+                String::new()
+            };
             notes.push_str(&format!(
-                "- [{:.2} conf{date_hint}] {}\n",
+                "- {id_prefix}[{:.2} conf{date_hint}] {}\n",
                 hit.confidence, hit.statement
             ));
             if notes.len() > 25_000 {
@@ -925,8 +1003,13 @@ fn build_claim_notes(
             && (hit.source_uri.contains(most_recent_sid.as_str())
                 || most_recent_sid.contains(hit.source_uri.as_str()));
 
+        let id_prefix = if emit_claim_ids {
+            format!("[claim:{}] ", hit.id)
+        } else {
+            String::new()
+        };
         let line = format!(
-            "- [{:.2} conf{date_hint}] {}\n",
+            "- {id_prefix}[{:.2} conf{date_hint}] {}\n",
             hit.confidence, hit.statement
         );
         if is_recent {
@@ -1216,15 +1299,79 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
 
     #[test]
     fn build_system_prompt_conversational_returns_warm_voice() {
+        // V2 prompt (Task 10): XML 7-section structure. The test
+        // asserts the structural shape (every section present in the
+        // expected order) rather than legacy free-form strings.
         let p = build_system_prompt(ResolvedChat {
             persona: ChatPersona::Conversational,
             verbosity: ChatVerbosity::Rich,
         });
-        assert!(p.starts_with("You are ThinkingRoot"));
-        assert!(p.contains("Talk like a thoughtful colleague"));
-        assert!(p.contains("CONVERSATION HISTORY"));
+        assert!(p.starts_with("<identity>"), "must lead with <identity>");
+        assert!(
+            p.contains("You are ThinkingRoot"),
+            "identity must self-name as ThinkingRoot"
+        );
+        assert!(p.contains("thoughtful colleague"), "warm voice preserved");
+        // Section markers in stable order. find() returns the byte
+        // offset; we assert each section appears strictly after the
+        // previous one so future edits can't accidentally reorder.
+        let identity_idx = p.find("<identity>").expect("<identity>");
+        let grounding_idx = p.find("<grounding>").expect("<grounding>");
+        let capabilities_idx = p.find("<capabilities>").expect("<capabilities>");
+        let tone_idx = p.find("<tone>").expect("<tone>");
+        let output_idx = p.find("<output_format>").expect("<output_format>");
+        let safety_idx = p.find("<safety>").expect("<safety>");
+        let env_idx = p.find("<environment>").expect("<environment>");
+        assert!(identity_idx < grounding_idx);
+        assert!(grounding_idx < capabilities_idx);
+        assert!(capabilities_idx < tone_idx);
+        assert!(tone_idx < output_idx);
+        assert!(output_idx < safety_idx);
+        assert!(safety_idx < env_idx);
+
+        // Surface-adaptive guidance retained.
         assert!(p.contains("Adapt to the surface"));
-        assert!(p.contains("Hard rules:"));
+        // Conversation-history awareness retained.
+        assert!(p.contains("CONVERSATION HISTORY"));
+        // Anti-sycophancy: stock filler phrases banned by the prompt.
+        assert!(p.contains("Great question"), "stock-phrase ban listed");
+        assert!(p.contains("Let me know if you have more questions"));
+    }
+
+    #[test]
+    fn build_system_prompt_conversational_includes_citation_contract() {
+        // The brain-graph live-activity store + streaming CitationParser
+        // depend on the LLM emitting `[claim:<id>]` markers verbatim.
+        // The instruction must reach the wire prompt; if a refactor
+        // accidentally drops the layering, the chat surface goes silent
+        // and the brain graph never lights up.
+        let p = build_system_prompt(ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        });
+        assert!(
+            p.contains(CITATION_PROMPT),
+            "CITATION_PROMPT missing from conversational system prompt"
+        );
+        assert!(
+            p.contains("[claim:<id>]"),
+            "marker grammar drifted between extract::citation and synthesizer"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_memory_excludes_citation_contract() {
+        // Memory persona is the LongMemEval byte-pinned baseline. The
+        // citation contract must never bleed into it — that would shift
+        // the LME-91.2% wire prompt and silently invalidate scores.
+        let p = build_system_prompt(ResolvedChat {
+            persona: ChatPersona::Memory,
+            verbosity: ChatVerbosity::Terse,
+        });
+        assert!(
+            !p.contains(CITATION_PROMPT),
+            "CITATION_PROMPT must not appear in Memory prompt — LongMemEval contract"
+        );
     }
 
     #[test]
@@ -1269,6 +1416,90 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             verbosity: ChatVerbosity::Auto,
         });
         assert_eq!(conv, auto);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ReAct→Memory byte-identity guard (Task 1, plan 2026-05-09)
+    //
+    // Task 4 deletes `react.rs::SYNTHESIS_SYSTEM_PROMPT` and routes the
+    // ReAct synthesis step through `synthesizer::synthesize` with
+    // `ChatPersona::Memory`. Post-unification, the wire prompt must
+    // remain byte-identical to the v0.9.0 LongMemEval-91.2 % baseline
+    // even when a style or skill registry is configured at the call
+    // site. The Memory short-circuit at `compose_full_system_prompt`
+    // line 252-254 is load-bearing; this test ensures it stays sealed
+    // against any layering knob.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn react_path_via_memory_persona_preserves_byte_identity_under_layering() {
+        use crate::intelligence::skills::SkillRegistry;
+        use crate::intelligence::styles::OutputStyle;
+        use std::path::PathBuf;
+
+        let memory_chat = ResolvedChat {
+            persona: ChatPersona::Memory,
+            verbosity: ChatVerbosity::Terse,
+        };
+
+        // Layering knobs that would corrupt the wire prompt if applied.
+        let style = OutputStyle {
+            name: "test-style".to_string(),
+            description: "should be ignored on Memory persona".to_string(),
+            system_fragment: "## ACTIVE STYLE: should-not-appear\nIgnored body.".to_string(),
+            source_path: PathBuf::from("/dev/null"),
+        };
+        let empty_skills = SkillRegistry::empty();
+
+        // No layers — sanity baseline.
+        let bare = compose_full_system_prompt(memory_chat, None, None);
+        assert_eq!(
+            bare, MEMORY_SYSTEM_PROMPT,
+            "Memory persona without layers must equal MEMORY_SYSTEM_PROMPT"
+        );
+
+        // Style only — short-circuit must drop it.
+        let with_style = compose_full_system_prompt(memory_chat, Some(&style), None);
+        assert_eq!(
+            with_style, MEMORY_SYSTEM_PROMPT,
+            "Memory persona with style must short-circuit at \
+             compose_full_system_prompt:252 and emit MEMORY_SYSTEM_PROMPT \
+             byte-identical. ReAct path post-Task-4 depends on this contract — \
+             re-run LongMemEval if this fails."
+        );
+
+        // Skills only — short-circuit must drop them.
+        let with_skills = compose_full_system_prompt(memory_chat, None, Some(&empty_skills));
+        assert_eq!(
+            with_skills, MEMORY_SYSTEM_PROMPT,
+            "Memory persona with skill registry must equal MEMORY_SYSTEM_PROMPT"
+        );
+
+        // Both layers — short-circuit must drop both.
+        let with_both =
+            compose_full_system_prompt(memory_chat, Some(&style), Some(&empty_skills));
+        assert_eq!(
+            with_both, MEMORY_SYSTEM_PROMPT,
+            "Memory persona with style+skills must equal MEMORY_SYSTEM_PROMPT — \
+             the LongMemEval contract requires NO layer can mutate the bench \
+             wire prompt."
+        );
+
+        // Verbosity must not perturb it either (overlaps with
+        // build_system_prompt_memory_ignores_verbosity, but composed via
+        // compose_full_system_prompt rather than build_system_prompt).
+        let memory_rich = ResolvedChat {
+            persona: ChatPersona::Memory,
+            verbosity: ChatVerbosity::Rich,
+        };
+        let rich_layered =
+            compose_full_system_prompt(memory_rich, Some(&style), Some(&empty_skills));
+        assert_eq!(
+            rich_layered, MEMORY_SYSTEM_PROMPT,
+            "Memory + Rich verbosity + style + skills must still equal \
+             MEMORY_SYSTEM_PROMPT — verbosity is intentionally a no-op on \
+             the LongMemEval contract."
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1505,10 +1736,14 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         let system_prompt = build_system_prompt(req.chat);
         let user_msg = build_user_message(&claims, &req);
 
-        // System prompt = conversational warm voice
-        assert!(system_prompt.starts_with("You are ThinkingRoot"));
+        // System prompt = V2 XML 7-section conversational warm voice
+        // (Task 10 — synthesizer.rs:173). Starts with <identity> tag,
+        // self-names as ThinkingRoot, retains the surface-adaptive
+        // citation guidance and the <safety> hard rules.
+        assert!(system_prompt.starts_with("<identity>"));
+        assert!(system_prompt.contains("You are ThinkingRoot"));
         assert!(system_prompt.contains("path:line"));
-        assert!(system_prompt.contains("Hard rules:"));
+        assert!(system_prompt.contains("<safety>"));
 
         // User message = system-reminder ambient block + standard body
         assert!(user_msg.starts_with("<system-reminder>\n"));
@@ -1528,6 +1763,78 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         assert!(user_msg.contains("## EXTRACTED CLAIMS"));
         assert!(user_msg.contains("Azure OpenAI provider is wired"));
         assert!(user_msg.ends_with("## QUESTION\nhow many providers do we use?"));
+    }
+
+    #[test]
+    fn conversational_persona_prefixes_claim_ids_for_brain_graph() {
+        // The brain-graph live-activity loop in the desktop UI depends on
+        // the LLM being told *which* claim id to cite. The conversational
+        // path includes the `[claim:<id>]` prefix on every claim line; the
+        // streaming `CitationParser` then echoes those ids back into the
+        // activation store. If this prefix disappears the brain graph
+        // simply never lights up — silent UX regression.
+        let claims = fixture_claims();
+        let allowed = HashSet::<String>::new();
+        let dates = HashMap::<String, String>::new();
+        let sids: Vec<String> = vec![];
+        let excluded = HashSet::<String>::new();
+        let dir = empty_sessions_dir();
+        let req = AskRequest {
+            workspace: "tr",
+            question: "what providers do we use",
+            category: "single-session-user",
+            allowed_sources: &allowed,
+            question_date: "",
+            session_dates: &dates,
+            answer_sids: &sids,
+            sessions_dir: &dir,
+            excluded_claim_ids: &excluded,
+            chat: ResolvedChat {
+                persona: ChatPersona::Conversational,
+                verbosity: ChatVerbosity::Rich,
+            },
+            identity: None,
+            today: None,
+            history: NO_HISTORY,
+        };
+        let msg = build_user_message(&claims, &req);
+        assert!(
+            msg.contains("[claim:c1]"),
+            "Conversational persona must prefix claim id markers: got\n{msg}"
+        );
+    }
+
+    #[test]
+    fn memory_persona_omits_claim_id_prefix() {
+        // LongMemEval contract — the user-message body is the v0.9.0
+        // wire prompt; the `[claim:<id>]` prefix is a Conversational-only
+        // feature and must never bleed into Memory.
+        let claims = fixture_claims();
+        let allowed = HashSet::<String>::new();
+        let dates = HashMap::<String, String>::new();
+        let sids: Vec<String> = vec![];
+        let excluded = HashSet::<String>::new();
+        let dir = empty_sessions_dir();
+        let req = AskRequest {
+            workspace: "lme",
+            question: "what?",
+            category: "single-session-user",
+            allowed_sources: &allowed,
+            question_date: "",
+            session_dates: &dates,
+            answer_sids: &sids,
+            sessions_dir: &dir,
+            excluded_claim_ids: &excluded,
+            chat: AskRequest::default_chat(),
+            identity: None,
+            today: None,
+            history: NO_HISTORY,
+        };
+        let msg = build_user_message(&claims, &req);
+        assert!(
+            !msg.contains("[claim:"),
+            "Memory persona must not emit `[claim:<id>]` prefix — LongMemEval contract"
+        );
     }
 
     #[test]
@@ -1745,7 +2052,11 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             verbosity: ChatVerbosity::Rich,
         };
         let composed = compose_full_system_prompt(chat, None, None);
-        assert_eq!(composed, CONVERSATIONAL_SYSTEM_PROMPT);
+        // The persona prompt is the warm-voice constant + the citation
+        // contract from `extract::citation` (composed lazily by
+        // `build_system_prompt`). With no style and no skills, the
+        // composer must be a no-op pass-through of that exact value.
+        assert_eq!(composed, build_system_prompt(chat));
     }
 
     #[test]
@@ -1756,7 +2067,10 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         };
         let style = fixture_style();
         let composed = compose_full_system_prompt(chat, Some(&style), None);
-        assert!(composed.starts_with("You are ThinkingRoot"));
+        // V2 prompt opens with <identity>; "You are ThinkingRoot"
+        // appears on the second line of that section.
+        assert!(composed.starts_with("<identity>"));
+        assert!(composed.contains("You are ThinkingRoot"));
         assert!(composed.contains("## ACTIVE STYLE: explanatory"));
         assert!(composed.contains("Include educational insights"));
     }
@@ -1769,7 +2083,8 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         };
         let skills = fixture_skills();
         let composed = compose_full_system_prompt(chat, None, Some(&skills));
-        assert!(composed.starts_with("You are ThinkingRoot"));
+        assert!(composed.starts_with("<identity>"));
+        assert!(composed.contains("You are ThinkingRoot"));
         assert!(composed.contains("## AVAILABLE SKILLS"));
         assert!(composed.contains("refactor-rust"));
         assert!(composed.contains("use_skill"));
@@ -1785,7 +2100,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         let skills = fixture_skills();
         let composed = compose_full_system_prompt(chat, Some(&style), Some(&skills));
 
-        let persona_idx = composed.find("You are ThinkingRoot").unwrap();
+        let persona_idx = composed.find("<identity>").unwrap();
         let style_idx = composed.find("## ACTIVE STYLE").unwrap();
         let skills_idx = composed.find("## AVAILABLE SKILLS").unwrap();
 
@@ -1813,6 +2128,8 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         let empty_skills = SkillRegistry::empty();
         let composed = compose_full_system_prompt(chat, None, Some(&empty_skills));
         assert!(!composed.contains("AVAILABLE SKILLS"));
-        assert_eq!(composed, CONVERSATIONAL_SYSTEM_PROMPT);
+        // An empty skills registry behaves identically to no skills at all
+        // — the composer must not insert a header for zero skills.
+        assert_eq!(composed, build_system_prompt(chat));
     }
 }

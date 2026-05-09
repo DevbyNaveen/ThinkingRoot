@@ -132,6 +132,55 @@ pub enum ChatEvent {
         name: String,
         reason: String,
     },
+    /// Post-stream verifier verdict. Emitted exactly once per turn,
+    /// after `Final`, by the engine's `agent_stream_response`
+    /// (intelligence/verifier.rs). Carries the verdict shape the
+    /// trust-receipt UI renders — green / yellow / red / "no claim".
+    /// `kind` is one of: fully_grounded, partially_grounded,
+    /// unverified_citations, skipped_chitchat, skipped_rejection,
+    /// skipped_bench.
+    TrustReceipt {
+        turn_id: String,
+        kind: String,
+        claims_used: Vec<String>,
+        /// Present only for FullyGrounded.
+        auto_cited_count: Option<usize>,
+        /// Present only for PartiallyGrounded.
+        related_count: Option<usize>,
+        /// Present only for UnverifiedCitations — the claim_ids
+        /// the agent emitted that don't resolve in substrate.
+        bad_claim_ids: Option<Vec<String>>,
+    },
+    /// Per-turn engram activation — emitted by the engine when the
+    /// agent calls `materialize_engram` or `probe_engram`. Drives the
+    /// EngramTimeline scrubber on the chat surface's right rail.
+    /// `tool` is "materialize_engram" or "probe_engram"; the optional
+    /// fields are populated per tool. `ts_ms` is the wall-clock
+    /// millisecond at which the SSE relay observed the activation.
+    EngramActivated {
+        turn_id: String,
+        tool: String,
+        pointer: String,
+        ts_ms: i64,
+        /// Populated for materialize_engram. Best-effort summary
+        /// payload pulled from the tool result (shape owned by
+        /// `intelligence/engram.rs::EngramSummary`).
+        summary: Option<serde_json::Value>,
+        /// Populated for materialize_engram.
+        source_count: Option<u64>,
+        /// Populated for probe_engram.
+        answer_count: Option<u64>,
+    },
+    /// Reflection gaps surfaced by the agent's `gaps` MCP tool call.
+    /// Drives the inline gap cards in the chat surface — the
+    /// "by the way, X usually comes with Y" affordance.
+    /// Wire shape per gap mirrors `thinkingroot_reflect::types::GapReport`
+    /// so the engine's pre-baked English (`reason`) renders unchanged.
+    GapsSurfaced {
+        turn_id: String,
+        ts_ms: i64,
+        gaps: Vec<serde_json::Value>,
+    },
 }
 
 #[tauri::command]
@@ -142,9 +191,7 @@ pub async fn chat_send_stream(
     let state = app.state::<AppState>();
     let sidecar = state.sidecar.lock().await.clone();
     let Some(sidecar) = sidecar else {
-        return Err(
-            "agent runtime sidecar is not running — try restarting the app".to_string(),
-        );
+        return Err("agent runtime sidecar is not running — try restarting the app".to_string());
     };
 
     let turn_id = Uuid::new_v4().to_string();
@@ -244,6 +291,7 @@ async fn consume_ask_stream(
     let mut claims_used: usize = 0;
     let mut category = String::new();
     let mut emitted_any = false;
+    let mut saw_final = false;
 
     while let Some(item) = events.next().await {
         match item {
@@ -253,9 +301,7 @@ async fn consume_ask_stream(
             }
             Ok(ev) => match ev.event.as_str() {
                 "meta" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         claims_used = json
                             .get("claims_used")
                             .and_then(|v| v.as_u64())
@@ -266,14 +312,13 @@ async fn consume_ask_stream(
                     }
                 }
                 "token" => {
-                    let json: serde_json::Value =
-                        match serde_json::from_str(&ev.data) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                emit_error(&app, &turn_id, format!("decode token: {e}"));
-                                return;
-                            }
-                        };
+                    let json: serde_json::Value = match serde_json::from_str(&ev.data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_error(&app, &turn_id, format!("decode token: {e}"));
+                            return;
+                        }
+                    };
                     if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
                             if !emitted_any {
@@ -292,12 +337,8 @@ async fn consume_ask_stream(
                     }
                 }
                 "final" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
-                        if let Some(c) =
-                            json.get("claims_used").and_then(|v| v.as_u64())
-                        {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        if let Some(c) = json.get("claims_used").and_then(|v| v.as_u64()) {
                             claims_used = c as usize;
                         }
                         if let Some(c) = json.get("category").and_then(|v| v.as_str()) {
@@ -315,8 +356,12 @@ async fn consume_ask_stream(
                             conversation_id: conv.clone(),
                         },
                     );
-                    let _ = workspace;
-                    return;
+                    saw_final = true;
+                    // Don't return: the engine's agent_stream_response
+                    // emits a `trust_receipt` SSE event AFTER `final`
+                    // (intelligence/verifier.rs wiring). Keep the loop
+                    // running so the trust-receipt arrives at the UI
+                    // before the SSE stream closes.
                 }
                 "error" => {
                     let msg = serde_json::from_str::<serde_json::Value>(&ev.data)
@@ -331,9 +376,7 @@ async fn consume_ask_stream(
                     return;
                 }
                 "tool_call_proposed" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         let id = json
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -365,9 +408,7 @@ async fn consume_ask_stream(
                     }
                 }
                 "approval_requested" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         let id = json
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -394,9 +435,7 @@ async fn consume_ask_stream(
                     }
                 }
                 "tool_call_executing" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         let id = json
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -418,9 +457,7 @@ async fn consume_ask_stream(
                     }
                 }
                 "tool_call_finished" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         let id = json
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -453,9 +490,7 @@ async fn consume_ask_stream(
                     }
                 }
                 "tool_call_rejected" => {
-                    if let Ok(json) =
-                        serde_json::from_str::<serde_json::Value>(&ev.data)
-                    {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
                         let id = json
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -482,19 +517,120 @@ async fn consume_ask_stream(
                         );
                     }
                 }
+                "gaps_surfaced" => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        let ts_ms = json.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let gaps = json
+                            .get("gaps")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if !gaps.is_empty() {
+                            let _ = app.emit(
+                                "chat-event",
+                                ChatEvent::GapsSurfaced {
+                                    turn_id: turn_id.clone(),
+                                    ts_ms,
+                                    gaps,
+                                },
+                            );
+                        }
+                    }
+                }
+                "engram_activated" => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        let tool = json
+                            .get("tool")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let pointer = json
+                            .get("pointer")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let ts_ms = json.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let summary = json.get("summary").cloned();
+                        let source_count = json.get("source_count").and_then(|v| v.as_u64());
+                        let answer_count = json.get("answer_count").and_then(|v| v.as_u64());
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::EngramActivated {
+                                turn_id: turn_id.clone(),
+                                tool,
+                                pointer,
+                                ts_ms,
+                                summary,
+                                source_count,
+                                answer_count,
+                            },
+                        );
+                    }
+                }
+                "trust_receipt" => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        let kind = json
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let claims_used: Vec<String> = json
+                            .get("claims_used")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let auto_cited_count = json
+                            .get("auto_cited_count")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize);
+                        let related_count = json
+                            .get("related_count")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize);
+                        let bad_claim_ids = json.get("bad_claim_ids").and_then(|v| v.as_array()).map(
+                            |arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect::<Vec<String>>()
+                            },
+                        );
+                        let _ = app.emit(
+                            "chat-event",
+                            ChatEvent::TrustReceipt {
+                                turn_id: turn_id.clone(),
+                                kind,
+                                claims_used,
+                                auto_cited_count,
+                                related_count,
+                                bad_claim_ids,
+                            },
+                        );
+                    }
+                }
                 _ => { /* keep-alive comments / unknown events: ignore */ }
             },
         }
     }
 
-    // Stream ended without `final` — surface as error so the UI never
-    // gets stuck in "Generating…". Dropping silently is the failure
-    // mode the rewrite is meant to eliminate.
-    emit_error(
-        &app,
-        &turn_id,
-        "stream closed without final event".to_string(),
-    );
+    // Stream ended. If we never saw `final` the agent never finished
+    // — surface as error so the UI never gets stuck in "Generating…".
+    // Dropping silently is the failure mode the rewrite is meant to
+    // eliminate. When `final` did arrive, the trust-receipt
+    // follow-up was either delivered or genuinely absent (the engine
+    // skipped emission); either case is a clean stream close, no
+    // error needed.
+    let _ = workspace;
+    if !saw_final {
+        emit_error(
+            &app,
+            &turn_id,
+            "stream closed without final event".to_string(),
+        );
+    }
 }
 
 fn emit_error(app: &AppHandle, turn_id: &str, message: String) {
@@ -609,10 +745,7 @@ pub struct ChatApproveArgs {
 /// matching pending oneshot in `state.pending_approvals` and
 /// unblocks the agent's `ToolApprovalRouter::check`.
 #[tauri::command]
-pub async fn chat_approve(
-    app: AppHandle,
-    args: ChatApproveArgs,
-) -> Result<(), String> {
+pub async fn chat_approve(app: AppHandle, args: ChatApproveArgs) -> Result<(), String> {
     let state = app.state::<AppState>();
     let sidecar = state.sidecar.lock().await.clone();
     let Some(sidecar) = sidecar else {

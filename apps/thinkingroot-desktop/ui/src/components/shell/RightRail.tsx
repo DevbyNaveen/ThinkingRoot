@@ -6,6 +6,8 @@
  *   FolderTree → Files (project + .thinkingroot tree, preview, pack export)
  *   Cpu     → Brain     (BrainView in panel mode)
  *   GitBranch → Branches (BranchesView in panel mode)
+ *   Code2   → Builders  (workspace backend connect surface)
+ *   Globe2  → Browser   (manual web browser)
  *   ShieldCheck → Privacy (PrivacyDashboard in panel mode)
  *
  * The left edge has an invisible drag handle that lets the user
@@ -26,9 +28,12 @@ import {
   Loader2,
   Square,
   Cpu,
+  Code2,
   BookOpen,
   FolderTree,
   Package,
+  Globe2,
+  Terminal as TerminalIcon,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -40,6 +45,9 @@ import { BranchesView } from "@/components/branches/BranchesView";
 import { PrivacyDashboard } from "@/components/privacy/PrivacyDashboard";
 import { ReadmeView } from "@/components/readme/ReadmeView";
 import { WorkspaceFilesPanel } from "@/components/shell/WorkspaceFilesPanel";
+import { BrowserPanel } from "@/components/browser/BrowserPanel";
+import { TerminalPanel } from "@/components/terminal/TerminalPanel";
+import { BuildersPanel } from "@/components/builders/BuildersPanel";
 import {
   branchCheckout,
   branchList,
@@ -47,6 +55,7 @@ import {
   workspaceCompileStop,
   workspaceList,
   type BranchView,
+  type IncrementalSummary,
   type WorkspaceView,
 } from "@/lib/tauri";
 import {
@@ -63,12 +72,15 @@ const MAX_WIDTH = 800;
 const DEFAULT_WIDTH = 450;
 
 const TABS: { id: RightRailTab; Icon: React.ElementType; label: string }[] = [
-  { id: "compile", Icon: Hammer,       label: "Compile"  },
-  { id: "files",   Icon: FolderTree,   label: "Files"    },
-  { id: "brain",   Icon: Cpu,          label: "Brain"    },
-  { id: "readme",  Icon: BookOpen,     label: "Readme"   },
-  { id: "branches",Icon: GitBranch,    label: "Branches" },
-  { id: "privacy", Icon: ShieldCheck,  label: "Privacy"  },
+  { id: "compile",  Icon: Hammer,       label: "Compile"  },
+  { id: "files",    Icon: FolderTree,   label: "Files"    },
+  { id: "brain",    Icon: Cpu,          label: "Brain"    },
+  { id: "readme",   Icon: BookOpen,     label: "Readme"   },
+  { id: "branches", Icon: GitBranch,    label: "Branches" },
+  { id: "builders", Icon: Code2,        label: "Builders" },
+  { id: "browser",  Icon: Globe2,       label: "Browser"  },
+  { id: "terminal", Icon: TerminalIcon, label: "Terminal" },
+  { id: "privacy",  Icon: ShieldCheck,  label: "Privacy"  },
 ];
 
 export function RightRail() {
@@ -221,11 +233,37 @@ export function RightRail() {
             <BranchesView panelMode />
           </div>
         )}
+        {activeTab === "builders" && (
+          <BuildersPanel activeWorkspace={activeWorkspace} />
+        )}
         {activeTab === "privacy" && (
           <div className="flex-1 overflow-hidden">
             <PrivacyDashboard />
           </div>
         )}
+        {/* Browser is also permanently mounted while the rail is open
+            so native child WebViews can be hidden/shown cleanly and do
+            not get recreated on every tab switch. */}
+        <div
+          className={cn(
+            "min-h-0 flex-1 overflow-hidden",
+            activeTab === "browser" ? "flex flex-col" : "hidden",
+          )}
+        >
+          <BrowserPanel isActive={activeTab === "browser"} />
+        </div>
+        {/* Terminal stays mounted across rail-tab switches so xterm
+            scrollback and the live shell process survive when the
+            user pops over to Compile / Brain. Only its visibility
+            toggles. */}
+        <div
+          className={cn(
+            "min-h-0 flex-1 overflow-hidden",
+            activeTab === "terminal" ? "flex flex-col" : "hidden",
+          )}
+        >
+          <TerminalPanel isActive={activeTab === "terminal"} />
+        </div>
       </div>
     </aside>
   );
@@ -496,9 +534,109 @@ function BranchPanel({ workspace }: { workspace: string }) {
   );
 }
 
+/**
+ * Group an individual `phase` discriminator into the umbrella phase
+ * that owns it. Used for ETA bookkeeping: every event in a phase
+ * shares one start clock so the ETA reflects elapsed work time, not
+ * the gap between two events.
+ */
+function compilePhaseGroup(phase: string): string {
+  if (phase.startsWith("extraction") || phase === "parse_complete") return "extract";
+  if (phase.startsWith("grounding")) return "ground";
+  if (phase.startsWith("rooting")) return "root";
+  if (phase.startsWith("linking")) return "link";
+  if (phase.startsWith("vector")) return "index";
+  if (phase.startsWith("compilation")) return "compile";
+  if (phase.startsWith("diff")) return "diff";
+  return phase;
+}
+
+function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m${s.toString().padStart(2, "0")}s`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const k = 1024;
+  if (n < k * k) return `${(n / k).toFixed(2)} KiB`;
+  if (n < k * k * k) return `${(n / (k * k)).toFixed(2)} MiB`;
+  return `${(n / (k * k * k)).toFixed(2)} GiB`;
+}
+
 function CompilationProgressIndicator() {
   const progress = useApp((s) => s.compileProgress);
   const [stopping, setStopping] = useState(false);
+  /** Same done/total for a long time while extracting — usually one slow LLM batch, not a frozen UI. */
+  const [extractionStalled, setExtractionStalled] = useState(false);
+  const extractionSigRef = useRef<string>("");
+  const extractionChangeAtRef = useRef<number>(0);
+  /**
+   * Per-group phase start clock for ETA computation. Reset whenever
+   * `compilePhaseGroup(progress.phase)` changes — every new umbrella
+   * phase gets a fresh wall clock so the rate calculation reflects
+   * the work of that phase only.
+   */
+  const phaseGroupRef = useRef<string>("");
+  const phaseStartedAtRef = useRef<number>(0);
+  /** Kept-alive ETA string for the currently-running phase. */
+  const [eta, setEta] = useState<string>("");
+
+  useEffect(() => {
+    if (!progress || progress.phase !== "extraction_progress") {
+      setExtractionStalled(false);
+      return;
+    }
+    const sig = `${progress.done}/${progress.total}`;
+    const now = Date.now();
+    if (sig !== extractionSigRef.current) {
+      extractionSigRef.current = sig;
+      extractionChangeAtRef.current = now;
+      setExtractionStalled(false);
+    }
+    const tick = window.setInterval(() => {
+      if (Date.now() - extractionChangeAtRef.current > 75_000) {
+        setExtractionStalled(true);
+      }
+    }, 4000);
+    return () => window.clearInterval(tick);
+  }, [progress]);
+
+  // Track per-phase start time; recompute ETA whenever a counted-progress
+  // event arrives. Done/failed/cancelled clear the ETA so a stale value
+  // doesn't bleed into the terminal UI.
+  useEffect(() => {
+    if (!progress) {
+      setEta("");
+      phaseGroupRef.current = "";
+      return;
+    }
+    if (progress.phase === "done" || progress.phase === "failed" || progress.phase === "cancelled") {
+      setEta("");
+      return;
+    }
+    const group = compilePhaseGroup(progress.phase);
+    if (group !== phaseGroupRef.current) {
+      phaseGroupRef.current = group;
+      phaseStartedAtRef.current = Date.now();
+      setEta("");
+      return;
+    }
+    // Compute ETA only for events that carry done/total — every other
+    // phase already telegraphs progress via its own message line.
+    if ("done" in progress && "total" in progress && typeof progress.done === "number" && typeof progress.total === "number" && progress.total > 0 && progress.done > 0) {
+      const elapsedSec = (Date.now() - phaseStartedAtRef.current) / 1000;
+      if (elapsedSec >= 1) {
+        const rate = progress.done / elapsedSec;
+        const remaining = (progress.total - progress.done) / rate;
+        setEta(formatEta(remaining));
+      }
+    }
+  }, [progress]);
+
   if (!progress) return null;
 
   async function handleStop() {
@@ -535,10 +673,15 @@ function CompilationProgressIndicator() {
     case "parse_complete":
       title = "Parsing source files"; details = `Parsed ${progress.files} files`; percent = 15; break;
     case "extraction_start":
-      title = "Extracting claims"; details = `Starting ${progress.total_batches} batches`; percent = 20; break;
+      title = "Extracting claims";
+      details = `Starting ${progress.total_batches} batches · ${progress.total_chunks} chunks total (count jumps when each batch finishes)`;
+      percent = 20;
+      break;
     case "extraction_progress":
-      title = "Extracting claims"; details = `${progress.done} / ${progress.total} chunks`;
-      percent = 20 + Math.floor((progress.done / Math.max(1, progress.total)) * 30); break;
+      title = "Extracting claims";
+      details = `${progress.done} / ${progress.total} chunks · can sit on one number while a batch runs`;
+      percent = 20 + Math.floor((progress.done / Math.max(1, progress.total)) * 30);
+      break;
     case "extraction_complete":
       title = "Extraction complete"; details = `${progress.claims} claims, ${progress.entities} entities`; percent = 50; break;
     case "extraction_partial":
@@ -603,7 +746,9 @@ function CompilationProgressIndicator() {
         <h3 className="font-medium tracking-tight text-foreground">{title}</h3>
         {!isDone && !isError && !isCancelled && (
           <>
-            <span className="ml-auto font-mono text-[9px] font-medium text-accent">{percent}%</span>
+            <span className="ml-auto font-mono text-[9px] font-medium text-accent">
+              {eta ? `${percent}% · ETA ${eta}` : `${percent}%`}
+            </span>
             <Button
               variant="ghost"
               size="icon"
@@ -634,10 +779,75 @@ function CompilationProgressIndicator() {
             style={{ width: `${percent}%` }}
           />
         </div>
-        <p className="mt-0.5 truncate text-[10px] text-muted-foreground" title={details}>
+        <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground" title={details}>
           {details}
         </p>
+        {progress.phase === "extraction_progress" && extractionStalled && !isDone && !isError && !isCancelled && (
+          <p className="text-[10px] leading-snug text-amber-200/90">
+            Over 75s on this count — likely a slow or stuck LLM call. Stop (■) aborts the run; check Settings → Credentials and provider
+            limits.
+          </p>
+        )}
+        {progress.phase === "done" && progress.failed_batches !== undefined && progress.failed_batches > 0 && (
+          <p className="text-[10px] leading-snug text-amber-200/90">
+            ⚠ {progress.failed_batches} LLM batches failed permanently — knowledge graph is partial.
+          </p>
+        )}
+        {progress.phase === "done" && progress.incremental_summary && (
+          <CompileSummaryPanel summary={progress.incremental_summary} />
+        )}
       </div>
     </section>
+  );
+}
+
+/**
+ * Per-phase timing breakdown rendered after a successful compile.
+ *
+ * Mirrors the CLI `summary_printer` output (canonical PHASE_NAMES order)
+ * so the user sees the same data on both surfaces. Only phases with
+ * non-zero elapsed are shown — a fingerprint-cutoff steady-state run
+ * legitimately has only `diff` and `audit` populated.
+ */
+const PHASE_DISPLAY_ORDER = [
+  "diff",
+  "extract",
+  "ground",
+  "fingerprint",
+  "remove_sources",
+  "entity_relations",
+  "link",
+  "structural_persist",
+  "audit",
+  "other",
+];
+
+function CompileSummaryPanel({ summary }: { summary: IncrementalSummary }) {
+  const orderedPhases = PHASE_DISPLAY_ORDER.filter(
+    (name) => (summary.phase_timings[name] ?? 0) > 0,
+  );
+  const totalSec = (summary.total_elapsed_ms / 1000).toFixed(1);
+  return (
+    <div className="mt-1.5 flex flex-col gap-1 rounded-md border border-border/40 bg-muted/20 p-2">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+        <span className="font-mono text-foreground">{totalSec}s</span>
+        <span>· {summary.sources_truly_changed}/{summary.sources_total} sources</span>
+        <span>· +{summary.claims_added} −{summary.claims_deleted} claims</span>
+        {summary.llm_calls > 0 && <span>· {summary.llm_calls} LLM calls</span>}
+        {summary.cache_hits > 0 && <span>· {summary.cache_hits} cache hits</span>}
+        {summary.bytes_re_extracted > 0 && (
+          <span>· {formatBytes(summary.bytes_re_extracted)} re-extracted</span>
+        )}
+      </div>
+      {orderedPhases.length > 0 && (
+        <div className="flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[9px] text-muted-foreground/80">
+          {orderedPhases.map((name) => (
+            <span key={name}>
+              {name} <span className="text-foreground">{(summary.phase_timings[name] ?? 0)}ms</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

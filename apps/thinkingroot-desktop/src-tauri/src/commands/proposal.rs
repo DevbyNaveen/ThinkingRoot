@@ -33,7 +33,11 @@ pub struct ProposalView {
 
 fn proposal_view(v: &Value) -> ProposalView {
     ProposalView {
-        id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        id: v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         source_branch: v
             .get("source_branch")
             .and_then(|x| x.as_str())
@@ -53,15 +57,9 @@ fn proposal_view(v: &Value) -> ProposalView {
 }
 
 #[tauri::command]
-pub async fn proposal_open(
-    app: AppHandle,
-    args: ProposalOpenArgs,
-) -> Result<ProposalView, String> {
+pub async fn proposal_open(app: AppHandle, args: ProposalOpenArgs) -> Result<ProposalView, String> {
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
-    let path = format!(
-        "/api/v1/branches/{}/proposals",
-        urlencode(&args.branch)
-    );
+    let path = format!("/api/v1/branches/{}/proposals", urlencode(&args.branch));
     let body = serde_json::json!({
         "target": args.target,
         "description": args.description,
@@ -104,10 +102,7 @@ pub struct ProposalReviewArgs {
 }
 
 #[tauri::command]
-pub async fn proposal_review(
-    app: AppHandle,
-    args: ProposalReviewArgs,
-) -> Result<(), String> {
+pub async fn proposal_review(app: AppHandle, args: ProposalReviewArgs) -> Result<(), String> {
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let path = format!("/api/v1/proposals/{}/reviews", urlencode(&args.id));
     let body = serde_json::json!({
@@ -129,9 +124,7 @@ pub async fn proposal_close(app: AppHandle, id: String) -> Result<(), String> {
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));

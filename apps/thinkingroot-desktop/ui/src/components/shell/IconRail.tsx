@@ -104,7 +104,7 @@ function RailButton({
           aria-current={active ? "page" : undefined}
           className={cn(
             "window-no-drag relative flex h-9 w-9 items-center justify-center rounded-md transition-colors",
-            "hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            "hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50 focus-visible:ring-offset-0",
             active ? "text-accent" : "text-muted-foreground",
           )}
         >

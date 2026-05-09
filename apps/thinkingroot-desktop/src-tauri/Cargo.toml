@@ -33,7 +33,7 @@ tauri-build = { version = "2", features = [] }
 # Tauri stack — desktop-side plugins only. Sinks that were
 # helloroot-internal are out of scope here; the agent-runtime
 # sidecar (Step 10) takes over chat / agent orchestration.
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
@@ -79,3 +79,11 @@ eventsource-stream = "0.2"
 futures = "0.3"
 # UUIDs for conversation + message ids.
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Embedded terminal — PTY-backed shell sessions surfaced through the
+# right-rail Terminal panel. `portable-pty` is the wezterm-team's
+# cross-platform PTY abstraction (ConPTY on Windows, openpty on
+# macOS/Linux); `base64` keeps binary PTY chunks safe across the
+# Tauri IPC JSON boundary.
+portable-pty = "0.9"
+base64 = "0.22"

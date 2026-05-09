@@ -6519,6 +6519,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tower-http",
+ "tr-sigstore",
  "tracing",
  "uuid",
 ]

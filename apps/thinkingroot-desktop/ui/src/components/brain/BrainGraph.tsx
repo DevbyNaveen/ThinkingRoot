@@ -13,6 +13,7 @@ import { select } from "d3-selection";
 import { motion } from "framer-motion";
 import type { BrainEntity, BrainRelation, ClaimRow } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import { useBrainActivation, type ActivationKind } from "@/store/brain";
 
 interface Node extends SimulationNodeDatum {
   id: string;
@@ -42,6 +43,24 @@ function getSemanticColor(type: string): string {
   if (t === "requirement") return "hsl(340, 70%, 65%)"; // Pink
   if (t === "inferred") return "rgba(140, 140, 140, 0.4)"; // Muted silver
   return "rgba(200, 200, 200, 0.8)"; // Default silver
+}
+
+// Per-`ActivationKind` halo hue. Mirrors the CSS keyframes in
+// `globals.css` (`.brain-pulse-cited` etc.) so a node halo on the
+// canvas reads as the same event as a citation chip rendered via
+// the matching CSS class. Stable across alpha — opacity is driven by
+// the live activation intensity, not by the colour itself.
+function activationHue(kind: ActivationKind): { r: number; g: number; b: number } {
+  // sky blue / emerald / purple — matches the CSS palette, expressed
+  // as RGB so the canvas can blend opacity per intensity.
+  switch (kind) {
+    case "cited":
+      return { r: 100, g: 200, b: 255 }; // sky blue
+    case "retrieved":
+      return { r: 100, g: 220, b: 160 }; // emerald
+    case "cascade":
+      return { r: 200, g: 140, b: 255 }; // purple
+  }
 }
 
 // Lower index = higher priority — same ordering as the pre-rewrite
@@ -97,6 +116,18 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
   const isolatedRef = useRef<string | null>(null);
   const searchQueryRef = useRef<string | undefined>(undefined);
   const drawRef = useRef<(() => void) | null>(null);
+
+  // Brain-graph live activity — same refs-not-state posture as
+  // hovered/isolated. The activation store is keyed by `claim_id`;
+  // BrainGraph derives the per-node halo at draw time using the
+  // claim → entity-names resolver built in the data useMemo above.
+  // Zustand `subscribe` is what keeps the canvas alive across store
+  // updates without re-rendering the whole 5K-node component.
+  const activationsRef = useRef<Record<string, { intensity: number; kind: ActivationKind }>>({});
+  // Initialised empty; the resolver-mirror effect below pushes the
+  // useMemo result in on mount and on every `claims`/`entities` change.
+  const claimToEntitiesRef = useRef<Map<string, string[]>>(new Map());
+  const decayRafRef = useRef<number | null>(null);
   const setHovered = (id: string | null) => {
     if (hoveredRef.current === id) return;
     hoveredRef.current = id;
@@ -110,12 +141,17 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
 
   const [size, setSize] = useState({ w: 800, h: 600 });
 
-  // 1. Prepare data + adjacency map + per-entity best semantic type.
-  const { nodes, links, neighborMap } = useMemo(() => {
+  // 1. Prepare data + adjacency map + per-entity best semantic type +
+  //    claim → entity-names resolver (the brain-graph activation store
+  //    keys by claim id; the canvas needs to know which nodes to halo
+  //    when a given claim is cited — same alternation regex pass that
+  //    the priority loop runs, so it's free).
+  const { nodes, links, neighborMap, claimToEntities } = useMemo(() => {
     const nameToNode = new Map<string, Node>();
     const neighbors = new Map<string, Set<string>>();
     const bestTypeMap = new Map<string, string>();
     const bestRankMap = new Map<string, number>();
+    const claimEntityMap = new Map<string, string[]>();
 
     // P6 / H1: instead of iterating every entity for every claim
     // (the old O(N×M) nested loop), build a single alternation regex
@@ -149,6 +185,7 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
 
         // `matchAll` walks every non-overlapping match in one pass.
         const matches = claim.statement.matchAll(matcher);
+        const seenForThisClaim = new Set<string>();
         for (const m of matches) {
           const name = m[0];
           const currentRank = bestRankMap.get(name);
@@ -168,6 +205,10 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
               bestTypeMap.set(name, "rooted");
             }
           }
+          seenForThisClaim.add(name);
+        }
+        if (seenForThisClaim.size > 0) {
+          claimEntityMap.set(claim.id, Array.from(seenForThisClaim));
         }
       }
     }
@@ -203,7 +244,12 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
       type: r.relation_type,
       strength: r.strength,
     }));
-    return { nodes: nodeArr, links: linkArr, neighborMap: neighbors };
+    return {
+      nodes: nodeArr,
+      links: linkArr,
+      neighborMap: neighbors,
+      claimToEntities: claimEntityMap,
+    };
   }, [entities, relations, claims]);
 
   // 2. Initialise physics engine.  Setting `alphaMin` explicitly is
@@ -343,6 +389,55 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
         }
       });
 
+      // Brain-graph live activity halos. Resolves active claim ids
+      // into entity-name targets via the cached resolver, then keeps
+      // the strongest (intensity, kind) per node so a node cited by
+      // multiple claims pulses once at the loudest volume rather than
+      // stacking. Drawn last so halos sit visually on top of the node.
+      const liveActivations = activationsRef.current;
+      if (Object.keys(liveActivations).length > 0) {
+        const resolver = claimToEntitiesRef.current;
+        const perNode = new Map<string, { intensity: number; kind: ActivationKind }>();
+        for (const [claimId, activation] of Object.entries(liveActivations)) {
+          const entityNames = resolver.get(claimId);
+          if (!entityNames) continue;
+          for (const name of entityNames) {
+            const prev = perNode.get(name);
+            if (!prev || activation.intensity > prev.intensity) {
+              perNode.set(name, activation);
+            }
+          }
+        }
+        if (perNode.size > 0) {
+          ctx.save();
+          for (const node of nodes) {
+            if (node.x == null || node.y == null) continue;
+            const a = perNode.get(node.id);
+            if (!a) continue;
+            const baseR = Math.max(3, Math.min(12, 3 + Math.sqrt(node.claim_count) * 1.5));
+            const haloR = baseR + 8 / t.k + a.intensity * 6;
+            const { r: hr, g: hg, b: hb } = activationHue(a.kind);
+            const opacity = Math.min(0.85, a.intensity);
+            // Outer soft glow.
+            const grad = ctx.createRadialGradient(node.x, node.y, baseR, node.x, node.y, haloR);
+            grad.addColorStop(0, `rgba(${hr}, ${hg}, ${hb}, ${opacity * 0.55})`);
+            grad.addColorStop(1, `rgba(${hr}, ${hg}, ${hb}, 0)`);
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, haloR, 0, 2 * Math.PI);
+            ctx.fill();
+            // Crisp inner ring so the activation is legible even
+            // against a busy background.
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, baseR + 2 / t.k, 0, 2 * Math.PI);
+            ctx.strokeStyle = `rgba(${hr}, ${hg}, ${hb}, ${opacity})`;
+            ctx.lineWidth = 1.5 / t.k;
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+
       ctx.restore();
     };
 
@@ -386,6 +481,64 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     searchQueryRef.current = searchQuery;
     drawRef.current?.();
   }, [searchQuery]);
+
+  // 4b. Keep the claim→entity resolver ref in lockstep with the
+  //     useMemo result. The canvas draw closure reads it without
+  //     re-binding, so a new resolver shape just lands silently on
+  //     the next frame.
+  useEffect(() => {
+    claimToEntitiesRef.current = claimToEntities;
+  }, [claimToEntities]);
+
+  // 4c. Subscribe to the brain-activation store + drive an
+  //     exponential-decay rAF loop while any claim is still
+  //     activated. The store applies the decay; we just keep ticking
+  //     until it returns an empty map and then stop the loop so the
+  //     canvas goes back to 0% CPU (the same posture as the d3-force
+  //     `on("end")` boundary).
+  useEffect(() => {
+    const tick = () => {
+      const now = performance.now();
+      useBrainActivation.getState().decay(now);
+      const live = useBrainActivation.getState().activations;
+      activationsRef.current = Object.fromEntries(
+        Object.entries(live).map(([id, a]) => [id, { intensity: a.intensity, kind: a.kind }]),
+      );
+      drawRef.current?.();
+      if (Object.keys(live).length > 0) {
+        decayRafRef.current = requestAnimationFrame(tick);
+      } else {
+        decayRafRef.current = null;
+      }
+    };
+
+    const unsubscribe = useBrainActivation.subscribe((state) => {
+      // Mirror the latest activations into the ref synchronously so
+      // a draw triggered by some other path (hover, zoom) sees them
+      // without waiting for the next rAF tick.
+      activationsRef.current = Object.fromEntries(
+        Object.entries(state.activations).map(([id, a]) => [
+          id,
+          { intensity: a.intensity, kind: a.kind },
+        ]),
+      );
+      drawRef.current?.();
+      if (
+        Object.keys(state.activations).length > 0 &&
+        decayRafRef.current === null
+      ) {
+        decayRafRef.current = requestAnimationFrame(tick);
+      }
+    });
+
+    return () => {
+      unsubscribe();
+      if (decayRafRef.current !== null) {
+        cancelAnimationFrame(decayRafRef.current);
+        decayRafRef.current = null;
+      }
+    };
+  }, []);
 
   // 5. Container resize — guard the destructure: the ResizeObserver
   //    callback can fire with an empty entries array on rare

@@ -77,9 +77,7 @@ pub struct ConversationCreateArgs {
 }
 
 #[tauri::command]
-pub fn conversations_create(
-    args: ConversationCreateArgs,
-) -> Result<ConversationSummary, String> {
+pub fn conversations_create(args: ConversationCreateArgs) -> Result<ConversationSummary, String> {
     let entry = lookup_workspace(&args.workspace)?;
     let dir = conv_dir(&entry.path);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
@@ -306,7 +304,11 @@ fn derive_title(content: &str) -> String {
     if line.chars().count() > 60 {
         t.push('…');
     }
-    if t.is_empty() { "Untitled".to_string() } else { t }
+    if t.is_empty() {
+        "Untitled".to_string()
+    } else {
+        t
+    }
 }
 
 fn is_safe_id(id: &str) -> bool {

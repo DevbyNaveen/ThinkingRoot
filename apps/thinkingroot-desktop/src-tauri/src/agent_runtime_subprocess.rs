@@ -56,7 +56,12 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     // isolation case).
     if port == cortex::DEFAULT_PORT {
         match cortex_bridge::resolve_engine(EngineIntent::DesktopBoot).await {
-            Ok(EngineConnection::Remote { host, port: lock_port, started_by, pid }) => {
+            Ok(EngineConnection::Remote {
+                host,
+                port: lock_port,
+                started_by,
+                pid,
+            }) => {
                 tracing::info!(
                     pid,
                     port = lock_port,
@@ -187,7 +192,10 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
             }
         }
         Err(e) => {
-            tracing::debug!(?e, "credentials.toml unreadable; sidecar inherits desktop env only");
+            tracing::debug!(
+                ?e,
+                "credentials.toml unreadable; sidecar inherits desktop env only"
+            );
         }
     }
 
@@ -360,9 +368,7 @@ pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
         // NOT kill it — that would orphan the CLI users it's still
         // serving. Leave the cortex.lock alone too: whoever spawned
         // the daemon owns its lifecycle.
-        tracing::info!(
-            "cortex attach mode — daemon not owned by this desktop, leaving it running"
-        );
+        tracing::info!("cortex attach mode — daemon not owned by this desktop, leaving it running");
         return;
     };
     // Drop stdin so the engine's stdin reader (when any) sees EOF
@@ -384,11 +390,7 @@ pub async fn shutdown<R: Runtime>(app: &AppHandle<R>) {
             // following short wait reaps the child so we don't leak
             // a zombie.
             let _ = child.kill().await;
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                child.wait(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
         }
     }
 
@@ -493,11 +495,7 @@ fn which_root() -> Option<PathBuf> {
 /// seconds, then store a `SidecarHandle` pointing at nothing.
 ///
 /// Returns `true` if the sidecar became ready, `false` otherwise.
-async fn wait_for_sidecar_ready(
-    livez_url: &str,
-    child: &mut Child,
-    timeout_secs: u64,
-) -> bool {
+async fn wait_for_sidecar_ready(livez_url: &str, child: &mut Child, timeout_secs: u64) -> bool {
     use tokio::time::{Duration, Instant, sleep};
 
     // Pre-fix: `.build().unwrap_or_default()` would silently fall back to
@@ -610,7 +608,10 @@ async fn cleanup_stale_sidecar(port: u16) {
             // SIGKILL because if a process is still listening and
             // hasn't responded to prior shutdown attempts, it's
             // likely wedged.
-            let _ = StdCommand::new("kill").arg("-9").arg(pid.to_string()).status();
+            let _ = StdCommand::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
         }
     }
 }
@@ -655,9 +656,7 @@ fn stale_pids_on_port(port: u16) -> Vec<u32> {
 
     // Strategy 2: `ss -tlnp`.  Output line shape:
     //   LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:(("root",pid=1234,fd=3))
-    if let Ok(out) = StdCommand::new("ss")
-        .arg("-tlnp")
-        .output()
+    if let Ok(out) = StdCommand::new("ss").arg("-tlnp").output()
         && out.status.success()
     {
         let needle_v4 = format!(":{}", port);

@@ -48,14 +48,21 @@ import {
   conversationsGet,
   llmHealth,
   workspaceCompile,
+  workspaceList,
   onChatEvent,
   type ChatEvent,
   type ChatTurnPayload,
   type LlmHealth,
 } from "@/lib/tauri";
-import type { ChatMessage } from "@/types";
+import { BrainCitationParser, useBrainActivation } from "@/store/brain";
+import type { ChatMessage, EngramActivationEntry, GapEntry } from "@/types";
+import { BranchChip } from "./BranchChip";
 import { ClaimCard } from "./ClaimCard";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { EngramTimeline } from "./EngramTimeline";
+import { GapCards } from "./GapCards";
+import { ReasoningTrace } from "./ReasoningTrace";
+import { TrustReceiptChip } from "./TrustReceipt";
 import { runSlashCommand } from "./slashCommands";
 
 /** Stable pretty-print of a tool-call input for display in a claim
@@ -117,6 +124,27 @@ export function ChatView() {
   // hangs when the workspace has no provider key configured.
   const [health, setHealth] = useState<LlmHealth | null>(null);
   const [compileBusy, setCompileBusy] = useState(false);
+  const [activeWorkspaceRoot, setActiveWorkspaceRoot] = useState<string | null>(null);
+  useEffect(() => {
+    if (!activeWorkspace) {
+      setActiveWorkspaceRoot(null);
+      return;
+    }
+    let cancelled = false;
+    workspaceList()
+      .then((list) => {
+        if (cancelled) return;
+        const row = list.find((w) => w.name === activeWorkspace);
+        setActiveWorkspaceRoot(row?.path ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setActiveWorkspaceRoot(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspace]);
+
   useEffect(() => {
     if (!activeWorkspace) {
       setHealth(null);
@@ -210,6 +238,33 @@ export function ChatView() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let running = true;
+    // Per-turn citation parsers — the LLM is instructed to emit
+    // `[claim:<id>]` markers (see CITATION_PROMPT in
+    // `intelligence/synthesizer.rs`) and we forward each emitted id
+    // into the brain-activation store so the BrainGraph canvas pulses
+    // the cited entities live as the model writes.
+    //
+    // Rationale for per-turn parsers (not a singleton): the parser
+    // dedupes within its own lifetime; reusing one across turns would
+    // suppress legitimate re-citations of the same claim in a later
+    // answer. Parsers are dropped on Final/Error to bound memory.
+    const citationParsers = new Map<string, BrainCitationParser>();
+    // Per-turn lookup so a later `trust_receipt` event can patch the
+    // assistant message that was appended when `final` arrived.
+    // Cleared alongside the citation parser when the turn closes.
+    const lastAssistantMessage = new Map<
+      string,
+      { workspace: string; convId: string; messageId: string }
+    >();
+    // Per-turn engram-activation accumulator. Entries land here from
+    // the `engram_activated` ChatEvent and are flushed to the
+    // persisted assistant message on `final` (or, if the activation
+    // arrives AFTER `final` due to SSE ordering, patched in via
+    // `updateMessage`). Cleared on trust_receipt / error.
+    const turnEngramActivations = new Map<string, EngramActivationEntry[]>();
+    // Per-turn reflection-gap accumulator. Same pattern as
+    // turnEngramActivations.
+    const turnGaps = new Map<string, GapEntry[]>();
     onChatEvent((ev: ChatEvent) => {
       if (!running) return;
       // Stream E — keep this as debug-level so it's silenced in
@@ -237,6 +292,26 @@ export function ChatView() {
         // moment onStartTurn fired until Final/Error.
         if (cur.streaming?.turnId === ev.turn_id) {
           appendDelta(ev.text);
+
+          // Streaming citation extraction. Lazy-create a parser on
+          // first token for this turn; feed every token; touch the
+          // activation store for each newly-detected `[claim:<id>]`
+          // marker. The store's exponential decay (~1.4s half-life)
+          // makes the BrainGraph node fade out within ~2s, which the
+          // user reads as "the model is currently thinking about that
+          // claim" rather than "that claim is permanently selected."
+          let parser = citationParsers.get(ev.turn_id);
+          if (!parser) {
+            parser = new BrainCitationParser();
+            citationParsers.set(ev.turn_id, parser);
+          }
+          const cites = parser.feed(ev.text);
+          if (cites.length > 0) {
+            const touch = useBrainActivation.getState().touch;
+            for (const c of cites) {
+              touch(c.claimId, "cited", 1.0);
+            }
+          }
         } else {
           // eslint-disable-next-line no-console
           console.warn(
@@ -315,12 +390,40 @@ export function ChatView() {
               });
             });
           }
+          const messageId = `m-${Date.now()}-${ev.type === "final" ? "a" : "e"}`;
+          const flushedActivations = turnEngramActivations.get(ev.turn_id);
+          const flushedGaps = turnGaps.get(ev.turn_id);
+          // Reasoning-trace snapshot: copy the streaming.agentSteps
+          // off the active StreamState (read BEFORE setStreaming(null)
+          // below clears it). Empty arrays drop to undefined so the
+          // accordion is hidden when there's nothing to expand.
+          const flushedSteps =
+            cur.streaming?.turnId === ev.turn_id
+              ? [...cur.streaming.agentSteps]
+              : [];
           appendMessage(ctx.workspace, ctx.convId, {
-            id: `m-${Date.now()}-${ev.type === "final" ? "a" : "e"}`,
+            id: messageId,
             kind: "assistant",
             body: msgBody,
             at: new Date(),
+            engramActivations:
+              flushedActivations && flushedActivations.length > 0
+                ? flushedActivations
+                : undefined,
+            gaps: flushedGaps && flushedGaps.length > 0 ? flushedGaps : undefined,
+            agentSteps: flushedSteps.length > 0 ? flushedSteps : undefined,
           });
+          // Remember this message id for the matching trust_receipt
+          // event that arrives shortly after `final` on the same SSE
+          // stream. Only meaningful for `final` (errors don't carry
+          // a verifier verdict).
+          if (ev.type === "final") {
+            lastAssistantMessage.set(ev.turn_id, {
+              workspace: ctx.workspace,
+              convId: ctx.convId,
+              messageId,
+            });
+          }
         } else {
           // eslint-disable-next-line no-console
           console.warn(
@@ -332,7 +435,91 @@ export function ChatView() {
         if (cur.streaming?.turnId === ev.turn_id) {
           setStreaming(null);
         }
-        cur.clearTurn(ev.turn_id);
+        // For `final`, do NOT clearTurn — the trust_receipt may still
+        // be in flight. We clear in the trust_receipt handler below,
+        // and also after a short timeout below in case the stream
+        // closes without one. For `error`, clear immediately.
+        if (ev.type === "error") {
+          cur.clearTurn(ev.turn_id);
+          citationParsers.delete(ev.turn_id);
+          lastAssistantMessage.delete(ev.turn_id);
+          turnEngramActivations.delete(ev.turn_id);
+          turnGaps.delete(ev.turn_id);
+        }
+        return;
+      }
+      if (ev.type === "gaps_surfaced") {
+        // Append (don't replace) so multiple `gaps` tool calls in
+        // one turn — possible when the agent narrows then broadens —
+        // accumulate. Dedupe is handled at render time by the
+        // entity_type:entity_name:expected_claim_type composite key.
+        const prior = turnGaps.get(ev.turn_id) ?? [];
+        const next = [...prior, ...ev.gaps];
+        turnGaps.set(ev.turn_id, next);
+        const cur = useApp.getState();
+        if (cur.streaming?.turnId === ev.turn_id) {
+          cur.appendGaps(ev.gaps);
+        }
+        const target = lastAssistantMessage.get(ev.turn_id);
+        if (target) {
+          cur.updateMessage(target.workspace, target.convId, target.messageId, {
+            gaps: next,
+          });
+        }
+        return;
+      }
+      if (ev.type === "engram_activated") {
+        const entry: EngramActivationEntry = {
+          tool: ev.tool,
+          pointer: ev.pointer,
+          tsMs: ev.ts_ms,
+          sourceCount: ev.source_count,
+          answerCount: ev.answer_count,
+        };
+        // Append to per-turn accumulator AND to streaming state
+        // (so the in-flight scrubber updates live). If `final`
+        // already arrived, patch the persisted message directly —
+        // SSE ordering can deliver activations after final.
+        const prior = turnEngramActivations.get(ev.turn_id) ?? [];
+        const next = [...prior, entry];
+        turnEngramActivations.set(ev.turn_id, next);
+        const cur = useApp.getState();
+        if (cur.streaming?.turnId === ev.turn_id) {
+          cur.appendEngramActivation(entry);
+        }
+        const target = lastAssistantMessage.get(ev.turn_id);
+        if (target) {
+          cur.updateMessage(target.workspace, target.convId, target.messageId, {
+            engramActivations: next,
+          });
+        }
+        return;
+      }
+      if (ev.type === "trust_receipt") {
+        const target = lastAssistantMessage.get(ev.turn_id);
+        if (target) {
+          useApp.getState().updateMessage(
+            target.workspace,
+            target.convId,
+            target.messageId,
+            {
+              trustReceipt: {
+                kind: ev.kind,
+                claimsUsed: ev.claims_used,
+                autoCitedCount: ev.auto_cited_count,
+                relatedCount: ev.related_count,
+                badClaimIds: ev.bad_claim_ids,
+              },
+            },
+          );
+        }
+        // Trust receipt is the last per-turn event; clean up.
+        useApp.getState().clearTurn(ev.turn_id);
+        citationParsers.delete(ev.turn_id);
+        lastAssistantMessage.delete(ev.turn_id);
+        turnEngramActivations.delete(ev.turn_id);
+        turnGaps.delete(ev.turn_id);
+        return;
       }
     }).then((u) => {
       unlisten = u;
@@ -344,6 +531,7 @@ export function ChatView() {
     return () => {
       running = false;
       unlisten?.();
+      citationParsers.clear();
     };
   }, [appendDelta, appendMessage, setStreaming]);
 
@@ -411,6 +599,7 @@ export function ChatView() {
             {/* Floating composer card */}
             <Composer
               workspace={activeWorkspace}
+              workspaceRootPath={activeWorkspaceRoot}
               convId={activeConv}
               disabled={streaming != null}
               autoFocus
@@ -500,6 +689,8 @@ export function ChatView() {
                   tokensIn: 0,
                   tokensOut: 0,
                   agentSteps: [],
+                  engramActivations: [],
+                  gaps: [],
                 });
               }}
             />
@@ -516,6 +707,14 @@ export function ChatView() {
 
   return (
     <div className="flex h-full flex-col bg-background">
+      <div className="border-b border-border/40 bg-background/80 px-8 py-2 backdrop-blur">
+        <div className="mx-auto flex max-w-3xl items-center gap-3">
+          <span className="text-[10px] uppercase tracking-widest text-muted-foreground/60">
+            {activeWorkspace}
+          </span>
+          <BranchChip workspace={activeWorkspace} />
+        </div>
+      </div>
       <div className="flex-1 overflow-y-auto px-8 py-6">
         <ul className="mx-auto flex max-w-3xl flex-col gap-6">
           {messages.map((m) => (
@@ -541,6 +740,19 @@ export function ChatView() {
                       ))}
                     </div>
                   </div>
+                </div>
+              )}
+              {streaming.engramActivations.length > 0 && (
+                <div className="mx-auto w-full max-w-3xl">
+                  <EngramTimeline
+                    activations={streaming.engramActivations}
+                    turnStartedAtMs={streaming.startedAt.getTime()}
+                  />
+                </div>
+              )}
+              {streaming.gaps.length > 0 && (
+                <div className="mx-auto w-full max-w-3xl">
+                  <GapCards gaps={streaming.gaps} />
                 </div>
               )}
               {streaming.partial.length > 0 && (
@@ -574,6 +786,7 @@ export function ChatView() {
 
       <Composer
         workspace={activeWorkspace}
+        workspaceRootPath={activeWorkspaceRoot}
         convId={activeConv}
         disabled={streaming != null}
         health={health}
@@ -621,6 +834,8 @@ export function ChatView() {
             tokensIn: 0,
             tokensOut: 0,
             agentSteps: [],
+            engramActivations: [],
+            gaps: [],
           });
         }}
       />
@@ -635,6 +850,15 @@ export function ChatView() {
  * letting the user submit and watch a spinner. Renders nothing on the
  * happy path (configured + has claims).
  */
+/** Compare absolute workspace roots (macOS may differ only by case). */
+function sameWorkspaceRoot(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  const x = a.replace(/\/$/, "");
+  const y = b.replace(/\/$/, "");
+  if (x === y) return true;
+  return x.toLowerCase() === y.toLowerCase();
+}
+
 /**
  * Slice 0 — chat readiness banner driven by the unified workspace
  * status snapshot. Replaces the pre-Slice-0 banner that read its own
@@ -650,12 +874,16 @@ export function ChatView() {
 function LlmHealthBanner({
   health,
   workspace,
+  workspaceRootPath,
   openSettings,
 }: {
   health: LlmHealth | null;
   workspace: string;
+  workspaceRootPath: string | null;
   openSettings: () => void;
 }) {
+  const compileProgress = useApp((s) => s.compileProgress);
+  const compileRootPath = useApp((s) => s.compileRootPath);
   const status = useWorkspaceStatus(workspace);
   const blocker = pickPrimaryDiagnostic(status, "for_chat");
 
@@ -744,6 +972,28 @@ function LlmHealthBanner({
     );
   }
   if (health.claim_count === 0) {
+    const compilePhase = compileProgress?.phase;
+    const compileRunning =
+      compileRootPath != null &&
+      workspaceRootPath != null &&
+      sameWorkspaceRoot(workspaceRootPath, compileRootPath) &&
+      compilePhase != null &&
+      compilePhase !== "done" &&
+      compilePhase !== "failed" &&
+      compilePhase !== "cancelled";
+    if (compileRunning) {
+      return (
+        <div className="flex w-full items-start gap-2.5 rounded-xl border border-border/70 bg-muted/25 px-3.5 py-2.5 text-xs text-foreground/90">
+          <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+          <div className="leading-relaxed text-muted-foreground">
+            <span className="font-medium text-foreground/85">Compile running.</span>{" "}
+            Claim count stays at zero until this pass finishes — follow progress in the
+            right-hand <span className="font-medium text-foreground/80">Compile</span>{" "}
+            panel (e.g. extracting claims).
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex w-full items-start gap-2.5 rounded-xl border border-border/70 bg-muted/35 px-3.5 py-2.5 text-xs text-foreground/90">
         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none text-amber-300" />
@@ -851,6 +1101,26 @@ function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }
           {pending && (
             <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
           )}
+          {!pending && msg.engramActivations && msg.engramActivations.length > 0 && (
+            <div className="mt-2">
+              <EngramTimeline activations={msg.engramActivations} />
+            </div>
+          )}
+          {!pending && msg.gaps && msg.gaps.length > 0 && (
+            <div className="mt-2">
+              <GapCards gaps={msg.gaps} />
+            </div>
+          )}
+          {!pending && msg.agentSteps && msg.agentSteps.length > 0 && (
+            <div className="mt-2">
+              <ReasoningTrace steps={msg.agentSteps} />
+            </div>
+          )}
+          {!pending && msg.trustReceipt && (
+            <div className="mt-2">
+              <TrustReceiptChip receipt={msg.trustReceipt} />
+            </div>
+          )}
         </div>
       </div>
     );
@@ -873,6 +1143,7 @@ function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }
 
 function Composer({
   workspace,
+  workspaceRootPath,
   convId,
   disabled,
   autoFocus,
@@ -886,6 +1157,8 @@ function Composer({
   onStartTurn,
 }: {
   workspace: string;
+  /** Absolute path for `workspace` — used to align compile progress with this row. */
+  workspaceRootPath: string | null;
   convId: string | null;
   disabled: boolean;
   autoFocus?: boolean;
@@ -993,6 +1266,7 @@ function Composer({
               <LlmHealthBanner
                 health={health}
                 workspace={workspace}
+                workspaceRootPath={workspaceRootPath}
                 openSettings={() => useApp.getState().setSurface("settings")}
               />
             </div>

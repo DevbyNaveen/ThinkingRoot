@@ -55,6 +55,12 @@ pub fn run() {
                 tauri::WindowEvent::Destroyed => {
                     let handle = window.app_handle().clone();
                     tauri::async_runtime::spawn(async move {
+                        // Order matters: kill terminal children first so
+                        // their PTY masters drop while the app handle is
+                        // still alive (otherwise their read threads
+                        // would fail to emit the final exit event).
+                        commands::terminal::shutdown_all(&handle).await;
+                        commands::browser::shutdown_all(&handle).await;
                         agent_runtime_subprocess::shutdown(&handle).await;
                     });
                 }
@@ -109,6 +115,7 @@ pub fn run() {
             commands::doctor::doctor_run,
             commands::mcp_local::mcp_status,
             commands::mcp_local::mcp_get_config_snippet,
+            commands::mcp_local::mcp_configure_tool,
             commands::mcp_local::mcp_list_connected,
             commands::privacy::privacy_summary,
             commands::privacy::privacy_forget,
@@ -133,6 +140,9 @@ pub fn run() {
             commands::branch_extras::branch_lineage,
             commands::branch_extras::branch_rebase,
             commands::branch_extras::branch_rollback,
+            commands::branch_extras::branch_diff,
+            commands::branch_extras::branch_event_subscribe,
+            commands::branch_extras::branch_event_unsubscribe,
             commands::tag::tag_create,
             commands::tag::tag_list,
             commands::tag::tag_get,
@@ -162,6 +172,22 @@ pub fn run() {
             commands::workspace_status::workspace_status_refresh,
             commands::workspace_status::subscribe_workspace_status_stream,
             commands::workspace_status::unsubscribe_workspace_status_stream,
+            commands::terminal::terminal_open,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_close,
+            commands::terminal::terminal_list,
+            commands::browser::browser_open,
+            commands::browser::browser_navigate,
+            commands::browser::browser_reload,
+            commands::browser::browser_back,
+            commands::browser::browser_forward,
+            commands::browser::browser_set_bounds,
+            commands::browser::browser_show,
+            commands::browser::browser_hide,
+            commands::browser::browser_focus,
+            commands::browser::browser_close,
+            commands::browser::browser_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

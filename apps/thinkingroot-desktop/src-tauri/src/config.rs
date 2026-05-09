@@ -103,8 +103,8 @@ impl DesktopState {
 
     /// Persist the state, creating parent directories as needed.
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::path()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve desktop config path"))?;
+        let path =
+            Self::path().ok_or_else(|| anyhow::anyhow!("cannot resolve desktop config path"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
@@ -169,7 +169,10 @@ fn take_legacy_desktop_toml() -> Option<toml::Table> {
 /// onboarding-wizard scratch we don't want to honour silently.
 fn migrate_legacy(state: &mut DesktopState, legacy: &toml::Table) {
     // Active workspace pointer → WorkspaceRegistry.active.
-    if let Some(name) = legacy.get("THINKINGROOT_WORKSPACE_NAME").and_then(|v| v.as_str()) {
+    if let Some(name) = legacy
+        .get("THINKINGROOT_WORKSPACE_NAME")
+        .and_then(|v| v.as_str())
+    {
         if let Ok(mut registry) = thinkingroot_core::WorkspaceRegistry::load() {
             if registry.workspaces.iter().any(|w| w.name == name)
                 && registry.active.as_deref() != Some(name)

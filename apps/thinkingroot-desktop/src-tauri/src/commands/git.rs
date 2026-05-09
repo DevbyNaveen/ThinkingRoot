@@ -129,10 +129,10 @@ mod tests {
 
     #[test]
     fn parse_handles_remote_branches() {
-        let out = parse_branches(
-            "* main\n  remotes/origin/main\n  remotes/origin/feature/x\n",
-        );
-        let remote_main = out.iter().find(|b| b.kind == BranchKind::Remote && b.name == "main");
+        let out = parse_branches("* main\n  remotes/origin/main\n  remotes/origin/feature/x\n");
+        let remote_main = out
+            .iter()
+            .find(|b| b.kind == BranchKind::Remote && b.name == "main");
         assert!(remote_main.is_some());
         assert_eq!(
             remote_main.unwrap().remote.as_deref(),
@@ -143,13 +143,14 @@ mod tests {
 
     #[test]
     fn parse_skips_head_arrow_line() {
-        let out = parse_branches(
-            "* main\n  remotes/origin/HEAD -> origin/main\n  remotes/origin/main\n",
-        );
+        let out =
+            parse_branches("* main\n  remotes/origin/HEAD -> origin/main\n  remotes/origin/main\n");
         // origin/HEAD line gets parsed into an entry named "HEAD" pointing
         // at remote `origin` — that's still a real entry; the canonicaliser
         // just stripped the arrow so we don't accidentally produce two.
-        let head = out.iter().find(|b| b.name == "HEAD" && b.remote.as_deref() == Some("origin"));
+        let head = out
+            .iter()
+            .find(|b| b.name == "HEAD" && b.remote.as_deref() == Some("origin"));
         assert!(head.is_some());
     }
 

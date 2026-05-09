@@ -101,6 +101,10 @@ pub fn spawn_agent_run(
 
     let agent_req = AgentRequest {
         system: req.system_prompt,
+        // C5: no refresher wired yet — will be set in Task 5/9
+        // (system-reminder bus). Until then, agent path uses static
+        // identity captured at request entry. Bug C5, plan 2026-05-09.
+        system_refresher: None,
         history: messages,
         tool_choice: ToolChoice::Auto,
     };

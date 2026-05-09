@@ -17,7 +17,10 @@ export type RightRailTab =
   | "brain"
   | "readme"
   | "branches"
-  | "privacy";
+  | "builders"
+  | "browser"
+  | "privacy"
+  | "terminal";
 
 /** Surfaces in the layout.
  *
@@ -28,7 +31,7 @@ export type RightRailTab =
  * tags as a side-effect ("show me Brain" → flips the right-rail tab
  * to brain). Removing them would force every call site through a
  * separate "rail target" type for no real gain. */
-export type Surface = "chats" | "settings" | "brain" | "privacy" | "branches";
+export type Surface = "chats" | "settings" | "docs" | "brain" | "privacy" | "branches";
 
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {
@@ -57,6 +60,36 @@ export interface ChatMessage {
   at: Date;
   provenance?: Provenance[];
   tool?: { name: string; args: unknown; ok?: boolean };
+  /** Post-stream verifier verdict, attached when the engine emits
+   *  the `trust_receipt` SSE event after `final`. Only meaningful
+   *  on kind === "assistant" messages. */
+  trustReceipt?: TrustReceipt;
+  /** Engrams the agent activated while producing this message,
+   *  copied from the StreamState's `engramActivations` at `final`.
+   *  Only meaningful on kind === "assistant" messages. */
+  engramActivations?: EngramActivationEntry[];
+  /** Reflection gaps the agent surfaced via the `gaps` MCP tool
+   *  during this turn. Renders as inline "by the way" cards under
+   *  the assistant body. Only meaningful on kind === "assistant". */
+  gaps?: GapEntry[];
+  /** Tool calls the agent made while producing this message — the
+   *  reasoning trace. Copied from StreamState.agentSteps at `final`.
+   *  Only meaningful on kind === "assistant"; renders as a collapsed
+   *  accordion below the body. */
+  agentSteps?: AgentStep[];
+}
+
+/** Re-export of the wire-shape gap entry for component prop types.
+ *  Kept here so component files can `import type { GapEntry }` from
+ *  a single source. The canonical definition lives at
+ *  `lib/tauri.ts::GapEntry` (keep them aligned). */
+export interface GapEntry {
+  entity_name: string;
+  entity_type: string;
+  expected_claim_type: string;
+  confidence: number;
+  sample_size: number;
+  reason: string;
 }
 
 export interface Provenance {
@@ -108,6 +141,26 @@ export interface StreamState {
   /** Agent tool-call steps emitted during this turn. Empty for
    *  legacy non-agent streams. */
   agentSteps: AgentStep[];
+  /** Engram activations during this turn — populated from
+   *  `ChatEvent::EngramActivated`. Drives the EngramTimeline
+   *  scrubber while the turn is in flight; copied to the persisted
+   *  ChatMessage on `final`. */
+  engramActivations: EngramActivationEntry[];
+  /** Reflection gaps surfaced during this turn (from the engine's
+   *  `gaps_surfaced` SSE event). Copied to the assistant
+   *  ChatMessage on `final`. */
+  gaps: GapEntry[];
+}
+
+/** One engram activation observed during a turn. Mirrors the
+ *  rest.rs `engram_activated` SSE shape; matches what
+ *  `EngramTimeline.tsx` consumes. */
+export interface EngramActivationEntry {
+  tool: string;
+  pointer: string;
+  tsMs: number;
+  sourceCount?: number;
+  answerCount?: number;
 }
 
 /** Live capsule rendered in the footer + toast deck. */
@@ -116,4 +169,33 @@ export interface LiveCapsule {
   operation: string;
   kind: string;
   graceEndsAt: Date;
+}
+
+/** Verifier verdict — one wire kind per `Verdict` variant on the
+ *  engine side (intelligence/verifier.rs). The UI switches on `kind`
+ *  to render colour + tooltip; the optional fields are populated
+ *  per variant. */
+export type TrustReceiptKind =
+  | "fully_grounded"
+  | "partially_grounded"
+  | "unverified_citations"
+  | "skipped_chitchat"
+  | "skipped_rejection"
+  | "skipped_bench";
+
+/** Post-stream trust receipt attached to an assistant message.
+ *  Arrives via the `chat-event` Tauri channel as `ChatEvent::TrustReceipt`
+ *  (apps/thinkingroot-desktop/src-tauri/src/commands/chat.rs). */
+export interface TrustReceipt {
+  kind: TrustReceiptKind;
+  /** Distinct claim_ids the response credits (may be empty for
+   *  skip variants). Stable order from the verifier. */
+  claimsUsed: string[];
+  /** Present only when kind === "fully_grounded". */
+  autoCitedCount?: number;
+  /** Present only when kind === "partially_grounded". */
+  relatedCount?: number;
+  /** Present only when kind === "unverified_citations" — claim_ids
+   *  the agent emitted that DON'T resolve in substrate. */
+  badClaimIds?: string[];
 }

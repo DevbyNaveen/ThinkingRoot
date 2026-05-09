@@ -69,10 +69,7 @@ pub struct BranchListArgs {
 }
 
 #[tauri::command]
-pub async fn branch_list(
-    app: AppHandle,
-    args: BranchListArgs,
-) -> Result<Vec<BranchView>, String> {
+pub async fn branch_list(app: AppHandle, args: BranchListArgs) -> Result<Vec<BranchView>, String> {
     let _ = args.workspace; // accepted for backward-compat; daemon resolves from workspace_root
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let head: HeadResponse = client.get("/api/v1/head").await?;
@@ -99,10 +96,7 @@ pub struct BranchCreateArgs {
 }
 
 #[tauri::command]
-pub async fn branch_create(
-    app: AppHandle,
-    args: BranchCreateArgs,
-) -> Result<BranchView, String> {
+pub async fn branch_create(app: AppHandle, args: BranchCreateArgs) -> Result<BranchView, String> {
     let _ = args.workspace;
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let body = serde_json::json!({
@@ -132,10 +126,7 @@ struct CheckoutResponse {
 }
 
 #[tauri::command]
-pub async fn branch_checkout(
-    app: AppHandle,
-    args: BranchCheckoutArgs,
-) -> Result<String, String> {
+pub async fn branch_checkout(app: AppHandle, args: BranchCheckoutArgs) -> Result<String, String> {
     let _ = args.workspace;
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let path = format!("/api/v1/branches/{}/checkout", urlencode(&args.name));
@@ -188,10 +179,7 @@ fn count_or_len(v: &serde_json::Value) -> usize {
 }
 
 #[tauri::command]
-pub async fn branch_merge(
-    app: AppHandle,
-    args: BranchMergeArgs,
-) -> Result<MergeOutcome, String> {
+pub async fn branch_merge(app: AppHandle, args: BranchMergeArgs) -> Result<MergeOutcome, String> {
     let _ = args.workspace;
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let path = format!("/api/v1/branches/{}/merge", urlencode(&args.name));
@@ -222,10 +210,7 @@ struct DeletedResponse {
 }
 
 #[tauri::command]
-pub async fn branch_delete(
-    app: AppHandle,
-    args: BranchDeleteArgs,
-) -> Result<bool, String> {
+pub async fn branch_delete(app: AppHandle, args: BranchDeleteArgs) -> Result<bool, String> {
     let _ = args.workspace;
     let client = SidecarClient::ensure_active_for_branches(&app).await?;
     let path = format!("/api/v1/branches/{}", urlencode(&args.name));
@@ -236,9 +221,7 @@ pub async fn branch_delete(
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));

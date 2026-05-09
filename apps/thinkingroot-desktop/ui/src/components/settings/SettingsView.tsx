@@ -9,7 +9,9 @@ import {
   Save,
   Check,
   Copy,
+  Loader2,
   X,
+  Trash2,
 } from "lucide-react";
 import {
   configPaths,
@@ -18,11 +20,13 @@ import {
   credentialsStatus,
   globalConfigRead,
   globalConfigWrite,
+  mcpConfigureTool,
   mcpGetConfigSnippet,
   mcpStatus,
   workspaceList,
   workspaceLlmConfig,
   workspaceLlmWrite,
+  workspaceRemove,
   workspaceSetActive,
   type ConfigPaths,
   type CredentialRow,
@@ -77,6 +81,7 @@ const THEMES: Array<{ id: Theme; label: string; note?: string }> = [
 export function SettingsView() {
   const theme = useApp((s) => s.theme);
   const setTheme = useApp((s) => s.setTheme);
+  const setAppActiveWorkspace = useApp((s) => s.setActiveWorkspace);
 
   const [paths, setPaths] = useState<ConfigPaths | null>(null);
   const [globalCfg, setGlobalCfg] = useState<GlobalLlmConfig | null>(null);
@@ -119,7 +124,9 @@ export function SettingsView() {
         setWorkspaces(wsRes);
         const active: WorkspaceView | undefined =
           wsRes.find((w) => w.active) ?? wsRes[0];
-        setActiveWorkspaceLocal(active?.name ?? null);
+        const activeName = active?.name ?? null;
+        setActiveWorkspaceLocal(activeName);
+        useApp.getState().setActiveWorkspace(activeName);
         if (cfgRes.default_provider) {
           const known = PROVIDER_META.find((p) => p.id === cfgRes.default_provider);
           if (known) setProvider(known.id);
@@ -239,6 +246,7 @@ export function SettingsView() {
     try {
       await workspaceSetActive(name);
       setActiveWorkspaceLocal(name);
+      setAppActiveWorkspace(name);
       const wsRes = await workspaceList();
       setWorkspaces(wsRes);
       const ws = wsRes.find((w) => w.name === name);
@@ -248,6 +256,51 @@ export function SettingsView() {
       }
     } catch (e) {
       toast("Activate workspace failed", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function removeWorkspaceFromRegistry(name: string) {
+    const ok = window.confirm(
+      `Remove workspace “${name}” from ThinkingRoot?\n\nThis only unregisters the folder — it does not delete your project or .thinkingroot on disk.`,
+    );
+    if (!ok) return;
+    try {
+      const removed = await workspaceRemove(name);
+      if (!removed) {
+        toast("Remove workspace", {
+          kind: "warn",
+          body: `No registered workspace named “${name}”.`,
+        });
+        return;
+      }
+      const wsRes = await workspaceList();
+      setWorkspaces(wsRes);
+      const next =
+        wsRes.find((w) => w.active) ?? (wsRes.length > 0 ? wsRes[0] : undefined);
+      if (next) {
+        await workspaceSetActive(next.name);
+        setActiveWorkspaceLocal(next.name);
+        setAppActiveWorkspace(next.name);
+        try {
+          const llm = await workspaceLlmConfig(next.path);
+          setWsLlm(llm);
+        } catch {
+          setWsLlm(null);
+        }
+      } else {
+        setActiveWorkspaceLocal(null);
+        setAppActiveWorkspace(null);
+        setWsLlm(null);
+      }
+      toast("Workspace removed", {
+        kind: "success",
+        body: `${name} is no longer in the sidebar list.`,
+      });
+    } catch (e) {
+      toast("Remove workspace failed", {
         kind: "error",
         body: e instanceof Error ? e.message : String(e),
       });
@@ -384,32 +437,45 @@ export function SettingsView() {
                 {workspaces.map((w) => {
                   const isActive = activeWorkspace === w.name;
                   return (
-                    <button
+                    <div
                       key={w.name}
-                      type="button"
-                      onClick={() => void changeActiveWorkspace(w.name)}
                       className={cn(
-                        "flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-xs transition-colors",
-                        isActive
-                          ? "bg-accent/12 ring-1 ring-accent/40"
-                          : "hover:bg-muted/35",
+                        "flex w-full items-stretch gap-1 rounded-lg text-xs transition-colors",
+                        isActive ? "bg-accent/12 ring-1 ring-accent/40" : "hover:bg-muted/35",
                       )}
                     >
-                      <div className="flex min-w-0 flex-col">
-                        <span className="font-medium text-foreground">
-                          {w.name}
-                          {w.compiled && (
-                            <span className="ml-2 rounded bg-success/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-success">
-                              compiled
-                            </span>
-                          )}
-                        </span>
-                        <span className="font-mono text-[10px] text-muted-foreground">
-                          {w.path}
-                        </span>
-                      </div>
-                      {isActive && <Check className="size-3.5 text-accent" />}
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => void changeActiveWorkspace(w.name)}
+                        className="flex min-w-0 flex-1 items-center justify-between gap-3 px-3 py-2 text-left"
+                      >
+                        <div className="flex min-w-0 flex-col">
+                          <span className="font-medium text-foreground">
+                            {w.name}
+                            {w.compiled && (
+                              <span className="ml-2 rounded bg-success/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-success">
+                                compiled
+                              </span>
+                            )}
+                          </span>
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {w.path}
+                          </span>
+                        </div>
+                        {isActive && <Check className="size-3.5 shrink-0 text-accent" />}
+                      </button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-auto shrink-0 rounded-l-none text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                        aria-label={`Remove ${w.name} from workspace list`}
+                        title="Remove from list (does not delete files)"
+                        onClick={() => void removeWorkspaceFromRegistry(w.name)}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </div>
                   );
                 })}
               </div>
@@ -461,7 +527,7 @@ export function SettingsView() {
           <Section
             Icon={Plug}
             title="MCP"
-            body="The local MCP sidecar exposes the same tools (`ask`, `query_claims`, …) every cloud client uses, bound to 127.0.0.1 only. Paste a snippet into Claude Desktop, Cursor, Zed, etc. to connect."
+            body="The local MCP sidecar exposes the same tools (`ask`, `query_claims`, …) every cloud client uses, bound to 127.0.0.1 only. Auto-configure Claude Desktop, Cursor, Zed, Codex, etc. or copy the snippet manually."
           >
             <McpPane />
           </Section>
@@ -692,6 +758,7 @@ function McpPane() {
   const [tool, setTool] = useState<McpToolKey>("claude-desktop");
   const [snippet, setSnippet] = useState<string>("");
   const [loading, setLoading] = useState(true);
+  const [configuring, setConfiguring] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -733,6 +800,26 @@ function McpPane() {
         kind: "error",
         body: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  async function configureSelectedTool() {
+    setConfiguring(true);
+    try {
+      const result = await mcpConfigureTool(tool);
+      toast(`${result.tool} configured`, {
+        kind: "success",
+        body: `Wrote ThinkingRoot MCP config to ${result.path}. Restart ${result.tool} to pick it up.`,
+        durationMs: 7000,
+      });
+    } catch (err) {
+      toast("Auto-config failed", {
+        kind: "error",
+        body: err instanceof Error ? err.message : String(err),
+        durationMs: 8000,
+      });
+    } finally {
+      setConfiguring(false);
     }
   }
 
@@ -800,21 +887,37 @@ function McpPane() {
         <pre className="overflow-x-auto rounded-xl bg-muted/30 p-3 font-mono text-[11px] leading-relaxed text-foreground">
           {snippet || "(loading…)"}
         </pre>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={copySnippet}
-          disabled={!snippet}
-          className="absolute right-2 top-2 h-7 gap-1 text-[11px]"
-        >
-          <Copy className="size-3" /> Copy
-        </Button>
+        <div className="absolute right-2 top-2 flex gap-1.5">
+          <Button
+            size="sm"
+            variant="default"
+            onClick={() => void configureSelectedTool()}
+            disabled={configuring}
+            className="h-7 gap-1 text-[11px]"
+          >
+            {configuring ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <Plug className="size-3" />
+            )}
+            Auto configure
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={copySnippet}
+            disabled={!snippet}
+            className="h-7 gap-1 text-[11px]"
+          >
+            <Copy className="size-3" /> Copy
+          </Button>
+        </div>
       </div>
 
       <p className="text-[10px] text-muted-foreground">
-        Stdio entries spawn `root serve --mcp-stdio` per session, so the AI
-        tool talks to the local engine directly. Restart the AI tool after
-        pasting the snippet.
+        Auto configure writes the same entry shown above. Stdio tools spawn
+        `root serve --mcp-stdio` per session; restart the AI tool after the
+        config is written.
       </p>
     </div>
   );

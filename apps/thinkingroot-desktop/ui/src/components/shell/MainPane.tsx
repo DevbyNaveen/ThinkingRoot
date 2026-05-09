@@ -1,4 +1,5 @@
 import { ChatView } from "@/components/chat/ChatView";
+import { DocsView } from "@/components/docs/DocsView";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { useApp } from "@/store/app";
 
@@ -12,7 +13,13 @@ export function MainPane() {
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <div className="flex-1 overflow-hidden">
-        {surface === "settings" ? <SettingsView /> : <ChatView />}
+        {surface === "settings" ? (
+          <SettingsView />
+        ) : surface === "docs" ? (
+          <DocsView />
+        ) : (
+          <ChatView />
+        )}
       </div>
     </main>
   );
