@@ -19,10 +19,16 @@ export type RightRailTab =
   | "branches"
   | "privacy";
 
-/** Surfaces in the layout. Brain/Branches/Privacy have moved to the
- * right-rail tab panel; only chats and settings remain as full
- * main-pane surfaces. */
-export type Surface = "chats" | "settings";
+/** Surfaces in the layout.
+ *
+ * Conceptually `"chats"` and `"settings"` are the only full main-pane
+ * surfaces post-Stream-F; Brain/Branches/Privacy have moved to the
+ * right-rail tab panel. The two legacy values stay in the union
+ * because the command palette + IconRail still navigate via Surface
+ * tags as a side-effect ("show me Brain" → flips the right-rail tab
+ * to brain). Removing them would force every call site through a
+ * separate "rail target" type for no real gain. */
+export type Surface = "chats" | "settings" | "brain" | "privacy" | "branches";
 
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {

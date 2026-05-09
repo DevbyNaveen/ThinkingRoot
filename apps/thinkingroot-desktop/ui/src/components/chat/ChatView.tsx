@@ -758,15 +758,6 @@ function LlmHealthBanner({
   return null;
 }
 
-function ChatHeader({
-  workspace,
-  convTitle,
-}: {
-  workspace: string;
-  convTitle: string;
-}) {
-  return null;
-}
 
 function NoWorkspace() {
   return (

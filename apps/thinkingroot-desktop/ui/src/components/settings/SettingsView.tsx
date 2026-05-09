@@ -7,12 +7,10 @@ import {
   Bell,
   Plug,
   Save,
-  AlertTriangle,
   Check,
   Copy,
   X,
 } from "lucide-react";
-import { motion } from "framer-motion";
 import {
   configPaths,
   credentialsRemove,
@@ -337,7 +335,7 @@ export function SettingsView() {
                         [providerMeta.env_var]: e.target.value,
                       }))
                     }
-                    className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+                    className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
                   />
                   {credForActive?.persisted && (
                     <Button
@@ -650,58 +648,6 @@ function AzureWorkspaceCard({
   );
 }
 
-function Header({
-  dirty,
-  saving,
-  onSave,
-  configPath,
-  credentialsPath,
-}: {
-  dirty: boolean;
-  saving: boolean;
-  onSave: () => void;
-  configPath?: string;
-  credentialsPath?: string;
-}) {
-  return (
-    <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-surface px-3 py-2">
-      <div className="flex items-center gap-2">
-        <SettingsIcon className="size-4 text-accent" />
-        <h2 className="text-sm font-medium tracking-tight">Settings</h2>
-        {configPath && (
-          <span
-            className="font-mono text-[10px] text-muted-foreground"
-            title={`config: ${configPath}\ncredentials: ${credentialsPath ?? "—"}`}
-          >
-            {configPath}
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        {dirty && !saving && (
-          <motion.span
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="flex items-center gap-1 text-[11px] text-warn"
-          >
-            <AlertTriangle className="size-3" />
-            unsaved changes
-          </motion.span>
-        )}
-        <Button
-          onClick={onSave}
-          disabled={!dirty || saving}
-          size="sm"
-          className="h-7 gap-1 text-xs"
-        >
-          <Save className="size-3" />
-          {saving ? "Saving…" : "Save"}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 function Section({
   Icon,
   title,
@@ -896,4 +842,4 @@ function Field({
 }
 
 const fieldClass =
-  "h-9 w-full rounded-lg border border-input/70 bg-background/70 px-2.5 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40";
+  "h-9 w-full rounded-lg border border-input/70 bg-background/70 px-2.5 text-xs font-mono text-foreground focus:outline-none";

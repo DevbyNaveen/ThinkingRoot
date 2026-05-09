@@ -223,7 +223,7 @@ export function RightRail() {
         )}
         {activeTab === "privacy" && (
           <div className="flex-1 overflow-hidden">
-            <PrivacyDashboard panelMode />
+            <PrivacyDashboard />
           </div>
         )}
       </div>
