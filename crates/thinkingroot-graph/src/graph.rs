@@ -4784,17 +4784,6 @@ pub struct EntityContext {
     pub contradictions: Vec<ContextContradiction>,
 }
 
-/// A direct neighbour of the focal entity in the graph.
-#[derive(Debug, Clone, Serialize)]
-pub struct NeighborhoodEntity {
-    pub name: String,
-    pub entity_type: String,
-    pub relation_type: String,
-    /// "outgoing" (focal → neighbour) or "incoming" (neighbour → focal).
-    pub direction: String,
-    pub claim_count: usize,
-}
-
 /// Top entity by claim count — used for workspace overview.
 #[derive(Debug, Clone, Serialize)]
 pub struct TopEntity {
@@ -4998,58 +4987,6 @@ impl GraphStore {
 
     /// Return all direct neighbours (radius = 1) of `entity_name`, in both
     /// directions, with their entity type and claim count.
-    pub fn get_neighborhood(&self, entity_name: &str) -> Result<Vec<NeighborhoodEntity>> {
-        let mut params = BTreeMap::new();
-        params.insert("name".into(), DataValue::Str(entity_name.into()));
-
-        // Outgoing: focal → neighbour.
-        let out_rows = self
-            .db
-            .run_script(
-                r#"?[neighbor_name, neighbor_type, rel_type] :=
-                    *entities{id: eid, canonical_name: $name},
-                    *entity_relations{from_id: eid, to_id, relation_type: rel_type},
-                    *entities{id: to_id, canonical_name: neighbor_name, entity_type: neighbor_type}"#,
-                params.clone(),
-                ScriptMutability::Immutable,
-            )
-            .map_err(|e| Error::GraphStorage(format!("neighborhood_out query failed: {e}")))?;
-
-        // Incoming: neighbour → focal.
-        let in_rows = self
-            .db
-            .run_script(
-                r#"?[neighbor_name, neighbor_type, rel_type] :=
-                    *entities{id: eid, canonical_name: $name},
-                    *entity_relations{from_id, to_id: eid, relation_type: rel_type},
-                    *entities{id: from_id, canonical_name: neighbor_name, entity_type: neighbor_type}"#,
-                params,
-                ScriptMutability::Immutable,
-            )
-            .map_err(|e| Error::GraphStorage(format!("neighborhood_in query failed: {e}")))?;
-
-        let mut neighbors: Vec<NeighborhoodEntity> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (rows, direction) in [(&out_rows.rows, "outgoing"), (&in_rows.rows, "incoming")] {
-            for row in rows {
-                let name = dv_to_string(&row[0]);
-                if seen.insert(name.clone()) {
-                    let claim_count = self.get_claim_count_for_entity_name(&name).unwrap_or(0);
-                    neighbors.push(NeighborhoodEntity {
-                        name,
-                        entity_type: dv_to_string(&row[1]),
-                        relation_type: dv_to_string(&row[2]),
-                        direction: direction.to_string(),
-                        claim_count,
-                    });
-                }
-            }
-        }
-
-        Ok(neighbors)
-    }
-
     /// Return the top `limit` entities ranked by claim count.
     pub fn get_top_entities_by_claim_count(&self, limit: usize) -> Result<Vec<TopEntity>> {
         // Push the caller's `limit` into the Datalog query so a
@@ -5090,25 +5027,6 @@ impl GraphStore {
                 },
             })
             .collect())
-    }
-
-    /// Count claims linked to an entity looked up by canonical name.
-    fn get_claim_count_for_entity_name(&self, entity_name: &str) -> Result<usize> {
-        let mut params = BTreeMap::new();
-        params.insert("name".into(), DataValue::Str(entity_name.into()));
-
-        let result = self
-            .db
-            .run_script(
-                r#"?[count(cid)] :=
-                    *entities{id: eid, canonical_name: $name},
-                    *claim_entity_edges{claim_id: cid, entity_id: eid}"#,
-                params,
-                ScriptMutability::Immutable,
-            )
-            .map_err(|e| Error::GraphStorage(format!("claim_count query failed: {e}")))?;
-
-        Ok(count_from_rows(&result.rows))
     }
 
     /// Find an entity by exact canonical name (case-insensitive) or by alias.
