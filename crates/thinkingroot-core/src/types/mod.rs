@@ -12,6 +12,7 @@ mod relation;
 mod source;
 mod workspace;
 mod workspace_event;
+mod workspace_status;
 
 pub use artifact::*;
 pub use branch::*;
@@ -30,6 +31,7 @@ pub use relation::*;
 pub use source::*;
 pub use workspace::*;
 pub use workspace_event::*;
+pub use workspace_status::*;
 
 // --- Type-safe ID aliases ---
 

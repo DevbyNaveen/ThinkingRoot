@@ -17,6 +17,13 @@ import {
   type PackExportResult,
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
+import {
+  exportButtonEnabled,
+  pickPrimaryDiagnostic,
+  useDiagnosticsFor,
+  useWorkspaceStatus,
+  useWorkspaceStatusSubscription,
+} from "@/store/workspace-status";
 
 interface Props {
   /** Absolute path to the workspace whose substrate to pack. */
@@ -93,9 +100,19 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
     };
   }, [workspace]);
 
-  const compiled = estimate?.compiled ?? false;
+  // Slice 0 — unified workspace status. Pre-Slice-0 the export sheet
+  // read its own `pack_estimate` Tauri command and decided "compiled
+  // = bool" from a substrate-only check, which conflicted with the
+  // right-rail badge and the chat banner. Now we read the same
+  // snapshot every other view reads, including the diagnostic that
+  // explains *why* export is blocked (no claims, no sources, mid-
+  // compile, …).
+  useWorkspaceStatusSubscription(workspace);
+  const status = useWorkspaceStatus(workspace);
+  const exportDiagnostics = useDiagnosticsFor(workspace, "for_export");
+  const blocker = pickPrimaryDiagnostic(status, "for_export");
   const submittable =
-    compiled &&
+    exportButtonEnabled(status) &&
     form.name.trim().length > 0 &&
     form.version.trim().length > 0 &&
     /^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(form.name.trim()) &&
@@ -180,13 +197,32 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
         </header>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 text-sm">
-          {!compiled && (
-            <div className="mb-4 rounded-md border border-warn bg-warn/10 px-3 py-2 text-xs text-warn-foreground">
-              <strong>Workspace not compiled.</strong> Run <code>Compile</code>{" "}
-              from the brain surface (or <code>root compile</code>) before
-              exporting.
+          {exportDiagnostics.length > 0 && (
+            <div className="mb-4 flex flex-col gap-1 rounded-md border border-warn bg-warn/10 px-3 py-2 text-xs text-warn-foreground">
+              {exportDiagnostics.map((d) => (
+                <div key={d.code} className="flex flex-col gap-0.5">
+                  <span>
+                    <strong>
+                      {d.severity === "error" ? "Cannot export." : "Heads up."}
+                    </strong>{" "}
+                    {d.message}
+                  </span>
+                  {d.actions.length > 0 && (
+                    <span className="text-[10px] opacity-80">
+                      Suggested: {d.actions.map((a) => a.label).join(" · ")}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
           )}
+          {blocker === null &&
+            exportButtonEnabled(status) === false &&
+            status === null && (
+              <div className="mb-4 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Loading workspace status…
+              </div>
+            )}
 
           <div className="grid grid-cols-1 gap-3">
             <Field
@@ -288,7 +324,7 @@ function Field(props: {
     <label className="flex flex-col gap-1 text-xs">
       <span className="text-muted-foreground">{props.label}</span>
       <input
-        className="rounded-md border border-border bg-surface px-2 py-1 text-sm focus:border-accent focus:outline-none"
+        className="rounded-md border border-border bg-surface px-2 py-1 text-sm focus:outline-none"
         value={props.value}
         placeholder={props.placeholder}
         onChange={(e) => props.onChange(e.target.value)}

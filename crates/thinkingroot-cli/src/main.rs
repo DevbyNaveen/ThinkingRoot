@@ -34,6 +34,7 @@ mod retrieve_cmd;
 mod rooting_cmd;
 mod serve;
 mod setup;
+mod status_cmd;
 mod tag_cmd;
 mod update_cmd;
 mod watch;
@@ -153,6 +154,30 @@ enum Commands {
         /// lockfile exists.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+    },
+    /// Show unified workspace status (Slice 0).
+    ///
+    /// Reads the daemon's `/api/v1/workspaces/{name}/status` endpoint
+    /// — the same source of truth the desktop's right-rail badge,
+    /// chat banner, and export dialog all consume. With `--watch`,
+    /// streams every state change from the SSE companion endpoint.
+    ///
+    /// Distinct from the legacy `root status` (which reports branch +
+    /// filesystem state of a path); `workspace-status` reports the
+    /// daemon-tracked unified status across substrate, sources,
+    /// mount, LLM, compile, and branch axes.
+    WorkspaceStatus {
+        /// Workspace name (defaults to the active workspace from the
+        /// registry when omitted).
+        name: Option<String>,
+        /// Emit the JSON snapshot on stdout instead of formatted
+        /// human prose. Useful for piping into `jq` or scripting.
+        #[arg(long)]
+        json: bool,
+        /// Subscribe to the SSE stream and print every snapshot until
+        /// Ctrl-C. Honours the same JSON / human-prose flag.
+        #[arg(long)]
+        watch: bool,
     },
     /// Initialize a new ThinkingRoot workspace
     Init {
@@ -1438,6 +1463,18 @@ async fn async_main() -> anyhow::Result<()> {
             })
             .await?;
             std::process::exit(exit_code);
+        }
+        Some(Commands::WorkspaceStatus { name, json, watch }) => {
+            // The unified workspace-status command always goes through
+            // the cortex — the snapshot lives in the daemon's
+            // per-workspace state-machine actor. Without a daemon,
+            // there is nothing to show.
+            status_cmd::run_status(status_cmd::StatusOpts {
+                name,
+                json,
+                watch,
+            })
+            .await?;
         }
         Some(Commands::Init { path }) => {
             // `init` is stateless — it creates a `.thinkingroot/`

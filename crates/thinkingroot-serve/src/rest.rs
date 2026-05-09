@@ -15,9 +15,10 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::engine::{ClaimFilter, QueryEngine};
+use crate::workspace_state::{Msg as WorkspaceStatusMsg, WorkspaceStateRegistry};
 use crate::workspace_watcher::WatcherHandle;
 use thinkingroot_core::BranchEvent;
-use thinkingroot_core::types::{WorkspaceEvent, WorkspaceState};
+use thinkingroot_core::types::{WorkspaceEvent, WorkspaceState, WorkspaceStatusEvent};
 
 // ─── App State ───────────────────────────────────────────────
 
@@ -75,6 +76,14 @@ pub struct AppState {
     /// disappears.  `None` in the in-process / legacy code paths that
     /// don't run a daemon (CLI `--in-process`, MCP stdio).
     pub workspace_watcher: Arc<RwLock<Option<Arc<WatcherHandle>>>>,
+    /// Slice 0 — per-workspace state-machine actor registry. Mount /
+    /// unmount / compile / fs-watcher push [`WorkspaceStatusMsg`]s into
+    /// the matching actor; the `/api/v1/workspaces/{name}/status` and
+    /// `/status/stream` endpoints read from it. The five contradicting
+    /// per-view probes (`pack_estimate`, `llm_health`, `mcp_list_connected`,
+    /// `workspace_compile_state`, right-rail substrate poll) all collapse
+    /// to a single subscriber on this registry.
+    pub workspace_status: Arc<WorkspaceStateRegistry>,
 }
 
 impl AppState {
@@ -103,6 +112,7 @@ impl AppState {
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
             active_merges: Arc::new(RwLock::new(HashMap::new())),
             workspace_watcher: Arc::new(RwLock::new(None)),
+            workspace_status: Arc::new(WorkspaceStateRegistry::new()),
         })
     }
 
@@ -297,6 +307,23 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route(
                 "/workspaces/{name}",
                 delete(unmount_workspace_handler),
+            )
+            // Slice 0 — unified workspace status surface. One source of
+            // truth for substrate / sources / mount / llm / compile /
+            // branch axes plus pure-derived readiness flags. All five
+            // pre-Slice-0 view-side probes collapse to a single
+            // subscriber on `/status/stream`.
+            .route(
+                "/workspaces/{name}/status",
+                get(workspace_status_handler),
+            )
+            .route(
+                "/workspaces/{name}/status/stream",
+                get(workspace_status_stream_handler),
+            )
+            .route(
+                "/workspaces/{name}/refresh",
+                post(workspace_status_refresh_handler),
             )
             .route("/ws/{ws}/entities", get(list_entities))
             .route("/ws/{ws}/entities/{name}", get(get_entity))
@@ -689,6 +716,13 @@ async fn mount_workspace_handler(
         );
     }
 
+    // Slice 0 — flag the actor that mount is in flight so subscribers
+    // see a `Mounting` snapshot instead of jumping NotMounted → Mounted.
+    state
+        .workspace_status
+        .dispatch(&name, root_path.clone(), WorkspaceStatusMsg::MountAttempt)
+        .await;
+
     let mut engine = state.engine.write().await;
     let mount_result = match body.data_dir.as_deref() {
         Some(dd) => {
@@ -700,6 +734,18 @@ async fn mount_workspace_handler(
         None => engine.mount(name.clone(), root_path.clone()).await,
     };
     if let Err(e) = mount_result {
+        // Slice 0 — propagate the failure to the actor before
+        // converting the error into the HTTP response so the desktop's
+        // status stream surfaces `MountState::Failed` immediately.
+        let reason = format!("{e}");
+        state
+            .workspace_status
+            .dispatch(
+                &name,
+                root_path.clone(),
+                WorkspaceStatusMsg::MountFailed { reason },
+            )
+            .await;
         return match_engine_error(e);
     }
 
@@ -714,6 +760,32 @@ async fn mount_workspace_handler(
         .unwrap_or((0, 0, 0));
 
     drop(engine);
+
+    // Slice 0 — push live counts into the actor. The state machine
+    // moves to `MountState::Mounted` and `SubstrateState::Populated`
+    // (or `Empty` when claim_count == 0). All views read from the
+    // resulting snapshot — no more per-view probes.
+    let graph_db_bytes = match tokio::fs::metadata(
+        root_path.join(".thinkingroot").join("graph").join("graph.db"),
+    )
+    .await
+    {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+    state
+        .workspace_status
+        .dispatch(
+            &name,
+            root_path.clone(),
+            WorkspaceStatusMsg::MountSucceeded {
+                claim_count: claim_count as u64,
+                entity_count: entity_count as u64,
+                source_count_at_last_compile: source_count as u64,
+                graph_db_bytes,
+            },
+        )
+        .await;
 
     // Emit RARP-aware invalidation so any pre-existing engrams pinned
     // to a same-named workspace are dropped — defends against the
@@ -752,6 +824,14 @@ async fn unmount_workspace_handler(
     drop(engine);
 
     state.engram_manager.invalidate_workspace(&name).await;
+
+    // Slice 0 — flip the status actor to `NotMounted`. The actor
+    // remains live so subscribers keep their stream until the
+    // workspace is genuinely removed (the registry remove is the
+    // disposal path).
+    if let Some(actor) = state.workspace_status.get(&name).await {
+        let _ = actor.send(WorkspaceStatusMsg::Unmounted).await;
+    }
 
     ok_response(serde_json::json!({ "unmounted": name })).into_response()
 }
@@ -1474,7 +1554,7 @@ struct CompileStreamRequest {
 
 async fn compile_stream(
     State(state): State<Arc<AppState>>,
-    Path(_ws): Path<String>,
+    Path(ws): Path<String>,
     Json(body): Json<CompileStreamRequest>,
 ) -> Response {
     use crate::pipeline::{PipelineOptions, ProgressEvent, run_pipeline_with_options};
@@ -1502,6 +1582,19 @@ async fn compile_stream(
 
     let branch = body.branch.clone();
     let no_rooting = body.no_rooting;
+
+    // Slice 0 — flag the actor that compile started so subscribers
+    // see `CompileState::Running`. The actor is keyed by URL `ws` name;
+    // if the request bypassed the registry (workspace not registered)
+    // we still spawn an actor for the path so refresh / status calls
+    // work after the first compile.
+    let status_name = ws.clone();
+    let status_path = root_path.clone();
+    state
+        .workspace_status
+        .dispatch(&status_name, status_path.clone(), WorkspaceStatusMsg::CompileStarted)
+        .await;
+    let compile_started = std::time::Instant::now();
 
     // The DropGuard fires the cancel token when the SSE stream is
     // dropped (client disconnect, axum body cancellation, etc.).
@@ -1564,21 +1657,115 @@ async fn compile_stream(
         // Channel closed → the pipeline task has finished. Await
         // its outcome and emit a single terminator event.
         if let Some(h) = handle.take() {
+            // Slice 0 — translate the pipeline outcome into a
+            // `CompileFinished` actor message before yielding the
+            // terminator event. The actor moves substrate to
+            // Populated/Empty (or holds steady on Failed/Cancelled)
+            // so every UI surface sees the same post-compile state
+            // without re-probing.
+            let duration_ms = compile_started.elapsed().as_millis() as u64;
             match h.await {
                 Ok(Ok(result)) => {
+                    let outcome = if result.failed_batches > 0 {
+                        thinkingroot_core::types::CompileOutcome::Partial {
+                            extracted_claims: result.claims_count as u64,
+                            failed_batches: result.failed_batches as u64,
+                            summary: format!("{} LLM batches", result.failed_batches),
+                        }
+                    } else {
+                        thinkingroot_core::types::CompileOutcome::Success {
+                            extracted_claims: result.claims_count as u64,
+                            sources_processed: result.files_parsed as u64,
+                        }
+                    };
+                    let graph_db_bytes = match tokio::fs::metadata(
+                        status_path
+                            .join(".thinkingroot")
+                            .join("graph")
+                            .join("graph.db"),
+                    )
+                    .await
+                    {
+                        Ok(m) => m.len(),
+                        Err(_) => 0,
+                    };
+                    state
+                        .workspace_status
+                        .dispatch(
+                            &status_name,
+                            status_path.clone(),
+                            WorkspaceStatusMsg::CompileFinished {
+                                outcome,
+                                duration_ms,
+                                claim_count: result.claims_count as u64,
+                                entity_count: result.entities_count as u64,
+                                graph_db_bytes,
+                            },
+                        )
+                        .await;
                     let payload = serde_json::to_string(&result)
                         .unwrap_or_else(|_| "{}".to_string());
                     yield Ok(Event::default().event("done").data(payload));
                 }
                 Ok(Err(e)) if e.is_cancelled() => {
+                    state
+                        .workspace_status
+                        .dispatch(
+                            &status_name,
+                            status_path.clone(),
+                            WorkspaceStatusMsg::CompileFinished {
+                                outcome: thinkingroot_core::types::CompileOutcome::Cancelled {
+                                    phase: "unknown".into(),
+                                },
+                                duration_ms,
+                                claim_count: 0,
+                                entity_count: 0,
+                                graph_db_bytes: 0,
+                            },
+                        )
+                        .await;
                     yield Ok(Event::default().event("cancelled").data("{}"));
                 }
                 Ok(Err(e)) => {
+                    state
+                        .workspace_status
+                        .dispatch(
+                            &status_name,
+                            status_path.clone(),
+                            WorkspaceStatusMsg::CompileFinished {
+                                outcome: thinkingroot_core::types::CompileOutcome::Failed {
+                                    phase: "unknown".into(),
+                                    reason: e.to_string(),
+                                },
+                                duration_ms,
+                                claim_count: 0,
+                                entity_count: 0,
+                                graph_db_bytes: 0,
+                            },
+                        )
+                        .await;
                     let payload =
                         serde_json::json!({ "error": e.to_string() }).to_string();
                     yield Ok(Event::default().event("failed").data(payload));
                 }
                 Err(e) => {
+                    state
+                        .workspace_status
+                        .dispatch(
+                            &status_name,
+                            status_path.clone(),
+                            WorkspaceStatusMsg::CompileFinished {
+                                outcome: thinkingroot_core::types::CompileOutcome::Failed {
+                                    phase: "unknown".into(),
+                                    reason: format!("task panicked: {e}"),
+                                },
+                                duration_ms,
+                                claim_count: 0,
+                                entity_count: 0,
+                                graph_db_bytes: 0,
+                            },
+                        )
+                        .await;
                     let payload = serde_json::json!({
                         "error": format!("pipeline task panicked: {e}"),
                     })
@@ -3992,6 +4179,139 @@ async fn stream_workspace_events_handler(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+// ─── Slice 0: unified workspace status ───────────────────────
+
+/// `GET /api/v1/workspaces/{name}/status` — current full snapshot.
+///
+/// One-shot read; for live updates connect to
+/// [`workspace_status_stream_handler`]. The body is a
+/// [`WorkspaceStatus`] (the same shape served on the SSE stream's
+/// `Snapshot` events) so consumers can use one decoder for both routes.
+async fn workspace_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let path = match resolve_workspace_path(&state, &name).await {
+        Some(p) => p,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                &format!("workspace `{name}` is not registered"),
+            );
+        }
+    };
+    let actor = state.workspace_status.ensure(&name, path).await;
+    let snap = actor.current().await;
+    Json(snap).into_response()
+}
+
+/// `GET /api/v1/workspaces/{name}/status/stream` — SSE stream of
+/// [`WorkspaceStatusEvent`]s. The first event a fresh subscriber
+/// receives is a `snapshot` carrying the actor's current state, so
+/// connect-then-render is a one-roundtrip operation; subsequent
+/// `snapshot` and `heartbeat` events follow.
+///
+/// Mirrors the broadcast → SSE pattern of
+/// [`stream_branch_events_handler`] (T1.6) so the two surfaces share
+/// the same lagged-event semantics and keep-alive cadence.
+async fn workspace_status_stream_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    use tokio_stream::StreamExt as _;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let path = match resolve_workspace_path(&state, &name).await {
+        Some(p) => p,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                &format!("workspace `{name}` is not registered"),
+            );
+        }
+    };
+    let actor = state.workspace_status.ensure(&name, path).await;
+
+    // Capture the current snapshot so the very first event the client
+    // sees is a complete `Snapshot` — never an empty connect followed
+    // by a wait for the next state change.
+    let initial = actor.current().await;
+    let initial_event = WorkspaceStatusEvent::Snapshot(initial);
+    let initial_payload =
+        serde_json::to_string(&initial_event).unwrap_or_else(|_| "{}".to_string());
+
+    let rx = actor.subscribe();
+    let live = BroadcastStream::new(rx).map(|res| match res {
+        Ok(event) => {
+            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            let kind = match &event {
+                WorkspaceStatusEvent::Snapshot(_) => "snapshot",
+                WorkspaceStatusEvent::Heartbeat { .. } => "heartbeat",
+            };
+            Ok::<Event, std::convert::Infallible>(Event::default().event(kind).data(payload))
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Ok(Event::default().event("lagged").data(payload))
+        }
+    });
+    let initial_stream = tokio_stream::once(Ok::<Event, std::convert::Infallible>(
+        Event::default().event("snapshot").data(initial_payload),
+    ));
+    let stream = initial_stream.chain(live);
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// `POST /api/v1/workspaces/{name}/refresh` — force the actor to
+/// re-probe the on-disk substrate + sources axes. Used by the desktop
+/// "Refresh" command palette entry and by long-idle clients that
+/// suspect the watcher missed an event.
+async fn workspace_status_refresh_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let path = match resolve_workspace_path(&state, &name).await {
+        Some(p) => p,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                &format!("workspace `{name}` is not registered"),
+            );
+        }
+    };
+    let actor = state.workspace_status.ensure(&name, path).await;
+    if let Err(e) = actor.send(WorkspaceStatusMsg::Refresh).await {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ACTOR_DOWN",
+            &format!("status actor inbox closed: {e}"),
+        );
+    }
+    ok_response(serde_json::json!({ "refreshed": name })).into_response()
+}
+
+/// Resolve `<name> → <root_path>` from the engine's mounted workspaces
+/// list. Returns `None` for unregistered names so the three status
+/// endpoints can refuse with a 404 rather than spawning a phantom actor.
+async fn resolve_workspace_path(state: &AppState, name: &str) -> Option<PathBuf> {
+    let engine = state.engine.read().await;
+    let list = engine.list_workspaces().await.ok()?;
+    list.into_iter()
+        .find(|w| w.name == name)
+        .map(|w| PathBuf::from(w.path))
 }
 
 // ─── Error Mapping ───────────────────────────────────────────

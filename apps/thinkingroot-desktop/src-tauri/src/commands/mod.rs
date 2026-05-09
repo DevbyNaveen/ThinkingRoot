@@ -33,4 +33,5 @@ pub mod settings;
 pub mod sidecar;
 pub mod sidecar_client;
 pub mod tag;
+pub mod workspace_status;
 pub mod workspaces;

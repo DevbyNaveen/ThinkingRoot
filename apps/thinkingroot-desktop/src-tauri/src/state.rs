@@ -6,9 +6,11 @@
 //! opens `graph.db` itself; the daemon stays the single owner per the
 //! Cortex Protocol invariant.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex as AsyncMutex;
+use thinkingroot_core::types::WorkspaceStatus;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 /// All process-wide state owned by Tauri's `app.manage(...)`.
@@ -27,6 +29,20 @@ pub struct AppState {
     /// button possible — `cancel.cancel()` propagates through the
     /// pipeline orchestrator and aborts in-flight LLM batches.
     pub active_compile: AsyncMutex<Option<CompileHandle>>,
+    /// Slice 0 — cached unified workspace status, keyed by workspace
+    /// name. Mirrors what the daemon's status-stream SSE has pushed.
+    /// Every UI surface reads from here through the
+    /// `workspace_status_get` Tauri command + the `workspace_status:{name}`
+    /// Tauri events that fire on every cache update. Removes the five
+    /// independent per-view probes the pre-Slice-0 desktop had.
+    pub workspace_status: Arc<RwLock<HashMap<String, WorkspaceStatus>>>,
+    /// Slice 0 — handle for the live SSE subscriber that mirrors the
+    /// daemon's `/status/stream` into [`AppState::workspace_status`].
+    /// The slot is `Some` while a subscriber is running; the
+    /// `subscribe_workspace_status_stream` command swaps it for a
+    /// fresh handle (cancelling the previous one) when the active
+    /// workspace changes.
+    pub workspace_status_subscriber: AsyncMutex<Option<WorkspaceStatusSubscriberHandle>>,
 }
 
 /// Live handle for an in-progress workspace compile.
@@ -56,4 +72,17 @@ pub struct SidecarHandle {
     pub port: u16,
     pub pid: Option<u32>,
     pub child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+}
+
+/// Slice 0 — handle for an active SSE subscriber to the daemon's
+/// `/api/v1/workspaces/{name}/status/stream` endpoint. The subscriber
+/// task runs on a tokio spawn; tripping `cancel` exits the next
+/// receive loop and the task ends cleanly. The handle is recreated
+/// on every workspace switch.
+#[derive(Debug)]
+pub struct WorkspaceStatusSubscriberHandle {
+    /// Workspace name the subscriber is currently bound to.
+    pub workspace: String,
+    /// Cancellation token; cancelled to stop the subscriber.
+    pub cancel: CancellationToken,
 }

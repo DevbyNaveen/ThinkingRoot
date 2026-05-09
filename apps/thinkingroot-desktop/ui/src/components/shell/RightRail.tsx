@@ -49,6 +49,13 @@ import {
   type BranchView,
   type WorkspaceView,
 } from "@/lib/tauri";
+import {
+  pickPrimaryDiagnostic,
+  substrateBadge,
+  useWorkspaceConnection,
+  useWorkspaceStatus,
+  useWorkspaceStatusSubscription,
+} from "@/store/workspace-status";
 import type { RightRailTab } from "@/types";
 
 const MIN_WIDTH = 250;
@@ -242,6 +249,17 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
   const [w, setW] = useState<WorkspaceView | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Slice 0 — subscribe to the daemon's unified status stream for the
+  // active workspace. The previous code read `w.compiled` (a single
+  // boolean from `workspaceList()`) which collapsed five distinct
+  // substrate states to "compiled / uncompiled" and disagreed with
+  // the chat banner, the export dialog, and the MCP TOOLS panel.
+  // The unified status replaces that with a five-tone badge driven
+  // by `substrate.kind`.
+  useWorkspaceStatusSubscription(activeWorkspace);
+  const status = useWorkspaceStatus(activeWorkspace);
+  const conn = useWorkspaceConnection(activeWorkspace);
+
   useEffect(() => {
     let cancelled = false;
     if (!activeWorkspace) { setW(null); return; }
@@ -262,6 +280,43 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
     );
   }
 
+  const badge = substrateBadge(status);
+  const compileDiag = pickPrimaryDiagnostic(status, "for_compile");
+  const queryDiag = pickPrimaryDiagnostic(status, "for_query");
+  const isPopulated = status?.substrate.kind === "populated";
+  const compileButtonLabel = isPopulated ? "Recompile Workspace" : "Compile Workspace";
+  const badgeTitle = (() => {
+    switch (status?.substrate.kind) {
+      case "absent":
+        return "No substrate yet — run Compile to initialise.";
+      case "empty":
+        return "Substrate exists but has no claims yet — add sources and recompile.";
+      case "populated":
+        return `Substrate ready — ${status.substrate.claim_count} claim(s), ${status.substrate.entity_count} entity(s).`;
+      case "orphaned":
+        return "Substrate was deleted from disk while the daemon held it open.";
+      case "corrupt":
+        return `Substrate refused to open: ${status.substrate.reason}`;
+      default:
+        return "Loading substrate state…";
+    }
+  })();
+  const toneClass = (() => {
+    switch (badge.tone) {
+      case "ok":
+        return "bg-emerald-500/15 text-emerald-400";
+      case "warn":
+        return "bg-amber-500/15 text-amber-400";
+      case "error":
+        return "bg-rose-500/15 text-rose-400";
+      case "info":
+        return "bg-sky-500/15 text-sky-400";
+      case "muted":
+      default:
+        return "bg-muted/40 text-muted-foreground";
+    }
+  })();
+
   return (
     <section className="flex flex-col gap-3.5">
       <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
@@ -270,22 +325,37 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
       <div className="flex items-center gap-1.5 text-xs">
         <Folder className="size-3.5 text-muted-foreground" />
         <span className="truncate font-medium">{activeWorkspace}</span>
-        {w?.compiled ? (
-          <span
-            className="ml-auto rounded-full bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-emerald-400"
-            title="Workspace has been compiled at least once (graph.db present)."
-          >
-            compiled
-          </span>
-        ) : (
-          <span
-            className="ml-auto rounded-full bg-amber-500/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-amber-400"
-            title="Workspace has not been compiled yet — click Compile Workspace to build the substrate."
-          >
-            uncompiled
-          </span>
-        )}
+        <span
+          className={cn(
+            "ml-auto rounded-full px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider",
+            toneClass,
+          )}
+          title={badgeTitle}
+        >
+          {badge.label}
+        </span>
       </div>
+      {!conn.connected && conn.lastSeenMs && (
+        <p className="text-[10px] text-muted-foreground/80">
+          Status disconnected — last seen{" "}
+          {Math.round((Date.now() - conn.lastSeenMs) / 1000)}s ago
+        </p>
+      )}
+      {(queryDiag ?? compileDiag) && (
+        <p
+          className={cn(
+            "text-[11px] leading-snug",
+            (queryDiag ?? compileDiag)?.severity === "error"
+              ? "text-rose-400"
+              : (queryDiag ?? compileDiag)?.severity === "warn"
+                ? "text-amber-400"
+                : "text-muted-foreground",
+          )}
+          title={(queryDiag ?? compileDiag)?.code}
+        >
+          {(queryDiag ?? compileDiag)?.message}
+        </p>
+      )}
       {w && (
         <p className="font-mono text-[10px] text-muted-foreground/80" title={w.path}>
           {w.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
@@ -316,7 +386,7 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           }}
         >
           <Hammer className="size-3" />
-          {w?.compiled ? "Recompile Workspace" : "Compile Workspace"}
+          {compileButtonLabel}
         </Button>
         <Button
           variant="outline"

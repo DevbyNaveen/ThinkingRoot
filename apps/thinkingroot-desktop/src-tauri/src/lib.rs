@@ -157,6 +157,11 @@ pub fn run() {
             commands::engram::engram_list,
             commands::engram::engram_probe,
             commands::engram::engram_expire,
+            commands::workspace_status::workspace_status_get,
+            commands::workspace_status::workspace_status_get_all,
+            commands::workspace_status::workspace_status_refresh,
+            commands::workspace_status::subscribe_workspace_status_stream,
+            commands::workspace_status::unsubscribe_workspace_status_stream,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

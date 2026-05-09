@@ -37,6 +37,11 @@ import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
 import {
+  pickPrimaryDiagnostic,
+  useWorkspaceStatus,
+  useWorkspaceStatusSubscription,
+} from "@/store/workspace-status";
+import {
   chatSendStream,
   conversationsAppendMessage,
   conversationsCreate,
@@ -90,6 +95,10 @@ function buildHistoryPayload(messages: ChatMessage[]): ChatTurnPayload[] {
 
 export function ChatView() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
+  // Slice 0 — keep the unified workspace-status SSE subscription alive
+  // for as long as the chat surface is mounted. This is what powers the
+  // banner's authoritative diagnostic + the right-rail badge they share.
+  useWorkspaceStatusSubscription(activeWorkspace);
   const activeConv = useApp((s) => s.activeConversationId);
   const setActiveConv = useApp((s) => s.setActiveConversationId);
   const rightRailOpen = useApp((s) => s.rightRailOpen);
@@ -626,6 +635,18 @@ export function ChatView() {
  * letting the user submit and watch a spinner. Renders nothing on the
  * happy path (configured + has claims).
  */
+/**
+ * Slice 0 — chat readiness banner driven by the unified workspace
+ * status snapshot. Replaces the pre-Slice-0 banner that read its own
+ * `llm_health` Tauri command (one of the five contradicting probes).
+ *
+ * Picks the highest-severity diagnostic blocking `for_chat` and
+ * renders its message verbatim with the diagnostic-supplied actions.
+ * Returns `null` on the happy path. Falls back to the legacy
+ * `LlmHealth` shape only when the SSE stream hasn't landed a snapshot
+ * yet — the legacy probe is best-effort, the unified status is
+ * authoritative.
+ */
 function LlmHealthBanner({
   health,
   workspace,
@@ -635,6 +656,55 @@ function LlmHealthBanner({
   workspace: string;
   openSettings: () => void;
 }) {
+  const status = useWorkspaceStatus(workspace);
+  const blocker = pickPrimaryDiagnostic(status, "for_chat");
+
+  // Authoritative path: unified status has answered. Render its
+  // diagnostic message directly — no per-banner string baked in.
+  if (status) {
+    if (status.readiness.for_chat) return null;
+    if (!blocker) return null;
+    const tone =
+      blocker.severity === "error"
+        ? "text-rose-300"
+        : blocker.severity === "warn"
+          ? "text-amber-300"
+          : "text-muted-foreground";
+    return (
+      <div className="flex w-full items-start gap-2.5 rounded-xl border border-border/70 bg-muted/35 px-3.5 py-2.5 text-xs text-foreground/90">
+        <AlertTriangle className={cn("mt-0.5 h-3.5 w-3.5 flex-none", tone)} />
+        <div className="flex flex-1 flex-col gap-1 leading-relaxed text-muted-foreground">
+          <span>
+            <strong className="font-medium text-foreground/90">
+              {workspace}
+            </strong>
+            {" — "}
+            {blocker.message}
+          </span>
+          {blocker.code === "no_provider" && (
+            <span>
+              Add a provider key under{" "}
+              <button
+                type="button"
+                onClick={openSettings}
+                className="font-medium underline underline-offset-2 hover:text-foreground"
+              >
+                Settings → Credentials
+              </button>
+              .
+            </span>
+          )}
+          {blocker.actions.length > 0 && blocker.code !== "no_provider" && (
+            <span className="text-[10px] opacity-80">
+              Suggested: {blocker.actions.map((a) => a.label).join(" · ")}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback path while the SSE snapshot is still in flight.
   if (!health) return null;
   if (!health.mounted) {
     return (
@@ -921,7 +991,7 @@ function Composer({
         {/* Floating card — large radius, subtle shadow, gentle border */}
         <div
           className={cn(
-            "group relative flex flex-col border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-all focus-within:border-border/80 focus-within:shadow-[0_4px_24px_rgba(0,0,0,0.35)]",
+            "group relative flex flex-col border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-shadow",
             isIdleCentered ? "rounded-xl" : "rounded-2xl",
           )}
         >
