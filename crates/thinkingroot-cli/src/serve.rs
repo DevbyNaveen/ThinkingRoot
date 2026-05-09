@@ -344,6 +344,24 @@ pub async fn run_serve(
         None
     };
 
+    // Slice 3 — file-system watcher for workspace lifecycle events.
+    // Read the active workspace_root via the same RwLock the mount
+    // handler updates so a desktop `workspace_set_active` flips the
+    // watcher's target automatically.
+    let watcher_state = state.clone();
+    let watcher_handle = thinkingroot_serve::workspace_watcher::spawn_workspace_watcher(
+        move || {
+            // Best-effort try-read; on contention return the previous
+            // root next tick.  The watcher is poll-driven; missing one
+            // tick delays the re-attach by `poll_interval` (500ms).
+            watcher_state.workspace_root.try_read().ok().and_then(|g| g.clone())
+        },
+        thinkingroot_serve::workspace_watcher::WatcherConfig::default(),
+    );
+    state
+        .attach_workspace_watcher(std::sync::Arc::new(watcher_handle))
+        .await;
+
     let router = build_router_opts(state, !no_rest, !no_mcp);
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -489,6 +507,18 @@ async fn run_serve_with_listener(
     } else {
         None
     };
+
+    // Slice 3 — file-system watcher (parity with the bound-port path).
+    let watcher_state = state.clone();
+    let watcher_handle = thinkingroot_serve::workspace_watcher::spawn_workspace_watcher(
+        move || {
+            watcher_state.workspace_root.try_read().ok().and_then(|g| g.clone())
+        },
+        thinkingroot_serve::workspace_watcher::WatcherConfig::default(),
+    );
+    state
+        .attach_workspace_watcher(std::sync::Arc::new(watcher_handle))
+        .await;
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
 

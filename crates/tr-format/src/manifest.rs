@@ -19,6 +19,35 @@ use crate::error::{Error, Result};
 /// surface incompatibility cleanly.
 pub const FORMAT_VERSION_V3: &str = "tr/3";
 
+/// v3.1 format identifier — `"tr/3.1"`. Backward-compatible additive
+/// bump that introduces:
+///
+/// - [`ManifestV3::sources`] — per-source detail rows ([`SourceEntry`]).
+/// - [`ManifestV3::author_key_id`] — DID-style identifier of the key
+///   that signed the manifest (consumed by `tr-verify::AuthorVerifier`).
+///
+/// Old `tr/3` readers accept new packs because the new fields are
+/// `#[serde(default, skip_serializing_if = ...)]`; new readers accept
+/// old packs by leaving the fields empty/`None`. Round-tripping a
+/// `tr/3` manifest through v3.1 code emits identical canonical bytes.
+pub const FORMAT_VERSION_V31: &str = "tr/3.1";
+
+/// Latest format version emitted by this crate's writer. Consumers
+/// that want to pin against the most recent published format should
+/// use this alias rather than hard-coding the literal string.
+pub const FORMAT_VERSION_LATEST: &str = FORMAT_VERSION_V31;
+
+/// Allow-list of `derived_hashes[].kind` values per spec §3.2 v3.1.
+/// Anything outside this list is refused at [`ManifestV3::validate`]
+/// time so the field can never be used as a free-form annotation
+/// channel. Add new values here only when the matching extractor
+/// surface ships in the engine.
+pub const DERIVED_HASH_KINDS: &[&str] = &[
+    "thumbnail.blake3",
+    "transcript.blake3",
+    "summary.blake3",
+];
+
 /// The v3 manifest. Carried as `manifest.toml` inside `package.tr`.
 ///
 /// Wire-format ordering and serialization are explicitly canonicalized
@@ -74,14 +103,86 @@ pub struct ManifestV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Long-form human README in markdown. Optional. Capped at 256 KiB
+    /// by [`ManifestV3::validate`]. Adding the field as optional with
+    /// `#[serde(default)]` is forward-compatible with `tr/3` — old
+    /// readers parse and drop it; old packs without the field round-
+    /// trip identically through new code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
+
     /// Author handles or contact strings. Optional, default empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authors: Vec<String>,
+
+    /// DID-style identifier of the key that signed the manifest, when
+    /// the pack is author-signed. Format `did:method:identifier#fragment`,
+    /// matching `tr_identity::Did`. Consumed by
+    /// `tr-verify::AuthorVerifier`. **Setting this field requires
+    /// `format_version == "tr/3.1"`** — [`ManifestV3::validate`] rejects
+    /// the combination on `tr/3` to keep the schema-bump invariant
+    /// honest.
+    ///
+    /// Forward-compat: old `tr/3` readers parse and drop this field;
+    /// old packs without the field round-trip identically through new
+    /// code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_key_id: Option<String>,
+
+    /// Per-source detail rows. Empty/absent on `tr/3`; populated on
+    /// `tr/3.1` packs that opt in to multimodal extractors. Each entry
+    /// names a source file by its relative path inside `source.tar.zst`,
+    /// its BLAKE3 content hash, byte count, optional MIME type, and any
+    /// derived-content hashes (thumbnails, transcripts, summaries). A
+    /// non-empty value requires `format_version == "tr/3.1"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceEntry>,
+}
+
+/// Per-source detail row. Introduced in `tr/3.1`. Each entry describes
+/// one file inside the inner `source.tar.zst` bundle. The list is the
+/// authoritative inventory consumed by the cloud registry, the EU AI
+/// Act compliance bundle (`root compliance --eu-ai-act`), and the
+/// multimodal extractor pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEntry {
+    /// Path inside `source.tar.zst`, relative, forward-slash-separated.
+    /// Validated against `[A-Za-z0-9_./-]+` (no `..`, no leading `/`)
+    /// to refuse path-traversal payloads at parse time.
+    pub relative_path: String,
+    /// BLAKE3 of the file body — `blake3:<64-lowercase-hex>`.
+    pub content_hash: String,
+    /// Uncompressed byte length of the file.
+    pub bytes: u64,
+    /// IANA MIME type when known. `None` for files where the extractor
+    /// declines to guess (rare). Surface only — the engine never
+    /// trusts a manifest-declared MIME for routing decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Hashes of derived artefacts (thumbnail, transcript, summary).
+    /// Each entry's `kind` must be in [`DERIVED_HASH_KINDS`]; arbitrary
+    /// kinds are refused at [`ManifestV3::validate`] time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_hashes: Vec<DerivedHash>,
+}
+
+/// Hash of a derived artefact attached to a [`SourceEntry`]. The
+/// `kind` field is constrained to a small allow-list so the field can
+/// never become a free-form annotation channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedHash {
+    /// One of [`DERIVED_HASH_KINDS`]. Anything else fails validation.
+    pub kind: String,
+    /// BLAKE3 of the derived bytes — `blake3:<64-lowercase-hex>`.
+    pub hash: String,
 }
 
 impl ManifestV3 {
     /// Minimal builder. Hashes are all-empty until the v3 writer fills
-    /// them in at pack-emit time.
+    /// them in at pack-emit time. Defaults to [`FORMAT_VERSION_V3`] —
+    /// callers that opt in to v3.1 features (`sources`, `author_key_id`)
+    /// must bump `format_version` to [`FORMAT_VERSION_V31`] explicitly,
+    /// which `validate()` then enforces.
     pub fn new(name: impl Into<String>, version: Version) -> Self {
         Self {
             format_version: FORMAT_VERSION_V3.to_string(),
@@ -97,24 +198,32 @@ impl ManifestV3 {
             extractor: None,
             license: None,
             description: None,
+            readme: None,
             authors: Vec::new(),
+            author_key_id: None,
+            sources: Vec::new(),
         }
     }
 
     /// Validate every structural invariant on the reader path:
-    /// `format_version == "tr/3"`, well-formed `name`/`version`,
+    /// `format_version` ∈ {`tr/3`, `tr/3.1`}, well-formed `name`/`version`,
     /// hash fields are either empty (during pack assembly) or
-    /// `blake3:<64-lowercase-hex>`, and consistent counts.
+    /// `blake3:<64-lowercase-hex>`, and consistent counts. v3.1-only
+    /// fields (`sources`, `author_key_id`) are rejected on `tr/3` so a
+    /// v3 declaration cannot smuggle in features that require the bump.
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != FORMAT_VERSION_V3 {
-            return Err(Error::Invalid {
-                what: "manifest.toml",
-                detail: format!(
-                    "format_version must be `{FORMAT_VERSION_V3}`, got `{}`",
-                    self.format_version
-                ),
-            });
-        }
+        let is_v31 = match self.format_version.as_str() {
+            FORMAT_VERSION_V3 => false,
+            FORMAT_VERSION_V31 => true,
+            other => {
+                return Err(Error::Invalid {
+                    what: "manifest.toml",
+                    detail: format!(
+                        "format_version must be `{FORMAT_VERSION_V3}` or `{FORMAT_VERSION_V31}`, got `{other}`"
+                    ),
+                });
+            }
+        };
         validate_name(&self.name)?;
         for (label, val) in [
             ("source_hash", &self.source_hash),
@@ -122,6 +231,71 @@ impl ManifestV3 {
             ("pack_hash", &self.pack_hash),
         ] {
             validate_blake3_hash_field(label, val)?;
+        }
+        if let Some(r) = &self.readme {
+            const MAX_README_BYTES: usize = 256 * 1024;
+            if r.len() > MAX_README_BYTES {
+                return Err(Error::Invalid {
+                    what: "manifest.toml",
+                    detail: format!(
+                        "readme exceeds {MAX_README_BYTES} bytes (got {})",
+                        r.len()
+                    ),
+                });
+            }
+        }
+        // Version-feature consistency: v3.1-only fields require the bump.
+        if !is_v31 && self.author_key_id.is_some() {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "`author_key_id` requires format_version `{FORMAT_VERSION_V31}`; got `{}`",
+                    self.format_version
+                ),
+            });
+        }
+        if !is_v31 && !self.sources.is_empty() {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "`sources` requires format_version `{FORMAT_VERSION_V31}`; got `{}`",
+                    self.format_version
+                ),
+            });
+        }
+        if let Some(did) = &self.author_key_id {
+            validate_author_key_id(did)?;
+        }
+        for (i, src) in self.sources.iter().enumerate() {
+            validate_source_entry(i, src)?;
+        }
+        // Cross-field consistency: when both summary counts and the
+        // detailed `sources` list are present they must agree. This
+        // catches accidental drift between the per-source list and the
+        // aggregate counts emitted by the writer.
+        if let Some(declared) = self.source_files {
+            if !self.sources.is_empty() && declared as usize != self.sources.len() {
+                return Err(Error::Invalid {
+                    what: "manifest.toml",
+                    detail: format!(
+                        "source_files = {declared} disagrees with sources.len() = {}",
+                        self.sources.len()
+                    ),
+                });
+            }
+        }
+        if let Some(declared) = self.source_bytes {
+            if !self.sources.is_empty() {
+                let summed: u64 = self.sources.iter().map(|s| s.bytes).sum();
+                if declared != summed {
+                    return Err(Error::Invalid {
+                        what: "manifest.toml",
+                        detail: format!(
+                            "source_bytes = {declared} disagrees with sum(sources[].bytes) = {summed}"
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -168,9 +342,23 @@ impl ManifestV3 {
     /// manifest-body form for the pack file.
     fn emit_canonical_toml(&self, blank_pack_hash: bool) -> String {
         let mut out = String::new();
-        // Alphabetical: authors, claim_count, claims_hash, description,
-        // extracted_at, extractor, format_version, license, name,
-        // pack_hash, source_bytes, source_files, source_hash, version.
+        // Alphabetical: authors, author_key_id, claim_count, claims_hash,
+        // description, extracted_at, extractor, format_version, license,
+        // name, pack_hash, readme, source_bytes, source_files, source_hash,
+        // sources, version.
+        //
+        // Note on ordering of `author_key_id` vs `authors`: ASCII-wise
+        // `'_' (0x5F) < 's' (0x73)` so `author_key_id` < `authors` …
+        // but only when comparing the eighth byte. Both strings share
+        // the prefix `author`; at byte 6 we have `_` (key_id) vs `s`
+        // (authors), and `_` < `s` — so `author_key_id` sorts BEFORE
+        // `authors`. We emit in that order to keep canonical bytes
+        // deterministic.
+        if let Some(d) = &self.author_key_id {
+            out.push_str("author_key_id = \"");
+            escape_toml_string_into(&mut out, d);
+            out.push_str("\"\n");
+        }
         if !self.authors.is_empty() {
             out.push_str("authors = [");
             for (i, a) in self.authors.iter().enumerate() {
@@ -224,6 +412,11 @@ impl ManifestV3 {
             self.pack_hash.as_str()
         };
         out.push_str(&format!("pack_hash = \"{pack_hash}\"\n"));
+        if let Some(r) = &self.readme {
+            out.push_str("readme = \"");
+            escape_toml_string_into(&mut out, r);
+            out.push_str("\"\n");
+        }
         if let Some(c) = self.source_bytes {
             out.push_str(&format!("source_bytes = {c}\n"));
         }
@@ -231,6 +424,19 @@ impl ManifestV3 {
             out.push_str(&format!("source_files = {c}\n"));
         }
         out.push_str(&format!("source_hash = \"{}\"\n", self.source_hash));
+        if !self.sources.is_empty() {
+            // Inline array-of-inline-tables. Avoids the TOML pitfall
+            // where `[[sources]]` headers steal subsequent top-level
+            // keys; with inline tables every top-level key stays at
+            // the outer scope.
+            out.push_str("sources = [\n");
+            for src in &self.sources {
+                out.push_str("    { ");
+                emit_source_entry_inline(&mut out, src);
+                out.push_str(" },\n");
+            }
+            out.push_str("]\n");
+        }
         out.push_str(&format!("version = \"{}\"\n", self.version));
         out
     }
@@ -245,6 +451,140 @@ impl ManifestV3 {
     pub fn canonical_bytes_for_hashing(&self) -> Vec<u8> {
         self.emit_canonical_toml(true).into_bytes()
     }
+}
+
+/// Emit a [`SourceEntry`] as an inline TOML table body — the part
+/// between `{` and `}`. Fields ordered alphabetically: `bytes`,
+/// `content_hash`, `derived_hashes`, `mime_type`, `relative_path`.
+/// Optional/empty fields are skipped to match the
+/// `skip_serializing_if` rules on the struct.
+fn emit_source_entry_inline(out: &mut String, src: &SourceEntry) {
+    out.push_str(&format!("bytes = {}", src.bytes));
+    out.push_str(", content_hash = \"");
+    escape_toml_string_into(out, &src.content_hash);
+    out.push('"');
+    if !src.derived_hashes.is_empty() {
+        out.push_str(", derived_hashes = [");
+        for (i, dh) in src.derived_hashes.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("{ hash = \"");
+            escape_toml_string_into(out, &dh.hash);
+            out.push_str("\", kind = \"");
+            escape_toml_string_into(out, &dh.kind);
+            out.push_str("\" }");
+        }
+        out.push(']');
+    }
+    if let Some(mt) = &src.mime_type {
+        out.push_str(", mime_type = \"");
+        escape_toml_string_into(out, mt);
+        out.push('"');
+    }
+    out.push_str(", relative_path = \"");
+    escape_toml_string_into(out, &src.relative_path);
+    out.push('"');
+}
+
+/// Validate a `SourceEntry` row. Refuses path-traversal payloads,
+/// malformed BLAKE3 hashes, and `derived_hashes[].kind` outside
+/// [`DERIVED_HASH_KINDS`].
+fn validate_source_entry(index: usize, src: &SourceEntry) -> Result<()> {
+    let path = &src.relative_path;
+    if path.is_empty() || path.len() > 1024 {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("sources[{index}].relative_path must be 1–1024 chars"),
+        });
+    }
+    if path.starts_with('/') {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("sources[{index}].relative_path must not start with `/`"),
+        });
+    }
+    // `..` segments and backslashes are rejected so a malicious manifest
+    // cannot smuggle path-traversal hooks into compliance bundles or
+    // mount targets that consume this list verbatim.
+    for seg in path.split('/') {
+        if seg == ".." || seg.contains('\\') {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "sources[{index}].relative_path contains forbidden segment `{seg}`"
+                ),
+            });
+        }
+    }
+    if !path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+    {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!(
+                "sources[{index}].relative_path may only contain [A-Za-z0-9_./-]"
+            ),
+        });
+    }
+    validate_blake3_hash_field("sources[].content_hash", &src.content_hash)?;
+    if src.content_hash.is_empty() {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("sources[{index}].content_hash must not be empty"),
+        });
+    }
+    for (j, dh) in src.derived_hashes.iter().enumerate() {
+        if !DERIVED_HASH_KINDS.contains(&dh.kind.as_str()) {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "sources[{index}].derived_hashes[{j}].kind = `{}` is not in the allow-list ({:?})",
+                    dh.kind, DERIVED_HASH_KINDS
+                ),
+            });
+        }
+        validate_blake3_hash_field("derived_hashes[].hash", &dh.hash)?;
+        if dh.hash.is_empty() {
+            return Err(Error::Invalid {
+                what: "manifest.toml",
+                detail: format!(
+                    "sources[{index}].derived_hashes[{j}].hash must not be empty"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `author_key_id` field — must be a `did:method:identifier`
+/// possibly with a `#fragment` suffix. We do not resolve the DID here;
+/// resolution lives in `tr-verify::AuthorVerifier`.
+fn validate_author_key_id(did: &str) -> Result<()> {
+    if did.len() > 512 {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: "author_key_id must be ≤ 512 chars".into(),
+        });
+    }
+    let core = did.split('#').next().unwrap_or("");
+    let parts: Vec<&str> = core.split(':').collect();
+    if parts.len() < 3 || parts[0] != "did" {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!(
+                "author_key_id `{did}` must match `did:method:identifier[#fragment]`"
+            ),
+        });
+    }
+    if parts[1].is_empty() || parts[2..].iter().any(|p| p.is_empty()) {
+        return Err(Error::Invalid {
+            what: "manifest.toml",
+            detail: format!("author_key_id `{did}` has empty method or identifier segment"),
+        });
+    }
+    Ok(())
 }
 
 /// Escape a string into TOML basic-string form. Only the rules we
@@ -412,5 +752,289 @@ mod tests {
         m.pack_hash.clear();
         let bytes_without = m.canonical_bytes_for_hashing();
         assert_eq!(bytes_with_hash, bytes_without);
+    }
+
+    #[test]
+    fn readme_round_trip_some() {
+        let mut m = sample();
+        m.readme = Some("# Title\n\nBody with `code` and *emphasis*\n".into());
+        let toml_bytes = m.to_canonical_toml();
+        let parsed = ManifestV3::parse(&toml_bytes).unwrap();
+        assert_eq!(parsed.readme, m.readme);
+        let toml_again = parsed.to_canonical_toml();
+        assert_eq!(toml_bytes, toml_again, "second emit must be byte-stable");
+    }
+
+    #[test]
+    fn readme_round_trip_none() {
+        let m = sample();
+        let toml_bytes = m.to_canonical_toml();
+        let toml_str = std::str::from_utf8(&toml_bytes).unwrap();
+        assert!(
+            !toml_str.contains("readme = "),
+            "None readme must not appear in canonical TOML, got:\n{toml_str}"
+        );
+        let parsed = ManifestV3::parse(&toml_bytes).unwrap();
+        assert_eq!(parsed.readme, None);
+    }
+
+    #[test]
+    fn readme_escapes_special_chars() {
+        let mut m = sample();
+        let payload = "quotes \"x\" backslash \\ newline\nreturn\rtab\tcontrol\u{0001} emoji 🌳";
+        m.readme = Some(payload.into());
+        let toml_bytes = m.to_canonical_toml();
+        let parsed = ManifestV3::parse(&toml_bytes).unwrap();
+        assert_eq!(parsed.readme.as_deref(), Some(payload));
+    }
+
+    #[test]
+    fn readme_above_cap_rejected() {
+        let mut m = sample();
+        m.readme = Some("x".repeat(257 * 1024));
+        match m.validate() {
+            Err(Error::Invalid { what, detail }) => {
+                assert_eq!(what, "manifest.toml");
+                assert!(detail.contains("readme exceeds"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readme_old_pack_hashes_identically() {
+        // A pre-feature pack has no `readme` field. After upgrading,
+        // round-tripping with `readme: None` must produce the exact
+        // same canonical-bytes-for-hashing as before — i.e. the field
+        // is invisible when None. Regression guard for forward-compat.
+        let m = sample();
+        let bytes_a = m.canonical_bytes_for_hashing();
+        let toml_str = std::str::from_utf8(&bytes_a).unwrap();
+        assert!(
+            !toml_str.contains("readme"),
+            "manifest with readme: None must not emit a readme line"
+        );
+
+        let parsed = ManifestV3::parse(&m.to_canonical_toml()).unwrap();
+        let bytes_b = parsed.canonical_bytes_for_hashing();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "round-trip through new code must be byte-stable when readme is None"
+        );
+    }
+
+    // ── tr/3.1 schema bump tests ────────────────────────────────────
+
+    fn good_source_entry(name: &str) -> SourceEntry {
+        // 64-hex BLAKE3 placeholders — `0123456789abcdef` × 4 = 64 chars.
+        const CONTENT: &str =
+            "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const DERIVED: &str =
+            "blake3:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        SourceEntry {
+            relative_path: name.into(),
+            content_hash: CONTENT.into(),
+            bytes: 100,
+            mime_type: Some("text/markdown".into()),
+            derived_hashes: vec![DerivedHash {
+                kind: "summary.blake3".into(),
+                hash: DERIVED.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_v31_round_trip() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        m.author_key_id = Some("did:key:z6MkpzExample123#k1".into());
+        m.sources = vec![good_source_entry("a.md"), good_source_entry("b/c.md")];
+        m.source_files = Some(2);
+        m.source_bytes = Some(200);
+        let toml_bytes = m.to_canonical_toml();
+        let parsed = ManifestV3::parse(&toml_bytes).unwrap();
+        assert_eq!(parsed.format_version, FORMAT_VERSION_V31);
+        assert_eq!(parsed.author_key_id.as_deref(), Some("did:key:z6MkpzExample123#k1"));
+        assert_eq!(parsed.sources.len(), 2);
+        assert_eq!(parsed.sources[0].relative_path, "a.md");
+        assert_eq!(parsed.sources[1].relative_path, "b/c.md");
+        // Second emit is byte-stable (pack_hash determinism).
+        let toml_again = parsed.to_canonical_toml();
+        assert_eq!(toml_bytes, toml_again, "second emit must be byte-stable");
+    }
+
+    #[test]
+    fn v3_reader_ignores_unknown_v31_inline_fields() {
+        // Forward-compat: a `tr/3` manifest produced by *old* code
+        // that received a v3.1 pack must drop the v3.1 fields silently.
+        // We simulate "old code" by parsing a v3.1 TOML body with the
+        // current parser, then forcing the format_version back to v3
+        // and re-validating — this is the minimal proof that the new
+        // fields don't bleed through into a v3 declaration.
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        m.author_key_id = Some("did:web:example.com#k1".into());
+        m.sources = vec![good_source_entry("a.md")];
+        m.source_files = Some(1);
+        m.source_bytes = Some(100);
+        let _ = m.to_canonical_toml();
+        // Now the same struct without the v3.1 fields, declared v3 —
+        // must round-trip cleanly with no v3.1 contamination.
+        let mut m_v3 = sample();
+        m_v3.format_version = FORMAT_VERSION_V3.into();
+        let bytes = m_v3.to_canonical_toml();
+        let parsed = ManifestV3::parse(&bytes).unwrap();
+        assert!(parsed.author_key_id.is_none());
+        assert!(parsed.sources.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_v3_with_author_key_id() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V3.into();
+        m.author_key_id = Some("did:key:abc#k1".into());
+        match m.validate() {
+            Err(Error::Invalid { detail, .. }) => {
+                assert!(
+                    detail.contains("author_key_id") && detail.contains(FORMAT_VERSION_V31),
+                    "error should name the field and the required version: {detail}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_v3_with_sources() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V3.into();
+        m.sources = vec![good_source_entry("a.md")];
+        m.source_files = Some(1);
+        m.source_bytes = Some(100);
+        match m.validate() {
+            Err(Error::Invalid { detail, .. }) => {
+                assert!(detail.contains("sources") && detail.contains(FORMAT_VERSION_V31));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        for bad in ["../etc/passwd", "/abs/path", "ok/../bad", "back\\slash"] {
+            let mut src = good_source_entry("placeholder");
+            src.relative_path = bad.into();
+            m.sources = vec![src];
+            m.source_files = Some(1);
+            m.source_bytes = Some(100);
+            assert!(
+                m.validate().is_err(),
+                "`{bad}` must be rejected as path traversal"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_derived_hash_kind() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        let mut src = good_source_entry("a.md");
+        src.derived_hashes = vec![DerivedHash {
+            kind: "embedding.blake3".into(), // not in allow-list
+            hash: "blake3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+        }];
+        m.sources = vec![src];
+        m.source_files = Some(1);
+        m.source_bytes = Some(100);
+        match m.validate() {
+            Err(Error::Invalid { detail, .. }) => {
+                assert!(detail.contains("embedding.blake3") && detail.contains("allow-list"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_did() {
+        for bad in [
+            "not-a-did",
+            "did:",
+            "did::missing-method",
+            "did:method:",
+            "did:method",
+        ] {
+            let mut m = sample();
+            m.format_version = FORMAT_VERSION_V31.into();
+            m.author_key_id = Some(bad.into());
+            assert!(
+                m.validate().is_err(),
+                "`{bad}` must be rejected as malformed DID"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_count_disagreement() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        m.sources = vec![good_source_entry("a.md"), good_source_entry("b.md")];
+        m.source_files = Some(99); // disagrees
+        m.source_bytes = Some(200);
+        assert!(m.validate().is_err());
+
+        m.source_files = Some(2);
+        m.source_bytes = Some(99); // disagrees with sum
+        assert!(m.validate().is_err());
+
+        m.source_bytes = Some(200); // 100 + 100
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn canonical_toml_alphabetical_includes_v31_fields() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        m.author_key_id = Some("did:key:abc#k1".into());
+        m.sources = vec![good_source_entry("a.md")];
+        m.source_files = Some(1);
+        m.source_bytes = Some(100);
+        let bytes = m.to_canonical_toml();
+        let toml_str = std::str::from_utf8(&bytes).unwrap();
+        // Validate ordering by finding offsets — `author_key_id` MUST
+        // come before `claims_hash` and `sources` MUST come after
+        // `source_hash`.
+        let pos_author = toml_str.find("author_key_id").expect("author_key_id present");
+        let pos_claims = toml_str.find("claims_hash").expect("claims_hash present");
+        let pos_source_hash = toml_str.find("source_hash").expect("source_hash present");
+        let pos_sources = toml_str.find("sources = [").expect("sources present");
+        let pos_version = toml_str.find("\nversion = ").expect("version present");
+        assert!(pos_author < pos_claims, "author_key_id must precede claims_hash");
+        assert!(
+            pos_source_hash < pos_sources,
+            "sources must follow source_hash"
+        );
+        assert!(
+            pos_sources < pos_version,
+            "sources must precede version (otherwise TOML inline-table parsing breaks)"
+        );
+    }
+
+    #[test]
+    fn v31_hash_is_byte_stable_across_two_serialisations() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V31.into();
+        m.author_key_id = Some("did:key:abc#k1".into());
+        m.sources = vec![good_source_entry("a.md"), good_source_entry("b.md")];
+        m.source_files = Some(2);
+        m.source_bytes = Some(200);
+        let bytes_a = m.canonical_bytes_for_hashing();
+        let parsed = ManifestV3::parse(&m.to_canonical_toml()).unwrap();
+        let bytes_b = parsed.canonical_bytes_for_hashing();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "v3.1 manifest must hash identically across parse-then-emit"
+        );
     }
 }

@@ -41,6 +41,102 @@ async fn list_workspaces_returns_ok() {
     assert_eq!(json["ok"], true);
 }
 
+// ─── Workspace Readme Endpoint ───────────────────────────────
+
+#[tokio::test]
+async fn workspace_readme_unmounted_returns_404() {
+    let app = empty_app(None).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ws/nonexistent/readme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"]["code"], "WORKSPACE_NOT_MOUNTED");
+}
+
+#[tokio::test]
+async fn workspace_readme_returns_disk_content_when_mounted() {
+    use thinkingroot_serve::engine::QueryEngine;
+    use thinkingroot_serve::rest::{AppState, build_router};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let tr_dir = root.join(".thinkingroot");
+    std::fs::create_dir_all(&tr_dir).unwrap();
+    let readme_text = "# Hello world\n\nthis is the test README\n";
+    std::fs::write(tr_dir.join("README.md"), readme_text).unwrap();
+
+    let mut engine = QueryEngine::new();
+    engine.mount("test-ws".to_string(), root.clone()).await.unwrap();
+    let state = AppState::new(engine, None);
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ws/test-ws/readme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["data"]["readme"], readme_text);
+}
+
+#[tokio::test]
+async fn workspace_readme_missing_file_returns_empty_string() {
+    use thinkingroot_serve::engine::QueryEngine;
+    use thinkingroot_serve::rest::{AppState, build_router};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let tr_dir = root.join(".thinkingroot");
+    std::fs::create_dir_all(&tr_dir).unwrap();
+    // Note: no README.md written — workspace is mounted but file is absent.
+
+    let mut engine = QueryEngine::new();
+    engine.mount("empty-ws".to_string(), root.clone()).await.unwrap();
+    let state = AppState::new(engine, None);
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ws/empty-ws/readme")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["data"]["readme"], "", "missing file → empty string, not 404");
+}
+
 // ─── 404 for Unknown Workspace ───────────────────────────────
 
 #[tokio::test]
@@ -339,4 +435,34 @@ async fn compile_stream_rejects_non_directory_path() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["code"], "ROOT_PATH_NOT_DIR");
+}
+
+#[tokio::test]
+async fn well_known_mcp_returns_tool_catalog() {
+    let app = empty_app(None).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/mcp")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tools = json["tools"].as_array().expect("tools array");
+    assert!(
+        tools.iter().any(|t| t["name"] == "search"),
+        "expected search tool in catalog"
+    );
+    assert!(
+        tools.iter().any(|t| t["name"] == "compile"),
+        "expected compile tool in catalog"
+    );
 }

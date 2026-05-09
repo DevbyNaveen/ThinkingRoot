@@ -6,15 +6,21 @@
 //! S3-mirror, IPFS) slot in by implementing the trait without
 //! touching `pack_cmd::run_install`.
 //!
+//! The trait itself lives in `thinkingroot-core` so cloud services
+//! and the desktop can implement custom backends without depending on
+//! this CLI binary crate. We re-export it here so existing callers
+//! (`use crate::resolver::PackResolver`) keep working unchanged.
+//!
 //! Construction is the responsibility of the caller — `pack_cmd`
 //! parses the user's pack reference into an [`crate::pack_cmd::InstallRef`]
 //! and dispatches to the matching resolver via the
 //! [`crate::pack_cmd::build_resolver`] helper. The trait itself is
 //! state-bearing (`&self`) so each resolver carries the ref it
 //! resolves.
-
-use anyhow::Result;
-use async_trait::async_trait;
+//!
+//! `anyhow::Error` consumes [`ResolverError`] automatically through
+//! its blanket `From<E: Error>` impl, so call sites in `pack_cmd` can
+//! continue to use `?` unchanged.
 
 pub mod http;
 pub mod local;
@@ -22,16 +28,12 @@ pub mod local;
 pub use http::{HttpDirectUrlResolver, HttpRegistryResolver};
 pub use local::LocalFsResolver;
 
-/// Backend-agnostic source for `.tr` archive bytes.
-///
-/// Implementations are responsible for any source-specific integrity
-/// check (e.g. BLAKE3 cross-check against a registry-advertised
-/// header) before returning. Trust verification — Sigstore signatures,
-/// revocation deny-lists — happens *after* this layer in
-/// [`crate::pack_cmd::install_from_bytes_with_verifier`].
-#[async_trait]
-pub trait PackResolver: Send + Sync {
-    /// Fetch the raw bytes of the `.tr` file this resolver was
-    /// configured for.
-    async fn resolve(&self) -> Result<Vec<u8>>;
-}
+// Re-exported from core so existing imports
+// (`use crate::resolver::PackResolver`) keep working unchanged.
+// `ResolverDescriptor` / `ResolverError` are part of the trait's
+// surface contract — surfaced here even though the binary itself
+// doesn't currently call them, so external integrators (cloud, the
+// future custom-resolver plugin path) can `use crate::resolver::*`
+// without reaching across the workspace boundary.
+#[allow(unused_imports)]
+pub use thinkingroot_core::resolver::{PackResolver, ResolverDescriptor, ResolverError};

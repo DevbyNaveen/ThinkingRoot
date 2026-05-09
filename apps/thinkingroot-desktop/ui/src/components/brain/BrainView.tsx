@@ -118,10 +118,9 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
     );
   }
 
-  // Panel mode: compact table-only view (no graph, no full header)
-  if (panelMode) {
-    return (
-      <div className="flex h-full flex-col">
+  return (
+    <div className="flex h-full flex-col">
+      {panelMode ? (
         <div className="flex shrink-0 items-center justify-between border-b border-border/50 px-3 py-1.5">
           {snap && (
             <span className="text-[10px] text-muted-foreground">
@@ -139,83 +138,67 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
             <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
           </Button>
         </div>
-        {error && (
-          <div className="px-3 py-2 text-[11px] text-destructive">{error}</div>
-        )}
-        <div className="flex-1 overflow-hidden">
-          {snap ? (
-            <BrainTable
-              claims={snap.claims}
-              query={searchQuery}
-              setQuery={setSearchQuery}
-              tierFilter={tierFilter}
-              setTierFilter={setTierFilter}
-            />
-          ) : (
-            <Skeleton text="Loading claims…" />
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex h-full flex-col">
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
-        <Folder className="size-4 text-muted-foreground" />
-        <span className="text-sm font-medium">{activeWorkspace}</span>
-        <span className="text-muted-foreground">·</span>
-        <span className="text-xs text-muted-foreground">Brain</span>
-        {snap && (
-          <span className="ml-2 text-[10px] text-muted-foreground">
-            {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
-            {snap.relations.length} relations
-            {brief && brief.contradiction_count > 0 && (
-              <>
-                {" · "}
-                <span className="text-amber-600 dark:text-amber-400">
-                  {brief.contradiction_count} contradiction
-                  {brief.contradiction_count === 1 ? "" : "s"}
-                </span>
-              </>
+      ) : (
+        <>
+          <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
+            <Folder className="size-4 text-muted-foreground" />
+            <span className="text-sm font-medium">{activeWorkspace}</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="text-xs text-muted-foreground">Brain</span>
+            {snap && (
+              <span className="ml-2 text-[10px] text-muted-foreground">
+                {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
+                {snap.relations.length} relations
+                {brief && brief.contradiction_count > 0 && (
+                  <>
+                    {" · "}
+                    <span className="text-amber-600 dark:text-amber-400">
+                      {brief.contradiction_count} contradiction
+                      {brief.contradiction_count === 1 ? "" : "s"}
+                    </span>
+                  </>
+                )}
+              </span>
             )}
-          </span>
-        )}
-        <Button
-          variant="ghost"
-          size="icon"
-          className="ml-auto h-7 w-7"
-          onClick={load}
-          disabled={loading}
-          aria-label="Reload"
-        >
-          <RefreshCw className={loading ? "size-3.5 animate-spin" : "size-3.5"} />
-        </Button>
-      </header>
-      {brief && brief.top_entities.length > 0 && (
-        <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/10 px-4 py-1.5">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
-            Top
-          </span>
-          {brief.top_entities.slice(0, 8).map((e) => (
-            <button
-              key={e.name}
-              type="button"
-              onClick={() => setSearchQuery(e.name)}
-              className="flex shrink-0 items-center gap-1 rounded-full bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-              title={`Filter table for ${e.name} (${e.entity_type})`}
+            <Button
+              variant="ghost"
+              size="icon"
+              className="ml-auto h-7 w-7"
+              onClick={load}
+              disabled={loading}
+              aria-label="Reload"
             >
-              <span className="font-medium">{e.name}</span>
-              <span>·</span>
-              <span>{e.claim_count}</span>
-            </button>
-          ))}
-        </div>
+              <RefreshCw className={loading ? "size-3.5 animate-spin" : "size-3.5"} />
+            </Button>
+          </header>
+          {brief && brief.top_entities.length > 0 && (
+            <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/10 px-4 py-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+                Top
+              </span>
+              {brief.top_entities.slice(0, 8).map((e) => (
+                <button
+                  key={e.name}
+                  type="button"
+                  onClick={() => setSearchQuery(e.name)}
+                  className="flex shrink-0 items-center gap-1 rounded-full bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  title={`Filter table for ${e.name} (${e.entity_type})`}
+                >
+                  <span className="font-medium">{e.name}</span>
+                  <span>·</span>
+                  <span>{e.claim_count}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       {error && (
-        <div className="flex items-start gap-2 border-b border-destructive/20 bg-destructive/10 px-4 py-2 text-xs text-destructive">
-          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+        <div className={panelMode 
+          ? "px-3 py-2 text-[11px] text-destructive"
+          : "flex items-start gap-2 border-b border-destructive/20 bg-destructive/10 px-4 py-2 text-xs text-destructive"}>
+          {!panelMode && <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />}
           <span>{error}</span>
         </div>
       )}

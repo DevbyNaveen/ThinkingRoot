@@ -60,7 +60,7 @@ export function SlashAutocomplete({
 
   return (
     <div className="absolute top-full left-0 right-0 z-20 mt-2">
-      <div className="overflow-hidden rounded-2xl border border-border/70 bg-surface">
+      <div className="overflow-hidden rounded-xl border border-border/70 bg-surface">
         <ul className="max-h-72 overflow-y-auto py-1">
           {matches.map((c, i) => (
             <li key={c.cmd}>

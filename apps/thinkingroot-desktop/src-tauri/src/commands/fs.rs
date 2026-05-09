@@ -52,6 +52,23 @@ pub struct FsListDirArgs {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FsReadTextArgs {
+    pub path: String,
+}
+
+/// Preview payload for small text reads in the workspace file inspector.
+#[derive(Debug, Serialize)]
+pub struct FsReadTextBody {
+    /// Lossy-decoded UTF-8 (invalid bytes replaced).
+    pub content: String,
+    pub had_invalid_utf8: bool,
+    pub size: u64,
+}
+
+/// Maximum file size for `fs_read_text` previews (512 KiB).
+const MAX_TEXT_FILE_BYTES: u64 = 512 * 1024;
+
 /// One level of children for `path`. Errors are surfaced as strings
 /// (not panics) so the webview can render them inline as tree nodes
 /// without the whole surface unmounting.
@@ -63,6 +80,9 @@ pub struct FsListDirArgs {
 #[tauri::command]
 pub fn fs_list_dir(args: FsListDirArgs) -> Result<Vec<FsEntry>, String> {
     let path = ensure_under_registered_workspace(&args.path)?;
+    if !path.exists() {
+        return Err(format!("path does not exist: {}", path.display()));
+    }
     if !path.is_dir() {
         return Err(format!("not a directory: {}", path.display()));
     }
@@ -126,6 +146,37 @@ pub fn fs_list_dir(args: FsListDirArgs) -> Result<Vec<FsEntry>, String> {
     Ok(entries)
 }
 
+/// Read a file for the workspace inspector preview. Same sandbox as
+/// [`fs_list_dir`]. Caps size at [`MAX_TEXT_FILE_BYTES`]; binary content
+/// is returned as lossy UTF-8 with `had_invalid_utf8 = true`.
+#[tauri::command]
+pub fn fs_read_text(args: FsReadTextArgs) -> Result<FsReadTextBody, String> {
+    let path = ensure_under_registered_workspace(&args.path)?;
+    if !path.is_file() {
+        return Err(format!(
+            "not a regular file (or missing): {}",
+            path.display()
+        ));
+    }
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let len = meta.len();
+    if len > MAX_TEXT_FILE_BYTES {
+        return Err(format!(
+            "file is {} bytes (max preview {} KiB)",
+            len,
+            MAX_TEXT_FILE_BYTES / 1024
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let had_invalid_utf8 = std::str::from_utf8(&bytes).is_err();
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(FsReadTextBody {
+        content,
+        had_invalid_utf8,
+        size: len,
+    })
+}
+
 /// Hide dotfiles by default — but keep `.thinkingroot` visible because
 /// that's the compiled-artifact directory the user wants to see for any
 /// satellite folder. Add other always-visible exceptions here.
@@ -136,9 +187,12 @@ fn should_skip(name: &str) -> bool {
     !matches!(name, ".thinkingroot")
 }
 
-/// Canonicalise `raw` and assert it falls inside one of the registered
-/// workspace roots. Returns the canonical path on success; an error
-/// string suitable for the Tauri command result on rejection.
+/// Resolve `raw` to a path that must fall inside one of the registered
+/// workspace roots. Existing paths are canonicalised; non-existent
+/// logical children (e.g. `…/workspace/.thinkingroot` before first compile)
+/// are accepted by component-wise prefix match against each registered
+/// root — still bounded to the workspace; `..` segments in the tail are
+/// rejected.
 fn ensure_under_registered_workspace(raw: &str) -> Result<PathBuf, String> {
     let registry = WorkspaceRegistry::load()
         .map_err(|e| format!("load workspace registry: {e}"))?;
@@ -149,27 +203,55 @@ fn ensure_under_registered_workspace(raw: &str) -> Result<PathBuf, String> {
     }
 
     let raw_path = PathBuf::from(raw);
-    let canonical = match raw_path.canonicalize() {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!("resolve {}: {e}", raw_path.display()));
-        }
-    };
 
+    if let Ok(canonical) = raw_path.canonicalize() {
+        for ws in &registry.workspaces {
+            let root = match ws.path.canonicalize() {
+                Ok(c) => c,
+                Err(_) => ws.path.clone(),
+            };
+            if canonical.starts_with(&root) {
+                return Ok(canonical);
+            }
+        }
+        return Err(format!(
+            "path {} is outside every registered workspace — refusing to enumerate",
+            canonical.display()
+        ));
+    }
+
+    // Path does not exist on disk yet — allow `root/child/...` as long as
+    // `root` matches a registered workspace path by components.
     for ws in &registry.workspaces {
-        let root = match ws.path.canonicalize() {
-            Ok(c) => c,
-            Err(_) => ws.path.clone(),
-        };
-        if canonical.starts_with(&root) {
-            return Ok(canonical);
+        let root = ws.path.canonicalize().unwrap_or_else(|_| ws.path.clone());
+        if let Some(rel) = strip_workspace_suffix(&raw_path, &root) {
+            if rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            return Ok(root.join(rel));
         }
     }
 
     Err(format!(
         "path {} is outside every registered workspace — refusing to enumerate",
-        canonical.display()
+        raw_path.display()
     ))
+}
+
+/// If `path` is exactly `root` or a strict child (by path components),
+/// return the relative tail (possibly empty). Otherwise `None`.
+fn strip_workspace_suffix(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut pit = path.components();
+    for rc in root.components() {
+        match pit.next() {
+            Some(p) if p == rc => {}
+            _ => return None,
+        }
+    }
+    Some(pit.as_path().to_path_buf())
 }
 
 fn dir_has_visible_children(path: &Path) -> bool {
@@ -205,5 +287,24 @@ mod tests {
     fn should_skip_keeps_normal_files() {
         assert!(!should_skip("README.md"));
         assert!(!should_skip("src"));
+    }
+
+    #[test]
+    fn strip_suffix_child() {
+        use std::path::Path;
+        let root = Path::new("/project/ws");
+        let child = Path::new("/project/ws/.thinkingroot/cache");
+        assert_eq!(
+            super::strip_workspace_suffix(child, root),
+            Some(Path::new(".thinkingroot/cache").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn strip_suffix_other_branch() {
+        use std::path::Path;
+        let root = Path::new("/a/b");
+        let sibling = Path::new("/a/c/x");
+        assert!(super::strip_workspace_suffix(sibling, root).is_none());
     }
 }

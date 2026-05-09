@@ -188,6 +188,17 @@ export async function fsListDir(path: string): Promise<FsEntry[]> {
   return invoke<FsEntry[]>("fs_list_dir", { args: { path } });
 }
 
+export interface FsReadTextBody {
+  content: string;
+  had_invalid_utf8: boolean;
+  size: number;
+}
+
+/** Preview a file under a registered workspace (≤ 512 KiB). */
+export async function fsReadText(path: string): Promise<FsReadTextBody> {
+  return invoke<FsReadTextBody>("fs_read_text", { args: { path } });
+}
+
 // ─── Git branches (informational sidebar) ────────────────────────────
 
 export type BranchKind = "local" | "remote";
@@ -236,6 +247,62 @@ export function onTrFileOpened(
   handler: (path: string) => void,
 ): Promise<UnlistenFn> {
   return listen<string>("tr-file-opened", (e) => handler(e.payload));
+}
+
+// ─── Pack export (Slice 9) ───────────────────────────────────────────
+
+export interface PackEstimate {
+  compiled: boolean;
+  name: string;
+  version: string;
+  license: string | null;
+  description: string | null;
+  source_bytes: number;
+  source_files: number;
+}
+
+export async function packEstimate(workspace: string): Promise<PackEstimate> {
+  return invoke<PackEstimate>("pack_estimate", { workspace });
+}
+
+export interface PackExportRequest {
+  workspace: string;
+  out_path: string;
+  name?: string | null;
+  version?: string | null;
+  license?: string | null;
+  description?: string | null;
+  sign_keyless?: boolean;
+  branch?: string | null;
+}
+
+export interface PackExportResult {
+  out_path: string;
+  bytes: number;
+  pack_hash: string;
+  trust_tier: string;
+  warnings: string[];
+  stdout_log: string;
+  stderr_log: string;
+}
+
+export async function packExport(
+  req: PackExportRequest,
+): Promise<PackExportResult> {
+  return invoke<PackExportResult>("pack_export", { req });
+}
+
+// ─── Doctor (Slice 1 desktop wiring) ─────────────────────────────────
+
+export interface DoctorReport {
+  verdict: "ok" | "degraded" | "broken";
+  raw_json: string;
+  stderr_log: string;
+  exit_code: number;
+}
+
+export async function doctorRun(repair: boolean): Promise<DoctorReport> {
+  return invoke<DoctorReport>("doctor_run", { repair });
 }
 
 // ─── Privacy dashboard ───────────────────────────────────────────────
@@ -376,6 +443,17 @@ export async function workspaceCompileStatus(): Promise<CompileStatus> {
   return invoke<CompileStatus>("workspace_compile_status");
 }
 
+/**
+ * Fetch the engine-canonical workspace README markdown — the contents of
+ * `<workspace>/.thinkingroot/README.md`, auto-synthesised by Phase 10 of
+ * the compile pipeline. Returns an empty string when the workspace has
+ * not been compiled yet (the UI renders an empty-state message rather
+ * than a fabricated placeholder).
+ */
+export async function workspaceReadme(): Promise<string> {
+  return invoke<string>("workspace_readme");
+}
+
 export type CompileProgress =
   | { phase: "started"; workspace: string }
   // Emitted while the desktop is waiting for the bundled `root`
@@ -383,14 +461,28 @@ export type CompileProgress =
   // user clicked Compile and saw no UI activity for up to 60 s; React
   // can now render an explanatory "Waiting for engine…" state.
   | { phase: "booting"; workspace: string }
+  | { phase: "diff_start" }
+  | { phase: "diff_complete"; changed: number; unchanged: number; deleted: number }
   | { phase: "parse_complete"; files: number }
   | { phase: "extraction_start"; total_chunks: number; total_batches: number }
   | { phase: "extraction_progress"; done: number; total: number }
   | { phase: "extraction_complete"; claims: number; entities: number }
+  | { phase: "extraction_partial"; failed_batches: number; failed_chunk_ranges: Array<[number, number]> }
+  | { phase: "grounding_start"; llm_claims: number; structural_claims: number }
   | { phase: "grounding_progress"; done: number; total: number }
+  | { phase: "grounding_done"; accepted: number; rejected: number }
+  | { phase: "fingerprint_done"; truly_changed: number; cutoffs: number }
+  | { phase: "rooting_start"; candidates: number }
+  | { phase: "rooting_progress"; done: number; total: number }
+  | { phase: "rooting_done"; rooted: number; attested: number; quarantined: number; rejected: number }
   | { phase: "linking_start"; total_entities: number }
   | { phase: "linking_progress"; done: number; total: number }
   | { phase: "vector_progress"; done: number; total: number }
+  | { phase: "vector_update_done"; entities_indexed: number; claims_indexed: number }
+  | { phase: "compilation_progress"; done: number; total: number }
+  | { phase: "compilation_done"; artifacts: number }
+  | { phase: "verification_done"; health: number }
+  | { phase: "phase_done"; name: string; elapsed_ms: number }
   | {
       phase: "done";
       files_parsed: number;

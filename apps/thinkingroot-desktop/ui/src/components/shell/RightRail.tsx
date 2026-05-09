@@ -3,6 +3,7 @@
  *
  * Tab bar (top, icon-only):
  *   Hammer  → Compile   (workspace card + live compile progress)
+ *   FolderTree → Files (project + .thinkingroot tree, preview, pack export)
  *   Cpu     → Brain     (BrainView in panel mode)
  *   GitBranch → Branches (BranchesView in panel mode)
  *   ShieldCheck → Privacy (PrivacyDashboard in panel mode)
@@ -25,6 +26,9 @@ import {
   Loader2,
   Square,
   Cpu,
+  BookOpen,
+  FolderTree,
+  Package,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -34,6 +38,8 @@ import { toast } from "@/store/toast";
 import { BrainView } from "@/components/brain/BrainView";
 import { BranchesView } from "@/components/branches/BranchesView";
 import { PrivacyDashboard } from "@/components/privacy/PrivacyDashboard";
+import { ReadmeView } from "@/components/readme/ReadmeView";
+import { WorkspaceFilesPanel } from "@/components/shell/WorkspaceFilesPanel";
 import {
   branchCheckout,
   branchList,
@@ -45,13 +51,15 @@ import {
 } from "@/lib/tauri";
 import type { RightRailTab } from "@/types";
 
-const MIN_WIDTH = 220;
-const MAX_WIDTH = 600;
-const DEFAULT_WIDTH = 300;
+const MIN_WIDTH = 250;
+const MAX_WIDTH = 800;
+const DEFAULT_WIDTH = 450;
 
 const TABS: { id: RightRailTab; Icon: React.ElementType; label: string }[] = [
   { id: "compile", Icon: Hammer,       label: "Compile"  },
+  { id: "files",   Icon: FolderTree,   label: "Files"    },
   { id: "brain",   Icon: Cpu,          label: "Brain"    },
+  { id: "readme",  Icon: BookOpen,     label: "Readme"   },
   { id: "branches",Icon: GitBranch,    label: "Branches" },
   { id: "privacy", Icon: ShieldCheck,  label: "Privacy"  },
 ];
@@ -107,8 +115,8 @@ export function RightRail() {
   // ── Collapsed state ─────────────────────────────────────────────
   if (!open) {
     return (
-      <div className="flex h-full w-10 shrink-0 flex-col items-center border-l border-border bg-surface">
-        <header className="flex h-11 w-full items-center justify-center border-b border-border">
+      <div className="flex h-full w-10 shrink-0 flex-col items-center bg-surface">
+        <header className="flex h-11 w-full items-center justify-center">
           <Button
             variant="ghost"
             size="icon"
@@ -188,9 +196,17 @@ export function RightRail() {
         {activeTab === "compile" && (
           <CompilePanel activeWorkspace={activeWorkspace} />
         )}
+        {activeTab === "files" && (
+          <WorkspaceFilesPanel activeWorkspace={activeWorkspace} />
+        )}
         {activeTab === "brain" && (
           <div className="flex-1 overflow-hidden">
             <BrainView panelMode />
+          </div>
+        )}
+        {activeTab === "readme" && (
+          <div className="flex-1 overflow-hidden">
+            <ReadmeView panelMode />
           </div>
         )}
         {activeTab === "branches" && (
@@ -212,7 +228,7 @@ export function RightRail() {
 
 function CompilePanel({ activeWorkspace }: { activeWorkspace: string | null }) {
   return (
-    <div className="flex flex-col gap-3 overflow-y-auto px-3 py-3">
+    <div className="flex flex-col gap-6 overflow-y-auto px-4 py-5">
       <WorkspaceCard activeWorkspace={activeWorkspace} />
       <CompilationProgressIndicator />
       {activeWorkspace && <BranchPanel workspace={activeWorkspace} />}
@@ -221,6 +237,8 @@ function CompilePanel({ activeWorkspace }: { activeWorkspace: string | null }) {
 }
 
 function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) {
+  const setPackExportTarget = useApp((s) => s.setPackExportTarget);
+  const setRightRailTab = useApp((s) => s.setRightRailTab);
   const [w, setW] = useState<WorkspaceView | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -238,14 +256,17 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
 
   if (!activeWorkspace) {
     return (
-      <p className="rounded-md border border-dashed border-border p-3 text-[11px] text-muted-foreground">
+      <p className="text-[11px] text-muted-foreground">
         No workspace selected. Pick one from the sidebar.
       </p>
     );
   }
 
   return (
-    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3">
+    <section className="flex flex-col gap-3.5">
+      <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+        Workspace
+      </div>
       <div className="flex items-center gap-1.5 text-xs">
         <Folder className="size-3.5 text-muted-foreground" />
         <span className="truncate font-medium">{activeWorkspace}</span>
@@ -260,15 +281,15 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         )}
       </div>
       {w && (
-        <p className="font-mono text-[10px] text-muted-foreground" title={w.path}>
+        <p className="font-mono text-[10px] text-muted-foreground/80" title={w.path}>
           {w.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
         </p>
       )}
-      <div className="flex items-center gap-1.5 pt-1">
+      <div className="flex flex-wrap items-center gap-1.5 pt-1">
         <Button
           variant="outline"
           size="sm"
-          className="flex-1 gap-1.5 text-xs"
+          className="h-8 min-w-[160px] gap-1.5 rounded-xl border-border/70 bg-background/40 px-3 text-xs hover:bg-muted/40"
           disabled={busy}
           onClick={async () => {
             setBusy(true);
@@ -289,7 +310,27 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           }}
         >
           <Hammer className="size-3" />
-          {w?.compiled ? "Recompile" : "Compile"}
+          {w?.compiled ? "Recompile Workspace" : "Compile Workspace"}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 gap-1.5 rounded-xl border-border/70 bg-background/40 px-3 text-xs hover:bg-muted/40"
+          type="button"
+          onClick={() => setPackExportTarget({ workspace: activeWorkspace })}
+        >
+          <Package className="size-3" />
+          Export .tr
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 gap-1 rounded-xl px-2.5 text-[11px] text-muted-foreground hover:text-foreground"
+          type="button"
+          onClick={() => setRightRailTab("files")}
+        >
+          <FolderTree className="size-3.5" />
+          Files
         </Button>
       </div>
     </section>
@@ -316,7 +357,7 @@ function BranchPanel({ workspace }: { workspace: string }) {
   useEffect(() => { void load(); }, [workspace]);
 
   return (
-    <section className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/40 p-3">
+    <section className="flex flex-col gap-2.5">
       <header className="flex items-center gap-1.5 text-xs">
         <GitBranch className="size-3.5 text-muted-foreground" />
         <h3 className="font-medium">Branches</h3>
@@ -355,10 +396,10 @@ function BranchPanel({ workspace }: { workspace: string }) {
                 }
               }}
               className={cn(
-                "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[11px] transition-colors",
+                "flex w-full items-center gap-1.5 rounded-xl px-2.5 py-2 text-left text-[11px] transition-colors",
                 b.current
-                  ? "bg-accent/10 text-accent"
-                  : "text-foreground hover:bg-muted/60",
+                  ? "bg-accent/12 text-accent"
+                  : "text-foreground hover:bg-muted/35",
               )}
               title={b.description ?? b.name}
             >
@@ -404,8 +445,15 @@ function CompilationProgressIndicator() {
   let percent = 0;
   let isDone  = false;
   let isError = false;
+  let isCancelled = false;
 
   switch (progress.phase) {
+    case "booting":
+      title = "Waiting for engine"; details = `Workspace: ${progress.workspace}`; percent = 2; break;
+    case "diff_start":
+      title = "Diffing workspace state"; details = "Comparing changed and unchanged sources"; percent = 8; break;
+    case "diff_complete":
+      title = "Diff complete"; details = `${progress.changed} changed · ${progress.unchanged} unchanged · ${progress.deleted} deleted`; percent = 12; break;
     case "started":
       title = "Starting compilation"; details = `Workspace: ${progress.workspace}`; percent = 5; break;
     case "parse_complete":
@@ -417,9 +465,24 @@ function CompilationProgressIndicator() {
       percent = 20 + Math.floor((progress.done / Math.max(1, progress.total)) * 30); break;
     case "extraction_complete":
       title = "Extraction complete"; details = `${progress.claims} claims, ${progress.entities} entities`; percent = 50; break;
+    case "extraction_partial":
+      title = "Extraction partially failed"; details = `${progress.failed_batches} failed batches`; percent = 50; break;
+    case "grounding_start":
+      title = "Grounding claims"; details = `${progress.llm_claims} LLM + ${progress.structural_claims} structural`; percent = 52; break;
     case "grounding_progress":
       title = "Grounding entities"; details = `${progress.done} / ${progress.total}`;
       percent = 50 + Math.floor((progress.done / Math.max(1, progress.total)) * 15); break;
+    case "grounding_done":
+      title = "Grounding complete"; details = `${progress.accepted} accepted · ${progress.rejected} rejected`; percent = 66; break;
+    case "fingerprint_done":
+      title = "Fingerprint complete"; details = `${progress.truly_changed} changed · ${progress.cutoffs} cutoffs`; percent = 68; break;
+    case "rooting_start":
+      title = "Rooting claims"; details = `${progress.candidates} candidates`; percent = 70; break;
+    case "rooting_progress":
+      title = "Rooting claims"; details = `${progress.done} / ${progress.total}`;
+      percent = 70 + Math.floor((progress.done / Math.max(1, progress.total)) * 8); break;
+    case "rooting_done":
+      title = "Rooting complete"; details = `${progress.rooted} rooted · ${progress.attested} attested`; percent = 78; break;
     case "linking_start":
       title = "Linking knowledge graph"; details = `${progress.total_entities} entities to link`; percent = 65; break;
     case "linking_progress":
@@ -428,6 +491,20 @@ function CompilationProgressIndicator() {
     case "vector_progress":
       title = "Building vector index"; details = `${progress.done} / ${progress.total}`;
       percent = 80 + Math.floor((progress.done / Math.max(1, progress.total)) * 19); break;
+    case "vector_update_done":
+      title = "Vector index updated"; details = `${progress.entities_indexed} entities · ${progress.claims_indexed} claims`; percent = 95; break;
+    case "compilation_progress":
+      title = "Compiling artifacts"; details = `${progress.done} / ${progress.total}`;
+      percent = 90 + Math.floor((progress.done / Math.max(1, progress.total)) * 7); break;
+    case "compilation_done":
+      title = "Artifacts complete"; details = `${progress.artifacts} artifacts`; percent = 98; break;
+    case "verification_done":
+      title = "Verification complete"; details = `Health ${progress.health}`; percent = 99; break;
+    case "phase_done":
+      title = "Phase complete"; details = `${progress.name} in ${progress.elapsed_ms}ms`; percent = 99; break;
+    case "cancelled":
+      title = "Compilation stopped"; details = "Stopped by user";
+      percent = 100; isCancelled = true; break;
     case "done":
       title = "Compilation complete"; details = `${progress.claims} claims, ${progress.entities} entities`;
       percent = 100; isDone = true; break;
@@ -437,7 +514,7 @@ function CompilationProgressIndicator() {
   }
 
   return (
-    <section className="relative flex flex-col gap-2 overflow-hidden rounded-lg border border-border/60 bg-background/40 p-3 shadow-sm">
+    <section className="relative flex flex-col gap-2.5 overflow-hidden rounded-xl bg-muted/15 p-3">
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-accent/5 to-transparent" />
       <header className="relative z-10 flex items-center gap-2 text-xs">
         {isDone ? (
@@ -448,7 +525,7 @@ function CompilationProgressIndicator() {
           <Loader2 className="size-4 animate-spin text-accent" />
         )}
         <h3 className="font-medium tracking-tight text-foreground">{title}</h3>
-        {!isDone && !isError && (
+        {!isDone && !isError && !isCancelled && (
           <>
             <span className="ml-auto font-mono text-[9px] font-medium text-accent">{percent}%</span>
             <Button
@@ -466,11 +543,17 @@ function CompilationProgressIndicator() {
         )}
       </header>
       <div className="relative z-10 mt-1 flex flex-col gap-1.5">
-        <div className="h-1.5 w-full overflow-hidden rounded-full border border-border/50 bg-muted/50">
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted/50">
           <div
             className={cn(
               "h-full transition-all duration-300 ease-out",
-              isDone ? "bg-emerald-500" : isError ? "bg-destructive" : "bg-accent",
+                isDone
+                  ? "bg-emerald-500"
+                  : isError
+                    ? "bg-destructive"
+                    : isCancelled
+                      ? "bg-muted-foreground"
+                      : "bg-accent",
             )}
             style={{ width: `${percent}%` }}
           />

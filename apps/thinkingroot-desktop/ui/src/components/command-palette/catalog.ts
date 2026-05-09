@@ -70,12 +70,14 @@ import {
 import type { Surface, Theme, TrustFilter } from "@/types";
 import {
   appQuit,
+  doctorRun,
   workspaceCompile,
   workspaceSetActive,
   workspaceList,
   workspaceAdd,
 } from "@/lib/tauri";
 import { toast } from "@/store/toast";
+import { useApp } from "@/store/app";
 
 export type CommandGroup =
   | "Navigate"
@@ -284,6 +286,42 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       argLabel: "output path",
       argPlaceholder: "~/Desktop/thinkingroot-export.md",
       run: phase("/export", "D-10"),
+    },
+    {
+      id: "pack-export",
+      label: "Export workspace as .tr pack",
+      group: "Tools",
+      Icon: Download,
+      keywords: ["pack", "export", ".tr", "publish", "share"],
+      run: async (c) => {
+        try {
+          const ws = await workspaceList();
+          const active = ws.find((w) => w.active) ?? ws[0];
+          if (!active) {
+            toast("No workspace registered", {
+              kind: "info",
+              body: "Add a workspace before exporting.",
+            });
+            c.close();
+            return;
+          }
+          if (!active.compiled) {
+            toast("Workspace not compiled", {
+              kind: "info",
+              body: "Run Compile before exporting a pack.",
+            });
+            c.close();
+            return;
+          }
+          useApp.getState().setPackExportTarget({ workspace: active.path });
+        } catch (e) {
+          toast("Could not list workspaces", {
+            kind: "error",
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+        c.close();
+      },
     },
 
     // ─── Tool ops (15) ───
@@ -535,7 +573,58 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       label: "Run diagnostics",
       group: "Info",
       Icon: HeartPulse,
-      run: phase("/doctor", "D-10"),
+      keywords: ["doctor", "diagnostics", "health", "check"],
+      run: async (c) => {
+        try {
+          const report = await doctorRun(false);
+          const tone =
+            report.verdict === "ok"
+              ? "success"
+              : report.verdict === "degraded"
+                ? "info"
+                : "error";
+          toast(`Doctor: ${report.verdict}`, {
+            kind: tone,
+            body: summarizeDoctor(report.raw_json),
+            durationMs: 8000,
+          });
+        } catch (e) {
+          toast("Doctor failed", {
+            kind: "error",
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+        c.close();
+      },
+    },
+    {
+      id: "doctor-repair",
+      label: "Run diagnostics (with repair)",
+      group: "Info",
+      Icon: HeartPulse,
+      keywords: ["doctor", "repair", "fix", "self-heal"],
+      run: async (c) => {
+        try {
+          const report = await doctorRun(true);
+          const tone =
+            report.verdict === "ok"
+              ? "success"
+              : report.verdict === "degraded"
+                ? "info"
+                : "error";
+          toast(`Doctor (repair): ${report.verdict}`, {
+            kind: tone,
+            body: summarizeDoctor(report.raw_json),
+            durationMs: 8000,
+          });
+        } catch (e) {
+          toast("Doctor repair failed", {
+            kind: "error",
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+        c.close();
+      },
     },
     {
       id: "version",
@@ -789,6 +878,29 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
   ];
 
   return items;
+}
+
+/** Compact one-liner summary of `root doctor --json` output for the
+ *  toast body. Returns the raw stdout (truncated) on parse failure so
+ *  we never silently swallow an unexpected shape. */
+function summarizeDoctor(rawJson: string): string {
+  try {
+    const parsed = JSON.parse(rawJson) as {
+      summary?: string;
+      checks?: Array<{ name: string; status: string }>;
+    };
+    if (parsed.summary) return parsed.summary;
+    const checks = parsed.checks ?? [];
+    const failed = checks
+      .filter((c) => c.status !== "ok")
+      .map((c) => c.name)
+      .slice(0, 4);
+    if (failed.length === 0)
+      return `${checks.length} checks all ok`;
+    return `failing: ${failed.join(", ")}`;
+  } catch {
+    return rawJson.slice(0, 200);
+  }
 }
 
 export const GROUP_ORDER: CommandGroup[] = [

@@ -14,8 +14,10 @@ mod branch_extras_cmd;
 mod branch_template_cmd;
 mod claims_cmd;
 mod cloud;
+mod compliance_cmd;
 mod cortex_client;
 mod cortex_remote;
+mod doctor_cmd;
 mod engram_cmd;
 mod eval_cmd;
 mod mcp_config;
@@ -112,6 +114,45 @@ enum Commands {
         /// Path to the compiled knowledge base
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+    /// Emit an EU AI Act technical-documentation bundle (Article 11 +
+    /// Annex IV) for a compiled workspace. Produces eight files plus a
+    /// BLAKE3 manifest under `--out`, optionally signed via Sigstore-
+    /// keyless DSSE.  CLAUDE.md §honesty rule §1 is enforced: the
+    /// training-data section uses an allow-list of provider-published
+    /// URLs and refuses to fabricate lineage for unknown providers.
+    Compliance {
+        /// Emit the EU AI Act bundle. Required.
+        #[arg(long = "eu-ai-act")]
+        eu_ai_act: bool,
+        /// Output directory. Bundle lands as a timestamped sub-dir.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Sign the manifest via Sigstore-keyless DSSE (browser OIDC,
+        /// or `$TR_OIDC_TOKEN` if set).
+        #[arg(long)]
+        sign: bool,
+        /// Workspace root.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+    /// Run a self-check battery against the local install. Probes
+    /// daemon reachability, lockfile sanity, workspace substrate,
+    /// trust-cache freshness, disk headroom, and provider config.
+    /// Pass `--repair` to apply safe fixes (clear stale lockfiles,
+    /// prune orphan tmpfiles, create missing cache dirs). Pass
+    /// `--json` to emit a machine-readable report.
+    Doctor {
+        /// Apply safe-repair actions for each failing check.
+        #[arg(long)]
+        repair: bool,
+        /// Emit a JSON `Report` on stdout instead of human prose.
+        #[arg(long)]
+        json: bool,
+        /// Fallback host for the daemon reachability probe when no
+        /// lockfile exists.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
     },
     /// Initialize a new ThinkingRoot workspace
     Init {
@@ -1141,7 +1182,7 @@ enum WorkspaceAction {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     // Worker stack of 8 MB. Default is 2 MB but the synthesis path
     // transitively pulls in fastembed → ONNX Runtime, which can blow
     // a 2 MB tokio worker stack on first model load —
@@ -1149,11 +1190,37 @@ fn main() -> anyhow::Result<()> {
     // this on a fresh process without the bump. `#[tokio::main]`
     // doesn't expose `thread_stack_size`, so we build the runtime
     // manually.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)
-        .build()?;
-    runtime.block_on(async_main())
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to build tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(async_main());
+    match result {
+        Ok(()) => {}
+        Err(e) => {
+            // Distinct exit code when the cortex daemon is unreachable
+            // so wrappers and CI scripts can detect "your engine is
+            // not running" without grepping stderr. Walk the anyhow
+            // cause chain in case a higher-level handler attached
+            // additional `with_context` frames above the marker.
+            if e.downcast_ref::<cortex_remote::DaemonUnreachable>().is_some()
+                || e.chain()
+                    .any(|err| err.is::<cortex_remote::DaemonUnreachable>())
+            {
+                eprintln!("error: {e:#}");
+                std::process::exit(pack_cmd::EXIT_DAEMON_UNREACHABLE);
+            }
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Cortex Protocol entry point for stateful CLI commands.
@@ -1338,6 +1405,39 @@ async fn async_main() -> anyhow::Result<()> {
             } else {
                 run_health(&path).await?;
             }
+        }
+        Some(Commands::Compliance {
+            eu_ai_act,
+            out,
+            sign,
+            workspace,
+        }) => {
+            // `compliance` is intentionally NOT routed through the
+            // cortex — it reads CozoDB directly via GraphStore for a
+            // deterministic snapshot; the daemon doesn't expose a
+            // bundle-rendering route and proxying through a streaming
+            // route would only add latency and a serialization roundtrip.
+            compliance_cmd::run_compliance(compliance_cmd::ComplianceOpts {
+                eu_ai_act,
+                out,
+                sign,
+                workspace,
+            })
+            .await?;
+        }
+        Some(Commands::Doctor { repair, json, host }) => {
+            // `doctor` is intentionally NOT routed through the cortex
+            // — it inspects local state (lockfile, cache, disk) and
+            // probes the daemon as one of its checks. Routing would
+            // mean "ask the daemon if it's healthy via the daemon"
+            // which is circular.
+            let exit_code = doctor_cmd::run_doctor(doctor_cmd::DoctorOpts {
+                repair,
+                json,
+                host,
+            })
+            .await?;
+            std::process::exit(exit_code);
         }
         Some(Commands::Init { path }) => {
             // `init` is stateless — it creates a `.thinkingroot/`

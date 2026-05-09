@@ -171,10 +171,11 @@ fn workspace_path() -> Option<String> {
 
 // ─── MCP server list (sidebar "MCP TOOLS") ───────────────────────────
 //
-// One row per server the sidecar exposes. The sidecar is the OSS
-// engine's `root serve` — we read its `/.well-known/mcp` manifest to
-// avoid hard-coding the tool catalog here. If the sidecar is down we
-// surface that honestly rather than fabricating a list.
+// One row per MCP tool (and optional `servers[]` entries from the
+// manifest). The sidecar is the OSS engine's `root serve` — we read
+// `/.well-known/mcp`, which mirrors the JSON-RPC `tools/list` catalog.
+// If the sidecar is down we surface that honestly rather than fabricating
+// a list.
 
 #[derive(Debug, Serialize, Clone)]
 pub struct McpServerRow {
@@ -218,14 +219,12 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
     let resp = match client.get(&manifest_url).send().await {
         Ok(r) => r,
         Err(_) => {
-            // Manifest may not exist on the engine yet — fall back to
-            // the self-row only.
             return Ok(vec![McpServerRow {
-                name: "thinkingroot".to_string(),
+                name: "local sidecar".to_string(),
                 transport: "sse".to_string(),
                 status: self_status.to_string(),
                 description: Some(format!(
-                    "Local sidecar at {}:{}",
+                    "Manifest unavailable — sidecar {}:{}",
                     sidecar.host, sidecar.port
                 )),
             }]);
@@ -233,27 +232,40 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
     };
     if !resp.status().is_success() {
         return Ok(vec![McpServerRow {
-            name: "thinkingroot".to_string(),
+            name: "local sidecar".to_string(),
             transport: "sse".to_string(),
             status: self_status.to_string(),
             description: Some(format!(
-                "Local sidecar at {}:{}",
-                sidecar.host, sidecar.port
+                "GET /.well-known/mcp returned {} — {}:{}",
+                resp.status(),
+                sidecar.host,
+                sidecar.port
             )),
         }]);
     }
     let body: Value = resp.json().await.map_err(|e| e.to_string())?;
 
-    let mut rows = vec![McpServerRow {
-        name: "thinkingroot".to_string(),
-        transport: "sse".to_string(),
-        status: self_status.to_string(),
-        description: body
-            .get("description")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .or(Some(format!("Local sidecar at {}:{}", sidecar.host, sidecar.port))),
-    }];
+    let mut rows: Vec<McpServerRow> = Vec::new();
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for t in tools {
+            let name = t
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)")
+                .to_string();
+            let description = t
+                .get("description")
+                .and_then(Value::as_str)
+                .map(String::from);
+            rows.push(McpServerRow {
+                name,
+                transport: "sse".to_string(),
+                status: self_status.to_string(),
+                description,
+            });
+        }
+    }
 
     if let Some(servers) = body.get("servers").and_then(Value::as_array) {
         for srv in servers {
@@ -271,11 +283,6 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
                 .get("description")
                 .and_then(Value::as_str)
                 .map(String::from);
-            // External servers listed in the manifest are *configured*
-            // — the sidecar exposes them through its tool catalog —
-            // but we have no signal that the upstream process is
-            // actually serving traffic.  "configured" surfaces that
-            // honestly without falsely promising "running".
             rows.push(McpServerRow {
                 name,
                 transport,
@@ -284,5 +291,23 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
             });
         }
     }
+
+    if rows.is_empty() {
+        let desc = body
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(Some(format!(
+                "Sidecar reachable at {}:{} but tool catalog empty",
+                sidecar.host, sidecar.port
+            )));
+        rows.push(McpServerRow {
+            name: "local sidecar".to_string(),
+            transport: "sse".to_string(),
+            status: self_status.to_string(),
+            description: desc,
+        });
+    }
+
     Ok(rows)
 }

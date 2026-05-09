@@ -18,7 +18,15 @@
  * rejected).
  */
 import { useState } from "react";
-import { Check, X, Loader2, CheckCircle2, AlertTriangle } from "lucide-react";
+import {
+  Check,
+  X,
+  Loader2,
+  CheckCircle2,
+  AlertTriangle,
+  ChevronRight,
+  ChevronDown,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -35,6 +43,12 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
   const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectInput, setShowRejectInput] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const hasInput = !!step.input && step.input !== "{}";
+  const hasOutput = !!step.output;
+  const hasDetails = hasInput || hasOutput;
+  const friendlyName = getFriendlyStepName(step.name);
 
   const onApprove = async () => {
     if (busy) return;
@@ -76,29 +90,32 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
   return (
     <div
       className={cn(
-        "rounded-md border bg-muted/30 p-3 text-sm",
-        step.status === "rejected" && "border-destructive/40",
-        step.status === "finished" && step.isError && "border-destructive/40",
-        step.status === "finished" && !step.isError && "border-emerald-500/40",
+        "rounded-lg border border-border/60 bg-background/30 px-2.5 py-2 text-sm transition-colors",
+        step.status === "finished" && !step.isError && "border-emerald-500/30",
+        (step.status === "rejected" || (step.status === "finished" && step.isError)) &&
+          "border-destructive/40",
       )}
     >
       <div className="flex items-center gap-2">
         <StatusIcon status={step.status} isError={step.isError} />
-        <span className="font-mono text-xs font-medium">
-          {step.name}
-        </span>
+        <span className="text-xs font-medium text-foreground">{friendlyName}</span>
+        <span className="text-[10px] text-muted-foreground">{statusText(step.status)}</span>
         {step.isWrite && (
           <span className="ml-auto rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-amber-700 dark:text-amber-300">
             write
           </span>
         )}
+        {hasDetails && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="ml-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          >
+            {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            {expanded ? "Hide details" : "Show details"}
+          </button>
+        )}
       </div>
-
-      {step.input && step.input !== "{}" && (
-        <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-background/50 p-2 font-mono text-[11px] leading-snug text-muted-foreground">
-          {step.input}
-        </pre>
-      )}
 
       {step.status === "awaiting_approval" && (
         <div className="mt-3 flex flex-col gap-2">
@@ -167,20 +184,52 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
         </p>
       )}
 
-      {step.status === "finished" && step.output && (
-        <pre
-          className={cn(
-            "mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded p-2 font-mono text-[11px] leading-snug",
-            step.isError
-              ? "bg-destructive/10 text-destructive"
-              : "bg-background/50 text-muted-foreground",
+      {expanded && (
+        <div className="mt-2 space-y-2">
+          {hasInput && (
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-background/60 p-2 font-mono text-[11px] leading-snug text-muted-foreground">
+              {step.input}
+            </pre>
           )}
-        >
-          {step.output}
-        </pre>
+          {step.status === "finished" && step.output && (
+            <pre
+              className={cn(
+                "overflow-x-auto whitespace-pre-wrap break-words rounded p-2 font-mono text-[11px] leading-snug",
+                step.isError
+                  ? "bg-destructive/10 text-destructive"
+                  : "bg-background/60 text-muted-foreground",
+              )}
+            >
+              {step.output}
+            </pre>
+          )}
+        </div>
       )}
     </div>
   );
+}
+
+function statusText(status: AgentStep["status"]): string {
+  switch (status) {
+    case "proposed":
+      return "queued";
+    case "awaiting_approval":
+      return "needs approval";
+    case "executing":
+      return "running";
+    case "finished":
+      return "done";
+    case "rejected":
+      return "rejected";
+  }
+}
+
+function getFriendlyStepName(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("search") || n.includes("query")) return "Searching graph";
+  if (n.includes("claim") || n.includes("read")) return "Reading claims";
+  if (n.includes("summar") || n.includes("synth")) return "Synthesizing answer";
+  return name.replace(/_/g, " ");
 }
 
 function StatusIcon({

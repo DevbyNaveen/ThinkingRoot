@@ -1,6 +1,7 @@
 pub mod aep_queries;
 pub mod graph;
 pub mod hybrid_queries;
+pub mod spreading_activation;
 pub mod per_source_rows;
 pub mod row_blake3;
 pub mod rows;

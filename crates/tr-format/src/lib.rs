@@ -38,7 +38,10 @@ pub mod writer_v3;
 
 pub use claims::ClaimRecord;
 pub use error::Error;
-pub use manifest::{FORMAT_VERSION_V3, ManifestV3};
+pub use manifest::{
+    DERIVED_HASH_KINDS, DerivedHash, FORMAT_VERSION_LATEST, FORMAT_VERSION_V3,
+    FORMAT_VERSION_V31, ManifestV3, SourceEntry,
+};
 pub use reader_v3::{
     DEFAULT_PACK_SIZE_CAP_BYTES, V3Pack, read_v3_pack, read_v3_pack_with_cap,
 };

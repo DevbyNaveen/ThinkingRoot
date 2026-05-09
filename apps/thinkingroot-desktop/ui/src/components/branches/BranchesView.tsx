@@ -66,7 +66,7 @@ const TABS: Array<{ id: Tab; label: string; icon: typeof GitBranch }> = [
   { id: "templates", label: "Templates", icon: Layers },
 ];
 
-export function BranchesView() {
+export function BranchesView({ panelMode = false }: { panelMode?: boolean }) {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [tab, setTab] = useState<Tab>("branches");
 
@@ -84,24 +84,31 @@ export function BranchesView() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
-        <GitBranch className="size-4 text-muted-foreground" />
-        <span className="text-sm font-medium">{activeWorkspace}</span>
-        <span className="text-muted-foreground">·</span>
-        <span className="text-xs text-muted-foreground">Branches</span>
-      </header>
+      {!panelMode && (
+        <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
+          <GitBranch className="size-4 text-muted-foreground" />
+          <span className="text-sm font-medium">{activeWorkspace}</span>
+          <span className="text-muted-foreground">·</span>
+          <span className="text-xs text-muted-foreground">Branches</span>
+        </header>
+      )}
 
-      <nav className="flex items-center gap-1 border-b border-border px-2 pt-1.5">
+      <nav
+        className={cn(
+          "flex items-center gap-1 border-b border-border",
+          panelMode ? "px-3 pt-2" : "px-2 pt-1.5",
+        )}
+      >
         {TABS.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
             type="button"
             onClick={() => setTab(id)}
             className={cn(
-              "flex items-center gap-1.5 rounded-t-md px-3 py-1.5 text-xs transition-colors",
+              "flex items-center gap-1.5 rounded-t-lg px-3 py-1.5 text-xs transition-colors",
               tab === id
                 ? "border border-b-background border-border bg-background text-foreground"
-                : "text-muted-foreground hover:text-foreground",
+                : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
             )}
           >
             <Icon className="size-3.5" />
@@ -269,7 +276,7 @@ function BranchesPanel({ workspace }: { workspace: string }) {
   }
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto p-3.5">
       <CreateBranchForm
         name={newName}
         setName={setNewName}
@@ -330,7 +337,7 @@ function CreateBranchForm({
   onCreate: () => void;
 }) {
   return (
-    <section className="rounded-lg border border-border bg-muted/20 p-3">
+    <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
       <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
         New branch
       </h3>
@@ -340,21 +347,21 @@ function CreateBranchForm({
           placeholder="branch name"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
         />
         <input
           type="text"
           placeholder="parent (default: main)"
           value={parent}
           onChange={(e) => setParent(e.target.value)}
-          className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
         />
         <input
           type="text"
           placeholder="description (optional)"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
         />
       </div>
       <div className="mt-2 flex justify-end">
@@ -507,7 +514,7 @@ function TagsPanel() {
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
-      <section className="rounded-lg border border-border bg-muted/20 p-3">
+      <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
         <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
           New tag
         </h3>
@@ -517,21 +524,21 @@ function TagsPanel() {
             placeholder="tag name (immutable)"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
           <input
             type="text"
             placeholder="branch"
             value={branch}
             onChange={(e) => setBranch(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
           <input
             type="text"
             placeholder="message (optional)"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
         </div>
         <div className="mt-2 flex justify-end">
@@ -670,8 +677,8 @@ function ProposalsPanel() {
   }
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
-      <section className="rounded-lg border border-border bg-muted/20 p-3">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto p-3.5">
+      <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
         <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Open proposal
         </h3>
@@ -681,21 +688,21 @@ function ProposalsPanel() {
             placeholder="source branch"
             value={openName}
             onChange={(e) => setOpenName(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
           <input
             type="text"
             placeholder="target branch (default: main)"
             value={openTarget}
             onChange={(e) => setOpenTarget(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
           <input
             type="text"
             placeholder="description (optional)"
             value={openDescription}
             onChange={(e) => setOpenDescription(e.target.value)}
-            className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
           />
         </div>
         <div className="mt-2 flex justify-end">
@@ -849,7 +856,7 @@ function TemplatesPanel() {
   }
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto p-3.5">
       <PanelHeader
         title={`${templates?.length ?? 0} templates`}
         onRefresh={refresh}
@@ -883,7 +890,7 @@ function TemplatesPanel() {
                   onChange={(e) =>
                     setApplyTo((prev) => ({ ...prev, [t.name]: e.target.value }))
                   }
-                  className="flex-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs"
+                  className="flex-1 rounded-lg border border-border/70 bg-background/70 px-2.5 py-1 text-xs"
                 />
                 <Button
                   size="sm"

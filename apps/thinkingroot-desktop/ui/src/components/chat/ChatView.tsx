@@ -22,9 +22,15 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Square,
-  Folder,
   AlertTriangle,
+  Hammer,
+  Loader2,
 } from "lucide-react";
+
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
 import { cn } from "@/lib/utils";
 import { useApp } from "@/store/app";
@@ -36,6 +42,7 @@ import {
   conversationsCreate,
   conversationsGet,
   llmHealth,
+  workspaceCompile,
   onChatEvent,
   type ChatEvent,
   type ChatTurnPayload,
@@ -85,6 +92,7 @@ export function ChatView() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const activeConv = useApp((s) => s.activeConversationId);
   const setActiveConv = useApp((s) => s.setActiveConversationId);
+  const rightRailOpen = useApp((s) => s.rightRailOpen);
   const messagesByKey = useApp((s) => s.messages);
   const appendMessage = useApp((s) => s.appendMessage);
   const setMessages = useApp((s) => s.setMessages);
@@ -99,6 +107,7 @@ export function ChatView() {
   // a banner appears *before* the user types — no more 120 s "Generating…"
   // hangs when the workspace has no provider key configured.
   const [health, setHealth] = useState<LlmHealth | null>(null);
+  const [compileBusy, setCompileBusy] = useState(false);
   useEffect(() => {
     if (!activeWorkspace) {
       setHealth(null);
@@ -373,12 +382,16 @@ export function ChatView() {
   // flips back to the standard "messages above, composer at bottom"
   // chat layout.
   if (isEmpty) {
+    const compileLabel =
+      health?.mounted && health.claim_count > 0
+        ? "Recompile Workspace"
+        : "Compile Workspace";
+
     return (
       <div className="flex h-full flex-col bg-background">
-        <ChatHeader workspace={activeWorkspace} convTitle="New conversation" />
         {/* Vertically centered floating composer — Cursor-style */}
         <div className="flex flex-1 flex-col items-center justify-center px-8">
-          <div className="flex w-full max-w-xl flex-col gap-3">
+          <div className="flex w-full max-w-3xl flex-col gap-3">
             {/* Subtle heading above the card */}
             <div className="mb-1 text-center">
               <p className="text-[11px] uppercase tracking-widest text-muted-foreground/50">
@@ -392,6 +405,43 @@ export function ChatView() {
               convId={activeConv}
               disabled={streaming != null}
               autoFocus
+              isIdleCentered
+              compileAction={
+                rightRailOpen
+                  ? undefined
+                  : {
+                      busy: compileBusy,
+                      label: compileLabel,
+                      onRun: async () => {
+                        const ui = useApp.getState();
+                        ui.setRightRailTab("compile");
+                        if (!ui.rightRailOpen) {
+                          ui.toggleRightRail();
+                        }
+                        setCompileBusy(true);
+                        try {
+                          await workspaceCompile({ target: activeWorkspace });
+                          toast("Compile queued", {
+                            kind: "info",
+                            body: "Progress is shown in the Compile panel.",
+                          });
+                          try {
+                            const freshHealth = await llmHealth(activeWorkspace);
+                            setHealth(freshHealth);
+                          } catch {
+                            // Non-blocking: compile can still run even if health probe fails.
+                          }
+                        } catch (e) {
+                          toast("Compile failed", {
+                            kind: "error",
+                            body: e instanceof Error ? e.message : String(e),
+                          });
+                        } finally {
+                          setCompileBusy(false);
+                        }
+                      },
+                    }
+              }
               health={health}
               recentHistory={buildHistoryPayload(messages)}
               onCancel={() => {
@@ -457,8 +507,6 @@ export function ChatView() {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <ChatHeader workspace={activeWorkspace} convTitle="" />
-
       <div className="flex-1 overflow-y-auto px-8 py-6">
         <ul className="mx-auto flex max-w-3xl flex-col gap-6">
           {messages.map((m) => (
@@ -469,14 +517,21 @@ export function ChatView() {
           {streaming && (
             <li className="space-y-3">
               {streaming.agentSteps.length > 0 && (
-                <div className="mx-auto max-w-3xl space-y-2">
-                  {streaming.agentSteps.map((step) => (
-                    <ClaimCard
-                      key={step.id}
-                      step={step}
-                      workspace={activeWorkspace}
-                    />
-                  ))}
+                <div className="mx-auto w-full max-w-3xl">
+                  <div className="rounded-xl border border-border/60 bg-muted/20 p-2.5">
+                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+                      Activity
+                    </div>
+                    <div className="space-y-1.5">
+                      {streaming.agentSteps.map((step) => (
+                        <ClaimCard
+                          key={step.id}
+                          step={step}
+                          workspace={activeWorkspace}
+                        />
+                      ))}
+                    </div>
+                  </div>
                 </div>
               )}
               {streaming.partial.length > 0 && (
@@ -583,9 +638,9 @@ function LlmHealthBanner({
   if (!health) return null;
   if (!health.mounted) {
     return (
-      <div className="flex w-full items-start gap-2 rounded-md border border-yellow-500/30 bg-yellow-500/5 px-3 py-2 text-xs text-yellow-200">
-        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
-        <div>
+      <div className="flex w-full items-start gap-2.5 rounded-xl border border-border/70 bg-muted/35 px-3.5 py-2.5 text-xs text-foreground/90">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none text-amber-300" />
+        <div className="leading-relaxed text-muted-foreground">
           Workspace <code className="font-mono">{workspace}</code> isn't
           mounted in the engine yet. Compile it from the Workspaces panel
           before chatting.
@@ -616,13 +671,12 @@ function LlmHealthBanner({
   }
   if (health.claim_count === 0) {
     return (
-      <div className="flex w-full items-start gap-2 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs text-blue-100">
-        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
-        <div>
-          No compiled claims in <code className="font-mono">{workspace}</code>{" "}
-          yet. The {health.provider} {health.model} model is wired, but
-          there's nothing to ground answers against — drop sources into the
-          workspace and run <code className="font-mono">root compile</code>.
+      <div className="flex w-full items-start gap-2.5 rounded-xl border border-border/70 bg-muted/35 px-3.5 py-2.5 text-xs text-foreground/90">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none text-amber-300" />
+        <div className="leading-relaxed text-muted-foreground">
+          No compiled claims in <code className="font-mono text-foreground/90">{workspace}</code>{" "}
+          yet. Add sources to the workspace, then run{" "}
+          <code className="font-mono text-foreground/90">root compile</code>.
         </div>
       </div>
     );
@@ -637,18 +691,7 @@ function ChatHeader({
   workspace: string;
   convTitle: string;
 }) {
-  return (
-    <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
-      <Folder className="size-4 text-muted-foreground" />
-      <span className="text-sm font-medium">{workspace}</span>
-      {convTitle && (
-        <>
-          <span className="text-muted-foreground">·</span>
-          <span className="text-xs text-muted-foreground">{convTitle}</span>
-        </>
-      )}
-    </header>
-  );
+  return null;
 }
 
 function NoWorkspace() {
@@ -668,15 +711,13 @@ function NoWorkspace() {
 function ThinkingLoader() {
   return (
     <div className="flex h-12 items-center justify-start px-2">
-      <div className="relative h-6 w-6 animate-scale-pulse">
-        <img
-          src="/logo_white.png"
-          alt="Thinking"
-          className="h-full w-full object-contain opacity-80"
-          style={{
-            filter: 'drop-shadow(0 0 8px hsl(var(--accent) / 0.5))'
-          }}
-        />
+      <div className="inline-flex items-center gap-2 rounded-full bg-muted/35 px-3 py-1.5 text-xs text-muted-foreground">
+        <span>Thinking</span>
+        <span className="inline-flex items-center gap-1">
+          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:0ms]" />
+          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:180ms]" />
+          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:360ms]" />
+        </span>
       </div>
     </div>
   );
@@ -690,21 +731,76 @@ function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }
     return <ThinkingLoader />;
   }
 
+  // AI Message: No bubble, full width, rendered with Markdown
+  if (!isUser) {
+    return (
+      <div className={cn("flex w-full px-2", pending && "opacity-90")}>
+        <div className="w-full max-w-3xl text-[15px] leading-7 text-foreground">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              code({ node, inline, className, children, ...props }: any) {
+                const match = /language-(\w+)/.exec(className || "");
+                return !inline && match ? (
+                  <div className="my-4 overflow-hidden rounded-md border border-border/50">
+                    <div className="flex items-center justify-between bg-muted/50 px-4 py-1.5 text-xs font-medium text-muted-foreground">
+                      <span>{match[1]}</span>
+                    </div>
+                    <SyntaxHighlighter
+                      style={vscDarkPlus as any}
+                      language={match[1]}
+                      PreTag="div"
+                      customStyle={{ margin: 0, background: "transparent", padding: "16px" }}
+                      {...props}
+                    >
+                      {String(children).replace(/\n$/, "")}
+                    </SyntaxHighlighter>
+                  </div>
+                ) : (
+                  <code className="rounded bg-muted/80 px-1.5 py-0.5 text-[13px] font-mono text-foreground" {...props}>
+                    {children}
+                  </code>
+                );
+              },
+              p: ({ children }) => <p className="mb-4 last:mb-0 leading-relaxed">{children}</p>,
+              ul: ({ children }) => <ul className="mb-4 list-disc pl-6 last:mb-0 space-y-1">{children}</ul>,
+              ol: ({ children }) => <ol className="mb-4 list-decimal pl-6 last:mb-0 space-y-1">{children}</ol>,
+              li: ({ children }) => <li className="mb-1 leading-relaxed">{children}</li>,
+              h1: ({ children }) => <h1 className="mb-4 mt-6 text-2xl font-bold">{children}</h1>,
+              h2: ({ children }) => <h2 className="mb-4 mt-6 text-xl font-bold border-b border-border/50 pb-2">{children}</h2>,
+              h3: ({ children }) => <h3 className="mb-4 mt-4 text-lg font-bold">{children}</h3>,
+              a: ({ href, children }) => (
+                <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary underline underline-offset-4">
+                  {children}
+                </a>
+              ),
+              blockquote: ({ children }) => (
+                <blockquote className="border-l-4 border-muted pl-4 italic text-muted-foreground my-4">
+                  {children}
+                </blockquote>
+              ),
+            }}
+          >
+            {msg.body}
+          </ReactMarkdown>
+          {pending && (
+            <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // User Message: Right-aligned bubble
   return (
-    <div className={cn("flex w-full", isUser && "justify-end")}>
+    <div className="flex w-full justify-end px-2">
       <div
         className={cn(
-          "max-w-2xl whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm transition-all duration-300",
-          isUser
-            ? "bg-accent/15 text-foreground"
-            : "bg-surface text-foreground shadow-sm border border-border/40",
+          "max-w-2xl whitespace-pre-wrap break-words rounded-2xl bg-accent/15 px-4 py-3 text-[15px] text-foreground transition-all duration-300",
           pending && "opacity-90"
         )}
       >
         {msg.body}
-        {pending && !isUser && (
-          <span className="ml-1 inline-block h-3.5 w-1 translate-y-0.5 bg-accent/60 animate-pulse" />
-        )}
       </div>
     </div>
   );
@@ -715,6 +811,8 @@ function Composer({
   convId,
   disabled,
   autoFocus,
+  isIdleCentered,
+  compileAction,
   health,
   recentHistory,
   onCancel,
@@ -726,6 +824,12 @@ function Composer({
   convId: string | null;
   disabled: boolean;
   autoFocus?: boolean;
+  isIdleCentered?: boolean;
+  compileAction?: {
+    busy: boolean;
+    label: string;
+    onRun: () => Promise<void>;
+  };
   health?: LlmHealth | null;
   /** Last ~8 user/assistant turns of this conversation, oldest-first.
    *  Forwarded to the engine so the agent can treat them as memory.
@@ -804,9 +908,19 @@ function Composer({
 
   return (
     <div className="px-5 py-3">
-      <div className="mx-auto max-w-2xl">
+      <div
+        className={cn(
+          "mx-auto",
+          isIdleCentered ? "max-w-[38rem]" : "max-w-3xl",
+        )}
+      >
         {/* Floating card — large radius, subtle shadow, gentle border */}
-        <div className="group relative flex flex-col rounded-2xl border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-all focus-within:border-border/80 focus-within:shadow-[0_4px_24px_rgba(0,0,0,0.35)]">
+        <div
+          className={cn(
+            "group relative flex flex-col border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-all focus-within:border-border/80 focus-within:shadow-[0_4px_24px_rgba(0,0,0,0.35)]",
+            isIdleCentered ? "rounded-xl" : "rounded-2xl",
+          )}
+        >
 
           {/* Health banner inside the card, above the textarea */}
           {health && (
@@ -834,47 +948,84 @@ function Composer({
             </div>
           )}
 
-          {/* Textarea */}
-          <textarea
-            ref={textareaRef}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder={
-              disabled
-                ? "Generating…"
-                : "Plan, Build, / for commands, @ for context"
-            }
-            rows={1}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void send();
+          <div className="relative w-full">
+            {/* Textarea */}
+            <textarea
+              ref={textareaRef}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder={
+                disabled
+                  ? "Generating…"
+                  : "Plan, Build, / for commands, @ for context"
               }
-            }}
-            className="w-full resize-none border-0 bg-transparent px-4 pt-3 pb-2 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
-          />
+              rows={1}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+              className={cn(
+                "w-full resize-none border-0 bg-transparent pl-4 pr-12 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
+                isIdleCentered ? "min-h-[92px] py-6" : "py-2.5",
+              )}
+            />
 
-          {/* Bottom action row */}
-          <div className="flex items-center justify-end px-3 pb-2.5">
-            {disabled ? (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={onCancel}
-                className="h-7 w-7 rounded-full hover:bg-destructive/10 hover:text-destructive"
-              >
-                <Square className="size-3 fill-current" />
-              </Button>
-            ) : (
-              <Button
-                size="icon"
-                disabled={!text.trim() || busy}
-                onClick={() => void send()}
-                className="h-7 w-7 rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:opacity-30"
-              >
-                <ArrowUp className="size-3.5" />
-              </Button>
-            )}
+            {/* Inline action button */}
+            <div
+              className={cn(
+                "absolute right-2 flex items-center justify-end",
+                isIdleCentered ? "bottom-2.5" : "bottom-1.5",
+              )}
+            >
+              {isIdleCentered && compileAction && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={compileAction.busy || disabled}
+                  onClick={() => void compileAction.onRun()}
+                  className="mr-2 h-8 rounded-lg border-border/70 bg-background/40 px-2.5 text-[11px] hover:bg-muted/40"
+                >
+                  {compileAction.busy ? (
+                    <Loader2 className="mr-1 size-3 animate-spin" />
+                  ) : (
+                    <Hammer className="mr-1 size-3" />
+                  )}
+                  {compileAction.busy ? "Compiling..." : compileAction.label}
+                </Button>
+              )}
+              {disabled ? (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={onCancel}
+                  className={cn(
+                    "rounded-full hover:bg-destructive/10 hover:text-destructive",
+                    isIdleCentered ? "h-8 w-8" : "h-7 w-7",
+                  )}
+                >
+                  <Square
+                    className={cn(
+                      "fill-current",
+                      isIdleCentered ? "size-3.5" : "size-3",
+                    )}
+                  />
+                </Button>
+              ) : (
+                <Button
+                  size="icon"
+                  disabled={!text.trim() || busy}
+                  onClick={() => void send()}
+                  className={cn(
+                    "rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:opacity-30",
+                    isIdleCentered ? "h-8 w-8" : "h-7 w-7",
+                  )}
+                >
+                  <ArrowUp className={cn(isIdleCentered ? "size-4" : "size-3.5")} />
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       </div>

@@ -5029,6 +5029,49 @@ impl GraphStore {
             .collect())
     }
 
+    /// Return up to `limit` source URIs ranked by claim count descending,
+    /// tie-broken by URI lexicographic ascending. Used by README
+    /// synthesis (deterministic ordering is load-bearing — the README
+    /// ends up inside `manifest.toml` which contributes to `pack_hash`,
+    /// so non-deterministic source order would break content addressing).
+    pub fn get_top_sources_with_claim_counts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, usize)>> {
+        let mut params = BTreeMap::new();
+        params.insert("lim".into(), DataValue::Num(Num::Int(limit as i64)));
+        let result = self
+            .db
+            .run_script(
+                r#"src_cnts[sid, count(cid)] :=
+                    *claims{id: cid, source_id: sid}
+                ?[uri, cnt] :=
+                    src_cnts[sid, cnt],
+                    *sources{id: sid, uri}
+                :order -cnt, uri
+                :limit $lim"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("top_sources query failed: {e}"))
+            })?;
+        Ok(result
+            .rows
+            .iter()
+            .take(limit)
+            .map(|row| {
+                let uri = dv_to_string(&row[0]);
+                let cnt = match &row[1] {
+                    DataValue::Num(Num::Int(n)) => *n as usize,
+                    DataValue::Num(Num::Float(f)) => *f as usize,
+                    _ => 0,
+                };
+                (uri, cnt)
+            })
+            .collect())
+    }
+
     /// Find an entity by exact canonical name (case-insensitive) or by alias.
     /// Returns `(id, canonical_name)` if found.
     pub fn find_entity_by_name(&self, name: &str) -> Result<Option<(String, String)>> {

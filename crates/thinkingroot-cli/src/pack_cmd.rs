@@ -66,6 +66,13 @@ pub const EXIT_REVOKED: i32 = 72;
 /// supply-chain attack alert.
 pub const EXIT_REVOCATION_UNVERIFIABLE: i32 = 73;
 
+/// CLI gave up reconnecting to the cortex daemon. Surfaced when
+/// `cortex_remote::with_reconnect` exhausts its retry budget — i.e.
+/// the daemon is genuinely unreachable, not just hiccuping. Distinct
+/// from generic CLI errors so wrappers and scripts can detect "your
+/// engine isn't running" without grepping stderr.
+pub const EXIT_DAEMON_UNREACHABLE: i32 = 75;
+
 /// Refusal returned by `run_install` when verification rejects the
 /// pack. Carries an exit code so `main.rs` can `process::exit` with the
 /// right number after printing the user-facing message.
@@ -484,6 +491,10 @@ fn run_keyless_signing(builder: tr_format::V3PackBuilder, pack_filename: &str) -
 ///   not be checked (offline registry, no trusted snapshot).
 ///   Distinct from `72` so transient outages don't masquerade as
 ///   confirmed revocations in CI.
+/// - [`EXIT_DAEMON_UNREACHABLE`] (75) — surfaced by stateful CLI
+///   commands when `cortex_remote::with_reconnect` exhausts its
+///   retry budget. Distinct from generic CLI errors so wrappers can
+///   detect "your engine is not running" without grepping stderr.
 ///
 /// When `revocation_check` is true the function constructs a
 /// [`tr_revocation::RevocationCache`] and drives the async
@@ -721,11 +732,40 @@ fn build_manifest_v3(
     if let Some(d) = description_override.or_else(|| from_file.and_then(|p| p.description)) {
         manifest.description = Some(d);
     }
+    // Authority chain for the README:
+    //   <workspace_root>/README.md  (user-facing, carries hand-written narrative)
+    //   .thinkingroot/README.md      (engine-canonical fallback)
+    // The pipeline maintains both on every dirty compile; pack just
+    // picks the user-facing version when present so published packs
+    // carry the user's full story. NotFound is intended (fresh
+    // workspaces); other I/O errors are real and surface as a hard
+    // failure (CLAUDE.md §honesty rule §6 — never silently embed an
+    // empty/wrong README in a published pack).
+    let readme = read_optional_file(&workspace.join("README.md"))?
+        .or(read_optional_file(&workspace.join(".thinkingroot/README.md"))?);
+    if let Some(r) = readme.filter(|s| !s.is_empty()) {
+        manifest.readme = Some(r);
+    }
     // Validate eagerly so user gets the error before the slow walk.
     manifest
         .validate()
         .map_err(|e| anyhow!("invalid manifest: {e}"))?;
     Ok(manifest)
+}
+
+/// Read a file as a string, returning `Ok(None)` only when the file
+/// is missing. Permission denied / I/O errors / invalid UTF-8 surface
+/// as real failures rather than being masked as "absent" — packing a
+/// pack with a missing or empty README is honest behaviour, but
+/// silently embedding an empty README because a permission-denied
+/// error was swallowed is the silent-failure class CLAUDE.md §6
+/// forbids.
+fn read_optional_file(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("read {}: {e}", path.display())),
+    }
 }
 
 /// Run `root install`. The `reference` argument accepts:

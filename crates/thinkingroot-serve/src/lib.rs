@@ -17,3 +17,4 @@ pub mod mcp;
 pub mod pipeline;
 pub mod rest;
 pub mod structural_persist;
+pub mod workspace_watcher;

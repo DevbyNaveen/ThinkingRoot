@@ -23,6 +23,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "thinkingroot-desktop"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

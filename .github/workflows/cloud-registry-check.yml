@@ -1,0 +1,102 @@
+name: Cloud registry cross-check
+
+# Slice 8 — guard the cross-repo path-dep boundary between OSS
+# `tr-format` and the cloud `services/registry`. Whenever a PR
+# touches one of the trust crates, this job checks out the cloud
+# sibling at `main` and runs `cargo check -p registry` and
+# `cargo check -p compile-worker` against the OSS HEAD on this PR.
+#
+# A red status here means the proposed OSS change breaks the cloud
+# downstream. Fix the drift on the same PR (or in a coordinated
+# cloud-side PR) before merging.
+#
+# Required secret: `CROSS_REPO_PAT` — fine-grained PAT with
+# `contents: read` permission on `DevbyNaveen/thinkingroot-cloud`.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/tr-format/**'
+      - 'crates/tr-identity/**'
+      - 'crates/tr-sigstore/**'
+      - 'crates/tr-revocation/**'
+      - 'crates/tr-verify/**'
+      - 'crates/tr-render/**'
+      - 'crates/tr-transparency/**'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/tr-format/**'
+      - 'crates/tr-identity/**'
+      - 'crates/tr-sigstore/**'
+      - 'crates/tr-revocation/**'
+      - 'crates/tr-verify/**'
+      - 'crates/tr-render/**'
+      - 'crates/tr-transparency/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  cross-check:
+    name: cargo check -p {registry, compile-worker}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OSS at PR head
+        uses: actions/checkout@v4
+        with:
+          path: thinkingroot
+
+      - name: Checkout cloud at main
+        uses: actions/checkout@v4
+        with:
+          repository: DevbyNaveen/thinkingroot-cloud
+          token: ${{ secrets.CROSS_REPO_PAT }}
+          path: thinkingroot-cloud
+          ref: main
+
+      - name: Verify sibling layout
+        # The cloud's path-dep is `path = "../../../thinkingroot/crates/tr-format"`.
+        # Both repos must be siblings of each other for that path to resolve.
+        run: |
+          ls -la
+          test -d thinkingroot/crates/tr-format
+          test -f thinkingroot-cloud/services/registry/Cargo.toml
+          grep -q '../../../thinkingroot/crates/tr-format' thinkingroot-cloud/services/registry/Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: thinkingroot-cloud
+
+      - name: cargo check -p registry against OSS HEAD
+        working-directory: thinkingroot-cloud
+        run: cargo check -p registry
+
+      - name: cargo check -p compile-worker against OSS HEAD
+        working-directory: thinkingroot-cloud
+        run: cargo check -p compile-worker
+
+      - name: Comment PR on failure
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '🚨 **Cross-repo break detected.**',
+              '',
+              'This PR breaks the cloud sibling (`thinkingroot-cloud`).',
+              'Run `cargo check -p registry` from `thinkingroot-cloud` against',
+              "this branch's `tr-format` and fix the drift before merging.",
+              '',
+              'See `docs/CROSS_REPO_CI.md` for the workflow this guards.',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

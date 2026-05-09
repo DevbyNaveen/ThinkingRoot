@@ -8,6 +8,7 @@ import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ToastStack } from "@/components/ui/toast-stack";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
+import { PackExportSheet } from "@/components/export/PackExportSheet";
 import { onTrFileOpened, onboardingStatus, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 
@@ -35,6 +36,8 @@ export default function App() {
   const onboardingDismissed = useApp((s) => s.onboardingDismissed);
   const setOnboardingDismissed = useApp((s) => s.setOnboardingDismissed);
   const setCompileProgress = useApp((s) => s.setCompileProgress);
+  const packExportTarget = useApp((s) => s.packExportTarget);
+  const setPackExportTarget = useApp((s) => s.setPackExportTarget);
   const [installTrPath, setInstallTrPath] = useState<string | null>(null);
 
   // Subscribe to compilation progress events from the background sidecar
@@ -129,6 +132,13 @@ export default function App() {
         path={installTrPath}
         onClose={() => setInstallTrPath(null)}
       />
+      {packExportTarget && (
+        <PackExportSheet
+          workspace={packExportTarget.workspace}
+          branch={packExportTarget.branch}
+          onClose={() => setPackExportTarget(null)}
+        />
+      )}
       <ToastStack />
     </TooltipProvider>
   );

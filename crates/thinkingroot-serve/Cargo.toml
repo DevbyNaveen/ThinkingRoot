@@ -57,6 +57,13 @@ hex = "0.4"
 base64 = { workspace = true }
 tempfile = "3"
 
+# Slice 3 — file-system watcher for workspace lifecycle events
+# (`.thinkingroot/` removal, graph.db missing, config.toml modified).
+# Workspace dep pinned at notify v8 to match the CLI's existing usage in
+# `root compile --watch` so we have a single notify version across the
+# tree.
+notify = { workspace = true }
+
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }

@@ -1467,6 +1467,27 @@ async fn run_pipeline_inner(
     }
     mark_phase!("audit");
 
+    // ─── Phase 10: Workspace README synthesis ───
+    // Deterministic from substrate; folded into the "audit" phase
+    // budget rather than added to PHASE_NAMES (synth is sub-millisecond
+    // on real workspaces). Only runs when this compile produced new
+    // substrate and we are on the canonical (main / un-branched) view —
+    // branches share workspace sources, so per-branch README would only
+    // differ in counts and the user-facing root README is workspace-
+    // level state.
+    if matches!(branch, None | Some("main")) {
+        if let Err(e) = synthesise_and_persist_readme(root_path, &storage).await {
+            // Non-fatal: a failure here means the README is stale, not
+            // that the compile produced bad data. Surface as warn (no
+            // silent failure — CLAUDE.md honesty rule §6).
+            tracing::warn!(
+                target: "readme",
+                error = %e,
+                "README synthesis failed; .thinkingroot/README.md may be stale"
+            );
+        }
+    }
+
     fingerprints.save()?;
     config.save(root_path)?;
 
@@ -1580,6 +1601,152 @@ fn upsert_in_chunks(
         done += chunk.len();
     }
     Ok(done)
+}
+
+/// Synthesise the workspace README from current substrate, write the
+/// engine-canonical view to `<root>/.thinkingroot/README.md`, and
+/// merge the auto-block into `<root>/README.md` (preserving any user-
+/// authored content outside the markers).
+async fn synthesise_and_persist_readme(
+    root_path: &Path,
+    storage: &StorageEngine,
+) -> Result<()> {
+    use thinkingroot_extract::readme;
+
+    let workspace_name: String = root_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let (source_count, claim_count, entity_count) = storage.graph.get_counts()?;
+    let (rooted, attested, quarantined, rejected) =
+        storage.graph.count_claims_by_admission_tier()?;
+    let top_entities_raw = storage.graph.get_top_entities_by_claim_count(10)?;
+    let top_sources_raw: Vec<(String, usize)> =
+        storage.graph.get_top_sources_with_claim_counts(20)?;
+    let contradiction_count = storage.graph.get_contradictions()?.len();
+
+    let branches_raw = thinkingroot_branch::list_branches(root_path)?;
+
+    let top_entities: Vec<readme::TopEntity<'_>> = top_entities_raw
+        .iter()
+        .map(|e| readme::TopEntity {
+            name: e.name.as_str(),
+            claim_count: e.claim_count as u64,
+        })
+        .collect();
+    let sources: Vec<readme::SourceLine<'_>> = top_sources_raw
+        .iter()
+        .map(|(uri, cnt)| readme::SourceLine {
+            relative_path: uri.as_str(),
+            claim_count: *cnt as u64,
+        })
+        .collect();
+    let branch_kinds: Vec<String> = branches_raw
+        .iter()
+        .map(|b| format!("{:?}", b.kind))
+        .collect();
+    let branch_policies: Vec<String> = branches_raw
+        .iter()
+        .map(|b| format!("{:?}", b.merge_policy))
+        .collect();
+    let branches: Vec<readme::BranchLine<'_>> = branches_raw
+        .iter()
+        .enumerate()
+        .map(|(i, b)| readme::BranchLine {
+            name: b.name.as_str(),
+            kind: branch_kinds[i].as_str(),
+            merge_policy: branch_policies[i].as_str(),
+        })
+        .collect();
+
+    let extractor = format!("thinkingroot/extract@{}", env!("CARGO_PKG_VERSION"));
+    let thinkingroot_version = env!("CARGO_PKG_VERSION");
+    let now = chrono::Utc::now();
+
+    let inputs = readme::ReadmeInputs {
+        workspace_name: workspace_name.as_str(),
+        description: None,
+        extracted_at: now,
+        extractor: extractor.as_str(),
+        source_count: source_count as u64,
+        claim_count: claim_count as u64,
+        entity_count: entity_count as u64,
+        rooted: rooted as u64,
+        attested: attested as u64,
+        quarantined: quarantined as u64,
+        rejected: rejected as u64,
+        top_entities: &top_entities,
+        sources: &sources,
+        branches: &branches,
+        contradiction_count: contradiction_count as u64,
+        thinkingroot_version,
+    };
+
+    // 1. Engine-canonical README — always overwritten.
+    let canonical = readme::synthesise(&inputs);
+    let canonical_path = root_path.join(".thinkingroot").join("README.md");
+    if let Some(parent) = canonical_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| thinkingroot_core::Error::io_path(parent.to_path_buf(), e))?;
+    }
+    tokio::fs::write(&canonical_path, canonical.as_bytes())
+        .await
+        .map_err(|e| thinkingroot_core::Error::io_path(canonical_path.clone(), e))?;
+
+    // 2. User-facing root README — section-marker maintained.
+    //
+    // Auto-creation is opt-in: the pipeline updates an *existing*
+    // `<root>/README.md` (preserving user content outside markers) but
+    // does NOT create one from scratch on a fresh workspace. Reason:
+    // the workspace walker would pick up an auto-generated README.md
+    // as a real source on the next compile (entity names listed in
+    // the auto-block would re-enter the claim graph as a feedback
+    // loop). Users opt in by creating the file themselves —
+    // `touch README.md` is enough for the pipeline to start
+    // maintaining the auto-block on the next compile. The desktop's
+    // Readme tab keeps working in either case because it reads from
+    // `.thinkingroot/README.md` (canonical, always written).
+    let block = readme::synthesise_block(&inputs);
+    let root_readme = root_path.join("README.md");
+    // NotFound is the intended path for fresh workspaces (root README
+    // auto-creation is opt-in). Other I/O errors (permission denied,
+    // bad UTF-8, etc.) are real failures — log them rather than
+    // silently treating the file as absent. CLAUDE.md §honesty rule §6.
+    let existing = match tokio::fs::read_to_string(&root_readme).await {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                target: "readme",
+                error = %e,
+                path = %root_readme.display(),
+                "could not read existing root README — skipping update"
+            );
+            None
+        }
+    };
+    if let Some(existing_str) = existing.as_deref() {
+        match readme::merge_into_root_readme(Some(existing_str), &block, "") {
+            Ok(merged) => {
+                tokio::fs::write(&root_readme, merged.as_bytes())
+                    .await
+                    .map_err(|e| thinkingroot_core::Error::io_path(root_readme.clone(), e))?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "readme",
+                    error = %e,
+                    path = %root_readme.display(),
+                    "skipping root README update — markers malformed; user file unchanged"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -19,6 +19,31 @@ pub enum Error {
     /// failed.
     #[error("revocation cache unavailable: {0}")]
     RevocationUnavailable(#[from] tr_revocation::Error),
+
+    /// `manifest.author_key_id` is malformed (not a valid
+    /// `did:method:identifier[#fragment]`). Surfaced before any
+    /// network call so a malformed manifest fails fast at the
+    /// boundary rather than the resolver.
+    #[error("invalid author_key_id `{did}`: {reason}")]
+    InvalidAuthorKey {
+        /// The malformed DID string.
+        did: String,
+        /// Why it's malformed.
+        reason: String,
+    },
+
+    /// The author's DID could not be resolved (HTTPS fetch failed,
+    /// DID document malformed, no Ed25519 keys in the document, etc.).
+    /// Distinct from [`crate::v3::V3Verdict::Tampered`] — this means
+    /// "we cannot decide", not "we decided no".
+    #[error("author DID resolution failed for `{did}`: {source}")]
+    AuthorKeyResolutionFailed {
+        /// The DID we tried to resolve.
+        did: String,
+        /// The underlying tr-identity error.
+        #[source]
+        source: tr_identity::Error,
+    },
 }
 
 /// Convenience alias for `Result<T, crate::Error>`.

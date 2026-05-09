@@ -2,10 +2,8 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
 use async_trait::async_trait;
-
-use super::PackResolver;
+use thinkingroot_core::resolver::{PackResolver, ResolverDescriptor, ResolverError};
 
 /// Read a `.tr` from a local filesystem path. Performs no integrity
 /// check beyond what [`tr_format::read_v3_pack`] does on parse —
@@ -24,8 +22,18 @@ impl LocalFsResolver {
 
 #[async_trait]
 impl PackResolver for LocalFsResolver {
-    async fn resolve(&self) -> Result<Vec<u8>> {
-        std::fs::read(&self.path).with_context(|| format!("read {}", self.path.display()))
+    async fn resolve(&self) -> Result<Vec<u8>, ResolverError> {
+        std::fs::read(&self.path).map_err(|e| {
+            ResolverError::with_source(
+                "local-fs",
+                format!("read {}", self.path.display()),
+                e,
+            )
+        })
+    }
+
+    fn descriptor(&self) -> ResolverDescriptor {
+        ResolverDescriptor::new("local-fs", self.path.to_string_lossy())
     }
 }
 
@@ -51,6 +59,15 @@ mod tests {
         let path = tmp.path().join("missing.tr");
         let resolver = LocalFsResolver::new(path);
         let err = resolver.resolve().await.unwrap_err();
-        assert!(err.to_string().contains("read"));
+        assert_eq!(err.kind, "local-fs");
+        assert!(err.detail.contains("read"));
+    }
+
+    #[tokio::test]
+    async fn descriptor_reports_local_fs_kind() {
+        let resolver = LocalFsResolver::new("/tmp/example.tr");
+        let d = resolver.descriptor();
+        assert_eq!(d.kind, "local-fs");
+        assert_eq!(d.source, "/tmp/example.tr");
     }
 }

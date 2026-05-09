@@ -6,13 +6,27 @@
 //! [`HttpRegistryResolver`] adds the discovery-doc → download-URL →
 //! BLAKE3 cross-check flow against `{owner}/{slug}@{version}`.
 
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use subtle::ConstantTimeEq;
+use thinkingroot_core::resolver::{PackResolver, ResolverDescriptor, ResolverError};
 use tr_format::digest::blake3_hex;
 
-use super::PackResolver;
 use crate::pack_cmd::{http_client, refuse_insecure_http};
+
+const KIND_DIRECT: &str = "http-direct";
+const KIND_REGISTRY: &str = "http-registry";
+
+/// Build a [`ResolverError`] from an `anyhow::Error`. Wraps the chain
+/// so `error.source()` walks back to the original cause; the detail
+/// string is the top-level `anyhow` rendering minus the chain (which
+/// `Display` would otherwise print twice).
+fn from_anyhow(kind: &'static str, detail: impl Into<String>, err: anyhow::Error) -> ResolverError {
+    ResolverError {
+        kind,
+        detail: detail.into(),
+        source: Some(err.into()),
+    }
+}
 
 // -----------------------------------------------------------------------------
 // HttpDirectUrlResolver
@@ -32,22 +46,31 @@ impl HttpDirectUrlResolver {
 
 #[async_trait]
 impl PackResolver for HttpDirectUrlResolver {
-    async fn resolve(&self) -> Result<Vec<u8>> {
-        refuse_insecure_http(&self.url)?;
-        let client = http_client()?;
+    async fn resolve(&self) -> Result<Vec<u8>, ResolverError> {
+        refuse_insecure_http(&self.url)
+            .map_err(|e| from_anyhow(KIND_DIRECT, "policy refused URL", e))?;
+        let client = http_client()
+            .map_err(|e| from_anyhow(KIND_DIRECT, "build http client", e))?;
         let resp = client
             .get(&self.url)
             .send()
             .await
-            .with_context(|| format!("GET {}", self.url))?;
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("GET {}", self.url))?;
-        let bytes = resp
-            .bytes()
-            .await
-            .with_context(|| format!("read body from {}", self.url))?;
+            .map_err(|e| ResolverError::with_source(KIND_DIRECT, format!("GET {}", self.url), e))?;
+        let resp = resp.error_for_status().map_err(|e| {
+            ResolverError::with_source(KIND_DIRECT, format!("GET {}", self.url), e)
+        })?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            ResolverError::with_source(
+                KIND_DIRECT,
+                format!("read body from {}", self.url),
+                e,
+            )
+        })?;
         Ok(bytes.to_vec())
+    }
+
+    fn descriptor(&self) -> ResolverDescriptor {
+        ResolverDescriptor::new(KIND_DIRECT, &self.url)
     }
 }
 
@@ -93,43 +116,61 @@ impl HttpRegistryResolver {
 
 #[async_trait]
 impl PackResolver for HttpRegistryResolver {
-    async fn resolve(&self) -> Result<Vec<u8>> {
-        refuse_insecure_http(&self.registry_url)?;
+    async fn resolve(&self) -> Result<Vec<u8>, ResolverError> {
+        refuse_insecure_http(&self.registry_url)
+            .map_err(|e| from_anyhow(KIND_REGISTRY, "policy refused registry URL", e))?;
         let registry_url = self.registry_url.trim_end_matches('/');
-        let client = http_client()?;
+        let client = http_client()
+            .map_err(|e| from_anyhow(KIND_REGISTRY, "build http client", e))?;
 
         // 1. Discovery doc.
         let discovery_url = format!("{}/.well-known/tr-registry.json", registry_url);
-        let disco: serde_json::Value = client
-            .get(&discovery_url)
-            .send()
-            .await
-            .with_context(|| format!("GET {}", discovery_url))?
-            .error_for_status()
-            .with_context(|| format!("GET {}", discovery_url))?
-            .json()
-            .await
-            .with_context(|| format!("parse JSON from {}", discovery_url))?;
+        let resp = client.get(&discovery_url).send().await.map_err(|e| {
+            ResolverError::with_source(KIND_REGISTRY, format!("GET {discovery_url}"), e)
+        })?;
+        let resp = resp.error_for_status().map_err(|e| {
+            ResolverError::with_source(KIND_REGISTRY, format!("GET {discovery_url}"), e)
+        })?;
+        let disco: serde_json::Value = resp.json().await.map_err(|e| {
+            ResolverError::with_source(
+                KIND_REGISTRY,
+                format!("parse JSON from {discovery_url}"),
+                e,
+            )
+        })?;
 
         let registry_fmt = disco["format_version"].as_str().unwrap_or("");
         if registry_fmt != "tr-registry/1" {
-            return Err(anyhow!(
-                "registry at {} advertises unsupported format_version `{}`",
-                registry_url,
-                registry_fmt
+            return Err(ResolverError::new(
+                KIND_REGISTRY,
+                format!(
+                    "registry at {} advertises unsupported format_version `{}`",
+                    registry_url, registry_fmt
+                ),
             ));
         }
         let advertised_tr_fmt = disco["tr_format"].as_str().unwrap_or("");
-        if advertised_tr_fmt != tr_format::FORMAT_VERSION_V3 {
-            return Err(anyhow!(
-                "registry advertises tr_format `{}` but this client only handles `{}`",
-                advertised_tr_fmt,
-                tr_format::FORMAT_VERSION_V3
+        // Accept either `tr/3` or `tr/3.1` — registry's advertised
+        // version may lag the OSS bump while the wire format is
+        // backwards-compatible. Reject unknown values loudly.
+        if advertised_tr_fmt != tr_format::FORMAT_VERSION_V3
+            && advertised_tr_fmt != tr_format::FORMAT_VERSION_V31
+        {
+            return Err(ResolverError::new(
+                KIND_REGISTRY,
+                format!(
+                    "registry advertises tr_format `{}` but this client handles `{}` and `{}`",
+                    advertised_tr_fmt,
+                    tr_format::FORMAT_VERSION_V3,
+                    tr_format::FORMAT_VERSION_V31
+                ),
             ));
         }
         let pattern = disco["endpoints"]["download"]
             .as_str()
-            .ok_or_else(|| anyhow!("registry doc missing endpoints.download"))?;
+            .ok_or_else(|| {
+                ResolverError::new(KIND_REGISTRY, "registry doc missing endpoints.download")
+            })?;
         // Default max-pack-bytes when the discovery doc doesn't override.
         // 100 MiB matches the v3 spec §6.4 single-pack ceiling.
         let max_bytes = disco["max_pack_bytes"]
@@ -144,22 +185,21 @@ impl PackResolver for HttpRegistryResolver {
         let download_url = format!("{}{}", registry_url, download_path);
 
         // 3. Fetch the bytes.
-        let resp = client
-            .get(&download_url)
-            .send()
-            .await
-            .with_context(|| format!("GET {}", download_url))?
-            .error_for_status()
-            .with_context(|| format!("GET {}", download_url))?;
+        let resp = client.get(&download_url).send().await.map_err(|e| {
+            ResolverError::with_source(KIND_REGISTRY, format!("GET {download_url}"), e)
+        })?;
+        let resp = resp.error_for_status().map_err(|e| {
+            ResolverError::with_source(KIND_REGISTRY, format!("GET {download_url}"), e)
+        })?;
 
         if let Some(cl) = resp.content_length() {
             if cl > max_bytes {
-                return Err(anyhow!(
-                    "registry advertised content-length {} exceeds max_pack_bytes {} for {}/{}",
-                    cl,
-                    max_bytes,
-                    self.owner,
-                    self.slug
+                return Err(ResolverError::new(
+                    KIND_REGISTRY,
+                    format!(
+                        "registry advertised content-length {} exceeds max_pack_bytes {} for {}/{}",
+                        cl, max_bytes, self.owner, self.slug
+                    ),
                 ));
             }
         }
@@ -174,15 +214,21 @@ impl PackResolver for HttpRegistryResolver {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let bytes = resp
-            .bytes()
-            .await
-            .with_context(|| format!("read body from {}", download_url))?;
+        let bytes = resp.bytes().await.map_err(|e| {
+            ResolverError::with_source(
+                KIND_REGISTRY,
+                format!("read body from {download_url}"),
+                e,
+            )
+        })?;
         if bytes.len() as u64 > max_bytes {
-            return Err(anyhow!(
-                "registry returned {} bytes, exceeds max_pack_bytes {}",
-                bytes.len(),
-                max_bytes
+            return Err(ResolverError::new(
+                KIND_REGISTRY,
+                format!(
+                    "registry returned {} bytes, exceeds max_pack_bytes {}",
+                    bytes.len(),
+                    max_bytes
+                ),
             ));
         }
 
@@ -209,16 +255,25 @@ impl PackResolver for HttpRegistryResolver {
                 false
             };
             if !equal {
-                return Err(anyhow!(
-                    "content hash mismatch for {}/{}@{}: registry advertised `{}`, computed `{}`",
-                    self.owner,
-                    self.slug,
-                    self.version,
-                    expected,
-                    actual
+                return Err(ResolverError::new(
+                    KIND_REGISTRY,
+                    format!(
+                        "content hash mismatch for {}/{}@{}: registry advertised `{}`, computed `{}`",
+                        self.owner, self.slug, self.version, expected, actual
+                    ),
                 ));
             }
         }
         Ok(bytes.to_vec())
+    }
+
+    fn descriptor(&self) -> ResolverDescriptor {
+        ResolverDescriptor::new(
+            KIND_REGISTRY,
+            format!(
+                "{}#{}/{}@{}",
+                self.registry_url, self.owner, self.slug, self.version
+            ),
+        )
     }
 }

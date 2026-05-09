@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Zap, DollarSign, Command, Folder, Loader2, Cloud, CloudOff } from "lucide-react";
+import { Zap, Command, Folder, Loader2, Cloud, CloudOff } from "lucide-react";
 import { useApp } from "@/store/app";
-import { formatCost, formatTokens } from "@/lib/utils";
+import { formatTokens } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { authState, type AuthState } from "@/lib/tauri";
 
@@ -39,7 +39,6 @@ import { authState, type AuthState } from "@/lib/tauri";
  * order is stable when they ship.
  */
 export function StatusBar() {
-  const totalCost = useApp((s) => s.totalCostUsd);
   const totalIn = useApp((s) => s.totalTokensIn);
   const totalOut = useApp((s) => s.totalTokensOut);
   const trust = useApp((s) => s.trust);
@@ -89,6 +88,10 @@ export function StatusBar() {
         return "compile: waiting for engine…";
       case "started":
         return "compile: starting…";
+      case "diff_start":
+        return "compile: diffing…";
+      case "diff_complete":
+        return `compile: diff ${p.changed} changed`;
       case "parse_complete":
         return `compile: parsed ${p.files} files`;
       case "extraction_progress":
@@ -97,20 +100,45 @@ export function StatusBar() {
         return `compile: extracting (0/${p.total_chunks})`;
       case "extraction_complete":
         return `compile: extracted ${p.claims} claims`;
+      case "extraction_partial":
+        return `compile: partial (${p.failed_batches} failed batches)`;
+      case "grounding_start":
+        return "compile: grounding start";
       case "grounding_progress":
         return `compile: grounding (${p.done}/${p.total})`;
+      case "grounding_done":
+        return `compile: grounded ${p.accepted} accepted`;
+      case "fingerprint_done":
+        return `compile: fingerprint ${p.cutoffs} cutoffs`;
+      case "rooting_start":
+        return `compile: rooting ${p.candidates} candidates`;
+      case "rooting_progress":
+        return `compile: rooting (${p.done}/${p.total})`;
+      case "rooting_done":
+        return `compile: rooted ${p.rooted}`;
       case "linking_start":
         return `compile: linking ${p.total_entities} entities`;
       case "linking_progress":
         return `compile: linking (${p.done}/${p.total})`;
       case "vector_progress":
         return `compile: vectoring (${p.done}/${p.total})`;
+      case "vector_update_done":
+        return "compile: vector update done";
+      case "compilation_progress":
+        return `compile: artifacts (${p.done}/${p.total})`;
+      case "compilation_done":
+        return `compile: artifacts ${p.artifacts}`;
+      case "verification_done":
+        return `compile: verification ${p.health}`;
+      case "phase_done":
+        return `compile: ${p.name} ${p.elapsed_ms}ms`;
       default:
         return "compile: running";
     }
   })();
-  const compileIsError =
-    compileProgress?.phase === "failed";
+  const compileIsWarn =
+    compileProgress?.phase === "failed" ||
+    compileProgress?.phase === "extraction_partial";
 
   return (
     <footer
@@ -132,24 +160,17 @@ export function StatusBar() {
           <Segment
             Icon={Loader2}
             label={compileLabel}
-            tone={compileIsError ? "warn" : undefined}
+            tone={compileIsWarn ? "warn" : undefined}
           />
         ) : null}
 
-        {/* 4. Cost today */}
-        <Segment
-          Icon={DollarSign}
-          label={`${formatCost(totalCost)} today`}
-          tone={totalCost > 5 ? "warn" : undefined}
-        />
-
-        {/* 5. Tokens in/out */}
+        {/* 4. Tokens in/out */}
         <Segment label={`${formatTokens(totalIn)} in · ${formatTokens(totalOut)} out`} />
 
-        {/* 6. Trust filter */}
+        {/* 5. Trust filter */}
         <Segment label={`trust: ${trust}`} />
 
-        {/* 7. Cloud sign-in state — honest read of desktop.toml + env */}
+        {/* 6. Cloud sign-in state — honest read of desktop.toml + env */}
         <CloudSegment auth={auth} />
 
         {/* 8. (reserved) credits — pending B1 cloud chat path; intentionally absent */}

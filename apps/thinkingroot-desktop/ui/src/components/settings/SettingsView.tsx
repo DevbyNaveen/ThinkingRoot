@@ -269,15 +269,20 @@ export function SettingsView() {
 
   return (
     <div className="flex h-full flex-col">
-      <Header
-        dirty={dirty}
-        saving={saving}
-        onSave={save}
-        configPath={paths.config_path ?? undefined}
-        credentialsPath={paths.credentials_path ?? undefined}
-      />
       <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-8">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-6 py-8">
+          <div className="flex items-center justify-end">
+            <Button
+              onClick={save}
+              disabled={!dirty || saving}
+              size="sm"
+              className="h-7 gap-1 text-xs"
+            >
+              <Save className="size-3" />
+              {saving ? "Saving…" : "Save"}
+            </Button>
+          </div>
+
           <Section
             Icon={KeyRound}
             title="Provider"
@@ -377,7 +382,7 @@ export function SettingsView() {
                 No workspaces registered yet. Add one from the sidebar.
               </p>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 {workspaces.map((w) => {
                   const isActive = activeWorkspace === w.name;
                   return (
@@ -386,10 +391,10 @@ export function SettingsView() {
                       type="button"
                       onClick={() => void changeActiveWorkspace(w.name)}
                       className={cn(
-                        "flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left text-xs transition-colors",
+                        "flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-xs transition-colors",
                         isActive
-                          ? "border-accent bg-accent/10"
-                          : "border-border hover:border-accent/60 hover:bg-muted/40",
+                          ? "bg-accent/12 ring-1 ring-accent/40"
+                          : "hover:bg-muted/35",
                       )}
                     >
                       <div className="flex min-w-0 flex-col">
@@ -468,7 +473,7 @@ export function SettingsView() {
             title="Channels"
             body="Optional mobile surfaces — reach ThinkingRoot from Telegram, Slack, or Discord. Adapter wiring lands when the channel messaging crate ships the MCP bridge."
           >
-            <div className="rounded-lg border border-dashed border-border/70 p-3 text-[11px] text-muted-foreground">
+            <div className="rounded-lg bg-muted/30 px-3 py-2.5 text-[11px] text-muted-foreground">
               Channel adapters arrive in a follow-on phase.
             </div>
           </Section>
@@ -533,9 +538,9 @@ function AzureWorkspaceCard({
   }
 
   return (
-    <div className="mt-4 space-y-3">
-      <div className="rounded-md border border-border/60 bg-muted/20 p-3">
-        <div className="mb-3 flex items-center justify-between">
+    <div className="mt-4 space-y-4">
+      <div className="space-y-3 rounded-xl bg-muted/25 p-3.5">
+        <div className="flex items-center justify-between">
           <div className="text-xs font-medium text-foreground">Global Azure config</div>
           <span
             className={cn(
@@ -607,8 +612,8 @@ function AzureWorkspaceCard({
       </div>
 
       {wsLlm?.config_exists && (
-        <div className="rounded-md border border-border/60 bg-muted/20 p-3">
-          <div className="mb-3 flex items-center justify-between">
+        <div className="space-y-3 rounded-xl bg-muted/25 p-3.5">
+          <div className="flex items-center justify-between">
             <div className="text-xs font-medium text-foreground">
               Workspace override
               <span className="ml-2 font-mono text-[10px] text-muted-foreground">
@@ -709,7 +714,7 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-xl border border-border bg-surface p-5">
+    <section className="rounded-2xl border border-border/70 bg-surface/80 p-5">
       <header className="flex items-start gap-3">
         <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent/10 text-accent">
           <Icon className="size-4" />
@@ -787,7 +792,7 @@ function McpPane() {
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-[11px]">
+      <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2 text-[11px]">
         <span
           className={cn(
             "inline-block size-2 rounded-full",
@@ -846,7 +851,7 @@ function McpPane() {
       </div>
 
       <div className="relative">
-        <pre className="overflow-x-auto rounded-md border border-border bg-background p-3 font-mono text-[11px] leading-relaxed text-foreground">
+        <pre className="overflow-x-auto rounded-xl bg-muted/30 p-3 font-mono text-[11px] leading-relaxed text-foreground">
           {snippet || "(loading…)"}
         </pre>
         <Button
@@ -891,4 +896,4 @@ function Field({
 }
 
 const fieldClass =
-  "h-8 w-full rounded-md border border-input bg-background px-2 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40";
+  "h-9 w-full rounded-lg border border-input/70 bg-background/70 px-2.5 text-xs font-mono text-foreground focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40";

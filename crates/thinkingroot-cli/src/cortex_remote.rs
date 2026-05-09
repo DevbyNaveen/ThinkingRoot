@@ -20,6 +20,7 @@
 //!
 //! Spec: `docs/2026-05-02-unified-singleton-runtime.md` §6 + §7.
 
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,6 +29,135 @@ use console::style;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use thinkingroot_core::cortex::EngineConnection;
+
+use crate::cortex_client::health_check;
+
+/// Number of total attempts (including the first call) for unary HTTP
+/// helpers. One real attempt + one retry-after-reconnect is enough:
+/// a daemon restart sequence (graceful shutdown → respawn → bind) is
+/// O(seconds), so any failure persisting beyond a single retry is a
+/// genuine outage that the user needs to see.
+const MAX_UNARY_ATTEMPTS: u32 = 2;
+
+/// Backoff sequence between unary retries. Mirrors `wait_for_livez`'s
+/// exponential schedule but only the first two steps — total worst-
+/// case wait before an unrecoverable failure surfaces is ~600 ms.
+const UNARY_RETRY_BACKOFF_MS: &[u64] = &[150, 450];
+
+/// Detect whether a `reqwest::Error` is the kind that warrants a
+/// daemon-restart-aware retry: connect refused, transport-level read
+/// timeout, or a 5xx that the daemon would emit while shutting down.
+/// 4xx is **never** retried — those are programming errors.
+fn is_transient_transport(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+    if let Some(status) = err.status() {
+        // 502/503/504 from a fronting proxy or a half-shutdown daemon
+        // mean "try again." Distinct from 401/403/404 which are
+        // permanent.
+        let code = status.as_u16();
+        return code == 502 || code == 503 || code == 504;
+    }
+    // Body-side failures (broken pipe mid-read, TLS reset) bubble up
+    // as request errors without a status. Treat as transient — the
+    // daemon either crashed or restarted; one retry decides.
+    err.is_request() && err.url().is_some()
+}
+
+/// Wrap a unary HTTP call with daemon-restart-aware retry.
+///
+/// The closure is invoked at most [`MAX_UNARY_ATTEMPTS`] times. Between
+/// attempts we:
+///
+/// 1. Probe `/livez` (1 s timeout, same as `cortex_client::health_check`).
+/// 2. If the daemon answers, the failure was a transient hiccup — wait
+///    a short backoff and retry the original call.
+/// 3. If the daemon does NOT answer, wait the longer backoff (gives a
+///    restarting daemon a moment to bind) and retry.
+///
+/// Cancellation surfaces immediately. Any non-transient error (4xx
+/// from the daemon, malformed URL, etc.) bypasses the retry loop and
+/// surfaces verbatim.
+async fn with_reconnect<F, Fut, T>(
+    conn: &EngineConnection,
+    operation: &'static str,
+    mut call: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, reqwest::Error>>,
+{
+    let (host, port) = match conn {
+        EngineConnection::Remote { host, port, .. } => (host.clone(), *port),
+        other => anyhow::bail!("{operation} called with non-Remote connection: {other:?}"),
+    };
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 0..MAX_UNARY_ATTEMPTS {
+        match call().await {
+            Ok(v) => return Ok(v),
+            Err(e) if !is_transient_transport(&e) => {
+                return Err(e).with_context(|| format!("{operation} (non-transient)"));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 == MAX_UNARY_ATTEMPTS {
+                    break;
+                }
+                let alive = health_check(&host, port).await;
+                let backoff = UNARY_RETRY_BACKOFF_MS
+                    .get(attempt as usize)
+                    .copied()
+                    .unwrap_or(450);
+                tracing::warn!(
+                    operation = %operation,
+                    daemon_alive = alive,
+                    attempt = attempt + 1,
+                    backoff_ms = backoff,
+                    "cortex retry"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+            }
+        }
+    }
+    let last_attempt = last_err
+        .as_ref()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "no underlying error".to_string());
+    Err(anyhow::Error::new(DaemonUnreachable {
+        operation: operation.to_string(),
+        attempts: MAX_UNARY_ATTEMPTS,
+        last_attempt,
+    }))
+}
+
+/// Marker error attached by [`with_reconnect`] when the retry budget
+/// is exhausted. `main.rs` downcasts the top-level `anyhow::Error`
+/// chain against this type so the process can exit with
+/// [`crate::pack_cmd::EXIT_DAEMON_UNREACHABLE`] (75) instead of the
+/// generic `1`. Wrappers and CI scripts use the distinct exit code
+/// to render "your engine is not running" without parsing stderr.
+#[derive(Debug)]
+pub struct DaemonUnreachable {
+    /// Operation we tried before giving up (e.g. `"GET"`, `"POST"`).
+    pub operation: String,
+    /// Total attempts made.
+    pub attempts: u32,
+    /// Stringified last underlying transport error.
+    pub last_attempt: String,
+}
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed after {} attempts; cortex daemon is unreachable: {}",
+            self.operation, self.attempts, self.last_attempt
+        )
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
 
 /// Build a base URL from a Remote connection. Centralised so the
 /// `127.0.0.1` vs `[::1]` formatting decision lives in one place.
@@ -78,16 +208,26 @@ fn extract_error_message(body: &str) -> String {
 /// GET a daemon endpoint and return the raw JSON body of the `data`
 /// field on the `{ok, data, error}` envelope. The caller decides how
 /// to render — tables vs JSON vs counts.
+///
+/// Wrapped in [`with_reconnect`] so a daemon restart between two
+/// CLI calls is invisible at this seam — the second attempt re-attaches
+/// to the new process automatically.
+///
+/// Note: the closure calls `.error_for_status()` so 5xx-class
+/// responses surface as `reqwest::Error` with a status code — that's
+/// what [`is_transient_transport`] keys off to decide retry. 4xx and
+/// non-{502,503,504} 5xx errors fail fast and propagate to the caller.
 pub async fn get_json(
     conn: &EngineConnection,
     path: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "GET", || async {
+        client.get(&url).send().await?.error_for_status()
+    })
+    .await
+    .with_context(|| format!("GET {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -98,12 +238,12 @@ pub async fn post_json(
     body: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .post(&url)
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "POST", || async {
+        client.post(&url).json(body).send().await?.error_for_status()
+    })
+    .await
+    .with_context(|| format!("POST {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -113,11 +253,12 @@ pub async fn delete_json(
     path: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .delete(&url)
-        .send()
-        .await
-        .with_context(|| format!("DELETE {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "DELETE", || async {
+        client.delete(&url).send().await?.error_for_status()
+    })
+    .await
+    .with_context(|| format!("DELETE {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -131,13 +272,18 @@ pub async fn post_json_with_session(
     body: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .post(&url)
-        .header("X-TR-Session-Id", session_id)
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "POST", || async {
+        client
+            .post(&url)
+            .header("X-TR-Session-Id", session_id)
+            .json(body)
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .await
+    .with_context(|| format!("POST {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -148,12 +294,17 @@ pub async fn get_json_with_session(
     session_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .get(&url)
-        .header("X-TR-Session-Id", session_id)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "GET", || async {
+        client
+            .get(&url)
+            .header("X-TR-Session-Id", session_id)
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .await
+    .with_context(|| format!("GET {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -164,12 +315,17 @@ pub async fn delete_json_with_session(
     session_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}{path}", base_url(conn)?);
-    let resp = client(UNARY_TIMEOUT)?
-        .delete(&url)
-        .header("X-TR-Session-Id", session_id)
-        .send()
-        .await
-        .with_context(|| format!("DELETE {url}"))?;
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "DELETE", || async {
+        client
+            .delete(&url)
+            .header("X-TR-Session-Id", session_id)
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .await
+    .with_context(|| format!("DELETE {url}"))?;
     decode_envelope(resp).await
 }
 
@@ -885,5 +1041,195 @@ mod tests {
     fn extract_error_message_falls_through_on_plain_text() {
         let body = "internal server error";
         assert_eq!(extract_error_message(body), body);
+    }
+
+    // ── Slice 4: with_reconnect tests ──────────────────────────────
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    #[derive(Clone)]
+    struct MockState {
+        op_calls: Arc<AtomicU32>,
+        fail_with_status: Arc<AtomicU32>,
+        succeed: Arc<AtomicBool>,
+    }
+
+    impl MockState {
+        fn new(initial_status: u16) -> Self {
+            Self {
+                op_calls: Arc::new(AtomicU32::new(0)),
+                fail_with_status: Arc::new(AtomicU32::new(initial_status as u32)),
+                succeed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    async fn livez_handler() -> impl IntoResponse {
+        (StatusCode::OK, "ok")
+    }
+
+    async fn op_handler(State(s): State<MockState>) -> impl IntoResponse {
+        s.op_calls.fetch_add(1, Ordering::SeqCst);
+        let forced = s.fail_with_status.load(Ordering::SeqCst);
+        if forced != 0 && !s.succeed.load(Ordering::SeqCst) {
+            let status =
+                StatusCode::from_u16(forced as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return (status, "transient").into_response();
+        }
+        Json(serde_json::json!({
+            "ok": true,
+            "data": { "hits": 42 },
+            "error": null
+        }))
+        .into_response()
+    }
+
+    async fn spawn_mock(
+        initial_status: u16,
+    ) -> (SocketAddr, MockState, tokio::sync::oneshot::Sender<()>) {
+        let state = MockState::new(initial_status);
+        let app = Router::new()
+            .route("/livez", get(livez_handler))
+            .route("/api/v1/op", get(op_handler))
+            .route("/api/v1/op", post(op_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        // Let the listener start accepting before the test makes a call.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (addr, state, tx)
+    }
+
+    fn remote_conn(addr: SocketAddr) -> EngineConnection {
+        EngineConnection::Remote {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            pid: std::process::id(),
+            started_by: StartedBy::Cli,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unary_call_retries_after_503_clears() {
+        let (addr, state, _shutdown) = spawn_mock(503).await;
+        let conn = remote_conn(addr);
+        // Flip to success after 200 ms — long enough that the first
+        // call fails but the retry-attempt backoff (450 ms) has cleared.
+        let succeed = state.succeed.clone();
+        tokio::spawn(async move {
+            // Backoff between attempts is 150 ms; flip success at
+            // 50 ms so the second attempt clears.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            succeed.store(true, Ordering::SeqCst);
+        });
+        let v = get_json(&conn, "/api/v1/op").await.unwrap();
+        assert_eq!(v["hits"], 42);
+        assert!(state.op_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unary_call_does_not_retry_on_4xx() {
+        let (addr, state, _shutdown) = spawn_mock(404).await;
+        let conn = remote_conn(addr);
+        let err = get_json(&conn, "/api/v1/op").await.unwrap_err();
+        assert_eq!(state.op_calls.load(Ordering::SeqCst), 1, "no retry on 4xx");
+        assert!(!err.chain().any(|c| c.is::<DaemonUnreachable>()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unary_call_fails_loudly_after_retry_exhausted() {
+        let (addr, state, _shutdown) = spawn_mock(503).await;
+        let conn = remote_conn(addr);
+        let err = get_json(&conn, "/api/v1/op").await.unwrap_err();
+        assert_eq!(state.op_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            err.chain().any(|c| c.is::<DaemonUnreachable>()),
+            "expected DaemonUnreachable in chain, got: {err:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_with_body_also_retries() {
+        let (addr, state, _shutdown) = spawn_mock(502).await;
+        let conn = remote_conn(addr);
+        let succeed = state.succeed.clone();
+        tokio::spawn(async move {
+            // Backoff between attempts is 150 ms; flip success at
+            // 50 ms so the second attempt clears.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            succeed.store(true, Ordering::SeqCst);
+        });
+        let body = serde_json::json!({ "k": "v" });
+        let v = post_json(&conn, "/api/v1/op", &body).await.unwrap();
+        assert_eq!(v["hits"], 42);
+        assert!(state.op_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_daemon_surfaces_marker_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let conn = remote_conn(addr);
+        let err = get_json(&conn, "/api/v1/op").await.unwrap_err();
+        let marker = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<DaemonUnreachable>())
+            .expect("DaemonUnreachable should be in chain");
+        assert_eq!(marker.attempts, 2);
+        assert!(!marker.last_attempt.is_empty());
+    }
+
+    #[test]
+    fn is_transient_classifies_status_codes() {
+        // 502/503/504 are retried.
+        assert!(matches!(
+            is_transient_transport_for_status(502),
+            true
+        ));
+        assert!(matches!(
+            is_transient_transport_for_status(503),
+            true
+        ));
+        assert!(matches!(
+            is_transient_transport_for_status(504),
+            true
+        ));
+        // 4xx and 5xx-not-{502,503,504} are NOT retried by the
+        // status-only classifier path. Note that bare reqwest errors
+        // without a status code (connect/timeout) are caught by the
+        // is_connect/is_timeout branches; this test only covers the
+        // status-coded path.
+        assert!(matches!(
+            is_transient_transport_for_status(404),
+            false
+        ));
+        assert!(matches!(
+            is_transient_transport_for_status(500),
+            false
+        ));
+    }
+
+    /// Test-only mirror of [`is_transient_transport`]'s status-code
+    /// branch — keeps the test crisp without needing a real
+    /// `reqwest::Error` (which is hard to construct in unit tests).
+    fn is_transient_transport_for_status(code: u16) -> bool {
+        matches!(code, 502 | 503 | 504)
     }
 }

@@ -169,6 +169,12 @@ pub enum CompileProgress {
     Booting {
         workspace: String,
     },
+    DiffStart,
+    DiffComplete {
+        changed: usize,
+        unchanged: usize,
+        deleted: usize,
+    },
     ParseComplete {
         files: usize,
     },
@@ -192,9 +198,34 @@ pub enum CompileProgress {
         failed_batches: usize,
         failed_chunk_ranges: Vec<(usize, usize)>,
     },
+    GroundingStart {
+        llm_claims: usize,
+        structural_claims: usize,
+    },
     GroundingProgress {
         done: usize,
         total: usize,
+    },
+    GroundingDone {
+        accepted: usize,
+        rejected: usize,
+    },
+    FingerprintDone {
+        truly_changed: usize,
+        cutoffs: usize,
+    },
+    RootingStart {
+        candidates: usize,
+    },
+    RootingProgress {
+        done: usize,
+        total: usize,
+    },
+    RootingDone {
+        rooted: usize,
+        attested: usize,
+        quarantined: usize,
+        rejected: usize,
     },
     LinkingStart {
         total_entities: usize,
@@ -206,6 +237,24 @@ pub enum CompileProgress {
     VectorProgress {
         done: usize,
         total: usize,
+    },
+    VectorUpdateDone {
+        entities_indexed: usize,
+        claims_indexed: usize,
+    },
+    CompilationProgress {
+        done: usize,
+        total: usize,
+    },
+    CompilationDone {
+        artifacts: usize,
+    },
+    VerificationDone {
+        health: u8,
+    },
+    PhaseDone {
+        name: String,
+        elapsed_ms: u64,
     },
     Done {
         files_parsed: usize,
@@ -698,8 +747,38 @@ pub async fn workspace_compile_status(app: AppHandle) -> Result<CompileStatus, S
     })
 }
 
+/// `GET /api/v1/ws/{ws}/readme` proxy. Returns the engine-canonical
+/// workspace README markdown (auto-synthesised by Phase 10 of the
+/// compile pipeline). Backs the desktop's right-rail Readme tab.
+/// Empty string when the workspace has not been compiled yet — the
+/// view renders an "no README yet" empty state, never a fabricated
+/// placeholder (CLAUDE.md honesty rule §1).
+#[derive(Debug, serde::Deserialize)]
+struct ReadmeEnvelope {
+    readme: String,
+}
+
+#[tauri::command]
+pub async fn workspace_readme(app: AppHandle) -> Result<String, String> {
+    use crate::commands::sidecar_client::SidecarClient;
+    let sc = SidecarClient::ensure_active(&app).await?;
+    let path = format!("/api/v1/ws/{}/readme", sc.workspace);
+    let env: ReadmeEnvelope = sc.get(&path).await?;
+    Ok(env.readme)
+}
+
 fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgress> {
     match event {
+        ProgressEvent::DiffStart => Some(CompileProgress::DiffStart),
+        ProgressEvent::DiffComplete {
+            changed,
+            unchanged,
+            deleted,
+        } => Some(CompileProgress::DiffComplete {
+            changed,
+            unchanged,
+            deleted,
+        }),
         ProgressEvent::ParseComplete { files } => Some(CompileProgress::ParseComplete { files }),
         ProgressEvent::ExtractionStart {
             total_chunks,
@@ -722,9 +801,43 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
             failed_batches,
             failed_chunk_ranges,
         }),
+        ProgressEvent::GroundingStart {
+            llm_claims,
+            structural_claims,
+        } => Some(CompileProgress::GroundingStart {
+            llm_claims,
+            structural_claims,
+        }),
         ProgressEvent::GroundingProgress { done, total } => {
             Some(CompileProgress::GroundingProgress { done, total })
         }
+        ProgressEvent::GroundingDone { accepted, rejected } => {
+            Some(CompileProgress::GroundingDone { accepted, rejected })
+        }
+        ProgressEvent::FingerprintDone {
+            truly_changed,
+            cutoffs,
+        } => Some(CompileProgress::FingerprintDone {
+            truly_changed,
+            cutoffs,
+        }),
+        ProgressEvent::RootingStart { candidates } => {
+            Some(CompileProgress::RootingStart { candidates })
+        }
+        ProgressEvent::RootingProgress { done, total } => {
+            Some(CompileProgress::RootingProgress { done, total })
+        }
+        ProgressEvent::RootingDone {
+            rooted,
+            attested,
+            quarantined,
+            rejected,
+        } => Some(CompileProgress::RootingDone {
+            rooted,
+            attested,
+            quarantined,
+            rejected,
+        }),
         ProgressEvent::LinkingStart { total_entities } => {
             Some(CompileProgress::LinkingStart { total_entities })
         }
@@ -734,11 +847,27 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
         ProgressEvent::VectorProgress { done, total } => {
             Some(CompileProgress::VectorProgress { done, total })
         }
-        // Pipeline emits a richer event set than we surface to the UI
-        // (GroundingStart, ExtractionBatchStart, CompilationProgress,
-        // VerificationDone, RootingProgress, …). We drop them silently
-        // rather than spamming the webview; the `Done` event is
-        // constructed in `workspace_compile` from `PipelineResult`.
+        ProgressEvent::VectorUpdateDone {
+            entities_indexed,
+            claims_indexed,
+        } => Some(CompileProgress::VectorUpdateDone {
+            entities_indexed,
+            claims_indexed,
+        }),
+        ProgressEvent::CompilationProgress { done, total } => {
+            Some(CompileProgress::CompilationProgress { done, total })
+        }
+        ProgressEvent::CompilationDone { artifacts } => {
+            Some(CompileProgress::CompilationDone { artifacts })
+        }
+        ProgressEvent::VerificationDone { health } => {
+            Some(CompileProgress::VerificationDone { health })
+        }
+        ProgressEvent::PhaseDone { name, elapsed_ms } => {
+            Some(CompileProgress::PhaseDone { name, elapsed_ms })
+        }
+        // Remaining events are either internal timing markers or high-frequency
+        // signals that don't add user-facing value in the desktop progress UI.
         _ => None,
     }
 }

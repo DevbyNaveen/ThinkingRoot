@@ -267,19 +267,41 @@ For balance — the plan got a lot right. These I confirmed by direct read:
 What the production plan commits to that **does not exist in code today**:
 
 ### 7.1 OSS pending
-- [ ] `root doctor` — verified ABSENT (no `Doctor` enum variant in `Commands`; no `doctor_cmd.rs`)
-- [ ] `root doctor --repair` — ABSENT
-- [ ] `root doctor --json` — ABSENT
-- [ ] `root compliance --eu-ai-act` — ABSENT (only `--profile compliance` flag for `retrieve` exists)
-- [ ] FS-event watcher in `crates/thinkingroot-serve/` for `.thinkingroot/` deletion — verified ABSENT (`grep -rn "notify::Watcher" serve/` returns zero)
-- [ ] H.7 CLI auto-retry on daemon disconnect — verified ABSENT in `cortex_remote.rs` (zero `retry`/`reconnect`/`backoff` matches)
-- [ ] `ManifestV3.readme: Option<String>` field — verified ABSENT in `crates/tr-format/src/manifest.rs`
-- [ ] `tr/3.1` schema bump — verified absent (no references)
-- [ ] Phase C `PackResolver` trait migration to `thinkingroot-core` — still in CLI module (`crates/thinkingroot-cli/src/resolver/`)
-- [ ] `tr-verify` author-key DID validation — `tr-verify/Cargo.toml` does not depend on `tr-identity`; surface intentionally absent
+- [x] `root doctor` — SHIPPED 2026-05-09 (`Commands::Doctor` at `main.rs:145`, `doctor_cmd.rs` 9-check battery)
+- [x] `root doctor --repair` — SHIPPED 2026-05-09 (per-check repair actions; never silently mutates without flag)
+- [x] `root doctor --json` — SHIPPED 2026-05-09 (machine-readable Report struct, exit codes 0/1/2)
+- [x] `root compliance --eu-ai-act` — SHIPPED 2026-05-09 (`compliance_cmd.rs`, 8-file bundle + BLAKE3 manifest + optional Sigstore signature)
+- [x] FS-event watcher in `crates/thinkingroot-serve/` for `.thinkingroot/` deletion — SHIPPED 2026-05-09 (`workspace_watcher.rs` + `Error::WorkspaceOrphaned` + `/ws/{ws}/events/stream` SSE)
+- [x] H.7 CLI auto-retry on daemon disconnect — SHIPPED 2026-05-09 (`with_reconnect` helper in `cortex_remote.rs`, exit code 75 for `DaemonUnreachable`)
+- [x] `ManifestV3.readme: Option<String>` field — SHIPPED earlier (verified present in `crates/tr-format/src/manifest.rs`)
+- [x] `tr/3.1` schema bump — SHIPPED 2026-05-09 (`FORMAT_VERSION_V31`, `SourceEntry`, `DerivedHash`, `author_key_id`)
+- [x] Phase C `PackResolver` trait migration to `thinkingroot-core` — SHIPPED 2026-05-09 (`thinkingroot_core::resolver::PackResolver` with sanitized `ResolverDescriptor`)
+- [x] `tr-verify` author-key DID validation — SHIPPED 2026-05-09 (`tr-verify` now path-deps `tr-identity`; new `AuthorVerifier` + `AuthorVerdict` enum)
 - [ ] `tr-format::Error::TooLarge` wired to `read_v3_pack` (currently dead variant)
 - [ ] BLAKE3 constant-time comparison at `crates/thinkingroot-cli/src/resolver/http.rs:193`
-- [ ] CI job: compile cloud `services/registry` against OSS `tr-format` HEAD (this is exactly how the §2.1 blocker happened)
+- [x] CI job: compile cloud `services/registry` against OSS `tr-format` HEAD — SHIPPED 2026-05-09 (`.github/workflows/cloud-registry-check.yml` + `docs/CROSS_REPO_CI.md`)
+
+### 7.3 OSS shipped 2026-05-09 (this audit closure sweep)
+- [x] Desktop pack export — `commands/pack_export.rs` (Tauri) + `components/export/PackExportSheet.tsx` (UI) + command-palette entry "Export workspace as .tr pack"
+- [x] Brain graph live-activity infra — `thinkingroot-extract::citation::CitationParser` (streaming `[claim:<id>]` parser, 9 tests) + `thinkingroot-graph::spreading_activation::spread` (Collins & Loftus BFS, 6 tests) + UI `store/brain.ts` (activation store + decay loop). NOTE: chat-token wiring + d3-force pulse classes still to be wired into `BrainGraph.tsx` / `ChatView.tsx`; engine + parser + store are load-bearing and tested.
+
+### 7.4 Still pending after 2026-05-09 sweep
+- [ ] `tr-format::Error::TooLarge` wired to `read_v3_pack` (currently dead variant)
+- [ ] BLAKE3 constant-time comparison at `crates/thinkingroot-cli/src/resolver/http.rs:193`
+- [ ] `root restart` subcommand — never planned, never shipped (separate from `root doctor`)
+- [ ] Daemon HTTP `/doctor` route — Slice 1 design intentionally kept doctor CLI-local (probing the daemon via the daemon would be circular); cross-check still warranted if a remote-doctor use case appears
+- [ ] Brain graph pulse rendering — engine + store ship; wiring `BrainGraph.tsx` to read `useBrainActivation` + adding pulse CSS classes is a follow-up
+
+### 7.5 Test verification (cargo test, 2026-05-09)
+- compliance_cmd: 11/11 passing
+- doctor_cmd: 7/7 passing (covered in CLI bin set)
+- cortex_remote (Slice 4 retry): 14/14 passing
+- workspace_watcher: 5/5 passing; core `types::workspace_event`: 3/3 passing
+- citation parser: 9/9 passing; spreading_activation: 6/6 passing
+- pack_export (desktop): 3/3 passing
+- author_verifier (tr-verify): 7/7 passing
+- tr-format manifest (incl. v3.1 round-trip): 140/140 passing
+- `cargo check --workspace`: clean
 
 ### 7.2 Cloud pending
 - [ ] `services/registry` v3 migration — see §2.1

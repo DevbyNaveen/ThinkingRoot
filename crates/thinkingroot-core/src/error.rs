@@ -143,6 +143,17 @@ pub enum Error {
         count: usize,
         sample: Vec<(String, String)>,
     },
+
+    /// Slice 3 — surfaced by serve handlers when the FS-event watcher
+    /// has flagged the active workspace's `.thinkingroot/` as missing.
+    /// CLAUDE.md §honesty rule §1 forbids silent recovery; the user
+    /// must `root mount` again or `root compile --rebuild` after the
+    /// substrate disappears mid-run.
+    #[error(
+        "workspace orphaned: `.thinkingroot/` is missing under `{workspace_root}` — \
+         re-mount the workspace before continuing"
+    )]
+    WorkspaceOrphaned { workspace_root: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

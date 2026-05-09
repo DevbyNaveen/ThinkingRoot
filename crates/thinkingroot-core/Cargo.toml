@@ -25,6 +25,8 @@ url = { workspace = true }
 ordered-float = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+# `PackResolver` (resolver.rs) is async; the trait uses `#[async_trait]`.
+async-trait = "0.1"
 # Cortex Protocol — PID liveness, atomic write-then-rename,
 # advisory locking on the writer-sentinel.
 sysinfo = { workspace = true }

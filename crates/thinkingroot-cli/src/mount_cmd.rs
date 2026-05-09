@@ -177,6 +177,15 @@ pub async fn run_mount(
     std::fs::write(storage_dir.join("claims.jsonl"), &pack.claims_jsonl)
         .with_context(|| format!("write claims.jsonl at {}", storage_dir.display()))?;
 
+    // 6b. Surface the publisher's README at `.thinkingroot/README.md`
+    //     so the desktop's Readme tab works on mounted (replay) workspaces.
+    //     Skipped silently when the pack's manifest carries no readme —
+    //     pre-feature packs round-trip through this path unchanged.
+    if let Some(readme_str) = pack.manifest.readme.as_deref() {
+        std::fs::write(storage_dir.join("README.md"), readme_str.as_bytes())
+            .with_context(|| format!("write README at {}", storage_dir.display()))?;
+    }
+
     // 7. Resolve cortex daemon.  EngineIntent::Command means "if no
     //    daemon is running, spawn one and wait until /livez is green".
     //    Returns the connection details for the daemon we should

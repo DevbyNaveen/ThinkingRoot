@@ -15,7 +15,9 @@ use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::engine::{ClaimFilter, QueryEngine};
+use crate::workspace_watcher::WatcherHandle;
 use thinkingroot_core::BranchEvent;
+use thinkingroot_core::types::{WorkspaceEvent, WorkspaceState};
 
 // ─── App State ───────────────────────────────────────────────
 
@@ -66,6 +68,13 @@ pub struct AppState {
     /// from the map on every exit path (success, failure, cancellation)
     /// by the merge handler so a long-cancelled merge never leaks.
     pub active_merges: Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Slice 3 — optional file-system watcher handle.  When `Some`,
+    /// `/api/v1/ws/{ws}/events/stream` subscribes to its broadcast
+    /// channel and stateful handlers consult [`WatcherHandle::state`]
+    /// to refuse with `Error::WorkspaceOrphaned` once the substrate
+    /// disappears.  `None` in the in-process / legacy code paths that
+    /// don't run a daemon (CLI `--in-process`, MCP stdio).
+    pub workspace_watcher: Arc<RwLock<Option<Arc<WatcherHandle>>>>,
 }
 
 impl AppState {
@@ -93,7 +102,35 @@ impl AppState {
             ),
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
             active_merges: Arc::new(RwLock::new(HashMap::new())),
+            workspace_watcher: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Slice 3 — install the workspace watcher handle and arm
+    /// [`AppState::workspace_state`] reads. Called once by the serve
+    /// binary right after `AppState::new_with_root` returns.
+    pub async fn attach_workspace_watcher(self: &Arc<Self>, handle: Arc<WatcherHandle>) {
+        *self.workspace_watcher.write().await = Some(handle);
+    }
+
+    /// Returns the current [`WorkspaceState`]; `Active` when no watcher
+    /// is installed (the contract preserved across in-process /
+    /// MCP-stdio paths that never spawn one).
+    pub async fn workspace_state(&self) -> WorkspaceState {
+        let guard = self.workspace_watcher.read().await;
+        match guard.as_ref() {
+            Some(handle) => *handle.state.read().await,
+            None => WorkspaceState::Active,
+        }
+    }
+
+    /// Subscribe to the workspace event channel. Returns `None` when no
+    /// watcher is installed.
+    pub async fn subscribe_workspace_events(
+        &self,
+    ) -> Option<broadcast::Receiver<WorkspaceEvent>> {
+        let guard = self.workspace_watcher.read().await;
+        guard.as_ref().map(|h| h.tx.subscribe())
     }
 
     /// Read the current workspace_root path.
@@ -267,6 +304,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
+            .route("/ws/{ws}/readme", get(workspace_readme_handler))
             .route("/ws/{ws}/relations", get(get_all_relations))
             .route("/ws/{ws}/relations/{entity}", get(get_entity_relations))
             .route("/ws/{ws}/artifacts", get(list_artifacts))
@@ -324,6 +362,15 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 post(ask_approval_handler),
             )
             .route("/ws/{ws}/galaxy", get(get_galaxy))
+            // Slice 3 — live SSE feed of workspace lifecycle events
+            // (FS deletion, graph.db missing, config.toml modified,
+            // heartbeats). Subscribers attach to the per-process
+            // broadcast channel hosted by the daemon's
+            // `workspace_watcher`.
+            .route(
+                "/ws/{ws}/events/stream",
+                get(stream_workspace_events_handler),
+            )
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/compile/stream", post(compile_stream))
             .route("/ws/{ws}/verify", post(verify_ws))
@@ -433,6 +480,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
         .route("/metrics", get(metrics_handler))
         .route("/readyz", get(readyz_handler))
         .route("/livez", get(livez_handler))
+        .route("/.well-known/mcp", get(well_known_mcp_handler))
         .with_state(state)
 }
 
@@ -442,6 +490,30 @@ async fn livez_handler() -> Response {
     // If this handler runs, the tokio reactor is alive enough to accept
     // requests. No deeper check — that's what /readyz is for.
     (StatusCode::OK, "ok\n").into_response()
+}
+
+/// GET `/.well-known/mcp`
+///
+/// JSON manifest for UIs and integrators. The `tools` array is exactly the
+/// MCP `tools/list` catalog (names + descriptions + input schemas) so
+/// clients like ThinkingRoot Desktop can show the real tool surface without
+/// opening an SSE session.
+async fn well_known_mcp_handler() -> Response {
+    let rpc = crate::mcp::tools::handle_list(None).await;
+    let tools = rpc
+        .result
+        .as_ref()
+        .and_then(|r| r.get("tools"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "description": "ThinkingRoot MCP catalog (mirrors JSON-RPC tools/list). Client transport: GET /mcp/sse then POST /mcp?sessionId=…",
+        "servers": [],
+        "tools": tools,
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
@@ -921,6 +993,66 @@ async fn list_sources_handler(
         Ok(sources) => ok_response(sources).into_response(),
         Err(e) => match_engine_error(e),
     }
+}
+
+#[derive(Serialize)]
+struct ReadmeResponse {
+    /// Engine-canonical workspace README markdown (the contents of
+    /// `<workspace_root>/.thinkingroot/README.md`). Empty string when
+    /// the file does not exist — honest empty state, never a 404 (the
+    /// workspace itself exists; a missing README is just a no-op
+    /// surface, not a not-found condition).
+    readme: String,
+}
+
+/// `GET /api/v1/ws/{ws}/readme`. Returns the engine-canonical workspace
+/// README synthesised by Phase 10 of the compile pipeline. Backs the
+/// desktop's right-rail Readme tab and any consumer that wants to render
+/// a workspace overview without reissuing the per-substrate aggregate
+/// queries on every request.
+///
+/// Workspace must be mounted (otherwise `404 NOT_FOUND`). README file
+/// missing returns `200 { readme: "" }` — the workspace is healthy, the
+/// README is just stale or never compiled.
+async fn workspace_readme_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let root = {
+        let engine = state.engine.read().await;
+        match engine.workspace_root_path(&ws) {
+            Some(p) => p,
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "WORKSPACE_NOT_MOUNTED",
+                    &format!("workspace '{ws}' not mounted"),
+                );
+            }
+        }
+    };
+    let path = root.join(".thinkingroot").join("README.md");
+    let body = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            // Permission / corruption errors are real failures — log
+            // and surface as 500 rather than silently masquerading as
+            // "no README" (CLAUDE.md §honesty rule §6).
+            tracing::error!(
+                target: "readme",
+                error = %e,
+                path = %path.display(),
+                "workspace_readme: read_to_string failed"
+            );
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "READ_FAILED",
+                &format!("could not read README: {e}"),
+            );
+        }
+    };
+    ok_response(ReadmeResponse { readme: body }).into_response()
 }
 
 #[derive(Deserialize)]
@@ -3805,6 +3937,44 @@ async fn llm_health_handler(
     .into_response()
 }
 
+// ─── Slice 3: workspace event SSE stream ────────────────────────────
+
+async fn stream_workspace_events_handler(
+    State(state): State<Arc<AppState>>,
+    Path(_ws): Path<String>,
+) -> Response {
+    use tokio_stream::StreamExt as _;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let Some(rx) = state.subscribe_workspace_events().await else {
+        return err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WATCHER_NOT_RUNNING",
+            "workspace watcher is not attached to this daemon",
+        );
+    };
+    let stream = BroadcastStream::new(rx).map(|res| match res {
+        Ok(event) => {
+            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("workspace_event").data(payload),
+            )
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Ok(Event::default().event("lagged").data(payload))
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
 // ─── Error Mapping ───────────────────────────────────────────
 
 fn match_engine_error(e: thinkingroot_core::Error) -> Response {
@@ -3815,6 +3985,11 @@ fn match_engine_error(e: thinkingroot_core::Error) -> Response {
         thinkingroot_core::Error::Config(_) => {
             err_response(StatusCode::NOT_FOUND, "NOT_FOUND", &e.to_string())
         }
+        thinkingroot_core::Error::WorkspaceOrphaned { .. } => err_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WORKSPACE_ORPHANED",
+            &e.to_string(),
+        ),
         _ => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",

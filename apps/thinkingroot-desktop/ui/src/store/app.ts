@@ -39,6 +39,8 @@ interface AppStore {
   setRightRailTab: (tab: RightRailTab) => void;
   rightRailWidth: number;
   setRightRailWidth: (w: number) => void;
+  sidebarWidth: number;
+  setSidebarWidth: (w: number) => void;
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
 
@@ -106,6 +108,13 @@ interface AppStore {
   onboardingDismissed: boolean;
   setOnboardingDismissed: (dismissed: boolean) => void;
 
+  // Slice 9 — Pack export sheet. When non-null, the sheet is open
+  // pointing at this workspace. Cleared when the user dismisses.
+  packExportTarget: { workspace: string; branch?: string } | null;
+  setPackExportTarget: (
+    target: { workspace: string; branch?: string } | null,
+  ) => void;
+
   // Status-bar usage totals
   totalCostUsd: number;
   totalTokensIn: number;
@@ -145,8 +154,10 @@ export const useApp = create<AppStore>()(
       toggleRightRail: () => set((s) => ({ rightRailOpen: !s.rightRailOpen })),
       rightRailTab: "compile",
       setRightRailTab: (rightRailTab) => set({ rightRailTab }),
-      rightRailWidth: 300,
+      rightRailWidth: 450,
       setRightRailWidth: (rightRailWidth) => set({ rightRailWidth }),
+      sidebarWidth: 220,
+      setSidebarWidth: (sidebarWidth) => set({ sidebarWidth }),
       commandPaletteOpen: false,
       setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
 
@@ -269,6 +280,9 @@ export const useApp = create<AppStore>()(
       onboardingDismissed: false,
       setOnboardingDismissed: (onboardingDismissed) => set({ onboardingDismissed }),
 
+      packExportTarget: null,
+      setPackExportTarget: (packExportTarget) => set({ packExportTarget }),
+
       totalCostUsd: 0,
       totalTokensIn: 0,
       totalTokensOut: 0,
@@ -288,6 +302,7 @@ export const useApp = create<AppStore>()(
         rightRailOpen: s.rightRailOpen,
         rightRailTab: s.rightRailTab,
         rightRailWidth: s.rightRailWidth,
+        sidebarWidth: s.sidebarWidth,
         trust: s.trust,
         recentCommandIds: s.recentCommandIds,
         onboardingDismissed: s.onboardingDismissed,

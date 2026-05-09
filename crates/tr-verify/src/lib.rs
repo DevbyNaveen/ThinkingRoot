@@ -27,10 +27,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod author;
 pub mod error;
 pub mod v3;
 pub mod verdict;
 
+pub use author::{AuthorVerdict, AuthorVerifier};
 pub use error::{Error, Result};
 pub use v3::{V3TamperedKind, V3Verdict, verify_v3_pack, verify_v3_pack_with_revocation};
 pub use verdict::RevokedDetails;

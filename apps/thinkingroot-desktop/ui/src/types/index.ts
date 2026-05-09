@@ -11,7 +11,13 @@ export type Theme =
 export type TrustFilter = "any" | "rooted" | "attested";
 
 /** Right-rail panel tabs. */
-export type RightRailTab = "compile" | "brain" | "branches" | "privacy";
+export type RightRailTab =
+  | "compile"
+  | "files"
+  | "brain"
+  | "readme"
+  | "branches"
+  | "privacy";
 
 /** Surfaces in the layout. Brain/Branches/Privacy have moved to the
  * right-rail tab panel; only chats and settings remain as full
