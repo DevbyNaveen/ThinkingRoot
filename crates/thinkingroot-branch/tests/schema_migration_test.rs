@@ -7,8 +7,8 @@
 //! rest of `branch_tests.rs` that doesn't touch the registry.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use tempfile::tempdir;
+use tokio::sync::Mutex;
 
 use thinkingroot_core::{
     CLAIM_SCHEMA_VERSION_META_KEY, BranchKind, BranchPermissions, ClaimMigration, MergePolicy,
@@ -19,7 +19,14 @@ use thinkingroot_core::{
 /// process-global migration registry.  Cargo runs tests inside the
 /// same binary in parallel by default; without this guard one test
 /// could clear the registry just as another test was about to read it.
-static SERIAL: Mutex<()> = Mutex::new(());
+///
+/// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guarded
+/// region awaits `setup_workspace_with_branch().await`.  Holding a
+/// `std::sync::Mutex` across `.await` is a clippy lint and a real
+/// bug: a panicking test could poison the lock and cascade-panic the
+/// remaining tests via the `.unwrap()` on `lock()`.  The tokio mutex
+/// is poison-free.
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 async fn setup_workspace_with_branch() -> (tempfile::TempDir, PathBuf, String) {
     let dir = tempdir().unwrap();
@@ -58,7 +65,7 @@ fn migration_v1_to_v2_appends_marker(claim: &mut thinkingroot_core::Claim) -> Re
 
 #[tokio::test]
 async fn merge_migrates_stale_branch_claims_when_target_is_ahead() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().await;
     clear_global_registry_for_test();
     register_migration(ClaimMigration {
         from: 1,
@@ -104,7 +111,7 @@ async fn merge_migrates_stale_branch_claims_when_target_is_ahead() {
 
 #[tokio::test]
 async fn merge_errors_when_chain_has_a_gap() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().await;
     clear_global_registry_for_test();
     // Register only v1→v2; target asks for v3 — chain gap should
     // surface as Err rather than silently leaving claims at v2.
@@ -165,7 +172,7 @@ async fn merge_errors_when_chain_has_a_gap() {
 
 #[tokio::test]
 async fn merge_is_noop_when_versions_match() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().await;
     clear_global_registry_for_test();
     register_migration(ClaimMigration {
         from: 1,

@@ -39,11 +39,18 @@ pub fn insert_verdicts_batch(graph: &GraphStore, verdicts: &[TrialVerdict]) -> R
     )> = verdicts
         .iter()
         .map(|v| {
-            let prov = find_score(v, crate::probes::ProbeName::Provenance);
-            let contra = find_score(v, crate::probes::ProbeName::Contradiction);
-            let pred = find_score(v, crate::probes::ProbeName::Predicate);
-            let topo = find_score(v, crate::probes::ProbeName::Topology);
-            let temp = find_score(v, crate::probes::ProbeName::Temporal);
+            // `find_score` returns `Option<f64>` so absence ("probe did
+            // not run") is type-distinct from a real low-confidence
+            // score in Rust code.  `score_to_sentinel` is the single
+            // boundary at which we collapse `None` into the schema's
+            // `-1.0` Float-default sentinel for storage.  Keeps the
+            // `-1.0` magic number contained to one well-named helper.
+            let prov = score_to_sentinel(find_score(v, crate::probes::ProbeName::Provenance));
+            let contra =
+                score_to_sentinel(find_score(v, crate::probes::ProbeName::Contradiction));
+            let pred = score_to_sentinel(find_score(v, crate::probes::ProbeName::Predicate));
+            let topo = score_to_sentinel(find_score(v, crate::probes::ProbeName::Topology));
+            let temp = score_to_sentinel(find_score(v, crate::probes::ProbeName::Temporal));
             (
                 v.id.clone(),
                 v.claim_id.to_string(),
@@ -111,33 +118,47 @@ pub fn insert_certificates_batch(graph: &GraphStore, certificates: &[Certificate
         .map_err(|e| RootingError::Graph(format!("insert_certificates_batch: {e}")))
 }
 
-/// Resolve a probe score for the given name from a verdict, encoding "did
-/// not run" as the schema's sentinel `-1.0` (see `trial_verdicts` schema:
-/// every `*_score` column declares `Float default -1.0`).
+/// Resolve a probe score for the given name from a verdict.
 ///
-/// Probes use two values to communicate "no signal":
-/// - `ProbeResult::skipped(...)` returns the `-1.0` sentinel directly
+/// Returns `Some(score)` for an active probe with `score ∈ [0.0, 1.0]`,
+/// and `None` for either of the two "no signal" cases:
+/// - `ProbeResult::skipped(...)` produces the `-1.0` in-memory sentinel
 ///   (e.g. predicate probe with no predicate attached, temporal probe
-///   on a claim with no event date).
-/// - "no row in `verdict.probes` at all" — the probe never ran (a fatal
+///   on a claim with no event date) — collapsed to `None` here.
+/// - No row in `verdict.probes` at all — the probe never ran (a fatal
 ///   probe short-circuited before reaching it).
 ///
-/// Both collapse to `-1.0` on persistence.  In debug builds we assert
-/// real, active probe scores stay in `[0.0, 1.0]` so a regression in
-/// any probe that produces NaN / out-of-band values is caught loudly;
-/// the schema sentinel `-1.0` is exempted from the bound check.
-fn find_score(verdict: &TrialVerdict, name: crate::probes::ProbeName) -> f64 {
-    match verdict.probes.iter().find(|p| p.name == name) {
-        Some(p) => {
-            debug_assert!(
-                p.score == -1.0 || (0.0..=1.0).contains(&p.score),
-                "probe `{name:?}` produced score {} outside [0.0, 1.0] and \
-                 not equal to the `-1.0` skipped sentinel — schema invariant \
-                 violated",
-                p.score
-            );
-            p.score
-        }
-        None => -1.0,
+/// The `Option<f64>` return makes "absent" type-distinct from a real
+/// low-confidence score in Rust code.  Persistence into Cozo's
+/// `Float default -1.0` columns happens through `score_to_sentinel`,
+/// which is the single boundary at which the magic number reappears.
+///
+/// In debug builds we assert real, active probe scores stay in
+/// `[0.0, 1.0]` so a regression producing NaN / out-of-band values is
+/// caught loudly; the in-memory `-1.0` skipped marker is exempt from
+/// the bound check (it short-circuits to `None` before the assert).
+fn find_score(verdict: &TrialVerdict, name: crate::probes::ProbeName) -> Option<f64> {
+    let probe = verdict.probes.iter().find(|p| p.name == name)?;
+    if probe.score == -1.0 {
+        // Skipped-probe sentinel — collapse to `None` so the rest of
+        // the Rust code path never sees the magic number.
+        return None;
     }
+    debug_assert!(
+        (0.0..=1.0).contains(&probe.score),
+        "probe `{name:?}` produced score {} outside [0.0, 1.0] and \
+         not equal to the `-1.0` skipped sentinel — schema invariant \
+         violated",
+        probe.score
+    );
+    Some(probe.score)
+}
+
+/// Encode an `Option<f64>` probe score into the schema's `-1.0`
+/// Float-default sentinel for persistence into the `trial_verdicts`
+/// Cozo relation.  Single boundary at which the in-band magic number
+/// reappears — every other `find_score` consumer sees a typed
+/// `Option<f64>` instead.
+fn score_to_sentinel(score: Option<f64>) -> f64 {
+    score.unwrap_or(-1.0)
 }

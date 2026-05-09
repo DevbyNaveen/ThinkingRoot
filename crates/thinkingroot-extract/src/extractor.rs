@@ -698,6 +698,15 @@ impl Extractor {
         const MAX_CONSECUTIVE_PERMANENT_FAILURES: usize =
             crate::extractor_consts::MAX_CONSECUTIVE_PERMANENT_FAILURES;
         let mut consecutive_permanent: usize = 0;
+        // The initial `None` is by construction never observed: every read
+        // (the `last_permanent_msg.as_deref()` site below) is gated on
+        // `consecutive_permanent >= MAX_CONSECUTIVE_PERMANENT_FAILURES`,
+        // which can only be reached after MAX writes via the
+        // `last_permanent_msg = Some(msg)` line in the permanent-error
+        // arm.  rustc's flow analysis cannot prove this transitive
+        // coupling between the counter and the message, so the
+        // unused-assignment warning is allowed at this single site.
+        #[allow(unused_assignments)]
         let mut last_permanent_msg: Option<String> = None;
         loop {
             let join_result = match self.cancel.as_ref() {
@@ -735,8 +744,16 @@ impl Extractor {
                     // are working — reset the consecutive-failure run
                     // so a sporadic transient error mid-compile cannot
                     // accidentally trip the bail-out threshold.
+                    //
+                    // Note: we deliberately do NOT clear
+                    // `last_permanent_msg` here.  The message is only
+                    // ever read inside the `consecutive_permanent >= MAX`
+                    // branch, which by construction is preceded by a
+                    // fresh `last_permanent_msg = Some(msg)` write — so
+                    // any stale value would be overwritten before being
+                    // observed.  Clearing it would be dead code that
+                    // rustc rightly flags via `unused_assignments`.
                     consecutive_permanent = 0;
-                    last_permanent_msg = None;
                     triple
                 }
                 Err((rs, re, is_permanent, msg)) => {

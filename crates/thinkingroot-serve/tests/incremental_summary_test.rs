@@ -200,7 +200,12 @@ async fn compile_collect_events(
 
 // ── 5. Full compile populates summary ────────────────────────────────────────
 
-#[tokio::test]
+// `flavor = "multi_thread"` is required because the pipeline calls
+// `tokio::task::block_in_place()` around the synchronous grounder
+// (pipeline.rs:771).  `block_in_place` panics on the default
+// current-thread runtime — every test in this file drives the full
+// pipeline, so they all need the multi-threaded flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_result_includes_summary_after_compile() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -232,7 +237,12 @@ async fn pipeline_result_includes_summary_after_compile() {
 
 // ── 6. Early-return path populates summary ────────────────────────────────────
 
-#[tokio::test]
+// `flavor = "multi_thread"` is required because the pipeline calls
+// `tokio::task::block_in_place()` around the synchronous grounder
+// (pipeline.rs:771).  `block_in_place` panics on the default
+// current-thread runtime — every test in this file drives the full
+// pipeline, so they all need the multi-threaded flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_early_return_still_populates_summary() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -275,7 +285,12 @@ async fn pipeline_early_return_still_populates_summary() {
 
 // ── 7. Timing invariant: phase sum ≤ total ────────────────────────────────────
 
-#[tokio::test]
+// `flavor = "multi_thread"` is required because the pipeline calls
+// `tokio::task::block_in_place()` around the synchronous grounder
+// (pipeline.rs:771).  `block_in_place` panics on the default
+// current-thread runtime — every test in this file drives the full
+// pipeline, so they all need the multi-threaded flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase_timings_sum_within_total_elapsed() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -298,7 +313,12 @@ async fn phase_timings_sum_within_total_elapsed() {
 
 // ── 8. PhaseDone events emitted ───────────────────────────────────────────────
 
-#[tokio::test]
+// `flavor = "multi_thread"` is required because the pipeline calls
+// `tokio::task::block_in_place()` around the synchronous grounder
+// (pipeline.rs:771).  `block_in_place` panics on the default
+// current-thread runtime — every test in this file drives the full
+// pipeline, so they all need the multi-threaded flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_emits_phase_done_events() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -339,7 +359,12 @@ async fn pipeline_emits_phase_done_events() {
 
 // ── 9. IncrementalDone event emitted ─────────────────────────────────────────
 
-#[tokio::test]
+// `flavor = "multi_thread"` is required because the pipeline calls
+// `tokio::task::block_in_place()` around the synchronous grounder
+// (pipeline.rs:771).  `block_in_place` panics on the default
+// current-thread runtime — every test in this file drives the full
+// pipeline, so they all need the multi-threaded flavor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_emits_incremental_done_event() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();

@@ -433,12 +433,22 @@ pub async fn run_query_remote(
 
     let payload: serde_json::Value =
         serde_json::from_str(&body).context("unparsable search response")?;
+    // Surface a non-array response loudly instead of silently
+    // returning "0 results" — a malformed `data` field (e.g. an API
+    // drift that wraps results in `{ "items": [...] }`) is
+    // indistinguishable from a legitimate empty-result query when
+    // collapsed via `unwrap_or_default()` and hides upstream contract
+    // breaks from the operator.
     let results = payload
         .get("data")
         .or(Some(&payload))
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "search response has no array `data` field (or response itself is not an array); body: {body}"
+            )
+        })?
+        .clone();
 
     println!();
     println!(
@@ -671,9 +681,16 @@ pub async fn run_status_remote(
         .map(|s| (s.uri, s.content_hash))
         .collect();
 
-    let config = Config::load_merged(&root).unwrap_or_default();
-    let files_on_disk =
-        thinkingroot_parse::walker::walk(&root, &config.parsers).unwrap_or_default();
+    // Pre-fix `unwrap_or_default()` here meant a corrupt `config.toml`
+    // or an unwalkable workspace directory (permission denied, missing
+    // root) silently substituted an empty config + empty file list,
+    // making `root status --remote` print "Working tree clean" while
+    // 100 dirty files sat on disk.  Both errors now propagate via
+    // `with_context` so the operator sees the actual cause.
+    let config = Config::load_merged(&root)
+        .with_context(|| format!("failed to load workspace config at {}", root.display()))?;
+    let files_on_disk = thinkingroot_parse::walker::walk(&root, &config.parsers)
+        .with_context(|| format!("failed to walk workspace at {}", root.display()))?;
 
     let mut modified: Vec<String> = Vec::new();
     let mut untracked: Vec<String> = Vec::new();
