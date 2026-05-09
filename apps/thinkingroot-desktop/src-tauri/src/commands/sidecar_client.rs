@@ -294,6 +294,66 @@ async fn sidecar_live(host: &str, port: u16) -> bool {
     false
 }
 
+/// Lightweight read-only endpoint discovery for *status* commands
+/// (the sidebar's "MCP TOOLS" panel, the chat banner's `llm_health`
+/// pre-flight). Unlike [`resolve_sidecar`], this:
+///
+/// - never spawns a daemon (status commands shouldn't trigger a heavy
+///   subprocess on a cold app launch — that's the job of the next
+///   real workspace operation),
+/// - returns quickly (≤ ~1 s worst case) so the status panel paints
+///   without the user staring at a spinner,
+/// - falls back to `cortex.lock` discovery when `state.sidecar` is
+///   empty (a daemon started outside this desktop session — e.g. a
+///   `root serve` from another terminal — should still surface
+///   honestly), and
+/// - **write-throughs** the discovered handle into `state.sidecar`
+///   so subsequent calls hit the fast path.
+///
+/// Returns `None` when no daemon is reachable; callers MUST surface
+/// the empty state honestly rather than fabricating data.
+pub async fn try_resolve_endpoint(app: &AppHandle) -> Option<(String, u16)> {
+    let state = app.state::<AppState>();
+
+    // Fast path: an existing handle we trust.
+    {
+        let guard = state.sidecar.lock().await;
+        if let Some(h) = guard.as_ref()
+            && cortex_bridge::health_check(&h.host, h.port).await
+        {
+            return Some((h.host.clone(), h.port));
+        }
+    }
+
+    // Fallback: cortex.lock left by some daemon (this desktop's prior
+    // launch, a CLI `root serve`, a launchd-managed daemon).
+    let lock = thinkingroot_core::cortex::read_lock().ok().flatten()?;
+    if !thinkingroot_core::cortex::process_alive(lock.pid) {
+        return None;
+    }
+    if !cortex_bridge::health_check(&lock.host, lock.port).await {
+        return None;
+    }
+
+    // Write-through so the next call (`mcp_list_connected`, `llm_health`,
+    // `brain_load` etc.) doesn't re-do the work. `child = None` because
+    // we did not spawn this process; `shutdown()` checks this and refuses
+    // to kill what it doesn't own — same contract as the cortex attach
+    // path in `agent_runtime_subprocess::spawn`.
+    {
+        let mut guard = state.sidecar.lock().await;
+        if guard.is_none() {
+            *guard = Some(crate::state::SidecarHandle {
+                host: lock.host.clone(),
+                port: lock.port,
+                pid: Some(lock.pid),
+                child: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            });
+        }
+    }
+    Some((lock.host, lock.port))
+}
+
 fn resolve_active_workspace() -> Result<(String, PathBuf), String> {
     let registry = WorkspaceRegistry::load()
         .map_err(|e| format!("load workspace registry: {e}"))?;

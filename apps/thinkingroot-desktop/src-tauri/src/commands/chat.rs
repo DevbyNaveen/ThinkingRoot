@@ -525,13 +525,22 @@ pub struct LlmHealth {
 /// switch. The desktop never blocks send on the result; it just renders
 /// a banner so users with an unconfigured workspace know *before* they
 /// type 200 chars why the answer won't come.
+///
+/// Uses the lightweight cortex-aware resolver so a daemon started
+/// outside this desktop session (e.g. CLI `root serve`, launchd, the
+/// "Restart local engine" palette command) is detected without
+/// requiring the user to reload — pre-fix this command short-circuited
+/// to `mounted: false` whenever the desktop's `state.sidecar` slot was
+/// empty, even when the daemon was healthy on the canonical port.
 #[tauri::command]
 pub async fn llm_health(app: AppHandle, workspace: String) -> Result<LlmHealth, String> {
-    let state = app.state::<AppState>();
-    let sidecar = state.sidecar.lock().await.clone();
-    let Some(sidecar) = sidecar else {
-        // No sidecar yet — treat as "not configured" so the UI can show
-        // the same banner shape rather than spinning.
+    let Some((host, port)) =
+        crate::commands::sidecar_client::try_resolve_endpoint(&app).await
+    else {
+        // No daemon reachable anywhere — treat as "not configured" so
+        // the UI can render the same banner shape rather than
+        // spinning. This is the only scenario where the banner's
+        // "isn't mounted in the engine" copy is the truth.
         return Ok(LlmHealth {
             configured: false,
             provider: None,
@@ -543,7 +552,7 @@ pub async fn llm_health(app: AppHandle, workspace: String) -> Result<LlmHealth, 
 
     let url = format!(
         "http://{}:{}/api/v1/ws/{}/llm/health",
-        sidecar.host, sidecar.port, workspace
+        host, port, workspace
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

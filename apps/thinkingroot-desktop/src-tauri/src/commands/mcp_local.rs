@@ -187,9 +187,13 @@ pub struct McpServerRow {
 
 #[tauri::command]
 pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, String> {
-    let state = app.state::<AppState>();
-    let handle = state.sidecar.lock().await.clone();
-    let Some(sidecar) = handle else {
+    // Use the shared lightweight resolver so the panel stays accurate
+    // when a daemon was started outside this desktop session (e.g.
+    // CLI `root serve`, launchd, or a fresh sidecar respawn). Returns
+    // None only when no daemon is genuinely reachable.
+    let Some((host, port)) =
+        crate::commands::sidecar_client::try_resolve_endpoint(&app).await
+    else {
         return Ok(Vec::new());
     };
 
@@ -205,7 +209,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
     // would falsely advertise itself, and external MCP servers listed
     // by the manifest were marked "running" with zero verification.
     // Honesty rule: surface what we actually know.
-    let livez_url = format!("http://{}:{}/livez", sidecar.host, sidecar.port);
+    let livez_url = format!("http://{}:{}/livez", host, port);
     let self_status = match client.get(&livez_url).send().await {
         Ok(r) if r.status().is_success() => "running",
         Ok(_) => "unhealthy",
@@ -214,7 +218,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
 
     let manifest_url = format!(
         "http://{}:{}/.well-known/mcp",
-        sidecar.host, sidecar.port
+        host, port
     );
     let resp = match client.get(&manifest_url).send().await {
         Ok(r) => r,
@@ -225,7 +229,7 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
                 status: self_status.to_string(),
                 description: Some(format!(
                     "Manifest unavailable — sidecar {}:{}",
-                    sidecar.host, sidecar.port
+                    host, port
                 )),
             }]);
         }
@@ -238,8 +242,8 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
             description: Some(format!(
                 "GET /.well-known/mcp returned {} — {}:{}",
                 resp.status(),
-                sidecar.host,
-                sidecar.port
+                host,
+                port
             )),
         }]);
     }
@@ -292,21 +296,32 @@ pub async fn mcp_list_connected(app: AppHandle) -> Result<Vec<McpServerRow>, Str
         }
     }
 
-    if rows.is_empty() {
-        let desc = body
-            .get("description")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .or(Some(format!(
-                "Sidecar reachable at {}:{} but tool catalog empty",
-                sidecar.host, sidecar.port
-            )));
-        rows.push(McpServerRow {
+    // Always include the "local sidecar" anchor row so the panel
+    // never goes dark when the daemon is reachable but the manifest
+    // happens to enumerate only external servers. This is the row
+    // the user looks at first to know "is the engine alive at all"
+    // — without it a busy-but-tools-only manifest would hide the
+    // daemon's existence behind editor-specific entries (Antigravity,
+    // Codex, Cursor, …).
+    rows.insert(
+        0,
+        McpServerRow {
             name: "local sidecar".to_string(),
             transport: "sse".to_string(),
             status: self_status.to_string(),
-            description: desc,
-        });
+            description: Some(format!("ThinkingRoot engine at {}:{}", host, port)),
+        },
+    );
+
+    if rows.len() == 1 {
+        // Manifest had no tools and no servers — surface the empty
+        // state honestly on the anchor row.
+        if let Some(desc) = body.get("description").and_then(Value::as_str) {
+            rows[0].description = Some(format!(
+                "ThinkingRoot engine at {}:{} — {}",
+                host, port, desc
+            ));
+        }
     }
 
     Ok(rows)
