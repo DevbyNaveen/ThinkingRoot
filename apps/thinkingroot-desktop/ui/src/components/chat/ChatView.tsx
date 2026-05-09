@@ -376,87 +376,79 @@ export function ChatView() {
     return (
       <div className="flex h-full flex-col bg-background">
         <ChatHeader workspace={activeWorkspace} convTitle="New conversation" />
-        <div className="flex flex-1 flex-col items-center px-8 pt-[24vh]">
-          <div className="flex w-full max-w-2xl flex-col items-center gap-4">
-            <h2 className="text-center text-lg font-medium">
-              New conversation in{" "}
-              <span className="text-accent">{activeWorkspace}</span>
-            </h2>
-            <p className="max-w-md text-center text-xs text-muted-foreground">
-              Ask anything about your compiled sources, or use{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono">/</code>{" "}
-              for slash commands.
-            </p>
-            <LlmHealthBanner
-              health={health}
-              workspace={activeWorkspace}
-              openSettings={() => useApp.getState().setSurface("settings")}
-            />
-            <div className="w-full">
-              <Composer
-                workspace={activeWorkspace}
-                convId={activeConv}
-                disabled={streaming != null}
-                autoFocus
-                recentHistory={buildHistoryPayload(messages)}
-                onCancel={() => {
-                  setStreaming(null);
-                  toast("Cancelled — partial message kept.", { kind: "warn" });
-                }}
-                onCreateConvIfNeeded={async (firstUserText) => {
-                  if (activeConv) return activeConv;
-                  const c = await conversationsCreate(
-                    activeWorkspace,
-                    firstUserText,
-                  );
-                  setActiveConv(c.id);
-                  return c.id;
-                }}
-                onUserMessage={(content) => {
-                  const ws = activeWorkspace;
-                  if (!ws) return;
-                  const cid = useApp.getState().activeConversationId;
-                  if (!cid) return;
-                  const id = `m-${Date.now()}-u`;
-                  // Stream E — render optimistically so the user sees
-                  // their message immediately, but on persist failure
-                  // remove the local row and surface an error toast.
-                  // Honesty rule #6: never claim something synced when
-                  // it didn't.  Pre-fix the optimistic row stayed in
-                  // the UI even after the file write failed, leading
-                  // the user to believe the message was saved.
-                  appendMessage(ws, cid, {
-                    id,
-                    kind: "user",
-                    body: content,
-                    at: new Date(),
-                  });
-                  conversationsAppendMessage({
-                    workspace: ws,
-                    conversationId: cid,
-                    role: "user",
-                    content,
-                  }).catch((e) => {
-                    useApp.getState().removeMessage(ws, cid, id);
-                    toast("Could not save your message — try again", {
-                      kind: "error",
-                      body: e instanceof Error ? e.message : String(e),
-                    });
-                  });
-                }}
-                onStartTurn={(turnId, ws, cid) => {
-                  useApp.getState().registerTurn(turnId, ws, cid);
-                  setStreaming({
-                    turnId,
-                    partial: "",
-                    startedAt: new Date(),
-                    tokensIn: 0,
-                    tokensOut: 0,
-                    agentSteps: [],
-                  });
-                }}
-              />
+        {/* Vertically centered floating composer — Cursor-style */}
+        <div className="flex flex-1 flex-col items-center justify-center px-8">
+          <div className="flex w-full max-w-xl flex-col gap-3">
+            {/* Subtle heading above the card */}
+            <div className="mb-1 text-center">
+              <p className="text-[11px] uppercase tracking-widest text-muted-foreground/50">
+                {activeWorkspace}
+              </p>
             </div>
+
+            {/* Floating composer card */}
+            <Composer
+              workspace={activeWorkspace}
+              convId={activeConv}
+              disabled={streaming != null}
+              autoFocus
+              health={health}
+              recentHistory={buildHistoryPayload(messages)}
+              onCancel={() => {
+                setStreaming(null);
+                toast("Cancelled — partial message kept.", { kind: "warn" });
+              }}
+              onCreateConvIfNeeded={async (firstUserText) => {
+                if (activeConv) return activeConv;
+                const c = await conversationsCreate(
+                  activeWorkspace,
+                  firstUserText,
+                );
+                setActiveConv(c.id);
+                return c.id;
+              }}
+              onUserMessage={(content) => {
+                const ws = activeWorkspace;
+                if (!ws) return;
+                const cid = useApp.getState().activeConversationId;
+                if (!cid) return;
+                const id = `m-${Date.now()}-u`;
+                appendMessage(ws, cid, {
+                  id,
+                  kind: "user",
+                  body: content,
+                  at: new Date(),
+                });
+                conversationsAppendMessage({
+                  workspace: ws,
+                  conversationId: cid,
+                  role: "user",
+                  content,
+                }).catch((e) => {
+                  useApp.getState().removeMessage(ws, cid, id);
+                  toast("Could not save your message — try again", {
+                    kind: "error",
+                    body: e instanceof Error ? e.message : String(e),
+                  });
+                });
+              }}
+              onStartTurn={(turnId, ws, cid) => {
+                useApp.getState().registerTurn(turnId, ws, cid);
+                setStreaming({
+                  turnId,
+                  partial: "",
+                  startedAt: new Date(),
+                  tokensIn: 0,
+                  tokensOut: 0,
+                  agentSteps: [],
+                });
+              }}
+            />
+
+            {/* Hint below the card */}
+            <p className="text-center text-[11px] text-muted-foreground/40">
+              Ask anything · <kbd className="font-mono">/</kbd> for commands · <kbd className="font-mono">@</kbd> to mention
+            </p>
           </div>
         </div>
       </div>
@@ -516,17 +508,11 @@ export function ChatView() {
         </ul>
       </div>
 
-      <div className="mx-auto w-full max-w-3xl px-8">
-        <LlmHealthBanner
-          health={health}
-          workspace={activeWorkspace}
-          openSettings={() => useApp.getState().setSurface("settings")}
-        />
-      </div>
       <Composer
         workspace={activeWorkspace}
         convId={activeConv}
         disabled={streaming != null}
+        health={health}
         recentHistory={buildHistoryPayload(messages)}
         onCancel={() => {
           setStreaming(null);
@@ -729,6 +715,7 @@ function Composer({
   convId,
   disabled,
   autoFocus,
+  health,
   recentHistory,
   onCancel,
   onCreateConvIfNeeded,
@@ -739,6 +726,7 @@ function Composer({
   convId: string | null;
   disabled: boolean;
   autoFocus?: boolean;
+  health?: LlmHealth | null;
   /** Last ~8 user/assistant turns of this conversation, oldest-first.
    *  Forwarded to the engine so the agent can treat them as memory.
    *  Empty for fresh conversations. */
@@ -815,20 +803,38 @@ function Composer({
   }
 
   return (
-    <div className="px-4 py-4">
-      <div className="mx-auto max-w-3xl">
-        <div className="group relative flex flex-col gap-2 rounded-3xl border border-border/60 bg-muted/40 px-4 pt-3 pb-2 transition-colors focus-within:border-border">
-          {slashQuery && (
-            <SlashAutocomplete
-              query={slashQuery}
-              onSelect={(insertion) => {
-                setText(insertion);
-                setSlashDismissed(false);
-                requestAnimationFrame(() => textareaRef.current?.focus());
-              }}
-              onDismiss={() => setSlashDismissed(true)}
-            />
+    <div className="px-5 py-3">
+      <div className="mx-auto max-w-2xl">
+        {/* Floating card — large radius, subtle shadow, gentle border */}
+        <div className="group relative flex flex-col rounded-2xl border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-all focus-within:border-border/80 focus-within:shadow-[0_4px_24px_rgba(0,0,0,0.35)]">
+
+          {/* Health banner inside the card, above the textarea */}
+          {health && (
+            <div className="px-4 pt-3">
+              <LlmHealthBanner
+                health={health}
+                workspace={workspace}
+                openSettings={() => useApp.getState().setSurface("settings")}
+              />
+            </div>
           )}
+
+          {/* Slash autocomplete */}
+          {slashQuery && (
+            <div className="px-4 pt-3">
+              <SlashAutocomplete
+                query={slashQuery}
+                onSelect={(insertion) => {
+                  setText(insertion);
+                  setSlashDismissed(false);
+                  requestAnimationFrame(() => textareaRef.current?.focus());
+                }}
+                onDismiss={() => setSlashDismissed(true)}
+              />
+            </div>
+          )}
+
+          {/* Textarea */}
           <textarea
             ref={textareaRef}
             value={text}
@@ -836,7 +842,7 @@ function Composer({
             placeholder={
               disabled
                 ? "Generating…"
-                : "Ask anything · / for commands · @ to mention"
+                : "Plan, Build, / for commands, @ for context"
             }
             rows={1}
             onKeyDown={(e) => {
@@ -845,26 +851,28 @@ function Composer({
                 void send();
               }
             }}
-            className="w-full resize-none border-0 bg-transparent text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/50 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+            className="w-full resize-none border-0 bg-transparent px-4 pt-3 pb-2 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
           />
-          <div className="flex items-center justify-end -mr-2">
+
+          {/* Bottom action row */}
+          <div className="flex items-center justify-end px-3 pb-2.5">
             {disabled ? (
               <Button
                 variant="ghost"
                 size="icon"
                 onClick={onCancel}
-                className="h-8 w-8 rounded-full hover:bg-destructive/10 hover:text-destructive"
+                className="h-7 w-7 rounded-full hover:bg-destructive/10 hover:text-destructive"
               >
-                <Square className="size-3.5 fill-current" />
+                <Square className="size-3 fill-current" />
               </Button>
             ) : (
               <Button
                 size="icon"
                 disabled={!text.trim() || busy}
                 onClick={() => void send()}
-                className="h-8 w-8 rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:bg-muted disabled:text-muted-foreground/50"
+                className="h-7 w-7 rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:opacity-30"
               >
-                <ArrowUp className="size-4" />
+                <ArrowUp className="size-3.5" />
               </Button>
             )}
           </div>

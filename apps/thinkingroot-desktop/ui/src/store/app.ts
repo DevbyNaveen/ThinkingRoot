@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import type {
   AgentStep,
   ChatMessage,
+  RightRailTab,
   StreamState,
   Surface,
   Theme,
@@ -34,6 +35,10 @@ interface AppStore {
   toggleSidebar: () => void;
   rightRailOpen: boolean;
   toggleRightRail: () => void;
+  rightRailTab: RightRailTab;
+  setRightRailTab: (tab: RightRailTab) => void;
+  rightRailWidth: number;
+  setRightRailWidth: (w: number) => void;
   commandPaletteOpen: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
 
@@ -138,6 +143,10 @@ export const useApp = create<AppStore>()(
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       rightRailOpen: true,
       toggleRightRail: () => set((s) => ({ rightRailOpen: !s.rightRailOpen })),
+      rightRailTab: "compile",
+      setRightRailTab: (rightRailTab) => set({ rightRailTab }),
+      rightRailWidth: 300,
+      setRightRailWidth: (rightRailWidth) => set({ rightRailWidth }),
       commandPaletteOpen: false,
       setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
 
@@ -277,6 +286,8 @@ export const useApp = create<AppStore>()(
         surface: s.surface,
         sidebarOpen: s.sidebarOpen,
         rightRailOpen: s.rightRailOpen,
+        rightRailTab: s.rightRailTab,
+        rightRailWidth: s.rightRailWidth,
         trust: s.trust,
         recentCommandIds: s.recentCommandIds,
         onboardingDismissed: s.onboardingDismissed,

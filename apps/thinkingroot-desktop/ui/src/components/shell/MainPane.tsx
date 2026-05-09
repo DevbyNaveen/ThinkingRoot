@@ -1,16 +1,10 @@
 import { ChatView } from "@/components/chat/ChatView";
-import { BrainView } from "@/components/brain/BrainView";
-import { BranchesView } from "@/components/branches/BranchesView";
 import { SettingsView } from "@/components/settings/SettingsView";
-import { PrivacyDashboard } from "@/components/privacy/PrivacyDashboard";
 import { useApp } from "@/store/app";
 
 /**
- * Main working area. Surface-routed pane below a thin window
- * chrome/tab strip from the parent shell. Each surface owns its own
- * header — we don't impose a generic tab bar over them because each
- * pane knows its context (workspace name, conversation title) better
- * than this router.
+ * Main working area — always Chat or Settings.
+ * Brain / Branches / Privacy have moved to the resizable right panel.
  */
 export function MainPane() {
   const surface = useApp((s) => s.surface);
@@ -18,17 +12,7 @@ export function MainPane() {
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
       <div className="flex-1 overflow-hidden">
-        {surface === "chats" ? (
-          <ChatView />
-        ) : surface === "brain" ? (
-          <BrainView />
-        ) : surface === "branches" ? (
-          <BranchesView />
-        ) : surface === "privacy" ? (
-          <PrivacyDashboard />
-        ) : (
-          <SettingsView />
-        )}
+        {surface === "settings" ? <SettingsView /> : <ChatView />}
       </div>
     </main>
   );

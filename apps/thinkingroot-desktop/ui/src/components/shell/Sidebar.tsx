@@ -23,12 +23,9 @@ import {
   ChevronRight,
   Folder,
   FolderPlus,
-  GitBranch,
   MessageSquarePlus,
   RefreshCw,
-  ShieldCheck,
   SlidersHorizontal,
-  Cpu,
   Plug,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -137,7 +134,7 @@ export function Sidebar() {
 
       <ScrollArea.Root className="flex-1 overflow-hidden">
         <ScrollArea.Viewport className="h-full w-full">
-          <div className="flex flex-col px-2 pb-3 pt-2">
+          <div className="flex flex-col px-2 pb-4 pt-2">
             <PrimaryActions
               surface={surface}
               setSurface={setSurface}
@@ -299,13 +296,14 @@ export function Sidebar() {
                 Sidecar starting…
               </p>
             ) : (
-              <ul className="flex flex-col">
+              <ul className="flex flex-col gap-0.5">
                 {mcp.map((row, i) => (
                   <li
                     key={`${row.name}-${i}`}
-                    className="flex items-center gap-2 rounded-md px-2 py-1 text-xs"
+                    className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs"
                     title={row.description ?? row.name}
                   >
+                    {/* status dot */}
                     <span
                       className={cn(
                         "size-1.5 shrink-0 rounded-full",
@@ -314,9 +312,12 @@ export function Sidebar() {
                           : "bg-zinc-500",
                       )}
                     />
-                    <Plug className="size-3 shrink-0 text-muted-foreground" />
-                    <span className="truncate text-foreground/80">{row.name}</span>
-                    <span className="ml-auto font-mono text-[9px] uppercase text-muted-foreground">
+                    {/* plug icon */}
+                    <Plug className="size-3.5 shrink-0 text-muted-foreground" />
+                    {/* name */}
+                    <span className="min-w-0 flex-1 truncate text-foreground/80">{row.name}</span>
+                    {/* transport badge */}
+                    <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
                       {row.transport}
                     </span>
                   </li>
@@ -352,11 +353,9 @@ function Header() {
 }
 
 function PrimaryActions({
-  surface,
-  setSurface,
-  activeWorkspace,
-  hasWorkspaces,
   onNewConversation,
+  hasWorkspaces,
+  activeWorkspace,
 }: {
   surface: Surface;
   setSurface: (s: Surface) => void;
@@ -365,12 +364,12 @@ function PrimaryActions({
   onNewConversation: () => void;
 }) {
   return (
-    <div className="mb-2 flex flex-col gap-0.5">
+    <div className="mb-1 flex flex-col gap-0.5">
       <Button
         variant="outline"
         size="sm"
         onClick={onNewConversation}
-        className="mb-1 h-9 justify-start gap-2 text-xs"
+        className="mb-2 h-8 w-full justify-start gap-2 text-xs font-medium"
         disabled={!hasWorkspaces}
         title={
           activeWorkspace
@@ -380,28 +379,9 @@ function PrimaryActions({
               : "Add a workspace first"
         }
       >
-        <MessageSquarePlus className="size-4" />
+        <MessageSquarePlus className="size-3.5" />
         <span>New conversation</span>
       </Button>
-
-      <NavRow
-        Icon={Cpu}
-        label="Brain"
-        active={surface === "brain"}
-        onClick={() => setSurface("brain")}
-      />
-      <NavRow
-        Icon={GitBranch}
-        label="Branches"
-        active={surface === "branches"}
-        onClick={() => setSurface("branches")}
-      />
-      <NavRow
-        Icon={ShieldCheck}
-        label="Privacy"
-        active={surface === "privacy"}
-        onClick={() => setSurface("privacy")}
-      />
     </div>
   );
 }
@@ -432,14 +412,15 @@ function WorkspaceRow({
     <li>
       <div
         className={cn(
-          "group flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-xs",
+          "group flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs",
           isActive ? "bg-accent/10 text-accent" : "text-foreground hover:bg-muted/60",
         )}
       >
+        {/* chevron toggle */}
         <button
           type="button"
           onClick={onToggle}
-          className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted/50"
+          className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted/40"
           aria-label={workspace.expanded ? "Collapse" : "Expand"}
         >
           {workspace.expanded ? (
@@ -448,24 +429,28 @@ function WorkspaceRow({
             <ChevronRight className="size-3" />
           )}
         </button>
+
+        {/* workspace name */}
         <button
           type="button"
           onClick={onSelectWorkspace}
-          className="flex flex-1 items-center gap-1.5 truncate text-left font-medium"
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left font-medium"
           title={workspace.path}
         >
           <Folder className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="truncate">{workspace.name}</span>
-          {!workspace.compiled && (
-            <span className="ml-auto rounded bg-zinc-500/20 px-1 py-0.5 font-mono text-[8px] uppercase tracking-wider text-zinc-400">
-              new
-            </span>
-          )}
         </button>
+
+        {/* "new" badge pushed all the way right */}
+        {!workspace.compiled && (
+          <span className="shrink-0 rounded bg-zinc-500/20 px-1 py-0.5 font-mono text-[8px] uppercase tracking-wider text-zinc-400">
+            new
+          </span>
+        )}
       </div>
 
       {workspace.expanded && (
-        <ul className="ml-4 flex flex-col border-l border-border/60 pl-1">
+        <ul className="ml-5 flex flex-col border-l border-border/50 pl-1.5 pt-0.5">
           {workspace.conversations.length === 0 && (
             <li className="px-2 py-1.5 text-[10px] italic text-muted-foreground">
               No conversations yet.
@@ -479,15 +464,15 @@ function WorkspaceRow({
                   type="button"
                   onClick={() => onSelectConv(c.id)}
                   className={cn(
-                    "group flex w-full items-center justify-between gap-1 rounded-md px-2 py-1 text-left text-[11px] transition-colors",
+                    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11px] transition-colors",
                     selected
                       ? "bg-muted text-foreground"
                       : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                   )}
                   title={c.title}
                 >
-                  <span className="line-clamp-1 flex-1">{c.title}</span>
-                  <span className="shrink-0 font-mono text-[9px] text-muted-foreground/80">
+                  <span className="line-clamp-1 min-w-0 flex-1">{c.title}</span>
+                  <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground/70">
                     {timeago(c.updated_at)}
                   </span>
                 </button>
@@ -495,8 +480,8 @@ function WorkspaceRow({
             );
           })}
           {overflow > 0 && (
-            <li className="px-2 py-1 text-[10px] text-muted-foreground/80">
-              See all ({overflow + visibleConvs.length})
+            <li className="px-2 py-1.5 text-[10px] text-muted-foreground/70">
+              +{overflow} more…
             </li>
           )}
         </ul>
@@ -513,11 +498,11 @@ function SectionHeader({
   right?: React.ReactNode;
 }) {
   return (
-    <div className="mt-3 flex h-7 items-center px-2">
-      <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+    <div className="mt-4 flex h-6 items-center px-2">
+      <span className="flex-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
         {label}
       </span>
-      {right ? <div className="ml-2 flex items-center gap-1">{right}</div> : null}
+      {right ? <div className="flex items-center gap-0.5">{right}</div> : null}
     </div>
   );
 }
@@ -540,7 +525,7 @@ function IconBtn({
       onClick={onClick}
       title={title}
       disabled={busy}
-      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-muted/30 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground disabled:opacity-50"
+      className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground/60 transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-40"
       {...rest}
     >
       {children}
@@ -564,13 +549,13 @@ function NavRow({
       type="button"
       onClick={onClick}
       className={cn(
-        "flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
+        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs font-medium transition-colors",
         active
           ? "bg-muted text-foreground"
           : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
       )}
     >
-      <Icon className="size-3.5" />
+      <Icon className="size-3.5 shrink-0" />
       <span>{label}</span>
     </button>
   );
@@ -597,7 +582,7 @@ function Footer({
         onClick={() => setSurface("settings")}
       />
       <div
-        className="flex items-center gap-1.5 px-2 py-1 text-[9px] text-muted-foreground"
+        className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[10px] text-muted-foreground"
         title={
           auth
             ? `Storage: local ${auth.storage.local ? "✓" : "✗"} · cloud ${auth.storage.cloud ? "✓" : "✗"}`
@@ -606,7 +591,7 @@ function Footer({
       >
         <span
           className={cn(
-            "size-1.5 rounded-full",
+            "size-1.5 shrink-0 rounded-full",
             auth?.signed_in ? "bg-sky-500" : "bg-zinc-500",
           )}
         />

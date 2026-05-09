@@ -38,7 +38,7 @@ function readPersistedSplit(): number {
   }
 }
 
-export function BrainView() {
+export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [snap, setSnap] = useState<BrainSnapshot | null>(null);
   const [brief, setBrief] = useState<WorkspaceBrief | null>(null);
@@ -112,11 +112,49 @@ export function BrainView() {
 
   if (!activeWorkspace) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center">
-        <h2 className="text-base font-medium">No workspace selected</h2>
-        <p className="max-w-sm text-sm text-muted-foreground">
-          Pick a workspace from the sidebar to load its knowledge graph.
-        </p>
+      <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center">
+        <p className="text-xs text-muted-foreground">No workspace selected.</p>
+      </div>
+    );
+  }
+
+  // Panel mode: compact table-only view (no graph, no full header)
+  if (panelMode) {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="flex shrink-0 items-center justify-between border-b border-border/50 px-3 py-1.5">
+          {snap && (
+            <span className="text-[10px] text-muted-foreground">
+              {snap.claims.length} claims · {snap.entities.length} entities
+            </span>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="ml-auto h-5 w-5"
+            onClick={load}
+            disabled={loading}
+            aria-label="Reload"
+          >
+            <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
+          </Button>
+        </div>
+        {error && (
+          <div className="px-3 py-2 text-[11px] text-destructive">{error}</div>
+        )}
+        <div className="flex-1 overflow-hidden">
+          {snap ? (
+            <BrainTable
+              claims={snap.claims}
+              query={searchQuery}
+              setQuery={setSearchQuery}
+              tierFilter={tierFilter}
+              setTierFilter={setTierFilter}
+            />
+          ) : (
+            <Skeleton text="Loading claims…" />
+          )}
+        </div>
       </div>
     );
   }
