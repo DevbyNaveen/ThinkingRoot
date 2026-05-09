@@ -230,37 +230,94 @@ pub async fn run_serve(
         workspaces
     };
 
+    // Honesty rule §1 — a workspace registered in workspaces.toml whose
+    // .thinkingroot/ substrate has been deleted out from under us is not a
+    // fatal error for the *whole daemon*. We surface a WARN per offender,
+    // skip them, and keep mounting the rest. If we propagated the first
+    // failure, a single deleted directory would take down every other
+    // workspace, every desktop session attached to this daemon, and every
+    // editor MCP session — exactly the cascade the watcher in Slice 3
+    // (workspace_watcher.rs) was built to prevent. The watcher catches
+    // *runtime* deletion; this catches *startup-time* skew between
+    // registry and disk.
+    //
+    // CLI-explicit cases (`--name <ws>` or single `--path <p>`) still
+    // bail loudly: the user named exactly one workspace, missing it
+    // means there's nothing to do. Multi-workspace start-from-registry
+    // skips, surfaces, and keeps going.
     let mut engine = QueryEngine::new();
+    let single_explicit = name.is_some() || resolved_paths.len() == 1;
+    let mut skipped: Vec<(String, std::path::PathBuf, String)> = Vec::new();
     for (ws_name, abs_path, _ws_port) in &resolved_paths {
         if let Some(ref branch_name) = branch {
             let data_dir = resolve_data_dir(abs_path, Some(branch_name));
             if !data_dir.exists() {
-                anyhow::bail!(
-                    "branch '{}' not found for workspace '{}' — expected data dir at {}. \
-                     Run `root branch {}` first.",
-                    branch_name,
-                    ws_name,
-                    data_dir.display(),
-                    branch_name,
+                if single_explicit {
+                    anyhow::bail!(
+                        "branch '{}' not found for workspace '{}' — expected data dir at {}. \
+                         Run `root branch {}` first.",
+                        branch_name,
+                        ws_name,
+                        data_dir.display(),
+                        branch_name,
+                    );
+                }
+                tracing::warn!(
+                    "skipping workspace '{}': branch '{}' data dir missing at {} \
+                     (run `root branch {}` to recreate it, or `root workspace remove {}` to clear the registry entry)",
+                    ws_name, branch_name, data_dir.display(), branch_name, ws_name,
                 );
+                skipped.push((
+                    ws_name.clone(),
+                    abs_path.clone(),
+                    format!("branch '{branch_name}' data dir missing"),
+                ));
+                continue;
             }
-            engine
+            match engine
                 .mount_with_data_dir(ws_name.clone(), abs_path.clone(), data_dir.clone())
-                .await?;
-            tracing::info!(
-                "mounted workspace '{}' from branch '{}' ({})",
-                ws_name,
-                branch_name,
-                data_dir.display()
-            );
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    "mounted workspace '{}' from branch '{}' ({})",
+                    ws_name,
+                    branch_name,
+                    data_dir.display()
+                ),
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping workspace '{}' (branch '{}'): {e}",
+                        ws_name, branch_name
+                    );
+                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
+                }
+            }
         } else {
-            engine.mount(ws_name.clone(), abs_path.clone()).await?;
-            tracing::info!(
-                "mounted workspace '{}' from {}",
-                ws_name,
-                abs_path.display()
-            );
+            match engine.mount(ws_name.clone(), abs_path.clone()).await {
+                Ok(()) => tracing::info!(
+                    "mounted workspace '{}' from {}",
+                    ws_name,
+                    abs_path.display()
+                ),
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping workspace '{}' at {}: {e}",
+                        ws_name,
+                        abs_path.display()
+                    );
+                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
+                }
+            }
         }
+    }
+    if !skipped.is_empty() {
+        tracing::warn!(
+            "{} workspace(s) skipped at startup; daemon continues with the rest. \
+             Run `root doctor` for detail or `root workspace remove <name>` to clear stale registry entries.",
+            skipped.len()
+        );
     }
 
     if mcp_stdio {
@@ -453,25 +510,52 @@ async fn run_serve_with_listener(
         workspaces
     };
 
+    // Mirror the resilient mount loop from `run_serve` — see comment
+    // there for the rationale. A registered workspace whose substrate
+    // was deleted out from under us is not fatal for the whole daemon.
     let mut engine = QueryEngine::new();
+    let single_explicit = name.is_some() || resolved_paths.len() == 1;
     for (ws_name, abs_path) in &resolved_paths {
         if let Some(ref branch_name) = branch {
             let data_dir = resolve_data_dir(abs_path, Some(branch_name));
             if !data_dir.exists() {
-                anyhow::bail!(
-                    "branch '{}' not found for workspace '{}' — expected data dir at {}. \
-                     Run `root branch {}` first.",
-                    branch_name,
-                    ws_name,
-                    data_dir.display(),
-                    branch_name,
+                if single_explicit {
+                    anyhow::bail!(
+                        "branch '{}' not found for workspace '{}' — expected data dir at {}. \
+                         Run `root branch {}` first.",
+                        branch_name,
+                        ws_name,
+                        data_dir.display(),
+                        branch_name,
+                    );
+                }
+                tracing::warn!(
+                    "skipping workspace '{}': branch '{}' data dir missing at {}",
+                    ws_name, branch_name, data_dir.display()
                 );
+                continue;
             }
-            engine
+            match engine
                 .mount_with_data_dir(ws_name.clone(), abs_path.clone(), data_dir.clone())
-                .await?;
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => tracing::warn!(
+                    "skipping workspace '{}' (branch '{}'): {e}",
+                    ws_name, branch_name
+                ),
+            }
         } else {
-            engine.mount(ws_name.clone(), abs_path.clone()).await?;
+            match engine.mount(ws_name.clone(), abs_path.clone()).await {
+                Ok(()) => {}
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => tracing::warn!(
+                    "skipping workspace '{}' at {}: {e}",
+                    ws_name,
+                    abs_path.display()
+                ),
+            }
         }
     }
 

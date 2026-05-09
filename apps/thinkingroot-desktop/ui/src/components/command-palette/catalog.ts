@@ -71,6 +71,7 @@ import type { Surface, Theme, TrustFilter } from "@/types";
 import {
   appQuit,
   doctorRun,
+  sidecarRestart,
   workspaceCompile,
   workspaceSetActive,
   workspaceList,
@@ -590,6 +591,33 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
           });
         } catch (e) {
           toast("Doctor failed", {
+            kind: "error",
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+        c.close();
+      },
+    },
+    {
+      id: "sidecar-restart",
+      label: "Restart local engine",
+      group: "Info",
+      Icon: RefreshCw,
+      keywords: [
+        "restart",
+        "sidecar",
+        "engine",
+        "root serve",
+        "mount",
+        "connection",
+        "livez",
+      ],
+      run: async (c) => {
+        try {
+          const msg = await sidecarRestart();
+          toast("Engine restarted", { kind: "success", body: msg, durationMs: 6000 });
+        } catch (e) {
+          toast("Restart failed", {
             kind: "error",
             body: e instanceof Error ? e.message : String(e),
           });

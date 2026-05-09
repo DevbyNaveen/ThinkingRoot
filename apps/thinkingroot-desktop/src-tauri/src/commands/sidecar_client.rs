@@ -25,6 +25,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use tauri::{AppHandle, Manager};
 use thinkingroot_core::WorkspaceRegistry;
 
+use crate::agent_runtime_subprocess;
+use crate::cortex_bridge;
 use crate::state::AppState;
 
 /// Boot wait for the sidecar's `AppState.sidecar` slot to populate.
@@ -79,25 +81,53 @@ impl SidecarClient {
     /// remount-overwrite so calling repeatedly is safe; it also pins
     /// `state.workspace_root` to this path (Stream A — see rest.rs)
     /// so branch operations target the right repo.
+    ///
+    /// Self-healing on transport failure: a single retry with a fresh
+    /// connection is attempted when the first POST returns a transport
+    /// error (TCP reset, half-open from a stale daemon, OS socket
+    /// hiccup). On the second failure we surface a typed error rather
+    /// than retry forever — silent retry loops are exactly the
+    /// "everything looks fine but the user sees a spinner" failure
+    /// mode the audit's `§3.5` gateway-fallback bug warned about.
     async fn ensure_workspace_mounted(&self, root_path: &Path) -> Result<(), String> {
         let url = format!("http://{}:{}/api/v1/workspaces", self.host, self.port);
         let body = serde_json::json!({
             "name": self.workspace,
             "root_path": root_path.display().to_string(),
         });
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("mount workspace request: {e}"))?;
+
+        let send_once = || async {
+            self.client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+        };
+
+        let resp = match send_once().await {
+            Ok(r) => r,
+            Err(first_err) => {
+                tracing::warn!(
+                    workspace = self.workspace.as_str(),
+                    error = %first_err,
+                    "mount workspace: first POST failed (transport), retrying once"
+                );
+                // Brief pause so an ongoing graceful-shutdown of a
+                // stale daemon completes and the sidecar manager has a
+                // chance to spawn the replacement before we retry.
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                send_once().await.map_err(|second_err| {
+                    format!(
+                        "mount workspace request failed twice (first: {first_err}; retry: {second_err})"
+                    )
+                })?
+            }
+        };
+
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "mount workspace failed ({status}): {body}"
-            ));
+            return Err(format!("mount workspace failed ({status}): {body}"));
         }
         Ok(())
     }
@@ -208,14 +238,38 @@ impl SidecarClient {
 /// — a fresh-launch desktop may issue a Brain probe before the sidecar
 /// has finished mounting workspaces, and 60 s of polling is far better
 /// than failing the user's first action with `sidecar not running`.
+///
+/// **Self-heal:** if we have a handle but `/livez` fails (stale port /
+/// dead process — e.g. user killed `root serve` while the UI still
+/// cached metadata), clear the slot, remove a stale `cortex.lock`, and
+/// respawn via [`agent_runtime_subprocess::spawn`].
 async fn resolve_sidecar(app: &AppHandle) -> Result<(String, u16), String> {
     let state = app.state::<AppState>();
     for _ in 0..SIDECAR_BOOT_MAX_ATTEMPTS {
+        let mut stale_respawn = false;
         {
-            let guard = state.sidecar.lock().await;
+            let mut guard = state.sidecar.lock().await;
             if let Some(h) = guard.as_ref() {
-                return Ok((h.host.clone(), h.port));
+                if sidecar_live(&h.host, h.port).await {
+                    return Ok((h.host.clone(), h.port));
+                }
+                tracing::warn!(
+                    host = %h.host,
+                    port = h.port,
+                    pid = ?h.pid,
+                    "sidecar handle is stale (/livez failed) — clearing lock and respawning engine"
+                );
+                *guard = None;
+                stale_respawn = true;
             }
+        }
+        if stale_respawn {
+            if let Err(e) = thinkingroot_core::cortex::remove_lock() {
+                tracing::debug!(error = %e, "remove_lock after stale sidecar (may be absent)");
+            }
+            agent_runtime_subprocess::spawn(app).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            continue;
         }
         tokio::time::sleep(SIDECAR_POLL_INTERVAL).await;
     }
@@ -225,6 +279,19 @@ async fn resolve_sidecar(app: &AppHandle) -> Result<(String, u16), String> {
          or set THINKINGROOT_ROOT_BINARY to a custom path."
             .to_string(),
     )
+}
+
+/// A few short retries — avoids flaking on a slow `/livez` right after boot.
+async fn sidecar_live(host: &str, port: u16) -> bool {
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if cortex_bridge::health_check(host, port).await {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_active_workspace() -> Result<(String, PathBuf), String> {

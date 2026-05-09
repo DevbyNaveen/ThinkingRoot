@@ -80,6 +80,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::meta::app_version,
             commands::meta::app_quit,
+            commands::sidecar::sidecar_restart,
             commands::memory::memory_list,
             commands::memory::brain_load,
             commands::settings::config_paths,

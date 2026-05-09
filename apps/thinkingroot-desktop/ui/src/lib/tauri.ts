@@ -305,6 +305,11 @@ export async function doctorRun(repair: boolean): Promise<DoctorReport> {
   return invoke<DoctorReport>("doctor_run", { repair });
 }
 
+/** Shut down and respawn the bundled `root serve` sidecar (cortex singleton). */
+export async function sidecarRestart(): Promise<string> {
+  return invoke<string>("sidecar_restart");
+}
+
 // ─── Privacy dashboard ───────────────────────────────────────────────
 
 export interface PrivacySource {

@@ -48,29 +48,94 @@ pub async fn resolve_engine(
 
     if let Some(lock) = cortex::read_lock()? {
         if cortex::process_alive(lock.pid) && health_check(&lock.host, lock.port).await {
-            tracing::debug!(
+            // Version skew check — if the running daemon's binary is
+            // an older build than the one this desktop ships with, its
+            // request handlers may have bugs that have been fixed in
+            // the bundled binary. Attaching to it would let the
+            // desktop's mount call hit a stale handler that returns
+            // an empty body or panics mid-response (the production
+            // failure mode we're closing here). We treat a version
+            // mismatch as "stale" — same blast radius as a stale
+            // lockfile — and let the caller respawn.
+            match daemon_version(&lock.host, lock.port).await {
+                Ok(running) if running == EXPECTED_DAEMON_VERSION => {
+                    tracing::debug!(
+                        pid = lock.pid,
+                        port = lock.port,
+                        started_by = lock.started_by.as_str(),
+                        version = running.as_str(),
+                        "cortex_bridge: attached to existing daemon"
+                    );
+                    return Ok(EngineConnection::Remote {
+                        host: lock.host,
+                        port: lock.port,
+                        started_by: lock.started_by,
+                        pid: lock.pid,
+                    });
+                }
+                Ok(running) => {
+                    tracing::warn!(
+                        pid = lock.pid,
+                        port = lock.port,
+                        running_version = running.as_str(),
+                        bundled_version = EXPECTED_DAEMON_VERSION,
+                        "cortex_bridge: daemon version skew — caller should respawn"
+                    );
+                    cortex::remove_lock()?;
+                }
+                Err(e) => {
+                    // /api/v1/version is only present on builds that
+                    // include this fix. A 404 means the daemon is
+                    // older than this desktop; treat as stale.
+                    tracing::warn!(
+                        pid = lock.pid,
+                        port = lock.port,
+                        error = %e,
+                        "cortex_bridge: daemon does not expose /api/v1/version — treating as stale"
+                    );
+                    cortex::remove_lock()?;
+                }
+            }
+        } else {
+            tracing::info!(
                 pid = lock.pid,
                 port = lock.port,
-                started_by = lock.started_by.as_str(),
-                "cortex_bridge: attached to existing daemon"
+                "cortex_bridge: stale lock detected, removing"
             );
-            return Ok(EngineConnection::Remote {
-                host: lock.host,
-                port: lock.port,
-                started_by: lock.started_by,
-                pid: lock.pid,
-            });
+            cortex::remove_lock()?;
         }
-        tracing::info!(
-            pid = lock.pid,
-            port = lock.port,
-            "cortex_bridge: stale lock detected, removing"
-        );
-        cortex::remove_lock()?;
     }
 
     // No daemon. Caller (the sidecar manager) decides what to do.
     Ok(EngineConnection::InProcess)
+}
+
+/// Bundled-binary version. Matched against the running daemon's
+/// `/api/v1/version` response to detect stale-binary skew.
+const EXPECTED_DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// GET `<host>:<port>/api/v1/version` and parse the `data.version`
+/// field from the daemon's standard `{ ok, data, error }` envelope.
+async fn daemon_version(host: &str, port: u16) -> Result<String, String> {
+    let url = format!("http://{host}:{port}/api/v1/version");
+    let client = reqwest::Client::builder()
+        .timeout(HEALTH_CHECK_TIMEOUT)
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    let envelope: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
+    envelope
+        .pointer("/data/version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("no .data.version in response from {url}"))
 }
 
 /// HTTP GET `<host>:<port>/livez` with the same 1s timeout the CLI

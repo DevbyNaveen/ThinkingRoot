@@ -480,6 +480,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
         .route("/metrics", get(metrics_handler))
         .route("/readyz", get(readyz_handler))
         .route("/livez", get(livez_handler))
+        .route("/api/v1/version", get(version_handler))
         .route("/.well-known/mcp", get(well_known_mcp_handler))
         .with_state(state)
 }
@@ -490,6 +491,24 @@ async fn livez_handler() -> Response {
     // If this handler runs, the tokio reactor is alive enough to accept
     // requests. No deeper check — that's what /readyz is for.
     (StatusCode::OK, "ok\n").into_response()
+}
+
+/// GET `/api/v1/version`
+///
+/// Identity probe for cortex discovery. Lets a desktop / CLI client
+/// detect when the running daemon is a stale binary (different
+/// `CARGO_PKG_VERSION` than the bundled one) and decide to respawn
+/// rather than attach to a daemon whose handlers might have been
+/// fixed in a newer source revision.
+///
+/// Unauthenticated on purpose — discovery must work before the
+/// client knows whether to send credentials.
+async fn version_handler() -> Response {
+    let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+    });
+    ok_response(body).into_response()
 }
 
 /// GET `/.well-known/mcp`
