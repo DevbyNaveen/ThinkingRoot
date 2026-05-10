@@ -23,6 +23,8 @@
 // bad_claim_ids that didn't resolve.
 
 import { useState } from "react";
+
+import { cn } from "@/lib/utils";
 import type { TrustReceipt as TrustReceiptShape, TrustReceiptKind } from "../../types";
 
 type ChipPalette = {
@@ -96,16 +98,15 @@ export function TrustReceiptChip({ receipt }: { receipt: TrustReceiptShape }) {
         type="button"
         onClick={() => setOpen(true)}
         title={palette.description}
-        className={[
-          "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium",
-          "transition-colors hover:bg-opacity-80 cursor-pointer",
-          palette.bg,
-          palette.border,
-          palette.fg,
-        ].join(" ")}
+        className={cn(
+          "inline-flex cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-xs font-normal text-muted-foreground",
+          "transition-colors hover:text-foreground hover:underline hover:underline-offset-2",
+        )}
         aria-label={`Trust receipt: ${palette.label}. Click for details.`}
       >
-        <span aria-hidden>{palette.glyph}</span>
+        <span aria-hidden className="opacity-60">
+          {palette.glyph}
+        </span>
         <span>{palette.label}</span>
       </button>
       {open && (

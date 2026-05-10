@@ -73,7 +73,12 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
     | { kind: "error"; message: string }
   >({ kind: "form" });
 
-  // Load the lightweight estimate to pre-fill the form.
+  // Load the lightweight estimate to pre-fill the form. Bugfix
+  // 2026-05-10 — the form now starts populated with sensible defaults
+  // derived from the workspace name (`local/<slug>` + `0.1.0`) so the
+  // user never lands on an empty form they have to figure out. They
+  // can still overwrite anything, and the on-submit sanitiser fixes
+  // partial input rather than blocking it.
   useEffect(() => {
     let cancelled = false;
     packEstimate(workspace)
@@ -81,8 +86,8 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
         if (cancelled) return;
         setEstimate(est);
         setForm((prev) => ({
-          name: prev.name || est.name,
-          version: prev.version || est.version,
+          name: prev.name || est.name || defaultPackName(workspace),
+          version: prev.version || est.version || "0.1.0",
           license: prev.license || (est.license ?? ""),
           description: prev.description || (est.description ?? ""),
           signKeyless: prev.signKeyless,
@@ -111,16 +116,29 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
   const status = useWorkspaceStatus(workspace);
   const exportDiagnostics = useDiagnosticsFor(workspace, "for_export");
   const blocker = pickPrimaryDiagnostic(status, "for_export");
-  const submittable =
-    exportButtonEnabled(status) &&
-    form.name.trim().length > 0 &&
-    form.version.trim().length > 0 &&
-    /^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(form.name.trim()) &&
-    phase.kind === "form";
+
+  // Bugfix 2026-05-10 — the form auto-sanitises name + version on
+  // submit. Pre-fix any non-conforming input (e.g. `Cipher` instead
+  // of `acme/cipher`, or `1.01` instead of `1.0.1`) just disabled the
+  // button silently. Now we always show what the export will use
+  // (computed below) and the only block is the workspace-readiness
+  // axis. The CLI contract (`owner/slug` + SemVer) is preserved by
+  // the sanitiser, never by gating the button.
+  const sanitizedName = sanitizePackName(form.name, workspace);
+  const sanitizedVersion = sanitizeSemver(form.version);
+  const willRewriteName = sanitizedName !== form.name.trim();
+  const willRewriteVersion = sanitizedVersion !== form.version.trim();
+
+  const workspaceBlocker =
+    !exportButtonEnabled(status)
+      ? blocker?.message ?? "Workspace not ready to export."
+      : null;
+
+  const submittable = workspaceBlocker === null && phase.kind === "form";
 
   const onSubmit = async () => {
     if (!submittable) return;
-    const defaultFile = `${form.name.replace("/", "-")}-${form.version}.tr`;
+    const defaultFile = `${sanitizedName.replace("/", "-")}-${sanitizedVersion}.tr`;
     let outPath: string | null;
     try {
       outPath = await save({
@@ -142,8 +160,8 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
       const result = await packExport({
         workspace,
         out_path: outPath,
-        name: form.name.trim(),
-        version: form.version.trim(),
+        name: sanitizedName,
+        version: sanitizedVersion,
         license: form.license.trim() || null,
         description: form.description.trim() || null,
         sign_keyless: form.signKeyless,
@@ -230,7 +248,7 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
               value={form.name}
               onChange={(v) => setForm((p) => ({ ...p, name: v }))}
               placeholder="acme/widgets"
-              hint="Lowercase letters, digits, '-' and '_'. Required."
+              hint="Format: `owner/slug` (e.g. `acme/cipher`). Each part accepts letters, digits, '-' and '_'."
             />
             <Field
               label="Version (SemVer)"
@@ -274,6 +292,16 @@ export function PackExportSheet({ workspace, branch, onClose }: Props) {
                 {humanBytes(estimate.source_bytes)}
               </div>
               {branch && <div>Packing branch: {branch}</div>}
+            </div>
+          )}
+
+          {(willRewriteName || willRewriteVersion) && phase.kind === "form" && (
+            <div className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-[11px] text-muted-foreground">
+              Will export as{" "}
+              <code className="font-mono text-foreground/90">
+                {sanitizedName}@{sanitizedVersion}
+              </code>{" "}
+              (auto-fixed to match the `owner/slug` + SemVer contract).
             </div>
           )}
 
@@ -390,4 +418,73 @@ function humanBytes(n: number): string {
     i++;
   } while (v >= 1024 && i < units.length - 1);
   return `${v.toFixed(2)} ${units[i]}`;
+}
+
+/**
+ * Compute a sane default `owner/slug` from the workspace name. Used
+ * to pre-fill the pack name field so the user lands on a working
+ * default rather than an empty field. Owner defaults to `local`
+ * because nothing on the desktop has been associated with a remote
+ * registry account yet — the user can overwrite it freely.
+ */
+function defaultPackName(workspace: string): string {
+  const slug = sanitizeSlug(workspace) || "pack";
+  return `local/${slug}`;
+}
+
+/**
+ * Lowercase, replace runs of invalid chars with `-`, trim leading/
+ * trailing `-`. Mirrors what `tr-format`'s manifest validator
+ * accepts. Empty input yields empty output (the caller decides what
+ * to default to).
+ */
+function sanitizeSlug(s: string): string {
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Normalise whatever the user typed into a valid `owner/slug`.
+ * - Has a slash: sanitise each half.
+ * - No slash: treat the whole string as the slug, prefix with the
+ *   workspace-derived default owner.
+ * - Empty: fall back to the workspace default.
+ */
+function sanitizePackName(input: string, workspace: string): string {
+  const raw = input.trim();
+  if (raw.length === 0) return defaultPackName(workspace);
+  if (raw.includes("/")) {
+    const [ownerRaw, ...rest] = raw.split("/");
+    const slugRaw = rest.join("-"); // collapse multi-slash typos
+    const owner = sanitizeSlug(ownerRaw ?? "") || "local";
+    const slug = sanitizeSlug(slugRaw) || sanitizeSlug(workspace) || "pack";
+    return `${owner}/${slug}`;
+  }
+  const slug = sanitizeSlug(raw) || sanitizeSlug(workspace) || "pack";
+  return `local/${slug}`;
+}
+
+/**
+ * Normalise user-typed version strings into valid SemVer.
+ * - `1.0.1` → `1.0.1` (passthrough)
+ * - `1.01` → `1.0.1` (pads short forms to 3 components)
+ * - `1` → `1.0.0`
+ * - `v1.2.3` → `1.2.3` (drops common prefix)
+ * - garbage → `0.1.0`
+ */
+function sanitizeSemver(input: string): string {
+  const raw = input.trim().replace(/^v/, "");
+  if (raw.length === 0) return "0.1.0";
+  // Already valid SemVer?
+  if (/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(raw)) return raw;
+  // Pull leading numeric components.
+  const match = raw.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+  if (!match) return "0.1.0";
+  const major = match[1] ?? "0";
+  const minor = match[2] ?? "0";
+  const patch = match[3] ?? "0";
+  return `${major}.${minor}.${patch}`;
 }

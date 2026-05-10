@@ -87,6 +87,134 @@
     @apply animate-shimmer;
   }
 
+  @keyframes dragonfly-hover {
+    0%,
+    100% {
+      transform: translate3d(-1px, 0, 0);
+    }
+    50% {
+      transform: translate3d(2px, -1px, 0);
+    }
+  }
+
+  @keyframes dragonfly-wing-left {
+    0%,
+    100% {
+      transform: translate(1px, 1px) rotate(-28deg) scaleY(1);
+      opacity: 0.95;
+    }
+    50% {
+      transform: translate(0, 2px) rotate(-12deg) scaleY(0.45);
+      opacity: 0.55;
+    }
+  }
+
+  @keyframes dragonfly-wing-right {
+    0%,
+    100% {
+      transform: translate(-1px, 1px) rotate(28deg) scaleY(1);
+      opacity: 0.95;
+    }
+    50% {
+      transform: translate(0, 2px) rotate(12deg) scaleY(0.45);
+      opacity: 0.55;
+    }
+  }
+
+  @keyframes thought-pixel {
+    0%,
+    100% {
+      opacity: 0.28;
+      transform: translateY(0);
+    }
+    45% {
+      opacity: 0.95;
+      transform: translateY(-1px);
+    }
+  }
+
+  .pixel-dragonfly {
+    position: relative;
+    display: inline-block;
+    width: 22px;
+    height: 14px;
+    image-rendering: pixelated;
+    animation: dragonfly-hover 720ms steps(2, end) infinite;
+  }
+
+  .pixel-dragonfly__body,
+  .pixel-dragonfly__wing {
+    position: absolute;
+    display: block;
+    border-radius: 1px;
+  }
+
+  .pixel-dragonfly__body {
+    left: 10px;
+    top: 3px;
+    width: 3px;
+    height: 9px;
+    background: hsl(var(--accent) / 0.9);
+    box-shadow:
+      0 -2px 0 hsl(var(--foreground) / 0.72),
+      0 9px 0 hsl(var(--muted-foreground) / 0.38),
+      -4px 3px 0 hsl(var(--muted-foreground) / 0.55),
+      4px 3px 0 hsl(var(--muted-foreground) / 0.55);
+  }
+
+  .pixel-dragonfly__wing {
+    top: 1px;
+    width: 8px;
+    height: 5px;
+    background: hsl(var(--info) / 0.48);
+    box-shadow: 0 4px 0 hsl(var(--info) / 0.22);
+    transform-origin: center right;
+  }
+
+  .pixel-dragonfly__wing--left {
+    left: 1px;
+    animation: dragonfly-wing-left 120ms steps(1, end) infinite;
+  }
+
+  .pixel-dragonfly__wing--right {
+    right: 1px;
+    transform-origin: center left;
+    animation: dragonfly-wing-right 120ms steps(1, end) infinite;
+  }
+
+  .pixel-thoughts {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .pixel-thoughts > span {
+    display: block;
+    width: 3px;
+    height: 3px;
+    border-radius: 1px;
+    background: hsl(var(--accent) / 0.72);
+    animation: thought-pixel 780ms steps(2, end) infinite;
+  }
+
+  .pixel-thoughts > span:nth-child(2) {
+    animation-delay: 120ms;
+    background: hsl(var(--info) / 0.72);
+  }
+
+  .pixel-thoughts > span:nth-child(3) {
+    animation-delay: 240ms;
+    background: hsl(var(--muted-foreground) / 0.62);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pixel-dragonfly,
+    .pixel-dragonfly__wing,
+    .pixel-thoughts > span {
+      animation: none;
+    }
+  }
+
   /* Subtle surface elevation. */
   .surface {
     @apply bg-surface;

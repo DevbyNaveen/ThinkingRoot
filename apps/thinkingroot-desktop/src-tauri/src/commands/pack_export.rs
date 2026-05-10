@@ -34,9 +34,45 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
+use thinkingroot_core::WorkspaceRegistry;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tr_format::read_v3_pack;
+
+/// Resolve a workspace identifier (sent by the desktop UI) to an
+/// absolute filesystem path. Bugfix 2026-05-10 — pre-fix the export
+/// commands assumed the UI passed an absolute path, but the React
+/// store carries the workspace *name* (`"CipherVault"`) and several
+/// call sites (BuildersPanel, RightRail, WorkspaceFilesPanel) wired
+/// the name straight into the Tauri request. The Rust side then did
+/// `PathBuf::from("CipherVault").join(".thinkingroot")` which
+/// resolves against the daemon's CWD, finds nothing, and the export
+/// reports `0 files, 0 B`.
+///
+/// Resolution order:
+///   1. If the input is already an absolute path, use it verbatim.
+///   2. Look up the name in `WorkspaceRegistry`.
+///   3. Surface a clear error otherwise — never silently fall back to
+///      a relative path against the daemon's CWD.
+fn resolve_workspace_path(workspace: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(workspace);
+    if candidate.is_absolute() {
+        return Ok(candidate);
+    }
+    let registry = WorkspaceRegistry::load()
+        .map_err(|e| format!("load workspace registry: {e}"))?;
+    registry
+        .workspaces
+        .iter()
+        .find(|w| w.name == workspace)
+        .map(|w| w.path.clone())
+        .ok_or_else(|| {
+            format!(
+                "workspace `{workspace}` not found in registry. \
+                 Run `root workspace list` to see registered workspaces."
+            )
+        })
+}
 
 /// Form state submitted by the desktop UI.
 #[derive(Debug, Clone, Deserialize)]
@@ -150,7 +186,7 @@ fn resolve_root_binary() -> Option<String> {
 /// Estimate without writing.
 #[tauri::command]
 pub async fn pack_estimate(workspace: String) -> Result<PackEstimate, String> {
-    let ws = PathBuf::from(&workspace);
+    let ws = resolve_workspace_path(&workspace)?;
     let engine = ws.join(".thinkingroot");
     let compiled = engine.join("graph").exists();
 
@@ -185,7 +221,7 @@ pub async fn pack_estimate(workspace: String) -> Result<PackEstimate, String> {
 /// Run the export.
 #[tauri::command]
 pub async fn pack_export(req: PackExportRequest) -> Result<PackExportResult, String> {
-    let ws = PathBuf::from(&req.workspace);
+    let ws = resolve_workspace_path(&req.workspace)?;
     if !ws.join(".thinkingroot").exists() {
         return Err(format!(
             "no engine output at `{}/.thinkingroot/`; compile the workspace first",
@@ -197,7 +233,7 @@ pub async fn pack_export(req: PackExportRequest) -> Result<PackExportResult, Str
 
     let mut cmd = Command::new(&bin);
     cmd.arg("pack");
-    cmd.arg(&req.workspace);
+    cmd.arg(&ws);
     cmd.arg("--out").arg(&req.out_path);
     if let Some(n) = &req.name {
         cmd.arg("--name").arg(n);

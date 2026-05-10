@@ -10,8 +10,8 @@
 //   - Switch: clicking a row in the dropdown calls `branchCheckout`
 //
 // Behaviour:
-//   - Closed state: pill button "🌿 stream/abc" — green when active
-//     branch is the workspace default (`main`), blue otherwise
+//   - Closed state: branch name + chevron only (no pill/box); hover
+//     darkens text; non-main branch reads slightly stronger
 //   - Open state: dropdown lists all branches with status badges,
 //     click switches, click outside or ESC closes
 //
@@ -20,7 +20,7 @@
 // is the always-visible "where am I writing claims" affordance.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { GitBranch, Check, ChevronDown } from "lucide-react";
+import { Check, ChevronDown } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { toast } from "@/store/toast";
@@ -163,12 +163,11 @@ export function BranchChip({ workspace }: BranchChipProps) {
 
   if (branches.length === 0) {
     // Substrate may not be mounted, or the daemon may not be reachable
-    // yet. Render a neutral chip; clicking it does nothing harmful.
+    // yet. Show branch label only (no interactive affordance).
     return (
-      <div className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 bg-zinc-50 px-2.5 py-0.5 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/40 dark:text-zinc-500">
-        <GitBranch className="h-3 w-3" aria-hidden />
-        <span>main</span>
-      </div>
+      <span className="inline-flex items-center gap-1 font-mono text-[11px] text-muted-foreground">
+        main
+      </span>
     );
   }
 
@@ -178,19 +177,21 @@ export function BranchChip({ workspace }: BranchChipProps) {
         type="button"
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors cursor-pointer",
-          isMain
-            ? "border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-950/60"
-            : "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-300 dark:hover:bg-blue-950/60",
+          "inline-flex max-w-[min(220px,100%)] cursor-pointer items-center gap-1 rounded-sm py-0.5 text-left font-mono text-[11px] transition-colors",
+          "hover:text-foreground",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/55 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          open ? "text-foreground" : isMain ? "text-muted-foreground" : "text-foreground/85",
         )}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={`Active branch: ${activeName}. Click to switch.`}
       >
-        <GitBranch className="h-3 w-3" aria-hidden />
-        <span className="font-mono">{activeName}</span>
+        <span className="min-w-0 truncate">{activeName}</span>
         <ChevronDown
-          className={cn("h-3 w-3 transition-transform", open && "rotate-180")}
+          className={cn(
+            "h-3.5 w-3.5 shrink-0 opacity-70 transition-transform",
+            open && "rotate-180",
+          )}
           aria-hidden
         />
       </button>
@@ -199,9 +200,9 @@ export function BranchChip({ workspace }: BranchChipProps) {
         <div
           role="listbox"
           aria-label="Branches"
-          className="absolute left-0 top-full z-30 mt-1 w-64 overflow-hidden rounded-md border border-border bg-popover shadow-lg"
+          className="absolute left-0 top-full z-30 mt-1.5 w-72 overflow-hidden rounded-xl border border-border/70 bg-surface-elevated shadow-elevated"
         >
-          <ul className="max-h-72 overflow-y-auto">
+          <ul className="max-h-72 overflow-y-auto p-1">
             {branches.map((b) => {
               const isActive = b.current;
               return (
@@ -213,22 +214,22 @@ export function BranchChip({ workspace }: BranchChipProps) {
                     disabled={switching != null}
                     onClick={() => void onSwitch(b.name)}
                     className={cn(
-                      "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted/60 disabled:opacity-50",
-                      isActive && "bg-muted/40",
+                      "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-muted/45 disabled:opacity-50",
+                      isActive && "bg-muted/55 text-foreground",
                     )}
                   >
                     {isActive ? (
-                      <Check className="h-3 w-3 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
+                      <Check className="h-3 w-3 flex-shrink-0 text-success" />
                     ) : (
                       <span className="block h-3 w-3 flex-shrink-0" />
                     )}
-                    <span className="flex-1 truncate font-mono">{b.name}</span>
+                    <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{b.name}</span>
                     {b.parent && b.parent !== b.name && (
-                      <span className="text-[10px] text-muted-foreground">
+                      <span className="max-w-20 truncate text-[10px] text-muted-foreground">
                         ← {b.parent}
                       </span>
                     )}
-                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                    <span className="rounded-md border border-border/50 bg-background/35 px-1.5 py-0.5 text-[9px] uppercase tracking-wide text-muted-foreground">
                       {b.status}
                     </span>
                   </button>
@@ -236,7 +237,7 @@ export function BranchChip({ workspace }: BranchChipProps) {
               );
             })}
           </ul>
-          <div className="border-t border-border bg-muted/30 px-3 py-1.5 text-[10px] text-muted-foreground">
+          <div className="border-t border-border/60 bg-background/35 px-3 py-1.5 text-[10px] text-muted-foreground">
             Click to switch · ESC to close
           </div>
         </div>

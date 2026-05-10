@@ -25,7 +25,10 @@ import {
   AlertTriangle,
   Hammer,
   Loader2,
+  Copy,
+  Share2,
 } from "lucide-react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -708,11 +711,19 @@ export function ChatView() {
   return (
     <div className="flex h-full flex-col bg-background">
       <div className="border-b border-border/40 bg-background/80 px-8 py-2 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl items-center gap-3">
-          <span className="text-[10px] uppercase tracking-widest text-muted-foreground/60">
+        <div className="mx-auto flex min-w-0 max-w-3xl items-center gap-1.5">
+          <span className="min-w-0 truncate text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
             {activeWorkspace}
           </span>
-          <BranchChip workspace={activeWorkspace} />
+          <span
+            className="shrink-0 select-none text-[10px] text-muted-foreground/40"
+            aria-hidden
+          >
+            /
+          </span>
+          <div className="min-w-0 shrink">
+            <BranchChip workspace={activeWorkspace} />
+          </div>
         </div>
       </div>
       <div className="flex-1 overflow-y-auto px-8 py-6">
@@ -1023,15 +1034,75 @@ function NoWorkspace() {
   );
 }
 
+async function copyAssistantMessage(body: string) {
+  try {
+    await writeText(body);
+    toast("Copied to clipboard", { kind: "success" });
+  } catch (e) {
+    toast("Copy failed", { body: String(e), kind: "error" });
+  }
+}
+
+async function shareAssistantMessage(body: string) {
+  if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
+    try {
+      await navigator.share({ title: "ThinkingRoot", text: body });
+      return;
+    } catch (e) {
+      const name = (e as { name?: string })?.name;
+      if (name === "AbortError") return;
+    }
+  }
+  try {
+    await writeText(body);
+    toast("Copied to clipboard (share as text)", { kind: "info" });
+  } catch (e) {
+    toast("Share failed", { body: String(e), kind: "error" });
+  }
+}
+
+function AssistantMessageActions({ body }: { body: string }) {
+  if (!body.trim()) return null;
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-1 border-t border-border/30 pt-2">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1.5 px-2 text-[11px] text-muted-foreground hover:text-foreground [&_svg]:size-3.5"
+        onClick={() => void copyAssistantMessage(body)}
+      >
+        <Copy aria-hidden />
+        Copy
+      </Button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-7 gap-1.5 px-2 text-[11px] text-muted-foreground hover:text-foreground [&_svg]:size-3.5"
+        onClick={() => void shareAssistantMessage(body)}
+      >
+        <Share2 aria-hidden />
+        Share
+      </Button>
+    </div>
+  );
+}
+
 function ThinkingLoader() {
   return (
-    <div className="flex h-12 items-center justify-start px-2">
-      <div className="inline-flex items-center gap-2 rounded-full bg-muted/35 px-3 py-1.5 text-xs text-muted-foreground">
-        <span>Thinking</span>
-        <span className="inline-flex items-center gap-1">
-          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:0ms]" />
-          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:180ms]" />
-          <span className="size-1.5 animate-pulse rounded-full bg-muted-foreground/70 [animation-delay:360ms]" />
+    <div className="flex h-12 items-center justify-start px-2" role="status" aria-label="Thinking">
+      <div className="inline-flex items-center gap-2.5 py-1.5 text-xs text-muted-foreground">
+        <span className="pixel-dragonfly" aria-hidden>
+          <span className="pixel-dragonfly__wing pixel-dragonfly__wing--left" />
+          <span className="pixel-dragonfly__wing pixel-dragonfly__wing--right" />
+          <span className="pixel-dragonfly__body" />
+        </span>
+        <span className="font-medium tracking-[0.01em]">Thinking</span>
+        <span className="pixel-thoughts" aria-hidden>
+          <span />
+          <span />
+          <span />
         </span>
       </div>
     </div>
@@ -1101,6 +1172,7 @@ function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }
           {pending && (
             <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
           )}
+          <AssistantMessageActions body={msg.body} />
           {!pending && msg.engramActivations && msg.engramActivations.length > 0 && (
             <div className="mt-2">
               <EngramTimeline activations={msg.engramActivations} />

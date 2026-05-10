@@ -813,6 +813,37 @@ async fn mount_workspace_handler(
         )
         .await;
 
+    // Bugfix 2026-05-10 — also push an LLM probe state so the actor's
+    // `llm` axis stops reading `Unconfigured` once mount has produced
+    // a usable LlmClient. Pre-fix the actor stayed at the initial
+    // `Unconfigured` forever; daemon restart silently broke the chat
+    // gates on every previously-compiled workspace. Honest decision:
+    // we have credentials in shape (LlmClient was constructible) but
+    // no fresh probe in this session, so `Configured` is the truthful
+    // axis state — the periodic reconcile tick at `workspace_state.rs:321`
+    // would decay any `Healthy` we tried to fabricate here back to
+    // `Configured` within `LLM_HEALTH_WINDOW`, so we save the flicker
+    // and dispatch the durable answer directly.
+    let llm_summary = {
+        let engine = state.engine.read().await;
+        engine.workspace_llm_summary(&name)
+    };
+    if let Some((provider, model)) = llm_summary {
+        state
+            .workspace_status
+            .dispatch(
+                &name,
+                root_path.clone(),
+                WorkspaceStatusMsg::LlmProbed {
+                    state: thinkingroot_core::types::LlmState::Configured {
+                        provider,
+                        model: Some(model),
+                    },
+                },
+            )
+            .await;
+    }
+
     // Emit RARP-aware invalidation so any pre-existing engrams pinned
     // to a same-named workspace are dropped — defends against the
     // "remount under the same name returns stale claim ids" case.
@@ -1598,6 +1629,14 @@ async fn compile_stream(
         }
     };
 
+    // Bugfix 2026-05-10 — canonicalize the path so workspace-registry
+    // matching works when the CLI sends a relative path like "." (which
+    // is what `root compile .` produces). Without canonicalization we'd
+    // compare `PathBuf::from(".")` against the registry's absolute paths,
+    // miss every match, and leak a phantom workspace named "_" with
+    // path "." into the engine's mount table.
+    let root_path = std::fs::canonicalize(&root_path).unwrap_or(root_path);
+
     if !root_path.is_dir() {
         return err_response(
             StatusCode::BAD_REQUEST,
@@ -1614,7 +1653,29 @@ async fn compile_stream(
     // if the request bypassed the registry (workspace not registered)
     // we still spawn an actor for the path so refresh / status calls
     // work after the first compile.
-    let status_name = ws.clone();
+    //
+    // Bugfix 2026-05-10 — when the CLI POSTs to `/api/v1/ws/_/compile/stream`
+    // (the `_` placeholder used by `cortex_remote::run_compile_remote`),
+    // `ws` is literally the string `_`. Using it as the actor key leaves
+    // the canonical workspace's actor (e.g. `CipherVault`) without a
+    // CompileFinished update, so `/workspaces/{name}/status` keeps
+    // reporting `substrate.kind=empty` after a successful compile. Resolve
+    // the canonical name from the engine's mounted-workspace registry by
+    // matching `root_path`; fall back to the URL `ws` if no match (e.g.
+    // first-time compile of an un-registered workspace).
+    let status_name = if ws == "_" {
+        let engine = state.engine.read().await;
+        match engine.list_workspaces().await {
+            Ok(list) => list
+                .into_iter()
+                .find(|w| std::path::PathBuf::from(&w.path) == root_path)
+                .map(|w| w.name)
+                .unwrap_or_else(|| ws.clone()),
+            Err(_) => ws.clone(),
+        }
+    } else {
+        ws.clone()
+    };
     let status_path = root_path.clone();
     state
         .workspace_status
@@ -1715,6 +1776,169 @@ async fn compile_stream(
                         Ok(m) => m.len(),
                         Err(_) => 0,
                     };
+
+                    // Bugfix 2026-05-10 — refresh the daemon's in-memory
+                    // KnowledgeGraph cache for this workspace. The compile
+                    // pipeline opened its own `StorageEngine::init(...)`,
+                    // committed claims to graph.db, and dropped that handle.
+                    // The daemon's pre-existing cache (loaded at startup
+                    // via `engine.mount(...)`) is now stale — every
+                    // post-compile read (`/workspaces`, `/ws/{ws}/claims`,
+                    // `/ws/{ws}/search`) returns the empty pre-compile view
+                    // until the workspace is re-mounted. Re-mount in place
+                    // so the freshly-written claims/entities/sources are
+                    // immediately queryable from the same daemon process.
+                    //
+                    // Idempotent: `engine.mount` does a HashMap insert
+                    // which replaces the prior handle. The old
+                    // Arc<Mutex<StorageEngine>> drops when its last
+                    // outstanding clone is released, closing the previous
+                    // Cozo connection cleanly.
+                    let mut remount_ok = false;
+                    {
+                        let mut engine = state.engine.write().await;
+                        match engine.mount(status_name.clone(), status_path.clone()).await {
+                            Ok(()) => {
+                                remount_ok = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    workspace = %status_name,
+                                    "post-compile cache reload failed: {e} — \
+                                     substrate is on disk but daemon's in-memory \
+                                     view is stale; restart the daemon or POST \
+                                     /api/v1/workspaces to remount"
+                                );
+                            }
+                        }
+                    }
+
+                    // Bugfix 2026-05-10 — rebuild the vector index after
+                    // a successful compile so the daemon's
+                    // `/search`, `/search/hybrid`, and `/engrams`
+                    // endpoints work immediately. v3 `root compile`
+                    // deliberately does not embed (the compile pipeline
+                    // owns the substrate; consumers choose their own
+                    // embedding model — see `pipeline.rs:1551`), so the
+                    // index has to be built once afterward. The in-process
+                    // CLI path already does this lazily in
+                    // `thinkingroot-cli/src/main.rs:2361`, but the daemon
+                    // path had no equivalent — every cortex-routed query
+                    // against a fresh compile returned `[]` even though
+                    // graph.db was fully populated.
+                    if remount_ok {
+                        match state.engine.read().await
+                            .rebuild_vector_index(&status_name)
+                            .await
+                        {
+                            Ok((entities, claims)) => {
+                                tracing::info!(
+                                    workspace = %status_name,
+                                    "post-compile vector index built: {} entities + {} claims",
+                                    entities, claims
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    workspace = %status_name,
+                                    "post-compile vector index rebuild failed: {e} — \
+                                     keyword search will work but semantic search and \
+                                     AEP probes will return empty results until the \
+                                     index is built"
+                                );
+                            }
+                        }
+                    }
+
+                    // Bugfix 2026-05-10 — also tell the workspace_status
+                    // actor that the workspace is now mounted in the
+                    // engine. Without this, `mount.kind` stays
+                    // `not_mounted` after a CLI-driven compile (the CLI
+                    // path never sends an explicit `POST /workspaces` to
+                    // mount), and `readiness.for_query` is gated false
+                    // even though `root query` works against the engine
+                    // immediately. Read live counts off the freshly-
+                    // remounted handle so the actor's mount snapshot
+                    // matches the post-compile reality.
+                    if remount_ok {
+                        let (counts, llm_summary) = {
+                            let engine = state.engine.read().await;
+                            let counts = engine.list_workspaces().await.ok().and_then(|list| {
+                                list.into_iter().find(|w| w.name == status_name).map(|w| {
+                                    (
+                                        w.claim_count as u64,
+                                        w.entity_count as u64,
+                                        w.source_count as u64,
+                                    )
+                                })
+                            });
+                            let llm = engine.workspace_llm_summary(&status_name);
+                            (counts, llm)
+                        };
+                        // Bugfix 2026-05-10 — push a real LLM probe state
+                        // when the workspace mount produced a usable
+                        // client. Without this the status actor's `llm`
+                        // axis stays `Unconfigured` and
+                        // `readiness.for_query`/`readiness.for_chat` are
+                        // gated false forever (both require
+                        // `LlmState::Healthy`, see
+                        // `crates/thinkingroot-core/src/types/workspace_status.rs:529`).
+                        //
+                        // The compile that just succeeded exercised the
+                        // extraction LLM client end-to-end (token-budget,
+                        // schema parsing, retries) — that is empirical
+                        // evidence the provider is reachable from this
+                        // host's network and the configured key is valid.
+                        // Stamping `Healthy` with `last_probed_at = now`
+                        // is honest under that contract; the heartbeat in
+                        // `workspace_state.rs:321` decays back to
+                        // `Configured` after `LLM_HEALTH_WINDOW` elapses
+                        // without a fresh probe, so we never claim
+                        // healthier-than-truth for long.
+                        if let Some((provider, model)) = llm_summary {
+                            state
+                                .workspace_status
+                                .dispatch(
+                                    &status_name,
+                                    status_path.clone(),
+                                    WorkspaceStatusMsg::LlmProbed {
+                                        state: thinkingroot_core::types::LlmState::Healthy {
+                                            provider,
+                                            model: Some(model),
+                                            last_probed_at: chrono::Utc::now(),
+                                        },
+                                    },
+                                )
+                                .await;
+                        }
+                        if let Some((claim_count, entity_count, source_count)) = counts {
+                            let graph_db_bytes_for_mount = match tokio::fs::metadata(
+                                status_path
+                                    .join(".thinkingroot")
+                                    .join("graph")
+                                    .join("graph.db"),
+                            )
+                            .await
+                            {
+                                Ok(m) => m.len(),
+                                Err(_) => 0,
+                            };
+                            state
+                                .workspace_status
+                                .dispatch(
+                                    &status_name,
+                                    status_path.clone(),
+                                    WorkspaceStatusMsg::MountSucceeded {
+                                        claim_count,
+                                        entity_count,
+                                        source_count_at_last_compile: source_count,
+                                        graph_db_bytes: graph_db_bytes_for_mount,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+
                     state
                         .workspace_status
                         .dispatch(

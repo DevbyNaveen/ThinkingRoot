@@ -373,8 +373,17 @@ pub async fn run_compile_remote(
     use indicatif::MultiProgress;
 
     let url = format!("{}/api/v1/ws/_/compile/stream", base_url(conn)?);
+    // Bugfix 2026-05-10 — canonicalize the path on the CLI side before
+    // sending. The daemon's CWD is not the user's CWD (the daemon is
+    // detached, often spawned from `/`); a relative path like "." sent
+    // verbatim is resolved against the daemon's CWD by the server-side
+    // `std::fs::canonicalize` and silently picks up the wrong workspace.
+    // The CLI is the only side that knows what the user typed `compile .`
+    // against, so the canonicalize must happen here.
+    let absolute_path = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to canonicalize compile path: {}", path.display()))?;
     let body = serde_json::json!({
-        "root_path": path.display().to_string(),
+        "root_path": absolute_path.display().to_string(),
         "branch": branch,
         "no_rooting": no_rooting,
     });

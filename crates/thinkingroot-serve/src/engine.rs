@@ -4175,6 +4175,58 @@ Rules: \
         self.workspaces.get(ws).map(|h| h.root_path.clone())
     }
 
+    /// Rebuild the vector index for a mounted workspace. Locks the
+    /// workspace's `StorageEngine` exclusively, so blocks any concurrent
+    /// reads while running. Suitable to call once after a successful
+    /// compile so the next `search` / `hybrid_retrieve` / `materialize_engram`
+    /// has a populated index — without this, those endpoints return empty
+    /// hits even though the substrate is fully populated.
+    ///
+    /// Bugfix 2026-05-10 — the in-process CLI path (`run_query` in
+    /// `thinkingroot-cli/src/main.rs:2361`) builds the index lazily on
+    /// first read, but the daemon path through `compile_stream` did not.
+    /// Result: every cortex-routed query against a fresh compile
+    /// returned `[]`. Hooking this into the compile success path keeps
+    /// the post-compile UX consistent across CLI-direct and daemon
+    /// modes.
+    pub async fn rebuild_vector_index(&self, ws: &str) -> Result<(usize, usize)> {
+        let handle = self.get_workspace(ws)?;
+        let storage_arc = Arc::clone(&handle.storage);
+        let counts = tokio::task::spawn_blocking(move || {
+            // Acquire the std-Mutex synchronously inside the blocking
+            // pool — the storage engine itself is sync work (Cozo
+            // queries + fastembed ONNX inference), and `block_in_place`
+            // would have to be at the call site otherwise.
+            let mut storage = storage_arc.blocking_lock();
+            crate::pipeline::rebuild_vector_index(&mut storage)
+        })
+        .await
+        .map_err(|e| Error::Config(format!("vector-index rebuild task panicked: {e}")))??;
+        Ok(counts)
+    }
+
+    /// Return `(provider, model)` when the named workspace has a usable
+    /// LLM client attached, or `None` when the workspace is unmounted
+    /// or its config did not yield a working client.
+    ///
+    /// Bugfix 2026-05-10 — used by the post-compile path in `rest.rs`
+    /// to dispatch an `LlmProbed::Configured` snapshot to the workspace
+    /// status actor. Pre-fix the actor's `llm` axis stayed
+    /// `Unconfigured` forever because no producer ever emitted a probe;
+    /// readiness's `for_query` / `for_chat` (both gated on `llm_healthy`)
+    /// were therefore false even on workspaces where the engine had a
+    /// fully-initialised `LlmClient`.
+    pub fn workspace_llm_summary(&self, ws: &str) -> Option<(String, String)> {
+        let handle = self.workspaces.get(ws)?;
+        if handle.llm.is_none() {
+            return None;
+        }
+        Some((
+            handle.config.llm.default_provider.clone(),
+            handle.config.llm.extraction_model.clone(),
+        ))
+    }
+
     /// Hand out a cheap clone of the workspace's `GraphStore` for direct
     /// Datalog access. `GraphStore` is `#[derive(Clone)]` over an Arc-internal
     /// Cozo `DbInstance` (`crates/thinkingroot-graph/src/graph.rs:50-53`), so

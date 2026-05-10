@@ -527,13 +527,27 @@ impl WorkspaceStatus {
         let substrate_populated = matches!(substrate, SubstrateState::Populated { .. });
         let mounted = matches!(mount, MountState::Mounted { .. });
         let llm_healthy = matches!(llm, LlmState::Healthy { .. });
+        // Bugfix 2026-05-10 — for_query/for_chat accept `Configured` as
+        // well as `Healthy`. A workspace with a constructed LlmClient
+        // and a populated substrate is chat-ready: the user has a
+        // provider in shape, the substrate has claims to ground on,
+        // and a momentarily-down provider produces the same UX as a
+        // failed pre-flight (a single error toast). Pre-fix the gate
+        // required `Healthy` which only the compile path produces, so
+        // every workspace that hadn't been recompiled in this daemon
+        // session was silently chat-blocked. `for_publish` still
+        // requires `Healthy` — publishing warrants the stricter bar.
+        let llm_ready = matches!(
+            llm,
+            LlmState::Healthy { .. } | LlmState::Configured { .. }
+        );
         let compile_running = matches!(
             compile,
             CompileState::Running { .. } | CompileState::Cancelling { .. }
         );
 
         let for_compile = path_exists && !compile_running && !matches!(substrate, SubstrateState::Corrupt { .. } | SubstrateState::Orphaned { .. });
-        let for_query = substrate_populated && mounted && llm_healthy;
+        let for_query = substrate_populated && mounted && llm_ready;
         let for_chat = for_query;
         let for_export = substrate_populated && sources.has_sources();
         let for_publish = for_export && llm_healthy && branch.current == "main" && !branch.modified;
@@ -718,12 +732,19 @@ impl WorkspaceStatus {
                 }],
             }),
             LlmState::Configured { .. } => {
+                // Info-level only — paired with the readiness relaxation
+                // at `derive_readiness`, `Configured` no longer blocks
+                // `for_query`/`for_chat`. Publishing still requires a
+                // recent successful probe (gated by `for_publish` →
+                // `llm_healthy`), so we surface that in the blocks list
+                // to drive the "Probe now" prompt for users on the
+                // publish path.
                 if matches!(substrate, SubstrateState::Populated { .. }) {
                     out.push(Diagnostic {
                         code: diagnostic_codes::PROVIDER_STALE.into(),
                         severity: DiagnosticSeverity::Info,
-                        message: "Provider has not been health-checked recently".into(),
-                        blocks: vec!["for_query".into(), "for_chat".into()],
+                        message: "Provider has not been health-checked this session".into(),
+                        blocks: vec!["for_publish".into()],
                         actions: vec![DiagnosticAction {
                             id: "probe_provider".into(),
                             label: "Probe now".into(),
@@ -928,6 +949,35 @@ mod tests {
         assert!(r.for_chat);
         assert!(r.for_export);
         assert!(r.for_publish);
+    }
+
+    #[test]
+    fn configured_llm_with_populated_substrate_unblocks_chat_but_not_publish() {
+        // Bugfix 2026-05-10 regression test — pre-fix, a workspace with
+        // `LlmState::Configured` (no recent probe) had `for_chat=false`
+        // because the gate required `Healthy`. Post-fix the readiness
+        // gate accepts `Configured` for chat/query (a constructed
+        // LlmClient + populated substrate is chat-ready), but `Healthy`
+        // is still required for `for_publish` (the stricter bar).
+        let r = WorkspaceStatus::derive_readiness(
+            &populated(),
+            &some_sources(),
+            &MountState::Mounted { since: Utc::now() },
+            &LlmState::Configured {
+                provider: "azure".into(),
+                model: Some("gpt-5.4".into()),
+            },
+            &idle_compile(),
+            &BranchState::default(),
+            true,
+        );
+        // Chat-readiness paths green — this is the user-visible fix.
+        assert!(r.for_query);
+        assert!(r.for_chat);
+        assert!(r.for_export);
+        assert!(r.for_compile);
+        // Publish still requires a fresh probe.
+        assert!(!r.for_publish);
     }
 
     #[test]
