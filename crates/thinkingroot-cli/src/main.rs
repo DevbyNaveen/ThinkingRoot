@@ -18,7 +18,6 @@ mod compliance_cmd;
 mod cortex_client;
 mod cortex_remote;
 mod doctor;
-mod doctor_cmd;
 mod engram_cmd;
 mod eval_cmd;
 mod mcp_config;
@@ -1459,9 +1458,18 @@ async fn async_main() -> anyhow::Result<()> {
                 }
                 doctor::DoctorMode::Quiet => {}
                 doctor::DoctorMode::Fix | doctor::DoctorMode::FixInteractive => {
-                    // Task 12 wires the actual fix runner.
                     print!("{}", doctor::format::to_terminal(&report));
-                    eprintln!("note: --fix runner lands in Slice B Task 12");
+                    let outcomes = doctor::fix::apply_all(
+                        &report.checks,
+                        mode == doctor::DoctorMode::FixInteractive,
+                    );
+                    if outcomes.is_empty() {
+                        eprintln!("no fixable failures.");
+                    } else {
+                        for (check, outcome) in &outcomes {
+                            eprintln!("  {} → {:?}", check.id.0, outcome);
+                        }
+                    }
                 }
                 doctor::DoctorMode::Default => {
                     print!("{}", doctor::format::to_terminal(&report));

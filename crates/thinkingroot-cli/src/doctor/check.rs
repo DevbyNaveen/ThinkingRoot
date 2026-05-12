@@ -3,9 +3,6 @@
 //! independently.
 //!
 //! Spec: `docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md` §2.
-//!
-//! Coexists with `crate::doctor_cmd` until the migration in Task 12
-//! deletes the legacy implementation.
 
 use std::path::PathBuf;
 

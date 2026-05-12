@@ -3,15 +3,16 @@
 //! --fix [--interactive]) on one check matrix.
 //!
 //! Spec: `docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md` §2.
-//!
-//! Coexists with `crate::doctor_cmd` (the legacy implementation)
-//! until Task 12 deletes it.
 
 pub mod check;
 pub mod checks;
+pub mod fix;
 pub mod format;
 
-pub use check::{CheckId, CheckResult, CheckStatus, DoctorEnv, FixAction};
+pub use check::{CheckResult, CheckStatus, FixAction};
+
+#[cfg(test)]
+use check::CheckId;
 
 use serde::{Deserialize, Serialize};
 
