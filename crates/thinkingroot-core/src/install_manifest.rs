@@ -66,9 +66,99 @@ pub struct InstallManifest {
     pub setup_complete_at: Option<DateTime<Utc>>,
 }
 
+/// All errors the manifest can produce. `#[non_exhaustive]` so we
+/// can add variants in later slices without breaking match arms in
+/// downstream crates.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ManifestError {
+    #[error("config directory unavailable (HOME unset?)")]
+    NoConfigDir,
+    #[error("manifest schema version {found} is newer than this binary supports ({supported})")]
+    IncompatibleSchema { found: u32, supported: u32 },
+    #[error("manifest I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("manifest parse error: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("checksum mismatch for {path}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        path: std::path::PathBuf,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl InstallManifest {
+    /// Canonical on-disk path. Honours `XDG_CONFIG_HOME` on
+    /// Linux/macOS and `APPDATA` on Windows via `dirs::config_dir`,
+    /// matching `cortex::lock_path` exactly.
+    pub fn path() -> Result<PathBuf, ManifestError> {
+        let config_dir = dirs::config_dir().ok_or(ManifestError::NoConfigDir)?;
+        Ok(config_dir.join("thinkingroot").join("install-manifest.json"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RAII helper that points `dirs::config_dir()` at a fresh
+    /// tempdir on Linux/macOS/Windows by setting all three env vars
+    /// (`XDG_CONFIG_HOME`, `HOME`, `APPDATA`) on construct and
+    /// restoring them on drop. Mirrors `cortex.rs::ConfigDirOverride`.
+    struct ConfigDirOverride {
+        _tmp: tempfile::TempDir,
+        prev_xdg: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_appdata: Option<std::ffi::OsString>,
+    }
+
+    impl ConfigDirOverride {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+            let prev_home = std::env::var_os("HOME");
+            let prev_appdata = std::env::var_os("APPDATA");
+            // SAFETY: tests do not run in parallel within this binary
+            // (cargo's default test isolation per-binary), and the
+            // Drop impl below restores the previous values.
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+                std::env::set_var("HOME", tmp.path());
+                std::env::set_var("APPDATA", tmp.path());
+            }
+            Self {
+                _tmp: tmp,
+                prev_xdg,
+                prev_home,
+                prev_appdata,
+            }
+        }
+
+        fn tmp_path(&self) -> &std::path::Path {
+            self._tmp.path()
+        }
+    }
+
+    impl Drop for ConfigDirOverride {
+        fn drop(&mut self) {
+            // SAFETY: same as new().
+            unsafe {
+                match self.prev_xdg.take() {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+                match self.prev_home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.prev_appdata.take() {
+                    Some(v) => std::env::set_var("APPDATA", v),
+                    None => std::env::remove_var("APPDATA"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn round_trip_serializes_deterministically() {
@@ -103,5 +193,22 @@ mod tests {
 
         let parsed: InstallManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest, parsed);
+    }
+
+    #[test]
+    fn path_honors_config_dir_override() {
+        let cfg = ConfigDirOverride::new();
+        let tmp_path = cfg.tmp_path().to_path_buf();
+
+        let path = InstallManifest::path().expect("path resolved");
+        assert!(
+            path.starts_with(&tmp_path),
+            "path={path:?}, tmp={tmp_path:?}"
+        );
+        assert_eq!(path.file_name().unwrap(), "install-manifest.json");
+        assert_eq!(
+            path.parent().unwrap().file_name().unwrap(),
+            "thinkingroot"
+        );
     }
 }
