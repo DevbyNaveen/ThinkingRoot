@@ -17,6 +17,7 @@ mod cloud;
 mod compliance_cmd;
 mod cortex_client;
 mod cortex_remote;
+mod doctor;
 mod doctor_cmd;
 mod engram_cmd;
 mod eval_cmd;
