@@ -84,7 +84,56 @@ impl DoctorEnv {
             path_entries,
         })
     }
+
+    /// True if `credentials.toml` declares at least one provider
+    /// API key with a non-empty value OR if any of the canonical
+    /// env vars is set. NEVER returns the values themselves.
+    pub fn has_any_provider_key(&self) -> bool {
+        for k in CREDENTIAL_VARS {
+            if std::env::var_os(k).filter(|v| !v.is_empty()).is_some() {
+                return true;
+            }
+        }
+        let creds_path = self.config_dir.join("credentials.toml");
+        let Ok(bytes) = std::fs::read(&creds_path) else {
+            return false;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.contains("_api_key") || trimmed.contains("_API_KEY") {
+                if let Some(eq) = trimmed.find('=') {
+                    let value_part = trimmed[eq + 1..].trim();
+                    if value_part != "\"\"" && !value_part.is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
+
+/// Provider env-var names recognised at install time. Keep in sync
+/// with `thinkingroot_core::Credentials`. Not exhaustive.
+pub const CREDENTIAL_VARS: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+    "COHERE_API_KEY",
+    "GEMINI_API_KEY",
+    "OLLAMA_HOST",
+    "VLLM_HOST",
+];
 
 #[cfg(test)]
 mod tests {
