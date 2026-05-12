@@ -381,9 +381,17 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
     // `engine_status_changed` Tauri event so Slice D's blocking-panel
     // UI can distinguish "clean stop" (e.g. SIGTERM at app shutdown)
     // from "crashed" (non-zero exit or wait() error) and react.
+    //
+    // Slice F T2: on `crashed`, the watchdog also drives auto-restart
+    // with exponential backoff (0ms, 500ms, 2s, 5s) up to 4 attempts in
+    // a 60s window before surfacing `repair_needed`. State is persisted
+    // at `<config_dir>/thinkingroot/restart-state.json` via the
+    // `thinkingroot_core::restart_state` substrate.
     let app_for_watchdog = app.app_handle().clone();
     let child_arc_for_watchdog = child_arc;
     let watchdog_pid = pid;
+    let watchdog_binary = binary_buf.clone();
+    let watchdog_port = port;
     tokio::spawn(async move {
         // Wait for the child to exit (blocks until process terminates).
         let exit_status = {
@@ -428,23 +436,157 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
             }
         };
 
-        // Clear the sidecar handle so future compiles go in-process.
+        // Clean shutdown: don't auto-restart.  Clear the handle, emit
+        // the clean-stop event, and exit the watchdog.
+        if status_label == "stopped" {
+            {
+                let state = app_for_watchdog.state::<AppState>();
+                let mut guard = state.sidecar.lock().await;
+                *guard = None;
+            }
+            let _ = app_for_watchdog.emit(
+                "engine_status_changed",
+                serde_json::json!({
+                    "status": status_label,
+                    "exit_code": exit_code,
+                }),
+            );
+            return;
+        }
+
+        // ── Slice F T2: crashed → auto-restart with backoff ─────────
+        handle_crash_and_respawn(
+            app_for_watchdog,
+            watchdog_binary,
+            watchdog_port,
+            exit_code,
+        )
+        .await;
+    });
+}
+
+/// Record the crash in `restart-state.json`, consult the backoff
+/// schedule, emit the appropriate `engine_status_changed` event, and
+/// either surface `repair_needed` (cap reached) or sleep + respawn.
+///
+/// Returns a `Pin<Box<dyn Future>>` rather than an opaque `impl Future`
+/// because `spawn_attached`'s watchdog (re-)invokes this helper on every
+/// crash — that's mutual async recursion between two `async fn`s in the
+/// same defining scope, which Rust's opaque-type inference can't resolve
+/// (E0391 "cycle detected"). The explicit boxed-trait-object return type
+/// breaks the type-level recursion.
+///
+/// Spec: `docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md` §7.
+fn handle_crash_and_respawn<R: Runtime>(
+    app: AppHandle<R>,
+    binary: PathBuf,
+    port: u16,
+    exit_code: Option<i32>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        use thinkingroot_core::recovery_log::{self, RecoveryEvent};
+        use thinkingroot_core::restart_state::{RestartState, backoff_for_attempt};
+
+        // Always clear the sidecar handle before deciding what to do next.
+        // A subsequent `spawn_attached` will install a fresh handle.
         {
-            let state = app_for_watchdog.state::<AppState>();
+            let state = app.state::<AppState>();
             let mut guard = state.sidecar.lock().await;
             *guard = None;
         }
 
-        // Emit AFTER the handle is cleared so any UI handler that
-        // queries state in response sees the post-crash truth.
-        let _ = app_for_watchdog.emit(
+        // Load + prune restart state.  Corrupt file → fresh state.
+        let mut restart_state = RestartState::load().unwrap_or_default();
+        restart_state.prune();
+        restart_state.record_crash(exit_code);
+
+        // Cap reached → surface `repair_needed`, do NOT respawn.
+        if restart_state.cap_reached() {
+            let failures = restart_state.recent_failure_count();
+            tracing::error!(
+                attempts = failures,
+                "auto-restart cap reached; surfacing RepairNeeded"
+            );
+            if let Err(e) = restart_state.save() {
+                tracing::warn!(error = %e, "failed to persist restart-state on cap-reached");
+            }
+            let _ = app.emit(
+                "engine_status_changed",
+                serde_json::json!({
+                    "status": "repair_needed",
+                    "failing_check_ids": ["daemon.restart.exhausted"],
+                    "exit_code": exit_code,
+                }),
+            );
+            return;
+        }
+
+        // Under cap → compute backoff, log + emit `restarting`, sleep,
+        // then spawn_attached.  The attempt number is the post-crash
+        // failure count (1 on the first crash, 2 on the second, …) so
+        // the backoff schedule progresses 0ms, 500ms, 2s, 5s.
+        let attempt = restart_state.recent_failure_count();
+        let backoff = backoff_for_attempt(attempt);
+        tracing::info!(
+            attempt,
+            backoff_ms = backoff.as_millis() as u64,
+            "auto-restart scheduled"
+        );
+        let _ = recovery_log::append(&RecoveryEvent::respawn_attempt(attempt as u32, backoff));
+        if let Err(e) = restart_state.save() {
+            tracing::warn!(error = %e, "failed to persist restart-state before respawn");
+        }
+        let _ = app.emit(
             "engine_status_changed",
             serde_json::json!({
-                "status": status_label,
+                "status": "restarting",
+                "attempt": attempt,
+                "backoff_ms": backoff.as_millis() as u64,
                 "exit_code": exit_code,
             }),
         );
-    });
+
+        if backoff.as_millis() > 0 {
+            tokio::time::sleep(backoff).await;
+        }
+
+        // Drive the respawn.  `spawn_attached` installs its own watchdog
+        // which will, on the next crash, call back into this helper —
+        // mutual recursion is fine because the boxed return type breaks
+        // the opaque-type cycle.
+        spawn_attached(&app, &binary, port).await;
+
+        // After spawn_attached returns, the new sidecar is either
+        // healthy (handle installed in state) or failed to come up
+        // (state remains None).  Record the outcome so subsequent
+        // crashes within the 60s window see the right cumulative
+        // failure count.
+        let new_pid = {
+            let state = app.state::<AppState>();
+            let guard = state.sidecar.lock().await;
+            guard.as_ref().and_then(|h| h.pid)
+        };
+
+        // Reload state (the next-crash watchdog may have written more
+        // in the meantime — though that race is rare because it would
+        // require a sub-backoff crash).
+        let mut restart_state = RestartState::load().unwrap_or_default();
+        restart_state.prune();
+        match new_pid {
+            Some(pid) => {
+                restart_state.record_respawn(pid);
+                let _ = recovery_log::append(&RecoveryEvent::respawn_ok(pid));
+                tracing::info!(pid, "auto-restart succeeded");
+            }
+            None => {
+                restart_state.record_spawn_failed();
+                tracing::error!("auto-restart spawn failed; sidecar handle still None");
+            }
+        }
+        if let Err(e) = restart_state.save() {
+            tracing::warn!(error = %e, "failed to persist restart-state after respawn");
+        }
+    })
 }
 
 /// Reap the sidecar on app exit.  Tries a graceful stop first

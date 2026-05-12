@@ -6,6 +6,7 @@ pub mod id;
 pub mod install_manifest;
 pub mod ir;
 pub mod recovery_log;
+pub mod restart_state;
 pub mod resolver;
 pub mod safe_path;
 pub mod structural_registry;
@@ -20,6 +21,10 @@ pub use id::Id;
 pub use install_manifest::{BinaryEntry, BinaryId, InstallManifest};
 pub use recovery_log::{LogError as RecoveryLogError, RecoveryEvent, RecoveryEventKind};
 pub use resolver::{PackResolver, ResolverDescriptor, ResolverError};
+pub use restart_state::{
+    AttemptOutcome, MAX_ATTEMPTS as RESTART_MAX_ATTEMPTS, RestartAttempt, RestartState,
+    RestartStateError, backoff_for_attempt as restart_backoff_for_attempt,
+};
 pub use safe_path::{atomic_write, is_loopback_host, safe_join_under, validate_id};
 pub use structural_registry::{STRUCTURAL_TABLES, StructuralTableSpec};
 pub use types::*;
