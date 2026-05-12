@@ -118,12 +118,11 @@ export interface CommandDef {
   keywords?: string[];
 }
 
-const SURFACE_IDS: Surface[] = ["chats", "brain", "branches", "privacy", "settings", "docs"];
+const SURFACE_IDS: Surface[] = ["chats", "brain", "privacy", "settings", "docs"];
 
 const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   chats: Activity,
   brain: Brain,
-  branches: GitBranch,
   privacy: ShieldCheck,
   settings: SettingsIcon,
   docs: BookOpen,
@@ -132,8 +131,7 @@ const SURFACE_ICONS: Record<Surface, LucideIcon> = {
 const SURFACE_HINT: Partial<Record<Surface, string>> = {
   chats: "⌘1",
   brain: "⌘2",
-  branches: "⌘3",
-  privacy: "⌘4",
+  privacy: "⌘3",
   settings: "⌘,",
 };
 
@@ -189,6 +187,20 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
   const items: CommandDef[] = [
     // ─── Navigate (6) ───
     ...SURFACE_IDS.map(go),
+    {
+      id: "go-compile-branches",
+      label: "Open compile (branches & graph)",
+      group: "Navigate",
+      Icon: GitBranch,
+      keywords: ["branches", "compile", "substrate", "graph", "merge"],
+      run: (c) => {
+        c.setSurface("chats");
+        const app = useApp.getState();
+        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailTab("compile");
+        c.close();
+      },
+    },
 
     // ─── Context ops (11) ───
     {

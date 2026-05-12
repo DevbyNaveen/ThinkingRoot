@@ -10,16 +10,24 @@
  * trusted local content.
  */
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, BookOpen, RefreshCw } from "lucide-react";
+import { AlertTriangle, BookOpen } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import { Button } from "@/components/ui/button";
+import { RefreshIcon } from "@/components/ui/refresh-icon";
 import { useApp } from "@/store/app";
 import { workspaceReadme } from "@/lib/tauri";
 
-export function ReadmeView({ panelMode = false }: { panelMode?: boolean }) {
+export function ReadmeView({
+  panelMode = false,
+  omitOuterToolbar = false,
+}: {
+  panelMode?: boolean;
+  /** When embedded in Files panel, hide the slim meta row (parent supplies chrome). */
+  omitOuterToolbar?: boolean;
+}) {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [content, setContent] = useState<string>("");
   const [loading, setLoading] = useState(false);
@@ -54,7 +62,7 @@ export function ReadmeView({ panelMode = false }: { panelMode?: boolean }) {
 
   return (
     <div className="flex h-full flex-col">
-      {panelMode ? (
+      {panelMode && !omitOuterToolbar ? (
         <div className="flex shrink-0 items-center justify-between border-b border-border/50 px-3 py-1.5">
           <span className="text-[10px] text-muted-foreground">
             {content
@@ -65,14 +73,14 @@ export function ReadmeView({ panelMode = false }: { panelMode?: boolean }) {
             variant="ghost"
             size="icon"
             className="ml-auto h-5 w-5"
-            onClick={load}
+            onClick={() => void load()}
             disabled={loading}
             aria-label="Reload"
           >
-            <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
+            <RefreshIcon className={loading ? "size-3 animate-spin" : "size-3"} />
           </Button>
         </div>
-      ) : (
+      ) : !panelMode ? (
         <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
           <BookOpen className="size-4 text-muted-foreground" />
           <span className="text-sm font-medium">{activeWorkspace}</span>
@@ -82,16 +90,16 @@ export function ReadmeView({ panelMode = false }: { panelMode?: boolean }) {
             variant="ghost"
             size="icon"
             className="ml-auto h-7 w-7"
-            onClick={load}
+            onClick={() => void load()}
             disabled={loading}
             aria-label="Reload"
           >
-            <RefreshCw
+            <RefreshIcon
               className={loading ? "size-3.5 animate-spin" : "size-3.5"}
             />
           </Button>
         </header>
-      )}
+      ) : null}
 
       {error && (
         <div

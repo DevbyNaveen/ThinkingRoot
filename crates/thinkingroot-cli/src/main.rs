@@ -17,7 +17,7 @@ mod cloud;
 mod compliance_cmd;
 mod cortex_client;
 mod cortex_remote;
-mod doctor_cmd;
+mod doctor;
 mod engram_cmd;
 mod eval_cmd;
 mod mcp_config;
@@ -141,23 +141,22 @@ enum Commands {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
     },
-    /// Run a self-check battery against the local install. Probes
-    /// daemon reachability, lockfile sanity, workspace substrate,
-    /// trust-cache freshness, disk headroom, and provider config.
-    /// Pass `--repair` to apply safe fixes (clear stale lockfiles,
-    /// prune orphan tmpfiles, create missing cache dirs). Pass
-    /// `--json` to emit a machine-readable report.
+    /// Diagnose setup + health. Returns structured JSON with
+    /// `--json`; runs interactive fix wizard with `--fix --interactive`;
+    /// runs no-op auto-fix with `--fix`; silences output with `--quiet`.
     Doctor {
-        /// Apply safe-repair actions for each failing check.
-        #[arg(long)]
-        repair: bool,
-        /// Emit a JSON `Report` on stdout instead of human prose.
+        /// Emit machine-readable JSON to stdout.
         #[arg(long)]
         json: bool,
-        /// Fallback host for the daemon reachability probe when no
-        /// lockfile exists.
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Run fix actions for failing checks.
+        #[arg(long)]
+        fix: bool,
+        /// Prompt y/n per fix (no-op without --fix).
+        #[arg(long)]
+        interactive: bool,
+        /// Silence stdout, exit-code only. For `install.sh` tail.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Show unified workspace status (Slice 0).
     ///
@@ -1435,19 +1434,48 @@ async fn async_main() -> anyhow::Result<()> {
             })
             .await?;
         }
-        Some(Commands::Doctor { repair, json, host }) => {
+        Some(Commands::Doctor { json, fix, interactive, quiet }) => {
             // `doctor` is intentionally NOT routed through the cortex
             // — it inspects local state (lockfile, cache, disk) and
             // probes the daemon as one of its checks. Routing would
             // mean "ask the daemon if it's healthy via the daemon"
             // which is circular.
-            let exit_code = doctor_cmd::run_doctor(doctor_cmd::DoctorOpts {
-                repair,
-                json,
-                host,
-            })
-            .await?;
-            std::process::exit(exit_code);
+            let mode = if json {
+                doctor::DoctorMode::Json
+            } else if fix && interactive {
+                doctor::DoctorMode::FixInteractive
+            } else if fix {
+                doctor::DoctorMode::Fix
+            } else if quiet {
+                doctor::DoctorMode::Quiet
+            } else {
+                doctor::DoctorMode::Default
+            };
+            let report = doctor::run_doctor(mode).await?;
+            match mode {
+                doctor::DoctorMode::Json => {
+                    println!("{}", doctor::format::to_json(&report));
+                }
+                doctor::DoctorMode::Quiet => {}
+                doctor::DoctorMode::Fix | doctor::DoctorMode::FixInteractive => {
+                    print!("{}", doctor::format::to_terminal(&report));
+                    let outcomes = doctor::fix::apply_all(
+                        &report.checks,
+                        mode == doctor::DoctorMode::FixInteractive,
+                    );
+                    if outcomes.is_empty() {
+                        eprintln!("no fixable failures.");
+                    } else {
+                        for (check, outcome) in &outcomes {
+                            eprintln!("  {} → {:?}", check.id.0, outcome);
+                        }
+                    }
+                }
+                doctor::DoctorMode::Default => {
+                    print!("{}", doctor::format::to_terminal(&report));
+                }
+            }
+            std::process::exit(report.summary.exit_code());
         }
         Some(Commands::WorkspaceStatus { name, json, watch }) => {
             // The unified workspace-status command always goes through
