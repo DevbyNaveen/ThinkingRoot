@@ -165,12 +165,6 @@ interface AppStore {
   recentCommandIds: string[];
   recordCommand: (id: string) => void;
 
-  // Onboarding overlay
-  onboardingOpen: boolean;
-  setOnboardingOpen: (open: boolean) => void;
-  onboardingDismissed: boolean;
-  setOnboardingDismissed: (dismissed: boolean) => void;
-
   // Slice 9 — Pack export sheet. When non-null, the sheet is open
   // pointing at this workspace. Cleared when the user dismisses.
   packExportTarget: { workspace: string; branch?: string } | null;
@@ -377,11 +371,6 @@ export const useApp = create<AppStore>()(
           ].slice(0, 8),
         })),
 
-      onboardingOpen: false,
-      setOnboardingOpen: (onboardingOpen) => set({ onboardingOpen }),
-      onboardingDismissed: false,
-      setOnboardingDismissed: (onboardingDismissed) => set({ onboardingDismissed }),
-
       packExportTarget: null,
       setPackExportTarget: (packExportTarget) => set({ packExportTarget }),
 
@@ -408,7 +397,6 @@ export const useApp = create<AppStore>()(
         sidebarWidth: s.sidebarWidth,
         trust: s.trust,
         recentCommandIds: s.recentCommandIds,
-        onboardingDismissed: s.onboardingDismissed,
         activeWorkspace: s.activeWorkspace,
       }),
       merge: (persisted, current) => {

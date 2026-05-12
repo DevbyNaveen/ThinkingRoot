@@ -318,48 +318,48 @@ pub fn credentials_remove(args: CredentialRemoveArgs) -> Result<(), String> {
     Ok(())
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Onboarding status
-// ────────────────────────────────────────────────────────────────────
-
-/// First-run summary the wizard reads: do we have at least one provider
-/// keyed, do we have a workspace registered + selected, and where do
-/// these files live so the UI can show the user.
-#[derive(Debug, Serialize, Clone)]
-pub struct OnboardingStatus {
-    pub paths: ConfigPaths,
-    pub has_any_provider_key: bool,
-    pub workspace_count: usize,
-    pub active_workspace: Option<String>,
-    pub missing: Vec<String>,
+/// Whether the user has completed first-run setup, per the install
+/// manifest's `setup_complete_at` field. `Some(ts)` means setup is
+/// done; `None` means the wizard should run on next `repair_needed`.
+#[tauri::command]
+pub fn get_setup_complete_at() -> Result<Option<String>, String> {
+    use thinkingroot_core::install_manifest::InstallManifest;
+    match InstallManifest::load() {
+        Ok(Some(m)) => Ok(m.setup_complete_at.map(|t| t.to_rfc3339())),
+        Ok(None) => Ok(None), // No manifest yet → setup not complete.
+        Err(e) => Err(format!("read install manifest: {e}")),
+    }
 }
 
+/// Mark setup as complete. Writes `setup_complete_at = now()` to the
+/// install manifest. Called by the EngineGate wizard when all
+/// setup-relevant checks have flipped to `ok`.
 #[tauri::command]
-pub fn onboarding_status() -> Result<OnboardingStatus, String> {
-    let creds = Credentials::load().map_err(|e| e.to_string())?;
-    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
+pub fn mark_setup_complete() -> Result<(), String> {
+    use thinkingroot_core::install_manifest::InstallManifest;
 
-    let has_any_provider_key = CREDENTIAL_VARS
-        .iter()
-        .any(|name| creds.get(name).is_some() || env_present(name));
-
-    let mut missing = Vec::new();
-    if !has_any_provider_key {
-        missing.push("provider api key".to_string());
-    }
-    if registry.workspaces.is_empty() {
-        missing.push("workspace".to_string());
-    } else if registry.active.is_none() {
-        missing.push("active workspace".to_string());
-    }
-
-    Ok(OnboardingStatus {
-        paths: config_paths()?,
-        has_any_provider_key,
-        workspace_count: registry.workspaces.len(),
-        active_workspace: registry.active,
-        missing,
-    })
+    // Load-and-rewrite via register_or_update isn't quite right
+    // because the manifest may have zero binaries. Inline the
+    // load → mutate → save pattern, using register_or_update's
+    // sentinel lock indirectly via save().
+    let mut manifest = match InstallManifest::load() {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            // No manifest exists — create a minimal one with just
+            // the setup_complete_at field set.  Slice F's disk-scan
+            // recovery + the desktop's register_desktop_bundle will
+            // populate the binaries[] entries on next launch.
+            InstallManifest {
+                schema_version: thinkingroot_core::install_manifest::SCHEMA_VERSION,
+                binaries: Vec::new(),
+                preferred: None,
+                setup_complete_at: None,
+            }
+        }
+        Err(e) => return Err(format!("read install manifest: {e}")),
+    };
+    manifest.setup_complete_at = Some(chrono::Utc::now());
+    manifest.save().map_err(|e| format!("write install manifest: {e}"))
 }
 
 // ────────────────────────────────────────────────────────────────────

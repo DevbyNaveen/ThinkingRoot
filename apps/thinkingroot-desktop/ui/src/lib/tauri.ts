@@ -160,16 +160,26 @@ export async function credentialsRemove(envVar: string): Promise<void> {
   return invoke<void>("credentials_remove", { args: { env_var: envVar } });
 }
 
-export interface OnboardingStatusRead {
-  paths: ConfigPaths;
-  has_any_provider_key: boolean;
-  workspace_count: number;
-  active_workspace?: string | null;
-  missing: string[];
+// ─── First-run setup (install manifest `setup_complete_at`) ──────────
+//
+// Mirrors `get_setup_complete_at` / `mark_setup_complete` in
+// `apps/.../src-tauri/src/commands/settings.rs`. The wizard variant of
+// `EngineGate` reads the timestamp on mount to decide between the
+// friendly first-launch flow and the standard "engine unavailable"
+// blocking panel; it calls `markSetupComplete()` once all
+// setup-relevant checks turn `ok` (or when the user hits "Skip for
+// now").
+
+/** ISO-8601 timestamp when first-run setup completed, or `null` if
+ *  the user hasn't yet finished the wizard. */
+export async function getSetupCompleteAt(): Promise<string | null> {
+  return invoke<string | null>("get_setup_complete_at");
 }
 
-export async function onboardingStatus(): Promise<OnboardingStatusRead> {
-  return invoke<OnboardingStatusRead>("onboarding_status");
+/** Stamp `setup_complete_at = now()` on the install manifest.
+ *  Idempotent — re-marking is a no-op overwrite. */
+export async function markSetupComplete(): Promise<void> {
+  return invoke<void>("mark_setup_complete");
 }
 
 // ─── Filesystem (file tree on Brain) ─────────────────────────────────

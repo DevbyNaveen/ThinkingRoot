@@ -5,11 +5,10 @@ import { MainPane } from "@/components/shell/MainPane";
 import { RightRail } from "@/components/shell/RightRail";
 import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ToastStack } from "@/components/ui/toast-stack";
-import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
 import { EngineGate } from "@/components/engine/EngineGate";
-import { onTrFileOpened, onboardingStatus, onWorkspaceCompileProgress } from "@/lib/tauri";
+import { onTrFileOpened, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 import { refreshBrainSnapshotCache } from "@/store/brain-cache";
 
@@ -30,10 +29,6 @@ import { refreshBrainSnapshotCache } from "@/store/brain-cache";
  */
 export default function App() {
   const theme = useApp((s) => s.theme);
-  const onboardingOpen = useApp((s) => s.onboardingOpen);
-  const setOnboardingOpen = useApp((s) => s.setOnboardingOpen);
-  const onboardingDismissed = useApp((s) => s.onboardingDismissed);
-  const setOnboardingDismissed = useApp((s) => s.setOnboardingDismissed);
   const setCompileProgress = useApp((s) => s.setCompileProgress);
   const setCompileRootPath = useApp((s) => s.setCompileRootPath);
   const activeWorkspace = useApp((s) => s.activeWorkspace);
@@ -86,27 +81,6 @@ export default function App() {
     };
   }, []);
 
-  // First-launch detection — open the wizard if no provider key is
-  // configured and the user hasn't already skipped it.
-  useEffect(() => {
-    if (onboardingDismissed) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const status = await onboardingStatus();
-        if (cancelled) return;
-        if (!status.has_any_provider_key) {
-          setOnboardingOpen(true);
-        }
-      } catch {
-        // Tauri may not be available in test renderers — ignore.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [onboardingDismissed, setOnboardingOpen]);
-
   // Re-apply theme on mount so the <html data-theme> attribute is
   // hydrated from persisted store even on first paint.
   useEffect(() => {
@@ -130,17 +104,6 @@ export default function App() {
           </div>
         </div>
         <CommandPalette />
-        <OnboardingWizard
-          open={onboardingOpen}
-          onComplete={() => {
-            setOnboardingOpen(false);
-            setOnboardingDismissed(true);
-          }}
-          onSkip={() => {
-            setOnboardingOpen(false);
-            setOnboardingDismissed(true);
-          }}
-        />
         <InstallTrSheet
           path={installTrPath}
           onClose={() => setInstallTrPath(null)}
