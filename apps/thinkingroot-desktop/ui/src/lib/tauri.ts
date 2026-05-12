@@ -320,6 +320,31 @@ export async function sidecarRestart(): Promise<string> {
   return invoke<string>("sidecar_restart");
 }
 
+// ─── Watchdog circuit breaker (Slice F T2/T3) ────────────────────────
+//
+// Mirrors the Tauri commands added in
+// `apps/.../src-tauri/src/agent_runtime_subprocess.rs` (T3). The
+// watchdog auto-restarts the daemon with exponential backoff; if it
+// trips the breaker (too many consecutive failures), the engine
+// surfaces a `daemon.restart.exhausted` doctor row and the UI offers a
+// manual reset button. `until_rfc3339` is null when the breaker is not
+// active.
+
+export interface CircuitBreakerStatus {
+  active: boolean;
+  until_rfc3339: string | null;
+  recent_failure_count: number;
+  recent_crash_signal_count: number;
+}
+
+export async function getCircuitBreakerStatus(): Promise<CircuitBreakerStatus> {
+  return invoke<CircuitBreakerStatus>("get_circuit_breaker_status");
+}
+
+export async function resetCircuitBreaker(): Promise<void> {
+  return invoke<void>("reset_circuit_breaker");
+}
+
 // ─── Privacy dashboard ───────────────────────────────────────────────
 
 export interface PrivacySource {
