@@ -294,13 +294,7 @@ impl BinaryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialise env-mutating tests within this binary so they don't
-    /// trample each other. Mirrors `cortex.rs::ENV_GUARD`. Without
-    /// this, `cargo test`'s default parallel execution would let one
-    /// test observe another's mid-flight env state.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
+    use crate::test_util::ENV_GUARD;
 
     /// RAII helper that points `dirs::config_dir()` at a fresh
     /// tempdir on Linux/macOS/Windows by setting all three env vars

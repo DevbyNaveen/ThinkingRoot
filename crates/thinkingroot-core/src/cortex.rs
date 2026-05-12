@@ -389,12 +389,7 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Tests share `XDG_CONFIG_HOME` overrides that mutate process
-    /// state; serialise via this mutex so they don't trample each
-    /// other when run in parallel by `cargo test`.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
+    use crate::test_util::ENV_GUARD;
 
     /// Override the config dir to a tempdir for the duration of the
     /// test. Restores the original on drop. Acquires the env guard
