@@ -203,12 +203,12 @@ pub async fn run_mount(
         ),
         EngineConnection::Stdio => bail!("MCP-stdio mode is not a mount target"),
         EngineConnection::SpawnRequired { .. } => {
-            // Slice C T5/T6 wires this — for now the variant is constructed
-            // only by the new resolve_engine paths under development.
-            unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+            unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
         }
-        EngineConnection::RepairNeeded { .. } => {
-            unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+        EngineConnection::RepairNeeded { failing_check_ids } => {
+            bail!(
+                "ThinkingRoot engine cannot start: missing {failing_check_ids:?}. Run `root doctor --fix` to repair."
+            );
         }
     };
 

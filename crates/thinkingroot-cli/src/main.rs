@@ -1260,12 +1260,15 @@ async fn try_resolve_remote(
         Ok(conn @ EngineConnection::Remote { .. }) => Some(conn),
         Ok(EngineConnection::InProcess) | Ok(EngineConnection::Stdio) => None,
         Ok(EngineConnection::SpawnRequired { .. }) => {
-            // Slice C T5/T6 wires this — for now the variant is constructed
-            // only by the new resolve_engine paths under development.
-            unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+            unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
         }
-        Ok(EngineConnection::RepairNeeded { .. }) => {
-            unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+        Ok(EngineConnection::RepairNeeded { failing_check_ids }) => {
+            eprintln!("error: ThinkingRoot engine cannot start.\n");
+            for id in &failing_check_ids {
+                eprintln!("  ✗ {id}");
+            }
+            eprintln!("\nRun `root doctor --fix` to repair, or `root doctor --json` for details.");
+            std::process::exit(1);
         }
         Err(e) => {
             tracing::warn!(

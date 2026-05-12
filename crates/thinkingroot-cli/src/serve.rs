@@ -170,12 +170,12 @@ pub async fn run_serve(
                 unreachable!("Stdio connection only returned for McpStdio intent");
             }
             Ok(cortex::EngineConnection::SpawnRequired { .. }) => {
-                // Slice C T5/T6 wires this — for now the variant is constructed
-                // only by the new resolve_engine paths under development.
-                unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+                unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
             }
-            Ok(cortex::EngineConnection::RepairNeeded { .. }) => {
-                unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+            Ok(cortex::EngineConnection::RepairNeeded { failing_check_ids }) => {
+                anyhow::bail!(
+                    "ThinkingRoot engine cannot start: missing {failing_check_ids:?}. Run `root doctor --fix` to repair."
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cortex resolve failed; falling back to direct bind");
