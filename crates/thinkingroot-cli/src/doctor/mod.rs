@@ -9,6 +9,7 @@
 
 pub mod check;
 pub mod checks;
+pub mod format;
 
 pub use check::{CheckId, CheckResult, CheckStatus, DoctorEnv, FixAction};
 
