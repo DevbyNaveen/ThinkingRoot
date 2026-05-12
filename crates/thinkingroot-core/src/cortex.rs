@@ -126,6 +126,101 @@ pub enum EngineConnection {
     Stdio,
 }
 
+/// Outcome of probing the daemon's `/livez` endpoint. Used by
+/// `decide()` to disambiguate "lock says daemon is here but it's
+/// actually dead" from "lock says daemon is here and it's serving."
+///
+/// Caller fills this in by running an async probe (e.g. via
+/// `thinkingroot-cortex-async::probe_livez`) BEFORE calling
+/// `decide()` — the decision function itself is sync and never
+/// touches the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// `/livez` returned 2xx within the timeout. `version` is the
+    /// daemon's reported version (from `/api/v1/version` or
+    /// `/livez` if it carries it).
+    Healthy { version: String },
+    /// `/livez` returned but daemon is degraded (e.g. workspace
+    /// mount errors). `warnings` carries the daemon's structured
+    /// degradation reasons. Still treated as "attach" by
+    /// `decide()` — degraded is not stale.
+    Degraded { version: String, warnings: Vec<String> },
+    /// `/livez` failed to respond, returned non-2xx, or hit the
+    /// timeout. The lockfile-claimed daemon is dead or wedged.
+    Unhealthy,
+    /// Caller did not probe (e.g. no lockfile exists, so there's
+    /// nothing to probe). Distinct from `Unhealthy` so `decide()`
+    /// can correctly choose "Spawn" vs "RepairNeeded".
+    NotProbed,
+}
+
+/// All facts `decide()` consumes. Caller assembles this struct
+/// from sync filesystem reads (`read_lock`, `process_alive`,
+/// `InstallManifest::load`) plus one async probe.
+///
+/// Everything in here is owned by the caller — `decide` takes
+/// `&self` semantics conceptually but the function consumes by
+/// value to keep ownership clean across the async/sync boundary.
+#[derive(Debug, Clone)]
+pub struct DecisionInputs {
+    /// Why the caller wants an engine.
+    pub intent: EngineIntent,
+    /// Current `cortex.lock` contents, or `None` if file is
+    /// absent / corrupt (corrupt = treated as absent per
+    /// `read_lock`'s contract).
+    pub lock: Option<CortexLock>,
+    /// `sysinfo::process_alive(lock.pid)` if lock is present.
+    /// `false` when lock is None.
+    pub lock_pid_alive: bool,
+    /// Outcome of probing the lockfile's host:port/livez. Caller
+    /// MUST set this to `ProbeResult::NotProbed` when no lock
+    /// exists.
+    pub probe_result: ProbeResult,
+    /// Path to the preferred install-manifest binary, if the
+    /// manifest exists AND its preferred entry exists on disk.
+    /// `None` triggers `Decision::RepairNeeded` for spawn intents.
+    pub manifest_preferred_binary: Option<std::path::PathBuf>,
+    /// True if `--in-process` global flag was passed. Forces
+    /// `Decision::InProcess` regardless of other inputs (escape
+    /// hatch for hermetic CI / air-gapped scenarios).
+    pub in_process_flag: bool,
+}
+
+/// What `decide()` says to do. Caller maps to its own connection
+/// type (`EngineConnection` for CLI, or with `SpawnRequired` for
+/// desktop's attached-spawn flow added in T3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Healthy daemon found — caller should attach via HTTP.
+    Attach {
+        host: String,
+        port: u16,
+        /// Version reported by `/livez`. Caller validates against
+        /// its own `CARGO_PKG_VERSION` and refuses on skew (desktop
+        /// case). CLI may attach across versions in practice but
+        /// the desktop is stricter.
+        version: String,
+    },
+    /// No healthy daemon. Caller should spawn the given binary on
+    /// the given host:port, then re-probe. CLI spawns detached;
+    /// desktop re-routes via `SpawnRequired` to keep Child handle.
+    Spawn {
+        binary_path: std::path::PathBuf,
+        port: u16,
+        host: String,
+    },
+    /// Caller is `root serve` and no daemon exists — caller
+    /// becomes the daemon. Also reachable via `--in-process`.
+    InProcess,
+    /// `intent == McpStdio`. Cortex bypassed.
+    Stdio,
+    /// Cannot proceed — install-side prerequisites are missing.
+    /// `failing_check_ids` carries `root doctor` check IDs that
+    /// the caller surfaces (CLI: exit non-zero with these in the
+    /// error message; desktop: render blocking panel).
+    RepairNeeded { failing_check_ids: Vec<String> },
+}
+
 /// On-disk lockfile shape. JSON-encoded for human inspectability and
 /// compatibility with non-Rust tooling (a future Python SDK reader
 /// only needs `json.load`).
@@ -648,5 +743,48 @@ mod tests {
             second.contains("\"schema_version\""),
             "expected schema_version on second line, got: {second}"
         );
+    }
+
+    #[test]
+    fn decision_serializable_roundtrip() {
+        // Sanity check the Decision enum can serialize for debug logs.
+        // (Decision is NOT a wire type — but Debug must work for tracing.)
+        let d = Decision::Attach {
+            host: "127.0.0.1".to_string(),
+            port: 31760,
+            version: "0.9.1".to_string(),
+        };
+        let repr = format!("{:?}", d);
+        assert!(repr.contains("Attach"), "got: {repr}");
+    }
+
+    #[test]
+    fn decision_repair_needed_carries_failing_checks() {
+        let d = Decision::RepairNeeded {
+            failing_check_ids: vec![
+                "binary.cli.installed".to_string(),
+                "config.dir.writable".to_string(),
+            ],
+        };
+        let repr = format!("{:?}", d);
+        assert!(repr.contains("binary.cli.installed"), "got: {repr}");
+    }
+
+    #[test]
+    fn probe_result_default_is_not_probed() {
+        let p = ProbeResult::NotProbed;
+        assert!(matches!(p, ProbeResult::NotProbed));
+    }
+
+    #[test]
+    fn decision_inputs_can_be_constructed() {
+        let _inputs = DecisionInputs {
+            intent: EngineIntent::Command,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: ProbeResult::NotProbed,
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        };
     }
 }
