@@ -12,6 +12,7 @@ mod agent_runtime_subprocess;
 mod commands;
 mod config;
 mod cortex_bridge;
+mod install_manifest_bridge;
 mod state;
 mod tray;
 
@@ -56,6 +57,13 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 commands::playground::ensure_playground_at_boot(&handle).await;
             });
+
+            // Register this desktop bundle in the install manifest
+            // (idempotent — safe every launch).  Sync — fast enough
+            // (one BLAKE3 over the bundled binary plus a JSON
+            // round-trip) to do before the user can open any
+            // engine surface.  Failures are logged + swallowed.
+            install_manifest_bridge::register_desktop_bundle(app.handle());
 
             Ok(())
         })
