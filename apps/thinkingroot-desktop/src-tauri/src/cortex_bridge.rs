@@ -63,6 +63,15 @@ pub enum BridgeError {
 /// `EngineConnection::RepairNeeded` with `daemon.version.match` as
 /// the failing check id rather than attaching.
 pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, BridgeError> {
+    // Dev escape hatch: THINKINGROOT_FORCE_IN_PROCESS=1 short-circuits
+    // to InProcess without any filesystem or network probes. Mirrors
+    // the CLI's `--in-process` global flag for the desktop dev loop
+    // where `pnpm tauri dev` runs without a bundled sidecar.
+    if std::env::var("THINKINGROOT_FORCE_IN_PROCESS").as_deref() == Ok("1") {
+        tracing::info!("THINKINGROOT_FORCE_IN_PROCESS=1 — resolving as InProcess");
+        return Ok(EngineConnection::InProcess);
+    }
+
     // 1. Gather inputs synchronously.
     let lock = cortex_core::read_lock()?;
     let lock_pid_alive = lock
