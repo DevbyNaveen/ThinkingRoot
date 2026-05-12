@@ -3,9 +3,8 @@
  *
  * Tab bar (top, icon-only):
  *   Hammer  → Compile   (workspace card + live compile progress + branch graph)
- *   FolderTree → Files   (README + project tree, preview, pack export)
+ *   FolderTree → Workspace (readme + folder tree in one panel; readme default)
  *   Glyph   → Knowledge (BrainView in panel mode)
- *   Code2   → Builders  (workspace backend connect surface)
  *   Globe2  → Browser   (manual web browser)
  *   Terminal → Terminal (PTY shells)
  *   ShieldCheck → Privacy (PrivacyDashboard in panel mode)
@@ -24,7 +23,6 @@ import {
   AlertCircle,
   Loader2,
   Square,
-  Code2,
   FolderTree,
   Package,
   Globe2,
@@ -42,7 +40,6 @@ import { WorkspaceFilesPanel } from "@/components/shell/WorkspaceFilesPanel";
 import { BranchResolutionRiver } from "@/components/shell/CompileBranchPipeline";
 import { BrowserPanel } from "@/components/browser/BrowserPanel";
 import { TerminalPanel } from "@/components/terminal/TerminalPanel";
-import { BuildersPanel } from "@/components/builders/BuildersPanel";
 import {
   workspaceCompile,
   workspaceCompileStop,
@@ -66,9 +63,8 @@ const DEFAULT_WIDTH = 450;
 
 const TABS: { id: RightRailTab; Icon: React.ElementType; label: string }[] = [
   { id: "compile", Icon: Hammer, label: "Compile" },
-  { id: "files", Icon: FolderTree, label: "Files" },
+  { id: "files", Icon: FolderTree, label: "Workspace" },
   { id: "brain", Icon: ThinkingRootGlyph, label: "Knowledge" },
-  { id: "builders", Icon: Code2, label: "Builders" },
   { id: "browser", Icon: Globe2, label: "Browser" },
   { id: "terminal", Icon: TerminalIcon, label: "Terminal" },
   { id: "privacy", Icon: ShieldCheck, label: "Privacy" },
@@ -225,9 +221,6 @@ export function RightRail() {
         >
           <BrainView panelMode isVisible={activeTab === "brain"} />
         </div>
-        {activeTab === "builders" && (
-          <BuildersPanel activeWorkspace={activeWorkspace} />
-        )}
         {activeTab === "privacy" && (
           <div className="flex-1 overflow-hidden">
             <PrivacyDashboard />

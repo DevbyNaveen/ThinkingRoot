@@ -31,6 +31,7 @@ import {
   FileSearch,
   FileText,
   FolderPlus,
+  FolderTree,
   GitBranch,
   GitFork,
   Globe,
@@ -330,15 +331,30 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       },
     },
     {
-      id: "builders-open",
-      label: "Open builders backend panel",
+      id: "readme-open",
+      label: "Open workspace readme",
       group: "Tools",
-      Icon: Code2,
-      keywords: ["builders", "backend", "sdk", "api", "mcp", "rest", "lovable", "cursor"],
+      Icon: BookOpen,
+      keywords: ["readme", "markdown", "overview", "docs", "workspace"],
       run: (c) => {
         const app = useApp.getState();
         if (!app.rightRailOpen) app.toggleRightRail();
-        app.setRightRailTab("builders");
+        app.setRightRailTab("files");
+        app.setWorkspaceInspectorPage("readme");
+        c.close();
+      },
+    },
+    {
+      id: "workspace-folder-open",
+      label: "Open workspace folder tree",
+      group: "Tools",
+      Icon: FolderTree,
+      keywords: ["files", "folder", "tree", "explorer", "browse", "workspace"],
+      run: (c) => {
+        const app = useApp.getState();
+        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailTab("files");
+        app.setWorkspaceInspectorPage("folder");
         c.close();
       },
     },

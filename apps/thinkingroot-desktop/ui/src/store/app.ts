@@ -11,6 +11,7 @@ import type {
   Surface,
   Theme,
   TrustFilter,
+  WorkspaceInspectorPage,
 } from "@/types";
 import {
   SIDEBAR_MAX_WIDTH,
@@ -21,18 +22,26 @@ const VALID_RAIL_TABS: RightRailTab[] = [
   "compile",
   "files",
   "brain",
-  "builders",
   "browser",
   "privacy",
   "terminal",
 ];
 
 function normalizeRightRailTab(tab: unknown): RightRailTab {
-  if (tab === "readme" || tab === "branches") return tab === "readme" ? "files" : "compile";
+  if (tab === "readme") return "files";
+  if (tab === "branches") return "compile";
+  if (tab === "builders") return "compile";
   if (typeof tab === "string" && (VALID_RAIL_TABS as string[]).includes(tab)) {
     return tab as RightRailTab;
   }
   return "compile";
+}
+
+function normalizeWorkspaceInspectorPage(
+  p: unknown,
+): WorkspaceInspectorPage {
+  if (p === "readme" || p === "folder") return p;
+  return "readme";
 }
 
 function normalizeSurface(surface: unknown): Surface {
@@ -82,6 +91,9 @@ interface AppStore {
   toggleRightRail: () => void;
   rightRailTab: RightRailTab;
   setRightRailTab: (tab: RightRailTab) => void;
+  /** Readme vs folder tree inside the Workspace right-rail tab. */
+  workspaceInspectorPage: WorkspaceInspectorPage;
+  setWorkspaceInspectorPage: (p: WorkspaceInspectorPage) => void;
   rightRailWidth: number;
   setRightRailWidth: (w: number) => void;
   sidebarWidth: number;
@@ -210,6 +222,12 @@ export const useApp = create<AppStore>()(
       rightRailTab: "compile",
       setRightRailTab: (rightRailTab) =>
         set({ rightRailTab: normalizeRightRailTab(rightRailTab) }),
+      workspaceInspectorPage: "readme",
+      setWorkspaceInspectorPage: (workspaceInspectorPage) =>
+        set({
+          workspaceInspectorPage:
+            normalizeWorkspaceInspectorPage(workspaceInspectorPage),
+        }),
       rightRailWidth: 450,
       setRightRailWidth: (rightRailWidth) => set({ rightRailWidth }),
       sidebarWidth: 232,
@@ -385,6 +403,7 @@ export const useApp = create<AppStore>()(
         sidebarOpen: s.sidebarOpen,
         rightRailOpen: s.rightRailOpen,
         rightRailTab: s.rightRailTab,
+        workspaceInspectorPage: s.workspaceInspectorPage,
         rightRailWidth: s.rightRailWidth,
         sidebarWidth: s.sidebarWidth,
         trust: s.trust,
@@ -399,6 +418,9 @@ export const useApp = create<AppStore>()(
             : {};
         const merged: AppStore = { ...current, ...p };
         merged.rightRailTab = normalizeRightRailTab(merged.rightRailTab);
+        merged.workspaceInspectorPage = normalizeWorkspaceInspectorPage(
+          merged.workspaceInspectorPage,
+        );
         merged.surface = normalizeSurface(merged.surface);
         return merged;
       },

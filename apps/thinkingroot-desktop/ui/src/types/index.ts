@@ -15,10 +15,12 @@ export type RightRailTab =
   | "compile"
   | "files"
   | "brain"
-  | "builders"
   | "browser"
   | "privacy"
   | "terminal";
+
+/** Sub-page inside the right-rail Workspace (files) inspector — readme first, folder tree second. */
+export type WorkspaceInspectorPage = "readme" | "folder";
 
 /** Surfaces in the layout.
  *
