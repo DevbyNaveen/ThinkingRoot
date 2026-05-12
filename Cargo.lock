@@ -6290,6 +6290,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-cortex-async"
+version = "0.9.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thinkingroot-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "thinkingroot-extract"
 version = "0.9.1"
 dependencies = [

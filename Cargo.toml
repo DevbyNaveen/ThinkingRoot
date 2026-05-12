@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/thinkingroot-core",
+    "crates/thinkingroot-cortex-async",
     "crates/thinkingroot-graph",
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
@@ -30,6 +31,7 @@ members = [
 # link it without Python headers.  `cargo check --workspace` still validates it.
 default-members = [
     "crates/thinkingroot-core",
+    "crates/thinkingroot-cortex-async",
     "crates/thinkingroot-graph",
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
