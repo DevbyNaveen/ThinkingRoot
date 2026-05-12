@@ -4,7 +4,7 @@
  * Tab bar (top, icon-only):
  *   Hammer  → Compile   (workspace card + live compile progress + branch graph)
  *   FolderTree → Workspace (readme + folder tree in one panel; readme default)
- *   Glyph   → Knowledge (BrainView in panel mode)
+ *   KnowledgeMark → Knowledge (custom substrate glyph, not Lucide stock)
  *   Globe2  → Browser   (manual web browser)
  *   Terminal → Terminal (PTY shells)
  *   ShieldCheck → Privacy (PrivacyDashboard in panel mode)
@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { ThinkingRootGlyph } from "@/components/shell/ThinkingRootGlyph";
+import { KnowledgeMark } from "@/components/shell/KnowledgeMark";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
@@ -51,6 +51,7 @@ import {
 import {
   pickPrimaryDiagnostic,
   substrateBadge,
+  SUBSTRATE_BADGE_SURFACE_CLASS,
   useWorkspaceConnection,
   useWorkspaceStatus,
   useWorkspaceStatusSubscription,
@@ -64,7 +65,7 @@ const DEFAULT_WIDTH = 450;
 const TABS: { id: RightRailTab; Icon: React.ElementType; label: string }[] = [
   { id: "compile", Icon: Hammer, label: "Compile" },
   { id: "files", Icon: FolderTree, label: "Workspace" },
-  { id: "brain", Icon: ThinkingRootGlyph, label: "Knowledge" },
+  { id: "brain", Icon: KnowledgeMark, label: "Knowledge" },
   { id: "browser", Icon: Globe2, label: "Browser" },
   { id: "terminal", Icon: TerminalIcon, label: "Terminal" },
   { id: "privacy", Icon: ShieldCheck, label: "Privacy" },
@@ -173,7 +174,8 @@ export function RightRail() {
               )}
             >
               <Icon
-                className={id === "brain" ? "size-3.5 opacity-90" : "size-3.5"}
+                className="size-3.5"
+                strokeWidth={activeTab === id ? 2 : 1.5}
               />
             </button>
           ))}
@@ -311,35 +313,19 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
   const badgeTitle = (() => {
     switch (status?.substrate.kind) {
       case "absent":
-        return "No substrate yet — run Compile to initialise.";
+        return "Behind — no substrate yet. Run Compile to initialise.";
       case "empty":
-        return "Substrate exists but has no claims yet — add sources and recompile.";
+        return "Behind — substrate exists but has no claims yet. Add sources and recompile.";
       case "populated":
-        return `Substrate ready — ${status.substrate.claim_count} claim(s), ${status.substrate.entity_count} entity(s).`;
+        return `Up to date — ${status.substrate.claim_count} claim(s), ${status.substrate.entity_count} entity(s).`;
       case "orphaned":
-        return "Substrate was deleted from disk while the daemon held it open.";
+        return "Behind — substrate was removed on disk while the daemon still had it open.";
       case "corrupt":
         return `Substrate refused to open: ${status.substrate.reason}`;
       default:
         return "Loading substrate state…";
     }
   })();
-  const toneClass = (() => {
-    switch (badge.tone) {
-      case "ok":
-        return "bg-emerald-500/15 text-emerald-400";
-      case "warn":
-        return "bg-amber-500/15 text-amber-400";
-      case "error":
-        return "bg-rose-500/15 text-rose-400";
-      case "info":
-        return "bg-sky-500/15 text-sky-400";
-      case "muted":
-      default:
-        return "bg-muted/40 text-muted-foreground";
-    }
-  })();
-
   return (
     <section className="flex flex-col gap-3.5">
       <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
@@ -350,8 +336,8 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         <span className="truncate font-medium">{activeWorkspace}</span>
         <span
           className={cn(
-            "ml-auto rounded-full px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider",
-            toneClass,
+            "ml-auto px-2 py-0.5 font-mono text-[9px] tracking-wide normal-case",
+            SUBSTRATE_BADGE_SURFACE_CLASS,
           )}
           title={badgeTitle}
         >
@@ -384,12 +370,13 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           {w.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
         </p>
       )}
-      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+      <div className="flex flex-wrap items-center gap-1 border-t border-border/35 pt-3">
         <Button
-          variant="outline"
+          variant="secondary"
           size="sm"
-          className="h-8 min-w-[160px] gap-1.5 rounded-xl border-border/70 bg-background/40 px-3 text-xs hover:bg-muted/40"
+          className="h-8 shrink-0 gap-1.5 px-3 text-xs font-medium shadow-none"
           disabled={busy}
+          title={compileButtonLabel}
           onClick={async () => {
             setBusy(true);
             try {
@@ -408,28 +395,36 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
             }
           }}
         >
-          <Hammer className="size-3" />
-          {compileButtonLabel}
+          <Hammer className="size-3.5 opacity-90" />
+          <span className="max-w-[9.5rem] truncate sm:max-w-none">
+            {compileButtonLabel}
+          </span>
         </Button>
+        <span
+          className="hidden h-4 w-px shrink-0 bg-border/60 sm:block"
+          aria-hidden
+        />
         <Button
-          variant="outline"
+          variant="ghost"
           size="sm"
-          className="h-8 gap-1.5 rounded-xl border-border/70 bg-background/40 px-3 text-xs hover:bg-muted/40"
+          className="h-8 shrink-0 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
           type="button"
+          title="Export workspace as .tr pack"
           onClick={() => setPackExportTarget({ workspace: activeWorkspace })}
         >
-          <Package className="size-3" />
+          <Package className="size-3.5 opacity-80" />
           Export .tr
         </Button>
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 gap-1 rounded-xl px-2.5 text-[11px] text-muted-foreground hover:text-foreground"
+          className="h-8 shrink-0 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
           type="button"
+          title="Open readme and folder inspector"
           onClick={() => setRightRailTab("files")}
         >
-          <FolderTree className="size-3.5" />
-          Files
+          <FolderTree className="size-3.5 opacity-80" />
+          Workspace
         </Button>
       </div>
     </section>

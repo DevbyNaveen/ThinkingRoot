@@ -419,22 +419,26 @@ export async function refreshWorkspaceStatus(
 
 // ─── Pure helpers (testable, no React) ───────────────────────────────
 
+/** Neutral chip surface for substrate / readiness labels (no traffic-light fills). */
+export const SUBSTRATE_BADGE_SURFACE_CLASS =
+  "rounded-md border border-border/50 bg-muted/[0.06] font-medium text-muted-foreground/90 shadow-none";
+
 /** Human-readable substrate badge label. UIs render this directly. */
 export function substrateBadge(
   status: WorkspaceStatus | null,
 ): { label: string; tone: "ok" | "info" | "warn" | "error" | "muted" } {
-  if (!status) return { label: "loading", tone: "muted" };
+  if (!status) return { label: "Loading", tone: "muted" };
   switch (status.substrate.kind) {
     case "absent":
-      return { label: "uncompiled", tone: "warn" };
+      return { label: "Behind", tone: "warn" };
     case "empty":
-      return { label: "empty", tone: "warn" };
+      return { label: "Behind", tone: "warn" };
     case "populated":
-      return { label: "ready", tone: "ok" };
+      return { label: "Up to date", tone: "ok" };
     case "orphaned":
-      return { label: "orphan", tone: "error" };
+      return { label: "Behind", tone: "error" };
     case "corrupt":
-      return { label: "corrupt", tone: "error" };
+      return { label: "Corrupt", tone: "error" };
   }
 }
 

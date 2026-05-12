@@ -133,33 +133,28 @@ export function WorkspaceFilesPanel({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 border-b border-border/40 px-2 py-1.5">
-        <div className="flex w-full rounded-lg bg-muted/30 p-0.5">
+      <div
+        className="flex shrink-0 gap-1 border-b border-border/45 px-1"
+        role="tablist"
+        aria-label="Workspace view"
+      >
+        {(["readme", "folder"] as const).map((id) => (
           <button
+            key={id}
             type="button"
+            role="tab"
+            aria-selected={inspectorPage === id}
             className={cn(
-              "flex-1 rounded-md px-2 py-1.5 text-[10px] font-medium transition-colors",
-              inspectorPage === "readme"
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
+              "-mb-px border-b-2 px-3 py-2 text-[11px] font-medium transition-colors",
+              inspectorPage === id
+                ? "border-accent text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground/88",
             )}
-            onClick={() => setInspectorPage("readme")}
+            onClick={() => setInspectorPage(id)}
           >
-            Readme
+            {id === "readme" ? "Readme" : "Folder"}
           </button>
-          <button
-            type="button"
-            className={cn(
-              "flex-1 rounded-md px-2 py-1.5 text-[10px] font-medium transition-colors",
-              inspectorPage === "folder"
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-            onClick={() => setInspectorPage("folder")}
-          >
-            Folder
-          </button>
-        </div>
+        ))}
       </div>
 
       {inspectorPage === "readme" && (
@@ -176,27 +171,34 @@ export function WorkspaceFilesPanel({
 
       {inspectorPage === "folder" && folderReady && (
         <>
-          <div className="flex shrink-0 flex-col gap-2 border-b border-border/40 px-3 py-2.5">
-            <div className="flex rounded-lg bg-muted/30 p-0.5">
+          <div className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/35 px-3 py-1.5">
+            <div
+              className="flex shrink-0 items-center gap-0.5 text-[10px]"
+              role="group"
+              aria-label="Browse scope"
+            >
               <button
                 type="button"
                 className={cn(
-                  "flex-1 rounded-md px-2 py-1.5 text-[10px] font-medium transition-colors",
+                  "rounded px-1 py-0.5 transition-colors",
                   scope === "project"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-foreground"
+                    : "text-muted-foreground hover:text-foreground/85",
                 )}
                 onClick={() => setScope("project")}
               >
                 Project
               </button>
+              <span className="select-none text-muted-foreground/30" aria-hidden>
+                /
+              </span>
               <button
                 type="button"
                 className={cn(
-                  "flex-1 rounded-md px-2 py-1.5 text-[10px] font-medium transition-colors",
+                  "rounded px-1 py-0.5 transition-colors",
                   scope === "thinkingroot"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
+                    ? "font-medium text-foreground"
+                    : "text-muted-foreground hover:text-foreground/85",
                 )}
                 onClick={() => setScope("thinkingroot")}
               >
@@ -204,21 +206,21 @@ export function WorkspaceFilesPanel({
               </button>
             </div>
             <p
-              className="truncate font-mono text-[9px] text-muted-foreground/90"
+              className="min-w-0 flex-1 truncate font-mono text-[9px] text-muted-foreground/80"
               title={treeRoot ?? undefined}
             >
               {(treeRoot as string).replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
             </p>
             <Button
-              variant="outline"
+              variant="ghost"
               size="sm"
-              className="h-8 w-full justify-center gap-1.5 rounded-xl border-border/70 text-xs"
+              className="h-7 shrink-0 gap-1 px-2 text-[10px] font-medium text-muted-foreground hover:text-foreground"
               onClick={() =>
                 setPackExportTarget({ workspace: activeWorkspace as string })
               }
             >
-              <Package className="size-3.5" />
-              Export .tr pack
+              <Package className="size-3 opacity-80" />
+              Export .tr
             </Button>
           </div>
 
@@ -229,9 +231,9 @@ export function WorkspaceFilesPanel({
                 "lg:h-full lg:max-w-[11rem] lg:min-w-[8.75rem] lg:w-[min(28%,11rem)] lg:flex-none lg:border-b-0 lg:border-r",
               )}
             >
-              <div className="flex items-center gap-1.5 border-b border-border/30 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
-                <FolderTree className="size-3" />
-                Files
+              <div className="flex items-center gap-1.5 border-b border-border/25 px-2 py-1 text-[10px] font-medium tracking-tight text-muted-foreground/75">
+                <FolderTree className="size-3 opacity-70" />
+                Tree
               </div>
               <div className="min-h-[140px] flex-1 overflow-y-auto overflow-x-hidden lg:max-h-none">
                 <FileTree
@@ -244,7 +246,7 @@ export function WorkspaceFilesPanel({
             </div>
 
             <div className="flex min-h-[120px] min-w-0 flex-1 flex-col bg-[#1e1e1e]">
-              <div className="border-b border-border/30 bg-muted/10 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+              <div className="border-b border-border/25 bg-muted/[0.06] px-2 py-1 text-[10px] font-medium tracking-tight text-muted-foreground/75">
                 Preview
               </div>
               <div className="min-h-0 min-w-0 flex-1 overflow-auto">

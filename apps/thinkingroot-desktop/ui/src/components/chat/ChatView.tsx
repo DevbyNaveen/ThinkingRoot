@@ -18,15 +18,29 @@
  * (see `crates/desktop/.../commands/chat.rs`); when the engine ships
  * SSE we drop the simulator with no UI change.
  */
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   ArrowUp,
   Square,
   AlertTriangle,
   Hammer,
   Loader2,
+  Plus,
+  FileText,
+  Image as ImageIcon,
+  FolderOpen,
+  ClipboardPaste,
+  Code2,
 } from "lucide-react";
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -1200,6 +1214,292 @@ function MessageBubble({
   );
 }
 
+const DOC_ATTACH_EXTENSIONS = [
+  "md",
+  "txt",
+  "rst",
+  "pdf",
+  "json",
+  "toml",
+  "yaml",
+  "yml",
+  "rs",
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "vue",
+  "svelte",
+  "py",
+  "go",
+  "java",
+  "kt",
+  "kts",
+  "c",
+  "h",
+  "cpp",
+  "hpp",
+  "cc",
+  "cs",
+  "swift",
+  "rb",
+  "php",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "sass",
+  "less",
+  "sql",
+  "sh",
+  "bash",
+  "zsh",
+  "ps1",
+  "xml",
+  "csv",
+  "log",
+];
+
+function formatLlmProviderTag(provider: string | null): string {
+  if (!provider) return "";
+  const k = provider.toLowerCase();
+  const map: Record<string, string> = {
+    anthropic: "Anthropic",
+    openai: "OpenAI",
+    azure: "Azure",
+    google: "Google",
+    gemini: "Google",
+    groq: "Groq",
+    ollama: "Ollama",
+    mistral: "Mistral",
+    deepseek: "DeepSeek",
+  };
+  return map[k] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+function ComposerModelFootnote({
+  health,
+  openSettings,
+}: {
+  health?: LlmHealth | null;
+  openSettings: () => void;
+}) {
+  if (health == null) {
+    return (
+      <span className="shrink-0 text-[10.5px] text-muted-foreground/50">
+        Model…
+      </span>
+    );
+  }
+  const configured = health.configured;
+  const model = health.model?.trim();
+  const provider = health.provider;
+  const label =
+    configured && model
+      ? `${formatLlmProviderTag(provider)} – ${model}`
+      : configured && provider
+        ? formatLlmProviderTag(provider)
+        : null;
+
+  if (label) {
+    return (
+      <div
+        className="max-w-[14rem] shrink truncate text-left text-[10.5px] leading-tight text-muted-foreground/90"
+        title={label}
+      >
+        <span className="font-medium text-muted-foreground">{label}</span>
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={openSettings}
+      className="shrink-0 text-[10.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+    >
+      Configure model
+    </button>
+  );
+}
+
+function firstOpenDialogPath(
+  picked: string | string[] | null,
+): string | null {
+  if (picked == null) return null;
+  if (typeof picked === "string") return picked;
+  return picked[0] ?? null;
+}
+
+function ComposerAttachMenu({
+  disabled,
+  insertText,
+}: {
+  disabled: boolean;
+  insertText: (snippet: string, opts?: { cursorOffset?: number }) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const close = () => setOpen(false);
+
+  const pickPath = async (opts: {
+    directory?: boolean;
+    filters?: { name: string; extensions: string[] }[];
+  }) => {
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: opts.directory ?? false,
+        filters: opts.filters,
+      });
+      const path = firstOpenDialogPath(picked);
+      if (!path) return;
+      insertText(`${path}\n`);
+      close();
+    } catch (e) {
+      toast("Could not open file picker", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const pickImageMarkdown = async () => {
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "webp", "gif", "svg", "heic", "bmp", "tif", "tiff"],
+          },
+        ],
+      });
+      const path = firstOpenDialogPath(picked);
+      if (!path) return;
+      insertText(`![](${path})\n`);
+      close();
+    } catch (e) {
+      toast("Could not open file picker", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const onPasteClipboard = async () => {
+    try {
+      const t = await readText();
+      if (!t?.trim()) {
+        toast("Clipboard is empty", { kind: "info" });
+        return;
+      }
+      insertText(t);
+      close();
+    } catch (e) {
+      toast("Could not read clipboard", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  type RowProps = { icon: ReactNode; label: string; onClick: () => void };
+  const Row = ({ icon, label, onClick }: RowProps) => (
+    <button
+      type="button"
+      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11px] text-foreground/90 hover:bg-surface-elevated"
+      onClick={() => void onClick()}
+    >
+      <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground">
+        {icon}
+      </span>
+      {label}
+    </button>
+  );
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        disabled={disabled}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="h-7 w-7 rounded-md text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Plus className="size-4" />
+      </Button>
+      {open && (
+        <div
+          className="absolute left-0 top-full z-[100] mt-1.5 min-w-[12.5rem] rounded-lg border border-border bg-muted p-1 text-foreground shadow-elevated"
+          role="menu"
+        >
+          <Row
+            icon={<FileText className="size-3.5" />}
+            label="Insert document path…"
+            onClick={() =>
+              void pickPath({
+                filters: [{ name: "Documents & code", extensions: DOC_ATTACH_EXTENSIONS }],
+              })
+            }
+          />
+          <Row
+            icon={<ImageIcon className="size-3.5" />}
+            label="Insert image (markdown)…"
+            onClick={() => void pickImageMarkdown()}
+          />
+          <Row
+            icon={<FileText className="size-3.5 opacity-70" />}
+            label="Insert any file path…"
+            onClick={() => void pickPath({})}
+          />
+          <Row
+            icon={<FolderOpen className="size-3.5" />}
+            label="Insert folder path…"
+            onClick={() => void pickPath({ directory: true })}
+          />
+          <div className="my-1 h-px bg-border" />
+          <Row
+            icon={<ClipboardPaste className="size-3.5" />}
+            label="Paste clipboard text"
+            onClick={() => void onPasteClipboard()}
+          />
+          <Row
+            icon={<Code2 className="size-3.5" />}
+            label="Insert code block"
+            onClick={() => {
+              insertText("```\n\n```", { cursorOffset: 4 });
+              close();
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Composer({
   workspace,
   workspaceRootPath,
@@ -1241,6 +1541,39 @@ function Composer({
   const [busy, setBusy] = useState(false);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textRef = useRef(text);
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
+
+  const openComposerSettings = useCallback(() => {
+    useApp.getState().setSettingsSection("provider");
+    useApp.getState().setSurface("settings");
+  }, []);
+
+  const insertText = useCallback((snippet: string, opts?: { cursorOffset?: number }) => {
+    const el = textareaRef.current;
+    const current = textRef.current;
+    const start = el ? Math.min(el.selectionStart, current.length) : current.length;
+    const end = el ? Math.min(el.selectionEnd, current.length) : current.length;
+    const before = current.slice(0, start);
+    const after = current.slice(end);
+    const needsLead =
+      before.length > 0 && !before.endsWith("\n") && !/^\n/.test(snippet);
+    const lead = needsLead ? "\n" : "";
+    const next = before + lead + snippet + after;
+    setText(next);
+    const cursorPos =
+      start + lead.length + (opts?.cursorOffset ?? snippet.length);
+    requestAnimationFrame(() => {
+      el?.focus();
+      try {
+        el?.setSelectionRange(cursorPos, cursorPos);
+      } catch {
+        /* selection may be invalid while unmounted */
+      }
+    });
+  }, []);
 
   // Slash autocomplete is open whenever the user is typing a /command on
   // the first line and hasn't pressed Esc to dismiss it.
@@ -1314,7 +1647,7 @@ function Composer({
         {/* Floating card — large radius, subtle shadow, gentle border */}
         <div
           className={cn(
-            "group relative flex flex-col border border-border/50 bg-muted/30 shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-shadow",
+            "group relative flex flex-col overflow-visible border border-border/60 bg-surface-elevated shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-shadow",
             isIdleCentered ? "rounded-xl" : "rounded-2xl",
           )}
         >
@@ -1326,16 +1659,13 @@ function Composer({
                 health={health}
                 workspace={workspace}
                 workspaceRootPath={workspaceRootPath}
-                openSettings={() => {
-                  useApp.getState().setSettingsSection("provider");
-                  useApp.getState().setSurface("settings");
-                }}
+                openSettings={openComposerSettings}
               />
             </div>
           )}
 
           {/* Slash autocomplete — anchored to textarea; opens up when composer is at bottom */}
-          <div className="relative w-full">
+          <div className="relative w-full overflow-visible">
             {slashQuery && (
               <SlashAutocomplete
                 query={slashQuery}
@@ -1366,64 +1696,97 @@ function Composer({
                 }
               }}
               className={cn(
-                "w-full resize-none border-0 bg-transparent pl-4 pr-12 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
-                isIdleCentered ? "min-h-[92px] py-6" : "py-2.5",
+                "w-full resize-none border-0 bg-transparent pl-4 pr-4 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
+                isIdleCentered
+                  ? "min-h-[92px] py-5 pb-12"
+                  : "py-2.5 pb-10",
               )}
             />
 
-            {/* Inline action button */}
+            {/* Bottom row: + · model (left) · compile + send (right) */}
             <div
               className={cn(
-                "absolute right-2 flex items-center justify-end",
-                isIdleCentered ? "bottom-2.5" : "bottom-1.5",
+                "absolute inset-x-0 bottom-0 flex items-center gap-2 px-1.5",
+                isIdleCentered ? "pb-2 pt-1" : "pb-1.5 pt-0.5",
               )}
             >
-              {isIdleCentered && compileAction && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={compileAction.busy || disabled}
-                  onClick={() => void compileAction.onRun()}
-                  className="mr-2 h-8 rounded-lg border-border/70 bg-background/40 px-2.5 text-[11px] hover:bg-muted/40"
-                >
-                  {compileAction.busy ? (
-                    <Loader2 className="mr-1 size-3 animate-spin" />
-                  ) : (
-                    <Hammer className="mr-1 size-3" />
-                  )}
-                  {compileAction.busy ? "Compiling..." : compileAction.label}
-                </Button>
-              )}
-              {disabled ? (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={onCancel}
-                  className={cn(
-                    "rounded-full hover:bg-destructive/10 hover:text-destructive",
-                    isIdleCentered ? "h-8 w-8" : "h-7 w-7",
-                  )}
-                >
-                  <Square
-                    className={cn(
-                      "fill-current",
-                      isIdleCentered ? "size-3.5" : "size-3",
+              <ComposerAttachMenu
+                disabled={disabled || busy}
+                insertText={insertText}
+              />
+              <div className="min-w-0 max-w-[min(46vw,15rem)] shrink">
+                <ComposerModelFootnote
+                  health={health}
+                  openSettings={openComposerSettings}
+                />
+              </div>
+              <div className="min-w-0 flex-1" />
+              <div className="flex shrink-0 items-center justify-end gap-2">
+                {isIdleCentered && compileAction && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={compileAction.busy || disabled}
+                    onClick={() => void compileAction.onRun()}
+                    className="hidden h-7 shrink-0 rounded-md border-border/70 bg-muted px-2 text-[10px] hover:bg-muted/80 sm:inline-flex"
+                  >
+                    {compileAction.busy ? (
+                      <Loader2 className="mr-1 size-3 animate-spin" />
+                    ) : (
+                      <Hammer className="mr-1 size-3" />
                     )}
-                  />
-                </Button>
-              ) : (
-                <Button
-                  size="icon"
-                  disabled={!text.trim() || busy}
-                  onClick={() => void send()}
-                  className={cn(
-                    "rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:opacity-30",
-                    isIdleCentered ? "h-8 w-8" : "h-7 w-7",
-                  )}
-                >
-                  <ArrowUp className={cn(isIdleCentered ? "size-4" : "size-3.5")} />
-                </Button>
-              )}
+                    {compileAction.busy ? "…" : compileAction.label}
+                  </Button>
+                )}
+                {isIdleCentered && compileAction && (
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    disabled={compileAction.busy || disabled}
+                    onClick={() => void compileAction.onRun()}
+                    className="inline-flex h-7 w-7 shrink-0 rounded-md border-border/70 bg-muted sm:hidden"
+                    title={compileAction.label}
+                  >
+                    {compileAction.busy ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Hammer className="size-3.5" />
+                    )}
+                  </Button>
+                )}
+                {disabled ? (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={onCancel}
+                    className={cn(
+                      "shrink-0 rounded-full hover:bg-destructive/10 hover:text-destructive",
+                      isIdleCentered ? "h-8 w-8" : "h-7 w-7",
+                    )}
+                  >
+                    <Square
+                      className={cn(
+                        "fill-current",
+                        isIdleCentered ? "size-3.5" : "size-3",
+                      )}
+                    />
+                  </Button>
+                ) : (
+                  <Button
+                    size="icon"
+                    disabled={!text.trim() || busy}
+                    onClick={() => void send()}
+                    className={cn(
+                      "shrink-0 rounded-full bg-foreground text-background shadow-none transition-transform hover:scale-105 active:scale-95 disabled:opacity-30",
+                      isIdleCentered ? "h-8 w-8" : "h-7 w-7",
+                    )}
+                  >
+                    <ArrowUp
+                      className={cn(isIdleCentered ? "size-4" : "size-3.5")}
+                    />
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
         </div>

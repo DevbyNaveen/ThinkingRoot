@@ -32,6 +32,7 @@ import { toast } from "@/store/toast";
 import {
   pickPrimaryDiagnostic,
   substrateBadge,
+  SUBSTRATE_BADGE_SURFACE_CLASS,
   useWorkspaceConnection,
   useWorkspaceStatus,
   useWorkspaceStatusSubscription,
@@ -200,14 +201,8 @@ export function BuildersPanel({
           <StatusPill ok={canExport} label={canExport ? "Export ready" : "Export blocked"} />
           <span
             className={cn(
-              "rounded-full px-2 py-1 text-[10px] font-medium",
-              badge.tone === "ok"
-                ? "bg-emerald-500/15 text-emerald-400"
-                : badge.tone === "warn"
-                  ? "bg-amber-500/15 text-amber-400"
-                  : badge.tone === "error"
-                    ? "bg-rose-500/15 text-rose-400"
-                    : "bg-muted/45 text-muted-foreground",
+              "px-2 py-0.5 font-mono text-[10px] tracking-wide normal-case",
+              SUBSTRATE_BADGE_SURFACE_CLASS,
             )}
           >
             {badge.label}
@@ -389,11 +384,15 @@ function StatusPill({ ok, label }: { ok: boolean; label: string }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] font-medium",
-        ok ? "bg-emerald-500/15 text-emerald-400" : "bg-amber-500/15 text-amber-400",
+        "inline-flex items-center gap-1 px-2 py-0.5 font-mono text-[10px] tracking-wide normal-case",
+        SUBSTRATE_BADGE_SURFACE_CLASS,
       )}
     >
-      {ok ? <CheckCircle2 className="size-3" /> : <AlertCircle className="size-3" />}
+      {ok ? (
+        <CheckCircle2 className="size-3 shrink-0 opacity-60" />
+      ) : (
+        <AlertCircle className="size-3 shrink-0 opacity-60" />
+      )}
       {label}
     </span>
   );
