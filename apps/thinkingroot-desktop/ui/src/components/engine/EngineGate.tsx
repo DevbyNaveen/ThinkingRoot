@@ -1,8 +1,16 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { AlertTriangle, CheckCircle2, Loader2, XCircle } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Circle,
+  Loader2,
+  Sparkles,
+  XCircle,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { getSetupCompleteAt, markSetupComplete } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
 /**
@@ -77,6 +85,10 @@ export function EngineGate({ children }: EngineGateProps) {
   const [reportLoading, setReportLoading] = useState(false);
   const [fixInFlight, setFixInFlight] = useState(false);
   const [bootProbeDone, setBootProbeDone] = useState(false);
+  // `null` = first-run setup not yet complete (wizard eligible).
+  // `string` = ISO-8601 timestamp when the user finished setup; any
+  // future `repair_needed` falls back to the standard panel.
+  const [setupCompleteAt, setSetupCompleteAt] = useState<string | null>(null);
 
   // Hold the latest cancellation flag in a ref so the event listener
   // (which captures it at mount time) can read the live value.
@@ -136,6 +148,18 @@ export function EngineGate({ children }: EngineGateProps) {
   useEffect(() => {
     cancelledRef.current = false;
     let unlistenFn: UnlistenFn | null = null;
+
+    // Load the install-manifest setup-complete timestamp.  We treat a
+    // read failure as "setup not complete" — the wizard surfacing on
+    // a recoverable error is friendlier than the standard panel.
+    getSetupCompleteAt()
+      .then((ts) => {
+        if (!cancelledRef.current) setSetupCompleteAt(ts);
+      })
+      .catch((err) => {
+        console.error("get_setup_complete_at failed:", err);
+        if (!cancelledRef.current) setSetupCompleteAt(null);
+      });
 
     // Subscribe BEFORE the initial probe so we don't miss a crash
     // that happens during boot. `listen()` returns a promise; if we
@@ -199,6 +223,60 @@ export function EngineGate({ children }: EngineGateProps) {
     }
   };
 
+  // First-launch detection. The wizard variant surfaces only when:
+  //   1. The user has never completed setup (`setup_complete_at` is null).
+  //   2. We're in the install-manifest-failure branch (`repair_needed`,
+  //      not a daemon crash — `crashed` always uses the standard panel).
+  //   3. Every failing check is setup-relevant — i.e. `credentials.*`,
+  //      `workspace.*`, or `models.*`. System-level failures
+  //      (`binary.*`, `config.*`, `daemon.*`, `install.*`) escape to
+  //      the standard panel even on first launch because they aren't
+  //      something a friendly wizard can talk the user through.
+  const isWizardVariant = useMemo(() => {
+    if (setupCompleteAt !== null) return false;
+    if (engineStatus !== "repair_needed") return false;
+    if (!doctorReport) return false;
+    const failing = doctorReport.checks.filter((c) => c.status === "fail");
+    if (failing.length === 0) return false;
+    return failing.every(
+      (c) =>
+        c.id.startsWith("credentials.") ||
+        c.id.startsWith("workspace.") ||
+        c.id.startsWith("models."),
+    );
+  }, [setupCompleteAt, engineStatus, doctorReport]);
+
+  // Once setup-relevant checks resolve and we transition to healthy
+  // for the first time, stamp the install manifest so the wizard
+  // never surfaces again. Future failures fall through to the
+  // standard panel.
+  useEffect(() => {
+    if (engineStatus === "healthy" && setupCompleteAt === null) {
+      const now = new Date().toISOString();
+      markSetupComplete()
+        .then(() => {
+          if (!cancelledRef.current) setSetupCompleteAt(now);
+        })
+        .catch((err) => {
+          console.error("mark_setup_complete failed:", err);
+        });
+    }
+  }, [engineStatus, setupCompleteAt]);
+
+  // Wizard escape hatch — "Skip for now" still stamps the manifest so
+  // the standard panel surfaces on subsequent launches if anything
+  // remains broken.
+  const handleSkipWizard = async () => {
+    try {
+      await markSetupComplete();
+    } catch (err) {
+      console.error("mark_setup_complete (skip) failed:", err);
+    }
+    if (cancelledRef.current) return;
+    setSetupCompleteAt(new Date().toISOString());
+    setEngineStatus("healthy");
+  };
+
   // Healthy → render children unmodified.
   if (engineStatus === "healthy") {
     return <>{children}</>;
@@ -215,6 +293,22 @@ export function EngineGate({ children }: EngineGateProps) {
           <span>Starting ThinkingRoot…</span>
         </div>
       </div>
+    );
+  }
+
+  // First-launch wizard variant — friendlier copy, numbered steps,
+  // contextual action buttons. Same data, same handlers; just a
+  // different presentation layer for first-run users.
+  if (isWizardVariant) {
+    return (
+      <WizardPanel
+        report={doctorReport}
+        reportLoading={reportLoading}
+        fixInFlight={fixInFlight}
+        onRecheck={handleRecheck}
+        onFixAll={handleFixAll}
+        onSkip={handleSkipWizard}
+      />
     );
   }
 
@@ -451,4 +545,273 @@ function FixHint({ fix }: { fix: FixAction }) {
       </code>
     </p>
   );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Wizard variant — first-launch onboarding panel
+// ────────────────────────────────────────────────────────────────────
+
+interface WizardPanelProps {
+  report: DoctorReport | null;
+  reportLoading: boolean;
+  fixInFlight: boolean;
+  onRecheck: () => void;
+  onFixAll: () => void;
+  onSkip: () => void;
+}
+
+/** Friendlier first-launch presentation of the same doctor report.
+ *  Surfaces only when `setup_complete_at` is null AND every failing
+ *  check is setup-relevant (credentials / workspace / models). On
+ *  completion the parent stamps the install manifest so subsequent
+ *  failures use the standard panel. */
+function WizardPanel({
+  report,
+  reportLoading,
+  fixInFlight,
+  onRecheck,
+  onFixAll,
+  onSkip,
+}: WizardPanelProps) {
+  // The "steps" of the wizard ARE the setup-relevant rows — failing
+  // ones are active steps, ok rows are checked-off steps, warn /
+  // skipped rows stay informational but visible.  We sort by a stable
+  // family ordering so credentials come before workspaces come before
+  // models — the natural setup arc.
+  const setupChecks = useMemo(() => {
+    if (!report) return [] as CheckResult[];
+    const order = (id: string): number => {
+      if (id.startsWith("credentials.")) return 0;
+      if (id.startsWith("workspace.")) return 1;
+      if (id.startsWith("models.")) return 2;
+      return 3;
+    };
+    return [...report.checks]
+      .filter(
+        (c) =>
+          c.id.startsWith("credentials.") ||
+          c.id.startsWith("workspace.") ||
+          c.id.startsWith("models."),
+      )
+      .sort((a, b) => order(a.id) - order(b.id));
+  }, [report]);
+
+  const failCount = report?.summary.fail ?? 0;
+  const canContinue = failCount === 0;
+
+  // Same fix-availability rule as the standard panel.
+  const hasApplicableFix =
+    report?.checks.some(
+      (c) => c.status === "fail" && c.fix && c.fix.kind === "run-command",
+    ) ?? false;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Welcome to ThinkingRoot"
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-background/95 backdrop-blur-sm"
+    >
+      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-border bg-surface-elevated shadow-elevated">
+        <header className="flex items-start gap-3 border-b border-border px-6 py-5">
+          <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full bg-accent/10">
+            <Sparkles className="size-4 text-accent" aria-hidden />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-base font-medium tracking-tight text-foreground">
+              Welcome to ThinkingRoot
+            </h2>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              Just a couple of quick steps to finish setting up.
+            </p>
+          </div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto px-6 py-5">
+          {reportLoading && !report && (
+            <div className="flex h-32 items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              <span>Getting things ready…</span>
+            </div>
+          )}
+
+          {report && setupChecks.length === 0 && !reportLoading && (
+            <div className="flex items-start gap-2 rounded-md bg-background p-3 text-xs text-muted-foreground">
+              <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-success" />
+              <p>You're all set. Press "Continue" to start using ThinkingRoot.</p>
+            </div>
+          )}
+
+          {report && setupChecks.length > 0 && (
+            <ol className="flex flex-col gap-3">
+              {setupChecks.map((c, idx) => (
+                <WizardStepRow key={c.id} step={idx + 1} check={c} />
+              ))}
+            </ol>
+          )}
+        </div>
+
+        <footer className="flex items-center justify-between gap-2 border-t border-border px-6 py-4">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onSkip}
+            disabled={fixInFlight}
+            className="h-8 text-xs text-muted-foreground hover:text-foreground"
+            title="Skip setup — you can finish later from Settings."
+          >
+            Skip for now
+          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRecheck}
+              disabled={reportLoading || fixInFlight}
+              className="h-8 text-xs"
+            >
+              {reportLoading ? (
+                <>
+                  <Loader2 className="size-3.5 animate-spin" />
+                  Checking…
+                </>
+              ) : (
+                "Re-check"
+              )}
+            </Button>
+            {hasApplicableFix && !canContinue && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onFixAll}
+                disabled={fixInFlight || reportLoading}
+                className="h-8 text-xs"
+              >
+                {fixInFlight ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin" />
+                    Applying fixes…
+                  </>
+                ) : (
+                  "Fix automatically"
+                )}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={onSkip}
+              disabled={!canContinue || fixInFlight}
+              className="h-8 text-xs"
+              title={
+                canContinue
+                  ? "All setup steps complete — start using ThinkingRoot."
+                  : "Resolve the remaining steps to continue."
+              }
+            >
+              Continue
+            </Button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+interface WizardStepRowProps {
+  step: number;
+  check: CheckResult;
+}
+
+/** A single numbered wizard step. Renders one of three states:
+ *  - ok      → checkmark + muted label, "step complete"
+ *  - fail    → numbered circle + action button (label-based — "Add a
+ *              provider key", "Choose a workspace", etc.)
+ *  - warn /
+ *    skipped → numbered circle, no action, informational only. */
+function WizardStepRow({ step, check }: WizardStepRowProps) {
+  const isDone = check.status === "ok";
+  const isFail = check.status === "fail";
+
+  return (
+    <li className="flex items-start gap-3">
+      <div className="mt-0.5 flex size-6 shrink-0 items-center justify-center">
+        {isDone ? (
+          <CheckCircle2 className="size-5 text-success" aria-hidden />
+        ) : isFail ? (
+          <div className="flex size-5 items-center justify-center rounded-full bg-accent/10 text-[11px] font-medium text-accent">
+            {step}
+          </div>
+        ) : (
+          <Circle className="size-5 text-muted-foreground/50" aria-hidden />
+        )}
+      </div>
+      <div className="min-w-0 flex-1 pb-1">
+        <div
+          className={cn(
+            "text-xs font-medium",
+            isDone ? "text-muted-foreground line-through" : "text-foreground",
+          )}
+        >
+          {check.label}
+        </div>
+        {!isDone && (
+          <div className="mt-0.5 break-words text-[11px] leading-relaxed text-muted-foreground">
+            {check.detail}
+          </div>
+        )}
+        {isFail && check.fix && <WizardFixHint check={check} />}
+      </div>
+    </li>
+  );
+}
+
+/** Label-based action prompt for a wizard step. Translates the check
+ *  id family into a user-facing action label without inventing
+ *  capabilities the engine doesn't have — actual remediation still
+ *  goes through the existing fix kinds (shell-hint / run-command /
+ *  fill-in). */
+function WizardFixHint({ check }: { check: CheckResult }) {
+  const fix = check.fix!;
+  const actionLabel = wizardActionLabel(check.id);
+
+  if (fix.kind === "shell-hint") {
+    return (
+      <div className="mt-2 flex flex-col gap-1.5">
+        <div className="text-[11px] font-medium text-foreground">
+          {actionLabel}
+        </div>
+        <pre className="overflow-x-auto rounded border border-border bg-surface px-2 py-1 font-mono text-[11px] leading-relaxed text-foreground">
+          <span className="text-muted-foreground">$ </span>
+          {fix.command}
+        </pre>
+      </div>
+    );
+  }
+  if (fix.kind === "run-command") {
+    return (
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        Click "Fix automatically" below to {actionLabel.toLowerCase()}.
+      </p>
+    );
+  }
+  // fill-in — credential the user must paste in.
+  return (
+    <p className="mt-2 text-[11px] text-muted-foreground">
+      {fix.prompt}{" "}
+      <code className="font-mono text-[11px] text-foreground">
+        ({fix.credential_key})
+      </code>
+    </p>
+  );
+}
+
+/** Map a check id to a friendly action verb. Pure string mapping —
+ *  no engine round-trips, no fabricated state. */
+function wizardActionLabel(id: string): string {
+  if (id.startsWith("credentials.")) return "Add a provider key";
+  if (id === "workspace.active.exists" || id.startsWith("workspace.active."))
+    return "Choose a workspace";
+  if (id.startsWith("workspace.")) return "Set up a workspace";
+  if (id.startsWith("models.")) return "Pick a model";
+  return "Resolve this step";
 }
