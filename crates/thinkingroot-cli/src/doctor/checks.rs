@@ -15,9 +15,11 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
     vec![
         binary_cli_installed(env),
         binary_cli_on_path(env),
+        binary_cli_checksum(env),
         config_dir_writable(env),
         credentials_any_provider(env),
         daemon_lockfile_parseable(env),
+        daemon_restart_exhausted(env),
         workspace_registry_parseable(env),
         workspace_active_exists(env),
         install_manifest_consistent(env),
@@ -646,6 +648,146 @@ pub async fn binary_cli_runnable(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Verify the binary file at the install manifest's preferred entry
+/// matches its recorded BLAKE3 checksum.  Slice F's binary-corruption
+/// auto-repair hooks fire when this returns Warn.
+///
+/// Status:
+/// - `Skipped`: no manifest, or manifest has no entry whose `path`
+///   exists on disk (other binary.* checks handle the absence)
+/// - `Ok`: BLAKE3 matches
+/// - `Warn`: BLAKE3 mismatches (suggests reinstall or tamper)
+pub fn binary_cli_checksum(_env: &DoctorEnv) -> CheckResult {
+    let manifest = match InstallManifest::load() {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.checksum"),
+                label: "Binary BLAKE3 integrity".into(),
+                status: CheckStatus::Skipped,
+                detail: "no install manifest".into(),
+                fix: None,
+            };
+        }
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.checksum"),
+                label: "Binary BLAKE3 integrity".into(),
+                status: CheckStatus::Skipped,
+                detail: format!("manifest read error: {e}"),
+                fix: None,
+            };
+        }
+    };
+
+    // Pick the preferred entry's binary, or the first entry whose
+    // path exists on disk (more lenient).
+    let entry = manifest
+        .preferred
+        .and_then(|id| manifest.binaries.iter().find(|e| e.id == id).cloned())
+        .filter(|e| e.path.exists())
+        .or_else(|| manifest.binaries.iter().find(|e| e.path.exists()).cloned());
+
+    let Some(entry) = entry else {
+        return CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Skipped,
+            detail: "no binary entry in manifest with a path that exists".into(),
+            fix: None,
+        };
+    };
+
+    match entry.verify_checksum() {
+        Ok(()) => CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "{} → {}",
+                entry.path.display(),
+                &entry.checksum_blake3[..entry.checksum_blake3.len().min(12)]
+            ),
+            fix: None,
+        },
+        Err(e) => CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Warn,
+            detail: format!("checksum mismatch: {e}"),
+            fix: Some(FixAction::RunCommand {
+                command: "root reinstall --pinned-version".into(),
+            }),
+        },
+    }
+}
+
+/// Surface the auto-restart subsystem's circuit-breaker state.  When
+/// the breaker is tripped, the daemon won't auto-restart — user
+/// needs to click "Reset and try again" or wait 5min.
+///
+/// Status:
+/// - `Ok`: no recent failures, breaker not tripped
+/// - `Warn`: recent failures present but breaker not yet tripped
+/// - `Fail`: breaker tripped — auto-restart suspended
+pub fn daemon_restart_exhausted(_env: &DoctorEnv) -> CheckResult {
+    use thinkingroot_core::restart_state::RestartState;
+
+    let mut state = match RestartState::load() {
+        Ok(s) => s,
+        Err(_) => {
+            // Corrupt or unreadable restart-state → assume Ok.
+            // Restart state is best-effort observability, not a
+            // correctness gate.
+            return CheckResult {
+                id: CheckId::from_static("daemon.restart.exhausted"),
+                label: "Daemon auto-restart healthy".into(),
+                status: CheckStatus::Ok,
+                detail: "no restart state recorded".into(),
+                fix: None,
+            };
+        }
+    };
+    state.prune();
+
+    if state.breaker_active() {
+        let until = state
+            .circuit_breaker_until
+            .expect("breaker_active implies set");
+        return CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "circuit breaker tripped — auto-restart suspended until {}",
+                until.to_rfc3339()
+            ),
+            fix: Some(FixAction::RunCommand {
+                command: "root doctor --recovery-log".into(),
+            }),
+        };
+    }
+
+    let recent = state.recent_failure_count();
+    if recent == 0 {
+        CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Ok,
+            detail: "no recent failures".into(),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Warn,
+            detail: format!("{} recent failure(s) in last 60s", recent),
+            fix: None,
+        }
+    }
+}
+
 /// Platform-specific fix hint for a binary that can't run.  We pick
 /// the most-likely-relevant fix per OS at compile time.
 fn platform_fix_for_unrunnable(binary: &std::path::Path) -> FixAction {
@@ -1035,5 +1177,98 @@ mod tests {
         assert_eq!(r.status, CheckStatus::Fail);
         #[cfg(not(unix))]
         let _ = r;  // tolerate platform variance
+    }
+
+    #[test]
+    fn binary_cli_checksum_skipped_when_no_manifest() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = binary_cli_checksum(&env);
+        assert_eq!(r.status, CheckStatus::Skipped);
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+        }
+    }
+
+    #[test]
+    fn daemon_restart_exhausted_ok_when_no_state() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("APPDATA", tmp.path());
+        }
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_restart_exhausted(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+            match prev_appdata { Some(v) => std::env::set_var("APPDATA", v), None => std::env::remove_var("APPDATA") }
+        }
+    }
+
+    #[test]
+    fn daemon_restart_exhausted_fail_when_breaker_active() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("APPDATA", tmp.path());
+        }
+
+        // Set up restart state with the breaker tripped.
+        let mut state = thinkingroot_core::restart_state::RestartState::new();
+        state.trip_circuit_breaker();
+        state.save().unwrap();
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_restart_exhausted(&env);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(matches!(r.fix, Some(FixAction::RunCommand { ref command }) if command.contains("doctor")));
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+            match prev_appdata { Some(v) => std::env::set_var("APPDATA", v), None => std::env::remove_var("APPDATA") }
+        }
     }
 }

@@ -36,6 +36,12 @@ tempfile = { workspace = true }
 # (regex::Regex isn't Serialize, so the policy stores raw strings).
 regex = { workspace = true }
 
+[features]
+## Expose `thinkingroot_core::test_util::ENV_GUARD` to dependent
+## crates' test binaries.  Off by default — only test code should
+## opt in via `[dev-dependencies]` with `features = ["test-helpers"]`.
+test-helpers = []
+
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
