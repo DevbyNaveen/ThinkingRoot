@@ -159,11 +159,15 @@ impl InstallManifest {
     ///   silent corruption (Honesty Rule #1).
     pub fn load() -> Result<Option<Self>, ManifestError> {
         let path = Self::path()?;
-        let bytes = match std::fs::read(&path) {
+        Self::load_unlocked(&path)
+    }
+
+    /// Internal — load without acquiring the write lock. Used by
+    /// `register_or_update` which already holds it.
+    fn load_unlocked(path: &std::path::Path) -> Result<Option<Self>, ManifestError> {
+        let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         if bytes.is_empty() {
@@ -194,6 +198,72 @@ impl InstallManifest {
         }
         let manifest: Self = serde_json::from_slice(&bytes)?;
         Ok(Some(manifest))
+    }
+
+    /// Atomically register or update one binary entry. Holds the
+    /// sibling `install-manifest.json.write` lock for the full
+    /// read-modify-write cycle so two writers do not lose updates.
+    ///
+    /// If the manifest doesn't exist yet, creates a fresh one with the
+    /// new entry and `preferred = Some(entry.id)`.
+    ///
+    /// If an entry with the same `id` already exists, replaces it in
+    /// place. `preferred` is left unchanged on update — that's a user
+    /// preference, not an install-side concern.
+    pub fn register_or_update(entry: BinaryEntry) -> Result<(), ManifestError> {
+        let path = Self::path()?;
+        let parent = path
+            .parent()
+            .expect("manifest path always has a parent");
+        std::fs::create_dir_all(parent)?;
+
+        let sentinel_path = parent.join("install-manifest.json.write");
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sentinel_path)?;
+        fs2::FileExt::lock_exclusive(&sentinel)?;
+
+        let mut manifest = match Self::load_unlocked(&path)? {
+            Some(m) => m,
+            None => Self {
+                schema_version: SCHEMA_VERSION,
+                binaries: Vec::new(),
+                preferred: Some(entry.id),
+                setup_complete_at: None,
+            },
+        };
+
+        if let Some(existing) = manifest.binaries.iter_mut().find(|e| e.id == entry.id) {
+            *existing = entry;
+        } else {
+            manifest.binaries.push(entry);
+        }
+
+        // Inline atomic write under the held sentinel lock (do not
+        // call `save()` — it would re-acquire the same lock).
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        let json = serde_json::to_string_pretty(&manifest)?;
+        {
+            use std::io::Write;
+            let mut handle = tmp.as_file().try_clone()?;
+            handle.write_all(json.as_bytes())?;
+            handle.sync_all()?;
+        }
+        tmp.persist(&path)
+            .map_err(|e| ManifestError::Io(e.error))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+
+        let _ = fs2::FileExt::unlock(&sentinel);
+        Ok(())
     }
 }
 
@@ -418,5 +488,59 @@ mod tests {
 
         let result = InstallManifest::load().expect("load() returns Ok for corrupt file");
         assert!(result.is_none(), "corrupt file treated as absent (Slice F rebuilds)");
+    }
+
+    #[test]
+    fn register_or_update_upserts_by_id() {
+        let _cfg = ConfigDirOverride::new();
+
+        // First registration → creates a new entry and sets preferred.
+        let entry = BinaryEntry {
+            id: BinaryId::CliScript,
+            path: std::path::PathBuf::from("/Users/x/.local/bin/root"),
+            version: "0.9.0".into(),
+            installed_at: chrono::Utc::now(),
+            checksum_blake3: "aa".repeat(32),
+        };
+        InstallManifest::register_or_update(entry.clone()).expect("first register");
+        let m = InstallManifest::load().unwrap().unwrap();
+        assert_eq!(m.binaries.len(), 1);
+        assert_eq!(m.binaries[0].version, "0.9.0");
+        assert_eq!(
+            m.preferred,
+            Some(BinaryId::CliScript),
+            "preferred defaults to first-registered entry's id"
+        );
+
+        // Re-registration with same id → replaces in place. No duplicate row.
+        let updated = BinaryEntry {
+            version: "0.9.1".into(),
+            installed_at: chrono::Utc::now(),
+            checksum_blake3: "bb".repeat(32),
+            ..entry.clone()
+        };
+        InstallManifest::register_or_update(updated).expect("upgrade register");
+        let m = InstallManifest::load().unwrap().unwrap();
+        assert_eq!(m.binaries.len(), 1, "no duplicate entry by id");
+        assert_eq!(m.binaries[0].version, "0.9.1");
+
+        // Different id → adds entry, preferred unchanged.
+        let desktop = BinaryEntry {
+            id: BinaryId::DesktopBundle,
+            path: std::path::PathBuf::from(
+                "/Applications/ThinkingRoot.app/Contents/Resources/binaries/thinkingroot-agent-runtime-aarch64-apple-darwin",
+            ),
+            version: "0.9.1".into(),
+            installed_at: chrono::Utc::now(),
+            checksum_blake3: "cc".repeat(32),
+        };
+        InstallManifest::register_or_update(desktop).expect("desktop register");
+        let m = InstallManifest::load().unwrap().unwrap();
+        assert_eq!(m.binaries.len(), 2);
+        assert_eq!(
+            m.preferred,
+            Some(BinaryId::CliScript),
+            "preferred sticky across new registrations"
+        );
     }
 }
