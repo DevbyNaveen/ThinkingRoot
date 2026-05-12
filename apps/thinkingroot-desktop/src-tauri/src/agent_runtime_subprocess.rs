@@ -377,9 +377,13 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
     // Spawn a background watchdog: if the child exits unexpectedly at
     // any point after startup, clear `state.sidecar` so that future
     // compile requests fall back to in-process instead of hitting
-    // "connection refused" against a dead process.
+    // "connection refused" against a dead process. Also emit an
+    // `engine_status_changed` Tauri event so Slice D's blocking-panel
+    // UI can distinguish "clean stop" (e.g. SIGTERM at app shutdown)
+    // from "crashed" (non-zero exit or wait() error) and react.
     let app_for_watchdog = app.app_handle().clone();
     let child_arc_for_watchdog = child_arc;
+    let watchdog_pid = pid;
     tokio::spawn(async move {
         // Wait for the child to exit (blocks until process terminates).
         let exit_status = {
@@ -387,35 +391,59 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
             if let Some(ref mut c) = *guard {
                 Some(c.wait().await)
             } else {
+                tracing::warn!("watchdog: child already None at start");
                 None
             }
         };
 
-        if let Some(status) = exit_status {
-            match status {
-                Ok(s) if s.success() => {
-                    tracing::info!(?s, "sidecar exited cleanly");
-                }
-                Ok(s) => {
-                    tracing::error!(
-                        ?s,
-                        "sidecar exited unexpectedly — clearing handle so compile \
-                         falls back to in-process"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        %e,
-                        "sidecar wait failed — clearing handle"
-                    );
-                }
-            }
+        let Some(status) = exit_status else {
+            return;
+        };
 
-            // Clear the sidecar handle so future compiles go in-process.
+        // Compute exit details for both the log line and the event
+        // payload. "stopped" = success exit (likely SIGTERM from OS
+        // shutdown or our own graceful shutdown path); "crashed" =
+        // non-zero status or a wait() error.
+        let (exit_code, status_label) = match &status {
+            Ok(s) if s.success() => {
+                tracing::info!(?s, pid = ?watchdog_pid, "sidecar exited cleanly");
+                (s.code(), "stopped")
+            }
+            Ok(s) => {
+                tracing::error!(
+                    ?s,
+                    pid = ?watchdog_pid,
+                    "sidecar exited unexpectedly — clearing handle so compile \
+                     falls back to in-process"
+                );
+                (s.code(), "crashed")
+            }
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    pid = ?watchdog_pid,
+                    "sidecar wait failed — clearing handle"
+                );
+                (None, "crashed")
+            }
+        };
+
+        // Clear the sidecar handle so future compiles go in-process.
+        {
             let state = app_for_watchdog.state::<AppState>();
             let mut guard = state.sidecar.lock().await;
             *guard = None;
         }
+
+        // Emit AFTER the handle is cleared so any UI handler that
+        // queries state in response sees the post-crash truth.
+        let _ = app_for_watchdog.emit(
+            "engine_status_changed",
+            serde_json::json!({
+                "status": status_label,
+                "exit_code": exit_code,
+            }),
+        );
     });
 }
 
