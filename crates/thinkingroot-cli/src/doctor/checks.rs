@@ -17,6 +17,8 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
         config_dir_writable(env),
         credentials_any_provider(env),
         daemon_lockfile_parseable(env),
+        workspace_registry_parseable(env),
+        workspace_active_exists(env),
     ]
 }
 
@@ -231,6 +233,135 @@ pub fn daemon_lockfile_parseable(env: &DoctorEnv) -> CheckResult {
                 command: format!("rm {}", lock_path.display()),
             }),
         },
+    }
+}
+
+/// Is `workspaces.toml` either absent or well-formed TOML?
+/// Parses the registry file at `env.config_dir.join("workspaces.toml")`
+/// directly (not via `WorkspaceRegistry::load`) so the DoctorEnv injection
+/// is honored — `load()` resolves through process-global `dirs::config_dir()`.
+pub fn workspace_registry_parseable(env: &DoctorEnv) -> CheckResult {
+    let path = env.config_dir.join("workspaces.toml");
+    if !path.exists() {
+        return CheckResult {
+            id: CheckId::from_static("workspace.registry.parseable"),
+            label: "Workspace registry".into(),
+            status: CheckStatus::Ok,
+            detail: "no workspaces registered".into(),
+            fix: None,
+        };
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("workspace.registry.parseable"),
+                label: "Workspace registry".into(),
+                status: CheckStatus::Warn,
+                detail: format!("unreadable: {e}"),
+                fix: None,
+            };
+        }
+    };
+    match toml::from_str::<thinkingroot_core::WorkspaceRegistry>(&content) {
+        Ok(reg) => CheckResult {
+            id: CheckId::from_static("workspace.registry.parseable"),
+            label: "Workspace registry".into(),
+            status: CheckStatus::Ok,
+            detail: format!("{} workspace(s) registered", reg.workspaces.len()),
+            fix: None,
+        },
+        Err(e) => CheckResult {
+            id: CheckId::from_static("workspace.registry.parseable"),
+            label: "Workspace registry".into(),
+            status: CheckStatus::Warn,
+            detail: format!("parse error: {e}"),
+            fix: Some(FixAction::ShellHint {
+                command: format!("mv {} {}.broken-$(date +%s)", path.display(), path.display()),
+            }),
+        },
+    }
+}
+
+/// If a workspace is marked active, does its directory still exist?
+/// Skipped if no registry or no active workspace.
+pub fn workspace_active_exists(env: &DoctorEnv) -> CheckResult {
+    let path = env.config_dir.join("workspaces.toml");
+    if !path.exists() {
+        return CheckResult {
+            id: CheckId::from_static("workspace.active.exists"),
+            label: "Active workspace directory exists".into(),
+            status: CheckStatus::Skipped,
+            detail: "no registry".into(),
+            fix: None,
+        };
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            return CheckResult {
+                id: CheckId::from_static("workspace.active.exists"),
+                label: "Active workspace directory exists".into(),
+                status: CheckStatus::Skipped,
+                detail: "registry unreadable".into(),
+                fix: None,
+            };
+        }
+    };
+    let reg = match toml::from_str::<thinkingroot_core::WorkspaceRegistry>(&content) {
+        Ok(r) => r,
+        Err(_) => {
+            return CheckResult {
+                id: CheckId::from_static("workspace.active.exists"),
+                label: "Active workspace directory exists".into(),
+                status: CheckStatus::Skipped,
+                detail: "registry unparseable".into(),
+                fix: None,
+            };
+        }
+    };
+    let Some(active) = reg.active.as_ref() else {
+        return CheckResult {
+            id: CheckId::from_static("workspace.active.exists"),
+            label: "Active workspace directory exists".into(),
+            status: CheckStatus::Skipped,
+            detail: "no active workspace set".into(),
+            fix: None,
+        };
+    };
+    let Some(entry) = reg.workspaces.iter().find(|w| &w.name == active) else {
+        return CheckResult {
+            id: CheckId::from_static("workspace.active.exists"),
+            label: "Active workspace directory exists".into(),
+            status: CheckStatus::Fail,
+            detail: format!("active workspace '{}' not in registry", active),
+            fix: Some(FixAction::RunCommand {
+                command: format!("root workspace remove {}", active),
+            }),
+        };
+    };
+    if entry.path.exists() {
+        CheckResult {
+            id: CheckId::from_static("workspace.active.exists"),
+            label: "Active workspace directory exists".into(),
+            status: CheckStatus::Ok,
+            detail: format!("{} -> {}", entry.name, entry.path.display()),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            id: CheckId::from_static("workspace.active.exists"),
+            label: "Active workspace directory exists".into(),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "active workspace '{}' points to {} which no longer exists",
+                entry.name,
+                entry.path.display()
+            ),
+            fix: Some(FixAction::RunCommand {
+                command: format!("root workspace remove {}", entry.name),
+            }),
+        }
     }
 }
 
@@ -509,6 +640,43 @@ mod tests {
             path_entries: vec![],
         };
         let r = daemon_reachable(&env).await;
+        assert_eq!(r.status, CheckStatus::Skipped);
+    }
+
+    #[test]
+    fn workspace_registry_parseable_ok_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = workspace_registry_parseable(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn workspace_registry_parseable_warn_when_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("workspaces.toml"), b"!!! not toml").unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = workspace_registry_parseable(&env);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn workspace_active_exists_skipped_when_no_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = workspace_active_exists(&env);
         assert_eq!(r.status, CheckStatus::Skipped);
     }
 }
