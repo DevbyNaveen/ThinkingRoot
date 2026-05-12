@@ -56,9 +56,10 @@ pub struct InstallManifest {
     /// write (later registration wins).
     pub binaries: Vec<BinaryEntry>,
     /// Which entry CLI + desktop should prefer when multiple
-    /// valid binaries exist. Defaults to the first registered
-    /// entry until a user runs `root setup --prefer <id>`.
-    pub preferred: BinaryId,
+    /// valid binaries exist. `None` means "no preference set yet"
+    /// — the resolver in Slice C falls back to the first entry
+    /// matching the caller's constraints.
+    pub preferred: Option<BinaryId>,
     /// Set by the onboarding wizard when all setup-relevant
     /// `root doctor` checks pass. `None` means the user has not
     /// completed first-run setup.
@@ -75,7 +76,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             binaries: vec![BinaryEntry {
                 id: BinaryId::CliScript,
-                path: "/Users/x/.local/bin/root".into(),
+                path: std::path::PathBuf::from("/Users/x/.local/bin/root"),
                 version: "0.9.1".to_string(),
                 installed_at: chrono::DateTime::parse_from_rfc3339(
                     "2026-05-11T14:22:00Z",
@@ -86,10 +87,20 @@ mod tests {
                     "f2ca1bb6c7e907d06dafe4687e579fce76b37e4e93b7605022da52e6ccc26fd2"
                         .to_string(),
             }],
-            preferred: BinaryId::CliScript,
+            preferred: Some(BinaryId::CliScript),
             setup_complete_at: None,
         };
+
         let json = serde_json::to_string_pretty(&manifest).unwrap();
+        assert!(
+            json.contains("\"id\": \"cli-script\""),
+            "BinaryId must serialize kebab-case; got: {json}"
+        );
+        assert!(
+            json.contains("\"schema_version\": 1"),
+            "SCHEMA_VERSION must serialize as integer 1; got: {json}"
+        );
+
         let parsed: InstallManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest, parsed);
     }

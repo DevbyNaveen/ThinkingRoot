@@ -16,9 +16,7 @@ pub use global_config::{
     Credentials, GlobalConfig, ServeConfig, WorkspaceEntry, WorkspaceRegistry,
 };
 pub use id::Id;
-pub use install_manifest::{
-    BinaryEntry, BinaryId, InstallManifest, SCHEMA_VERSION as INSTALL_MANIFEST_SCHEMA_VERSION,
-};
+pub use install_manifest::{BinaryEntry, BinaryId, InstallManifest};
 pub use resolver::{PackResolver, ResolverDescriptor, ResolverError};
 pub use safe_path::{atomic_write, is_loopback_host, safe_join_under, validate_id};
 pub use structural_registry::{STRUCTURAL_TABLES, StructuralTableSpec};
