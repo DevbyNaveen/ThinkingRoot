@@ -212,10 +212,12 @@ pub async fn doctor_check() -> Result<TypedDoctorReport, String> {
         .map_err(|e| format!("`root doctor --json` stdout not UTF-8: {e}"))?;
 
     let report: TypedDoctorReport = serde_json::from_str(&stdout).map_err(|e| {
-        format!(
-            "parse `root doctor --json` output: {e}\nstdout: {stdout}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
+        legacy_root_binary_hint(&bin, &stdout).unwrap_or_else(|| {
+            format!(
+                "parse `root doctor --json` output: {e}\nstdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
     })?;
 
     if report.schema_version > TYPED_REPORT_MAX_SCHEMA_VERSION {
@@ -227,6 +229,26 @@ pub async fn doctor_check() -> Result<TypedDoctorReport, String> {
     }
 
     Ok(report)
+}
+
+/// Detect whether `stdout` is the legacy `root doctor --json` shape
+/// (pre-Slice-B substrate) and return a friendly upgrade message.
+/// Returns `None` if the output doesn't look like the legacy shape —
+/// caller falls back to the verbatim parse error.
+///
+/// Legacy shape marker: top-level `"verdict": ...` field which the
+/// substrate doctor doesn't emit (substrate uses `schema_version` +
+/// structured `summary`).
+fn legacy_root_binary_hint(bin: &str, stdout: &str) -> Option<String> {
+    if !stdout.contains("\"verdict\"") {
+        return None;
+    }
+    Some(format!(
+        "Your `{bin}` binary predates this desktop and emits an older \
+         `root doctor --json` shape.  Upgrade by running:\n\n    \
+         cargo install --path crates/thinkingroot-cli --force --root ~/.local\n\n\
+         (or re-run install.sh once the next release ships)."
+    ))
 }
 
 /// Run `root doctor --fix --json` and return the post-fix typed report.
@@ -261,10 +283,12 @@ pub async fn doctor_apply_fix(_check_id: Option<String>) -> Result<TypedDoctorRe
         .map_err(|e| format!("`root doctor --fix --json` stdout not UTF-8: {e}"))?;
 
     let report: TypedDoctorReport = serde_json::from_str(&stdout).map_err(|e| {
-        format!(
-            "parse `root doctor --fix --json` output: {e}\nstdout: {stdout}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
+        legacy_root_binary_hint(&bin, &stdout).unwrap_or_else(|| {
+            format!(
+                "parse `root doctor --fix --json` output: {e}\nstdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
     })?;
 
     if report.schema_version > TYPED_REPORT_MAX_SCHEMA_VERSION {
