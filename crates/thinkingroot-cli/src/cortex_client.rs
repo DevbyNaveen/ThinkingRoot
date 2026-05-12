@@ -19,6 +19,7 @@ use thinkingroot_core::cortex::{
     ProbeResult, StartedBy,
 };
 use thinkingroot_core::install_manifest::InstallManifest;
+use thinkingroot_core::recovery_log::{self, RecoveryEvent};
 
 /// How long `health_check` waits for `/livez`. Short enough to feel
 /// instant on the happy path; long enough to survive a momentary
@@ -77,13 +78,46 @@ pub enum ResolveError {
 /// `Remote` after `/livez` comes green.
 pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, ResolveError> {
     // 1. Read the lock + check PID liveness synchronously.
-    let lock = cortex::read_lock()?;
-    let lock_pid_alive = lock
+    let mut lock = cortex::read_lock()?;
+    let mut lock_pid_alive = lock
         .as_ref()
         .map(|l| cortex::process_alive(l.pid))
         .unwrap_or(false);
 
-    // 2. Probe /livez only when there's a live-PID lock to probe.
+    // 2. Resolve the preferred install-manifest binary, if any. A
+    //    missing / corrupt / empty manifest yields None — decide()
+    //    then surfaces RepairNeeded for spawn intents.
+    let manifest_preferred_binary = load_preferred_manifest_binary();
+
+    // 3. Binary-path mismatch — if the lockfile points at a binary
+    //    that's been replaced (the manifest's preferred binary has
+    //    a different path), the daemon is running stale code. Treat
+    //    the lock as stale: kill (if alive) + remove lock + log,
+    //    then force decide() to see lock=None.  This is the spec §7
+    //    "lockfile binary path mismatch" cleanup rule.
+    if let (Some(stale), Some(preferred)) = (lock.as_ref(), manifest_preferred_binary.as_ref()) {
+        if &stale.binary_path != preferred {
+            tracing::warn!(
+                lock_binary = %stale.binary_path.display(),
+                preferred_binary = %preferred.display(),
+                pid = stale.pid,
+                "cortex: lockfile binary path mismatch — treating as stale"
+            );
+            if lock_pid_alive {
+                cleanup_wedged_daemon(stale).await;
+            } else {
+                // Dead PID + mismatch — just remove lock + log.
+                if let Err(e) = cortex::remove_lock() {
+                    tracing::warn!(error = %e, "remove mismatched cortex.lock failed");
+                }
+                let _ = recovery_log::append(&RecoveryEvent::stale_lock_cleanup(stale.pid));
+            }
+            lock = None;
+            lock_pid_alive = false;
+        }
+    }
+
+    // 4. Probe /livez only when there's a live-PID lock to probe.
     //    No lock → no probe; dead PID → no probe (the daemon is
     //    already known dead, no network round-trip needed).
     let probe_result = match (&lock, lock_pid_alive) {
@@ -93,12 +127,7 @@ pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, Re
         _ => ProbeResult::NotProbed,
     };
 
-    // 3. Resolve the preferred install-manifest binary, if any. A
-    //    missing / corrupt / empty manifest yields None — decide()
-    //    then surfaces RepairNeeded for spawn intents.
-    let manifest_preferred_binary = load_preferred_manifest_binary();
-
-    // 4. Run the pure decision. CLI never threads --in-process
+    // 5. Run the pure decision. CLI never threads --in-process
     //    through here — main.rs short-circuits to the in-process
     //    path before calling resolve_engine.
     let decision = cortex::decide(DecisionInputs {
@@ -135,16 +164,32 @@ pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, Re
         }
         Decision::Spawn { binary_path, port, host } => {
             // Before spawning, clean up any stale lock the decision
-            // tree saw (dead-PID lock, or Unhealthy probe). Without
-            // the cleanup the freshly-spawned daemon's bind would
-            // race against the stale lockfile.
+            // tree saw. Two cases:
+            //   - lock_pid_alive: probe was Unhealthy (decide()
+            //     would've returned Attach for Healthy/Degraded), so
+            //     the daemon is wedged. SIGTERM + 2s grace + SIGKILL
+            //     before remove_lock, otherwise the new spawn races
+            //     for the port and sees EADDRINUSE.
+            //   - dead PID: just remove the lockfile.  No process to
+            //     kill.
+            // Every cleanup writes a RecoveryEvent::stale_lock_cleanup
+            // entry to the audit log.
             if let Some(stale) = &lock {
-                tracing::info!(
-                    pid = stale.pid,
-                    port = stale.port,
-                    "cortex: removing stale lock before spawn"
-                );
-                cortex::remove_lock()?;
+                if lock_pid_alive {
+                    cleanup_wedged_daemon(stale).await;
+                } else {
+                    tracing::info!(
+                        pid = stale.pid,
+                        port = stale.port,
+                        "cortex: removing dead-PID stale lock before spawn"
+                    );
+                    if let Err(e) = cortex::remove_lock() {
+                        tracing::warn!(error = %e, "remove dead-pid cortex.lock failed");
+                    }
+                    let _ = recovery_log::append(
+                        &RecoveryEvent::stale_lock_cleanup(stale.pid),
+                    );
+                }
             }
             spawn_detached_daemon(&binary_path, &host, port).await?;
             wait_for_livez(&host, port, DAEMON_START_TIMEOUT).await?;
@@ -168,6 +213,91 @@ pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, Re
         Decision::RepairNeeded { failing_check_ids } => {
             Ok(EngineConnection::RepairNeeded { failing_check_ids })
         }
+    }
+}
+
+/// Clean up a wedged daemon before respawning.  Called when
+/// `decide()` returned `Spawn` after observing `Unhealthy` /
+/// `NotProbed` against a still-alive PID, or when a binary-path
+/// mismatch in the lockfile flagged the daemon as running stale
+/// code.  Best-effort — every failure logs + continues; the new
+/// daemon spawn will still race for the port.
+///
+/// Sequence: SIGTERM → 2s grace polling `process_alive` → SIGKILL if
+/// still alive → `remove_lock()` → audit-log entry.  On Windows
+/// there is no SIGTERM equivalent that's both graceful AND universal,
+/// so we use sysinfo's TerminateProcess-backed `kill()` (analogous
+/// to SIGKILL) directly — matching the documented spec semantics
+/// for the OS that doesn't ship signals.
+async fn cleanup_wedged_daemon(stale_lock: &CortexLock) {
+    tracing::warn!(
+        pid = stale_lock.pid,
+        port = stale_lock.port,
+        binary = %stale_lock.binary_path.display(),
+        "cortex: wedged daemon detected; sending termination signal"
+    );
+
+    #[cfg(unix)]
+    {
+        // SIGTERM via libc — no extra dependency. libc::pid_t is
+        // i32 on every Unix; cast is safe for PIDs < 2^31.
+        // SAFETY: libc::kill is async-signal-safe and well-defined
+        // for any pid value (returns -1 + ESRCH for unknown pids).
+        unsafe {
+            let _ = libc::kill(stale_lock.pid as libc::pid_t, libc::SIGTERM);
+        }
+        // Wait up to 2s for graceful exit, polling at 100ms.
+        let mut elapsed = Duration::ZERO;
+        let step = Duration::from_millis(100);
+        while elapsed < Duration::from_secs(2) {
+            if !cortex::process_alive(stale_lock.pid) {
+                break;
+            }
+            tokio::time::sleep(step).await;
+            elapsed += step;
+        }
+        // SIGKILL if still alive.
+        if cortex::process_alive(stale_lock.pid) {
+            tracing::warn!(
+                pid = stale_lock.pid,
+                "cortex: SIGTERM grace expired; escalating to SIGKILL"
+            );
+            // SAFETY: same as above.
+            unsafe {
+                let _ = libc::kill(stale_lock.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no SIGTERM. sysinfo's kill() calls
+        // TerminateProcess — analogous to SIGKILL. We deliberately
+        // skip the 2s grace on Windows because there's no graceful
+        // signal to wait on; an immediate terminate matches the
+        // documented spec for the OS that doesn't ship signals.
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(stale_lock.pid);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::new(),
+        );
+        if let Some(proc) = sys.process(pid) {
+            let _ = proc.kill();
+        }
+    }
+
+    // Remove the lockfile so the next spawn doesn't see it. Best-
+    // effort — log + continue on any error. Lock path is global; no
+    // override needed.
+    if let Err(e) = cortex::remove_lock() {
+        tracing::warn!(error = %e, "cortex: remove stale cortex.lock failed");
+    }
+
+    // Audit-log the cleanup so the recovery trail is complete.
+    if let Err(e) = recovery_log::append(&RecoveryEvent::stale_lock_cleanup(stale_lock.pid)) {
+        tracing::warn!(error = %e, "cortex: recovery_log append failed");
     }
 }
 
