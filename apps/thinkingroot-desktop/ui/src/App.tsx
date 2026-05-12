@@ -8,6 +8,7 @@ import { ToastStack } from "@/components/ui/toast-stack";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
+import { EngineGate } from "@/components/engine/EngineGate";
 import { onTrFileOpened, onboardingStatus, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 import { refreshBrainSnapshotCache } from "@/store/brain-cache";
@@ -119,38 +120,40 @@ export default function App() {
   }, [theme]);
 
   return (
-    <TooltipProvider delayDuration={250} skipDelayDuration={120}>
-      <div className="flex h-full w-full flex-col bg-background text-foreground">
-        <div className="flex min-h-0 min-w-0 flex-1">
-          <Sidebar />
-          <MainPane />
-          <RightRail />
+    <EngineGate>
+      <TooltipProvider delayDuration={250} skipDelayDuration={120}>
+        <div className="flex h-full w-full flex-col bg-background text-foreground">
+          <div className="flex min-h-0 min-w-0 flex-1">
+            <Sidebar />
+            <MainPane />
+            <RightRail />
+          </div>
         </div>
-      </div>
-      <CommandPalette />
-      <OnboardingWizard
-        open={onboardingOpen}
-        onComplete={() => {
-          setOnboardingOpen(false);
-          setOnboardingDismissed(true);
-        }}
-        onSkip={() => {
-          setOnboardingOpen(false);
-          setOnboardingDismissed(true);
-        }}
-      />
-      <InstallTrSheet
-        path={installTrPath}
-        onClose={() => setInstallTrPath(null)}
-      />
-      {packExportTarget && (
-        <PackExportSheet
-          workspace={packExportTarget.workspace}
-          branch={packExportTarget.branch}
-          onClose={() => setPackExportTarget(null)}
+        <CommandPalette />
+        <OnboardingWizard
+          open={onboardingOpen}
+          onComplete={() => {
+            setOnboardingOpen(false);
+            setOnboardingDismissed(true);
+          }}
+          onSkip={() => {
+            setOnboardingOpen(false);
+            setOnboardingDismissed(true);
+          }}
         />
-      )}
-      <ToastStack />
-    </TooltipProvider>
+        <InstallTrSheet
+          path={installTrPath}
+          onClose={() => setInstallTrPath(null)}
+        />
+        {packExportTarget && (
+          <PackExportSheet
+            workspace={packExportTarget.workspace}
+            branch={packExportTarget.branch}
+            onClose={() => setPackExportTarget(null)}
+          />
+        )}
+        <ToastStack />
+      </TooltipProvider>
+    </EngineGate>
   );
 }
