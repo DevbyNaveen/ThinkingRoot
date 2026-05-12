@@ -15,6 +15,7 @@ pub fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
     vec![
         binary_cli_installed(env),
         binary_cli_on_path(env),
+        config_dir_writable(env),
     ]
 }
 
@@ -101,6 +102,47 @@ pub fn binary_cli_on_path(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Can we create and write to a file under `env.config_dir`? Uses
+/// a tempfile sentinel to probe without polluting state.
+pub fn config_dir_writable(env: &DoctorEnv) -> CheckResult {
+    let dir = &env.config_dir;
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return CheckResult {
+                id: CheckId::from_static("config.dir.writable"),
+                label: "Config directory writable".into(),
+                status: CheckStatus::Fail,
+                detail: format!("cannot create {}: {e}", dir.display()),
+                fix: Some(FixAction::ShellHint {
+                    command: format!("mkdir -p {}", dir.display()),
+                }),
+            };
+        }
+    }
+    let sentinel = dir.join(".tr-doctor-probe");
+    match std::fs::write(&sentinel, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&sentinel);
+            CheckResult {
+                id: CheckId::from_static("config.dir.writable"),
+                label: "Config directory writable".into(),
+                status: CheckStatus::Ok,
+                detail: format!("{}", dir.display()),
+                fix: None,
+            }
+        }
+        Err(e) => CheckResult {
+            id: CheckId::from_static("config.dir.writable"),
+            label: "Config directory writable".into(),
+            status: CheckStatus::Fail,
+            detail: format!("cannot write under {}: {e}", dir.display()),
+            fix: Some(FixAction::ShellHint {
+                command: format!("chmod u+w {}", dir.display()),
+            }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +211,43 @@ mod tests {
             path_entries: vec![PathBuf::from("/somewhere/else")],
         };
         let r = binary_cli_on_path(&env);
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn config_dir_writable_ok_when_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = config_dir_writable(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_writable_fail_when_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let readonly = tmp.path().join("ro");
+        std::fs::create_dir(&readonly).unwrap();
+        let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&readonly, perms).unwrap();
+
+        let env = DoctorEnv {
+            config_dir: readonly.clone(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = config_dir_writable(&env);
+        // Restore perms before tempdir's drop tries to clean up.
+        let mut p = std::fs::metadata(&readonly).unwrap().permissions();
+        p.set_mode(0o700);
+        std::fs::set_permissions(&readonly, p).unwrap();
+
         assert_eq!(r.status, CheckStatus::Fail);
     }
 }
