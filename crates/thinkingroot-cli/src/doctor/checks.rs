@@ -30,6 +30,7 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
 pub async fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
     let mut checks = run_all_sync(env);
     checks.push(daemon_reachable(env).await);
+    checks.push(binary_cli_runnable(env).await);
     checks
 }
 
@@ -526,6 +527,157 @@ pub async fn daemon_reachable(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Pre-spawn smoke test: can we actually RUN the installed binary?
+/// Catches macOS Gatekeeper quarantine, Linux missing dynamic-link
+/// libs (libonnxruntime), Windows missing VC++ runtime.
+///
+/// Status:
+/// - `Skipped` if no binary installed (binary.cli.installed handles
+///   the fail in that case)
+/// - `Ok` if `<binary> --version` exits 0 within 3s
+/// - `Warn` if `<binary> --version` exits non-zero within 3s (binary
+///   ran but didn't recognize the flag — common for older builds;
+///   still attachable for purposes of doctor health)
+/// - `Fail` if subprocess spawn errored, hit the 3s timeout, or was
+///   killed by signal
+pub async fn binary_cli_runnable(env: &DoctorEnv) -> CheckResult {
+    let Some(binary) = env.install_dir_candidates.iter().find(|p| p.exists()) else {
+        return CheckResult {
+            id: CheckId::from_static("binary.cli.runnable"),
+            label: "`root` binary runs cleanly".into(),
+            status: CheckStatus::Skipped,
+            detail: "no binary installed".into(),
+            fix: None,
+        };
+    };
+
+    let spawn_result = tokio::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+
+    let child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.runnable"),
+                label: "`root` binary runs cleanly".into(),
+                status: CheckStatus::Fail,
+                detail: format!("could not spawn {}: {e}", binary.display()),
+                fix: Some(platform_fix_for_unrunnable(binary)),
+            };
+        }
+    };
+
+    let wait = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        child.wait_with_output(),
+    )
+    .await;
+
+    match wait {
+        Err(_) => {
+            // 3s timeout — kill the child (kill_on_drop handles it
+            // when `child` goes out of scope, but we capture the
+            // explicit error for the detail message).
+            CheckResult {
+                id: CheckId::from_static("binary.cli.runnable"),
+                label: "`root` binary runs cleanly".into(),
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "{} --version timed out after 3s (hung process?)",
+                    binary.display()
+                ),
+                fix: Some(platform_fix_for_unrunnable(binary)),
+            }
+        }
+        Ok(Err(e)) => CheckResult {
+            id: CheckId::from_static("binary.cli.runnable"),
+            label: "`root` binary runs cleanly".into(),
+            status: CheckStatus::Fail,
+            detail: format!("wait for {} failed: {e}", binary.display()),
+            fix: Some(platform_fix_for_unrunnable(binary)),
+        },
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                CheckResult {
+                    id: CheckId::from_static("binary.cli.runnable"),
+                    label: "`root` binary runs cleanly".into(),
+                    status: CheckStatus::Ok,
+                    detail: stdout.trim().to_string(),
+                    fix: None,
+                }
+            } else {
+                let code = output.status.code();
+                if code.is_none() {
+                    // Killed by signal — Fail.
+                    CheckResult {
+                        id: CheckId::from_static("binary.cli.runnable"),
+                        label: "`root` binary runs cleanly".into(),
+                        status: CheckStatus::Fail,
+                        detail: format!(
+                            "{} --version killed by signal",
+                            binary.display()
+                        ),
+                        fix: Some(platform_fix_for_unrunnable(binary)),
+                    }
+                } else {
+                    // Non-zero exit with valid code — Warn.  Binary
+                    // ran but rejected the flag.  Older builds may
+                    // not have --version; still attachable.
+                    CheckResult {
+                        id: CheckId::from_static("binary.cli.runnable"),
+                        label: "`root` binary runs cleanly".into(),
+                        status: CheckStatus::Warn,
+                        detail: format!(
+                            "{} --version exited {} (older build?)",
+                            binary.display(),
+                            code.unwrap_or(0)
+                        ),
+                        fix: None,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Platform-specific fix hint for a binary that can't run.  We pick
+/// the most-likely-relevant fix per OS at compile time.
+fn platform_fix_for_unrunnable(binary: &std::path::Path) -> FixAction {
+    #[cfg(target_os = "macos")]
+    {
+        FixAction::ShellHint {
+            command: format!("xattr -d com.apple.quarantine {}", binary.display()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "sudo apt install libonnxruntime  # or equivalent for your distro".to_string(),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "download VC++ redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe".to_string(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "verify binary integrity + dependencies".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +977,63 @@ mod tests {
         };
         let r = install_manifest_consistent(&env);
         assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_skipped_when_no_binary_installed() {
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![std::path::PathBuf::from("/nonexistent/root")],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        assert_eq!(r.status, CheckStatus::Skipped);
+        assert!(r.detail.contains("no binary installed"));
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_ok_when_binary_runs() {
+        // Use the current test binary's path as a stand-in — it's
+        // guaranteed to exist + run.  We're testing the smoke-test
+        // mechanic, not the actual `root --version` output.
+        let me = std::env::current_exe().unwrap();
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![me.clone()],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        // Any successful exit (incl. non-zero from a test binary called
+        // with --version it doesn't recognise) counts as Ok for this
+        // check: the binary RAN, that's what we care about.  If the
+        // assertion needs to be tighter, we'd ship a fixture binary —
+        // out of scope for Slice F T4.  Accept Ok OR Warn (some test
+        // runners exit non-zero on --version).
+        assert!(
+            matches!(r.status, CheckStatus::Ok | CheckStatus::Warn),
+            "expected Ok or Warn, got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_fail_when_binary_path_is_not_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("definitely-not-a-binary");
+        std::fs::write(&path, b"this is not an executable").unwrap();
+        // Don't chmod +x — on Unix this should fail to exec.
+
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![path.clone()],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        // On Unix: Permission denied → Fail.
+        // On Windows: may behave differently (.exe convention), but
+        // since we wrote non-magic-bytes the executor should refuse.
+        #[cfg(unix)]
+        assert_eq!(r.status, CheckStatus::Fail);
+        #[cfg(not(unix))]
+        let _ = r;  // tolerate platform variance
     }
 }
