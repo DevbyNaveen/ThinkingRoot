@@ -6224,6 +6224,7 @@ dependencies = [
  "thinkingroot-branch",
  "thinkingroot-compile",
  "thinkingroot-core",
+ "thinkingroot-cortex-async",
  "thinkingroot-extract",
  "thinkingroot-graph",
  "thinkingroot-ground",
