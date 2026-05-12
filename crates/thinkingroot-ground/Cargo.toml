@@ -1,6 +1,6 @@
 [package]
 name = "thinkingroot-ground"
-description = "Write-time hallucination prevention: 3-judge grounding tribunal"
+description = "Witness Mesh anchor verification — BLAKE3-based byte-anchor check (the surviving 1-of-5 piece of the pre-Witness-Mesh grounding tribunal)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,24 +12,21 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-## Enable Judge 3 (embedding cosine similarity) + Judge 4 (NLI entailment)
-## via fastembed/ort/tokenizers. Without this, only Judges 1+2 (pure string
-## ops) are active.
-vector = ["dep:thinkingroot-graph", "dep:ort", "dep:tokenizers", "dep:dirs"]
+# `vector` feature deleted in Witness Mesh cutover — the ML judges
+# (Judge 3 semantic cosine + Judge 4 NLI cross-encoder) are gone.
+# Feature-gating no longer applies. The `ort` + `tokenizers` + `dirs`
+# + `thinkingroot-graph` deps that backed them are removed below.
 
 [dependencies]
 thinkingroot-core = { workspace = true }
 thinkingroot-extract = { workspace = true }
+# `unicode-segmentation` is still used by the surviving `LexicalJudge`
+# (kept temporarily for `thinkingroot_rooting::probes::provenance`).
 unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
-
-# Optional: Judges 3+4 need fastembed/ort for ML inference.
-thinkingroot-graph = { workspace = true, optional = true }
-ort = { version = "2.0.0-rc.11", optional = true, default-features = false }
-tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
-dirs = { workspace = true, optional = true }
+# Witness anchor verification — BLAKE3 over source byte slices.
+blake3 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

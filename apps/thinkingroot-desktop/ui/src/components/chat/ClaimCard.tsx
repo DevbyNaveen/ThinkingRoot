@@ -226,9 +226,11 @@ function statusText(status: AgentStep["status"]): string {
 
 function getFriendlyStepName(name: string): string {
   const n = name.toLowerCase();
-  if (n.includes("search") || n.includes("query")) return "Searching graph";
-  if (n.includes("claim") || n.includes("read")) return "Reading claims";
-  if (n.includes("summar") || n.includes("synth")) return "Synthesizing answer";
+  if (n.includes("witness")) return "Checking witnesses";
+  if (n.includes("relation") || n.includes("graph")) return "Reading graph context";
+  if (n.includes("search") || n.includes("query")) return "Searching knowledge base";
+  if (n.includes("claim") || n.includes("read")) return "Reading relevant claims";
+  if (n.includes("summar") || n.includes("synth")) return "Composing answer";
   return name.replace(/_/g, " ");
 }
 

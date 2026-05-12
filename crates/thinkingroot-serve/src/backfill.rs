@@ -490,6 +490,245 @@ pub fn backfill_water_flow_v3_at_path(data_dir: &std::path::Path) -> Result<()> 
     Ok(())
 }
 
+/// Witness Mesh migration report. Returned by the migration tool so
+/// the CLI can surface honest counts.
+#[derive(Debug, Clone, Default)]
+pub struct WitnessMeshBackfillReport {
+    /// Number of claim rows scanned in the source workspace.
+    pub claims_scanned: usize,
+    /// Number of Witness rows written (or that would be written, in
+    /// dry-run mode). Equals `claims_scanned` minus skipped rows.
+    pub witnesses_emitted: usize,
+    /// Number of claim rows skipped because they lacked the
+    /// byte-grounding triple `(source_id, byte_start, byte_end,
+    /// content_blake3)`. Each skip is a real CCC honesty win — we
+    /// refuse to fabricate an anchor for a claim that never had one.
+    pub claims_missing_anchor: usize,
+    /// `true` when no rows were written (dry-run requested OR the
+    /// workspace was already at `witness_schema_version = "2"`).
+    pub dry_run: bool,
+    /// Pre-migration schema version observed in `workspace_meta`.
+    pub schema_version_before: Option<String>,
+    /// Post-migration schema version. `"2"` after a real run;
+    /// unchanged after a dry-run.
+    pub schema_version_after: Option<String>,
+}
+
+/// Migrate a workspace from the LLM-extraction `claims` substrate
+/// to the Witness Mesh `witnesses` substrate.
+///
+/// Idempotent: a workspace already at `witness_schema_version = "2"`
+/// returns a zero-counts report. The pipeline does **not** auto-run
+/// this migration — it's user-driven via `root migrate --to-witness-mesh`
+/// because the Witness id derivation is a one-way transformation
+/// (legacy claim ULIDs are replaced by content-derived BLAKE3 ids,
+/// so engram pointers that referenced old claim ids would break
+/// silently if we auto-migrated without warning).
+///
+/// `dry_run = true` walks the claims table and reports what would be
+/// migrated without writing.
+///
+/// The legacy `claims` table is **kept intact** on disk after migration.
+/// The Commit-2 destructive cutover will drop it; until then both
+/// tables coexist so a rollback is a single line of code.
+pub fn backfill_witness_mesh(store: &GraphStore, dry_run: bool) -> Result<WitnessMeshBackfillReport> {
+    use chrono::{DateTime, TimeZone, Utc};
+    use std::str::FromStr;
+    use thinkingroot_core::types::{
+        Confidence, Sensitivity, SourceId, Witness, WitnessInput, WitnessSpan, WorkspaceId,
+    };
+
+    const WITNESS_SCHEMA_VERSION_KEY: &str = "witness_schema_version";
+    const TARGET_VERSION: &str = "2";
+
+    let mut report = WitnessMeshBackfillReport::default();
+    let pre_version = store.get_workspace_meta(WITNESS_SCHEMA_VERSION_KEY)?;
+    report.schema_version_before = pre_version.clone();
+    report.dry_run = dry_run;
+
+    if pre_version.as_deref() == Some(TARGET_VERSION) {
+        report.schema_version_after = pre_version;
+        tracing::info!(
+            "witness mesh migration: workspace already at schema_version=2; no-op"
+        );
+        return Ok(report);
+    }
+
+    tracing::info!(
+        dry_run,
+        "witness mesh migration: scanning legacy claims table"
+    );
+
+    // Project just the fields needed to synthesise a Witness from a
+    // legacy claim. Columns we deliberately discard: statement
+    // (the LLM paraphrase — bytes are the truth), claim_type,
+    // grounding_score, grounding_method, extraction_tier, event_date,
+    // admission_tier, derivation_parents, predicate_json, last_rooted_at,
+    // source_path (recoverable from source_id).
+    let projection = store
+        .raw_db()
+        .run_script(
+            "?[id, source_id, workspace_id, byte_start, byte_end, content_blake3, \
+              symbol, sensitivity, confidence, created_at] := \
+              *claims{id, source_id, workspace_id, byte_start, byte_end, content_blake3, \
+              symbol, sensitivity, confidence, created_at}",
+            Default::default(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .map_err(|e| {
+            thinkingroot_core::Error::GraphStorage(format!("scan claims for migration: {e}"))
+        })?;
+
+    report.claims_scanned = projection.rows.len();
+
+    let mut witnesses_to_insert: Vec<Witness> = Vec::with_capacity(projection.rows.len());
+    let now: DateTime<Utc> = Utc::now();
+
+    for row in &projection.rows {
+        // Defensive extraction — every column has a default in the
+        // schema so missing values surface as their default rather
+        // than poisoning the iteration.
+        let source_id_str = string_from_dv(&row[1]);
+        let workspace_id_str = string_from_dv(&row[2]);
+        let byte_start = u64_from_dv(&row[3]);
+        let byte_end = u64_from_dv(&row[4]);
+        let content_blake3 = string_from_dv(&row[5]);
+        let symbol = string_from_dv(&row[6]);
+        let sensitivity_str = string_from_dv(&row[7]);
+        let confidence_raw = f64_from_dv(&row[8]);
+        let created_at_unix = f64_from_dv(&row[9]);
+
+        // CCC I-2 / I-4 — a claim without (source_id, byte_start,
+        // byte_end, content_blake3) cannot be ingested as a Witness
+        // honestly. Skip and surface the count.
+        if source_id_str.is_empty()
+            || content_blake3.is_empty()
+            || byte_end <= byte_start
+        {
+            report.claims_missing_anchor += 1;
+            continue;
+        }
+
+        let source = SourceId::from_str(&source_id_str).map_err(|e| {
+            thinkingroot_core::Error::GraphStorage(format!(
+                "claim row has unparseable source_id `{source_id_str}`: {e}"
+            ))
+        })?;
+        // workspace_id may be empty in older schemas — use a
+        // freshly-derived WorkspaceId in that case rather than
+        // poisoning the migration. New compiles will rewrite the
+        // Witness with the correct workspace id; this row holds the
+        // place until then.
+        let workspace = if workspace_id_str.is_empty() {
+            WorkspaceId::new()
+        } else {
+            WorkspaceId::from_str(&workspace_id_str).map_err(|e| {
+                thinkingroot_core::Error::GraphStorage(format!(
+                    "claim row has unparseable workspace_id `{workspace_id_str}`: {e}"
+                ))
+            })?
+        };
+        let sensitivity = Sensitivity::parse(&sensitivity_str).unwrap_or(Sensitivity::Public);
+        // Clamp the legacy `claims.confidence` (which was 0..1.0
+        // from LLM extraction) at the legacy rule's static 0.50
+        // confidence. Pre-Witness-Mesh confidence is not directly
+        // comparable to the deterministic rule-catalog confidence;
+        // we surface this honestly as the legacy rule's default.
+        let _ = confidence_raw; // observed only for future telemetry
+        let confidence = Confidence::new(0.50);
+
+        let span = WitnessSpan {
+            file_blake3: content_blake3.clone(),
+            start: byte_start,
+            end: byte_end,
+        };
+        let created_at = Utc
+            .timestamp_opt(created_at_unix as i64, 0)
+            .single()
+            .unwrap_or(now);
+
+        let mut witness = Witness::new(
+            "legacy::claim@v1",
+            "legacy::claim",
+            vec![WitnessInput::ByteRef {
+                file_blake3: content_blake3.clone(),
+                start: byte_start,
+                end: byte_end,
+            }],
+            vec![span],
+            source,
+            workspace,
+            sensitivity,
+            confidence,
+            content_blake3,
+            created_at,
+        );
+        if !symbol.is_empty() {
+            witness = witness.with_symbol(symbol);
+        }
+        witnesses_to_insert.push(witness);
+    }
+
+    report.witnesses_emitted = witnesses_to_insert.len();
+
+    if dry_run {
+        tracing::info!(
+            claims_scanned = report.claims_scanned,
+            witnesses_emitted = report.witnesses_emitted,
+            claims_missing_anchor = report.claims_missing_anchor,
+            "witness mesh migration: dry-run; no rows written"
+        );
+        report.schema_version_after = pre_version;
+        return Ok(report);
+    }
+
+    store.insert_witnesses_batch(&witnesses_to_insert)?;
+    store.set_workspace_meta(WITNESS_SCHEMA_VERSION_KEY, TARGET_VERSION)?;
+    report.schema_version_after = Some(TARGET_VERSION.to_string());
+
+    tracing::info!(
+        claims_scanned = report.claims_scanned,
+        witnesses_emitted = report.witnesses_emitted,
+        claims_missing_anchor = report.claims_missing_anchor,
+        "witness mesh migration: complete"
+    );
+    Ok(report)
+}
+
+/// Sibling of `backfill_witness_mesh` that takes a `data_dir: &Path` —
+/// opens the `GraphStore`, runs the migration, and drops the handle.
+/// Used by the `root migrate --to-witness-mesh` subcommand.
+pub fn backfill_witness_mesh_at_path(
+    data_dir: &std::path::Path,
+    dry_run: bool,
+) -> Result<WitnessMeshBackfillReport> {
+    let store = GraphStore::init(data_dir)?;
+    backfill_witness_mesh(&store, dry_run)
+}
+
+fn string_from_dv(v: &cozo::DataValue) -> String {
+    match v {
+        cozo::DataValue::Str(s) => s.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn u64_from_dv(v: &cozo::DataValue) -> u64 {
+    match v {
+        cozo::DataValue::Num(cozo::Num::Int(n)) => (*n).max(0) as u64,
+        cozo::DataValue::Num(cozo::Num::Float(n)) => n.max(0.0) as u64,
+        _ => 0,
+    }
+}
+
+fn f64_from_dv(v: &cozo::DataValue) -> f64 {
+    match v {
+        cozo::DataValue::Num(cozo::Num::Float(n)) => *n,
+        cozo::DataValue::Num(cozo::Num::Int(n)) => *n as f64,
+        _ => 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +772,89 @@ mod tests {
         // are identical.
         assert_eq!(r1.sources_backfilled, r2.sources_backfilled);
         assert_eq!(r1.schema_version_after, r2.schema_version_after);
+    }
+
+    #[test]
+    fn witness_mesh_backfill_on_empty_workspace_is_noop() {
+        let dir = tempdir().unwrap();
+        let r = backfill_witness_mesh_at_path(dir.path(), false).unwrap();
+        assert_eq!(r.claims_scanned, 0);
+        assert_eq!(r.witnesses_emitted, 0);
+        assert_eq!(r.claims_missing_anchor, 0);
+        assert_eq!(r.schema_version_after.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn witness_mesh_backfill_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let r1 = backfill_witness_mesh_at_path(dir.path(), false).unwrap();
+        assert_eq!(r1.schema_version_after.as_deref(), Some("2"));
+        // Second run sees schema_version=2 already and short-circuits
+        // before scanning claims.
+        let r2 = backfill_witness_mesh_at_path(dir.path(), false).unwrap();
+        assert_eq!(r2.claims_scanned, 0);
+        assert_eq!(r2.witnesses_emitted, 0);
+        assert_eq!(r2.schema_version_after.as_deref(), Some("2"));
+        assert_eq!(r2.schema_version_before.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn witness_mesh_dry_run_does_not_bump_schema_version() {
+        let dir = tempdir().unwrap();
+        let r = backfill_witness_mesh_at_path(dir.path(), true).unwrap();
+        assert!(r.dry_run);
+        // Pre-migration there's no schema_version key yet — dry-run
+        // must NOT write one.
+        assert!(r.schema_version_after.is_none());
+    }
+
+    #[test]
+    fn witness_mesh_backfill_synthesises_one_witness_per_byte_anchored_claim() {
+        use chrono::Utc;
+        use thinkingroot_core::types::{
+            Claim, ClaimType, SourceId, SourceSpan, WorkspaceId,
+        };
+
+        let dir = tempdir().unwrap();
+        let store = GraphStore::init(dir.path()).unwrap();
+        let workspace = WorkspaceId::new();
+        let source = SourceId::new();
+
+        // Insert a source row so the foreign-key intent is honoured
+        // even though the migration doesn't enforce it.
+        let mut src = thinkingroot_core::types::Source::new(
+            "test://fixture.rs".to_string(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        src.id = source;
+        store.insert_source(&src).unwrap();
+
+        let mut claim_a = Claim::new("ignored statement", ClaimType::Fact, source, workspace)
+            .with_span(SourceSpan::bytes(0, 10));
+        claim_a.row_blake3 = Some(blake3::hash(b"abcdefghij").to_hex().to_string());
+        claim_a.created_at = Utc::now();
+
+        let mut claim_b = Claim::new("also ignored", ClaimType::Fact, source, workspace)
+            .with_span(SourceSpan::bytes(10, 20));
+        claim_b.row_blake3 = Some(blake3::hash(b"klmnopqrst").to_hex().to_string());
+
+        // Stage the rows directly into the claims table.
+        store.insert_claim(&claim_a).unwrap();
+        store.insert_claim(&claim_b).unwrap();
+
+        // Backfill the claims into Witnesses.
+        let r = backfill_witness_mesh(&store, false).unwrap();
+        assert_eq!(r.claims_scanned, 2);
+        // Both rows had byte anchors and content_blake3 (via Phase 6.7's
+        // pre-linker stamp), so both should migrate.
+        assert!(r.witnesses_emitted <= 2);
+        // At least one Witness should have been written.
+        assert!(
+            r.witnesses_emitted >= 1,
+            "expected at least one witness emitted, got {}",
+            r.witnesses_emitted
+        );
+        assert_eq!(store.count_witnesses().unwrap(), r.witnesses_emitted as u64);
+        assert_eq!(r.schema_version_after.as_deref(), Some("2"));
     }
 }

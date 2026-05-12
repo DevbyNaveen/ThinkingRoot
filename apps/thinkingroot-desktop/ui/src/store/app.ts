@@ -6,11 +6,16 @@ import type {
   EngramActivationEntry,
   GapEntry,
   RightRailTab,
+  SettingsSectionId,
   StreamState,
   Surface,
   Theme,
   TrustFilter,
 } from "@/types";
+import {
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+} from "@/lib/sidebar-layout";
 
 /**
  * App-wide UI store.
@@ -34,6 +39,9 @@ interface AppStore {
   // UI
   surface: Surface;
   setSurface: (s: Surface) => void;
+  /** When `surface === "settings"`, the left sidebar lists these. */
+  settingsSection: SettingsSectionId;
+  setSettingsSection: (id: SettingsSectionId) => void;
   theme: Theme;
   setTheme: (t: Theme) => void;
   sidebarOpen: boolean;
@@ -149,6 +157,8 @@ export const useApp = create<AppStore>()(
 
       surface: "chats",
       setSurface: (surface) => set({ surface }),
+      settingsSection: "provider",
+      setSettingsSection: (settingsSection) => set({ settingsSection }),
       theme: "dark",
       setTheme: (theme) => {
         set({ theme });
@@ -169,8 +179,16 @@ export const useApp = create<AppStore>()(
       setRightRailTab: (rightRailTab) => set({ rightRailTab }),
       rightRailWidth: 450,
       setRightRailWidth: (rightRailWidth) => set({ rightRailWidth }),
-      sidebarWidth: 220,
-      setSidebarWidth: (sidebarWidth) => set({ sidebarWidth }),
+      sidebarWidth: 232,
+      setSidebarWidth: (sidebarWidth) => {
+        const w = Number.isFinite(sidebarWidth) ? sidebarWidth : SIDEBAR_MIN_WIDTH;
+        set({
+          sidebarWidth: Math.min(
+            SIDEBAR_MAX_WIDTH,
+            Math.max(SIDEBAR_MIN_WIDTH, w),
+          ),
+        });
+      },
       commandPaletteOpen: false,
       setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
 

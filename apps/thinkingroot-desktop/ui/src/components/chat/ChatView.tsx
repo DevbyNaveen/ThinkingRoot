@@ -25,8 +25,6 @@ import {
   AlertTriangle,
   Hammer,
   Loader2,
-  Copy,
-  Share2,
 } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
@@ -60,7 +58,7 @@ import {
 import { BrainCitationParser, useBrainActivation } from "@/store/brain";
 import type { ChatMessage, EngramActivationEntry, GapEntry } from "@/types";
 import { BranchChip } from "./BranchChip";
-import { ClaimCard } from "./ClaimCard";
+import { LiveActivityStrip } from "./LiveActivityStrip";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { EngramTimeline } from "./EngramTimeline";
 import { GapCards } from "./GapCards";
@@ -735,24 +733,11 @@ export function ChatView() {
           ))}
           {streaming && (
             <li className="space-y-3">
-              {streaming.agentSteps.length > 0 && (
-                <div className="mx-auto w-full max-w-3xl">
-                  <div className="rounded-xl border border-border/60 bg-muted/20 p-2.5">
-                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
-                      Activity
-                    </div>
-                    <div className="space-y-1.5">
-                      {streaming.agentSteps.map((step) => (
-                        <ClaimCard
-                          key={step.id}
-                          step={step}
-                          workspace={activeWorkspace}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              )}
+              <LiveActivityStrip
+                steps={streaming.agentSteps}
+                workspace={activeWorkspace}
+                hasAnswer={streaming.partial.length > 0}
+              />
               {streaming.engramActivations.length > 0 && (
                 <div className="mx-auto w-full max-w-3xl">
                   <EngramTimeline
@@ -777,18 +762,19 @@ export function ChatView() {
                   pending
                 />
               )}
-              {streaming.partial.length === 0 &&
-                streaming.agentSteps.length === 0 && (
-                  <MessageBubble
-                    msg={{
-                      id: streaming.turnId,
-                      kind: "assistant",
-                      body: streaming.partial,
-                      at: streaming.startedAt,
-                    }}
-                    pending
-                  />
-                )}
+              {/* Option A: agent steps use dragonfly row inside LiveActivityStrip only — no duplicate ThinkingLoader */}
+              {streaming.partial.length === 0 && streaming.agentSteps.length === 0 && (
+                <MessageBubble
+                  msg={{
+                    id: streaming.turnId,
+                    kind: "assistant",
+                    body: streaming.partial,
+                    at: streaming.startedAt,
+                  }}
+                  pending
+                  pendingLabel="Searching your knowledge base..."
+                />
+              )}
             </li>
           )}
           <div ref={bottomRef} />
@@ -1069,52 +1055,53 @@ function AssistantMessageActions({ body }: { body: string }) {
         type="button"
         variant="ghost"
         size="sm"
-        className="h-7 gap-1.5 px-2 text-[11px] text-muted-foreground hover:text-foreground [&_svg]:size-3.5"
+        className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground"
         onClick={() => void copyAssistantMessage(body)}
       >
-        <Copy aria-hidden />
         Copy
       </Button>
       <Button
         type="button"
         variant="ghost"
         size="sm"
-        className="h-7 gap-1.5 px-2 text-[11px] text-muted-foreground hover:text-foreground [&_svg]:size-3.5"
+        className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground"
         onClick={() => void shareAssistantMessage(body)}
       >
-        <Share2 aria-hidden />
         Share
       </Button>
     </div>
   );
 }
 
-function ThinkingLoader() {
+function ThinkingLoader({ label = "Thinking" }: { label?: string }) {
   return (
-    <div className="flex h-12 items-center justify-start px-2" role="status" aria-label="Thinking">
+    <div className="flex h-12 items-center justify-start px-2" role="status" aria-label={label}>
       <div className="inline-flex items-center gap-2.5 py-1.5 text-xs text-muted-foreground">
         <span className="pixel-dragonfly" aria-hidden>
           <span className="pixel-dragonfly__wing pixel-dragonfly__wing--left" />
           <span className="pixel-dragonfly__wing pixel-dragonfly__wing--right" />
           <span className="pixel-dragonfly__body" />
         </span>
-        <span className="font-medium tracking-[0.01em]">Thinking</span>
-        <span className="pixel-thoughts" aria-hidden>
-          <span />
-          <span />
-          <span />
-        </span>
+        <span className="font-medium tracking-[0.01em]">{label}</span>
       </div>
     </div>
   );
 }
 
-function MessageBubble({ msg, pending }: { msg: ChatMessage; pending?: boolean }) {
+function MessageBubble({
+  msg,
+  pending,
+  pendingLabel,
+}: {
+  msg: ChatMessage;
+  pending?: boolean;
+  pendingLabel?: string;
+}) {
   const isUser = msg.kind === "user";
   const isThinking = pending && !msg.body && !isUser;
 
   if (isThinking) {
-    return <ThinkingLoader />;
+    return <ThinkingLoader label={pendingLabel} />;
   }
 
   // AI Message: No bubble, full width, rendered with Markdown
@@ -1339,16 +1326,20 @@ function Composer({
                 health={health}
                 workspace={workspace}
                 workspaceRootPath={workspaceRootPath}
-                openSettings={() => useApp.getState().setSurface("settings")}
+                openSettings={() => {
+                  useApp.getState().setSettingsSection("provider");
+                  useApp.getState().setSurface("settings");
+                }}
               />
             </div>
           )}
 
-          {/* Slash autocomplete */}
-          {slashQuery && (
-            <div className="px-4 pt-3">
+          {/* Slash autocomplete — anchored to textarea; opens up when composer is at bottom */}
+          <div className="relative w-full">
+            {slashQuery && (
               <SlashAutocomplete
                 query={slashQuery}
+                placement={isIdleCentered ? "below" : "above"}
                 onSelect={(insertion) => {
                   setText(insertion);
                   setSlashDismissed(false);
@@ -1356,10 +1347,7 @@ function Composer({
                 }}
                 onDismiss={() => setSlashDismissed(true)}
               />
-            </div>
-          )}
-
-          <div className="relative w-full">
+            )}
             {/* Textarea */}
             <textarea
               ref={textareaRef}

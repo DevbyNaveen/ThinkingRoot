@@ -16,7 +16,7 @@ rust-version.workspace  = true
 ## Enable vector/semantic search. Disable with --no-default-features to build
 ## lightweight test binaries that don't link fastembed + ONNX Runtime.
 default = ["vector"]
-vector = ["thinkingroot-graph/vector", "thinkingroot-branch/vector", "thinkingroot-ground/vector"]
+vector = ["thinkingroot-graph/vector", "thinkingroot-branch/vector"]
 ## Enable Sigstore keyless signing for the Grounded Diff Certificate
 ## (`intelligence::diff_cert::sign_statement_keyless`). Pulls in
 ## `sigstore-rs` + `reqwest` + `tokio` + `openidconnect` via

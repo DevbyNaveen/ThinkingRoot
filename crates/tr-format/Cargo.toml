@@ -1,12 +1,19 @@
 [package]
 name = "tr-format"
-version.workspace = true
+# Witness Mesh cutover bumps tr-format to 1.0.0 (semver MAJOR) to signal
+# the wire-format extension: `claims.jsonl` (v3) is joined by
+# `witnesses.cbor` + `rule_catalog.toml` for `tr/3.2` packs that carry
+# the new substrate. Consumers pinning 0.9.x read v3 packs only; 1.0.0
+# consumers read both v3 and the new v3.2 shape. The workspace
+# inheritance is intentionally overridden here — the other 21 in-tree
+# crates remain on `version.workspace = true` (0.9.1).
+version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Reader/writer for the v3 (`tr/3`) .tr portable knowledge pack format — three files (manifest.toml + source.tar.zst + claims.jsonl) plus an optional Sigstore signature.sig."
+description = "Reader/writer for the .tr portable knowledge pack format — v3 (`tr/3`: manifest.toml + source.tar.zst + claims.jsonl + optional signature.sig) + v3.2 Witness Mesh extension (witnesses.cbor + rule_catalog.toml)."
 
 [lib]
 name = "tr_format"
@@ -25,6 +32,12 @@ tracing = { workspace = true }
 # source-of-truth function (D7 from the v3 implementation plan) rather
 # than depending on upstream toml crate ordering decisions.
 toml = { workspace = true }
+# v3.2 Witness Mesh `witnesses.cbor` encoder — `ciborium` produces
+# canonical CBOR (RFC 7049 §3.9 deterministic encoding: shortest int
+# form, sorted map keys, no indefinite-length items). The
+# `into_writer` path is byte-deterministic across processes given
+# the same sorted input vec.
+ciborium = "0.2"
 # Sigstore bundle types and offline DSSE verification — used by the v3
 # writer's `build_signed` and the v3 reader to expose a parsed
 # `SigstoreBundle` to consumers.

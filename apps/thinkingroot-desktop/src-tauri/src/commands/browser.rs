@@ -28,6 +28,33 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// User-agent the embedded WebView reports to every site.
+///
+/// We default to an iPad Safari UA so major sites (Google, Twitter,
+/// LinkedIn, Notion, Reddit, YouTube, GitHub) serve their responsive
+/// layout that adapts to the panel width. Their desktop layouts are
+/// fixed-width column grids designed for 1200 px+ viewports — at our
+/// ~700 px right-rail width they leave huge dead gutters of
+/// whitespace and the content collapses against the right edge.
+///
+/// iPad-class UAs are the sweet spot vs full-mobile: sites still
+/// serve desktop-grade JS, full-resolution images, and the same
+/// hover/click event model the chrome expects. They just route to a
+/// layout grid that respects the actual viewport width.
+///
+/// The UA also wins three other things almost for free:
+/// - **YouTube serves the same player** as on iPadOS Safari, which
+///   exposes PiP + fullscreen via standard HTML5 APIs.
+/// - **CAPTCHAs treat us as a real client** (mobile Safari is a
+///   first-class supported environment for hCaptcha / reCAPTCHA).
+/// - **No "you should use the desktop app" upsells**, because the
+///   site already thinks we're a mobile-class browser.
+///
+/// If a specific site refuses to serve content to iPad UAs (rare —
+/// usually old enterprise SSO pages), the user can open it
+/// externally via the "Open externally" button.
+const RESPONSIVE_USER_AGENT: &str = "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/604.1";
+
 /// Logical-pixel bounds relative to the parent Tauri window.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct BrowserBounds {
@@ -100,7 +127,7 @@ fn event_topic(id: &str) -> String {
 /// Normalize human URL-bar input:
 /// - `cursor.com` -> `https://cursor.com`
 /// - `localhost:1420` -> `http://localhost:1420`
-/// - words/spaces -> DuckDuckGo search URL
+/// - words/spaces -> Google search URL
 /// - `http://` allowed only for loopback/local dev hosts
 fn normalize_url(input: &str) -> Result<Url, String> {
     let trimmed = input.trim();
@@ -116,7 +143,7 @@ fn normalize_url(input: &str) -> Result<Url, String> {
         format!("https://{trimmed}")
     } else {
         let encoded: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
-        format!("https://duckduckgo.com/?q={encoded}")
+        format!("https://www.google.com/search?q={encoded}")
     };
 
     let url = Url::parse(&candidate).map_err(|e| format!("parse `{candidate}`: {e}"))?;
@@ -175,6 +202,7 @@ pub async fn browser_open(
     let topic_for_download = topic.clone();
 
     let builder = WebviewBuilder::new(&label, WebviewUrl::External(url.clone()))
+        .user_agent(RESPONSIVE_USER_AGENT)
         .on_navigation({
             let app = app.clone();
             let topic = topic.clone();
@@ -357,6 +385,123 @@ pub async fn browser_close(state: State<'_, AppState>, id: String) -> Result<(),
 pub async fn browser_list(state: State<'_, AppState>) -> Result<Vec<BrowserSessionInfo>, String> {
     let map = state.browsers.read().await;
     Ok(map.values().map(|s| s.info.clone()).collect())
+}
+
+/// Open or close the WebView Inspector for a tab.
+///
+/// Tauri's `open_devtools` / `close_devtools` / `is_devtools_open`
+/// are gated on the `devtools` Cargo feature *of the tauri crate*,
+/// which we enable unconditionally in `Cargo.toml`. So the inspector
+/// is available in both debug and release builds — it's a
+/// first-class browser surface, not a debug-only convenience.
+#[tauri::command]
+pub async fn browser_devtools(
+    state: State<'_, AppState>,
+    id: String,
+    open: bool,
+) -> Result<bool, String> {
+    let session = get_session(&state, &id).await?;
+    if open {
+        session.webview.open_devtools();
+    } else {
+        session.webview.close_devtools();
+    }
+    Ok(session.webview.is_devtools_open())
+}
+
+/// Find-in-page using the legacy `window.find()` API.
+///
+/// `window.find()` is non-standard but supported in WebKit
+/// (macOS/iOS), Chromium (Windows WebView2), and WebKitGTK. It scrolls
+/// to and selects the next/previous occurrence, returning a boolean
+/// for "any match found." We don't compute match count here — that
+/// would require a content-script DOM walk; instead the UI polls by
+/// repeatedly calling forward until `false` if it wants a count.
+///
+/// `query` is JSON-encoded into the eval string so single quotes,
+/// backslashes, and Unicode all survive.
+#[tauri::command]
+pub async fn browser_find(
+    state: State<'_, AppState>,
+    id: String,
+    query: String,
+    case_sensitive: bool,
+    backwards: bool,
+) -> Result<(), String> {
+    let session = get_session(&state, &id).await?;
+    let query_json = serde_json::to_string(&query)
+        .map_err(|e| format!("encode find query: {e}"))?;
+    // window.find(searchString, caseSensitive, backwards, wrapAround,
+    //   wholeWord, searchInFrames, showDialog)
+    let js = format!(
+        "window.find({query_json}, {case}, {back}, true, false, true, false);",
+        case = case_sensitive,
+        back = backwards
+    );
+    session
+        .webview
+        .eval(&js)
+        .map_err(|e| format!("find-in-page: {e}"))
+}
+
+/// Clear find-in-page highlights by collapsing the current selection.
+#[tauri::command]
+pub async fn browser_find_clear(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let session = get_session(&state, &id).await?;
+    session
+        .webview
+        .eval("window.getSelection()?.removeAllRanges();")
+        .map_err(|e| format!("clear find: {e}"))
+}
+
+/// Set the WebView zoom factor (1.0 = 100%). Clamped to a sensible
+/// range so the chrome buttons can't drive the page to an unreadable
+/// size by accident.
+#[tauri::command]
+pub async fn browser_zoom(
+    state: State<'_, AppState>,
+    id: String,
+    factor: f64,
+) -> Result<f64, String> {
+    let clamped = factor.clamp(0.25, 5.0);
+    let session = get_session(&state, &id).await?;
+    session
+        .webview
+        .set_zoom(clamped)
+        .map_err(|e| format!("set zoom: {e}"))?;
+    Ok(clamped)
+}
+
+/// Open the native print dialog. Users can choose "Save as PDF" from
+/// the OS dialog — we don't expose a separate PDF API because every
+/// platform's print sheet already does it (and ships a save-location
+/// picker we don't have to reimplement).
+#[tauri::command]
+pub async fn browser_print(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let session = get_session(&state, &id).await?;
+    session
+        .webview
+        .print()
+        .map_err(|e| format!("print: {e}"))
+}
+
+/// Scroll the active tab's document to an absolute (x, y) position.
+/// Used by chat-citation click-through to jump to the byte-range
+/// origin of a Witness once the page is loaded.
+#[tauri::command]
+pub async fn browser_scroll_to(
+    state: State<'_, AppState>,
+    id: String,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    let session = get_session(&state, &id).await?;
+    session
+        .webview
+        .eval(&format!(
+            "window.scrollTo({{ left: {x}, top: {y}, behavior: 'smooth' }});"
+        ))
+        .map_err(|e| format!("scroll-to: {e}"))
 }
 
 pub async fn shutdown_all(app: &AppHandle) {

@@ -226,6 +226,83 @@ const PackXRay = () => {
   );
 };
 
+// Screenshot Showcase Component
+const ScreenshotShowcase = () => {
+  return (
+    <div className="showcase-container">
+      <div className="showcase-item reveal">
+        <div className="showcase-text">
+          <h3>The Knowledge Compiler Engine</h3>
+          <p>Not just vector embeddings. ThinkingRoot parses your entire workspace through a multi-phase compilation process. Notice the terminal: 6,249 files distilled into 5,187 nodes and 34,482 Datalog relationships in under 90 seconds.</p>
+        </div>
+        <div className="showcase-image-wrapper glass-frame">
+          <img src="/screenshots/compilation.png" alt="Knowledge Compiler Execution" className="showcase-img" />
+        </div>
+      </div>
+      
+      <div className="showcase-item reverse reveal delay-1">
+        <div className="showcase-text">
+          <h3>Cross-Context Code Analysis</h3>
+          <p>True semantic understanding. Here, the system identifies a critical contradiction between a README file (claiming 310,000 iterations) and the actual Java source code (180,000 iterations) in CipherVault, mapped directly onto the knowledge graph.</p>
+        </div>
+        <div className="showcase-image-wrapper glass-frame">
+          <img src="/screenshots/ciphervault_contradiction.png" alt="Codebase Anomaly Detection and File Explorer" className="showcase-img" />
+        </div>
+      </div>
+
+      <div className="showcase-item reveal delay-2">
+        <div className="showcase-text">
+          <h3>Autonomous Agent Integration</h3>
+          <p>MCP is the plug. ThinkingRoot is the brain. Watch as Claude Code connects directly to the ThinkingRoot daemon, gaining instant, hallucination-free context of the entire repository without needing to read thousands of files manually.</p>
+        </div>
+        <div className="showcase-image-wrapper glass-frame">
+          <img src="/screenshots/ciphervault_agent.png" alt="Autonomous Agent Integration via MCP" className="showcase-img" />
+        </div>
+      </div>
+      
+      <div className="showcase-item reverse reveal delay-3">
+        <div className="showcase-text">
+          <h3>Embedded Context & Grounding</h3>
+          <p>Every response is verifiable. The transparent reasoning trace and "Grounded" claims pill ensure zero hallucination, while the embedded DuckDuckGo browser allows seamless external web search alongside your cryptographic .tr pack.</p>
+        </div>
+        <div className="showcase-image-wrapper glass-frame">
+          <img src="/screenshots/grounding_browser.png" alt="Cryptographic Grounding and Embedded Browser" className="showcase-img" />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// AEP Report Component
+const AEPReportShowcase = () => {
+  return (
+    <div className="report-container reveal">
+      <h3 className="section-eyebrow" style={{textAlign: 'center'}}>Case Study: The Knowledge Tax</h3>
+      <h2 className="statement-text" style={{fontSize: '2.5rem', marginBottom: '4rem', textAlign: 'center'}}>
+        Manual Audit vs. <span className="text-accent">ThinkingRoot AEP</span>
+      </h2>
+      <div className="report-grid">
+         <div className="report-column">
+            <div className="report-image-wrapper glass-frame">
+               <img src="/screenshots/report_without_mcp.png" alt="Analysis Without MCP" className="report-img" />
+            </div>
+            <div className="report-image-wrapper glass-frame" style={{marginTop: '2rem'}}>
+               <img src="/screenshots/report_metrics.png" alt="Comparison Metrics" className="report-img" />
+            </div>
+         </div>
+         <div className="report-column" style={{marginTop: '4rem'}}>
+            <div className="report-image-wrapper glass-frame">
+               <img src="/screenshots/report_summary.png" alt="Analysis Summary" className="report-img" />
+            </div>
+            <div className="report-image-wrapper glass-frame" style={{marginTop: '2rem'}}>
+               <img src="/screenshots/report_verdict.png" alt="Final Verdict" className="report-img" />
+            </div>
+         </div>
+      </div>
+    </div>
+  );
+};
+
 function App() {
   useEffect(() => {
     const observer = new IntersectionObserver((entries) => {
@@ -258,42 +335,106 @@ function App() {
       <main className="content-flow">
         {/* HERO SEQUENCE */}
         <section className="scroll-section hero-sequence">
-          <h1 className="hero-massive reveal">
-            <span className="hero-line">MCP DEFINES TOOLS.</span>
-            <span className="hero-line offset-line text-accent">WE DEFINE KNOWLEDGE.</span>
+          <div className="hero-metadata reveal">
+            <span className="metadata-item">STATUS: <span className="status-glow">COMPILED</span></span>
+            <span className="metadata-divider">//</span>
+            <span className="metadata-item">FORMAT: <span className="text-accent">.ZIP FOR AI KNOWLEDGE</span></span>
+            <span className="metadata-divider">//</span>
+            <span className="metadata-item">ARCH: TR-1.0-STABLE</span>
+          </div>
+          <h1 className="hero-massive reveal delay-1">
+            <span className="hero-line">THE SECONDARY BRAIN FOR</span>
+            <span className="hero-line offset-line text-accent">AUTONOMOUS AI AGENTS.</span>
           </h1>
           <p className="hero-sub reveal delay-2">
-            Every AI tool builds its own private brain. When you switch, you lose everything.
+            We don't just store data. We compile knowledge.
             ThinkingRoot is the open protocol that packs your sources into a content-addressed, 
             Sigstore-signed format.
           </p>
           <div className="cta-flow reveal delay-3">
-            <button className="pill-button" onClick={() => navigator.clipboard.writeText('cargo install thinkingroot-cli')}>
-              <Terminal size={18} /> cargo install thinkingroot-cli
-            </button>
+            <a href="https://github.com/DevbyNaveen/ThinkingRoot" target="_blank" rel="noreferrer" className="pill-button" style={{textDecoration: 'none'}}>
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.03c3.15-.38 6.5-1.4 6.5-7.1a5.8 5.8 0 0 0-1.5-3.8 5.4 5.4 0 0 0 .15-3.8s-1.2-.38-3.9 1.4a13.3 13.3 0 0 0-7 0C6.2 1.6 5 2 5 2a5.4 5.4 0 0 0 .15 3.8A5.8 5.8 0 0 0 3 9.6c0 5.7 3.3 6.7 6.5 7.1a4.8 4.8 0 0 0-1 3.03v4"></path>
+                <path d="M9 20a4.8 4.8 0 0 1-5-1.5"></path>
+              </svg> View on GitHub
+            </a>
           </div>
         </section>
 
-        {/* DATA / MARKET SEQUENCE */}
+        {/* FEATURES / COMPILER SEQUENCE */}
         <section className="scroll-section data-sequence">
+          <h3 className="section-eyebrow reveal">The Knowledge Compiler</h3>
           <div className="data-grid">
             <div className="data-block reveal">
-              <span className="data-number">98<span className="data-unit">ms</span></span>
-              <span className="data-label">p95 Compile Latency</span>
+              <span className="data-number">Graph + Vector</span>
+              <span className="data-label">Hybrid Retrieval</span>
             </div>
             <div className="data-block reveal delay-1">
-              <span className="data-number">22</span>
-              <span className="data-label">Rust Crates. Zero Stubs.</span>
+              <span className="data-number">100%</span>
+              <span className="data-label">Grounded & Provable</span>
             </div>
             <div className="data-block reveal delay-2">
-              <span className="data-number">Aug 2</span>
-              <span className="data-label">2026 EU AI Act Deadline</span>
+              <span className="data-number">Sub-ms</span>
+              <span className="data-label">Speeds via AEP/Engrams</span>
             </div>
           </div>
           <h2 className="statement-text reveal">
-            Machine-readable provenance is now a legal requirement. 
-            <br/><span className="text-accent">We are the compliance substrate.</span>
+            Less tokens · more signal. <br/>
+            <span className="text-accent">We don't make the model bigger. We make its context smarter.</span>
           </h2>
+        </section>
+
+        {/* GIT FOR KNOWLEDGE SEQUENCE */}
+        <section className="scroll-section architecture-sequence">
+          <h3 className="section-eyebrow reveal">Git For Knowledge</h3>
+          <div className="branch-grid reveal delay-1">
+             <div className="branch-card glass-frame">
+                <h4>Main Branch</h4>
+                <p>Trusted team knowledge</p>
+             </div>
+             <div className="branch-card glass-frame">
+                <h4>Normal Branch</h4>
+                <p>Experiments · reviews · proposals</p>
+             </div>
+             <div className="branch-card glass-frame">
+                <h4>Stream Branch</h4>
+                <p>Live AI session memory</p>
+             </div>
+          </div>
+          <h2 className="statement-text reveal delay-2" style={{marginTop: '4rem'}}>
+            AI memory needs version control.
+          </h2>
+        </section>
+
+        {/* SCREENSHOT SHOWCASE */}
+        <section className="scroll-section showcase-sequence">
+          <h3 className="section-eyebrow reveal" style={{textAlign: 'center', marginBottom: '4rem'}}>Not just a concept. A working engine.</h3>
+          <ScreenshotShowcase />
+        </section>
+
+        {/* AEP REPORT SHOWCASE */}
+        <section className="scroll-section aep-report-sequence" style={{paddingTop: '0'}}>
+          <AEPReportShowcase />
+        </section>
+
+        {/* ANY AI CAN PLUG IN / METRICS */}
+        <section className="scroll-section integration-sequence">
+           <h3 className="section-eyebrow reveal">Any AI Can Plug In</h3>
+           <p className="integration-text reveal delay-1" style={{fontSize: '1.5rem', color: 'var(--color-text-secondary)', marginBottom: '2rem'}}>
+             CLI · Desktop · REST · MCP <br/>
+             Python · TypeScript · Cloud
+           </p>
+           <h2 className="statement-text reveal delay-2">
+            MCP is the plug. <span className="text-accent">ThinkingRoot is the brain.</span><br/>
+            One knowledge layer. Any AI.
+          </h2>
+          <div className="metrics-grid reveal delay-3" style={{marginTop: '4rem'}}>
+             <div className="metric-item glass-frame"><strong>91.2%</strong> LongMemEval-500</div>
+             <div className="metric-item glass-frame"><strong>0.117ms</strong> p95 retrieval</div>
+             <div className="metric-item glass-frame"><strong>10,000</strong> concurrent agents</div>
+             <div className="metric-item glass-frame"><strong>.tr</strong> portability</div>
+             <div className="metric-item glass-frame"><strong>MCP</strong> compatible</div>
+          </div>
         </section>
 
         {/* TRIBUNAL SEQUENCE (Interactive) */}
@@ -304,13 +445,21 @@ function App() {
         {/* TR PROTOCOL VISUALIZER - X-RAY */}
         <section className="scroll-section protocol-sequence">
           <h3 className="section-eyebrow reveal">The .tr Knowledge Pack</h3>
-          <h2 className="statement-text reveal mb-4">
-            We extract truth. <br/>
-            <span className="text-accent">Hover to see how.</span>
-          </h2>
           <div className="reveal delay-1">
              <PackXRay />
           </div>
+        </section>
+
+        {/* CONCLUSION */}
+        <section className="scroll-section conclusion-sequence" style={{textAlign: 'center'}}>
+           <h2 className="statement-text massive-statement reveal" style={{fontSize: '4rem'}}>
+             Code travels in Git.<br/>
+             Models travel on HuggingFace.<br/>
+             <span className="text-accent">Knowledge travels in .tr.</span>
+           </h2>
+           <p className="hero-sub reveal delay-1" style={{margin: '4rem auto'}}>
+             We believe AI memory should belong to users and teams, not platforms.
+           </p>
         </section>
 
       </main>

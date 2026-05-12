@@ -141,6 +141,33 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                 }
             },
             {
+                "name": "list_witnesses",
+                "description": "List Witnesses from the new Witness Mesh substrate (rule-catalog produced, byte-grounded, content-addressed). Each Witness is the deterministic output of a named rule applied to source bytes — no LLM paraphrase, no grounding tribunal. Use when you want to read the v1.0 substrate directly: `// @claim` annotations, rustdoc/jsdoc tags, test assertions, opt-in invariants. Filter by `rule` to scope to one catalog rule (e.g. `comment::@claim@v1`). Returns Witness rows with content_blake3, spans, and rule provenance. Distinct from `query_claims` which reads the legacy LLM-extracted substrate.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name from the mount config." },
+                        "rule":      { "type": "string", "description": "Optional catalog rule name to filter by (e.g. `comment::@claim@v1`, `tree-sitter::function-decl@v1`, `cargo-test::assertion@v1`). Omit to list every Witness." },
+                        "limit":     { "type": "integer", "default": 100, "description": "Max Witnesses to return. Default 100. No upper bound — the substrate fits in memory for v1.0 workspaces." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "walk_mesh",
+                "description": "Walk the Witness Mesh DAG from a starting Witness id. Returns every Witness reachable within `max_depth` hops via `witness_input_edges` plus the edges that connect them — i.e. the full derivation chain: which rule produced this Witness, which Witnesses it derives from, what sibling Witnesses share its inputs. Use this when `list_witnesses` returned a Witness whose context matters (e.g. a `comment::SAFETY@v1` Witness — walk to find the parent `tree-sitter::unsafe-block@v1` it justifies). Cheap (Datalog traversal on the indexed edges table; no LLM, no embedding lookup). Returns `{ witnesses: [...], edges: [[parent, child], ...] }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string", "description": "Workspace name." },
+                        "witness_id":  { "type": "string", "description": "64-char lower-hex BLAKE3 id of the starting Witness (from `list_witnesses` or `search` results)." },
+                        "max_depth":   { "type": "integer", "default": 4, "description": "Maximum hops from the starting Witness. 0 = just the starting Witness, no edges. 4 is the v1.0 default (matches the spec's `walk_mesh` bound). Bound: 0–10." },
+                        "max_fanout":  { "type": "integer", "default": 50, "description": "Maximum edges followed per node. Caps pathological meshes (a Witness with thousands of children) at a tractable response size. Bound: 1–200." }
+                    },
+                    "required": ["workspace", "witness_id"]
+                }
+            },
+            {
                 "name": "get_relations",
                 "description": "Return every relation edge incident on a specific entity — both inbound (e.g. 'X is called by Y') and outbound (e.g. 'X depends on Z'). Use when you need to understand how an entity connects to the rest of the substrate: who calls it, what it calls, what it inherits from, what depends on it. Most useful as a follow-up to `search` once you have an entity name.",
                 "inputSchema": {
@@ -861,6 +888,73 @@ pub async fn handle_call(
                 .await
             {
                 Ok(claims) => mcp_text_result(id, &claims),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        // ── Witness Mesh — list witnesses by workspace ─────────────────
+        "list_witnesses" => {
+            let rule_filter: Option<String> = arguments
+                .get("rule")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let limit: Option<usize> = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            match engine.list_witnesses(ws, limit).await {
+                Ok(mut witnesses) => {
+                    if let Some(rule_name) = &rule_filter {
+                        witnesses.retain(|w| &w.rule == rule_name);
+                    }
+                    mcp_text_result(id, &witnesses)
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        // ── Witness Mesh — walk DAG from a starting Witness ────────────
+        "walk_mesh" => {
+            let witness_id = match arguments.get("witness_id").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "walk_mesh: missing required `witness_id` argument".to_string(),
+                    );
+                }
+            };
+            // Clamp depth + fanout to safe bounds per the tool
+            // descriptor. Surface clamps in the response so the
+            // caller can tell when their value was tightened.
+            let raw_depth = arguments
+                .get("max_depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4) as usize;
+            let max_depth = raw_depth.min(10);
+            let raw_fanout = arguments
+                .get("max_fanout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as usize;
+            let max_fanout = raw_fanout.clamp(1, 200);
+            match engine
+                .walk_witness_mesh(ws, &witness_id, max_depth, max_fanout)
+                .await
+            {
+                Ok((witnesses, edges)) => {
+                    let payload = serde_json::json!({
+                        "witnesses": witnesses,
+                        "edges": edges.iter().map(|(p, c)| {
+                            serde_json::json!({ "parent": p, "child": c })
+                        }).collect::<Vec<_>>(),
+                        "max_depth": max_depth,
+                        "max_fanout": max_fanout,
+                        "depth_clamped": raw_depth > max_depth,
+                        "fanout_clamped": raw_fanout != max_fanout,
+                    });
+                    mcp_text_result(id, &payload)
+                }
                 Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
             }
         }
@@ -2566,6 +2660,108 @@ pub fn parse_probe_kind_str(s: &str) -> Option<crate::intelligence::engram::Prob
         "comparative" => Some(ProbeKind::Comparative),
         "counterfactual" => Some(ProbeKind::Counterfactual),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod witness_tool_listing_tests {
+    use super::handle_list;
+
+    #[tokio::test]
+    async fn list_witnesses_tool_is_advertised() {
+        let resp = handle_list(None).await;
+        // `JsonRpcResponse::success` stores the payload in `result`;
+        // navigate to `tools` and look for our entry.
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"list_witnesses"),
+            "expected list_witnesses tool to be advertised; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_witnesses_tool_declares_workspace_required() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let descriptor = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("list_witnesses"))
+            .expect("list_witnesses tool present");
+        let schema = descriptor
+            .get("inputSchema")
+            .expect("schema present");
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array present");
+        let required_names: Vec<&str> = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required_names.contains(&"workspace"),
+            "expected `workspace` to be required for list_witnesses; got {required_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_mesh_tool_is_advertised() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"walk_mesh"),
+            "expected walk_mesh tool to be advertised; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_mesh_tool_requires_witness_id() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let descriptor = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("walk_mesh"))
+            .expect("walk_mesh tool present");
+        let required: Vec<&str> = descriptor
+            .get("inputSchema")
+            .and_then(|s| s.get("required"))
+            .and_then(|v| v.as_array())
+            .expect("required array present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            required.contains(&"workspace"),
+            "walk_mesh requires `workspace`; got {required:?}"
+        );
+        assert!(
+            required.contains(&"witness_id"),
+            "walk_mesh requires `witness_id`; got {required:?}"
+        );
     }
 }
 

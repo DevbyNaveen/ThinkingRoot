@@ -32,20 +32,41 @@ pub const FORMAT_VERSION_V3: &str = "tr/3";
 /// `tr/3` manifest through v3.1 code emits identical canonical bytes.
 pub const FORMAT_VERSION_V31: &str = "tr/3.1";
 
+/// v3.2 format identifier — `"tr/3.2"`. The Witness Mesh additive
+/// bump. Backward-compatible: `tr/3` and `tr/3.1` readers accept v3.2
+/// packs (the new members are extra files; the old `claims.jsonl` +
+/// `manifest.toml` + `source.tar.zst` shape is unchanged). v3.2-aware
+/// readers gain access to:
+///
+/// - `witnesses.cbor` — the Witness Mesh substrate produced by the
+///   rule catalog. CBOR-canonical sort, deterministic across
+///   processes.
+/// - `rule_catalog.toml` — the versioned rule catalog the witnesses
+///   reference. Its BLAKE3 is recorded in
+///   `derived_hashes` so a tampered catalog fails `tr-verify`.
+///
+/// A v3.2 pack manifest's `derived_hashes` allow-list adds two new
+/// `kind` entries: `"witnesses.cbor.blake3"` and
+/// `"rule_catalog.toml.blake3"`.
+pub const FORMAT_VERSION_V32: &str = "tr/3.2";
+
 /// Latest format version emitted by this crate's writer. Consumers
 /// that want to pin against the most recent published format should
 /// use this alias rather than hard-coding the literal string.
-pub const FORMAT_VERSION_LATEST: &str = FORMAT_VERSION_V31;
+pub const FORMAT_VERSION_LATEST: &str = FORMAT_VERSION_V32;
 
-/// Allow-list of `derived_hashes[].kind` values per spec §3.2 v3.1.
-/// Anything outside this list is refused at [`ManifestV3::validate`]
-/// time so the field can never be used as a free-form annotation
-/// channel. Add new values here only when the matching extractor
-/// surface ships in the engine.
+/// Allow-list of `derived_hashes[].kind` values per spec §3.2 v3.1
+/// and the v3.2 Witness Mesh extension. Anything outside this list
+/// is refused at [`ManifestV3::validate`] time so the field can
+/// never be used as a free-form annotation channel. Add new values
+/// here only when the matching extractor surface ships in the engine.
 pub const DERIVED_HASH_KINDS: &[&str] = &[
     "thumbnail.blake3",
     "transcript.blake3",
     "summary.blake3",
+    // ── tr/3.2 Witness Mesh extension ──
+    "witnesses.cbor.blake3",
+    "rule_catalog.toml.blake3",
 ];
 
 /// The v3 manifest. Carried as `manifest.toml` inside `package.tr`.
@@ -206,20 +227,25 @@ impl ManifestV3 {
     }
 
     /// Validate every structural invariant on the reader path:
-    /// `format_version` ∈ {`tr/3`, `tr/3.1`}, well-formed `name`/`version`,
-    /// hash fields are either empty (during pack assembly) or
-    /// `blake3:<64-lowercase-hex>`, and consistent counts. v3.1-only
-    /// fields (`sources`, `author_key_id`) are rejected on `tr/3` so a
-    /// v3 declaration cannot smuggle in features that require the bump.
+    /// `format_version` ∈ {`tr/3`, `tr/3.1`, `tr/3.2`}, well-formed
+    /// `name`/`version`, hash fields are either empty (during pack
+    /// assembly) or `blake3:<64-lowercase-hex>`, and consistent
+    /// counts. v3.1-only fields (`sources`, `author_key_id`) are
+    /// rejected on `tr/3` so a v3 declaration cannot smuggle in
+    /// features that require the bump.
     pub fn validate(&self) -> Result<()> {
+        // `is_v31` covers BOTH `tr/3.1` AND `tr/3.2` — v3.2 is a
+        // strict additive bump of v3.1 (extra files in the tarball,
+        // no new manifest fields), so every v3.1 invariant carries
+        // forward verbatim.
         let is_v31 = match self.format_version.as_str() {
             FORMAT_VERSION_V3 => false,
-            FORMAT_VERSION_V31 => true,
+            FORMAT_VERSION_V31 | FORMAT_VERSION_V32 => true,
             other => {
                 return Err(Error::Invalid {
                     what: "manifest.toml",
                     detail: format!(
-                        "format_version must be `{FORMAT_VERSION_V3}` or `{FORMAT_VERSION_V31}`, got `{other}`"
+                        "format_version must be `{FORMAT_VERSION_V3}`, `{FORMAT_VERSION_V31}`, or `{FORMAT_VERSION_V32}`, got `{other}`"
                     ),
                 });
             }

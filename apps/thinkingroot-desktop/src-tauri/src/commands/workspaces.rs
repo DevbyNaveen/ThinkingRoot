@@ -186,6 +186,34 @@ pub enum CompileProgress {
     Started {
         workspace: String,
     },
+    /// Unified compile-progress snapshot — emitted every 250 ms by the
+    /// daemon ticker while a compile is live. **This is the single
+    /// canonical progress event** new UI surfaces should render. The
+    /// per-phase variants below (`ParseComplete`, `ExtractionProgress`,
+    /// …) are kept for back-compat with the existing React multi-bar
+    /// component until that migrates to a single-bar rendering of
+    /// `Tick`.
+    Tick {
+        /// User-facing step. One of: `reading`, `extracting`,
+        /// `linking`, `persisting`, `packing`. Steps can repeat
+        /// across a single compile (e.g. Linking → Persisting →
+        /// Linking) — render the current step, never gate on
+        /// "have we passed step N".
+        step: String,
+        /// Human-readable step label (e.g. `"Linking"`).
+        step_label: String,
+        /// Step-local counter. 0 when total is also 0.
+        done: u64,
+        /// Step-local total. 0 means "indeterminate; show spinner".
+        total: u64,
+        /// Wall-clock since the current step started (ms).
+        step_elapsed_ms: u64,
+        /// Wall-clock since the compile started (ms).
+        total_elapsed_ms: u64,
+        /// Daemon-computed ETA for the current step (ms). `None` when
+        /// total is unknown or done is 0.
+        eta_ms: Option<u64>,
+    },
     /// Emitted while the compile task is waiting for the bundled
     /// `root` sidecar to finish booting (livez probe + child-process
     /// liveness).  Pre-fix the user's "Compile" click sat silent for
@@ -829,6 +857,24 @@ pub async fn workspace_readme(app: AppHandle) -> Result<String, String> {
 
 fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgress> {
     match event {
+        // The unified ticker event — single canonical path. Mapped
+        // first so it's the cheapest match in the hot loop (one tick
+        // every 250 ms, vs the per-row legacy events below).
+        ProgressEvent::CompileTick(tick) => Some(CompileProgress::Tick {
+            step: match tick.step {
+                thinkingroot_core::CompileStep::Reading => "reading".into(),
+                thinkingroot_core::CompileStep::Extracting => "extracting".into(),
+                thinkingroot_core::CompileStep::Linking => "linking".into(),
+                thinkingroot_core::CompileStep::Persisting => "persisting".into(),
+                thinkingroot_core::CompileStep::Packing => "packing".into(),
+            },
+            step_label: tick.step.label().to_string(),
+            done: tick.done,
+            total: tick.total,
+            step_elapsed_ms: tick.step_elapsed_ms,
+            total_elapsed_ms: tick.total_elapsed_ms,
+            eta_ms: tick.eta_ms,
+        }),
         ProgressEvent::DiffStart => Some(CompileProgress::DiffStart),
         ProgressEvent::DiffComplete {
             changed,

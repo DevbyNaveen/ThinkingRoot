@@ -81,9 +81,7 @@ export function ReasoningTrace({ steps }: ReasoningTraceProps) {
         onClick={() => setOpen((o) => !o)}
         className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted/20"
         aria-expanded={open}
-        aria-label={
-          open ? "Hide reasoning trace" : "Show reasoning trace"
-        }
+        aria-label={open ? "Hide evidence trail" : "Show evidence trail"}
       >
         {open ? (
           <ChevronDown className="h-3 w-3 flex-shrink-0" aria-hidden />
@@ -91,7 +89,7 @@ export function ReasoningTrace({ steps }: ReasoningTraceProps) {
           <ChevronRight className="h-3 w-3 flex-shrink-0" aria-hidden />
         )}
         <ListTree className="h-3 w-3 flex-shrink-0 text-muted-foreground" aria-hidden />
-        <span className="font-semibold text-muted-foreground">Reasoning trace</span>
+        <span className="font-semibold text-muted-foreground">Evidence trail</span>
         <span className="text-muted-foreground/70">
           {steps.length} tool call{steps.length === 1 ? "" : "s"} ·{" "}
           {finishedCount} ok

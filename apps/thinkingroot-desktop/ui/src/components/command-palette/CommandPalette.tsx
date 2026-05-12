@@ -17,6 +17,7 @@ export function CommandPalette() {
   const open = useApp((s) => s.commandPaletteOpen);
   const setOpen = useApp((s) => s.setCommandPaletteOpen);
   const setSurface = useApp((s) => s.setSurface);
+  const setSettingsSection = useApp((s) => s.setSettingsSection);
   const setTheme = useApp((s) => s.setTheme);
   const setTrust = useApp((s) => s.setTrust);
   const toggleSidebar = useApp((s) => s.toggleSidebar);
@@ -49,6 +50,7 @@ export function CommandPalette() {
   }
   useHotkey("mod+,", (e) => {
     e.preventDefault();
+    useApp.getState().setSettingsSection("provider");
     setSurface("settings");
   });
 
@@ -63,6 +65,7 @@ export function CommandPalette() {
   const ctx = useMemo(
     () => ({
       setSurface,
+      setSettingsSection,
       setTheme,
       setTrust,
       setRightRailOpen,

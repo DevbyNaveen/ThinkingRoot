@@ -1,133 +1,175 @@
+/**
+ * Brain-graph canvas — worker-backed, smooth at 10k+ nodes.
+ *
+ * Architecture (every piece is here on purpose):
+ *
+ *   • Two Web Workers — `entityResolver` (regex/matchAll for semantic
+ *     types + claim→entity resolver) and `forceLayout` (d3-force loop
+ *     streaming Float32Array position deltas).  Both load via the
+ *     standard Vite `new Worker(new URL(...), { type: "module" })`
+ *     idiom so HMR + bundling Just Work.
+ *
+ *   • Positions live in a `Float32Array` ref — never in React state.
+ *     Every worker tick flips the ref to a new buffer (transferable,
+ *     zero-copy) and asks the canvas to redraw.  React never sees the
+ *     tick rate.
+ *
+ *   • Layout persistence via `graphLayoutPersist` — node positions
+ *     and zoom transform survive page reloads.  When the persisted
+ *     fingerprint matches the current entity set we start with
+ *     `alpha = 0.05` (just enough to settle sub-pixel drift) instead
+ *     of `alpha = 1` (full 5–15s freeze on a 10k-node graph).
+ *
+ *   • Viewport + LOD culling — at zoom < threshold we skip labels
+ *     and very-small-radius nodes; offscreen nodes are skipped in
+ *     both the link loop and the node loop.  Keeps pan/zoom at 60 fps
+ *     even before the simulation cools.
+ *
+ *   • Visibility pause — when `isVisible` is false the layout worker
+ *     receives `pause` and the activation rAF stops.  Coming back
+ *     into view sends `resume`, which restarts d3-force at the
+ *     current alpha (typically 0, instant continue).
+ *
+ *   • Activation halos — unchanged behaviour: the chat token stream
+ *     drives `useBrainActivation`, the resolver Map sent by the
+ *     entity-resolver worker maps a `claim_id` onto entity-node
+ *     halos.  Decay loop is still rAF-driven (lightweight; no DOM
+ *     mutation, only canvas paint).
+ *
+ * Honesty notes:
+ *
+ *   - When the entity-resolver hasn't responded yet, nodes fall back
+ *     to `entity.entity_type` (the engine's mechanical type) so the
+ *     graph never reads as empty.  The semantic upgrade lands when
+ *     the worker reply arrives and triggers a single redraw.
+ *
+ *   - The persisted positions are advisory.  A schema mismatch, a
+ *     QuotaExceeded error, or a workspace that simply hasn't been
+ *     opened before all fall through to a fresh `alpha=1` layout —
+ *     never to a broken canvas.
+ */
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  forceCenter,
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  type SimulationLinkDatum,
-  type SimulationNodeDatum,
-} from "d3-force";
 import { zoom, zoomIdentity, type ZoomBehavior, type ZoomTransform } from "d3-zoom";
 import { select } from "d3-selection";
 import { motion } from "framer-motion";
+
 import type { BrainEntity, BrainRelation, ClaimRow } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useBrainActivation, type ActivationKind } from "@/store/brain";
+import {
+  fingerprintEntities,
+  loadGraphLayout,
+  saveGraphLayout,
+} from "@/lib/graphLayoutPersist";
+import type {
+  EntityResolverRequest,
+  EntityResolverResponse,
+} from "@/workers/entityResolver.worker";
 
-interface Node extends SimulationNodeDatum {
-  id: string;
-  label: string;
-  claim_count: number;
-  entity_type: string;
-}
-
-interface Link extends SimulationLinkDatum<Node> {
-  type: string;
-  strength: number;
-}
+// ───────────────────────── Component contract ─────────────────────────
 
 interface Props {
   entities: BrainEntity[];
   relations: BrainRelation[];
   claims?: ClaimRow[];
   searchQuery?: string;
+  cacheKey?: string;
+  isRefreshing?: boolean;
+  /** When false the simulation pauses.  Defaults to true. */
+  isVisible?: boolean;
 }
+
+// ───────────────────────── Internal shapes ────────────────────────────
+
+interface NodeMeta {
+  id: string;
+  label: string;
+  claim_count: number;
+  entity_type: string;
+}
+
+interface WorkerLinkOut {
+  source: string;
+  target: string;
+  strength: number;
+}
+
+interface InternalLink {
+  sourceIdx: number;
+  targetIdx: number;
+  type: string;
+  strength: number;
+}
+
+// ───────────────────────── Helpers ────────────────────────────────────
 
 function getSemanticColor(type: string): string {
   const t = type.toLowerCase();
-  if (t === "definition") return "hsl(280, 70%, 65%)"; // Purple
-  if (t === "apisignature") return "hsl(200, 80%, 65%)"; // Blue
-  if (t === "architecture") return "hsl(30, 80%, 65%)"; // Orange
-  if (t === "rooted") return "hsl(150, 70%, 60%)"; // Emerald
-  if (t === "requirement") return "hsl(340, 70%, 65%)"; // Pink
-  if (t === "inferred") return "rgba(140, 140, 140, 0.4)"; // Muted silver
-  return "rgba(200, 200, 200, 0.8)"; // Default silver
+  if (t === "definition") return "hsl(280, 70%, 65%)";
+  if (t === "apisignature") return "hsl(200, 80%, 65%)";
+  if (t === "architecture") return "hsl(30, 80%, 65%)";
+  if (t === "rooted") return "hsl(150, 70%, 60%)";
+  if (t === "requirement") return "hsl(340, 70%, 65%)";
+  if (t === "inferred") return "rgba(140, 140, 140, 0.4)";
+  return "rgba(200, 200, 200, 0.8)";
 }
 
-// Per-`ActivationKind` halo hue. Mirrors the CSS keyframes in
-// `globals.css` (`.brain-pulse-cited` etc.) so a node halo on the
-// canvas reads as the same event as a citation chip rendered via
-// the matching CSS class. Stable across alpha — opacity is driven by
-// the live activation intensity, not by the colour itself.
 function activationHue(kind: ActivationKind): { r: number; g: number; b: number } {
-  // sky blue / emerald / purple — matches the CSS palette, expressed
-  // as RGB so the canvas can blend opacity per intensity.
   switch (kind) {
     case "cited":
-      return { r: 100, g: 200, b: 255 }; // sky blue
+      return { r: 100, g: 200, b: 255 };
     case "retrieved":
-      return { r: 100, g: 220, b: 160 }; // emerald
+      return { r: 100, g: 220, b: 160 };
     case "cascade":
-      return { r: 200, g: 140, b: 255 }; // purple
+      return { r: 200, g: 140, b: 255 };
   }
 }
 
-// Lower index = higher priority — same ordering as the pre-rewrite
-// nested-loop did via `priority.indexOf(...)`, just hoisted into a
-// Map so the inner pass is O(1) instead of O(P).
-const TYPE_PRIORITY: ReadonlyArray<string> = [
-  "definition",
-  "apisignature",
-  "architecture",
-  "requirement",
-  "fact",
-];
-const TYPE_RANK = new Map<string, number>(
-  TYPE_PRIORITY.map((t, i) => [t, i] as const),
-);
-
-// Escape a string so it can be embedded as a literal inside a regex
-// alternation (`|`) without character-class side effects.  Used for
-// the H1 entity-name → claim-statement match index.
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function nodeRadius(claimCount: number): number {
+  return Math.max(3, Math.min(12, 3 + Math.sqrt(claimCount) * 1.5));
 }
 
-/**
- * Obsidian-grade canvas graph.
- *
- * Performance posture (post-P6):
- *   - Per-entity "best semantic type" derivation runs a single regex
- *     pass over each claim statement (was O(N×M×P) nested + indexOf).
- *   - Render loop is driven by `simulation.on("tick", ...)` plus
- *     explicit redraws on hover / isolate / search changes.  No
- *     manual `requestAnimationFrame`, so CPU drops to 0 % once the
- *     simulation converges (alpha < alphaMin).
- *   - Hover / isolate / search live in refs so a keystroke in the
- *     parent's search input doesn't tear down the canvas effect and
- *     reinitialise everything on every character.
- */
-export function BrainGraph({ entities, relations, claims = [], searchQuery }: Props) {
+// ───────────────────────── Component ──────────────────────────────────
+
+export function BrainGraph({
+  entities,
+  relations,
+  claims = [],
+  searchQuery,
+  cacheKey,
+  isRefreshing = false,
+  isVisible = true,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const simulationRef = useRef<ReturnType<typeof forceSimulation<Node>> | null>(
-    null,
-  );
+
+  // d3-zoom plumbing
   const transformRef = useRef<ZoomTransform>(zoomIdentity);
   const zoomBehaviorRef = useRef<ZoomBehavior<HTMLCanvasElement, unknown> | null>(null);
 
-  // Hovered + isolated entities live exclusively in refs (CLAUDE.md
-  // audit invariant) — every mouse-move would otherwise re-render
-  // this 5K-node component and re-run hook preamble at 60 Hz.  We
-  // call `drawRef.current?.()` directly from the event handlers
-  // instead, redrawing only the canvas without involving React.
+  // Hover / isolate / search — refs so a mouse-move doesn't re-render.
   const hoveredRef = useRef<string | null>(null);
   const isolatedRef = useRef<string | null>(null);
   const searchQueryRef = useRef<string | undefined>(undefined);
   const drawRef = useRef<(() => void) | null>(null);
 
-  // Brain-graph live activity — same refs-not-state posture as
-  // hovered/isolated. The activation store is keyed by `claim_id`;
-  // BrainGraph derives the per-node halo at draw time using the
-  // claim → entity-names resolver built in the data useMemo above.
-  // Zustand `subscribe` is what keeps the canvas alive across store
-  // updates without re-rendering the whole 5K-node component.
+  // Position state (worker-driven, never via React).
+  const positionsRef = useRef<Float32Array | null>(null);
+  const idIndexRef = useRef<Map<string, number>>(new Map());
+
+  // Activation overlay refs (citation halos).
   const activationsRef = useRef<Record<string, { intensity: number; kind: ActivationKind }>>({});
-  // Initialised empty; the resolver-mirror effect below pushes the
-  // useMemo result in on mount and on every `claims`/`entities` change.
   const claimToEntitiesRef = useRef<Map<string, string[]>>(new Map());
   const decayRafRef = useRef<number | null>(null);
+
+  // Per-node semantic-type upgrade from the entity-resolver worker.
+  const [bestTypeMap, setBestTypeMap] = useState<Map<string, string>>(() => new Map());
+
+  const [size, setSize] = useState({ w: 800, h: 600 });
+
+  // Note: `persistedHint` is computed lower down, once `fingerprint`
+  // is available from the `nodes` useMemo.
+
   const setHovered = (id: string | null) => {
     if (hoveredRef.current === id) return;
     hoveredRef.current = id;
@@ -139,152 +181,249 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     drawRef.current?.();
   };
 
-  const [size, setSize] = useState({ w: 800, h: 600 });
-
-  // 1. Prepare data + adjacency map + per-entity best semantic type +
-  //    claim → entity-names resolver (the brain-graph activation store
-  //    keys by claim id; the canvas needs to know which nodes to halo
-  //    when a given claim is cited — same alternation regex pass that
-  //    the priority loop runs, so it's free).
-  const { nodes, links, neighborMap, claimToEntities } = useMemo(() => {
-    const nameToNode = new Map<string, Node>();
-    const neighbors = new Map<string, Set<string>>();
-    const bestTypeMap = new Map<string, string>();
-    const bestRankMap = new Map<string, number>();
-    const claimEntityMap = new Map<string, string[]>();
-
-    // P6 / H1: instead of iterating every entity for every claim
-    // (the old O(N×M) nested loop), build a single alternation regex
-    // from entity names sorted longest-first (so multi-word names
-    // win over their prefixes) and run it once per statement.  At
-    // 10K claims × 1K entities the old loop did ~10M substring
-    // probes per refresh; this version is O(N×L) where L is mean
-    // statement length — comfortably under a frame budget.
-    const sortedNames = entities
-      .map((e) => e.name)
-      .filter((n) => n.length > 0)
-      .sort((a, b) => b.length - a.length);
-    const matcher =
-      sortedNames.length > 0
-        ? new RegExp(sortedNames.map(escapeRegex).join("|"), "g")
-        : null;
-
-    if (matcher) {
-      for (const claim of claims) {
-        // `claim_type` is optional in the wire schema (the engine
-        // omits it for some legacy / structural claims).  Skip the
-        // priority update when missing — the entity still gets a
-        // type from `entity.entity_type` in the fallback branch
-        // below — but the rooted-tier override still applies.
-        const incoming = claim.claim_type;
-        const incomingRank =
-          incoming === undefined
-            ? Number.MAX_SAFE_INTEGER
-            : (TYPE_RANK.get(incoming.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
-        const isRooted = claim.tier === "rooted";
-
-        // `matchAll` walks every non-overlapping match in one pass.
-        const matches = claim.statement.matchAll(matcher);
-        const seenForThisClaim = new Set<string>();
-        for (const m of matches) {
-          const name = m[0];
-          const currentRank = bestRankMap.get(name);
-          if (
-            incoming !== undefined &&
-            (currentRank === undefined || incomingRank < currentRank)
-          ) {
-            bestTypeMap.set(name, incoming);
-            bestRankMap.set(name, incomingRank);
-          }
-          // "rooted" tier overrides everything except an explicit
-          // `definition` type — same semantic as the pre-rewrite
-          // branch, just hoisted out of the inner-most loop.
-          if (isRooted) {
-            const cur = bestTypeMap.get(name);
-            if (!cur || cur.toLowerCase() !== "definition") {
-              bestTypeMap.set(name, "rooted");
-            }
-          }
-          seenForThisClaim.add(name);
-        }
-        if (seenForThisClaim.size > 0) {
-          claimEntityMap.set(claim.id, Array.from(seenForThisClaim));
-        }
-      }
-    }
+  // ── 1. Build nodes + links synchronously (no regex pass) ────────────
+  //
+  // The regex/matchAll work happens off the main thread in
+  // `entityResolver.worker.ts`.  Here we just produce the structural
+  // shape — nodes from `entities`, links from `relations`.  Semantic
+  // types start at the engine-provided `entity.entity_type` and get
+  // upgraded asynchronously when the worker reply lands.
+  const { nodes, links, neighborMap, fingerprint } = useMemo(() => {
+    const nameToIndex = new Map<string, number>();
+    const nodeArr: NodeMeta[] = [];
 
     for (const e of entities) {
-      nameToNode.set(e.name, {
+      nameToIndex.set(e.name, nodeArr.length);
+      nodeArr.push({
         id: e.name,
         label: e.name,
         claim_count: e.claim_count,
-        entity_type: bestTypeMap.get(e.name) || e.entity_type,
+        entity_type: bestTypeMap.get(e.name) ?? e.entity_type,
       });
     }
+    // Relations may reference entity names that aren't in `entities`
+    // (e.g. structural-only relations from a partial compile).  Add
+    // them as inferred-type nodes so the link draws correctly.
     for (const r of relations) {
       for (const name of [r.source, r.target]) {
-        if (!nameToNode.has(name)) {
-          nameToNode.set(name, {
+        if (!nameToIndex.has(name)) {
+          nameToIndex.set(name, nodeArr.length);
+          nodeArr.push({
             id: name,
             label: name,
             claim_count: 0,
-            entity_type: bestTypeMap.get(name) || "inferred",
+            entity_type: bestTypeMap.get(name) ?? "inferred",
           });
         }
       }
-      if (!neighbors.has(r.source)) neighbors.set(r.source, new Set());
-      if (!neighbors.has(r.target)) neighbors.set(r.target, new Set());
-      neighbors.get(r.source)!.add(r.target);
-      neighbors.get(r.target)!.add(r.source);
     }
-    const nodeArr = Array.from(nameToNode.values());
-    const linkArr: Link[] = relations.map((r) => ({
-      source: r.source,
-      target: r.target,
-      type: r.relation_type,
-      strength: r.strength,
-    }));
+
+    const linkArr: InternalLink[] = [];
+    const neighbors = new Map<number, Set<number>>();
+    for (const r of relations) {
+      const s = nameToIndex.get(r.source);
+      const t = nameToIndex.get(r.target);
+      if (s === undefined || t === undefined) continue;
+      linkArr.push({
+        sourceIdx: s,
+        targetIdx: t,
+        type: r.relation_type,
+        strength: r.strength,
+      });
+      if (!neighbors.has(s)) neighbors.set(s, new Set());
+      if (!neighbors.has(t)) neighbors.set(t, new Set());
+      neighbors.get(s)!.add(t);
+      neighbors.get(t)!.add(s);
+    }
+
+    idIndexRef.current = nameToIndex;
+
     return {
       nodes: nodeArr,
       links: linkArr,
       neighborMap: neighbors,
-      claimToEntities: claimEntityMap,
+      fingerprint: fingerprintEntities(nodeArr.map((n) => n.id)),
     };
-  }, [entities, relations, claims]);
+  }, [entities, relations, bestTypeMap]);
 
-  // 2. Initialise physics engine.  Setting `alphaMin` explicitly is
-  //    what lets the simulation actually emit an `end` event (default
-  //    is 0.001 but we set it for clarity in the pause-on-rest fix).
+  // Persisted layout, loaded once per (workspace, fingerprint) pair.
+  // Both the layout-init effect and the centering effect read this —
+  // doing it via `useMemo` avoids cross-effect timing races AND avoids
+  // parsing the ~250 KB localStorage payload every time `bestTypeMap`
+  // updates (which rebuilds `nodes` but doesn't change the id set).
+  const persistedHint = useMemo(() => {
+    return cacheKey ? loadGraphLayout(cacheKey, fingerprint) : null;
+  }, [cacheKey, fingerprint]);
+
+  // ── 2. Entity-resolver worker — semantic type upgrade ───────────────
+  const resolverWorkerRef = useRef<Worker | null>(null);
+  const resolverReqIdRef = useRef<number>(0);
+
   useEffect(() => {
-    if (nodes.length === 0) return;
+    const worker = new Worker(
+      new URL("../../workers/entityResolver.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+    resolverWorkerRef.current = worker;
 
-    const sim = forceSimulation<Node>(nodes)
-      .alphaDecay(0.015)
-      .alphaMin(0.001)
-      .force(
-        "link",
-        forceLink<Node, Link>(links).id((d) => d.id).distance(60).strength(0.5),
-      )
-      .force("charge", forceManyBody().strength(-150))
-      .force("center", forceCenter(0, 0))
-      .force(
-        "collide",
-        forceCollide<Node>()
-          .radius((d) => 4 + Math.sqrt(d.claim_count) * 1.5)
-          .iterations(2),
-      );
-
-    simulationRef.current = sim;
+    worker.onmessage = (e: MessageEvent<EntityResolverResponse>) => {
+      const { reqId, bestType, claimToEntities } = e.data;
+      // Drop stale replies — only the latest request's result counts.
+      if (reqId !== resolverReqIdRef.current) return;
+      setBestTypeMap(new Map(bestType));
+      claimToEntitiesRef.current = new Map(claimToEntities);
+      drawRef.current?.();
+    };
 
     return () => {
-      sim.stop();
+      worker.terminate();
+      resolverWorkerRef.current = null;
     };
-  }, [nodes, links]);
+  }, []);
 
-  // 3. Canvas + render hookup.  Stable deps — only the data shape
-  //    or the canvas size can retrigger this effect.  Hover, isolate,
-  //    and search are read via refs, so keystrokes do not invalidate
-  //    the GPU upload or restart d3-force ticking.
+  useEffect(() => {
+    const worker = resolverWorkerRef.current;
+    if (!worker) return;
+    resolverReqIdRef.current += 1;
+    const reqId = resolverReqIdRef.current;
+    const req: EntityResolverRequest = {
+      reqId,
+      entities: entities.map((e) => ({
+        name: e.name,
+        entity_type: e.entity_type,
+        claim_count: e.claim_count,
+      })),
+      claims: claims.map((c) => ({
+        id: c.id,
+        statement: c.statement,
+        claim_type: c.claim_type,
+        tier: c.tier,
+      })),
+    };
+    worker.postMessage(req);
+  }, [entities, claims]);
+
+  // ── 3. Force-layout worker + position stream ────────────────────────
+  const layoutWorkerRef = useRef<Worker | null>(null);
+  const hasInitedLayoutRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    const worker = new Worker(
+      new URL("../../workers/forceLayout.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+    layoutWorkerRef.current = worker;
+
+    worker.onmessage = (
+      e: MessageEvent<{
+        type: "tick" | "end";
+        positions: Float32Array;
+        alpha: number;
+        ids?: string[];
+      }>,
+    ) => {
+      const msg = e.data;
+      positionsRef.current = msg.positions;
+      if (msg.ids) {
+        const map = new Map<string, number>();
+        for (let i = 0; i < msg.ids.length; i++) {
+          const name = msg.ids[i];
+          if (name !== undefined) map.set(name, i);
+        }
+        idIndexRef.current = map;
+      }
+      drawRef.current?.();
+
+      if (msg.type === "end") {
+        // Persist the converged layout so the next session warm-starts.
+        const positions = positionsRef.current;
+        const ids = msg.ids;
+        if (positions && ids && cacheKey) {
+          const out = new Map<string, { x: number; y: number }>();
+          for (let i = 0; i < ids.length; i++) {
+            const name = ids[i];
+            if (name === undefined) continue;
+            const x = positions[i * 2];
+            const y = positions[i * 2 + 1];
+            if (x === undefined || y === undefined) continue;
+            out.set(name, { x, y });
+          }
+          const t = transformRef.current;
+          saveGraphLayout(cacheKey, fingerprint, out, {
+            x: t.x,
+            y: t.y,
+            k: t.k,
+          });
+        }
+      }
+    };
+
+    return () => {
+      worker.postMessage({ type: "stop" });
+      worker.terminate();
+      layoutWorkerRef.current = null;
+      hasInitedLayoutRef.current = false;
+    };
+  }, [cacheKey, fingerprint]);
+
+  // Send init/update to the layout worker when the graph shape changes.
+  //
+  // An exact fingerprint match on the persisted layout means we can
+  // warm-start at near-zero alpha; a partial match (some entities
+  // carry over, others are new) still uses the surviving positions
+  // but cools with normal alpha so new nodes settle.
+  useEffect(() => {
+    const worker = layoutWorkerRef.current;
+    if (!worker || nodes.length === 0) return;
+
+    const startingPositions = persistedHint?.positions ?? null;
+    const nodesForWorker = nodes.map((n) => {
+      const carried = startingPositions?.get(n.id);
+      return {
+        id: n.id,
+        claim_count: n.claim_count,
+        x: carried?.x,
+        y: carried?.y,
+      };
+    });
+    const linksForWorker: WorkerLinkOut[] = links.map((l) => {
+      const source = nodes[l.sourceIdx];
+      const target = nodes[l.targetIdx];
+      return {
+        source: source?.id ?? "",
+        target: target?.id ?? "",
+        strength: l.strength,
+      };
+    });
+
+    const alpha = persistedHint?.fingerprintMatches ? 0.05 : 1;
+
+    if (!hasInitedLayoutRef.current) {
+      worker.postMessage({
+        type: "init",
+        nodes: nodesForWorker,
+        links: linksForWorker,
+        alpha,
+      });
+      hasInitedLayoutRef.current = true;
+    } else {
+      worker.postMessage({
+        type: "update",
+        nodes: nodesForWorker,
+        links: linksForWorker,
+        alpha,
+      });
+    }
+  }, [nodes, links, persistedHint]);
+
+  // Pause/resume when isVisible flips.
+  useEffect(() => {
+    const worker = layoutWorkerRef.current;
+    if (!worker) return;
+    worker.postMessage({ type: isVisible ? "resume" : "pause" });
+  }, [isVisible]);
+
+  // ── 4. Canvas + draw ────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -298,6 +437,7 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     canvas.style.height = `${size.h}px`;
 
     const draw = () => {
+      const positions = positionsRef.current;
       ctx.save();
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.scale(dpr, dpr);
@@ -306,130 +446,171 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
       ctx.translate(t.x, t.y);
       ctx.scale(t.k, t.k);
 
-      const activeFocus = hoveredRef.current || isolatedRef.current;
-      const activeNeighbors = activeFocus
-        ? (neighborMap.get(activeFocus) ?? new Set<string>())
-        : new Set<string>();
-      const hasFocus = activeFocus !== null;
+      // Compute visible bounds in virtual space — anything outside is
+      // culled.  Cheap rectangle vs single AABB per node.
+      const viewMinX = -t.x / t.k;
+      const viewMinY = -t.y / t.k;
+      const viewMaxX = viewMinX + size.w / t.k;
+      const viewMaxY = viewMinY + size.h / t.k;
+
+      const hoveredId = hoveredRef.current;
+      const isolatedId = isolatedRef.current;
+      const activeFocusId = hoveredId ?? isolatedId;
+      const activeFocusIdx =
+        activeFocusId !== null ? (idIndexRef.current.get(activeFocusId) ?? -1) : -1;
+      const activeNeighbors =
+        activeFocusIdx >= 0
+          ? (neighborMap.get(activeFocusIdx) ?? new Set<number>())
+          : new Set<number>();
+      const hasFocus = activeFocusIdx >= 0;
 
       const q = searchQueryRef.current?.trim().toLowerCase();
       const hasSearch = !!q;
 
-      // Lines
-      links.forEach((l) => {
-        const s = l.source as Node;
-        const targetNode = l.target as Node;
-        if (s.x != null && targetNode.x != null && s.y != null && targetNode.y != null) {
+      // LOD: when zoomed out far OR the graph is large and unfocused,
+      // skip labels except for matched / focused nodes.  Empirically
+      // ~3000 nodes is where the per-label text rasterisation starts
+      // to dominate at 60 fps on M-series.
+      const lodHideLabels = t.k < 0.6 || (nodes.length > 3000 && !hasFocus && !hasSearch);
+
+      // ── Links pass ───────────────────────────────────────────────
+      if (positions) {
+        ctx.lineCap = "round";
+        for (const l of links) {
+          const sx = positions[l.sourceIdx * 2];
+          const sy = positions[l.sourceIdx * 2 + 1];
+          const tx = positions[l.targetIdx * 2];
+          const ty = positions[l.targetIdx * 2 + 1];
+          if (sx === undefined || sy === undefined || tx === undefined || ty === undefined) {
+            continue;
+          }
+
+          // Viewport cull on the bounding box of the segment.
+          const minX = Math.min(sx, tx);
+          const maxX = Math.max(sx, tx);
+          const minY = Math.min(sy, ty);
+          const maxY = Math.max(sy, ty);
+          if (maxX < viewMinX || minX > viewMaxX) continue;
+          if (maxY < viewMinY || minY > viewMaxY) continue;
+
           const isRelated =
-            activeFocus && (s.id === activeFocus || targetNode.id === activeFocus);
+            hasFocus && (l.sourceIdx === activeFocusIdx || l.targetIdx === activeFocusIdx);
 
           ctx.beginPath();
-          ctx.moveTo(s.x, s.y);
-          ctx.lineTo(targetNode.x, targetNode.y);
-
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(tx, ty);
           if (isRelated) {
             ctx.strokeStyle = "rgba(100, 200, 255, 0.7)";
             ctx.lineWidth = 1.5 / t.k;
-            ctx.stroke();
           } else {
             const opacity = hasFocus || hasSearch ? 0.02 : 0.08;
             ctx.strokeStyle = `rgba(255, 255, 255, ${opacity})`;
             ctx.lineWidth = 0.8 / t.k;
-            ctx.stroke();
+          }
+          ctx.stroke();
+        }
+      }
+
+      // ── Nodes pass ───────────────────────────────────────────────
+      if (positions) {
+        for (let i = 0; i < nodes.length; i++) {
+          const n = nodes[i];
+          if (!n) continue;
+          const x = positions[i * 2];
+          const y = positions[i * 2 + 1];
+          if (x === undefined || y === undefined) continue;
+
+          const r = nodeRadius(n.claim_count);
+          // Viewport cull — include radius + halo margin.
+          if (x + r < viewMinX || x - r > viewMaxX) continue;
+          if (y + r < viewMinY || y - r > viewMaxY) continue;
+
+          const isFocused = activeFocusIdx === i;
+          const isNeighbor = activeNeighbors.has(i);
+          const isSearchMatch = hasSearch && n.label.toLowerCase().includes(q!);
+
+          if (isFocused || isSearchMatch) {
+            ctx.beginPath();
+            ctx.arc(x, y, r + 6 / t.k, 0, 2 * Math.PI);
+            ctx.fillStyle =
+              isSearchMatch && !isFocused
+                ? "rgba(255, 200, 100, 0.25)"
+                : "rgba(100, 200, 255, 0.25)";
+            ctx.fill();
+          }
+
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, 2 * Math.PI);
+          if (isFocused) {
+            ctx.fillStyle = "rgb(255, 255, 255)";
+          } else if (isNeighbor) {
+            ctx.fillStyle = "rgb(100, 200, 255)";
+          } else if (isSearchMatch) {
+            ctx.fillStyle = "rgb(255, 200, 100)";
+          } else {
+            const semanticColor = getSemanticColor(n.entity_type);
+            ctx.fillStyle =
+              hasFocus || hasSearch ? "rgba(100, 100, 100, 0.1)" : semanticColor;
+          }
+          ctx.fill();
+
+          // Labels — only when LOD allows or the node is highlighted.
+          const showLabel =
+            !lodHideLabels &&
+            (isFocused ||
+              isNeighbor ||
+              isSearchMatch ||
+              (nodes.length < 100 && !hasFocus && !hasSearch));
+          if (showLabel) {
+            ctx.fillStyle =
+              isFocused || isNeighbor || isSearchMatch
+                ? "rgba(255, 255, 255, 1)"
+                : "rgba(180, 180, 180, 0.8)";
+            ctx.font = `${(isFocused ? 12 : 10) / t.k}px Inter, system-ui`;
+            ctx.textAlign = "center";
+            ctx.fillText(n.label, x, y - r - 5 / t.k);
           }
         }
-      });
+      }
 
-      // Nodes
-      nodes.forEach((n) => {
-        if (n.x == null || n.y == null) return;
-        const r = Math.max(3, Math.min(12, 3 + Math.sqrt(n.claim_count) * 1.5));
-        const isFocused = activeFocus === n.id;
-        const isNeighbor = activeNeighbors.has(n.id);
-        const isSearchMatch = hasSearch && n.label.toLowerCase().includes(q!);
-
-        if (isFocused || isSearchMatch) {
-          ctx.beginPath();
-          ctx.arc(n.x, n.y, r + 6 / t.k, 0, 2 * Math.PI);
-          ctx.fillStyle =
-            isSearchMatch && !isFocused
-              ? "rgba(255, 200, 100, 0.25)"
-              : "rgba(100, 200, 255, 0.25)";
-          ctx.fill();
-        }
-
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
-        if (isFocused) {
-          ctx.fillStyle = "rgb(255, 255, 255)";
-        } else if (isNeighbor) {
-          ctx.fillStyle = "rgb(100, 200, 255)";
-        } else if (isSearchMatch) {
-          ctx.fillStyle = "rgb(255, 200, 100)";
-        } else {
-          const semanticColor = getSemanticColor(n.entity_type);
-          ctx.fillStyle =
-            hasFocus || hasSearch ? "rgba(100, 100, 100, 0.1)" : semanticColor;
-        }
-        ctx.fill();
-
-        const showLabel =
-          isFocused ||
-          isNeighbor ||
-          isSearchMatch ||
-          (nodes.length < 100 && !hasFocus && !hasSearch);
-        if (showLabel) {
-          ctx.fillStyle =
-            isFocused || isNeighbor || isSearchMatch
-              ? "rgba(255, 255, 255, 1)"
-              : "rgba(180, 180, 180, 0.8)";
-          ctx.font = `${(isFocused ? 12 : 10) / t.k}px Inter, system-ui`;
-          ctx.textAlign = "center";
-          ctx.fillText(n.label, n.x, n.y - r - 5 / t.k);
-        }
-      });
-
-      // Brain-graph live activity halos. Resolves active claim ids
-      // into entity-name targets via the cached resolver, then keeps
-      // the strongest (intensity, kind) per node so a node cited by
-      // multiple claims pulses once at the loudest volume rather than
-      // stacking. Drawn last so halos sit visually on top of the node.
+      // ── Activation halos ─────────────────────────────────────────
       const liveActivations = activationsRef.current;
-      if (Object.keys(liveActivations).length > 0) {
+      if (positions && Object.keys(liveActivations).length > 0) {
         const resolver = claimToEntitiesRef.current;
-        const perNode = new Map<string, { intensity: number; kind: ActivationKind }>();
+        const perNode = new Map<number, { intensity: number; kind: ActivationKind }>();
         for (const [claimId, activation] of Object.entries(liveActivations)) {
           const entityNames = resolver.get(claimId);
           if (!entityNames) continue;
           for (const name of entityNames) {
-            const prev = perNode.get(name);
+            const idx = idIndexRef.current.get(name);
+            if (idx === undefined) continue;
+            const prev = perNode.get(idx);
             if (!prev || activation.intensity > prev.intensity) {
-              perNode.set(name, activation);
+              perNode.set(idx, activation);
             }
           }
         }
         if (perNode.size > 0) {
           ctx.save();
-          for (const node of nodes) {
-            if (node.x == null || node.y == null) continue;
-            const a = perNode.get(node.id);
-            if (!a) continue;
-            const baseR = Math.max(3, Math.min(12, 3 + Math.sqrt(node.claim_count) * 1.5));
+          for (const [idx, a] of perNode) {
+            const node = nodes[idx];
+            if (!node) continue;
+            const x = positions[idx * 2];
+            const y = positions[idx * 2 + 1];
+            if (x === undefined || y === undefined) continue;
+            const baseR = nodeRadius(node.claim_count);
             const haloR = baseR + 8 / t.k + a.intensity * 6;
             const { r: hr, g: hg, b: hb } = activationHue(a.kind);
             const opacity = Math.min(0.85, a.intensity);
-            // Outer soft glow.
-            const grad = ctx.createRadialGradient(node.x, node.y, baseR, node.x, node.y, haloR);
+            const grad = ctx.createRadialGradient(x, y, baseR, x, y, haloR);
             grad.addColorStop(0, `rgba(${hr}, ${hg}, ${hb}, ${opacity * 0.55})`);
             grad.addColorStop(1, `rgba(${hr}, ${hg}, ${hb}, 0)`);
             ctx.fillStyle = grad;
             ctx.beginPath();
-            ctx.arc(node.x, node.y, haloR, 0, 2 * Math.PI);
+            ctx.arc(x, y, haloR, 0, 2 * Math.PI);
             ctx.fill();
-            // Crisp inner ring so the activation is legible even
-            // against a busy background.
             ctx.beginPath();
-            ctx.arc(node.x, node.y, baseR + 2 / t.k, 0, 2 * Math.PI);
+            ctx.arc(x, y, baseR + 2 / t.k, 0, 2 * Math.PI);
             ctx.strokeStyle = `rgba(${hr}, ${hg}, ${hb}, ${opacity})`;
             ctx.lineWidth = 1.5 / t.k;
             ctx.stroke();
@@ -442,60 +623,20 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     };
 
     drawRef.current = draw;
-
-    const sim = simulationRef.current;
-    // First paint — covers the gap between mount and the first sim
-    // tick (especially relevant when the previous frame is still
-    // converged and `alpha < alphaMin`).
     draw();
-
-    if (sim) {
-      // P6 / M8: hand the render loop to d3-force's internal timer.
-      // It auto-advances ticks while alpha >= alphaMin and stops on
-      // its own — so the rAF loop that pre-rewrite ran at 60 Hz
-      // forever (1–3 % idle CPU) just doesn't exist any more.
-      sim.on("tick", draw);
-      sim.on("end", draw);
-      // If the sim already converged before we mounted (data was
-      // unchanged across a re-render), nudge it so the new viewport
-      // gets a few warm-up frames.
-      if (sim.alpha() < sim.alphaMin()) {
-        sim.alpha(0.3).restart();
-      }
-    }
 
     return () => {
       drawRef.current = null;
-      if (sim) {
-        sim.on("tick", null);
-        sim.on("end", null);
-      }
     };
   }, [nodes, links, neighborMap, size]);
 
-  // 4. Mirror only `searchQuery` (a parent prop, so we can't make it
-  //    a ref) into the canvas-readable ref. Hovered/isolated already
-  //    sit in refs — see the `setHovered` / `setIsolated` shims
-  //    above — so no extra effect is needed for them.
+  // ── 5. Search-query ref mirror ──────────────────────────────────────
   useEffect(() => {
     searchQueryRef.current = searchQuery;
     drawRef.current?.();
   }, [searchQuery]);
 
-  // 4b. Keep the claim→entity resolver ref in lockstep with the
-  //     useMemo result. The canvas draw closure reads it without
-  //     re-binding, so a new resolver shape just lands silently on
-  //     the next frame.
-  useEffect(() => {
-    claimToEntitiesRef.current = claimToEntities;
-  }, [claimToEntities]);
-
-  // 4c. Subscribe to the brain-activation store + drive an
-  //     exponential-decay rAF loop while any claim is still
-  //     activated. The store applies the decay; we just keep ticking
-  //     until it returns an empty map and then stop the loop so the
-  //     canvas goes back to 0% CPU (the same posture as the d3-force
-  //     `on("end")` boundary).
+  // ── 6. Activation store → ref + decay rAF ───────────────────────────
   useEffect(() => {
     const tick = () => {
       const now = performance.now();
@@ -505,7 +646,7 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
         Object.entries(live).map(([id, a]) => [id, { intensity: a.intensity, kind: a.kind }]),
       );
       drawRef.current?.();
-      if (Object.keys(live).length > 0) {
+      if (Object.keys(live).length > 0 && isVisible) {
         decayRafRef.current = requestAnimationFrame(tick);
       } else {
         decayRafRef.current = null;
@@ -513,9 +654,6 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     };
 
     const unsubscribe = useBrainActivation.subscribe((state) => {
-      // Mirror the latest activations into the ref synchronously so
-      // a draw triggered by some other path (hover, zoom) sees them
-      // without waiting for the next rAF tick.
       activationsRef.current = Object.fromEntries(
         Object.entries(state.activations).map(([id, a]) => [
           id,
@@ -525,7 +663,8 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
       drawRef.current?.();
       if (
         Object.keys(state.activations).length > 0 &&
-        decayRafRef.current === null
+        decayRafRef.current === null &&
+        isVisible
       ) {
         decayRafRef.current = requestAnimationFrame(tick);
       }
@@ -538,11 +677,9 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
         decayRafRef.current = null;
       }
     };
-  }, []);
+  }, [isVisible]);
 
-  // 5. Container resize — guard the destructure: the ResizeObserver
-  //    callback can fire with an empty entries array on rare
-  //    transition frames during route swaps.
+  // ── 7. Container resize observer ────────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -556,64 +693,78 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
     return () => ro.disconnect();
   }, []);
 
-  // 6. Pan / zoom — keyed on `nodes.length` so the effect re-runs
-  //    when the canvas finally mounts after the empty-state branch
-  //    falls through.  The ref guard ensures we never re-attach.
+  // ── 8. Pan / zoom ───────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || zoomBehaviorRef.current) return;
-
     const z = zoom<HTMLCanvasElement, unknown>()
       .scaleExtent([0.02, 10])
       .on("zoom", (event) => {
         transformRef.current = event.transform;
-        // Force a redraw on user pan/zoom — the simulation may be
-        // at rest and ticks won't otherwise fire.
         drawRef.current?.();
       });
-
     zoomBehaviorRef.current = z;
     select(canvas).call(z);
   }, [nodes.length]);
 
-  // 7. Centre the graph on initial load.
+  // ── 9. Initial centre / restore transform ──────────────────────────
+  //
+  // When a persisted transform exists we use that — it preserves the
+  // user's zoom and pan across reloads.  Otherwise we centre on the
+  // origin with a scale chosen so the bounding box of `sqrt(N) * 30`
+  // virtual units fits the viewport.
   const centeredRef = useRef(false);
   useEffect(() => {
-    if (centeredRef.current || size.w === 0 || nodes.length === 0) return;
     const canvas = canvasRef.current;
     if (!canvas || !zoomBehaviorRef.current) return;
+    if (centeredRef.current || size.w === 0 || nodes.length === 0) return;
+
+    const savedTransform = persistedHint?.transform;
+    if (savedTransform) {
+      const restored = zoomIdentity
+        .translate(savedTransform.x, savedTransform.y)
+        .scale(savedTransform.k);
+      select(canvas).call(zoomBehaviorRef.current.transform, restored);
+      transformRef.current = restored;
+      centeredRef.current = true;
+      return;
+    }
 
     const initialScale = Math.min(1, 400 / Math.max(200, Math.sqrt(nodes.length) * 30));
     const initialTransform = zoomIdentity
       .translate(size.w / 2, size.h / 2)
       .scale(initialScale);
-
     select(canvas).call(zoomBehaviorRef.current.transform, initialTransform);
     transformRef.current = initialTransform;
     centeredRef.current = true;
-  }, [size, nodes.length]);
+  }, [size, nodes.length, persistedHint]);
 
-  // 8. Hit detection.  Iterates from the top of the z-order down so
-  //    the first hit wins — matches the visual stacking order.
-  const getHitNode = (e: React.MouseEvent<HTMLCanvasElement>): Node | null => {
+  // ── 10. Hit detection (mouse → node) ───────────────────────────────
+  const getHitNode = (e: React.MouseEvent<HTMLCanvasElement>): { idx: number; node: NodeMeta } | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
+    const positions = positionsRef.current;
+    if (!positions) return null;
+
     const rect = canvas.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
-
     const t = transformRef.current;
     const virtualX = (mouseX - t.x) / t.k;
     const virtualY = (mouseY - t.y) / t.k;
 
+    // Front-to-back so the topmost-drawn node wins.
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
-      if (!n || n.x == null || n.y == null) continue;
-      const dx = n.x - virtualX;
-      const dy = n.y - virtualY;
-      const r = Math.max(3, Math.min(12, 3 + Math.sqrt(n.claim_count) * 1.5));
+      if (!n) continue;
+      const x = positions[i * 2];
+      const y = positions[i * 2 + 1];
+      if (x === undefined || y === undefined) continue;
+      const dx = x - virtualX;
+      const dy = y - virtualY;
+      const r = nodeRadius(n.claim_count);
       if (dx * dx + dy * dy < (r + 5 / t.k) ** 2) {
-        return n;
+        return { idx: i, node: n };
       }
     }
     return null;
@@ -621,38 +772,28 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const hit = getHitNode(e);
-    setHovered(hit ? hit.id : null);
+    setHovered(hit ? hit.node.id : null);
   };
 
-  // 9. Click to isolate + recentre.  Pre-rewrite this called
-  //    `select(canvas).transition().duration(750).call(...)` but
-  //    `d3-transition` was never installed — every click threw
-  //    `TypeError: select(...).transition is not a function`, so
-  //    the swoop never animated in production anyway.  Instant
-  //    recentre is a strict improvement over the broken path.
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const hit = getHitNode(e);
     if (!hit) {
       setIsolated(null);
       return;
     }
-    setIsolated(hit.id);
+    setIsolated(hit.node.id);
 
     const canvas = canvasRef.current;
-    if (
-      !canvas ||
-      !zoomBehaviorRef.current ||
-      hit.x == null ||
-      hit.y == null
-    ) {
-      return;
-    }
+    const positions = positionsRef.current;
+    if (!canvas || !zoomBehaviorRef.current || !positions) return;
+    const x = positions[hit.idx * 2];
+    const y = positions[hit.idx * 2 + 1];
+    if (x === undefined || y === undefined) return;
 
     const scale = Math.max(1.5, transformRef.current.k);
-    const targetX = size.w / 2 - hit.x * scale;
-    const targetY = size.h / 2 - hit.y * scale;
+    const targetX = size.w / 2 - x * scale;
+    const targetY = size.h / 2 - y * scale;
     const newTransform = zoomIdentity.translate(targetX, targetY).scale(scale);
-
     select(canvas).call(zoomBehaviorRef.current.transform, newTransform);
     transformRef.current = newTransform;
     drawRef.current?.();
@@ -671,12 +812,29 @@ export function BrainGraph({ entities, relations, claims = [], searchQuery }: Pr
         onMouseLeave={() => setHovered(null)}
         className="block h-full w-full touch-none outline-none cursor-crosshair"
       />
-      <Legend nodeCount={nodes.length} linkCount={links.length} />
+      <Legend
+        nodeCount={nodes.length}
+        linkCount={links.length}
+        isRefreshing={isRefreshing}
+        isPaused={!isVisible}
+      />
     </div>
   );
 }
 
-function Legend({ nodeCount, linkCount }: { nodeCount: number; linkCount: number }) {
+// ───────────────────────── Auxiliaries ────────────────────────────────
+
+function Legend({
+  nodeCount,
+  linkCount,
+  isRefreshing,
+  isPaused,
+}: {
+  nodeCount: number;
+  linkCount: number;
+  isRefreshing: boolean;
+  isPaused: boolean;
+}) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 4 }}
@@ -694,6 +852,18 @@ function Legend({ nodeCount, linkCount }: { nodeCount: number; linkCount: number
       <span>
         <span className="font-mono text-foreground">{linkCount}</span> relations
       </span>
+      {isRefreshing && (
+        <>
+          <span className="text-border">·</span>
+          <span className="text-accent">updating</span>
+        </>
+      )}
+      {isPaused && (
+        <>
+          <span className="text-border">·</span>
+          <span className="text-muted-foreground/80">paused</span>
+        </>
+      )}
       <span className="text-border">·</span>
       <span>scroll to zoom · drag to pan</span>
     </motion.div>

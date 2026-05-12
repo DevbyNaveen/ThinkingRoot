@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use thinkingroot_core::types::WorkspaceStatus;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::commands::browser::BrowserSession;
+use crate::commands::browser_save::ExtractCallbackPayload;
 use crate::commands::terminal::TerminalSession;
 
 /// All process-wide state owned by Tauri's `app.manage(...)`.
@@ -69,6 +70,17 @@ pub struct AppState {
     /// this map owns the native surfaces and keeps them hidden/shown as
     /// the right-rail tab changes.
     pub browsers: Arc<RwLock<HashMap<String, Arc<BrowserSession>>>>,
+    /// In-flight "Save Page" extraction requests, keyed by request id.
+    /// The `browser_save_page` command inserts a oneshot sender here
+    /// before injecting the Readability + Turndown extraction script
+    /// into the captive webview; the captive JS calls back into the
+    /// `browser_extract_callback` command which removes the sender
+    /// and delivers the payload. Senders are removed on success OR
+    /// on timeout (the command's `tokio::time::timeout` drops the
+    /// receiver, but we also clear the map entry on the timeout path
+    /// so subsequent attempts don't see stale state).
+    pub pending_extracts:
+        AsyncMutex<HashMap<String, oneshot::Sender<ExtractCallbackPayload>>>,
 }
 
 /// Live handle for an in-progress workspace compile.

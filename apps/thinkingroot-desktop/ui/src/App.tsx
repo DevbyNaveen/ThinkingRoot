@@ -3,7 +3,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { MainPane } from "@/components/shell/MainPane";
 import { RightRail } from "@/components/shell/RightRail";
-import { StatusBar } from "@/components/shell/StatusBar";
 import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ToastStack } from "@/components/ui/toast-stack";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
@@ -11,6 +10,7 @@ import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
 import { onTrFileOpened, onboardingStatus, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
+import { refreshBrainSnapshotCache } from "@/store/brain-cache";
 
 /**
  * Desktop app root. Three horizontal regions inside a vertical
@@ -21,13 +21,11 @@ import { useApp } from "@/store/app";
  *   | rail | sidebar |     main pane     | right rail |
  *   |      |         |                   |            |
  *   +------+---------+-------------------+------------+
- *   |                     status bar                  |
- *   +-------------------------------------------------+
  *
- * Rail + status bar are always visible. Sidebar and right rail are
- * independently collapsible. The main pane hosts a tab bar and a
- * content area (chat / brain / trace / …) that reacts to the active
- * surface + active tab.
+ * Compile progress, tokens, and sidecar status are not shown in a
+ * bottom chrome strip — use the Compile right rail and ⌘K when needed.
+ * Sidebar and right rail are independently collapsible. The main pane
+ * hosts content (chat / settings / …) for the active surface.
  */
 export default function App() {
   const theme = useApp((s) => s.theme);
@@ -37,6 +35,7 @@ export default function App() {
   const setOnboardingDismissed = useApp((s) => s.setOnboardingDismissed);
   const setCompileProgress = useApp((s) => s.setCompileProgress);
   const setCompileRootPath = useApp((s) => s.setCompileRootPath);
+  const activeWorkspace = useApp((s) => s.activeWorkspace);
   const packExportTarget = useApp((s) => s.packExportTarget);
   const setPackExportTarget = useApp((s) => s.setPackExportTarget);
   const [installTrPath, setInstallTrPath] = useState<string | null>(null);
@@ -54,6 +53,12 @@ export default function App() {
         payload.phase === "failed" ||
         payload.phase === "cancelled"
       ) {
+        if (payload.phase === "done" && activeWorkspace) {
+          void refreshBrainSnapshotCache(activeWorkspace).catch(() => {
+            // The Brain view can still refresh on demand; compile progress
+            // should never fail just because the warm cache pass did.
+          });
+        }
         setTimeout(() => {
           setCompileProgress(null);
           setCompileRootPath(null);
@@ -65,7 +70,7 @@ export default function App() {
     return () => {
       unlisten?.();
     };
-  }, [setCompileProgress, setCompileRootPath]);
+  }, [activeWorkspace, setCompileProgress, setCompileRootPath]);
 
   // Subscribe to `tr-file-opened` events emitted by the Rust side
   // when a `.tr` file is dropped on the window or routed via the
@@ -116,12 +121,11 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={250} skipDelayDuration={120}>
       <div className="flex h-full w-full flex-col bg-background text-foreground">
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1">
           <Sidebar />
           <MainPane />
           <RightRail />
         </div>
-        <StatusBar />
       </div>
       <CommandPalette />
       <OnboardingWizard

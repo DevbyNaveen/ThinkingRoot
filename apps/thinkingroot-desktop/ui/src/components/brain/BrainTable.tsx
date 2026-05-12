@@ -8,12 +8,6 @@ interface Props {
   claims: ClaimRow[];
 }
 
-const TIER_BADGE: Record<ClaimRow["tier"], string> = {
-  rooted: "bg-tier-rooted/15 text-tier-rooted border-tier-rooted/30",
-  attested: "bg-tier-attested/15 text-tier-attested border-tier-attested/30",
-  unknown: "bg-tier-unknown/15 text-tier-unknown border-tier-unknown/30",
-};
-
 /**
  * Virtualized table of claims. Built on `@tanstack/react-virtual`
  * so the render cost stays constant with 10k+ rows. Header stays
@@ -105,13 +99,12 @@ export function BrainTable({
                 <span className="truncate font-mono text-[11px] text-foreground">
                   {row.id}
                 </span>
-                <span
-                  className={cn(
-                    "inline-flex w-fit items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] capitalize",
-                    TIER_BADGE[row.tier],
-                  )}
-                >
-                  {row.tier} · {row.confidence.toFixed(2)}
+                <span className="truncate text-[11px] tabular-nums text-muted-foreground">
+                  <span className="font-medium capitalize text-foreground/90">
+                    {row.tier}
+                  </span>
+                  <span className="text-muted-foreground/55"> · </span>
+                  <span>{row.confidence.toFixed(2)}</span>
                 </span>
                 <span className="truncate text-foreground/80" title={row.statement}>
                   {row.statement}
@@ -171,7 +164,7 @@ function TierSelect({
     <div
       role="radiogroup"
       aria-label="Filter by tier"
-      className="flex items-center gap-0.5 rounded-md border border-border bg-surface p-0.5"
+      className="flex items-center gap-px rounded-md border border-border/70 bg-background/40 p-px"
     >
       {options.map((opt) => {
         const active = value === opt;
@@ -183,10 +176,10 @@ function TierSelect({
             aria-checked={active}
             onClick={() => onChange(opt)}
             className={cn(
-              "rounded px-2 py-1 text-[10px] capitalize transition-colors",
+              "rounded-sm px-2.5 py-1 text-[10px] font-medium capitalize transition-colors",
               active
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:text-foreground",
+                ? "bg-muted/90 text-foreground shadow-sm"
+                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
             )}
           >
             {opt}

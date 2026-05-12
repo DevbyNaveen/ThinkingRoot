@@ -390,11 +390,11 @@ impl ToolHandler for UseSkillTool {
 
 /// `read_source` — fetch the exact source bytes a claim cites.
 ///
-/// One of the three v3 MCP tools per the v3 spec §8.5
-/// (`docs/2026-04-29-thinkingroot-v3-final-plan.md`). Closes the
-/// "verifiable byte range" loop: every claim emitted by extract carries
-/// `(file, byte_start, byte_end)`; this tool reads the bytes back so an
-/// agent can quote source verbatim instead of paraphrasing.
+/// Closes the "verifiable byte range" loop required by CCC I-2 (see
+/// `.claude/rules/compile-completeness.md`): every claim and every
+/// Witness emitted by the compile pipeline carries `(file, byte_start,
+/// byte_end)`; this tool reads the bytes back so an agent can quote
+/// source verbatim instead of paraphrasing.
 pub struct ReadSourceTool {
     ctx: ToolContext,
 }

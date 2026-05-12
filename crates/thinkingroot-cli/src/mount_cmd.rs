@@ -34,7 +34,7 @@
 //! produces the full substrate at the cost of an LLM extraction
 //! pass against the embedded sources.
 //!
-//! Spec: `docs/secondary-brain-concept.md` §5 (the missing primitive).
+//! Quickstart: `docs/2026-05-03-secondary-brain-quickstart.md`.
 
 use std::collections::HashMap;
 use std::io::Read;

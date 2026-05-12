@@ -10,6 +10,7 @@ pub mod incremental;
 mod predicate;
 mod relation;
 mod source;
+mod witness;
 mod workspace;
 mod workspace_event;
 mod workspace_status;
@@ -25,10 +26,15 @@ pub use contradiction::*;
 pub use diff::*;
 pub use entity::*;
 pub use event::*;
-pub use incremental::{format_bytes, IncrementalSummary, PHASE_NAMES};
+pub use incremental::{
+    format_bytes, CompileStep, CompileTick, IncrementalSummary, PHASE_NAMES,
+};
 pub use predicate::*;
 pub use relation::*;
 pub use source::*;
+pub use witness::{
+    Witness, WitnessId, WitnessIdParseError, WitnessInput, WitnessMesh, WitnessSpan,
+};
 pub use workspace::*;
 pub use workspace_event::*;
 pub use workspace_status::*;

@@ -48,6 +48,15 @@ pub fn run() {
                 agent_runtime_subprocess::spawn(&handle).await;
             });
 
+            // Ensure the auto-mounted "playground" workspace exists
+            // and is registered. Idempotent — the second-launch call
+            // is just a registry membership check. Failure is logged
+            // but never aborts boot (existing workspaces still work).
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::playground::ensure_playground_at_boot(&handle).await;
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -188,6 +197,15 @@ pub fn run() {
             commands::browser::browser_focus,
             commands::browser::browser_close,
             commands::browser::browser_list,
+            commands::browser::browser_devtools,
+            commands::browser::browser_find,
+            commands::browser::browser_find_clear,
+            commands::browser::browser_zoom,
+            commands::browser::browser_print,
+            commands::browser::browser_scroll_to,
+            commands::browser_save::browser_save_page,
+            commands::browser_save::browser_extract_callback,
+            commands::playground::playground_ensure,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

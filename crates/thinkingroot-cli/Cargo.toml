@@ -123,7 +123,7 @@ tr-sigstore = { workspace = true, features = ["live"] }
 ## Enable neural embedding for semantic search. On by default; disable with
 ## --no-default-features for faster test builds that skip ONNX Runtime linking.
 default = ["vector"]
-vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector", "thinkingroot-branch/vector", "thinkingroot-ground/vector"]
+vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector", "thinkingroot-branch/vector"]
 
 [dev-dependencies]
 tempfile = "3"

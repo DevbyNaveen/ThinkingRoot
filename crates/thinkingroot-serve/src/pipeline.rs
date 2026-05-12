@@ -76,18 +76,29 @@ pub enum ProgressEvent {
         failed_batches: usize,
         failed_chunk_ranges: Vec<(usize, usize)>,
     },
-    /// Grounding tribunal is starting (runs between extraction and linking).
+    /// Grounding tribunal events — **deleted in Witness Mesh cutover**.
+    /// Variants retained so SSE deserializers built against pre-cutover
+    /// daemons keep parsing; pipeline.rs never emits them post-cutover.
     GroundingStart {
         llm_claims: usize,
         structural_claims: usize,
     },
-    /// NLI model finished loading — tribunal is now actively processing claims.
-    /// Fired once, between GroundingStart and the first GroundingProgress event.
     GroundingModelReady,
-    /// One batch of claims grounded. Drives the real progress bar.
     GroundingProgress { done: usize, total: usize },
-    /// Grounding tribunal finished. `accepted` = claims that survived.
     GroundingDone { accepted: usize, rejected: usize },
+    /// Witness Mesh persistence (Phase 6.45) is starting. `raw` = the
+    /// extractor's pre-dedup witness count.
+    WitnessMeshStart { raw: usize },
+    /// Witness Mesh persistence finished. `persisted` = rows actually
+    /// written after content-id dedup and SAFETY cross-check; `deduped`
+    /// = collapsed duplicates; `edges` = DAG edges in the input mesh;
+    /// `errors` = mesh-assembly warnings (malformed witnesses dropped).
+    WitnessMeshDone {
+        persisted: usize,
+        deduped: usize,
+        edges: usize,
+        errors: usize,
+    },
     /// Fingerprint check finished. `cutoffs` = sources skipped by fingerprint match.
     FingerprintDone {
         truly_changed: usize,
@@ -140,6 +151,13 @@ pub enum ProgressEvent {
     /// in-flight bars with a failure style instead of the ambiguous "skipped"
     /// dim dash.
     PipelineFailed { error: String },
+    /// Live progress snapshot — emitted by the daemon's ticker every
+    /// 250 ms while a compile is running. This is the **single canonical
+    /// progress event** for the unified CLI + desktop progress bar.
+    /// All the per-phase events above (`ChunkDone`, `EntityResolved`,
+    /// `LinkingStart`, `WitnessMeshStart`, …) are retained only for
+    /// legacy SSE consumers; new code should match on `CompileTick`.
+    CompileTick(thinkingroot_core::CompileTick),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -175,6 +193,145 @@ pub struct PipelineResult {
     /// branch on presence.
     #[serde(default)]
     pub incremental_summary: thinkingroot_core::IncrementalSummary,
+}
+
+/// Live compile-progress state shared between the pipeline body and
+/// the ticker task. Each `set_step` resets `done`/`total` and stamps a
+/// new step-start timestamp; phases advance via `advance` / `set_done`
+/// atomics. The ticker reads a coherent `CompileTick` snapshot every
+/// 250 ms — no per-row events on the channel, no lock contention.
+pub(crate) struct CompileProgressState {
+    step: std::sync::atomic::AtomicU8,
+    done: std::sync::atomic::AtomicU64,
+    total: std::sync::atomic::AtomicU64,
+    pipeline_start: std::time::Instant,
+    /// Milliseconds since `pipeline_start` when the current step began.
+    /// Stored as a u64 atomic so we never need a mutex.
+    step_started_ms: std::sync::atomic::AtomicU64,
+}
+
+impl CompileProgressState {
+    pub(crate) fn new() -> Self {
+        Self {
+            step: std::sync::atomic::AtomicU8::new(
+                thinkingroot_core::CompileStep::Reading.index(),
+            ),
+            done: std::sync::atomic::AtomicU64::new(0),
+            total: std::sync::atomic::AtomicU64::new(0),
+            pipeline_start: std::time::Instant::now(),
+            step_started_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn set_step(&self, step: thinkingroot_core::CompileStep, total: u64) {
+        use std::sync::atomic::Ordering;
+        let elapsed = self.pipeline_start.elapsed().as_millis() as u64;
+        // Order: step_started_ms first so concurrent snapshot reads see
+        // a consistent (step_started_ms <= now) view of the new step.
+        self.step_started_ms.store(elapsed, Ordering::Release);
+        self.done.store(0, Ordering::Release);
+        self.total.store(total, Ordering::Release);
+        self.step.store(step.index(), Ordering::Release);
+    }
+
+    pub(crate) fn advance(&self, n: u64) {
+        self.done
+            .fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn set_done(&self, n: u64) {
+        self.done.store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn set_total(&self, n: u64) {
+        self.total.store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    fn step_from_index(idx: u8) -> thinkingroot_core::CompileStep {
+        use thinkingroot_core::CompileStep::*;
+        match idx {
+            1 => Reading,
+            2 => Extracting,
+            3 => Linking,
+            4 => Persisting,
+            5 => Packing,
+            // Defensive default — unreachable if `set_step` is the only mutator.
+            _ => Reading,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> thinkingroot_core::CompileTick {
+        use std::sync::atomic::Ordering;
+        let step = Self::step_from_index(self.step.load(Ordering::Acquire));
+        let done = self.done.load(Ordering::Acquire);
+        let total = self.total.load(Ordering::Acquire);
+        let step_started_ms = self.step_started_ms.load(Ordering::Acquire);
+        let total_elapsed_ms = self.pipeline_start.elapsed().as_millis() as u64;
+        let step_elapsed_ms = total_elapsed_ms.saturating_sub(step_started_ms);
+        let eta_ms = if total > 0 && done > 0 && done < total {
+            // u128 to avoid overflow on large workspaces.
+            let remaining = (total - done) as u128;
+            let est = (step_elapsed_ms as u128).saturating_mul(remaining) / done as u128;
+            Some(est.min(u64::MAX as u128) as u64)
+        } else {
+            None
+        };
+        thinkingroot_core::CompileTick {
+            step,
+            done,
+            total,
+            step_elapsed_ms,
+            total_elapsed_ms,
+            eta_ms,
+            detail: None,
+        }
+    }
+}
+
+/// Spawn a tokio task that emits `CompileTick` snapshots every 250 ms
+/// until cancelled. Owns its own cancel-token so the pipeline body can
+/// shut it down on success or early return without affecting the
+/// user-facing pipeline `cancel` token.
+fn spawn_compile_ticker(
+    state: std::sync::Arc<CompileProgressState>,
+    tx: tokio::sync::mpsc::UnboundedSender<ProgressEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Emit one tick immediately so the consumer never sees a blank
+        // start — the first 250 ms of compile would otherwise look idle.
+        let _ = tx.send(ProgressEvent::CompileTick(state.snapshot()));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if tx.send(ProgressEvent::CompileTick(state.snapshot())).is_err() {
+                        // Channel closed — pipeline must be done; bail.
+                        break;
+                    }
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+    })
+}
+
+/// RAII guard that cancels and aborts the compile ticker on drop. Used
+/// so every early-return path in `run_pipeline_inner` (including the
+/// `?`-propagated errors) tears down the ticker cleanly.
+struct TickerGuard {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TickerGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
 }
 
 /// Run the v3 pipeline: Parse → Extract+Ground+Rooting+Link+SVO →
@@ -349,6 +506,29 @@ async fn run_pipeline_inner(
         }};
     }
 
+    // ─── Unified compile-progress ticker ─────────────────────────────
+    // Spawn one ticker task that owns the truth about "what step are
+    // we on" and emits a `CompileTick` snapshot every 250 ms. Each
+    // phase below calls `progress_state.set_step(...)` to relabel the
+    // ticker; no per-row events are required for the bar to keep moving
+    // (the step_elapsed_ms in every snapshot stays honest). The
+    // `_ticker_guard` cancels + aborts the task on every return path
+    // (`?`-propagated errors included) via its Drop impl.
+    let progress_state = std::sync::Arc::new(CompileProgressState::new());
+    let _ticker_guard = progress.as_ref().map(|tx| {
+        progress_state.set_step(thinkingroot_core::CompileStep::Reading, 0);
+        let ticker_cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_compile_ticker(
+            progress_state.clone(),
+            tx.clone(),
+            ticker_cancel.clone(),
+        );
+        TickerGuard {
+            cancel: ticker_cancel,
+            handle: Some(handle),
+        }
+    });
+
     let config = Config::load_merged(root_path)?;
     let data_dir = thinkingroot_branch::snapshot::resolve_data_dir(root_path, branch);
     std::fs::create_dir_all(&data_dir)?;
@@ -360,6 +540,13 @@ async fn run_pipeline_inner(
     bail_if_cancelled!();
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
+    // Reading is done — stamp the total so the bar shows N/N for a
+    // moment before transitioning. Then move to Extracting (covers
+    // Phase 2 extract + Phase 3 fingerprint + Phase 4 source-removal,
+    // which are all "input-deriving" work from the user's perspective).
+    progress_state.set_total(files_parsed as u64);
+    progress_state.set_done(files_parsed as u64);
+    progress_state.set_step(thinkingroot_core::CompileStep::Extracting, 0);
     emit!(ProgressEvent::ParseComplete {
         files: files_parsed
     });
@@ -512,7 +699,7 @@ async fn run_pipeline_inner(
     // ─── Phase 2: Extract potentially-changed documents (with cache) ───
     let workspace_id = WorkspaceId::new();
     let cache_hits;
-    let mut extraction;
+    let extraction;
 
     // ── Graph-Primed Context: inject known entities into extraction ──
     let known_entities = match storage.graph.get_known_entities() {
@@ -684,128 +871,32 @@ async fn run_pipeline_inner(
         );
     }
 
-    // ─── Phase 2b: Cascade Grounding ─────────────────────────────────────────────────
-    // Structural claims (from AST) are auto-grounded at 0.99 — skip tribunal.
-    // LLM claims run the full 4-judge grounding tribunal (unchanged behavior).
+    // ─── Phase 2b: Cascade Grounding — DELETED in Witness Mesh cutover ───
     //
-    // IMPORTANT: We partition claims before passing to the grounder so that
-    // the tribunal cannot overwrite auto-grounded structural scores. The
-    // structural claims are merged back after the tribunal completes.
+    // The 4-judge tribunal (lexical, span, semantic, NLI) existed to
+    // grade LLM-paraphrased claim text against source bytes. Under
+    // Witness Mesh, every Witness IS its byte span — there is no
+    // paraphrase to grade. The single surviving verifier
+    // (`witness_verifier::verify_witness_anchor`) is a BLAKE3
+    // comparison run at probe time + by `tr-verify` at pack-open
+    // time. The 22KB grounder + 17KB NLI ONNX + 3.8KB lexical +
+    // 3.8KB semantic collapse to ~200 LOC of cryptographic anchor
+    // verification.
     //
-    // NLI model is embedded in the binary (no downloads). Pool creation is
-    // cheap (just RAM detection), but we still use spawn_blocking because
-    // ONNX session creation from memory is CPU-heavy.
-
+    // Legacy claims that flow through the dual-write transition
+    // stay un-graded: their `grounding_score` field remains at the
+    // default `-1.0` (unverified). Read-side consumers that fall
+    // back to claims should treat -1.0 as "use Witness Mesh
+    // instead" rather than reading the legacy field.
+    //
+    // See `.claude/rules/witness-mesh.md` I-W8 for the anchor
+    // verification contract.
     bail_if_cancelled!();
-
-    // Partition: structural claims get 0.99, LLM claims go to tribunal.
-    let (llm_claims, mut structural_claims): (Vec<_>, Vec<_>) = extraction
-        .claims
-        .into_iter()
-        .partition(|c| c.extraction_tier == thinkingroot_core::types::ExtractionTier::Llm);
-
-    emit!(ProgressEvent::GroundingStart {
-        llm_claims: llm_claims.len(),
-        structural_claims: structural_claims.len(),
-    });
-
-    // Auto-ground structural claims.
-    let structural_count = structural_claims.len();
-    for claim in &mut structural_claims {
-        claim.grounding_score = Some(0.99);
-        claim.grounding_method = Some(thinkingroot_core::types::GroundingMethod::Structural);
-    }
-    if structural_count > 0 {
-        tracing::info!(
-            "cascade grounding: {} structural claims auto-grounded at 0.99 (skipped tribunal)",
-            structural_count
-        );
-    }
-
-    // Run tribunal on LLM claims only.
-    let grounded_llm_claims = if !llm_claims.is_empty() {
-        #[cfg(feature = "vector")]
-        let nli_pool = {
-            let data_dir_clone = data_dir.clone();
-            let result = match tokio::task::spawn_blocking(move || {
-                thinkingroot_ground::NliJudgePool::load(Some(&data_dir_clone))
-            })
-            .await
-            {
-                Ok(Ok(pool)) => {
-                    tracing::info!("NLI pool ready: {} parallel workers", pool.num_workers);
-                    Some(pool)
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("NLI pool unavailable, using Judges 1-3 only: {e}");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!("NLI pool load task failed: {e}, using Judges 1-3 only");
-                    None
-                }
-            };
-            // Signal the progress bar — model is loaded, tribunal is starting.
-            emit!(ProgressEvent::GroundingModelReady);
-            result
-        };
-
-        extraction.claims = llm_claims;
-        let pre_count = extraction.claims.len();
-        let grounder = {
-            let g =
-                thinkingroot_ground::Grounder::new(thinkingroot_ground::GroundingConfig::default());
-            if let Some(ref tx) = progress {
-                let tx_ground = tx.clone();
-                let pf = Arc::new(move |done: usize, total: usize| {
-                    let _ = tx_ground.send(ProgressEvent::GroundingProgress { done, total });
-                }) as thinkingroot_ground::GroundingProgressFn;
-                g.with_progress(pf)
-            } else {
-                g
-            }
-        };
-        // block_in_place: grounder.ground() is a long synchronous CPU/ONNX operation.
-        // Telling tokio this thread will block lets it keep the spawned bar_driver task
-        // and other async work scheduled on the remaining threads.
-        let mut grounded = tokio::task::block_in_place(|| {
-            grounder.ground(
-                extraction,
-                #[cfg(feature = "vector")]
-                Some(&mut storage.vector),
-                #[cfg(feature = "vector")]
-                nli_pool.as_ref(),
-            )
-        });
-        thinkingroot_ground::dedup::dedup_claims(&mut grounded.claims);
-        let post_count = grounded.claims.len();
-        if pre_count != post_count {
-            tracing::info!(
-                "grounding: {} → {} LLM claims ({} rejected/deduped)",
-                pre_count,
-                post_count,
-                pre_count - post_count,
-            );
-        }
-        grounded
-    } else {
-        // All claims are structural — rebuild extraction with empty claims vec.
-        extraction.claims = Vec::new();
-        extraction
-    };
-
-    // Merge: structural claims (0.99 grounding) + surviving LLM claims.
-    let pre_grounding_total = grounded_llm_claims.claims.len() + structural_claims.len();
-    extraction = grounded_llm_claims;
-    extraction.claims.extend(structural_claims);
-    thinkingroot_ground::dedup::dedup_claims(&mut extraction.claims);
-    let post_grounding_total = extraction.claims.len();
-
-    emit!(ProgressEvent::GroundingDone {
-        accepted: post_grounding_total,
-        rejected: pre_grounding_total.saturating_sub(post_grounding_total),
-    });
-    mark_phase!("ground");
+    // Phase 2b (the 4-judge grounding tribunal) is deleted in the
+    // Witness Mesh cutover. The honest progress bar for this stretch
+    // of the compile is the Witness Mesh persist at Phase 6.45 below
+    // — we don't emit a synthetic 0.0s "Grounding accepted N" line
+    // any more.
 
     // Phase 2c (SVO event extraction) is intentionally deferred to Phase 2c-post-link
     // below.  It must run AFTER Phase 7 (Linker) so that entity names can be resolved
@@ -949,6 +1040,11 @@ async fn run_pipeline_inner(
     mark_phase!("remove_sources");
 
     // ─── Phase 5: Incremental entity relation update for removals ──────
+    // First of two `Linking` slots in the user-visible bar. Phase 5 is
+    // entity-relation work; the second slot is the linker + SVO post
+    // Phase 7. We don't know an honest total here (Cozo-side update),
+    // so the ticker shows a spinner with elapsed time only.
+    progress_state.set_step(thinkingroot_core::CompileStep::Linking, 0);
     if !affected_triples.is_empty() {
         affected_triples.sort_unstable();
         affected_triples.dedup();
@@ -1033,6 +1129,15 @@ async fn run_pipeline_inner(
     // (and future re-rooting sweeps) can re-execute probes against them. The
     // byte-store is content-addressed, so multiple writes with the same hash
     // are no-ops — fresh recompiles of an unchanged file cost zero extra I/O.
+    //
+    // First `Persisting` slot in the user-visible bar — covers Phase 6
+    // sources + 6.45 witnesses + 6.7 structural rebuild. Total is the
+    // number of truly-changed sources we're about to rewrite; the
+    // per-source insert loop below advances the counter.
+    progress_state.set_step(
+        thinkingroot_core::CompileStep::Persisting,
+        truly_changed.len() as u64,
+    );
     let byte_store = thinkingroot_rooting::FileSystemSourceStore::new(&data_dir)
         .map_err(|e| thinkingroot_core::Error::Config(format!("rooting byte store: {e}")))?;
     for doc in &truly_changed {
@@ -1040,6 +1145,7 @@ async fn run_pipeline_inner(
             .with_id(doc.source_id)
             .with_hash(doc.content_hash.clone());
         storage.graph.insert_source(&source)?;
+        progress_state.advance(1);
 
         // Reconstruct the text used during extraction (chunks joined by \n).
         // This matches what the Grounder saw, so provenance probe results line
@@ -1093,126 +1199,90 @@ async fn run_pipeline_inner(
         // would do if it were filtered (currently it isn't — see issue C5).
         claim_quantities: extraction.claim_quantities,
         claim_expirations: extraction.claim_expirations,
+        // Witness Mesh — filter by truly-changed source set, same
+        // as `claims` / `relations`. Per-source filtering is the only
+        // way to keep incremental compile correct: a Witness for an
+        // unchanged source must not be re-written (its id is
+        // content-derived, so re-write is a no-op, but the redundant
+        // I/O would erase the I-W6 source-granular invariant).
+        witnesses: extraction
+            .witnesses
+            .into_iter()
+            .filter(|w| truly_changed_ids.contains(&w.source))
+            .collect(),
     };
 
-    // ─── Phase 6.5: Rooting ────────────────────────────────────────────
-    // Deterministic admission gate. Each candidate claim faces five probes
-    // (provenance, contradiction, predicate, topology, temporal). Rejected
-    // claims are removed from the extraction before Link sees them.
+    // ─── Phase 6.45: Witness Mesh persistence ──────────────────────────
+    // Write Witnesses produced by the rule-catalog extractors before
+    // Rooting / linker run. The witnesses substrate is independent of
+    // the claims substrate — Witnesses are content-addressed, never
+    // graded by the tribunal, and their inserts are idempotent on
+    // re-derived rows (same rule + same spans → same id).
     //
-    // Disabled when either the workspace config opts out
-    // (`config.rooting.disabled`) or the caller passed `no_rooting`
-    // (M3 — pre-fix this was an `unsafe { std::env::set_var(...) }`
-    // hazard; the env var is honoured here as a deprecated fallback
-    // so any external script that still sets `TR_ROOTING_DISABLED=1`
-    // keeps working unchanged).
-    let rooting_disabled_env = std::env::var("TR_ROOTING_DISABLED")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let rooting_skipped = no_rooting || rooting_disabled_env;
-    if !config.rooting.disabled && !rooting_skipped && !filtered_extraction.claims.is_empty() {
-        let rooting_cfg = thinkingroot_rooting::RootingConfig {
-            disabled: config.rooting.disabled,
-            provenance_threshold: config.rooting.provenance_threshold,
-            contradiction_floor: config.rooting.contradiction_floor,
-            contribute_gate: config.rooting.contribute_gate.clone(),
-            predicate_strength_threshold: config.rooting.predicate_strength_threshold,
-        };
-        let candidates_total = filtered_extraction.claims.len();
-        emit!(ProgressEvent::RootingStart {
-            candidates: candidates_total
-        });
-
-        let candidates: Vec<thinkingroot_rooting::CandidateClaim<'_>> = filtered_extraction
-            .claims
-            .iter()
-            .map(|c| thinkingroot_rooting::CandidateClaim {
-                claim: c,
-                predicate: c.predicate.as_ref(),
-                derivation: c.derivation.as_ref(),
-            })
-            .collect();
-
-        let rooter = {
-            let r = thinkingroot_rooting::Rooter::new(&storage.graph, &byte_store, rooting_cfg);
-            if let Some(ref tx) = progress {
-                let tx_root = tx.clone();
-                let pf: thinkingroot_rooting::RootingProgressFn =
-                    Arc::new(move |done: usize, total: usize| {
-                        let _ = tx_root.send(ProgressEvent::RootingProgress { done, total });
-                    });
-                r.with_progress(pf)
-            } else {
-                r
-            }
-        };
-
-        let rooting_output = rooter
-            .root_batch(&candidates)
-            .map_err(|e| thinkingroot_core::Error::Config(format!("rooting: {e}")))?;
-
-        // Drop Rejected claims from the extraction so Link never sees them.
-        let rejected_ids: std::collections::HashSet<thinkingroot_core::ClaimId> = rooting_output
-            .verdicts
-            .iter()
-            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Rejected)
-            .map(|v| v.claim_id)
-            .collect();
-        if !rejected_ids.is_empty() {
-            filtered_extraction
-                .claims
-                .retain(|c| !rejected_ids.contains(&c.id));
-        }
-
-        // Stamp survivors with their tier + last_rooted_at.
-        let tier_map: std::collections::HashMap<thinkingroot_core::ClaimId, _> = rooting_output
-            .verdicts
-            .iter()
-            .map(|v| (v.claim_id, (v.admission_tier, v.trial_at)))
-            .collect();
-        for c in &mut filtered_extraction.claims {
-            if let Some((tier, trial_at)) = tier_map.get(&c.id) {
-                c.admission_tier = *tier;
-                c.last_rooted_at = Some(*trial_at);
-            }
-        }
-
-        // Persist verdicts + certificates into CozoDB.
-        thinkingroot_rooting::storage::insert_verdicts_batch(
-            &storage.graph,
-            &rooting_output.verdicts,
-        )
-        .map_err(|e| thinkingroot_core::Error::Config(format!("rooting verdicts: {e}")))?;
-        thinkingroot_rooting::storage::insert_certificates_batch(
-            &storage.graph,
-            &rooting_output.certificates,
-        )
-        .map_err(|e| thinkingroot_core::Error::Config(format!("rooting certificates: {e}")))?;
-
-        let rooted = rooting_output
-            .verdicts
-            .iter()
-            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Rooted)
-            .count();
-        let attested = rooting_output
-            .verdicts
-            .iter()
-            .filter(|v| v.admission_tier == thinkingroot_core::types::AdmissionTier::Attested)
-            .count();
-        emit!(ProgressEvent::RootingDone {
-            rooted,
-            attested,
-            quarantined: rooting_output.quarantined_count,
-            rejected: rooting_output.rejected_count,
-        });
-        tracing::info!(
-            "rooting: {} rooted, {} attested, {} quarantined, {} rejected",
-            rooted,
-            attested,
-            rooting_output.quarantined_count,
-            rooting_output.rejected_count
+    // We persist the deduplicated mesh (drop intra-batch duplicates,
+    // SAFETY-rule cross-check) rather than the raw stream so the
+    // `witnesses` table reflects the same shape callers see via
+    // `walk_mesh`. Mesh-assembly errors (UnknownRule, MalformedSpan)
+    // are logged at WARN — the pipeline does not abort because the
+    // legacy `claims` flow is still load-bearing during the
+    // Witness-Mesh transition.
+    if !filtered_extraction.witnesses.is_empty() {
+        let raw_witness_count = filtered_extraction.witnesses.len();
+        emit!(ProgressEvent::WitnessMeshStart { raw: raw_witness_count });
+        let assembled = thinkingroot_extract::assemble_witness_mesh(
+            std::mem::take(&mut filtered_extraction.witnesses),
         );
+        if !assembled.errors.is_empty() {
+            for err in &assembled.errors {
+                tracing::warn!(error = %err, "witness mesh assembly: dropping malformed witness");
+            }
+        }
+        if !assembled.witnesses.is_empty() {
+            storage
+                .graph
+                .insert_witnesses_batch(&assembled.witnesses)?;
+        }
+        if !assembled.edges.is_empty() {
+            storage
+                .graph
+                .insert_witness_input_edges_batch(&assembled.edges)?;
+        }
+        tracing::info!(
+            raw = raw_witness_count,
+            persisted = assembled.witnesses.len(),
+            edges = assembled.edges.len(),
+            deduped = assembled.dedup_count,
+            errors = assembled.errors.len(),
+            "Witness Mesh: persisted to graph"
+        );
+        emit!(ProgressEvent::WitnessMeshDone {
+            persisted: assembled.witnesses.len(),
+            deduped: assembled.dedup_count,
+            edges: assembled.edges.len(),
+            errors: assembled.errors.len(),
+        });
     }
+    mark_phase!("witness_mesh");
+
+    // ─── Phase 6.5: Rooting — DELETED in Witness Mesh cutover ────────────
+    //
+    // The LLM-claim admission gate is obviated by content-addressed
+    // Witnesses. The Witness Mesh substrate (Phase 6.45 above) admits
+    // every Witness by construction: a Witness's id is a BLAKE3 over
+    // `(rule, spans)`, anchored by `content_blake3 ==
+    // BLAKE3(source[spans[0].start..end])`. There is nothing to "trial"
+    // because the substrate cannot lie — it doesn't paraphrase.
+    //
+    // The `_ = no_rooting;` line keeps the parameter live during the
+    // dual-substrate transition (legacy claims still flow through Link
+    // unchanged); callers that pass `--no-rooting` still get the same
+    // behaviour they always did because Phase 6.5 no longer runs at all.
+    //
+    // See `.claude/rules/witness-mesh.md` for the Witness Mesh's I-W8
+    // anchor verification — the surviving piece of the tribunal that
+    // replaces Rooting's five-probe trial.
+    let _ = no_rooting;
+    let _ = config.rooting.disabled;
 
     // ─── Phase 6.7: Structural Persist (Compile Completeness Contract §6) ───
     // Walks every chunk in every truly-changed document and emits typed
@@ -1241,6 +1311,14 @@ async fn run_pipeline_inner(
     );
     mark_phase!("structural_persist");
 
+    // Second `Linking` slot — covers Phase 7 (linker), Phase 7e
+    // (resolution), and Phase 8 (post-link entity-relation update + SVO
+    // event extraction). Phase 7's linker has its own done/total
+    // callback; we let the linker plumb counter advances directly into
+    // `progress_state` so the bar shows real entity-merge progress.
+    let entities_total = filtered_extraction.entities.len() as u64;
+    progress_state.set_step(thinkingroot_core::CompileStep::Linking, entities_total);
+
     let claims_count = filtered_extraction.claims.len();
     let entities_count = filtered_extraction.entities.len();
     let relations_count = filtered_extraction.relations.len();
@@ -1266,7 +1344,14 @@ async fn run_pipeline_inner(
             let tx_link = tx.clone();
             let total_entities = filtered_extraction.entities.len();
             emit!(ProgressEvent::LinkingStart { total_entities });
+            // Plumb the linker's per-entity callback into both the
+            // legacy `EntityResolved` event (kept for the old
+            // multi-bar driver) AND the unified `progress_state`
+            // counter (used by the ticker → `CompileTick`).
+            let state_for_linker = progress_state.clone();
             let pf = Arc::new(move |done: usize, total: usize| {
+                state_for_linker.set_total(total as u64);
+                state_for_linker.set_done(done as u64);
                 let _ = tx_link.send(ProgressEvent::EntityResolved { done, total });
             }) as thinkingroot_link::EntityProgressFn;
             l.with_progress(pf)
@@ -1401,6 +1486,11 @@ async fn run_pipeline_inner(
     // source has uncovered bytes. Per-compile escape hatch:
     // `TR_SKIP_BYTE_AUDIT=1` (intended for local iteration; CI must
     // keep it on).
+    //
+    // Second `Persisting` slot — audit reads the substrate rather than
+    // writing, but from the user's bar this is "verifying what we just
+    // persisted." No known total → spinner with elapsed-only.
+    progress_state.set_step(thinkingroot_core::CompileStep::Persisting, 0);
     let phase_9_skip = skip_byte_audit
         || std::env::var("TR_SKIP_BYTE_AUDIT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

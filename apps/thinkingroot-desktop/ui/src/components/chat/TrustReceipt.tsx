@@ -104,9 +104,6 @@ export function TrustReceiptChip({ receipt }: { receipt: TrustReceiptShape }) {
         )}
         aria-label={`Trust receipt: ${palette.label}. Click for details.`}
       >
-        <span aria-hidden className="opacity-60">
-          {palette.glyph}
-        </span>
         <span>{palette.label}</span>
       </button>
       {open && (

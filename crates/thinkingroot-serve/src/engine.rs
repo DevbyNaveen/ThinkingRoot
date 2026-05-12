@@ -126,10 +126,11 @@ pub struct ArtifactContent {
 }
 
 /// Result of [`QueryEngine::read_source`]. Returns the exact source bytes a
-/// claim cites — the round-trip the v3 `read_source` MCP tool exposes
-/// (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §8.5). `text` is the
-/// UTF-8 decoding of `bytes` when valid; consumers needing the raw bytes
-/// can inspect `bytes` directly.
+/// claim or Witness cites — the round-trip the `read_source` MCP tool
+/// exposes. Backed by the CCC I-2 byte-anchored invariant (see
+/// `.claude/rules/compile-completeness.md`). `text` is the UTF-8 decoding
+/// of `bytes` when valid; consumers needing the raw bytes can inspect
+/// `bytes` directly.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReadSourceResult {
     /// URI of the source the claim was extracted from (e.g. `src/lib.rs`).
@@ -1249,6 +1250,71 @@ impl QueryEngine {
 
         apply_pagination(&mut claims, filter.offset, filter.limit);
         Ok(claims)
+    }
+
+    /// List Witnesses in a workspace, optionally capped at `limit`.
+    /// Goes directly through the graph (no cache layer yet for the
+    /// Witness Mesh substrate — v1.1 will add one if profiling shows
+    /// it's needed). Each workspace owns its own CozoDB instance, so
+    /// the returned set is workspace-scoped by construction.
+    pub async fn list_witnesses(
+        &self,
+        ws: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<thinkingroot_core::types::Witness>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_witnesses(limit)
+    }
+
+    /// Fetch a single Witness by id from a workspace. Returns `None`
+    /// when the id is unknown — surfaces the absence honestly rather
+    /// than fabricating an empty Witness, because callers gate
+    /// downstream behaviour (e.g. AEP probe materialisation) on
+    /// `Some`.
+    pub async fn get_witness(
+        &self,
+        ws: &str,
+        id: &str,
+    ) -> Result<Option<thinkingroot_core::types::Witness>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_witness(id)
+    }
+
+    /// Count the witnesses table for a workspace. Used by the
+    /// migration-status REST surface and by tests verifying that
+    /// `root compile` populated the new substrate.
+    pub async fn count_witnesses(&self, ws: &str) -> Result<u64> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.count_witnesses()
+    }
+
+    /// Walk the Witness Mesh DAG starting from a witness id. Returns
+    /// every Witness reachable via `witness_input_edges` within
+    /// `max_depth` hops + the edges that connect them. Used by the
+    /// `walk_mesh` MCP tool so AI agents can trace a Witness's full
+    /// derivation chain (which rule produced it, what bytes it
+    /// derived from, what sibling Witnesses share inputs).
+    ///
+    /// Returns `(witnesses, edges)` — edges are the subset of
+    /// `witness_input_edges` rows that fall inside the walked set.
+    pub async fn walk_witness_mesh(
+        &self,
+        ws: &str,
+        root_id: &str,
+        max_depth: usize,
+        max_fanout: usize,
+    ) -> Result<(
+        Vec<thinkingroot_core::types::Witness>,
+        Vec<(String, String)>,
+    )> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage
+            .graph
+            .walk_mesh_from(root_id, max_depth, max_fanout)
     }
 
     /// Get relations for a specific entity by name.
@@ -2981,134 +3047,28 @@ Rules: \
 
         // No active branch — write to main graph, then reload cache.
         let accepted_ids;
-        let mut warnings;
+        let warnings;
         {
             let storage = handle.storage.lock().await;
             (accepted_ids, warnings) =
                 Self::write_agent_claims_to_graph(&storage.graph, &source, &agent_claims)?;
 
-            // ── Rooting advisory pass ─────────────────────────────────
-            // Route the freshly-admitted agent claims through the Rooting
-            // gate. The synthetic `mcp://agent/*` source has no bytes on
-            // disk, so we persist the joined claim statements as the source
-            // body — that makes the provenance probe a tautology (intended:
-            // agent attribution, not drift detection) and lets the
-            // contradiction + temporal probes do real work. Advisory mode
-            // logs tier distribution and appends a warning; enforce mode
-            // (future) would also delete Rejected-tier claims.
-            if handle.config.rooting.contribute_gate != "off"
-                && !handle.config.rooting.disabled
-                && !accepted_ids.is_empty()
-            {
-                let byte_store = thinkingroot_rooting::FileSystemSourceStore::new(
-                    &handle.root_path.join(".thinkingroot"),
-                );
-                if let Ok(byte_store) = byte_store {
-                    let joined: String = agent_claims
-                        .iter()
-                        .map(|c| c.statement.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    use thinkingroot_rooting::SourceByteStore;
-                    let _ = byte_store.put(source.id, &source.content_hash, joined.as_bytes());
-
-                    let mut claims: Vec<thinkingroot_core::Claim> =
-                        Vec::with_capacity(accepted_ids.len());
-                    for id in &accepted_ids {
-                        if let Ok(Some(c)) = storage.graph.get_claim_by_id(id) {
-                            claims.push(c);
-                        }
-                    }
-                    let candidates: Vec<thinkingroot_rooting::CandidateClaim<'_>> = claims
-                        .iter()
-                        .map(|c| thinkingroot_rooting::CandidateClaim {
-                            claim: c,
-                            predicate: c.predicate.as_ref(),
-                            derivation: c.derivation.as_ref(),
-                        })
-                        .collect();
-                    let rooting_cfg = thinkingroot_rooting::RootingConfig {
-                        disabled: handle.config.rooting.disabled,
-                        provenance_threshold: handle.config.rooting.provenance_threshold,
-                        contradiction_floor: handle.config.rooting.contradiction_floor,
-                        contribute_gate: handle.config.rooting.contribute_gate.clone(),
-                        predicate_strength_threshold: handle
-                            .config
-                            .rooting
-                            .predicate_strength_threshold,
-                    };
-                    let rooter =
-                        thinkingroot_rooting::Rooter::new(&storage.graph, &byte_store, rooting_cfg);
-                    match rooter.root_batch(&candidates) {
-                        Ok(output) => {
-                            // Persist verdicts + certificates for audit.
-                            let _ = thinkingroot_rooting::storage::insert_verdicts_batch(
-                                &storage.graph,
-                                &output.verdicts,
-                            );
-                            let _ = thinkingroot_rooting::storage::insert_certificates_batch(
-                                &storage.graph,
-                                &output.certificates,
-                            );
-                            // Stamp each claim with its new admission_tier.
-                            for (idx, v) in output.verdicts.iter().enumerate() {
-                                if let Some(c) = claims.get(idx) {
-                                    let mut updated = c.clone();
-                                    updated.admission_tier = v.admission_tier;
-                                    updated.last_rooted_at = Some(v.trial_at);
-                                    let _ = storage.graph.insert_claim(&updated);
-                                }
-                            }
-
-                            // Enforce mode excises any Rejected-tier claim
-                            // from the graph. Advisory keeps everything.
-                            let enforce = handle.config.rooting.contribute_gate == "enforce";
-                            let mut enforced_removed = 0usize;
-                            if enforce {
-                                for (idx, v) in output.verdicts.iter().enumerate() {
-                                    if v.admission_tier
-                                        == thinkingroot_core::types::AdmissionTier::Rejected
-                                    {
-                                        if let Some(c) = claims.get(idx) {
-                                            let cid = c.id.to_string();
-                                            if let Err(e) = storage.graph.remove_claim_fully(&cid) {
-                                                tracing::warn!(
-                                                    "contribute enforce: remove_claim_fully({}) failed: {e}",
-                                                    cid
-                                                );
-                                            } else {
-                                                enforced_removed += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            let enforce_note = if enforce {
-                                format!(" — enforce mode removed {enforced_removed}")
-                            } else {
-                                String::from(" — advisory mode, nothing removed")
-                            };
-
-                            if output.rejected_count > 0 || output.quarantined_count > 0 {
-                                warnings.push(format!(
-                                    "rooting: {} rejected, {} quarantined{}",
-                                    output.rejected_count, output.quarantined_count, enforce_note
-                                ));
-                            } else {
-                                tracing::info!(
-                                    "rooting {}: {} admitted cleanly (contribute)",
-                                    if enforce { "enforce" } else { "advisory" },
-                                    output.admitted_count
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("rooting advisory pass failed (non-fatal): {e}");
-                        }
-                    }
-                }
-            }
+            // ── Rooting advisory pass — DELETED in Witness Mesh cutover ──
+            //
+            // Pre-cutover this routed freshly-admitted agent claims
+            // through the 5-probe Rooting trial to gate Rejected-tier
+            // contributions. Under Witness Mesh, agent contributions
+            // produce Witnesses whose anchors are verified by
+            // `witness_verifier::verify_witness_anchor` — there is no
+            // tier to assign. The `contribute_gate` config is now a
+            // no-op; callers may set it for forward-compat but the
+            // value is not consulted.
+            //
+            // `warnings` is read further down to surface anything
+            // accumulated by `write_agent_claims_to_graph`; the
+            // rooting pass had its own additions that no longer apply.
+            let _ = &handle.config.rooting.contribute_gate;
+            let _ = &warnings;
 
             // Reload while still holding storage lock so no concurrent write
             // can slip in between the CozoDB write and the cache update.

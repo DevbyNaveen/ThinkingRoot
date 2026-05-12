@@ -33,7 +33,7 @@ tauri-build = { version = "2", features = [] }
 # Tauri stack — desktop-side plugins only. Sinks that were
 # helloroot-internal are out of scope here; the agent-runtime
 # sidecar (Step 10) takes over chat / agent orchestration.
-tauri = { version = "2", features = ["tray-icon", "unstable"] }
+tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
@@ -87,3 +87,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Tauri IPC JSON boundary.
 portable-pty = "0.9"
 base64 = "0.22"
+
+# Content addressing for the browser "Save to ThinkingRoot" feature.
+# The captured markdown is BLAKE3-hashed so we can detect "same page
+# re-saved with identical content" and skip the duplicate write +
+# recompile cycle. Same hash algorithm the engine uses for source
+# bytes — keeps "what changed since last save" honest end-to-end.
+blake3 = "1"

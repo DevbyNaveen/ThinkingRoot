@@ -8,6 +8,7 @@ pub mod rows;
 pub mod storage;
 pub mod structural_inserts;
 pub mod vector;
+pub mod witness_inserts;
 
 pub use per_source_rows::PerSourceRows;
 

@@ -4187,6 +4187,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
 dependencies = [
+ "phf_macros",
  "phf_shared",
 ]
 
@@ -4208,6 +4209,19 @@ checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
 dependencies = [
  "phf_shared",
  "rand 0.8.5",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6148,7 +6162,6 @@ dependencies = [
  "thinkingroot-core",
  "thinkingroot-graph",
  "thinkingroot-parse",
- "thinkingroot-rooting",
  "thinkingroot-serve",
 ]
 
@@ -6288,6 +6301,7 @@ dependencies = [
  "chrono",
  "eventsource-stream",
  "futures",
+ "phf",
  "regex",
  "reqwest",
  "serde",
@@ -6299,6 +6313,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tracing",
  "tree-sitter",
 ]
@@ -6325,13 +6340,11 @@ dependencies = [
 name = "thinkingroot-ground"
 version = "0.9.1"
 dependencies = [
- "dirs 5.0.1",
- "ort",
+ "blake3",
  "tempfile",
  "thinkingroot-core",
  "thinkingroot-extract",
- "thinkingroot-graph",
- "tokenizers",
+ "thiserror 2.0.18",
  "tracing",
  "unicode-segmentation",
 ]
@@ -6857,11 +6870,12 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tr-format"
-version = "0.9.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "blake3",
  "chrono",
+ "ciborium",
  "ed25519-dalek",
  "hex",
  "semver",

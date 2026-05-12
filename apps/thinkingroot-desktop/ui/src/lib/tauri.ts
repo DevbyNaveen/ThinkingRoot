@@ -509,6 +509,29 @@ export type CompileProgress =
   // user clicked Compile and saw no UI activity for up to 60 s; React
   // can now render an explanatory "Waiting for engine…" state.
   | { phase: "booting"; workspace: string }
+  // Unified compile-progress snapshot — emitted every 250 ms by the
+  // daemon ticker while a compile is live. **New UI surfaces should
+  // render this as the single source of truth**; the per-phase
+  // variants below are kept for back-compat only.
+  //   step          — `"reading" | "extracting" | "linking" | "persisting" | "packing"`.
+  //                   Step labels can re-appear within a single compile (e.g.
+  //                   linking → persisting → linking) — render the current
+  //                   step, never gate on "have we passed step N".
+  //   step_label    — Human-readable step name (e.g. `"Linking"`).
+  //   done / total  — Step-local counter. `total === 0` means
+  //                   indeterminate; render a spinner with elapsed only.
+  //   eta_ms        — Daemon-computed ETA for the current step.
+  //                   `null` when total is 0 or done is 0.
+  | {
+      phase: "tick";
+      step: "reading" | "extracting" | "linking" | "persisting" | "packing";
+      step_label: string;
+      done: number;
+      total: number;
+      step_elapsed_ms: number;
+      total_elapsed_ms: number;
+      eta_ms: number | null;
+    }
   | { phase: "diff_start" }
   | { phase: "diff_complete"; changed: number; unchanged: number; deleted: number }
   | { phase: "parse_complete"; files: number }
@@ -1578,4 +1601,87 @@ export async function listenBrowserEvent(
   handler: (event: BrowserEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<BrowserEvent>(topic, (e) => handler(e.payload));
+}
+
+export async function browserDevtools(id: string, open: boolean): Promise<boolean> {
+  return invoke<boolean>("browser_devtools", { id, open });
+}
+
+export async function browserFind(
+  id: string,
+  query: string,
+  options: { caseSensitive?: boolean; backwards?: boolean } = {},
+): Promise<void> {
+  return invoke("browser_find", {
+    id,
+    query,
+    caseSensitive: options.caseSensitive ?? false,
+    backwards: options.backwards ?? false,
+  });
+}
+
+export async function browserFindClear(id: string): Promise<void> {
+  return invoke("browser_find_clear", { id });
+}
+
+export async function browserZoom(id: string, factor: number): Promise<number> {
+  return invoke<number>("browser_zoom", { id, factor });
+}
+
+export async function browserPrint(id: string): Promise<void> {
+  return invoke("browser_print", { id });
+}
+
+export async function browserScrollTo(id: string, x: number, y: number): Promise<void> {
+  return invoke("browser_scroll_to", { id, x, y });
+}
+
+// ─── Browser → workspace save ───────────────────────────────────────
+//
+// `browser_save_page` injects Readability.js + Turndown.js into the
+// captive webview, awaits the cleaned-markdown payload via the
+// `browser_extract_callback` IPC bridge, writes it under the target
+// workspace's `sources/` with frontmatter (`url:`, `content_hash:`),
+// stamps any prior file with `superseded_by:` when content changed,
+// and kicks off `workspace_compile` so the new bytes flow through
+// the Witness Mesh pipeline.
+
+export type BrowserSaveStatus = "saved" | "already_saved" | "updated";
+
+export interface BrowserSavePageResult {
+  status: BrowserSaveStatus;
+  path: string;
+  slug: string;
+  title: string;
+  url: string;
+  workspace: string;
+  content_hash: string;
+  prior_path?: string;
+}
+
+export async function browserSavePage(
+  viewId: string,
+  workspace: string,
+): Promise<BrowserSavePageResult> {
+  return invoke<BrowserSavePageResult>("browser_save_page", {
+    args: { view_id: viewId, workspace },
+  });
+}
+
+// ─── Playground ────────────────────────────────────────────────────
+//
+// The playground workspace is auto-mounted on first launch. This
+// command is the manual escape hatch for the rare case where a user
+// removed it from the registry and wants it back without restarting
+// the app. Idempotent.
+
+export interface PlaygroundView {
+  name: string;
+  path: string;
+  port: number;
+  created: boolean;
+}
+
+export async function playgroundEnsure(): Promise<PlaygroundView> {
+  return invoke<PlaygroundView>("playground_ensure");
 }

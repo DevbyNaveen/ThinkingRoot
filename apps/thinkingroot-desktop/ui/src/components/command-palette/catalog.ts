@@ -68,7 +68,7 @@ import {
   Zap,
 } from "lucide-react";
 
-import type { Surface, Theme, TrustFilter } from "@/types";
+import type { SettingsSectionId, Surface, Theme, TrustFilter } from "@/types";
 import {
   appQuit,
   doctorRun,
@@ -92,6 +92,7 @@ export type CommandGroup =
 
 export interface CommandContext {
   setSurface: (s: Surface) => void;
+  setSettingsSection: (id: SettingsSectionId) => void;
   setTheme: (t: Theme) => void;
   setTrust: (t: TrustFilter) => void;
   setRightRailOpen: (o: boolean) => void;
@@ -391,6 +392,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       group: "Tools",
       Icon: SettingsIcon,
       run: (c) => {
+        c.setSettingsSection("provider");
         c.setSurface("settings");
         c.close();
       },

@@ -31,7 +31,11 @@ mod reflect_cmd;
 mod render_cmd;
 mod resolver;
 mod retrieve_cmd;
-mod rooting_cmd;
+// `rooting_cmd` deleted in Witness Mesh cutover — there is no admission
+// gate to inspect when every Witness is admitted by construction. The
+// surviving "verification" surface is `tr-verify` (pack-level anchor
+// check) + `witness_verifier::verify_witness_anchor` (per-witness BLAKE3
+// re-check), both of which already have their own CLI surfaces.
 mod serve;
 mod setup;
 mod status_cmd;
@@ -211,9 +215,18 @@ enum Commands {
         /// an engine upgrade.
         #[arg(long)]
         to_water_flow: bool,
+        /// Migrate to the Witness Mesh substrate (witness_schema_version "2").
+        /// Reads the legacy `claims` table and synthesises one Witness per
+        /// byte-anchored claim into the new `witnesses` table. Idempotent —
+        /// a workspace already at schema v2 returns a zero-counts report.
+        /// User-driven only (the pipeline does not auto-run this) because
+        /// Witness ids are content-derived BLAKE3 hashes, not legacy ULIDs;
+        /// engram pointers referencing old claim ids would silently dangle.
+        #[arg(long)]
+        to_witness_mesh: bool,
         /// Report what the migration would do without writing anything.
-        /// Only valid with `--to-water-flow`.
-        #[arg(long, requires = "to_water_flow")]
+        /// Valid with `--to-water-flow` or `--to-witness-mesh`.
+        #[arg(long)]
         dry_run: bool,
     },
     /// Query the compiled knowledge base (raw vector search)
@@ -426,11 +439,6 @@ enum Commands {
     },
     /// Update root to the latest version
     Update,
-    /// Inspect the Rooting gate — admission tiers, certificates, and failures
-    Rooting {
-        #[command(subcommand)]
-        action: RootingAction,
-    },
     /// Run the LongMemEval benchmark against a compiled workspace
     Eval {
         /// Path to the LongMemEval JSONL dataset file
@@ -621,7 +629,7 @@ enum Commands {
     /// workspace. The pack's claims become queryable through the
     /// daemon's REST + MCP endpoints in one command — the canonical
     /// "secondary brain" entry point per
-    /// `docs/secondary-brain-concept.md` §5.
+    /// `docs/2026-05-03-secondary-brain-quickstart.md`.
     ///
     /// On success, prints a JSON `MountSummary` to stdout containing
     /// the workspace name, REST URL, MCP URL, and substrate counts
@@ -1075,38 +1083,7 @@ enum BranchOpAction {
     },
 }
 
-#[derive(Subcommand)]
-enum RootingAction {
-    /// Show per-tier claim counts and recent trial failures.
-    Report {
-        /// Path to the compiled workspace
-        #[arg(short, long, default_value = ".")]
-        path: PathBuf,
-    },
-    /// Show the full trial history + certificate details for one claim.
-    Verify {
-        /// Claim ID to verify
-        claim_id: String,
-        /// Path to the compiled workspace
-        #[arg(short, long, default_value = ".")]
-        path: PathBuf,
-    },
-    /// Re-execute Rooting against existing claims + current source bytes.
-    /// Catches drift: a claim whose source changed since it was admitted
-    /// flips tier (Rooted → Quarantined) without re-compiling the whole pack.
-    #[command(name = "re-run")]
-    ReRun {
-        /// Re-run against every claim in the workspace
-        #[arg(long, conflicts_with = "claim")]
-        all: bool,
-        /// Re-run against a single claim by ID
-        #[arg(long)]
-        claim: Option<String>,
-        /// Path to the compiled workspace
-        #[arg(short, long, default_value = ".")]
-        path: PathBuf,
-    },
-}
+// `RootingAction` deleted in Witness Mesh cutover.
 
 #[derive(Subcommand)]
 enum ProviderAction {
@@ -1486,6 +1463,7 @@ async fn async_main() -> anyhow::Result<()> {
             path,
             to_completeness_contract,
             to_water_flow,
+            to_witness_mesh,
             dry_run,
         }) => {
             // `migrate` opens CozoDB to run schema upgrades; today
@@ -1493,7 +1471,13 @@ async fn async_main() -> anyhow::Result<()> {
             // up because the migration helpers take the workspace
             // lock and wait. Future hardening: route through the
             // daemon to centralise schema mutations.
-            run_migrate(&path, to_completeness_contract, to_water_flow, dry_run)?;
+            run_migrate(
+                &path,
+                to_completeness_contract,
+                to_water_flow,
+                to_witness_mesh,
+                dry_run,
+            )?;
         }
         Some(Commands::Query { query, path, top_k }) => {
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
@@ -1690,20 +1674,6 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Commands::Update) => {
             update_cmd::run_update().await?;
         }
-        Some(Commands::Rooting { action }) => match action {
-            RootingAction::Report { path } => {
-                rooting_cmd::report(&path)?;
-            }
-            RootingAction::Verify { claim_id, path } => {
-                rooting_cmd::verify(&path, &claim_id)?;
-            }
-            RootingAction::ReRun { all, claim, path } => {
-                if !all && claim.is_none() {
-                    anyhow::bail!("root rooting re-run requires --all or --claim <id>");
-                }
-                rooting_cmd::re_run(&path, all, claim.as_deref())?;
-            }
-        },
         Some(Commands::Eval {
             dataset,
             path,
@@ -2650,12 +2620,13 @@ fn run_migrate(
     path: &Path,
     to_completeness_contract: bool,
     to_water_flow: bool,
+    to_witness_mesh: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    if !to_completeness_contract && !to_water_flow {
+    if !to_completeness_contract && !to_water_flow && !to_witness_mesh {
         anyhow::bail!(
-            "no migration target specified. Use --to-completeness-contract to upgrade \
-             to the v2 schema, or --to-water-flow to upgrade to the v3 schema."
+            "no migration target specified. Use --to-completeness-contract for v2, \
+             --to-water-flow for v3, or --to-witness-mesh for the Witness Mesh substrate."
         );
     }
 
@@ -2665,6 +2636,55 @@ fn run_migrate(
             "no ThinkingRoot workspace at {} — run `root init` first",
             path.display()
         );
+    }
+
+    if to_witness_mesh {
+        if dry_run {
+            println!(
+                "  {} [dry-run] scanning workspace at {} for Witness Mesh migration",
+                style("→").cyan().bold(),
+                path.display()
+            );
+            let report = thinkingroot_serve::backfill::backfill_witness_mesh_at_path(
+                &data_dir, true,
+            )
+            .map_err(|e| anyhow::anyhow!("witness mesh dry-run failed: {e}"))?;
+            println!(
+                "  {} would migrate {} witness(es) from {} claim(s); {} claim(s) skipped (missing byte anchor)",
+                style("→").cyan().bold(),
+                report.witnesses_emitted,
+                report.claims_scanned,
+                report.claims_missing_anchor,
+            );
+            if let Some(v) = &report.schema_version_before {
+                println!(
+                    "  {} current witness_schema_version: {v}",
+                    style("→").cyan().bold()
+                );
+            }
+            return Ok(());
+        }
+        println!(
+            "  {} migrating workspace at {} to Witness Mesh substrate (witness_schema_version v2)",
+            style("→").cyan().bold(),
+            path.display()
+        );
+        let report = thinkingroot_serve::backfill::backfill_witness_mesh_at_path(
+            &data_dir, false,
+        )
+        .map_err(|e| anyhow::anyhow!("witness mesh migration failed: {e}"))?;
+        println!(
+            "  {} migrated {} witness(es) from {} claim(s); {} claim(s) skipped (missing byte anchor).",
+            style("✓").green().bold(),
+            report.witnesses_emitted,
+            report.claims_scanned,
+            report.claims_missing_anchor,
+        );
+        println!(
+            "  {} workspace is now on witness_schema_version=2.",
+            style("✓").green().bold()
+        );
+        return Ok(());
     }
 
     if to_water_flow {

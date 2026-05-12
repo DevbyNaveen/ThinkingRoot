@@ -7,8 +7,8 @@
 //! half of `root install`) then do their own zstd-decode + tar walk
 //! over the inner archive. Keeping the inner source bundle as raw
 //! bytes preserves the BLAKE3 hash chain — the pack-hash recipe
-//! (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §3.1) consumes
-//! the inner bundle byte-for-byte.
+//! (`docs/superpowers/specs/2026-05-10-witness-mesh-design.md`,
+//! tr/3.2 pack section) consumes the inner bundle byte-for-byte.
 
 use std::io::{Cursor, Read};
 

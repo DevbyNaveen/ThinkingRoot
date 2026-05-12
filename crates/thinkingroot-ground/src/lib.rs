@@ -1,18 +1,29 @@
-pub mod dedup;
-mod grounder;
+//! Witness Mesh anchor verification — the surviving 1-of-5 piece of
+//! the pre-Witness-Mesh grounding tribunal.
+//!
+//! **Deleted in Witness Mesh cutover (2026-05-11):**
+//! - `grounder.rs` — the 4-judge orchestrator
+//! - `nli.rs` — Judge 4 (ONNX NLI cross-encoder)
+//! - `semantic.rs` — Judge 3 (fastembed cosine similarity)
+//! - `span.rs` — Judge 2 (LLM-quote span attribution) — superseded
+//!   by `witness_verifier.rs` which is byte-exact rather than fuzzy
+//! - `dedup.rs` — Jaccard claim-text dedup, superseded by
+//!   content-addressed Witness id dedup in
+//!   `thinkingroot_extract::witness_mesh::assemble`
+//!
+//! **Surviving:**
+//! - `witness_verifier.rs` — `BLAKE3(source[start..end]) ==
+//!   content_blake3`. The one mechanical check the Witness Mesh
+//!   substrate needs. ~10µs per witness; replaces ~57KB of judges
+//!   with ~200 LOC of cryptographic comparison.
+//! - `lexical.rs` — kept temporarily as a tokenizer for
+//!   `thinkingroot_rooting::probes::provenance` (Rooting crate is
+//!   itself slated for deletion in the next cutover pass).
+
 mod lexical;
-mod span;
+mod witness_verifier;
 
-#[cfg(feature = "vector")]
-pub mod nli;
-#[cfg(feature = "vector")]
-mod semantic;
-
-pub use grounder::{Grounder, GroundingConfig, GroundingProgressFn, GroundingVerdict};
 pub use lexical::LexicalJudge;
-pub use span::SpanJudge;
-
-#[cfg(feature = "vector")]
-pub use nli::{NliJudge, NliJudgePool};
-#[cfg(feature = "vector")]
-pub use semantic::SemanticJudge;
+pub use witness_verifier::{
+    AnchorVerdict, WitnessAnchorError, is_witness_anchor_intact, verify_witness_anchor,
+};

@@ -17,7 +17,6 @@ thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-serve = { workspace = true }
-thinkingroot-rooting = { workspace = true }
 rand = { workspace = true }
 tempfile = "3"
 
@@ -71,7 +70,5 @@ name = "cache_effectiveness"
 harness = false
 path = "benches/macro/cache_effectiveness.rs"
 
-[[bench]]
-name = "rooting_overhead"
-harness = false
-path = "benches/macro/rooting_overhead.rs"
+# `rooting_overhead` bench deleted in Witness Mesh cutover — no
+# Rooting pipeline phase remains to measure overhead of.

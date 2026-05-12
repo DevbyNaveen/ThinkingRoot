@@ -4,38 +4,47 @@
  * Layout (top → bottom):
  *   1. + New Conversation  → creates a fresh conversation in the
  *      currently-active workspace and switches to chats surface.
- *   2. WORKSPACES + ⟳ + 📂  → tree of workspaces auto-discovered from
- *      disk via `workspace_scan`. Each row collapses to a list of
- *      that workspace's conversations.
+ *   2. WORKSPACES + ⟳ + add → flat sections: workspace title, then
+ *      conversation titles (minimal list; no file-tree chrome).
+ *      When the main pane is Settings, this column switches to a
+ *      category list (Provider, Workspace, …) plus Back to chats.
  *   4. MCP TOOLS → tool names from the sidecar `/.well-known/mcp`
  *      manifest (same catalog as MCP `tools/list`). Each row inherits
  *      the live `/livez` status for the local SSE transport.
- *   5. Footer — Settings, auth state, app version.
+ *
+ * Settings and Docs are also reachable from the account menu at the
+ * bottom of the rail (opens above the control; no bottom blur strip).
  *
  * The workspace list reloads when the `workspaces-changed` Tauri event
  * fires (after `workspace_set_active`, `workspace_remove`, `workspace_scan`
  * when new folders are registered, and after a compile finishes so the
  * compiled / new badges stay honest).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import {
-  ChevronDown,
-  ChevronRight,
+  ArrowLeft,
   BookOpen,
-  Folder,
-  FolderOpen,
   FolderPlus,
-  MessageSquarePlus,
+  Plus,
   RefreshCw,
   SlidersHorizontal,
   SquarePen,
   Plug,
+  ChevronDown,
+  KeyRound,
+  FolderOpen,
+  Paintbrush,
+  Bell,
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { cn } from "@/lib/utils";
+import {
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+} from "@/lib/sidebar-layout";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
@@ -54,18 +63,25 @@ import {
   type McpServerRow,
   type WorkspaceView,
 } from "@/lib/tauri";
-import type { Surface } from "@/types";
-
-type WorkspaceWithConvs = WorkspaceView & {
-  conversations: ConversationSummary[];
-  expanded: boolean;
-};
+import type { Surface, SettingsSectionId } from "@/types";
 
 const MAX_PINNED_CONVS = 6;
 
-const MIN_WIDTH = 180;
-const MAX_WIDTH = 400;
-const DEFAULT_WIDTH = 220;
+const SETTINGS_NAV: Array<{
+  id: SettingsSectionId;
+  label: string;
+  icon: typeof KeyRound;
+}> = [
+  { id: "provider", label: "Provider", icon: KeyRound },
+  { id: "workspace", label: "Workspace", icon: FolderOpen },
+  { id: "appearance", label: "Appearance", icon: Paintbrush },
+  { id: "mcp", label: "MCP", icon: Plug },
+  { id: "channels", label: "Channels", icon: Bell },
+];
+
+type WorkspaceWithConvs = WorkspaceView & {
+  conversations: ConversationSummary[];
+};
 
 export function Sidebar() {
   const open = useApp((s) => s.sidebarOpen);
@@ -74,25 +90,32 @@ export function Sidebar() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const setActiveWorkspace = useApp((s) => s.setActiveWorkspace);
   const activeConv = useApp((s) => s.activeConversationId);
+  const setSettingsSection = useApp((s) => s.setSettingsSection);
+  const settingsSection = useApp((s) => s.settingsSection);
   const setActiveConv = useApp((s) => s.setActiveConversationId);
 
   const [workspaces, setWorkspaces] = useState<WorkspaceWithConvs[]>([]);
   const [mcp, setMcp] = useState<McpServerRow[]>([]);
-  const [auth, setAuth] = useState<AuthState | null>(null);
   const [scanning, setScanning] = useState(false);
 
   const storedWidth = useApp((s) => s.sidebarWidth);
   const setStoreWidth = useApp((s) => s.setSidebarWidth);
 
-  const [width, setWidth] = useState(storedWidth ?? DEFAULT_WIDTH);
+  const [width, setWidth] = useState(storedWidth ?? SIDEBAR_DEFAULT_WIDTH);
   const dragging = useRef(false);
   const startX = useRef(0);
   const startWidth = useRef(width);
   const railRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    setWidth(storedWidth ?? DEFAULT_WIDTH);
-  }, [storedWidth]);
+    const raw = storedWidth ?? SIDEBAR_DEFAULT_WIDTH;
+    const clamped = Math.min(
+      SIDEBAR_MAX_WIDTH,
+      Math.max(SIDEBAR_MIN_WIDTH, raw),
+    );
+    if (clamped !== raw) setStoreWidth(clamped);
+    setWidth(clamped);
+  }, [storedWidth, setStoreWidth]);
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -103,14 +126,20 @@ export function Sidebar() {
     const onMove = (ev: MouseEvent) => {
       if (!dragging.current) return;
       const delta = ev.clientX - startX.current;
-      const next = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth.current + delta));
+      const next = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, startWidth.current + delta),
+      );
       setWidth(next);
     };
 
     const onUp = (ev: MouseEvent) => {
       dragging.current = false;
       const delta = ev.clientX - startX.current;
-      const next = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth.current + delta));
+      const next = Math.min(
+        SIDEBAR_MAX_WIDTH,
+        Math.max(SIDEBAR_MIN_WIDTH, startWidth.current + delta),
+      );
       setStoreWidth(next);
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
@@ -122,15 +151,22 @@ export function Sidebar() {
 
   const refresh = useCallback(async () => {
     try {
-      const active = useApp.getState().activeWorkspace;
       const [list, allConvs] = await Promise.all([
         workspaceList(),
         conversationsList(),
       ]);
-      const grouped: WorkspaceWithConvs[] = list.map((w) => ({
+      // Playground is the auto-mounted scratchpad workspace; we pin
+      // it to the top so it's always one click away no matter how
+      // many real workspaces the user has added. The rest keep
+      // registry order.
+      const sorted = [...list].sort((a, b) => {
+        if (a.name === "playground" && b.name !== "playground") return -1;
+        if (b.name === "playground" && a.name !== "playground") return 1;
+        return 0;
+      });
+      const grouped: WorkspaceWithConvs[] = sorted.map((w) => ({
         ...w,
         conversations: allConvs.filter((c) => c.workspace === w.name),
-        expanded: w.name === active,
       }));
       setWorkspaces(grouped);
     } catch (e) {
@@ -140,17 +176,6 @@ export function Sidebar() {
       });
     }
   }, []);
-
-  // Keep conversation-tree expansion aligned with the store's active
-  // workspace (selection is updated before some `workspace_list` calls).
-  useEffect(() => {
-    setWorkspaces((prev) =>
-      prev.map((w) => ({
-        ...w,
-        expanded: w.name === activeWorkspace,
-      })),
-    );
-  }, [activeWorkspace]);
 
   useEffect(() => {
     let cancelled = false;
@@ -184,12 +209,11 @@ export function Sidebar() {
       if (cancelled) return;
       await refresh();
       try {
-        const [m, a] = await Promise.all([mcpListConnected(), authState()]);
+        const m = await mcpListConnected();
         if (cancelled) return;
         setMcp(m);
-        setAuth(a);
       } catch {
-        /* honest empty if sidecar / auth unreachable */
+        /* honest empty if sidecar unreachable */
       }
     })();
     return () => {
@@ -197,13 +221,40 @@ export function Sidebar() {
     };
   }, [refresh]);
 
+  const createConversationIn = useCallback(
+    async (target: string) => {
+      try {
+        await workspaceSetActive(target);
+        setActiveWorkspace(target);
+      } catch (e) {
+        toast("Set active failed", {
+          kind: "error",
+          body: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
+      try {
+        const c = await conversationsCreate(target);
+        setActiveConv(c.id);
+        setSurface("chats");
+        await refresh();
+      } catch (e) {
+        toast("Create conversation failed", {
+          kind: "error",
+          body: e instanceof Error ? e.message : String(e),
+        });
+      }
+    },
+    [refresh, setActiveConv, setActiveWorkspace, setSurface],
+  );
+
   if (!open) return null;
 
   return (
     <aside
       ref={railRef}
       className="relative flex h-full shrink-0 flex-col border-r border-border bg-surface"
-      style={{ width }}
+      style={{ width, minWidth: SIDEBAR_MIN_WIDTH, maxWidth: SIDEBAR_MAX_WIDTH }}
       aria-label="Primary navigation"
     >
       {/* ── Drag handle (right edge) ────────────────────────────── */}
@@ -215,48 +266,38 @@ export function Sidebar() {
       />
       <Header />
 
-      <ScrollArea.Root className="flex-1 overflow-hidden">
-        <ScrollArea.Viewport className="h-full w-full">
-          <div className="flex flex-col px-2 pb-4 pt-2">
+      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+        <ScrollArea.Root className="h-full min-h-0 min-w-0">
+          <ScrollArea.Viewport className="h-full min-h-0 w-full max-h-full">
+            <div className="flex min-w-0 flex-col px-2 pb-4 pt-2">
+            {surface === "settings" ? (
+              <SettingsSidebarNav
+                active={settingsSection}
+                onPick={setSettingsSection}
+                onBackToChats={() => setSurface("chats")}
+              />
+            ) : (
+              <>
             <PrimaryActions
               surface={surface}
               setSurface={setSurface}
               activeWorkspace={activeWorkspace}
               hasWorkspaces={workspaces.length > 0}
               onNewConversation={async () => {
-                // If nothing's active yet, auto-pick the first
-                // workspace the user has — opening the chat surface
-                // empty-handed feels broken.
                 let target = activeWorkspace;
                 if (!target) {
                   if (workspaces.length === 0) {
                     toast("No workspace yet", {
                       kind: "warn",
-                      body: "Click the folder icon next to Workspaces to add one, or run `root compile <path>` in your terminal.",
+                      body: "Use Add workspace next to Workspaces, or run `root compile <path>` in your terminal.",
                     });
                     return;
                   }
                   const first = workspaces[0];
                   if (!first) return;
                   target = first.name;
-                  try {
-                    await workspaceSetActive(target);
-                    setActiveWorkspace(target);
-                  } catch {
-                    /* fall through — user can still chat */
-                  }
                 }
-                try {
-                  const c = await conversationsCreate(target);
-                  setActiveConv(c.id);
-                  setSurface("chats");
-                  await refresh();
-                } catch (e) {
-                  toast("Create conversation failed", {
-                    kind: "error",
-                    body: e instanceof Error ? e.message : String(e),
-                  });
-                }
+                await createConversationIn(target);
               }}
             />
 
@@ -338,11 +379,11 @@ export function Sidebar() {
             {workspaces.length === 0 ? (
               <p className="px-2 py-3 text-[11px] text-muted-foreground">
                 No workspaces yet. Use refresh to scan for folders that already
-                contain <code className="font-mono">.thinkingroot</code>, or
-                click the folder-plus icon to add one manually.
+                contain <code className="font-mono">.thinkingroot</code>, or add
+                one with the button beside Workspaces.
               </p>
             ) : (
-              <ul className="flex flex-col">
+              <ul className="flex min-w-0 flex-col">
                 {workspaces.map((w) => (
                   <WorkspaceRow
                     key={w.name}
@@ -350,6 +391,7 @@ export function Sidebar() {
                     surface={surface}
                     activeWorkspace={activeWorkspace}
                     activeConv={activeConv}
+                    onNewChat={() => void createConversationIn(w.name)}
                     onSelectWorkspace={async () => {
                       // Workspace click should take the user back to chats:
                       // one clear selection state in the sidebar.
@@ -369,15 +411,6 @@ export function Sidebar() {
                       setActiveConv(id);
                       setSurface("chats");
                     }}
-                    onToggle={() =>
-                      setWorkspaces((prev) =>
-                        prev.map((row) =>
-                          row.name === w.name
-                            ? { ...row, expanded: !row.expanded }
-                            : row,
-                        ),
-                      )
-                    }
                   />
                 ))}
               </ul>
@@ -389,11 +422,11 @@ export function Sidebar() {
                 Sidecar starting…
               </p>
             ) : (
-              <ul className="flex max-h-52 flex-col gap-0.5 overflow-y-auto pr-0.5">
+              <ul className="flex min-h-0 min-w-0 max-h-52 flex-col gap-0.5 overflow-y-auto overflow-x-hidden pr-0.5">
                 {mcp.map((row, i) => (
                   <li
                     key={`${row.name}-${i}`}
-                    className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs"
+                    className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-2 py-1.5 text-xs"
                     title={row.description ?? row.name}
                   >
                     {/* status dot */}
@@ -412,7 +445,9 @@ export function Sidebar() {
                     {/* plug icon */}
                     <Plug className="size-3.5 shrink-0 text-muted-foreground" />
                     {/* name */}
-                    <span className="min-w-0 flex-1 truncate text-foreground/80">{row.name}</span>
+                    <span className="min-w-0 flex-1 basis-0 break-words text-foreground/80">
+                      {row.name}
+                    </span>
                     {/* transport badge */}
                     <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
                       {row.transport}
@@ -421,28 +456,230 @@ export function Sidebar() {
                 ))}
               </ul>
             )}
+              </>
+            )}
           </div>
         </ScrollArea.Viewport>
         <ScrollArea.Scrollbar orientation="vertical" className="w-2 p-0.5">
           <ScrollArea.Thumb className="rounded-full bg-muted-foreground/30" />
         </ScrollArea.Scrollbar>
-      </ScrollArea.Root>
+        </ScrollArea.Root>
+      </div>
 
-      <Footer auth={auth} surface={surface} setSurface={setSurface} />
+      <SidebarAuthStrip />
     </aside>
+  );
+}
+
+function authLabel(auth: AuthState | null): string {
+  if (auth == null) return "…";
+  if (!auth.signed_in) return "Login";
+  if (auth.handle) return `@${auth.handle}`;
+  if (auth.cloud_base_url) {
+    try {
+      return new URL(auth.cloud_base_url).host;
+    } catch {
+      return auth.cloud_base_url;
+    }
+  }
+  return "Signed in";
+}
+
+/** Account / Login — opens upward; Docs + Settings + sign-in notes. */
+function SidebarAuthStrip() {
+  const setSurface = useApp((s) => s.setSurface);
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      authState()
+        .then((a) => {
+          if (alive) setAuth(a);
+        })
+        .catch(() => {
+          if (alive) setAuth(null);
+        });
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => {
+      alive = false;
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const el = wrapRef.current;
+      if (el && !el.contains(e.target as Node)) setMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc, true);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [menuOpen]);
+
+  const label = authLabel(auth);
+
+  const goDocs = () => {
+    setSurface("docs");
+    setMenuOpen(false);
+  };
+  const goSettings = () => {
+    useApp.getState().setSettingsSection("provider");
+    setSurface("settings");
+    setMenuOpen(false);
+  };
+
+  return (
+    <div
+      ref={wrapRef}
+      className="window-no-drag relative shrink-0 border-t border-border/40 px-2 pb-2 pt-1"
+    >
+      <button
+        type="button"
+        onClick={() => setMenuOpen((o) => !o)}
+        aria-expanded={menuOpen}
+        aria-haspopup="menu"
+        className="flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+      >
+        <span className="truncate">{label}</span>
+        <ChevronDown
+          className={cn(
+            "size-3.5 shrink-0 opacity-60 transition-transform duration-200",
+            menuOpen && "rotate-180",
+          )}
+          aria-hidden
+        />
+      </button>
+
+      {menuOpen ? (
+        <div
+          role="menu"
+          aria-label="Account menu"
+          className="absolute bottom-full left-2 right-2 z-[100] mb-1 overflow-hidden rounded-lg border border-border/80 bg-surface py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={goDocs}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-muted/60"
+          >
+            <BookOpen className="size-3.5 shrink-0 text-muted-foreground" />
+            Docs
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={goSettings}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-muted/60"
+          >
+            <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" />
+            Settings
+          </button>
+          <div className="my-1 h-px bg-border/60" role="separator" />
+          {auth?.signed_in ? (
+            <div className="space-y-1 px-3 py-2 text-[10px] leading-snug text-muted-foreground">
+              <p className="font-medium text-foreground/90">Cloud session</p>
+              {auth.handle ? (
+                <p className="truncate">@{auth.handle}</p>
+              ) : auth.cloud_base_url ? (
+                <p className="truncate">{auth.cloud_base_url}</p>
+              ) : (
+                <p>Signed in</p>
+              )}
+              <p className="text-muted-foreground/80">
+                Local {auth.storage.local ? "on" : "off"} · Cloud{" "}
+                {auth.storage.cloud ? "on" : "off"}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-1 px-3 py-2 text-[10px] leading-snug text-muted-foreground">
+              <p className="font-medium text-foreground/90">Sign in</p>
+              <p>
+                Run <code className="rounded bg-muted/80 px-1 font-mono">tr login</code>{" "}
+                in your terminal, then use Settings to verify the Hub
+                connection.
+              </p>
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SettingsSidebarNav({
+  active,
+  onPick,
+  onBackToChats,
+}: {
+  active: SettingsSectionId;
+  onPick: (id: SettingsSectionId) => void;
+  onBackToChats: () => void;
+}) {
+  return (
+    <>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        onClick={onBackToChats}
+        className="mb-1 h-8 w-full justify-start gap-2 px-2 text-xs text-muted-foreground hover:text-foreground"
+      >
+        <ArrowLeft className="size-3.5 shrink-0" />
+        Back to chats
+      </Button>
+      <SectionHeader label="Settings" />
+      <nav
+        className="mt-1 flex flex-col gap-0.5"
+        role="navigation"
+        aria-label="Settings categories"
+      >
+        {SETTINGS_NAV.map(({ id, label, icon: Icon }) => {
+          const isActive = active === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => onPick(id)}
+              className={cn(
+                "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
+                isActive
+                  ? "bg-muted/90 font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+              )}
+              aria-current={isActive ? "page" : undefined}
+            >
+              <Icon className="size-3.5 shrink-0 opacity-85" strokeWidth={2} />
+              <span className="truncate">{label}</span>
+            </button>
+          );
+        })}
+      </nav>
+    </>
   );
 }
 
 function Header() {
   return (
-    <header className="window-drag flex h-11 shrink-0 items-center gap-2 px-3 pl-14">
+    <header className="window-drag flex h-11 min-w-0 shrink-0 items-center gap-2 px-3 pl-14">
       <img
         src="/logo.png"
         alt="ThinkingRoot logo"
         draggable={false}
-        className="window-no-drag h-5 w-5 object-contain opacity-80"
+        className="window-no-drag h-5 w-5 shrink-0 object-contain opacity-80"
       />
-      <h1 className="window-no-drag text-sm font-medium tracking-tight">
+      <h1 className="window-no-drag min-w-0 shrink-0 text-sm font-medium tracking-tight whitespace-nowrap">
         ThinkingRoot
       </h1>
     </header>
@@ -466,7 +703,7 @@ function PrimaryActions({
         variant="ghost"
         size="sm"
         onClick={onNewConversation}
-        className="h-8 w-full justify-start gap-2 px-1.5 text-xs font-medium text-foreground/80 hover:bg-muted/50 hover:text-foreground"
+        className="h-auto min-h-8 w-full min-w-0 justify-start gap-2 px-1.5 py-1.5 text-left text-xs font-medium text-foreground/80 hover:bg-muted/50 hover:text-foreground"
         disabled={!hasWorkspaces}
         title={
           activeWorkspace
@@ -476,8 +713,10 @@ function PrimaryActions({
               : "Add a workspace first"
         }
       >
-        <SquarePen className="size-4 text-muted-foreground" />
-        <span>New conversation</span>
+        <SquarePen className="size-4 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 whitespace-normal break-words leading-snug">
+          New conversation
+        </span>
       </Button>
     </div>
   );
@@ -490,7 +729,7 @@ function WorkspaceRow({
   activeConv,
   onSelectWorkspace,
   onSelectConv,
-  onToggle,
+  onNewChat,
 }: {
   workspace: WorkspaceWithConvs;
   surface: Surface;
@@ -498,110 +737,123 @@ function WorkspaceRow({
   activeConv: string | null;
   onSelectWorkspace: () => void;
   onSelectConv: (id: string) => void;
-  onToggle: () => void;
+  onNewChat: () => void;
 }) {
   const isActive = surface !== "settings" && workspace.name === activeWorkspace;
-  const visibleConvs = useMemo(
-    () => workspace.conversations.slice(0, MAX_PINNED_CONVS),
-    [workspace.conversations],
-  );
-  const overflow = workspace.conversations.length - visibleConvs.length;
+  const [showAllChats, setShowAllChats] = useState(false);
+  const convs = workspace.conversations;
+  const hiddenCount = Math.max(0, convs.length - MAX_PINNED_CONVS);
+
+  useEffect(() => {
+    if (convs.length <= MAX_PINNED_CONVS) setShowAllChats(false);
+  }, [convs.length, workspace.name]);
+
+  const displayed =
+    showAllChats || hiddenCount === 0 ? convs : convs.slice(0, MAX_PINNED_CONVS);
 
   return (
-    <li className="mb-0.5">
-      <div
-        className={cn(
-          "group flex w-full items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors",
-          isActive ? "bg-accent/10 text-accent" : "text-foreground hover:bg-muted/60",
-        )}
-      >
-        {/* chevron toggle */}
-        <button
-          type="button"
-          onClick={onToggle}
-          className={cn(
-            "flex size-4 shrink-0 items-center justify-center rounded transition-colors",
-            isActive ? "text-accent" : "text-muted-foreground hover:bg-muted/80 hover:text-foreground"
-          )}
-          aria-label={workspace.expanded ? "Collapse" : "Expand"}
-        >
-          {workspace.expanded ? (
-            <ChevronDown className="size-3.5" />
-          ) : (
-            <ChevronRight className="size-3.5" />
-          )}
-        </button>
-
-        {/* workspace name */}
+    <li
+      className={cn(
+        "mb-3 min-w-0 rounded-lg px-1 py-0.5 last:mb-1",
+        isActive &&
+          "bg-muted/35 ring-1 ring-border/60 ring-inset",
+      )}
+    >
+      <div className="group/workspace-head flex min-w-0 items-start gap-0.5">
         <button
           type="button"
           onClick={onSelectWorkspace}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left font-medium"
+          className={cn(
+            "flex min-w-0 flex-1 items-start gap-2 rounded-md px-2 py-1.5 text-left text-[11px] font-medium tracking-tight transition-colors",
+            isActive
+              ? "text-foreground"
+              : "text-muted-foreground hover:text-foreground/90",
+          )}
           title={workspace.path}
         >
-          {workspace.expanded ? (
-            <FolderOpen className={cn("size-3.5 shrink-0", isActive ? "text-accent" : "text-muted-foreground")} />
-          ) : (
-            <Folder className={cn("size-3.5 shrink-0", isActive ? "text-accent" : "text-muted-foreground")} />
-          )}
-          <span className="truncate">{workspace.name}</span>
-        </button>
-
-        {/* "new" badge pushed all the way right */}
-        {!workspace.compiled && (
-          <span className="shrink-0 rounded bg-zinc-500/20 px-1 py-0.5 font-mono text-[8px] uppercase tracking-wider text-zinc-400">
-            new
+          <span className="min-w-0 flex-1 whitespace-normal break-words text-pretty">
+            {workspace.name}
           </span>
-        )}
+          {!workspace.compiled ? (
+            <span className="shrink-0 pt-0.5 text-[9px] font-normal uppercase tracking-wide text-muted-foreground/55">
+              new
+            </span>
+          ) : null}
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onNewChat();
+          }}
+          className={cn(
+            "window-no-drag mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md",
+            "text-muted-foreground transition-[opacity,background-color,color]",
+            "opacity-0 hover:bg-muted hover:text-foreground",
+            "group-hover/workspace-head:opacity-100 group-focus-within/workspace-head:opacity-100",
+            "[@media(pointer:coarse)]:opacity-100",
+          )}
+          title={`New chat in ${workspace.name}`}
+          aria-label={`New chat in ${workspace.name}`}
+        >
+          <Plus className="size-3.5" strokeWidth={2} />
+        </button>
       </div>
 
-      {workspace.expanded && (
-        <ul className="relative ml-3.5 mt-0.5 flex flex-col pl-3">
-          {/* Tree vertical line */}
-          <div className="absolute bottom-0 left-0 top-0 w-px bg-border/60" />
-          
-          {workspace.conversations.length === 0 && (
-            <li className="relative px-2 py-1.5 text-[10px] italic text-muted-foreground">
-              {/* Tree horizontal branch */}
-              <div className="absolute -left-3 top-1/2 h-px w-3 -translate-y-1/2 bg-border/60" />
-              <span className="pl-1">No conversations yet.</span>
+      <ul className="mt-0.5 flex min-w-0 flex-col gap-0.5">
+        {workspace.conversations.length === 0 ? (
+          <li>
+            <div className="rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] italic leading-snug text-muted-foreground/80">
+              No conversations yet.
+            </div>
+          </li>
+        ) : null}
+        {displayed.map((c) => {
+          const selected = surface !== "settings" && activeConv === c.id;
+          return (
+            <li key={c.id} className="min-w-0">
+              <button
+                type="button"
+                onClick={() => onSelectConv(c.id)}
+                aria-current={selected ? "true" : undefined}
+                className={cn(
+                  "w-full rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] leading-snug transition-colors",
+                  selected
+                    ? "bg-muted/90 font-medium text-foreground"
+                    : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                )}
+                title={c.title}
+              >
+                <span className="block min-w-0 whitespace-normal break-words text-pretty">
+                  {c.title}
+                </span>
+              </button>
             </li>
-          )}
-          {visibleConvs.map((c) => {
-            const selected = surface !== "settings" && activeConv === c.id;
-            return (
-              <li key={c.id} className="relative mt-0.5">
-                {/* Tree horizontal branch */}
-                <div className="absolute -left-3 top-1/2 h-px w-3 -translate-y-1/2 bg-border/60" />
-                <button
-                  type="button"
-                  onClick={() => onSelectConv(c.id)}
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[11px] transition-colors",
-                    selected
-                      ? "bg-muted text-foreground font-medium"
-                      : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-                  )}
-                  title={c.title}
-                >
-                  <MessageSquarePlus className={cn("size-3 shrink-0", selected ? "text-foreground" : "text-muted-foreground/60")} />
-                  <span className="line-clamp-1 min-w-0 flex-1">{c.title}</span>
-                  <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground/70">
-                    {timeago(c.updated_at)}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-          {overflow > 0 && (
-            <li className="relative px-2 py-1.5 text-[10px] text-muted-foreground/70">
-              {/* Tree horizontal branch */}
-              <div className="absolute -left-3 top-1/2 h-px w-3 -translate-y-1/2 bg-border/60" />
-              <span className="pl-1">+{overflow} more…</span>
-            </li>
-          )}
-        </ul>
-      )}
+          );
+        })}
+        {!showAllChats && hiddenCount > 0 ? (
+          <li>
+            <button
+              type="button"
+              onClick={() => setShowAllChats(true)}
+              className="w-full rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] leading-snug text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+            >
+              +{hiddenCount} more chats
+            </button>
+          </li>
+        ) : null}
+        {showAllChats && hiddenCount > 0 ? (
+          <li>
+            <button
+              type="button"
+              onClick={() => setShowAllChats(false)}
+              className="w-full rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] leading-snug text-muted-foreground/90 transition-colors hover:bg-muted/40 hover:text-foreground"
+            >
+              Show fewer
+            </button>
+          </li>
+        ) : null}
+      </ul>
     </li>
   );
 }
@@ -614,11 +866,13 @@ function SectionHeader({
   right?: React.ReactNode;
 }) {
   return (
-    <div className="mt-4 flex h-6 items-center px-2">
-      <span className="flex-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+    <div className="mt-4 flex min-h-6 w-full min-w-0 items-center justify-between gap-2 px-2">
+      <span className="min-w-0 truncate text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
         {label}
       </span>
-      {right ? <div className="flex items-center gap-0.5">{right}</div> : null}
+      {right ? (
+        <div className="flex shrink-0 items-center gap-0.5">{right}</div>
+      ) : null}
     </div>
   );
 }
@@ -649,89 +903,3 @@ function IconBtn({
   );
 }
 
-function NavRow({
-  Icon,
-  label,
-  active,
-  onClick,
-}: {
-  Icon: LucideIcon;
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs font-medium transition-colors",
-        active
-          ? "bg-muted text-foreground"
-          : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-      )}
-    >
-      <Icon className="size-3.5 shrink-0" />
-      <span>{label}</span>
-    </button>
-  );
-}
-
-function Footer({
-  auth,
-  surface,
-  setSurface,
-}: {
-  auth: AuthState | null;
-  surface: Surface;
-  setSurface: (s: Surface) => void;
-}) {
-  const storage = auth?.signed_in
-    ? "Signed in · cloud sync"
-    : "Local only";
-  return (
-    <footer className="flex shrink-0 flex-col gap-0.5 border-t border-border px-2 py-2">
-      <NavRow
-        Icon={SlidersHorizontal}
-        label="Settings"
-        active={surface === "settings"}
-        onClick={() => setSurface("settings")}
-      />
-      <NavRow
-        Icon={BookOpen}
-        label="Docs"
-        active={surface === "docs"}
-        onClick={() => setSurface("docs")}
-      />
-      <div
-        className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[10px] text-muted-foreground"
-        title={
-          auth
-            ? `Storage: local ${auth.storage.local ? "✓" : "✗"} · cloud ${auth.storage.cloud ? "✓" : "✗"}`
-            : "Storage state unknown"
-        }
-      >
-        <span
-          className={cn(
-            "size-1.5 shrink-0 rounded-full",
-            auth?.signed_in ? "bg-sky-500" : "bg-zinc-500",
-          )}
-        />
-        <span className="uppercase tracking-wider">{storage}</span>
-      </div>
-    </footer>
-  );
-}
-
-function timeago(iso: string): string {
-  try {
-    const t = new Date(iso).getTime();
-    const dt = Math.max(0, Date.now() - t);
-    if (dt < 60_000) return "now";
-    if (dt < 3_600_000) return `${Math.floor(dt / 60_000)}m`;
-    if (dt < 86_400_000) return `${Math.floor(dt / 3_600_000)}h`;
-    return `${Math.floor(dt / 86_400_000)}d`;
-  } catch {
-    return "";
-  }
-}

@@ -218,11 +218,20 @@ export function RightRail() {
         {activeTab === "files" && (
           <WorkspaceFilesPanel activeWorkspace={activeWorkspace} />
         )}
-        {activeTab === "brain" && (
-          <div className="flex-1 overflow-hidden">
-            <BrainView panelMode />
-          </div>
-        )}
+        {/* Brain stays permanently mounted while the rail is open so
+            the force-layout worker keeps its simulation state and the
+            d3 canvas keeps its GPU upload across tab switches.  The
+            BrainView pauses its simulation internally when
+            `isVisible` is false, so an unfocused Brain tab costs
+            zero CPU. */}
+        <div
+          className={cn(
+            "min-h-0 flex-1 overflow-hidden",
+            activeTab === "brain" ? "flex flex-col" : "hidden",
+          )}
+        >
+          <BrainView panelMode isVisible={activeTab === "brain"} />
+        </div>
         {activeTab === "readme" && (
           <div className="flex-1 overflow-hidden">
             <ReadmeView panelMode />
@@ -618,6 +627,18 @@ function CompilationProgressIndicator() {
       setEta("");
       return;
     }
+    // The unified `tick` event carries an authoritative `eta_ms` from
+    // the daemon — trust it and skip our client-side rate guess. The
+    // daemon has the full picture (queue depth, batch size, retry
+    // backoff) while the client only sees the events.
+    if (progress.phase === "tick") {
+      if (progress.eta_ms !== null && progress.eta_ms > 0) {
+        setEta(formatEta(progress.eta_ms / 1000));
+      } else {
+        setEta("");
+      }
+      return;
+    }
     const group = compilePhaseGroup(progress.phase);
     if (group !== phaseGroupRef.current) {
       phaseGroupRef.current = group;
@@ -661,7 +682,46 @@ function CompilationProgressIndicator() {
   let isError = false;
   let isCancelled = false;
 
+  // Tick step → progress-bar range. Matches the legacy per-phase
+  // percent stops below so a daemon that emits BOTH event styles
+  // doesn't make the bar jump back and forth as events alternate.
+  const TICK_RANGE: Record<
+    "reading" | "extracting" | "linking" | "persisting" | "packing",
+    [number, number]
+  > = {
+    reading: [5, 18],
+    extracting: [20, 60],
+    linking: [62, 82],
+    persisting: [82, 95],
+    packing: [95, 99],
+  };
+
   switch (progress.phase) {
+    case "tick": {
+      // Unified 250ms-cadence event. This is the **single source of
+      // truth** the daemon prefers — every other variant in the union
+      // is legacy back-compat. See the type doc in `lib/tauri.ts`.
+      const [base, top] = TICK_RANGE[progress.step];
+      const range = top - base;
+      const stepPct =
+        progress.total > 0
+          ? Math.floor((progress.done / progress.total) * range)
+          : 0;
+      percent = base + stepPct;
+      title = progress.step_label || progress.step;
+      if (progress.total > 0) {
+        // Compact `47 / 523` counter — the daemon's own ETA goes in
+        // the header next to the percent.
+        details = `${progress.done} / ${progress.total}`;
+      } else {
+        // total === 0 ⇒ indeterminate (e.g. early in extract before
+        // the walker has finished enumerating sources). Render
+        // elapsed-time so the user sees the engine is alive.
+        const sec = (progress.step_elapsed_ms / 1000).toFixed(1);
+        details = `${sec}s elapsed · counting sources…`;
+      }
+      break;
+    }
     case "booting":
       title = "Waiting for engine"; details = `Workspace: ${progress.workspace}`; percent = 2; break;
     case "diff_start":

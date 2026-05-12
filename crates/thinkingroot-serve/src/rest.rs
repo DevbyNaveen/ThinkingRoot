@@ -346,6 +346,14 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/entities/{name}", get(get_entity))
             .route("/ws/{ws}/claims", get(list_claims))
             .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
+            // Witness Mesh — new substrate read endpoints. Lives
+            // alongside `/claims` during the additive scaffold phase;
+            // the Commit-2 reader cutover routes legacy `/claims`
+            // consumers here too.
+            .route("/ws/{ws}/witnesses", get(list_witnesses_handler))
+            .route("/ws/{ws}/witnesses/count", get(witnesses_count_handler))
+            .route("/ws/{ws}/witnesses/{id}", get(get_witness_handler))
+            .route("/ws/{ws}/witnesses/{id}/walk", get(walk_mesh_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
             .route("/ws/{ws}/readme", get(workspace_readme_handler))
@@ -1282,6 +1290,98 @@ async fn list_claims(
     };
     match engine.list_claims(&ws, filter).await {
         Ok(claims) => ok_response(claims).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Query parameters accepted by `GET /api/v1/ws/{ws}/witnesses`.
+/// `limit` caps the row count; `rule` filters to a specific catalog
+/// rule. Both are optional — passing neither lists every Witness in
+/// the workspace.
+#[derive(serde::Deserialize)]
+struct WitnessListParams {
+    limit: Option<usize>,
+    rule: Option<String>,
+}
+
+async fn list_witnesses_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<WitnessListParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_witnesses(&ws, params.limit).await {
+        Ok(mut witnesses) => {
+            if let Some(rule_filter) = &params.rule {
+                witnesses.retain(|w| &w.rule == rule_filter);
+            }
+            ok_response(witnesses).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn get_witness_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_witness(&ws, &id).await {
+        Ok(Some(w)) => ok_response(w).into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            ok_response(serde_json::json!({
+                "error": "witness not found",
+                "witness_id": id,
+            })),
+        )
+            .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn witnesses_count_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.count_witnesses(&ws).await {
+        Ok(count) => ok_response(serde_json::json!({ "count": count })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Query parameters for `GET /api/v1/ws/{ws}/witnesses/{id}/walk`.
+/// Both are optional; the handler applies the same clamps as the
+/// MCP `walk_mesh` tool (depth ≤ 10, fanout 1..=200).
+#[derive(serde::Deserialize)]
+struct WalkMeshParams {
+    max_depth: Option<usize>,
+    max_fanout: Option<usize>,
+}
+
+async fn walk_mesh_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+    Query(params): Query<WalkMeshParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let raw_depth = params.max_depth.unwrap_or(4);
+    let max_depth = raw_depth.min(10);
+    let raw_fanout = params.max_fanout.unwrap_or(50);
+    let max_fanout = raw_fanout.clamp(1, 200);
+    match engine.walk_witness_mesh(&ws, &id, max_depth, max_fanout).await {
+        Ok((witnesses, edges)) => ok_response(serde_json::json!({
+            "witnesses": witnesses,
+            "edges": edges.iter().map(|(p, c)| {
+                serde_json::json!({ "parent": p, "child": c })
+            }).collect::<Vec<_>>(),
+            "max_depth": max_depth,
+            "max_fanout": max_fanout,
+            "depth_clamped": raw_depth > max_depth,
+            "fanout_clamped": raw_fanout != max_fanout,
+        }))
+        .into_response(),
         Err(e) => match_engine_error(e),
     }
 }

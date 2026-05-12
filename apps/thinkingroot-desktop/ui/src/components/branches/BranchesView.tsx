@@ -66,6 +66,16 @@ const TABS: Array<{ id: Tab; label: string; icon: typeof GitBranch }> = [
   { id: "templates", label: "Templates", icon: Layers },
 ];
 
+/** Form fields + top cards — Branches / Tags / Proposals workbench. */
+const WB_INPUT =
+  "w-full min-w-0 rounded-lg bg-background/50 px-3 py-2 text-xs text-foreground shadow-sm ring-1 ring-inset ring-border/25 transition-[box-shadow,background-color] placeholder:text-muted-foreground/60 hover:bg-background/65 hover:ring-border/35 focus:bg-background/80 focus:outline-none focus:ring-2 focus:ring-ring/30";
+
+const WB_FORM_SHELL =
+  "rounded-2xl bg-muted/20 p-4 shadow-sm ring-1 ring-border/15 dark:bg-muted/12 dark:ring-border/10";
+
+const WB_LIST_ITEM =
+  "rounded-lg border border-border/60 bg-surface/80 p-3";
+
 export function BranchesView({ panelMode = false }: { panelMode?: boolean }) {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const [tab, setTab] = useState<Tab>("branches");
@@ -95,26 +105,32 @@ export function BranchesView({ panelMode = false }: { panelMode?: boolean }) {
 
       <nav
         className={cn(
-          "flex items-center gap-1 border-b border-border",
-          panelMode ? "px-3 pt-2" : "px-2 pt-1.5",
+          "flex shrink-0 items-center border-b border-border/25 bg-muted/10",
+          panelMode ? "px-3 py-2.5" : "px-3 py-2",
         )}
+        role="tablist"
+        aria-label="Workbench sections"
       >
-        {TABS.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            type="button"
-            onClick={() => setTab(id)}
-            className={cn(
-              "flex items-center gap-1.5 rounded-t-lg px-3 py-1.5 text-xs transition-colors",
-              tab === id
-                ? "border border-b-background border-border bg-background text-foreground"
-                : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
-            )}
-          >
-            <Icon className="size-3.5" />
-            {label}
-          </button>
-        ))}
+        <div className="flex flex-wrap items-center gap-0.5 rounded-lg bg-muted/35 p-0.5 dark:bg-muted/20">
+          {TABS.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={tab === id}
+              onClick={() => setTab(id)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors",
+                tab === id
+                  ? "bg-background/80 text-foreground shadow-sm"
+                  : "text-muted-foreground hover:bg-background/45 hover:text-foreground/95",
+              )}
+            >
+              <Icon className="size-3.5 shrink-0 opacity-90" strokeWidth={2} />
+              {label}
+            </button>
+          ))}
+        </div>
       </nav>
 
       <div className="flex-1 overflow-hidden">
@@ -337,37 +353,82 @@ function CreateBranchForm({
   onCreate: () => void;
 }) {
   return (
-    <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
-      <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-        New branch
-      </h3>
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-        <input
-          type="text"
-          placeholder="branch name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-        />
-        <input
-          type="text"
-          placeholder="parent (default: main)"
-          value={parent}
-          onChange={(e) => setParent(e.target.value)}
-          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-        />
-        <input
-          type="text"
-          placeholder="description (optional)"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-        />
+    <section className={WB_FORM_SHELL}>
+      <div className="mb-3.5 flex items-start gap-2.5">
+        <div
+          className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-background/45 shadow-sm ring-1 ring-inset ring-border/20"
+          aria-hidden
+        >
+          <GitBranch className="size-3.5 text-muted-foreground" strokeWidth={2} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-medium tracking-tight text-foreground">New branch</h3>
+          <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+            Fork from a parent workspace branch. Nothing merges until you choose.
+          </p>
+        </div>
       </div>
-      <div className="mt-2 flex justify-end">
-        <Button onClick={onCreate} disabled={creating || !name.trim()} size="sm">
-          {creating ? <RefreshCw className="mr-1 size-3 animate-spin" /> : <Plus className="mr-1 size-3" />}
-          Create
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="min-w-0 space-y-1">
+          <label htmlFor="branch-create-name" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            Name
+          </label>
+          <input
+            id="branch-create-name"
+            type="text"
+            placeholder="e.g. feature/review"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className={WB_INPUT}
+            autoComplete="off"
+          />
+        </div>
+        <div className="min-w-0 space-y-1">
+          <label htmlFor="branch-create-parent" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            Parent
+          </label>
+          <input
+            id="branch-create-parent"
+            type="text"
+            placeholder="main"
+            value={parent}
+            onChange={(e) => setParent(e.target.value)}
+            className={WB_INPUT}
+            autoComplete="off"
+          />
+        </div>
+        <div className="min-w-0 space-y-1 sm:col-span-1">
+          <label htmlFor="branch-create-desc" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            Description <span className="font-normal normal-case text-muted-foreground/70">(optional)</span>
+          </label>
+          <input
+            id="branch-create-desc"
+            type="text"
+            placeholder="What this branch is for"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            className={WB_INPUT}
+            autoComplete="off"
+          />
+        </div>
+      </div>
+
+      <div className="mt-4 flex justify-end border-t border-border/15 pt-3.5">
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={onCreate}
+          disabled={creating || !name.trim()}
+          size="sm"
+          className="h-8 gap-1.5 px-3 text-xs font-medium shadow-sm"
+        >
+          {creating ? (
+            <RefreshCw className="size-3.5 shrink-0 animate-spin" aria-hidden />
+          ) : (
+            <Plus className="size-3.5 shrink-0" strokeWidth={2} aria-hidden />
+          )}
+          Create branch
         </Button>
       </div>
     </section>
@@ -399,15 +460,15 @@ function BranchRow({
   return (
     <li
       className={cn(
-        "rounded-lg border p-3",
-        branch.current ? "border-accent bg-accent/5" : "border-border",
+        WB_LIST_ITEM,
+        branch.current && "bg-muted/25",
       )}
     >
       <div className="flex items-center gap-2">
         <span className={cn("size-2 shrink-0 rounded-full", statusColor)} />
         <span className="font-medium text-sm">{branch.name}</span>
         {branch.current && (
-          <span className="rounded-full bg-accent/20 px-2 py-0.5 text-[9px] font-medium uppercase tracking-wider text-accent">
+          <span className="rounded-full border border-border/50 bg-muted/35 px-2 py-0.5 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
             current
           </span>
         )}
@@ -513,37 +574,82 @@ function TagsPanel() {
   }
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4">
-      <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
-        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          New tag
-        </h3>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <input
-            type="text"
-            placeholder="tag name (immutable)"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
-          <input
-            type="text"
-            placeholder="branch"
-            value={branch}
-            onChange={(e) => setBranch(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
-          <input
-            type="text"
-            placeholder="message (optional)"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
+    <div className="flex h-full flex-col gap-4 overflow-y-auto p-3.5">
+      <section className={WB_FORM_SHELL}>
+        <div className="mb-3.5 flex items-start gap-2.5">
+          <div
+            className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-background/45 shadow-sm ring-1 ring-inset ring-border/20"
+            aria-hidden
+          >
+            <TagIcon className="size-3.5 text-muted-foreground" strokeWidth={2} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-medium tracking-tight text-foreground">New tag</h3>
+            <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+              Immutable snapshot of a branch. Name cannot change after create.
+            </p>
+          </div>
         </div>
-        <div className="mt-2 flex justify-end">
-          <Button onClick={handleCreate} disabled={creating || !name.trim()} size="sm">
-            {creating ? <RefreshCw className="mr-1 size-3 animate-spin" /> : <Plus className="mr-1 size-3" />}
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="tag-create-name" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Name
+            </label>
+            <input
+              id="tag-create-name"
+              type="text"
+              placeholder="e.g. v0.2.0"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="tag-create-branch" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Branch
+            </label>
+            <input
+              id="tag-create-branch"
+              type="text"
+              placeholder="main"
+              value={branch}
+              onChange={(e) => setBranch(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="tag-create-msg" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Message <span className="font-normal normal-case text-muted-foreground/70">(optional)</span>
+            </label>
+            <input
+              id="tag-create-msg"
+              type="text"
+              placeholder="Release notes"
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 flex justify-end border-t border-border/15 pt-3.5">
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={handleCreate}
+            disabled={creating || !name.trim()}
+            size="sm"
+            className="h-8 gap-1.5 px-3 text-xs font-medium shadow-sm"
+          >
+            {creating ? (
+              <RefreshCw className="size-3.5 shrink-0 animate-spin" aria-hidden />
+            ) : (
+              <Plus className="size-3.5 shrink-0" strokeWidth={2} aria-hidden />
+            )}
             Create tag
           </Button>
         </div>
@@ -562,10 +668,7 @@ function TagsPanel() {
       ) : (
         <ul className="flex flex-col gap-2">
           {tags.map((t) => (
-            <li
-              key={t.name}
-              className="rounded-lg border border-border p-3"
-            >
+            <li key={t.name} className={WB_LIST_ITEM}>
               <div className="flex items-center gap-2">
                 <TagIcon className="size-3.5 text-muted-foreground" />
                 <span className="font-medium text-sm">{t.name}</span>
@@ -678,37 +781,82 @@ function ProposalsPanel() {
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-3.5">
-      <section className="rounded-xl border border-border/60 bg-surface/80 p-3.5">
-        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          Open proposal
-        </h3>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <input
-            type="text"
-            placeholder="source branch"
-            value={openName}
-            onChange={(e) => setOpenName(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
-          <input
-            type="text"
-            placeholder="target branch (default: main)"
-            value={openTarget}
-            onChange={(e) => setOpenTarget(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
-          <input
-            type="text"
-            placeholder="description (optional)"
-            value={openDescription}
-            onChange={(e) => setOpenDescription(e.target.value)}
-            className="rounded-lg border border-border/70 bg-background/70 px-2.5 py-1.5 text-xs"
-          />
+      <section className={WB_FORM_SHELL}>
+        <div className="mb-3.5 flex items-start gap-2.5">
+          <div
+            className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-background/45 shadow-sm ring-1 ring-inset ring-border/20"
+            aria-hidden
+          >
+            <Workflow className="size-3.5 text-muted-foreground" strokeWidth={2} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-medium tracking-tight text-foreground">Open proposal</h3>
+            <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+              Start a review when merges require an explicit proposal on the engine.
+            </p>
+          </div>
         </div>
-        <div className="mt-2 flex justify-end">
-          <Button onClick={handleOpen} disabled={creating || !openName.trim()} size="sm">
-            {creating ? <RefreshCw className="mr-1 size-3 animate-spin" /> : <Plus className="mr-1 size-3" />}
-            Open
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="proposal-open-source" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Source branch
+            </label>
+            <input
+              id="proposal-open-source"
+              type="text"
+              placeholder="branch to merge from"
+              value={openName}
+              onChange={(e) => setOpenName(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="proposal-open-target" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Target
+            </label>
+            <input
+              id="proposal-open-target"
+              type="text"
+              placeholder="main"
+              value={openTarget}
+              onChange={(e) => setOpenTarget(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-w-0 space-y-1">
+            <label htmlFor="proposal-open-desc" className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Description <span className="font-normal normal-case text-muted-foreground/70">(optional)</span>
+            </label>
+            <input
+              id="proposal-open-desc"
+              type="text"
+              placeholder="Context for reviewers"
+              value={openDescription}
+              onChange={(e) => setOpenDescription(e.target.value)}
+              className={WB_INPUT}
+              autoComplete="off"
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 flex justify-end border-t border-border/15 pt-3.5">
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={handleOpen}
+            disabled={creating || !openName.trim()}
+            size="sm"
+            className="h-8 gap-1.5 px-3 text-xs font-medium shadow-sm"
+          >
+            {creating ? (
+              <RefreshCw className="size-3.5 shrink-0 animate-spin" aria-hidden />
+            ) : (
+              <Plus className="size-3.5 shrink-0" strokeWidth={2} aria-hidden />
+            )}
+            Open proposal
           </Button>
         </div>
       </section>
@@ -754,7 +902,7 @@ function ProposalRow({
 }) {
   const isOpen = proposal.status === "open" || proposal.status === "reviewing";
   return (
-    <li className="rounded-lg border border-border p-3">
+    <li className={WB_LIST_ITEM}>
       <div className="flex items-center gap-2">
         <CircleDot
           className={cn(
@@ -874,7 +1022,7 @@ function TemplatesPanel() {
       ) : (
         <ul className="flex flex-col gap-2">
           {templates.map((t) => (
-            <li key={t.name} className="rounded-lg border border-border p-3">
+            <li key={t.name} className={WB_LIST_ITEM}>
               <div className="flex items-center gap-2">
                 <Layers className="size-3.5 text-muted-foreground" />
                 <span className="font-medium text-sm">{t.name}</span>
@@ -890,7 +1038,7 @@ function TemplatesPanel() {
                   onChange={(e) =>
                     setApplyTo((prev) => ({ ...prev, [t.name]: e.target.value }))
                   }
-                  className="flex-1 rounded-lg border border-border/70 bg-background/70 px-2.5 py-1 text-xs"
+                  className={cn(WB_INPUT, "flex-1 py-1.5")}
                 />
                 <Button
                   size="sm"
@@ -956,7 +1104,7 @@ function EmptyState({
   body: string;
 }) {
   return (
-    <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-muted/20 p-8 text-center">
+    <div className="flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-border/35 bg-muted/15 p-8 text-center">
       <Icon className="size-6 text-muted-foreground/60" />
       <h3 className="text-sm font-medium">{title}</h3>
       <p className="max-w-md text-xs text-muted-foreground">{body}</p>

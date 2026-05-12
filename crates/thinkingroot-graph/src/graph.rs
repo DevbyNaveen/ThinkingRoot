@@ -220,6 +220,50 @@ impl GraphStore {
                 content_blake3: String default '',
                 symbol: String default ''
             }",
+            // ─── Witness Mesh v1.0 — replaces `claims` after the
+            //     Commit-2 cutover. Created alongside `claims`
+            //     during the additive scaffold phase so
+            //     `root migrate --to-witness-mesh` can write into
+            //     it without a destructive DDL step.
+            //
+            // PK is the 64-char lower-hex BLAKE3 derived id
+            // (Witness::derive). All byte-grounding columns are
+            // mandatory (Witness Mesh I-W8 — every row's
+            // BLAKE3(source[start..end]) matches content_blake3).
+            // `inputs_json` is the JSON-encoded WitnessInput list;
+            // `spans_json` is the JSON-encoded WitnessSpan list.
+            // The canonical anchor span is spans_json[0]; its
+            // byte range is denormalised into (byte_start, byte_end)
+            // for Datalog join speed.
+            ":create witnesses {
+                id: String
+                =>
+                witness_type: String,
+                rule: String,
+                inputs_json: String default '[]',
+                spans_json: String,
+                source_id: String,
+                workspace_id: String default '',
+                sensitivity: String default 'Public',
+                confidence: Float default 0.99,
+                content_blake3: String,
+                symbol: String default '',
+                byte_start: Int default 0,
+                byte_end: Int default 0,
+                created_at: Float default 0.0,
+                valid_from: Float default 0.0,
+                valid_until: Float default 0.0
+            }",
+            // ─── Witness Mesh DAG denormalisation — one row per
+            //     `Witness.inputs.WitnessRef` edge. Enables fast
+            //     `walk_mesh` traversal without re-parsing the
+            //     `inputs_json` of every row.
+            ":create witness_input_edges {
+                parent_witness_id: String,
+                child_witness_id: String
+                =>
+                edge_kind: String default 'derives_from'
+            }",
             ":create entities {
                 id: String
                 =>
@@ -733,6 +777,15 @@ impl GraphStore {
             "::index create claim_entity_edges:by_entity { entity_id }",
             "::index create claim_source_edges:by_source { source_id }",
             "::index create entities:by_name { canonical_name }",
+            // Witness Mesh indexes — added alongside the new
+            // `witnesses` + `witness_input_edges` tables so query
+            // planners hit log-time lookups from day one.
+            "::index create witnesses:by_type { witness_type }",
+            "::index create witnesses:by_rule { rule }",
+            "::index create witnesses:by_source { source_id }",
+            "::index create witnesses:by_blake3 { content_blake3 }",
+            "::index create witness_input_edges:by_parent { parent_witness_id }",
+            "::index create witness_input_edges:by_child { child_witness_id }",
             "::index create events:by_subject { subject_entity_id }",
             "::index create events:by_timestamp { timestamp }",
             "::index create turns:by_session { session_id }",
@@ -1048,8 +1101,8 @@ impl GraphStore {
 
     /// v3 byte-range citation migration. Adds `source_path: String`,
     /// `byte_start: Int`, `byte_end: Int` to the `claims` relation so every
-    /// row carries the verifiable citation triple required by the v3 wire
-    /// format (`docs/2026-04-29-thinkingroot-v3-final-plan.md` §3.3).
+    /// row carries the verifiable citation triple required by the wire
+    /// format and by CCC I-2 (`.claude/rules/compile-completeness.md`).
     /// Existing rows backfill with `('', 0, 0)` — the "unknown" sentinel
     /// the structural extractor and provenance probe already understand.
     /// Idempotent — re-running against an already-migrated DB is a fast

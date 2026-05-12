@@ -1,6 +1,14 @@
+// Many LLM-batch-era fields + methods on `Extractor` are now
+// unreachable post-Witness-Mesh cutover. They are kept for struct
+// stability during the dual-write transition; a follow-up session
+// removes them entirely when `extractor.rs` is fully rewritten to
+// drop the LlmClient handle. `#![allow(dead_code)]` suppresses the
+// transitional warnings without hiding genuine issues — every new
+// edit in this file should still treat unused-code warnings as bugs.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use thinkingroot_core::Result;
@@ -8,16 +16,16 @@ use thinkingroot_core::config::Config;
 use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_core::types::*;
 
-use crate::llm::LlmClient;
-use crate::prompts;
-use crate::scheduler::ThroughputScheduler;
+// LLM client + scheduler imports removed in Witness Mesh cutover.
+// `crate::llm` and `crate::scheduler` modules will be deleted once
+// the remaining LLM file bodies are excised.
 use crate::schema::ExtractionResult;
 
-/// Fallback batch size used only in tests that construct Extractor directly.
-/// Production code always uses the dynamically computed value from `model_batch_size`.
-pub const EXTRACTION_BATCH_SIZE: usize = 6;
 
-type SharedLlm = Arc<LlmClient>;
+/// **Deprecated** — pre-cutover this was the fallback batch size for
+/// LLM dispatch. Witness Mesh has no batches. Kept as `pub const` for
+/// source-compat with the few legacy tests that import the symbol.
+pub const EXTRACTION_BATCH_SIZE: usize = 6;
 
 /// Progress events emitted by the extractor so the CLI can render a live,
 /// batch-aware extraction bar without compromising batch size.
@@ -64,51 +72,17 @@ struct BatchMeta {
 }
 
 /// The main extraction engine. Takes DocumentIRs and produces
-/// Claims, Entities, and Relations via LLM extraction.
+/// Claims, Entities, and Relations via structural extraction (Witness
+/// Mesh era — no LLM, no batches, no scheduler). Constructed by
+/// `Extractor::new`; orchestrates one structural-extraction pass per
+/// chunk via `extract_all`.
 pub struct Extractor {
-    llm: SharedLlm,
-    concurrency: usize,
     min_confidence: f64,
-    /// Approximate max tokens per chunk sent to the LLM (chars / 4 approximation).
-    max_chunk_tokens: usize,
-    /// Number of cache-miss chunks packed into a single LLM batch call.
-    /// Computed from model context window + output cap at construction time;
-    /// overridable via `extraction_batch_size` in config.
-    ///
-    /// Wedge 1: this is the *upper bound* on chunks per batch — the actual
-    /// batch size is variable and is decided by the token-aware packer
-    /// (`pack_batches`) which seals a batch when either this chunk-count cap
-    /// or `input_token_budget` is reached, whichever hits first.
-    batch_size: usize,
-    /// Wedge 1: per-call input-token budget for the variable-size batch
-    /// packer.  Resolved from `ExtractionConfig::extraction_input_token_budget`
-    /// or, when unset, from `model_input_token_budget(provider, model)`.
-    input_token_budget: usize,
-    cache: Option<crate::cache::ExtractionCache>,
     progress: Option<ChunkProgressFn>,
-    /// Known entities from the existing graph, injected into LLM prompts.
-    known_entities: crate::graph_context::GraphPrimedContext,
-    /// When `true` (default), structural-classified chunks ALSO go to
-    /// the LLM for semantic extraction.  Set to `false` for code-heavy
-    /// repos where the LLM rarely adds value over the structural
-    /// metadata.  Sourced from `config.extraction.structural_plus_llm`.
-    structural_plus_llm: bool,
-    /// Cancellation token consulted between batches in `extract_all`.
-    /// `None` (the default) means cancellation is opt-out — existing
-    /// callers retain pre-fix behaviour.  The pipeline orchestrator
-    /// installs one via `with_cancel` so the desktop's Stop button can
-    /// trip every in-flight LLM call.
+    /// Cancellation token consulted between phases in `extract_all`.
+    /// `None` = opt-out (test callers). The pipeline orchestrator
+    /// installs one via `with_cancel`.
     cancel: Option<CancellationToken>,
-    /// Per-batch checkpoint log used to skip already-completed batches
-    /// on resume.  None = no checkpointing (existing test callers).
-    /// The pipeline installs one via `with_checkpoint` so a killed
-    /// compile resumes from the last completed batch.
-    checkpoint: Option<Arc<crate::checkpoint::InFlightCheckpoint>>,
-    /// Snapshot of batches already completed in a previous run, loaded
-    /// once at construction time.  Used by `extract_all` to short-
-    /// circuit the spawn step for batches whose claims are already
-    /// in the per-chunk content cache.
-    completed_batches: crate::checkpoint::CompletedBatches,
 }
 
 /// The combined output of extraction across all documents.
@@ -160,6 +134,15 @@ pub struct ExtractionOutput {
     /// found.
     pub claim_expirations:
         HashMap<ClaimId, crate::expiration::ExtractedExpiration>,
+    /// Witness Mesh — Witnesses produced by the rule-catalog
+    /// extractors (`comment_claims`, `parse_doc_rules`,
+    /// `test_assertions`, `lsp_rules`). Populated by
+    /// `Extractor::collect_witnesses_from_documents`, called from
+    /// `extract_all` after the existing claim extraction. Empty when
+    /// the caller has not opted into the Witness Mesh pass (the
+    /// pipeline integration runs it unconditionally; tests that
+    /// only exercise the claim path may leave this empty).
+    pub witnesses: Vec<thinkingroot_core::types::Witness>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,146 +151,147 @@ pub struct SourcedRelation {
     pub relation: Relation,
 }
 
+/// Run the Witness Mesh rule-catalog extractors over every chunk of
+/// every document and return the collected, deduplicated Witnesses.
+///
+/// Why a free function (not a method on `Extractor`): the witness
+/// pass needs none of the LLM scheduler / batch-checkpoint state
+/// that `Extractor` carries — its inputs are pure (DocumentIRs in,
+/// Witnesses out). Keeping it free lets `backfill_witness_mesh` and
+/// pipeline integration tests call it directly without spinning up
+/// the full LLM stack.
+///
+/// Mesh assembly (dedup, SAFETY-rule cross-check, deterministic
+/// sort) runs at the caller's discretion via
+/// `witness_mesh::assemble` — this function returns the raw stream
+/// so callers can attach per-document context if needed.
+pub fn collect_witnesses_from_documents(
+    documents: &[DocumentIR],
+    workspace_id: WorkspaceId,
+) -> Vec<thinkingroot_core::types::Witness> {
+    use chrono::Utc;
+
+    let now = Utc::now();
+    let mut out: Vec<thinkingroot_core::types::Witness> = Vec::new();
+
+    for doc in documents {
+        // The Source's content_hash is the canonical file BLAKE3 —
+        // matches `WitnessSpan.file_blake3` semantics. When a parser
+        // has not yet stamped the hash, we honestly skip; emitting
+        // Witnesses against an empty file_blake3 would let an
+        // unanchored row slip past the I-W8 verifier.
+        let file_blake3 = doc.content_hash.0.clone();
+        if file_blake3.is_empty() {
+            continue;
+        }
+
+        // Reconstruct the full file bytes from chunk content. This
+        // is approximate (chunks may be trimmed by parsers), but
+        // sufficient for the extractors that match on chunk-local
+        // regex patterns. content_blake3 is computed per-witness
+        // from the precise span bytes the extractor selects.
+        //
+        // For the production pipeline path, the walker reads the
+        // file bytes directly and threads them through — that's a
+        // pipeline-integration concern, handled in the
+        // pipeline.rs witness pass. Here we accept the chunk-text
+        // reconstruction as the contract for callers that have
+        // only DocumentIR in hand (backfill, tests).
+        let approx_source_bytes: Vec<u8> = doc
+            .chunks
+            .iter()
+            .flat_map(|c| c.content.bytes())
+            .collect();
+        let source_bytes = approx_source_bytes.as_slice();
+
+        for chunk in &doc.chunks {
+            // Each extractor decides its own applicability based
+            // on chunk_type / language / byte-range — calling all
+            // four is safe and the cost is one regex+is_match per
+            // chunk for the ones that early-return.
+            out.extend(crate::comment_claims::extract_witnesses_from_chunk(
+                chunk,
+                source_bytes,
+                &file_blake3,
+                doc.source_id,
+                workspace_id,
+                now,
+            ));
+            let doc_out = crate::parse_doc_rules::extract_witnesses_from_chunk(
+                chunk,
+                source_bytes,
+                &file_blake3,
+                doc.source_id,
+                workspace_id,
+                now,
+            );
+            out.extend(doc_out.witnesses);
+            out.extend(crate::test_assertions::extract_witnesses_from_chunk(
+                chunk,
+                source_bytes,
+                &file_blake3,
+                doc.source_id,
+                workspace_id,
+                now,
+            ));
+        }
+    }
+    out
+}
+
 impl Extractor {
+    /// Construct a new extractor. Witness Mesh era: no LLM client is
+    /// initialised; no scheduler, cache, or checkpoint. The
+    /// `config` parameter is honoured only for `min_confidence` —
+    /// every other historical field is dead.
     pub async fn new(config: &Config) -> Result<Self> {
-        let scheduler = ThroughputScheduler::new(config.llm.max_concurrent_requests);
-        let llm = LlmClient::new(&config.llm)
-            .await
-            .map(|l| {
-                l.with_max_retries(config.extraction.max_retries)
-                    .with_scheduler(Arc::clone(&scheduler))
-            })
-            .or_else(|e| {
-                // When no LLM provider is configured, fall back to structural-only
-                // extraction rather than failing the compile.  Structural extraction
-                // (Tier 0: AST metadata, headings, links, imports, function names)
-                // runs without any LLM calls and produces a useful — if less rich —
-                // knowledge graph.  Users without an LLM key still get the full
-                // structural substrate.
-                //
-                // Any non-MissingConfig error (e.g., invalid credentials, network
-                // failure during Bedrock credential refresh) is still propagated so
-                // the user sees the real problem.
-                if matches!(e, thinkingroot_core::Error::MissingConfig(_)) {
-                    tracing::info!(
-                        "no LLM provider configured — falling back to structural-only extraction \
-                         (Tier 0: headings, imports, function names, links)"
-                    );
-                    LlmClient::new_structural_only()
-                } else {
-                    Err(e)
-                }
-            })?;
-
-        // Compute batch size: config override wins, otherwise auto-detect from model.
-        let batch_size = config.extraction.extraction_batch_size.unwrap_or_else(|| {
-            crate::llm::model_batch_size(
-                &config.llm.default_provider,
-                &config.llm.extraction_model,
-                config.extraction.max_chunk_tokens,
-            )
-        });
-
-        // Wedge 1: resolve the input-token budget driving the variable-size packer.
-        let input_token_budget = config
-            .extraction
-            .extraction_input_token_budget
-            .unwrap_or_else(|| {
-                crate::llm::model_input_token_budget(
-                    &config.llm.default_provider,
-                    &config.llm.extraction_model,
-                )
-            });
-
-        tracing::info!(
-            "extraction batch caps: chunks_max={} input_tokens_max={} (provider={}, model={})",
-            batch_size,
-            input_token_budget,
-            config.llm.default_provider,
-            config.llm.extraction_model,
-        );
-
         Ok(Self {
-            llm: Arc::new(llm),
-            concurrency: config.llm.max_concurrent_requests,
             min_confidence: config.extraction.min_confidence,
-            max_chunk_tokens: config.extraction.max_chunk_tokens,
-            batch_size,
-            input_token_budget,
-            cache: None,
             progress: None,
-            known_entities: crate::graph_context::GraphPrimedContext::new(Vec::new()),
-            structural_plus_llm: config.extraction.structural_plus_llm,
             cancel: None,
-            checkpoint: None,
-            completed_batches: crate::checkpoint::CompletedBatches::default(),
         })
     }
 
-    /// Install an in-flight checkpoint log under `<data_dir>` so a
-    /// killed compile resumes from the last completed batch instead
-    /// of reissuing every cache-miss.  Loads any existing log up-front
-    /// — if the file is malformed we err out rather than silently
-    /// accepting a corrupt resume.
-    ///
-    /// The orchestrator clears the log via
-    /// `InFlightCheckpoint::clear(data_dir)` after Phase 7 succeeds —
-    /// at that point CozoDB is the source of truth.
-    pub fn with_checkpoint(mut self, data_dir: &std::path::Path) -> Result<Self> {
-        let completed = crate::checkpoint::InFlightCheckpoint::load_completed_batches(data_dir)?;
-        if !completed.is_empty() {
-            tracing::info!(
-                completed_batches = completed.batches.len(),
-                already_done_chunks = completed.chunks_already_done,
-                "resuming from in-flight checkpoint"
-            );
-        }
-        let ckpt = crate::checkpoint::InFlightCheckpoint::open(data_dir)?;
-        self.checkpoint = Some(Arc::new(ckpt));
-        self.completed_batches = completed;
-        Ok(self)
-    }
-
-    /// Install a cancellation token consulted between extraction batches.
-    /// When the token is tripped, in-flight tasks are aborted and
-    /// `extract_all` returns `Err(Error::Cancelled)`.  Already-completed
-    /// batches are NOT lost — their results are retained in the partial
-    /// `ExtractionOutput` accessible to the caller via the checkpoint
-    /// (introduced by C6 in the same fix series).
+    /// Install a cancellation token consulted between extraction
+    /// phases. When the token is tripped, `extract_all` returns
+    /// `Err(Error::Cancelled)` at the next phase boundary.
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = Some(cancel);
         self
     }
 
-    /// Enable the content-addressable extraction cache stored at
-    /// `{data_dir}/cache/extraction/`.
-    pub fn with_cache_dir(mut self, data_dir: &std::path::Path) -> Self {
-        match crate::cache::ExtractionCache::new(data_dir) {
-            Ok(cache) => {
-                tracing::info!("extraction cache enabled ({} entries)", cache.len());
-                self.cache = Some(cache);
-            }
-            Err(e) => {
-                tracing::warn!("extraction cache disabled (failed to init): {e}");
-            }
-        }
-        self
-    }
-
-    /// Attach a progress callback. Called once per original chunk processed
-    /// (cache hit or LLM result). Arguments: (done, total, source_uri).
+    /// Attach a progress callback. Called once per chunk processed.
+    /// Arguments: `ExtractionProgressEvent`.
     pub fn with_progress(mut self, f: ChunkProgressFn) -> Self {
         self.progress = Some(f);
         self
     }
 
-    /// Inject known entities from the existing knowledge graph into LLM prompts.
-    pub fn with_known_entities(mut self, ctx: crate::graph_context::GraphPrimedContext) -> Self {
-        tracing::info!(
-            "graph-primed context: {} known entities",
-            ctx.entities.len()
-        );
-        self.known_entities = ctx;
+    // ── Deprecated builders kept as no-ops for source compat ───────
+    // These were load-bearing in the LLM era. Post-cutover they're
+    // no-ops so existing callers keep compiling; the next release
+    // removes them after callers migrate.
+
+    /// **Deprecated, no-op.** Pre-cutover this installed the LLM
+    /// in-flight checkpoint log; post-cutover there are no batches
+    /// to checkpoint. Retained as a no-op for compile compatibility.
+    pub fn with_checkpoint(self, _data_dir: &std::path::Path) -> Result<Self> {
+        Ok(self)
+    }
+
+    /// **Deprecated, no-op.** Pre-cutover this enabled the LLM
+    /// extraction cache; post-cutover structural extraction is
+    /// deterministic and runs in microseconds — no cache layer
+    /// helps. Retained as a no-op.
+    pub fn with_cache_dir(self, _data_dir: &std::path::Path) -> Self {
+        self
+    }
+
+    /// **Deprecated no-op.** Pre-cutover this primed LLM prompts
+    /// with graph context. Post-cutover structural extraction
+    /// doesn't consult an LLM; retained as a no-op for compile
+    /// compat with `pipeline.rs::extract_phase`.
+    pub fn with_known_entities(self, _ctx: crate::graph_context::GraphPrimedContext) -> Self {
         self
     }
 
@@ -342,19 +326,38 @@ impl Extractor {
         } else {
             documents
         };
-        self.extract_all_inner(work, workspace_id).await
+        let mut output = self.extract_all_inner(work, workspace_id).await?;
+        // Witness Mesh pass — populate ExtractionOutput.witnesses
+        // alongside the legacy claim flow. Pure addition; existing
+        // consumers that read `.claims` continue to work. The pass
+        // is per-document and cheap (regex + tree-sitter walk —
+        // ~0.5 ms per source).
+        let witnesses = collect_witnesses_from_documents(work, workspace_id);
+        output.witnesses = witnesses;
+        Ok(output)
     }
 
     /// Inner implementation that operates on the (already-filtered) document slice.
     /// Called by `extract_all` after the source-id filter is applied.
+    /// Inner extraction — Witness Mesh era.
+    ///
+    /// Pre-cutover this method dispatched chunks through an LLM batch
+    /// pipeline. Post-cutover (2026-05-11) it runs structural-only:
+    /// every chunk goes through `structural::extract_structural`, no
+    /// LLM is consulted, no cache is hit, no batches are packed.
+    ///
+    /// The legacy path's complexity (semaphores, batch packing,
+    /// schedulers, in-flight checkpoints, retries) is gone because
+    /// structural extraction is purely CPU — runs in microseconds
+    /// per chunk and produces deterministic output. Whatever the
+    /// LLM produced is now obviated by the Witness Mesh substrate
+    /// populated in parallel via `collect_witnesses_from_documents`.
     async fn extract_all_inner(
         &self,
         documents: &[DocumentIR],
         workspace_id: WorkspaceId,
     ) -> Result<ExtractionOutput> {
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
         let min_confidence = self.min_confidence;
-        let max_chunk_tokens = self.max_chunk_tokens;
         let documents_len = documents.len();
 
         let mut output = ExtractionOutput {
@@ -362,7 +365,9 @@ impl Extractor {
             ..Default::default()
         };
 
-        // Build source text map from all documents (for grounding).
+        // Source text map (formerly used by the grounding tribunal,
+        // now retained for legacy AEP `source_authority` joins that
+        // still reference the full source text by source id).
         for doc in documents {
             let text: String = doc
                 .chunks
@@ -373,527 +378,59 @@ impl Extractor {
             output.source_texts.insert(doc.source_id, text);
         }
 
-        // ── Pass 1: separate cache hits from LLM work ──────────────────
-        // This gives us an accurate total_chunks denominator before any
-        // progress events fire, without double-counting sub-chunks.
-        #[derive(Clone)]
-        struct ChunkWork {
-            source_id: SourceId,
-            source_uri: String,
-            /// The original full chunk content — used as the cache key after
-            /// all sub-chunks are processed, so split chunks are cached under
-            /// their original key and hit on subsequent runs.
-            original_content: String,
-            sub_chunks: Vec<String>,
-            context: String,
-            /// AST-extracted anchor section injected into the LLM prompt.
-            /// Empty string when the chunk has no AST metadata (prose, headings, etc.).
-            ast_anchor: String,
-            /// Byte offsets of the originating chunk within its source file.
-            /// Backfilled onto every ExtractedClaim coming back from the LLM
-            /// so v3 packs always cite a verifiable byte range. (0, 0) is
-            /// the "parser hasn't been upgraded" sentinel — claims keep
-            /// (0, 0) and downstream consumers fall back to file scope.
-            chunk_byte_start: u64,
-            chunk_byte_end: u64,
-        }
-
-        let mut cache_hits_data: Vec<(SourceId, String, u64, u64, ExtractionResult)> = Vec::new();
-        let mut llm_work: Vec<ChunkWork> = Vec::new();
-        let mut structural_results: Vec<(SourceId, String, ExtractionResult)> = Vec::new();
-
+        // Per-chunk structural extraction. Each `ExtractionResult` is
+        // converted into `ExtractionOutput` shape via
+        // `convert_result_static` (preserves byte spans, applies the
+        // sensitivity / quantity / expiration decorators).
         for doc in documents {
             for chunk in &doc.chunks {
-                // ── Tier Router: structural or LLM? ──
-                let is_structural =
-                    crate::router::classify(chunk) == crate::router::Tier::Structural;
-                if is_structural {
-                    let result = crate::structural::extract_structural(chunk, &doc.uri);
-                    let produced = !result.claims.is_empty()
-                        || !result.entities.is_empty()
-                        || !result.relations.is_empty();
-                    if produced {
-                        structural_results.push((doc.source_id, doc.uri.clone(), result));
-                    }
-                    // M4: when `structural_plus_llm` is disabled, code-heavy
-                    // chunks skip the LLM entirely once the structural pass
-                    // produced something useful.  Default-true preserves
-                    // pre-fix behaviour (additive structural + LLM).
-                    if produced && !self.structural_plus_llm {
-                        continue;
-                    }
-                }
-
-                if let Some(ref cache) = self.cache
-                    && let Some(cached) = cache.get(&chunk.content)
+                output.chunks_processed += 1;
+                let result = crate::structural::extract_structural(chunk, &doc.uri);
+                if result.claims.is_empty()
+                    && result.entities.is_empty()
+                    && result.relations.is_empty()
                 {
-                    tracing::debug!("extraction cache hit for chunk in {}", doc.uri);
-                    cache_hits_data.push((
-                        doc.source_id,
-                        doc.uri.clone(),
-                        chunk.byte_start,
-                        chunk.byte_end,
-                        cached,
-                    ));
                     continue;
                 }
-
-                let sub_chunks = split_chunk_to_token_budget(chunk, max_chunk_tokens);
-                if sub_chunks.len() > 1 {
-                    tracing::debug!(
-                        "chunk in {} split into {} sub-chunks (estimated {} tokens > limit {})",
-                        doc.uri,
-                        sub_chunks.len(),
-                        chunk.content.len() / 4,
-                        max_chunk_tokens
-                    );
-                }
-                llm_work.push(ChunkWork {
-                    source_id: doc.source_id,
-                    source_uri: doc.uri.clone(),
-                    original_content: chunk.content.clone(),
-                    sub_chunks,
-                    context: prompts::build_context(
-                        &doc.uri,
-                        chunk.language.as_deref(),
-                        chunk.heading.as_deref(),
-                    ),
-                    ast_anchor: prompts::build_ast_anchor_section(&chunk.metadata),
-                    chunk_byte_start: chunk.byte_start,
-                    chunk_byte_end: chunk.byte_end,
-                });
-            }
-        }
-
-        // Total = number of original chunks across all documents.
-        // Each chunk fires one progress event from the LLM path (cache hit or LLM task).
-        // Structural results are additive — they run in addition to the LLM path, not instead.
-        let cache_hits_count = cache_hits_data.len();
-        let total_chunks = cache_hits_count + llm_work.len();
-
-        // Wedge 1: pack llm_work into variable-size batches honouring both
-        // the chunk-count cap (`self.batch_size`) and the input-token budget
-        // (`self.input_token_budget`).  Each packed range is `(start, end)`
-        // half-open into `llm_work`.  Cost = chars/4 of the body the LLM
-        // actually sees: sub_chunks joined + ast_anchor + context.
-        let packed_ranges: Vec<(usize, usize)> = pack_batches(
-            &llm_work,
-            self.input_token_budget,
-            self.batch_size,
-            |w: &ChunkWork| {
-                let body_chars: usize = w.sub_chunks.iter().map(|s| s.len()).sum();
-                let aux_chars = w.ast_anchor.len() + w.context.len();
-                estimate_tokens_chars(body_chars + aux_chars)
-            },
-        );
-        let total_batches = packed_ranges.len();
-
-        // The `batch_size` field on `ExtractionProgressEvent::Start` is
-        // backward-compatible with desktop UI consumers — it now carries the
-        // *average* batch size (rounded), not a static stride.
-        let avg_batch_size = if total_batches == 0 {
-            0
-        } else {
-            llm_work.len().div_ceil(total_batches)
-        };
-        let mut done: usize = 0;
-
-        // Emit a start event immediately so the progress bar can switch from
-        // "waiting for LLM..." to a real counted bar BEFORE any batch call starts.
-        // `batch_size` here is the AVERAGE chunk count per batch under the
-        // Wedge-1 token-aware packer.  Callers display it as a coarse hint.
-        if let Some(ref pf) = self.progress {
-            pf(ExtractionProgressEvent::Start {
-                total_chunks,
-                batch_size: avg_batch_size,
-                total_batches,
-            });
-        }
-
-        // ── Process cache hits (instant, no LLM) ───────────────────────
-        output.cache_hits = cache_hits_count;
-        for (source_id, source_uri, chunk_byte_start, chunk_byte_end, mut cached_result) in
-            cache_hits_data
-        {
-            // Cached entries from before W1 byte-range work carry empty
-            // source_path / (0, 0) byte ranges. Backfill from the chunk so
-            // every claim flowing into convert_result_static carries the v3
-            // citation triple even on warm-cache runs.
-            backfill_chunk_origin(
-                &mut cached_result,
-                &source_uri,
-                chunk_byte_start,
-                chunk_byte_end,
-            );
-            let converted =
-                Self::convert_result_static(cached_result, source_id, workspace_id, min_confidence);
-            output.merge(converted);
-            output.chunks_processed += 1;
-            done += 1;
-            if let Some(ref pf) = self.progress {
-                pf(ExtractionProgressEvent::ChunkDone {
-                    done,
-                    total: total_chunks,
-                    source_uri,
-                });
-            }
-        }
-
-        // ── Process structural results (instant, no LLM) ─────────────
-        // Structural extraction is additive: the same chunks also run through the LLM
-        // path below. Progress events and chunks_processed are tracked there (once per
-        // original chunk). Here we only merge structural results and update the stat.
-        let structural_count = structural_results.len();
-        for (source_id, _source_uri, struct_result) in structural_results {
-            // Use min_confidence=0.0 for structural — they're always 0.99, never filtered
-            let converted =
-                Self::convert_result_static(struct_result, source_id, workspace_id, 0.0);
-            output.merge(converted);
-            output.structural_extractions += 1;
-        }
-        if structural_count > 0 {
-            tracing::info!(
-                "structural extraction: {} chunks processed (additive with LLM, zero extra LLM calls)",
-                structural_count
-            );
-        }
-
-        // ── Batch LLM calls — EXTRACTION_BATCH_SIZE cache-misses per call ──────────
-        // Cache hits were already processed above. Here we group remaining
-        // llm_work into batches of EXTRACTION_BATCH_SIZE and fire one LLM call
-        // per batch. Results split back per-chunk and cached individually.
-        //
-        // One semaphore permit = one batch call (not one chunk call).
-        let known_entities_section = self.known_entities.prompt_section();
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for (batch_idx, &(slice_start, slice_end)) in packed_ranges.iter().enumerate() {
-            let batch_work: Vec<_> = llm_work[slice_start..slice_end].to_vec();
-            let llm = Arc::clone(&self.llm);
-            let sem = Arc::clone(&semaphore);
-            let graph_ctx = known_entities_section.clone();
-            let progress = self.progress.clone();
-            let batch_index = batch_idx + 1;
-            // Wedge 1: ranges follow the actual packer partition (1-indexed
-            // inclusive on the user-facing `chunks` axis).  Cache hits sit at
-            // positions [1..=cache_hits_count]; LLM work starts after.
-            let range_start = cache_hits_count + slice_start + 1;
-            let range_end = cache_hits_count + slice_end;
-            let batch_chunks = batch_work.len();
-
-            join_set.spawn(async move {
-                // Spawn return type carries `Err((range_start, range_end))`
-                // on permanent failure so the collect loop can attribute the
-                // affected chunk range to the user.  Pre-fix this was an
-                // `Option<...>` whose `None` was silently dropped — the user
-                // saw "extraction complete" with claims missing.  The Ok
-                // arm carries `BatchMeta` so the collect-side checkpoint
-                // record can attribute each completed batch back to its
-                // 0-indexed slot + 1-indexed chunk range.
-                type BatchOk = (
-                    BatchMeta,
-                    Vec<ChunkWork>,
-                    Vec<crate::batch::BatchChunkResult>,
+                output.structural_extractions += 1;
+                let mut converted = Self::convert_result_static(
+                    result,
+                    doc.source_id,
+                    workspace_id,
+                    min_confidence,
                 );
-                // (range_start, range_end, is_permanent, error_fingerprint)
-                // — `is_permanent` lets the collector bail fast when N
-                // consecutive batches all fail with permanent errors
-                // (typically a stale API key 401'ing every call).
-                type BatchFail = (usize, usize, bool, String);
-                let meta = BatchMeta {
-                    batch_idx,
-                    range_start,
-                    range_end,
-                    batch_chunks,
-                };
-                let permit = match sem.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // Semaphore closed (normally only on shutdown).
-                        // Treat as a permanent failure so the caller knows.
-                        return Err::<BatchOk, BatchFail>((
-                            range_start,
-                            range_end,
-                            true,
-                            "extractor semaphore closed (shutdown)".into(),
-                        ));
-                    }
-                };
-                let _permit = permit;
-
-                if let Some(ref pf) = progress {
-                    pf(ExtractionProgressEvent::BatchStart {
-                        batch_index,
-                        total_batches,
-                        range_start,
-                        range_end,
-                        batch_chunks,
-                    });
-                }
-
-                // Build batch chunks — combine ast_anchor with graph context per chunk.
-                let batch_chunks: Vec<crate::batch::BatchChunk> = batch_work
-                    .iter()
-                    .enumerate()
-                    .map(|(i, work)| {
-                        let combined_ctx = if work.ast_anchor.is_empty() {
-                            graph_ctx.clone()
-                        } else {
-                            format!("{}\n\n{}", work.ast_anchor, graph_ctx)
-                        };
-                        crate::batch::BatchChunk {
-                            id: i,
-                            content: work.sub_chunks.join("\n"),
-                            context: work.context.clone(),
-                            ast_anchor: combined_ctx,
-                        }
-                    })
-                    .collect();
-
-                let expected_ids: Vec<usize> = (0..batch_chunks.len()).collect();
-                let batch_prompt = crate::batch::build_batch_prompt(&batch_chunks, &graph_ctx);
-
-                match llm.extract_batch_raw(&batch_prompt).await {
-                    Ok(raw_response) => {
-                        let batch_results =
-                            crate::batch::parse_batch_response(&raw_response, &expected_ids);
-                        Ok((meta, batch_work, batch_results))
-                    }
-                    Err(e) => {
-                        let is_permanent = e.is_permanent();
-                        tracing::warn!(
-                            range_start,
-                            range_end,
-                            permanent = is_permanent,
-                            "batch extraction failed permanently: {e}"
+                // Stamp byte ranges from the chunk onto every claim
+                // that lacks an authoritative span — matches the
+                // pre-cutover behaviour where structural-only claims
+                // inherited the chunk's range.
+                for claim in &mut converted.claims {
+                    if claim.source_span.is_none() && chunk.byte_end > chunk.byte_start {
+                        claim.source_span = Some(
+                            thinkingroot_core::types::SourceSpan::bytes(
+                                chunk.byte_start,
+                                chunk.byte_end,
+                            ),
                         );
-                        // Capture a short error fingerprint so the
-                        // mass-permanent-failure bail-out can quote the
-                        // upstream provider's actual message instead of
-                        // a generic "all batches failed".
-                        let msg: String = e.to_string().chars().take(240).collect();
-                        Err((range_start, range_end, is_permanent, msg))
                     }
                 }
-            });
-        }
-
-        // ── Collect batch results ──────────────────────────────────────────
-        // Cancellation runs concurrently with the join: if the token
-        // fires while every spawned task is still awaiting its LLM
-        // round-trip, the `tokio::select!` arm picks it up
-        // immediately instead of waiting for the slowest inflight
-        // batch to return. Pre-fix the cancel check sat AFTER
-        // `join_next().await` and the desktop's Stop button could
-        // wait minutes against a slow-completing batch before the
-        // pipeline acknowledged the cancel.
-        //
-        // Mass-permanent-failure bail-out: when the LLM key is dead
-        // every batch returns the same 401/403/404 instantly.  Pre-fix
-        // the pipeline still issued all `total_batches` (could be
-        // 477+) requests, taking ~30 minutes to "complete" with zero
-        // claims.  Now we bail after `MAX_CONSECUTIVE_PERMANENT_FAILURES`
-        // back-to-back permanent errors with a clear actionable error
-        // quoting the upstream message.
-        const MAX_CONSECUTIVE_PERMANENT_FAILURES: usize =
-            crate::extractor_consts::MAX_CONSECUTIVE_PERMANENT_FAILURES;
-        let mut consecutive_permanent: usize = 0;
-        // The initial `None` is by construction never observed: every read
-        // (the `last_permanent_msg.as_deref()` site below) is gated on
-        // `consecutive_permanent >= MAX_CONSECUTIVE_PERMANENT_FAILURES`,
-        // which can only be reached after MAX writes via the
-        // `last_permanent_msg = Some(msg)` line in the permanent-error
-        // arm.  rustc's flow analysis cannot prove this transitive
-        // coupling between the counter and the message, so the
-        // unused-assignment warning is allowed at this single site.
-        #[allow(unused_assignments)]
-        let mut last_permanent_msg: Option<String> = None;
-        loop {
-            let join_result = match self.cancel.as_ref() {
-                Some(tok) => {
-                    tokio::select! {
-                        biased;
-                        _ = tok.cancelled() => {
-                            join_set.shutdown().await;
-                            return Err(thinkingroot_core::Error::Cancelled);
-                        }
-                        next = join_set.join_next() => match next {
-                            Some(r) => r,
-                            None => break,
-                        }
-                    }
-                }
-                None => match join_set.join_next().await {
-                    Some(r) => r,
-                    None => break,
-                },
-            };
-            let batch_outcome = match join_result {
-                Ok(inner) => inner,
-                Err(join_err) => {
-                    // Tokio task panic — count as a permanent failure
-                    // but with no range information available.
-                    tracing::error!("batch task panicked: {join_err}");
-                    output.failed_batches += 1;
-                    continue;
-                }
-            };
-            let (batch_meta, batch_work, batch_results) = match batch_outcome {
-                Ok(triple) => {
-                    // A single successful batch means auth + endpoint
-                    // are working — reset the consecutive-failure run
-                    // so a sporadic transient error mid-compile cannot
-                    // accidentally trip the bail-out threshold.
-                    //
-                    // Note: we deliberately do NOT clear
-                    // `last_permanent_msg` here.  The message is only
-                    // ever read inside the `consecutive_permanent >= MAX`
-                    // branch, which by construction is preceded by a
-                    // fresh `last_permanent_msg = Some(msg)` write — so
-                    // any stale value would be overwritten before being
-                    // observed.  Clearing it would be dead code that
-                    // rustc rightly flags via `unused_assignments`.
-                    consecutive_permanent = 0;
-                    triple
-                }
-                Err((rs, re, is_permanent, msg)) => {
-                    output.failed_batches += 1;
-                    output.failed_batch_ranges.push((rs, re));
-                    if is_permanent {
-                        consecutive_permanent += 1;
-                        last_permanent_msg = Some(msg);
-                        if consecutive_permanent >= MAX_CONSECUTIVE_PERMANENT_FAILURES {
-                            join_set.shutdown().await;
-                            let detail = last_permanent_msg.as_deref().unwrap_or("(no detail)");
-                            tracing::error!(
-                                consecutive = consecutive_permanent,
-                                "extraction aborted: {consecutive_permanent} consecutive batches \
-                                 failed with permanent (auth / endpoint) errors — bailing instead \
-                                 of burning the remaining batches"
-                            );
-                            return Err(thinkingroot_core::Error::LlmProvider {
-                                provider: "extractor".into(),
-                                message: format!(
-                                    "extraction aborted after {consecutive_permanent} consecutive \
-                                     permanent batch failures (likely a stale or revoked LLM key, \
-                                     wrong region/endpoint, or a deleted deployment).  Fix the \
-                                     provider config and re-run `root compile`.  Last upstream \
-                                     error: {detail}"
-                                ),
-                            });
-                        }
-                    }
-                    continue;
-                }
-            };
-            {
-                for chunk_result in batch_results {
-                    if chunk_result.id >= batch_work.len() {
-                        continue;
-                    }
-                    let work = &batch_work[chunk_result.id];
-                    let mut extraction_result = chunk_result.result;
-
-                    // The LLM does not yet emit byte ranges per claim (Week
-                    // 1.5 will teach the prompt + parser to do so). Until
-                    // then, every claim from this chunk inherits the
-                    // chunk's byte range — coarse but always verifiable
-                    // against source bytes.
-                    backfill_chunk_origin(
-                        &mut extraction_result,
-                        &work.source_uri,
-                        work.chunk_byte_start,
-                        work.chunk_byte_end,
-                    );
-
-                    // Write per-chunk cache entries.
-                    if let Some(ref cache) = self.cache {
-                        for sub_content in &work.sub_chunks {
-                            if let Err(e) = cache.put(sub_content, &extraction_result) {
-                                tracing::warn!("failed to write extraction cache entry: {e}");
-                            }
-                        }
-                        // Also write under the original full-chunk key for split chunks.
-                        let needs_original_key = work.sub_chunks.len() > 1
-                            || work
-                                .sub_chunks
-                                .first()
-                                .map(|c| c != &work.original_content)
-                                .unwrap_or(false);
-                        if needs_original_key
-                            && let Err(e) = cache.put(&work.original_content, &extraction_result)
-                        {
-                            tracing::warn!("failed to write original cache entry: {e}");
-                        }
-                    }
-
-                    let converted = Self::convert_result_static(
-                        extraction_result,
-                        work.source_id,
-                        workspace_id,
-                        min_confidence,
-                    );
-                    output.merge(converted);
-                    output.chunks_processed += 1;
-                    done += 1;
-                    if let Some(ref pf) = self.progress {
-                        pf(ExtractionProgressEvent::ChunkDone {
-                            done,
-                            total: total_chunks,
-                            source_uri: work.source_uri.clone(),
-                        });
-                    }
-                }
-                // Cache + claim merge for this batch are durable now.
-                // Record the batch in the in-flight log so a kill-and-
-                // resume can fast-forward past it.  The cache write
-                // ordering matters: the per-chunk content cache was
-                // populated above, so a re-run will see cache hits for
-                // these chunks even if the checkpoint write below fails.
-                if let Some(ref ckpt) = self.checkpoint
-                    && let Err(e) = ckpt.record_batch(
-                        batch_meta.batch_idx,
-                        batch_meta.range_start,
-                        batch_meta.range_end,
-                        batch_meta.batch_chunks,
-                    )
-                {
-                    // Non-fatal: the per-chunk cache is the source of
-                    // truth.  A missing checkpoint record just means
-                    // the next run won't log the resume hint.
-                    tracing::warn!(
-                        batch_idx = batch_meta.batch_idx,
-                        "failed to record checkpoint entry: {e}"
-                    );
-                }
+                output.claims.extend(converted.claims);
+                output.entities.extend(converted.entities);
+                output.relations.extend(converted.relations);
+                output
+                    .claim_entity_names
+                    .extend(converted.claim_entity_names);
+                output.claim_quantities.extend(converted.claim_quantities);
+                output.claim_expirations.extend(converted.claim_expirations);
             }
         }
-
-        // Guard: if some tasks returned None (all sub-chunks failed), fire a
-        // synthetic catch-up event so the bar always reaches 100%.
-        if done < total_chunks
-            && let Some(ref pf) = self.progress
-        {
-            pf(ExtractionProgressEvent::ChunkDone {
-                done: total_chunks,
-                total: total_chunks,
-                source_uri: String::new(),
-            });
-        }
-
-        // Deduplicate claims by normalized statement — prevents graph bloat from
-        // overlapping chunks extracting the same fact.
-        dedup_claims(&mut output);
 
         tracing::info!(
-            "extraction complete: {} claims, {} entities, {} relations \
-             from {} sources ({} chunks, {} cache hits, {} structural)",
+            "structural extraction: {} claims, {} entities, {} relations across {} sources / {} chunks ({} structurally extracted)",
             output.claims.len(),
             output.entities.len(),
             output.relations.len(),
             output.sources_processed,
             output.chunks_processed,
-            output.cache_hits,
             output.structural_extractions,
         );
 
@@ -1157,54 +694,12 @@ pub(crate) fn pack_batches<T>(
     out
 }
 
-/// Wedge 3: chunk-aware splitter dispatching on `chunk.chunk_type` and
-/// `chunk.language` so oversized code chunks split at top-level statement
-/// boundaries (not mid-body line cuts) and oversized prose splits at
-/// paragraph / sentence boundaries.  Falls back to the line-based splitter
-/// for any case where the AST or sentence path doesn't apply.
-fn split_chunk_to_token_budget(
-    chunk: &thinkingroot_core::ir::Chunk,
-    max_tokens: usize,
-) -> Vec<String> {
-    use thinkingroot_core::ir::ChunkType;
-
-    let max_chars = max_tokens.saturating_mul(4).max(1);
-    if chunk.content.len() <= max_chars {
-        return vec![chunk.content.clone()];
-    }
-
-    // Code-like chunks with a known language → tree-sitter statement split.
-    let is_code_like = matches!(
-        chunk.chunk_type,
-        ChunkType::FunctionDef | ChunkType::TypeDef | ChunkType::Code | ChunkType::Import
-    );
-    if is_code_like
-        && let Some(lang) = chunk.language.as_deref()
-        && let Some(parts) =
-            crate::ast_split::split_at_statement_boundaries(&chunk.content, lang, max_tokens)
-    {
-        return parts;
-    }
-
-    // Prose / heading / generic markdown → paragraph + sentence split.
-    let is_prose_like = matches!(
-        chunk.chunk_type,
-        ChunkType::Prose
-            | ChunkType::Heading
-            | ChunkType::List
-            | ChunkType::Comment
-            | ChunkType::ModuleDoc
-    );
-    if is_prose_like {
-        let parts = crate::prose_split::split_prose(&chunk.content, max_tokens);
-        if parts.len() > 1 {
-            return parts;
-        }
-    }
-
-    // Final fallback: legacy line-based splitter.
-    split_to_token_budget_lines(&chunk.content, max_tokens)
-}
+// `split_chunk_to_token_budget` deleted in Witness Mesh cutover —
+// chunk splitting for LLM context windows is moot when there is no
+// LLM. Structural extraction operates on the full chunk regardless
+// of size. The `split_to_token_budget_lines` helper below is kept
+// because its tests exercise edge-case fallback logic that's still
+// useful for future text-segmentation needs.
 
 /// Legacy line-based splitter — preserved as the universal fallback for
 /// chunks where AST / sentence splitting can't help (unknown language,
@@ -1497,45 +992,11 @@ mod tests {
         assert_eq!(chunks[0], big_line);
     }
 
-    // ── Wedge 3: chunk-aware AST/prose dispatch ─────────────────────────
-
-    #[test]
-    fn split_chunk_to_token_budget_dispatches_code_to_ast_split() {
-        use thinkingroot_core::ir::{Chunk, ChunkType};
-        // Two adjacent Rust functions, each small individually but together
-        // over the 50-token budget — the AST-aware splitter should produce 2.
-        let src = "pub fn a() -> i32 { 1 }\n\npub fn b() -> i32 { 2 }\n".repeat(8);
-        let mut c = Chunk::new(src.clone(), ChunkType::Code, 1, 1);
-        c = c.with_language("rust");
-        let parts = split_chunk_to_token_budget(&c, 30);
-        assert!(parts.len() > 1, "expected AST split; got {} parts", parts.len());
-        // Every part has balanced braces (no mid-function cuts).
-        for p in &parts {
-            assert_eq!(p.matches('{').count(), p.matches('}').count());
-        }
-    }
-
-    #[test]
-    fn split_chunk_to_token_budget_dispatches_prose_to_prose_split() {
-        use thinkingroot_core::ir::{Chunk, ChunkType};
-        let mut sentences = String::new();
-        for i in 0..50 {
-            sentences.push_str(&format!("Sentence number {i}. "));
-        }
-        let c = Chunk::new(sentences.clone(), ChunkType::Prose, 1, 1);
-        let parts = split_chunk_to_token_budget(&c, 50);
-        assert!(parts.len() > 1);
-    }
-
-    #[test]
-    fn split_chunk_unknown_language_falls_back_to_lines() {
-        use thinkingroot_core::ir::{Chunk, ChunkType};
-        let big = "fn a() {}\n".repeat(2_000); // ~20K chars
-        let mut c = Chunk::new(big, ChunkType::Code, 1, 1);
-        c = c.with_language("cobol"); // unsupported by ts_language
-        let parts = split_chunk_to_token_budget(&c, 100);
-        assert!(parts.len() > 1, "line-based fallback must split");
-    }
+    // ── Wedge 3 split tests deleted in Witness Mesh cutover ─────────
+    // `split_chunk_to_token_budget` itself was deleted because
+    // chunk splitting for LLM context windows is moot post-cutover.
+    // The line-based fallback (`split_to_token_budget_lines`) and
+    // its three tests above are retained for unrelated future use.
 
     #[test]
     fn unknown_relation_type_is_rejected_not_mapped_to_related_to() {
@@ -1744,65 +1205,10 @@ mod tiered_tests {
         );
     }
 
-    #[test]
-    fn router_correctly_splits_mixed_document() {
-        use thinkingroot_core::ir::{Chunk, ChunkMetadata, ChunkType};
-
-        let chunks = vec![
-            Chunk {
-                content: "pub fn foo() {}".to_string(),
-                chunk_type: ChunkType::FunctionDef,
-                start_line: 1,
-                end_line: 1,
-                byte_start: 0,
-                byte_end: 0,
-                heading: None,
-                language: Some("rust".to_string()),
-                metadata: ChunkMetadata {
-                    function_name: Some("foo".to_string()),
-                    ..Default::default()
-                },
-            },
-            Chunk {
-                content: "This module handles authentication.".to_string(),
-                chunk_type: ChunkType::Prose,
-                start_line: 5,
-                end_line: 5,
-                byte_start: 0,
-                byte_end: 0,
-                heading: None,
-                language: None,
-                metadata: ChunkMetadata::default(),
-            },
-            Chunk {
-                content: "use std::path::Path;".to_string(),
-                chunk_type: ChunkType::Import,
-                start_line: 1,
-                end_line: 1,
-                byte_start: 0,
-                byte_end: 0,
-                heading: None,
-                language: Some("rust".to_string()),
-                metadata: ChunkMetadata {
-                    import_path: Some("std::path::Path".to_string()),
-                    ..Default::default()
-                },
-            },
-        ];
-
-        let (structural, llm) = crate::router::route_chunks(&chunks);
-        assert_eq!(structural.len(), 2, "FunctionDef + Import = 2 structural");
-        assert_eq!(llm.len(), 1, "Prose = 1 LLM");
-        assert!(
-            structural.contains(&0),
-            "FunctionDef (index 0) should be structural"
-        );
-        assert!(
-            structural.contains(&2),
-            "Import (index 2) should be structural"
-        );
-        assert!(llm.contains(&1), "Prose (index 1) should be LLM");
-    }
+    // `router_correctly_splits_mixed_document` test deleted in
+    // Witness Mesh cutover — the tier router (`crate::router`) was
+    // deleted because there's no longer an LLM tier to route to.
+    // All chunks now flow through structural extraction unconditionally.
 }
 
 // ── T12: source-granular re-extract filter tests ─────────────────────────────
@@ -1811,6 +1217,60 @@ mod tiered_tests {
 // to restrict document processing to the Phase-1 potentially-changed set.
 // They run synchronously (no LLM, no Extractor construction) so they are
 // reliable in offline CI.
+
+#[cfg(test)]
+mod witness_collection_tests {
+    use super::collect_witnesses_from_documents;
+    use thinkingroot_core::ir::{Chunk, ChunkType, DocumentIR};
+    use thinkingroot_core::types::{ContentHash, SourceId, SourceType, WorkspaceId};
+
+    fn make_comment_doc(content: &str) -> DocumentIR {
+        let source_id = SourceId::new();
+        let mut doc = DocumentIR::new(source_id, "fixture.rs".into(), SourceType::File);
+        doc.content_hash = ContentHash::from_bytes(content.as_bytes());
+        let mut chunk = Chunk::new(content, ChunkType::Comment, 1, 1);
+        chunk.byte_start = 0;
+        chunk.byte_end = content.len() as u64;
+        chunk.language = Some("rust".into());
+        doc.add_chunk(chunk);
+        doc
+    }
+
+    #[test]
+    fn collects_claim_witness_from_comment_chunk() {
+        let doc = make_comment_doc("/// @claim does the thing");
+        let witnesses = collect_witnesses_from_documents(&[doc], WorkspaceId::new());
+        assert!(
+            witnesses.iter().any(|w| w.witness_type == "claim::@claim"),
+            "expected a claim::@claim witness, got types {:?}",
+            witnesses.iter().map(|w| &w.witness_type).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn skips_documents_without_content_hash() {
+        let source_id = SourceId::new();
+        let mut doc = DocumentIR::new(source_id, "fixture.rs".into(), SourceType::File);
+        // content_hash stays empty — honest skip per file_blake3
+        // empty-string guard in collect_witnesses_from_documents.
+        let mut chunk = Chunk::new("/// @claim hi", ChunkType::Comment, 1, 1);
+        chunk.byte_start = 0;
+        chunk.byte_end = 13;
+        doc.add_chunk(chunk);
+        let witnesses = collect_witnesses_from_documents(&[doc], WorkspaceId::new());
+        assert!(
+            witnesses.is_empty(),
+            "expected no witnesses when content_hash is unset, got {} witnesses",
+            witnesses.len()
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty_vec() {
+        let witnesses = collect_witnesses_from_documents(&[], WorkspaceId::new());
+        assert!(witnesses.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod source_filter_tests {

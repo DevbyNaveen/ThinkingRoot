@@ -36,6 +36,14 @@ regex = { workspace = true }
 # Grammars are pulled in transitively via `thinkingroot-parse` so we don't
 # duplicate the language-name match arm.
 tree-sitter = { workspace = true }
+# Witness Mesh rule catalog: static string-keyed map of RuleDescriptor.
+phf = { version = "0.11", features = ["macros"] }
+
+[build-dependencies]
+# build.rs reads Cargo.lock at the workspace root and pins each
+# tree-sitter grammar version into `$OUT_DIR/grammar_versions.rs`
+# for inclusion in the rule catalog.
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

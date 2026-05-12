@@ -622,7 +622,221 @@
   letter-spacing: 0.05em;
 }
 
+/* New Sequences from Hackathon PDF */
+.architecture-sequence, .showcase-sequence, .integration-sequence, .conclusion-sequence {
+  border-top: 1px solid rgba(0,0,0,0.1);
+}
+
+.branch-grid, .metrics-grid {
+  display: grid;
+  gap: 2rem;
+  margin-top: 2rem;
+}
+
+.branch-grid {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+
+.metrics-grid {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.glass-frame {
+  background: rgba(253, 251, 247, 0.4);
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 20px;
+  padding: 2.5rem;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.02);
+  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.4s;
+}
+
+.glass-frame:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 20px 40px rgba(0,0,0,0.05);
+}
+
+.branch-card h4 {
+  font-size: 1.5rem;
+  margin-bottom: 0.5rem;
+  color: var(--text-primary);
+}
+
+.branch-card p {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.metric-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.metric-item strong {
+  font-size: 2.5rem;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  letter-spacing: -0.05em;
+  line-height: 1;
+}
+
+/* Screenshot Showcase */
+.showcase-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8rem;
+  margin-top: 4rem;
+}
+
+.showcase-item {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr;
+  gap: 4rem;
+  align-items: center;
+}
+
+.showcase-item.reverse {
+  grid-template-columns: 1.5fr 1fr;
+}
+
+.showcase-item.reverse .showcase-text {
+  order: 2;
+}
+
+.showcase-item.reverse .showcase-image-wrapper {
+  order: 1;
+}
+
+.showcase-text h3 {
+  font-size: clamp(1.8rem, 3vw, 2.5rem);
+  font-weight: 400;
+  margin-bottom: 1rem;
+  letter-spacing: -0.02em;
+}
+
+.showcase-text p {
+  font-size: 1.2rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  font-weight: 300;
+}
+
+.showcase-image-wrapper {
+  padding: 1rem;
+  overflow: hidden;
+}
+
+.showcase-img {
+  width: 100%;
+  height: auto;
+  border-radius: 12px;
+  box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+  transition: transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.showcase-image-wrapper:hover .showcase-img {
+  transform: scale(1.02);
+}
+
+.massive-statement {
+  line-height: 1.2;
+}
+
+/* AEP Report Component */
+.report-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.report-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4rem;
+  align-items: start;
+}
+
+.report-column {
+  display: flex;
+  flex-direction: column;
+}
+
+.report-image-wrapper {
+  padding: 1rem;
+  overflow: hidden;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.report-img {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+  display: block;
+}
+
+/* Hero Metadata Tag Styles */
+.hero-metadata {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  font-family: 'Inter', monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.2rem;
+  color: var(--text-secondary);
+  margin-bottom: 2rem;
+  text-transform: uppercase;
+  font-weight: 500;
+  opacity: 0.8;
+}
+
+.metadata-divider {
+  opacity: 0.3;
+}
+
+.status-glow {
+  color: #22c55e;
+  text-shadow: 0 0 10px rgba(34, 197, 94, 0.3);
+  animation: flicker 4s infinite;
+}
+
+@keyframes flicker {
+  0%, 19.999%, 22%, 62.999%, 64%, 64.999%, 70%, 100% {
+    opacity: 1;
+  }
+  20%, 21.999%, 63%, 63.999%, 65%, 69.999% {
+    opacity: 0.4;
+  }
+}
+
 @media (max-width: 900px) {
+  .hero-metadata {
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+    font-size: 0.7rem;
+    letter-spacing: 0.1rem;
+  }
+  .metadata-divider {
+    display: none;
+  }
+  .report-grid {
+    grid-template-columns: 1fr;
+    gap: 2rem;
+  }
+  .report-column {
+    margin-top: 0 !important;
+  }
   .layout {
     grid-template-columns: 1fr;
   }

@@ -16,10 +16,13 @@ export function SlashAutocomplete({
   query,
   onSelect,
   onDismiss,
+  placement = "below",
 }: {
   query: string;
   onSelect: (insertion: string) => void;
   onDismiss: () => void;
+  /** `below`: under the input (idle / centered). `above`: over the input (composer at bottom). */
+  placement?: "above" | "below";
 }) {
   const matches = useMemo(() => {
     const q = query.slice(1).toLowerCase();
@@ -59,7 +62,12 @@ export function SlashAutocomplete({
   if (matches.length === 0) return null;
 
   return (
-    <div className="absolute top-full left-0 right-0 z-20 mt-2">
+    <div
+      className={cn(
+        "absolute left-4 right-4 z-20",
+        placement === "above" ? "bottom-full mb-2" : "top-full mt-2",
+      )}
+    >
       <div className="overflow-hidden rounded-xl border border-border/70 bg-surface">
         <ul className="max-h-72 overflow-y-auto py-1">
           {matches.map((c, i) => (

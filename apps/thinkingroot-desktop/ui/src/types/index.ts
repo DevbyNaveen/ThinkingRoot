@@ -33,6 +33,14 @@ export type RightRailTab =
  * separate "rail target" type for no real gain. */
 export type Surface = "chats" | "settings" | "docs" | "brain" | "privacy" | "branches";
 
+/** Left-rail categories when the main pane is on Settings. */
+export type SettingsSectionId =
+  | "provider"
+  | "workspace"
+  | "appearance"
+  | "mcp"
+  | "channels";
+
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {
   id: string;

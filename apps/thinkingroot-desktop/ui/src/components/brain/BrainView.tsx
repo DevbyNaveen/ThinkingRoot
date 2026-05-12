@@ -9,17 +9,19 @@
  * Split position is persisted to localStorage so the graph/table
  * ratio survives a reload.
  */
-import { useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Folder, RefreshCw, AlertTriangle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/store/app";
 import {
-  brainBrief,
-  brainLoad,
-  type BrainSnapshot,
-  type WorkspaceBrief,
+  onWorkspacesChanged,
 } from "@/lib/tauri";
+import {
+  getCachedBrainSnapshot,
+  refreshBrainSnapshotCache,
+  subscribeBrainSnapshotCache,
+} from "@/store/brain-cache";
 import { BrainGraph } from "./BrainGraph";
 import { BrainTable } from "./BrainTable";
 
@@ -38,10 +40,23 @@ function readPersistedSplit(): number {
   }
 }
 
-export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
+export function BrainView({
+  panelMode = false,
+  isVisible = true,
+}: {
+  panelMode?: boolean;
+  /** When false (e.g. another rail tab is active) BrainView is still
+   *  mounted but its force-layout simulation pauses to avoid burning
+   *  CPU on a canvas the user can't see.  Defaults to true for the
+   *  non-panel mount sites that don't toggle visibility. */
+  isVisible?: boolean;
+}) {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
-  const [snap, setSnap] = useState<BrainSnapshot | null>(null);
-  const [brief, setBrief] = useState<WorkspaceBrief | null>(null);
+  const compileProgress = useApp((s) => s.compileProgress);
+  const initialCache = activeWorkspace ? getCachedBrainSnapshot(activeWorkspace) : null;
+  const [snap, setSnap] = useState(() => initialCache?.snap ?? null);
+  const [brief, setBrief] = useState(() => initialCache?.brief ?? null);
+  const [lastLoadedAt, setLastLoadedAt] = useState(() => initialCache?.loadedAt ?? 0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -52,32 +67,77 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
   const [searchQuery, setSearchQuery] = useState("");
   const [tierFilter, setTierFilter] = useState<"all" | "rooted" | "attested" | "unknown">("all");
 
-  async function load() {
-    setLoading(true);
+  const load = useCallback(async (opts: { background?: boolean } = {}) => {
+    if (!activeWorkspace) return;
+    const workspace = activeWorkspace;
+    const background = opts.background ?? false;
+    if (!background) setLoading(true);
+    else if (!getCachedBrainSnapshot(workspace)) setLoading(true);
     setError(null);
     try {
-      const [s, b] = await Promise.all([
-        brainLoad(),
-        // Brief is best-effort: an unmounted workspace returns an
-        // error, but the underlying brainLoad already covers that
-        // path. We keep the brief query independent so a slow
-        // brief never blocks the table.
-        brainBrief().catch(() => null),
-      ]);
-      setSnap(s);
-      setBrief(b);
+      const entry = await refreshBrainSnapshotCache(workspace);
+      if (useApp.getState().activeWorkspace !== workspace) return;
+      setSnap(entry.snap);
+      setBrief(entry.brief);
+      setLastLoadedAt(entry.loadedAt);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setSnap(null);
-      setBrief(null);
+      if (!getCachedBrainSnapshot(workspace)) {
+        setSnap(null);
+        setBrief(null);
+        setLastLoadedAt(0);
+      }
     } finally {
       setLoading(false);
     }
-  }
+  }, [activeWorkspace]);
 
   useEffect(() => {
-    if (activeWorkspace) void load();
+    if (!activeWorkspace) return;
+    const cached = getCachedBrainSnapshot(activeWorkspace);
+    if (cached) {
+      setSnap(cached.snap);
+      setBrief(cached.brief);
+      setLastLoadedAt(cached.loadedAt);
+      setError(null);
+      void load({ background: true });
+    } else {
+      setSnap(null);
+      setBrief(null);
+      setLastLoadedAt(0);
+      void load();
+    }
+  }, [activeWorkspace, load]);
+
+  useEffect(() => {
+    if (!activeWorkspace) return;
+    return subscribeBrainSnapshotCache((workspace, entry) => {
+      if (workspace !== activeWorkspace) return;
+      setSnap(entry.snap);
+      setBrief(entry.brief);
+      setLastLoadedAt(entry.loadedAt);
+      setError(null);
+      setLoading(false);
+    });
   }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (!activeWorkspace || compileProgress?.phase !== "done") return;
+    void load({ background: true });
+  }, [activeWorkspace, compileProgress, load]);
+
+  useEffect(() => {
+    if (!activeWorkspace) return;
+    let unlisten: (() => void) | undefined;
+    onWorkspacesChanged(() => {
+      void load({ background: true });
+    }).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [activeWorkspace, load]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -125,13 +185,14 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
           {snap && (
             <span className="text-[10px] text-muted-foreground">
               {snap.claims.length} claims · {snap.entities.length} entities
+              {loading && " · updating"}
             </span>
           )}
           <Button
             variant="ghost"
             size="icon"
             className="ml-auto h-5 w-5"
-            onClick={load}
+            onClick={() => void load()}
             disabled={loading}
             aria-label="Reload"
           >
@@ -149,6 +210,10 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
               <span className="ml-2 text-[10px] text-muted-foreground">
                 {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
                 {snap.relations.length} relations
+                {loading && <> · updating</>}
+                {!loading && lastLoadedAt > 0 && (
+                  <> · cached {formatCacheAge(lastLoadedAt)}</>
+                )}
                 {brief && brief.contradiction_count > 0 && (
                   <>
                     {" · "}
@@ -164,7 +229,7 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
               variant="ghost"
               size="icon"
               className="ml-auto h-7 w-7"
-              onClick={load}
+              onClick={() => void load()}
               disabled={loading}
               aria-label="Reload"
             >
@@ -213,9 +278,13 @@ export function BrainView({ panelMode = false }: { panelMode?: boolean }) {
         >
           <div className={isDragging ? "pointer-events-none h-full" : "h-full"}>
             {snap ? (
-              <BrainGraph 
-                entities={snap.entities} 
-                relations={snap.relations} 
+              <BrainGraph
+                key={activeWorkspace}
+                cacheKey={activeWorkspace}
+                isRefreshing={loading}
+                isVisible={isVisible}
+                entities={snap.entities}
+                relations={snap.relations}
                 claims={snap.claims}
                 searchQuery={searchQuery}
               />
@@ -259,4 +328,11 @@ function Skeleton({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+function formatCacheAge(loadedAt: number): string {
+  const ageMs = Math.max(0, Date.now() - loadedAt);
+  if (ageMs < 5_000) return "now";
+  if (ageMs < 60_000) return `${Math.round(ageMs / 1_000)}s ago`;
+  return `${Math.round(ageMs / 60_000)}m ago`;
 }
