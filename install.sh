@@ -540,6 +540,11 @@ main() {
   if [ -f "${config_dir_check}/install-manifest.json" ]; then
     say_dim "Install manifest: ${config_dir_check}/install-manifest.json"
   fi
+  if "${INSTALL_DIR}/${BINARY}" doctor --quiet 2>/dev/null; then
+    say "Doctor: all checks pass."
+  else
+    say_dim "Doctor flagged setup gaps; run \`root doctor\` for details or \`root setup\` to repair."
+  fi
   "${INSTALL_DIR}/${BINARY}" --version || true
   printf '\n'
   printf '    Get started:\n'
