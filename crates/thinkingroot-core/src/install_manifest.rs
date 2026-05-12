@@ -101,12 +101,20 @@ impl InstallManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise env-mutating tests within this binary so they don't
+    /// trample each other. Mirrors `cortex.rs::ENV_GUARD`. Without
+    /// this, `cargo test`'s default parallel execution would let one
+    /// test observe another's mid-flight env state.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     /// RAII helper that points `dirs::config_dir()` at a fresh
     /// tempdir on Linux/macOS/Windows by setting all three env vars
     /// (`XDG_CONFIG_HOME`, `HOME`, `APPDATA`) on construct and
     /// restoring them on drop. Mirrors `cortex.rs::ConfigDirOverride`.
     struct ConfigDirOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
         _tmp: tempfile::TempDir,
         prev_xdg: Option<std::ffi::OsString>,
         prev_home: Option<std::ffi::OsString>,
@@ -115,19 +123,23 @@ mod tests {
 
     impl ConfigDirOverride {
         fn new() -> Self {
+            let guard = ENV_GUARD.lock().expect("env guard poisoned");
             let tmp = tempfile::tempdir().expect("tempdir");
             let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
             let prev_home = std::env::var_os("HOME");
             let prev_appdata = std::env::var_os("APPDATA");
-            // SAFETY: tests do not run in parallel within this binary
-            // (cargo's default test isolation per-binary), and the
-            // Drop impl below restores the previous values.
+            // SAFETY: ENV_GUARD serialises with any other test in
+            // this binary that uses ConfigDirOverride; the Drop impl
+            // body below restores the previous env values synchronously
+            // before any field tears down, so the guard is still held
+            // while env state is being restored.
             unsafe {
                 std::env::set_var("XDG_CONFIG_HOME", tmp.path());
                 std::env::set_var("HOME", tmp.path());
                 std::env::set_var("APPDATA", tmp.path());
             }
             Self {
+                _guard: guard,
                 _tmp: tmp,
                 prev_xdg,
                 prev_home,
