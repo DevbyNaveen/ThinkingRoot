@@ -170,6 +170,8 @@ pub fn run() {
             commands::proposal::proposal_list,
             commands::proposal::proposal_review,
             commands::proposal::proposal_close,
+            commands::recovery::get_circuit_breaker_status,
+            commands::recovery::reset_circuit_breaker,
             commands::brain::brain_brief,
             commands::brain::brain_investigate,
             commands::retrieve::retrieve_hybrid,

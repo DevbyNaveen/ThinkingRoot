@@ -498,23 +498,56 @@ fn handle_crash_and_respawn<R: Runtime>(
         // Load + prune restart state.  Corrupt file → fresh state.
         let mut restart_state = RestartState::load().unwrap_or_default();
         restart_state.prune();
+
+        // Pre-check: don't restart if breaker is already active.
+        // Spec §7: the breaker auto-clears 5 minutes after trip; until
+        // that timestamp passes any new crash is a no-op (we surface
+        // `repair_needed` again so the UI keeps showing the panel).
+        if restart_state.breaker_active() {
+            tracing::info!(
+                until = ?restart_state.circuit_breaker_until,
+                "circuit breaker active; not restarting"
+            );
+            let _ = app.emit(
+                "engine_status_changed",
+                serde_json::json!({
+                    "status": "repair_needed",
+                    "failing_check_ids": ["daemon.restart.exhausted"],
+                    "circuit_breaker_until": restart_state.circuit_breaker_until,
+                    "exit_code": exit_code,
+                }),
+            );
+            return;
+        }
+
         restart_state.record_crash(exit_code);
 
-        // Cap reached → surface `repair_needed`, do NOT respawn.
-        if restart_state.cap_reached() {
+        // should_trip() combines the 4-failures-in-60s plain cap AND
+        // the 3-crash-signals-in-60s signal cap (SIGSEGV/SIGBUS/SIGILL
+        // on Unix, STATUS_ACCESS_VIOLATION/STATUS_STACK_BUFFER_OVERRUN
+        // on Windows).  Either path surfaces `repair_needed` with the
+        // breaker timestamp so the UI knows when auto-clear lands.
+        if restart_state.should_trip() {
+            let until = restart_state.trip_circuit_breaker();
             let failures = restart_state.recent_failure_count();
             tracing::error!(
                 attempts = failures,
-                "auto-restart cap reached; surfacing RepairNeeded"
+                ?until,
+                "circuit breaker tripped; surfacing RepairNeeded"
             );
+            let _ = recovery_log::append(&RecoveryEvent::circuit_breaker_tripped(
+                failures as u32,
+                until,
+            ));
             if let Err(e) = restart_state.save() {
-                tracing::warn!(error = %e, "failed to persist restart-state on cap-reached");
+                tracing::warn!(error = %e, "failed to persist restart-state on breaker-trip");
             }
             let _ = app.emit(
                 "engine_status_changed",
                 serde_json::json!({
                     "status": "repair_needed",
                     "failing_check_ids": ["daemon.restart.exhausted"],
+                    "circuit_breaker_until": Some(until),
                     "exit_code": exit_code,
                 }),
             );

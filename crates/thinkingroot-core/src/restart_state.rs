@@ -26,6 +26,15 @@ pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// we surface RepairNeeded.
 pub const MAX_ATTEMPTS: usize = 4;
 
+/// How long the breaker stays tripped before auto-clearing.
+/// Spec §7: 5 minutes.
+pub const BREAKER_DURATION: Duration = Duration::from_secs(5 * 60);
+
+/// How many crash-signal exits in FAILURE_WINDOW also trip the
+/// breaker (in addition to MAX_ATTEMPTS plain failures).
+/// Spec §7: 3.
+pub const CRASH_SIGNAL_TRIP_THRESHOLD: usize = 3;
+
 /// Backoff schedule for the Nth restart attempt (1-indexed).
 /// Spec §7: 0ms, 500ms, 2s, 5s; subsequent calls cap at 5s.
 pub fn backoff_for_attempt(attempt: usize) -> Duration {
@@ -206,6 +215,73 @@ impl RestartState {
             exit_code: None,
         });
     }
+
+    /// True if a previously-tripped breaker is still active.
+    /// Auto-clears when the timestamp passes.
+    pub fn breaker_active(&self) -> bool {
+        match self.circuit_breaker_until {
+            Some(until) => until > Utc::now(),
+            None => false,
+        }
+    }
+
+    /// Trip the breaker for BREAKER_DURATION from now.  Returns the
+    /// new `until` timestamp so callers can log it.
+    pub fn trip_circuit_breaker(&mut self) -> DateTime<Utc> {
+        let until = Utc::now()
+            + chrono::Duration::from_std(BREAKER_DURATION)
+                .expect("BREAKER_DURATION fits chrono::Duration");
+        self.circuit_breaker_until = Some(until);
+        until
+    }
+
+    /// Manually clear the breaker.  Also clears `attempts` so the
+    /// next restart starts at attempt 1 (backoff 0ms).
+    pub fn reset_circuit_breaker(&mut self) {
+        self.circuit_breaker_until = None;
+        self.attempts.clear();
+    }
+
+    /// Count crash-signal exits (SIGSEGV / SIGBUS / SIGILL on Unix,
+    /// STATUS_ACCESS_VIOLATION / STATUS_STACK_BUFFER_OVERRUN on
+    /// Windows) in the recent window.  Used by `should_trip()`.
+    pub fn recent_crash_signal_count(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a.outcome == AttemptOutcome::Crash)
+            .filter(|a| a.exit_code.map(is_crash_signal).unwrap_or(false))
+            .count()
+    }
+
+    /// True if we should trip the breaker, considering both caps.
+    /// Replaces direct `cap_reached()` checks in callers.
+    pub fn should_trip(&self) -> bool {
+        self.recent_failure_count() >= MAX_ATTEMPTS
+            || self.recent_crash_signal_count() >= CRASH_SIGNAL_TRIP_THRESHOLD
+    }
+}
+
+/// True if `exit_code` indicates a crash signal vs a graceful
+/// non-zero exit.  Unix convention: negative codes are signal
+/// numbers (Rust's `std::process::ExitStatus::code()` returns
+/// `None` on signal; tokio's `Child::wait` exposes the signal via
+/// `signal()` on Unix and via the exit status on Windows).
+///
+/// The watchdog calls this with the `i32` it captured; the helper
+/// recognises the canonical crash signals.  Conservative: treat
+/// unrecognized signals as non-crash so we don't over-trip the
+/// breaker on SIGTERM-during-shutdown.
+fn is_crash_signal(exit_code: i32) -> bool {
+    // Unix: negative-mapped signal numbers (SIGSEGV=-11, SIGBUS=-10,
+    //   SIGILL=-4, SIGFPE=-8, SIGABRT=-6).  Tokio's Child::wait
+    //   returns Some(status) on Unix with the signal value reachable
+    //   via status.signal() (Some(n)); callers typically forward
+    //   `-n` as the exit_code field for compat with Windows codes.
+    // Windows: STATUS_ACCESS_VIOLATION = 0xC0000005 = -1073741819.
+    matches!(
+        exit_code,
+        -11 | -10 | -4 | -8 | -6 | -1073741819 | -1073740791
+    )
 }
 
 #[cfg(test)]
@@ -260,5 +336,62 @@ mod tests {
         // 2 crashes + 1 respawn = 2 failures, under MAX_ATTEMPTS.
         assert_eq!(state.recent_failure_count(), 2);
         assert!(!state.cap_reached());
+    }
+}
+
+#[cfg(test)]
+mod breaker_tests {
+    use super::*;
+
+    #[test]
+    fn breaker_inactive_when_not_set() {
+        let state = RestartState::new();
+        assert!(!state.breaker_active());
+    }
+
+    #[test]
+    fn breaker_active_after_trip() {
+        let mut state = RestartState::new();
+        state.trip_circuit_breaker();
+        assert!(state.breaker_active());
+    }
+
+    #[test]
+    fn reset_clears_breaker_and_attempts() {
+        let mut state = RestartState::new();
+        state.record_crash(Some(139));
+        state.trip_circuit_breaker();
+        assert!(state.breaker_active());
+        state.reset_circuit_breaker();
+        assert!(!state.breaker_active());
+        assert!(state.attempts.is_empty());
+    }
+
+    #[test]
+    fn three_crash_signals_trip_breaker() {
+        let mut state = RestartState::new();
+        state.record_crash(Some(-11)); // SIGSEGV
+        state.record_crash(Some(-11));
+        state.record_crash(Some(-11));
+        assert!(state.should_trip());
+    }
+
+    #[test]
+    fn three_non_signal_crashes_do_not_trip_via_signal_cap() {
+        let mut state = RestartState::new();
+        state.record_crash(Some(1));
+        state.record_crash(Some(1));
+        state.record_crash(Some(1));
+        // Below MAX_ATTEMPTS=4 plain cap AND below CRASH_SIGNAL_TRIP_THRESHOLD=3
+        // for signal cap (because exit_code=1 is not a signal).
+        assert!(!state.should_trip());
+    }
+
+    #[test]
+    fn breaker_auto_clears_when_until_in_past() {
+        let mut state = RestartState::new();
+        // Manually set the breaker to expire in the past.
+        state.circuit_breaker_until = Some(Utc::now() - chrono::Duration::seconds(10));
+        assert!(!state.breaker_active(), "past timestamp → inactive");
     }
 }
