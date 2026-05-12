@@ -74,6 +74,12 @@ pub enum DoctorMode {
     Json,
     Fix,
     FixInteractive,
+    /// `--fix --json`: apply all available fixes non-interactively,
+    /// re-run the checks, and emit the final JSON report on stdout.
+    /// Used by the Desktop blocking-panel UI (Slice D) so it can
+    /// surface the post-fix state in the same typed shape it already
+    /// renders.
+    FixJson,
 }
 
 /// Entry point. Runs all built-in checks against the real filesystem

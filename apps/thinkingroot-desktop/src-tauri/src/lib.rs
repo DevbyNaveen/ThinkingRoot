@@ -130,6 +130,8 @@ pub fn run() {
             commands::pack_export::pack_estimate,
             commands::pack_export::pack_export,
             commands::doctor::doctor_run,
+            commands::doctor::doctor_check,
+            commands::doctor::doctor_apply_fix,
             commands::mcp_local::mcp_status,
             commands::mcp_local::mcp_get_config_snippet,
             commands::mcp_local::mcp_configure_tool,

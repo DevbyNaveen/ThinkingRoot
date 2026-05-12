@@ -1451,7 +1451,15 @@ async fn async_main() -> anyhow::Result<()> {
             // probes the daemon as one of its checks. Routing would
             // mean "ask the daemon if it's healthy via the daemon"
             // which is circular.
-            let mode = if json {
+            // `--fix --json` is the Desktop blocking-panel surface
+            // (Slice D): apply available fixes non-interactively,
+            // re-run the checks, emit the post-fix JSON report.  Order
+            // matters — check `fix && json` before plain `json` so the
+            // combined flag is routed to the post-fix flow rather than
+            // the read-only Json mode.
+            let mode = if fix && json {
+                doctor::DoctorMode::FixJson
+            } else if json {
                 doctor::DoctorMode::Json
             } else if fix && interactive {
                 doctor::DoctorMode::FixInteractive
@@ -1463,11 +1471,12 @@ async fn async_main() -> anyhow::Result<()> {
                 doctor::DoctorMode::Default
             };
             let report = doctor::run_doctor(mode).await?;
-            match mode {
+            let final_report = match mode {
                 doctor::DoctorMode::Json => {
                     println!("{}", doctor::format::to_json(&report));
+                    report
                 }
-                doctor::DoctorMode::Quiet => {}
+                doctor::DoctorMode::Quiet => report,
                 doctor::DoctorMode::Fix | doctor::DoctorMode::FixInteractive => {
                     print!("{}", doctor::format::to_terminal(&report));
                     let outcomes = doctor::fix::apply_all(
@@ -1481,12 +1490,27 @@ async fn async_main() -> anyhow::Result<()> {
                             eprintln!("  {} → {:?}", check.id.0, outcome);
                         }
                     }
+                    report
+                }
+                doctor::DoctorMode::FixJson => {
+                    // Apply all available fixes silently, re-run the
+                    // full check matrix, then emit the post-fix JSON.
+                    // stdout stays clean for the calling Tauri command
+                    // to parse; fix progress noise goes to stderr.
+                    let outcomes = doctor::fix::apply_all(&report.checks, false);
+                    for (check, outcome) in &outcomes {
+                        eprintln!("  {} → {:?}", check.id.0, outcome);
+                    }
+                    let post_fix = doctor::run_doctor(doctor::DoctorMode::Quiet).await?;
+                    println!("{}", doctor::format::to_json(&post_fix));
+                    post_fix
                 }
                 doctor::DoctorMode::Default => {
                     print!("{}", doctor::format::to_terminal(&report));
+                    report
                 }
-            }
-            std::process::exit(report.summary.exit_code());
+            };
+            std::process::exit(final_report.summary.exit_code());
         }
         Some(Commands::WorkspaceStatus { name, json, watch }) => {
             // The unified workspace-status command always goes through
