@@ -7,6 +7,7 @@
 //! freely; never rename existing ones.
 
 use crate::doctor::check::{CheckId, CheckResult, CheckStatus, DoctorEnv, FixAction};
+use thinkingroot_core::install_manifest::InstallManifest;
 
 /// Sync portion of the check matrix. Doesn't probe network IO.
 /// Useful for `--quiet` and dry-run scenarios.
@@ -19,6 +20,7 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
         daemon_lockfile_parseable(env),
         workspace_registry_parseable(env),
         workspace_active_exists(env),
+        install_manifest_consistent(env),
     ]
 }
 
@@ -365,6 +367,75 @@ pub fn workspace_active_exists(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Does every binary entry in the install manifest point to a file
+/// that exists on disk? Existence-only — BLAKE3 verification is
+/// Slice F's binary-corruption auto-repair.
+pub fn install_manifest_consistent(env: &DoctorEnv) -> CheckResult {
+    let manifest_path = env.config_dir.join("install-manifest.json");
+    if !manifest_path.exists() {
+        return CheckResult {
+            id: CheckId::from_static("install.manifest.consistent"),
+            label: "Install manifest in sync with disk".into(),
+            status: CheckStatus::Skipped,
+            detail: "no install manifest yet".into(),
+            fix: None,
+        };
+    }
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("install.manifest.consistent"),
+                label: "Install manifest in sync with disk".into(),
+                status: CheckStatus::Warn,
+                detail: format!("manifest unreadable: {e}"),
+                fix: None,
+            };
+        }
+    };
+    let manifest: InstallManifest = match serde_json::from_slice(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("install.manifest.consistent"),
+                label: "Install manifest in sync with disk".into(),
+                status: CheckStatus::Warn,
+                detail: format!("manifest unparseable: {e} (Slice F will rebuild)"),
+                fix: None,
+            };
+        }
+    };
+    let mut missing: Vec<String> = Vec::new();
+    for entry in &manifest.binaries {
+        if !entry.path.exists() {
+            missing.push(format!(
+                "{:?} → {}",
+                entry.id,
+                entry.path.display()
+            ));
+        }
+    }
+    if missing.is_empty() {
+        CheckResult {
+            id: CheckId::from_static("install.manifest.consistent"),
+            label: "Install manifest in sync with disk".into(),
+            status: CheckStatus::Ok,
+            detail: format!("{} entries, all paths exist", manifest.binaries.len()),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            id: CheckId::from_static("install.manifest.consistent"),
+            label: "Install manifest in sync with disk".into(),
+            status: CheckStatus::Warn,
+            detail: format!("missing binary path(s): {}", missing.join(", ")),
+            fix: Some(FixAction::RunCommand {
+                command: "root setup --as-cli".into(),
+            }),
+        }
+    }
+}
+
 /// Is the daemon described in `cortex.lock` actually serving HTTP?
 /// Status:
 /// - `Skipped` when lockfile absent (no daemon expected)
@@ -678,5 +749,81 @@ mod tests {
         };
         let r = workspace_active_exists(&env);
         assert_eq!(r.status, CheckStatus::Skipped);
+    }
+
+    #[test]
+    fn install_manifest_consistent_skipped_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = install_manifest_consistent(&env);
+        assert_eq!(r.status, CheckStatus::Skipped);
+    }
+
+    #[test]
+    fn install_manifest_consistent_ok_when_entry_matches_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("root");
+        std::fs::write(&bin, "x").unwrap();
+
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let content = format!(
+            r#"{{
+                "schema_version": 1,
+                "binaries": [
+                    {{
+                        "id": "cli-script",
+                        "path": "{}",
+                        "version": "0.9.1",
+                        "installed_at": "2026-05-11T14:22:00Z",
+                        "checksum_blake3": "deadbeef"
+                    }}
+                ],
+                "preferred": "cli-script",
+                "setup_complete_at": null
+            }}"#,
+            bin.display()
+        );
+        std::fs::write(&manifest_path, content).unwrap();
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = install_manifest_consistent(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn install_manifest_consistent_warn_when_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let content = r#"{
+            "schema_version": 1,
+            "binaries": [
+                {
+                    "id": "cli-script",
+                    "path": "/nonexistent/root",
+                    "version": "0.9.1",
+                    "installed_at": "2026-05-11T14:22:00Z",
+                    "checksum_blake3": "deadbeef"
+                }
+            ],
+            "preferred": "cli-script",
+            "setup_complete_at": null
+        }"#;
+        std::fs::write(&manifest_path, content).unwrap();
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = install_manifest_consistent(&env);
+        assert_eq!(r.status, CheckStatus::Warn);
     }
 }
