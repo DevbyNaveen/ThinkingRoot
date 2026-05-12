@@ -536,6 +536,10 @@ main() {
 
   printf '\n'
   say "Done!"
+  config_dir_check="$(resolve_config_dir)/thinkingroot"
+  if [ -f "${config_dir_check}/install-manifest.json" ]; then
+    say_dim "Install manifest: ${config_dir_check}/install-manifest.json"
+  fi
   "${INSTALL_DIR}/${BINARY}" --version || true
   printf '\n'
   printf '    Get started:\n'
