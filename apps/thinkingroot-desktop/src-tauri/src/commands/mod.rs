@@ -30,6 +30,7 @@ pub mod pack_export;
 pub mod playground;
 pub mod privacy;
 pub mod proposal;
+pub mod recovery;
 pub mod retrieve;
 pub mod scan;
 pub mod settings;

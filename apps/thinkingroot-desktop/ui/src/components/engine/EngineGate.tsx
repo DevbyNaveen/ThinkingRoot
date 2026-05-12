@@ -10,7 +10,11 @@ import {
   XCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { getSetupCompleteAt, markSetupComplete } from "@/lib/tauri";
+import {
+  getSetupCompleteAt,
+  markSetupComplete,
+  resetCircuitBreaker,
+} from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
 /**
@@ -55,12 +59,33 @@ interface DoctorReport {
 }
 
 // Payload shapes for `engine_status_changed`. The watchdog emits
-// `{ status: "stopped" | "crashed", exit_code }`; the install-manifest
-// branch emits `{ status: "repair_needed", failing_check_ids }`.
+// `{ status: "stopped" | "crashed", exit_code }` on daemon exit, or
+// `{ status: "restarting", attempt, backoff_ms }` between exponential
+// backoff attempts (Slice F T2). When the breaker trips after the
+// final attempt it emits `{ status: "repair_needed",
+// failing_check_ids: ["daemon.restart.exhausted"],
+// circuit_breaker_until }`. The install-manifest branch also emits
+// `{ status: "repair_needed", failing_check_ids }`.
 interface EngineStatusEventPayload {
-  status: "repair_needed" | "stopped" | "crashed";
+  status: "repair_needed" | "stopped" | "crashed" | "restarting";
   failing_check_ids?: string[];
   exit_code?: number | null;
+  // Slice F T2 — restart attempt counter (1..=4) + the wall-clock the
+  // watchdog is sleeping before the next spawn.
+  attempt?: number;
+  backoff_ms?: number;
+  // Slice F T3 — RFC3339 timestamp set when the breaker tripped.
+  circuit_breaker_until?: string | null;
+}
+
+// Transient side-state for the in-progress restart banner. Lives
+// alongside `engineStatus` (not part of the state machine) so the main
+// UI stays mounted underneath the banner during the brief backoff
+// window — flipping the gate to `crashed` for every restart attempt
+// would tear down children every 1-2s.
+interface RestartInfo {
+  attempt: number;
+  backoff_ms: number;
 }
 
 interface EngineGateProps {
@@ -89,6 +114,10 @@ export function EngineGate({ children }: EngineGateProps) {
   // `string` = ISO-8601 timestamp when the user finished setup; any
   // future `repair_needed` falls back to the standard panel.
   const [setupCompleteAt, setSetupCompleteAt] = useState<string | null>(null);
+  // Non-null only between `restarting` events from the watchdog
+  // (Slice F T2). Renders a corner banner over the main UI without
+  // unmounting children.
+  const [restartInfo, setRestartInfo] = useState<RestartInfo | null>(null);
 
   // Hold the latest cancellation flag in a ref so the event listener
   // (which captures it at mount time) can read the live value.
@@ -107,6 +136,8 @@ export function EngineGate({ children }: EngineGateProps) {
       setDoctorReport(report);
       if (report.summary.fail === 0) {
         setEngineStatus("healthy");
+        // Daemon is back — drop any in-progress restart banner.
+        setRestartInfo(null);
       } else if (opts?.forceStatusIfFailures) {
         setEngineStatus(opts.forceStatusIfFailures);
       } else {
@@ -167,10 +198,28 @@ export function EngineGate({ children }: EngineGateProps) {
     listen<EngineStatusEventPayload>("engine_status_changed", (event) => {
       if (cancelledRef.current) return;
       const payload = event.payload;
-      if (payload.status === "stopped") {
-        // Clean SIGTERM — usually app shutdown. Leave the UI alone.
+      if (payload.status === "restarting") {
+        // Watchdog is between exponential-backoff attempts. Show a
+        // non-blocking banner; do NOT flip `engineStatus` so the main
+        // UI stays rendered underneath during the brief backoff
+        // window (typically <2s — flicker-grade if we unmounted).
+        setRestartInfo({
+          attempt: payload.attempt ?? 1,
+          backoff_ms: payload.backoff_ms ?? 0,
+        });
         return;
       }
+      if (payload.status === "stopped") {
+        // Clean SIGTERM — usually app shutdown. Leave the UI alone.
+        // Also clear any lingering banner; we won't be restarting.
+        setRestartInfo(null);
+        return;
+      }
+      // crashed / repair_needed → terminal states; banner should
+      // disappear because either the daemon is back (next event will
+      // be a healthy doctor row from refreshReport) or the breaker
+      // has tripped (BlockingPanel takes over).
+      setRestartInfo(null);
       const forced: EngineStatus =
         payload.status === "crashed" ? "crashed" : "repair_needed";
       // Optimistically flip status so the panel appears even before
@@ -277,9 +326,21 @@ export function EngineGate({ children }: EngineGateProps) {
     setEngineStatus("healthy");
   };
 
-  // Healthy → render children unmodified.
+  // Healthy → render children unmodified. The restart banner overlays
+  // (corner, non-blocking) when the watchdog is between attempts but
+  // the daemon hasn't yet been declared crashed.
   if (engineStatus === "healthy") {
-    return <>{children}</>;
+    return (
+      <>
+        {children}
+        {restartInfo && (
+          <RestartBanner
+            attempt={restartInfo.attempt}
+            backoffMs={restartInfo.backoff_ms}
+          />
+        )}
+      </>
+    );
   }
 
   // Booting → render a minimal splash until the first probe lands.
@@ -429,6 +490,26 @@ function BlockingPanel({
               )}
             </ul>
           )}
+
+          {report?.checks.some(
+            (c) =>
+              c.id === "daemon.restart.exhausted" && c.status === "fail",
+          ) && (
+            <CircuitBreakerSection
+              onReset={async () => {
+                try {
+                  await resetCircuitBreaker();
+                  await onRecheck();
+                } catch (err) {
+                  // Non-fatal — the row stays surfaced and the user
+                  // can retry. We never silently swallow on the
+                  // happy path; the catch here is logged for
+                  // diagnostics only.
+                  console.error("reset_circuit_breaker failed:", err);
+                }
+              }}
+            />
+          )}
         </div>
 
         <footer className="flex items-center justify-between gap-2 border-t border-border px-5 py-3">
@@ -544,6 +625,87 @@ function FixHint({ fix }: { fix: FixAction }) {
         ({fix.credential_key})
       </code>
     </p>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Restart banner + circuit-breaker section (Slice F T7)
+// ────────────────────────────────────────────────────────────────────
+
+/** Non-blocking corner overlay that surfaces while the watchdog is
+ *  between exponential-backoff restart attempts. The main UI stays
+ *  fully usable underneath — this is a transient status hint, not a
+ *  gate. Wired in the `healthy` branch of `EngineGate` so it only
+ *  shows when the engine was healthy before the restart started. */
+function RestartBanner({
+  attempt,
+  backoffMs,
+}: {
+  attempt: number;
+  backoffMs: number;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-lg border border-warn/30 bg-warn/5 px-4 py-2 text-xs text-warn shadow-elevated"
+    >
+      <Loader2 className="size-4 animate-spin" aria-hidden />
+      <span>
+        Engine restarting (attempt {attempt}
+        {backoffMs > 0 && (
+          <> — waiting {(backoffMs / 1000).toFixed(1)}s</>
+        )}
+        )
+      </span>
+    </div>
+  );
+}
+
+/** Surfaces inside the BlockingPanel when the watchdog has tripped its
+ *  circuit breaker (`daemon.restart.exhausted` fail row). Clicking
+ *  "Reset and try again" calls `reset_circuit_breaker` then a fresh
+ *  `doctor_check` so the row clears and auto-restart resumes. Failure
+ *  is honest: the loading state ends and the row stays visible. */
+function CircuitBreakerSection({
+  onReset,
+}: {
+  onReset: () => Promise<void>;
+}) {
+  const [resetting, setResetting] = useState(false);
+  return (
+    <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+      <h3 className="text-sm font-medium text-destructive">
+        Auto-restart suspended
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        The engine has crashed too many times in a row. Click below to
+        clear the safety lock and try again. Auto-restart will resume.
+      </p>
+      <Button
+        variant="outline"
+        size="sm"
+        className="mt-3 h-8 text-xs"
+        disabled={resetting}
+        onClick={async () => {
+          setResetting(true);
+          try {
+            await onReset();
+          } finally {
+            setResetting(false);
+          }
+        }}
+      >
+        {resetting ? (
+          <>
+            <Loader2 className="size-3.5 animate-spin" />
+            Resetting…
+          </>
+        ) : (
+          "Reset and try again"
+        )}
+      </Button>
+    </div>
   );
 }
 

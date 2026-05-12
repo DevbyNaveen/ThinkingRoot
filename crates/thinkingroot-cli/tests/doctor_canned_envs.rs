@@ -100,7 +100,19 @@ fn empty_env_json_shape_is_well_formed() {
 
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["schema_version"], 1);
-    assert_eq!(parsed["checks"].as_array().unwrap().len(), 8);
+    // Sync checks: binary.cli.{installed,on_path,checksum},
+    // config.dir.writable, credentials.any_provider,
+    // daemon.{lockfile.parseable,restart.exhausted},
+    // workspace.{registry.parseable,active.exists},
+    // install.manifest.consistent → 10 total. Updated by Slice F
+    // (added binary.cli.checksum + daemon.restart.exhausted).
+    let checks = parsed["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 10, "sync check count drifted; got: {checks:?}");
+    // Verify the Slice F additions are present so future drift
+    // points at the new IDs rather than just count.
+    let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"binary.cli.checksum"), "got: {ids:?}");
+    assert!(ids.contains(&"daemon.restart.exhausted"), "got: {ids:?}");
     // At least one fail (binary or credentials)
     assert!(parsed["summary"]["fail"].as_u64().unwrap() >= 1);
 }

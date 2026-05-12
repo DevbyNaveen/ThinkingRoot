@@ -15,9 +15,11 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
     vec![
         binary_cli_installed(env),
         binary_cli_on_path(env),
+        binary_cli_checksum(env),
         config_dir_writable(env),
         credentials_any_provider(env),
         daemon_lockfile_parseable(env),
+        daemon_restart_exhausted(env),
         workspace_registry_parseable(env),
         workspace_active_exists(env),
         install_manifest_consistent(env),
@@ -30,6 +32,7 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
 pub async fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
     let mut checks = run_all_sync(env);
     checks.push(daemon_reachable(env).await);
+    checks.push(binary_cli_runnable(env).await);
     checks
 }
 
@@ -526,6 +529,297 @@ pub async fn daemon_reachable(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Pre-spawn smoke test: can we actually RUN the installed binary?
+/// Catches macOS Gatekeeper quarantine, Linux missing dynamic-link
+/// libs (libonnxruntime), Windows missing VC++ runtime.
+///
+/// Status:
+/// - `Skipped` if no binary installed (binary.cli.installed handles
+///   the fail in that case)
+/// - `Ok` if `<binary> --version` exits 0 within 3s
+/// - `Warn` if `<binary> --version` exits non-zero within 3s (binary
+///   ran but didn't recognize the flag — common for older builds;
+///   still attachable for purposes of doctor health)
+/// - `Fail` if subprocess spawn errored, hit the 3s timeout, or was
+///   killed by signal
+pub async fn binary_cli_runnable(env: &DoctorEnv) -> CheckResult {
+    let Some(binary) = env.install_dir_candidates.iter().find(|p| p.exists()) else {
+        return CheckResult {
+            id: CheckId::from_static("binary.cli.runnable"),
+            label: "`root` binary runs cleanly".into(),
+            status: CheckStatus::Skipped,
+            detail: "no binary installed".into(),
+            fix: None,
+        };
+    };
+
+    let spawn_result = tokio::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+
+    let child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.runnable"),
+                label: "`root` binary runs cleanly".into(),
+                status: CheckStatus::Fail,
+                detail: format!("could not spawn {}: {e}", binary.display()),
+                fix: Some(platform_fix_for_unrunnable(binary)),
+            };
+        }
+    };
+
+    let wait = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        child.wait_with_output(),
+    )
+    .await;
+
+    match wait {
+        Err(_) => {
+            // 3s timeout — kill the child (kill_on_drop handles it
+            // when `child` goes out of scope, but we capture the
+            // explicit error for the detail message).
+            CheckResult {
+                id: CheckId::from_static("binary.cli.runnable"),
+                label: "`root` binary runs cleanly".into(),
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "{} --version timed out after 3s (hung process?)",
+                    binary.display()
+                ),
+                fix: Some(platform_fix_for_unrunnable(binary)),
+            }
+        }
+        Ok(Err(e)) => CheckResult {
+            id: CheckId::from_static("binary.cli.runnable"),
+            label: "`root` binary runs cleanly".into(),
+            status: CheckStatus::Fail,
+            detail: format!("wait for {} failed: {e}", binary.display()),
+            fix: Some(platform_fix_for_unrunnable(binary)),
+        },
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                CheckResult {
+                    id: CheckId::from_static("binary.cli.runnable"),
+                    label: "`root` binary runs cleanly".into(),
+                    status: CheckStatus::Ok,
+                    detail: stdout.trim().to_string(),
+                    fix: None,
+                }
+            } else {
+                let code = output.status.code();
+                if code.is_none() {
+                    // Killed by signal — Fail.
+                    CheckResult {
+                        id: CheckId::from_static("binary.cli.runnable"),
+                        label: "`root` binary runs cleanly".into(),
+                        status: CheckStatus::Fail,
+                        detail: format!(
+                            "{} --version killed by signal",
+                            binary.display()
+                        ),
+                        fix: Some(platform_fix_for_unrunnable(binary)),
+                    }
+                } else {
+                    // Non-zero exit with valid code — Warn.  Binary
+                    // ran but rejected the flag.  Older builds may
+                    // not have --version; still attachable.
+                    CheckResult {
+                        id: CheckId::from_static("binary.cli.runnable"),
+                        label: "`root` binary runs cleanly".into(),
+                        status: CheckStatus::Warn,
+                        detail: format!(
+                            "{} --version exited {} (older build?)",
+                            binary.display(),
+                            code.unwrap_or(0)
+                        ),
+                        fix: None,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Verify the binary file at the install manifest's preferred entry
+/// matches its recorded BLAKE3 checksum.  Slice F's binary-corruption
+/// auto-repair hooks fire when this returns Warn.
+///
+/// Status:
+/// - `Skipped`: no manifest, or manifest has no entry whose `path`
+///   exists on disk (other binary.* checks handle the absence)
+/// - `Ok`: BLAKE3 matches
+/// - `Warn`: BLAKE3 mismatches (suggests reinstall or tamper)
+pub fn binary_cli_checksum(_env: &DoctorEnv) -> CheckResult {
+    let manifest = match InstallManifest::load() {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.checksum"),
+                label: "Binary BLAKE3 integrity".into(),
+                status: CheckStatus::Skipped,
+                detail: "no install manifest".into(),
+                fix: None,
+            };
+        }
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("binary.cli.checksum"),
+                label: "Binary BLAKE3 integrity".into(),
+                status: CheckStatus::Skipped,
+                detail: format!("manifest read error: {e}"),
+                fix: None,
+            };
+        }
+    };
+
+    // Pick the preferred entry's binary, or the first entry whose
+    // path exists on disk (more lenient).
+    let entry = manifest
+        .preferred
+        .and_then(|id| manifest.binaries.iter().find(|e| e.id == id).cloned())
+        .filter(|e| e.path.exists())
+        .or_else(|| manifest.binaries.iter().find(|e| e.path.exists()).cloned());
+
+    let Some(entry) = entry else {
+        return CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Skipped,
+            detail: "no binary entry in manifest with a path that exists".into(),
+            fix: None,
+        };
+    };
+
+    match entry.verify_checksum() {
+        Ok(()) => CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "{} → {}",
+                entry.path.display(),
+                &entry.checksum_blake3[..entry.checksum_blake3.len().min(12)]
+            ),
+            fix: None,
+        },
+        Err(e) => CheckResult {
+            id: CheckId::from_static("binary.cli.checksum"),
+            label: "Binary BLAKE3 integrity".into(),
+            status: CheckStatus::Warn,
+            detail: format!("checksum mismatch: {e}"),
+            fix: Some(FixAction::RunCommand {
+                command: "root reinstall --pinned-version".into(),
+            }),
+        },
+    }
+}
+
+/// Surface the auto-restart subsystem's circuit-breaker state.  When
+/// the breaker is tripped, the daemon won't auto-restart — user
+/// needs to click "Reset and try again" or wait 5min.
+///
+/// Status:
+/// - `Ok`: no recent failures, breaker not tripped
+/// - `Warn`: recent failures present but breaker not yet tripped
+/// - `Fail`: breaker tripped — auto-restart suspended
+pub fn daemon_restart_exhausted(_env: &DoctorEnv) -> CheckResult {
+    use thinkingroot_core::restart_state::RestartState;
+
+    let mut state = match RestartState::load() {
+        Ok(s) => s,
+        Err(_) => {
+            // Corrupt or unreadable restart-state → assume Ok.
+            // Restart state is best-effort observability, not a
+            // correctness gate.
+            return CheckResult {
+                id: CheckId::from_static("daemon.restart.exhausted"),
+                label: "Daemon auto-restart healthy".into(),
+                status: CheckStatus::Ok,
+                detail: "no restart state recorded".into(),
+                fix: None,
+            };
+        }
+    };
+    state.prune();
+
+    if state.breaker_active() {
+        let until = state
+            .circuit_breaker_until
+            .expect("breaker_active implies set");
+        return CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "circuit breaker tripped — auto-restart suspended until {}",
+                until.to_rfc3339()
+            ),
+            fix: Some(FixAction::RunCommand {
+                command: "root doctor --recovery-log".into(),
+            }),
+        };
+    }
+
+    let recent = state.recent_failure_count();
+    if recent == 0 {
+        CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Ok,
+            detail: "no recent failures".into(),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            id: CheckId::from_static("daemon.restart.exhausted"),
+            label: "Daemon auto-restart healthy".into(),
+            status: CheckStatus::Warn,
+            detail: format!("{} recent failure(s) in last 60s", recent),
+            fix: None,
+        }
+    }
+}
+
+/// Platform-specific fix hint for a binary that can't run.  We pick
+/// the most-likely-relevant fix per OS at compile time.
+fn platform_fix_for_unrunnable(binary: &std::path::Path) -> FixAction {
+    #[cfg(target_os = "macos")]
+    {
+        FixAction::ShellHint {
+            command: format!("xattr -d com.apple.quarantine {}", binary.display()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "sudo apt install libonnxruntime  # or equivalent for your distro".to_string(),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "download VC++ redistributable from https://aka.ms/vs/17/release/vc_redist.x64.exe".to_string(),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = binary;
+        FixAction::ShellHint {
+            command: "verify binary integrity + dependencies".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +1119,156 @@ mod tests {
         };
         let r = install_manifest_consistent(&env);
         assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_skipped_when_no_binary_installed() {
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![std::path::PathBuf::from("/nonexistent/root")],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        assert_eq!(r.status, CheckStatus::Skipped);
+        assert!(r.detail.contains("no binary installed"));
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_ok_when_binary_runs() {
+        // Use the current test binary's path as a stand-in — it's
+        // guaranteed to exist + run.  We're testing the smoke-test
+        // mechanic, not the actual `root --version` output.
+        let me = std::env::current_exe().unwrap();
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![me.clone()],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        // Any successful exit (incl. non-zero from a test binary called
+        // with --version it doesn't recognise) counts as Ok for this
+        // check: the binary RAN, that's what we care about.  If the
+        // assertion needs to be tighter, we'd ship a fixture binary —
+        // out of scope for Slice F T4.  Accept Ok OR Warn (some test
+        // runners exit non-zero on --version).
+        assert!(
+            matches!(r.status, CheckStatus::Ok | CheckStatus::Warn),
+            "expected Ok or Warn, got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_cli_runnable_fail_when_binary_path_is_not_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("definitely-not-a-binary");
+        std::fs::write(&path, b"this is not an executable").unwrap();
+        // Don't chmod +x — on Unix this should fail to exec.
+
+        let env = DoctorEnv {
+            config_dir: std::path::PathBuf::from("/tmp/cfg"),
+            install_dir_candidates: vec![path.clone()],
+            path_entries: vec![],
+        };
+        let r = binary_cli_runnable(&env).await;
+        // On Unix: Permission denied → Fail.
+        // On Windows: may behave differently (.exe convention), but
+        // since we wrote non-magic-bytes the executor should refuse.
+        #[cfg(unix)]
+        assert_eq!(r.status, CheckStatus::Fail);
+        #[cfg(not(unix))]
+        let _ = r;  // tolerate platform variance
+    }
+
+    #[test]
+    fn binary_cli_checksum_skipped_when_no_manifest() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+        }
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = binary_cli_checksum(&env);
+        assert_eq!(r.status, CheckStatus::Skipped);
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+        }
+    }
+
+    #[test]
+    fn daemon_restart_exhausted_ok_when_no_state() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("APPDATA", tmp.path());
+        }
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_restart_exhausted(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+            match prev_appdata { Some(v) => std::env::set_var("APPDATA", v), None => std::env::remove_var("APPDATA") }
+        }
+    }
+
+    #[test]
+    fn daemon_restart_exhausted_fail_when_breaker_active() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_appdata = std::env::var_os("APPDATA");
+        // SAFETY: ENV_GUARD held.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("APPDATA", tmp.path());
+        }
+
+        // Set up restart state with the breaker tripped.
+        let mut state = thinkingroot_core::restart_state::RestartState::new();
+        state.trip_circuit_breaker();
+        state.save().unwrap();
+
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_restart_exhausted(&env);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(matches!(r.fix, Some(FixAction::RunCommand { ref command }) if command.contains("doctor")));
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+            match prev_appdata { Some(v) => std::env::set_var("APPDATA", v), None => std::env::remove_var("APPDATA") }
+        }
     }
 }

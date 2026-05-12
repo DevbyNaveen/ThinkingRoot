@@ -122,6 +122,17 @@ ed25519-dalek = { workspace = true }
 # the CLI takes that compile cost (everything else stays lean).
 tr-sigstore = { workspace = true, features = ["live"] }
 
+# Wedged-daemon cleanup (cortex_client.rs::cleanup_wedged_daemon) —
+# SIGTERM + 2s grace + SIGKILL on Unix; sysinfo's TerminateProcess
+# on Windows. libc on Unix only; sysinfo cfg-gated to Windows here
+# because Unix paths use cortex::process_alive (already sysinfo-
+# backed via thinkingroot-core).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+sysinfo = { workspace = true }
+
 [features]
 ## Enable neural embedding for semantic search. On by default; disable with
 ## --no-default-features for faster test builds that skip ONNX Runtime linking.
@@ -137,3 +148,6 @@ semver = { version = "1", features = ["serde"] }
 # serialise per-test environment overrides (XDG_CONFIG_HOME, ports).
 assert_cmd = "2"
 serial_test = "3"
+# Cross-crate ENV_GUARD for doctor-check tests that mutate
+# XDG_CONFIG_HOME / HOME / APPDATA to point at a tempdir.
+thinkingroot-core = { workspace = true, features = ["test-helpers"] }
