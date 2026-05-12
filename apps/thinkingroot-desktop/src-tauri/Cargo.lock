@@ -7788,6 +7788,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-cortex-async"
+version = "0.9.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thinkingroot-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "thinkingroot-desktop-app"
 version = "0.1.0"
 dependencies = [
@@ -7813,6 +7825,7 @@ dependencies = [
  "tempfile",
  "thinkingroot-branch",
  "thinkingroot-core",
+ "thinkingroot-cortex-async",
  "thinkingroot-serve",
  "thiserror 2.0.18",
  "tokio",

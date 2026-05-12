@@ -94,6 +94,33 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
                 // fall-through to the spawn path.
                 tracing::warn!("cortex returned Stdio for DesktopBoot intent — falling through");
             }
+            Ok(EngineConnection::SpawnRequired {
+                binary_path,
+                port: _,
+                host: _,
+            }) => {
+                // Slice C T7 will wire this — the sidecar manager
+                // will spawn this binary attached and keep the Child
+                // handle. For now, log + fall through to the existing
+                // spawn-from-resource-dir path so behaviour is
+                // preserved during the slice-by-slice landing.
+                tracing::info!(
+                    ?binary_path,
+                    "cortex: SpawnRequired received — Slice C T7 will wire this; \
+                     using existing spawn path"
+                );
+            }
+            Ok(EngineConnection::RepairNeeded { failing_check_ids }) => {
+                // Slice C T7 wires the Tauri event for the blocking-
+                // panel UI (Slice D). For now, log honestly and let
+                // the existing spawn path also fail — the user sees
+                // the same "sidecar disabled" warning they would have
+                // seen before this refactor.
+                tracing::error!(
+                    ?failing_check_ids,
+                    "cortex: engine cannot start — install manifest missing or broken"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,

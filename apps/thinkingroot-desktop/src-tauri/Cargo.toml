@@ -44,9 +44,10 @@ tauri-plugin-window-state = "2"
 # OSS engine path-deps reaching into the parent workspace. The
 # desktop talks directly to the engine's QueryEngine — no helloroot
 # runtime wrapper sits between.
-thinkingroot-core   = { path = "../../../crates/thinkingroot-core" }
-thinkingroot-serve  = { path = "../../../crates/thinkingroot-serve", default-features = false }
-thinkingroot-branch = { path = "../../../crates/thinkingroot-branch" }
+thinkingroot-core          = { path = "../../../crates/thinkingroot-core" }
+thinkingroot-cortex-async  = { path = "../../../crates/thinkingroot-cortex-async" }
+thinkingroot-serve         = { path = "../../../crates/thinkingroot-serve", default-features = false }
+thinkingroot-branch        = { path = "../../../crates/thinkingroot-branch" }
 
 # Trust + preview surface for the `.tr` file-association flow. Each
 # crate is path-deped because the desktop sits outside the parent
