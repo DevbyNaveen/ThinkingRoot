@@ -8,10 +8,9 @@
 
 use crate::doctor::check::{CheckId, CheckResult, CheckStatus, DoctorEnv, FixAction};
 
-/// Run all built-in checks against `env`. Order is deterministic
-/// (matches the order checks appear in this file) so the terminal
-/// output is stable.
-pub fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
+/// Sync portion of the check matrix. Doesn't probe network IO.
+/// Useful for `--quiet` and dry-run scenarios.
+pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
     vec![
         binary_cli_installed(env),
         binary_cli_on_path(env),
@@ -19,6 +18,15 @@ pub fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
         credentials_any_provider(env),
         daemon_lockfile_parseable(env),
     ]
+}
+
+/// Full check matrix including async probes. Used by `run_doctor`.
+/// Order is deterministic (matches the order checks appear in this
+/// file) so the terminal output is stable.
+pub async fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
+    let mut checks = run_all_sync(env);
+    checks.push(daemon_reachable(env).await);
+    checks
 }
 
 /// Does at least one of the known install paths contain a `root` binary?
@@ -226,6 +234,96 @@ pub fn daemon_lockfile_parseable(env: &DoctorEnv) -> CheckResult {
     }
 }
 
+/// Is the daemon described in `cortex.lock` actually serving HTTP?
+/// Status:
+/// - `Skipped` when lockfile absent (no daemon expected)
+/// - `Ok` when /livez returns 2xx within 1s
+/// - `Warn` when lockfile exists but probe fails (stale lock)
+pub async fn daemon_reachable(env: &DoctorEnv) -> CheckResult {
+    let lock_path = env.config_dir.join("cortex.lock");
+    if !lock_path.exists() {
+        return CheckResult {
+            id: CheckId::from_static("daemon.reachable"),
+            label: "Daemon /livez".into(),
+            status: CheckStatus::Skipped,
+            detail: "no daemon running".into(),
+            fix: None,
+        };
+    }
+    let bytes = match std::fs::read(&lock_path) {
+        Ok(b) => b,
+        Err(_) => {
+            return CheckResult {
+                id: CheckId::from_static("daemon.reachable"),
+                label: "Daemon /livez".into(),
+                status: CheckStatus::Skipped,
+                detail: "lockfile unreadable".into(),
+                fix: None,
+            };
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct LockShape {
+        host: String,
+        port: u16,
+    }
+    let lock: LockShape = match serde_json::from_slice(&bytes) {
+        Ok(l) => l,
+        Err(_) => {
+            return CheckResult {
+                id: CheckId::from_static("daemon.reachable"),
+                label: "Daemon /livez".into(),
+                status: CheckStatus::Skipped,
+                detail: "lockfile not parseable".into(),
+                fix: None,
+            };
+        }
+    };
+    let url = format!("http://{}:{}/livez", lock.host, lock.port);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("daemon.reachable"),
+                label: "Daemon /livez".into(),
+                status: CheckStatus::Warn,
+                detail: format!("could not build HTTP client: {e}"),
+                fix: None,
+            };
+        }
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => CheckResult {
+            id: CheckId::from_static("daemon.reachable"),
+            label: "Daemon /livez".into(),
+            status: CheckStatus::Ok,
+            detail: format!("{} ok", url),
+            fix: None,
+        },
+        Ok(resp) => CheckResult {
+            id: CheckId::from_static("daemon.reachable"),
+            label: "Daemon /livez".into(),
+            status: CheckStatus::Warn,
+            detail: format!("{} returned {}", url, resp.status()),
+            fix: Some(FixAction::ShellHint {
+                command: format!("rm {}", lock_path.display()),
+            }),
+        },
+        Err(e) => CheckResult {
+            id: CheckId::from_static("daemon.reachable"),
+            label: "Daemon /livez".into(),
+            status: CheckStatus::Warn,
+            detail: format!("probe failed: {e}"),
+            fix: Some(FixAction::ShellHint {
+                command: format!("rm {}", lock_path.display()),
+            }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +498,17 @@ mod tests {
         };
         let r = daemon_lockfile_parseable(&env);
         assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[tokio::test]
+    async fn daemon_reachable_skipped_when_no_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_reachable(&env).await;
+        assert_eq!(r.status, CheckStatus::Skipped);
     }
 }

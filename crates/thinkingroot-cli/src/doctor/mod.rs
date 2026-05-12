@@ -78,7 +78,7 @@ pub enum DoctorMode {
 /// (via DoctorEnv) and returns the report. Caller renders.
 pub async fn run_doctor(_mode: DoctorMode) -> anyhow::Result<DoctorReport> {
     let env = check::DoctorEnv::from_real_filesystem()?;
-    let checks = checks::run_all(&env);
+    let checks = checks::run_all(&env).await;
     let summary = Summary::from_checks(&checks);
     Ok(DoctorReport {
         schema_version: REPORT_SCHEMA_VERSION,
