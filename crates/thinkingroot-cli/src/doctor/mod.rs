@@ -8,6 +8,7 @@
 //! until Task 12 deletes it.
 
 pub mod check;
+pub mod checks;
 
 pub use check::{CheckId, CheckResult, CheckStatus, DoctorEnv, FixAction};
 
@@ -75,12 +76,9 @@ pub enum DoctorMode {
 
 /// Entry point. Runs all built-in checks against the real filesystem
 /// (via DoctorEnv) and returns the report. Caller renders.
-///
-/// Currently returns an empty checks list — Task 3 wires the registry.
 pub async fn run_doctor(_mode: DoctorMode) -> anyhow::Result<DoctorReport> {
     let env = check::DoctorEnv::from_real_filesystem()?;
-    let _ = env; // silence unused until Task 3
-    let checks: Vec<CheckResult> = Vec::new();
+    let checks = checks::run_all(&env);
     let summary = Summary::from_checks(&checks);
     Ok(DoctorReport {
         schema_version: REPORT_SCHEMA_VERSION,
