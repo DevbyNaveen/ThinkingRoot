@@ -17,6 +17,38 @@ import {
   SIDEBAR_MIN_WIDTH,
 } from "@/lib/sidebar-layout";
 
+const VALID_RAIL_TABS: RightRailTab[] = [
+  "compile",
+  "files",
+  "brain",
+  "builders",
+  "browser",
+  "privacy",
+  "terminal",
+];
+
+function normalizeRightRailTab(tab: unknown): RightRailTab {
+  if (tab === "readme" || tab === "branches") return tab === "readme" ? "files" : "compile";
+  if (typeof tab === "string" && (VALID_RAIL_TABS as string[]).includes(tab)) {
+    return tab as RightRailTab;
+  }
+  return "compile";
+}
+
+function normalizeSurface(surface: unknown): Surface {
+  if (surface === "branches") return "chats";
+  if (
+    surface === "chats" ||
+    surface === "settings" ||
+    surface === "docs" ||
+    surface === "brain" ||
+    surface === "privacy"
+  ) {
+    return surface;
+  }
+  return "chats";
+}
+
 /**
  * App-wide UI store.
  *
@@ -156,7 +188,7 @@ export const useApp = create<AppStore>()(
       setCompileRootPath: (compileRootPath) => set({ compileRootPath }),
 
       surface: "chats",
-      setSurface: (surface) => set({ surface }),
+      setSurface: (surface) => set({ surface: normalizeSurface(surface) }),
       settingsSection: "provider",
       setSettingsSection: (settingsSection) => set({ settingsSection }),
       theme: "dark",
@@ -176,7 +208,8 @@ export const useApp = create<AppStore>()(
       rightRailOpen: true,
       toggleRightRail: () => set((s) => ({ rightRailOpen: !s.rightRailOpen })),
       rightRailTab: "compile",
-      setRightRailTab: (rightRailTab) => set({ rightRailTab }),
+      setRightRailTab: (rightRailTab) =>
+        set({ rightRailTab: normalizeRightRailTab(rightRailTab) }),
       rightRailWidth: 450,
       setRightRailWidth: (rightRailWidth) => set({ rightRailWidth }),
       sidebarWidth: 232,
@@ -359,6 +392,16 @@ export const useApp = create<AppStore>()(
         onboardingDismissed: s.onboardingDismissed,
         activeWorkspace: s.activeWorkspace,
       }),
+      merge: (persisted, current) => {
+        const p =
+          persisted && typeof persisted === "object"
+            ? (persisted as Partial<AppStore>)
+            : {};
+        const merged: AppStore = { ...current, ...p };
+        merged.rightRailTab = normalizeRightRailTab(merged.rightRailTab);
+        merged.surface = normalizeSurface(merged.surface);
+        return merged;
+      },
     },
   ),
 );

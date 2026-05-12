@@ -1,6 +1,6 @@
+import type { ElementType } from "react";
 import {
   MessageSquareText,
-  Cpu,
   ShieldCheck,
   SlidersHorizontal,
 } from "lucide-react";
@@ -8,6 +8,7 @@ import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useApp } from "@/store/app";
 import type { Surface } from "@/types";
+import { ThinkingRootGlyph } from "@/components/shell/ThinkingRootGlyph";
 import {
   Tooltip,
   TooltipContent,
@@ -17,13 +18,13 @@ import {
 interface RailItem {
   id: Surface;
   label: string;
-  Icon: typeof MessageSquareText;
+  Icon: ElementType;
   hint?: string;
 }
 
 const TOP: RailItem[] = [
   { id: "chats", label: "Conversations", Icon: MessageSquareText, hint: "⌘1" },
-  { id: "brain", label: "Brain", Icon: Cpu, hint: "⌘2" },
+  { id: "brain", label: "Knowledge", Icon: ThinkingRootGlyph, hint: "⌘2" },
   // "satellites" (multi-agent orbit view) and "trace" (Ed25519 trace
   // log) lived here pre-transplant; both are helloroot-only concepts
   // (see CLAUDE.md "Desktop transplant uses helloroot's shell, NOT
@@ -115,7 +116,11 @@ function RailButton({
               transition={{ type: "spring", stiffness: 500, damping: 35 }}
             />
           )}
-          <Icon className="relative z-10 size-4" strokeWidth={active ? 2 : 1.5} />
+          {item.id === "brain" ? (
+            <ThinkingRootGlyph className="relative z-10 size-4 object-contain opacity-90" />
+          ) : (
+            <Icon className="relative z-10 size-4" strokeWidth={active ? 2 : 1.5} />
+          )}
         </button>
       </TooltipTrigger>
       <TooltipContent side="right" className="flex items-center gap-2">

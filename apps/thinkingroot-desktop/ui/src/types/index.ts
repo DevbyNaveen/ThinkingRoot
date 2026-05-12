@@ -15,8 +15,6 @@ export type RightRailTab =
   | "compile"
   | "files"
   | "brain"
-  | "readme"
-  | "branches"
   | "builders"
   | "browser"
   | "privacy"
@@ -25,13 +23,11 @@ export type RightRailTab =
 /** Surfaces in the layout.
  *
  * Conceptually `"chats"` and `"settings"` are the only full main-pane
- * surfaces post-Stream-F; Brain/Branches/Privacy have moved to the
- * right-rail tab panel. The two legacy values stay in the union
- * because the command palette + IconRail still navigate via Surface
- * tags as a side-effect ("show me Brain" → flips the right-rail tab
- * to brain). Removing them would force every call site through a
- * separate "rail target" type for no real gain. */
-export type Surface = "chats" | "settings" | "docs" | "brain" | "privacy" | "branches";
+ * surfaces post-Stream-F; Knowledge (brain), Privacy, and the
+ * inspector rail are coordinated from here for palette shortcuts.
+ * Legacy persisted value `"branches"` is normalized to `"chats"` on
+ * rehydrate — branch tooling lives on the Compile rail tab. */
+export type Surface = "chats" | "settings" | "docs" | "brain" | "privacy";
 
 /** Left-rail categories when the main pane is on Settings. */
 export type SettingsSectionId =

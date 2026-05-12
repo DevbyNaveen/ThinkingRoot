@@ -2,12 +2,12 @@
  * Right panel — Cursor-style tabbed inspector with drag-to-resize.
  *
  * Tab bar (top, icon-only):
- *   Hammer  → Compile   (workspace card + live compile progress)
- *   FolderTree → Files (project + .thinkingroot tree, preview, pack export)
- *   Cpu     → Brain     (BrainView in panel mode)
- *   GitBranch → Branches (BranchesView in panel mode)
+ *   Hammer  → Compile   (workspace card + live compile progress + branch graph)
+ *   FolderTree → Files   (README + project tree, preview, pack export)
+ *   Glyph   → Knowledge (BrainView in panel mode)
  *   Code2   → Builders  (workspace backend connect surface)
  *   Globe2  → Browser   (manual web browser)
+ *   Terminal → Terminal (PTY shells)
  *   ShieldCheck → Privacy (PrivacyDashboard in panel mode)
  *
  * The left edge has an invisible drag handle that lets the user
@@ -17,19 +17,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   PanelRight,
-  GitBranch,
-  RefreshCw,
   Folder,
   Hammer,
-  GitMerge,
   ShieldCheck,
   CheckCircle2,
   AlertCircle,
   Loader2,
   Square,
-  Cpu,
   Code2,
-  BookOpen,
   FolderTree,
   Package,
   Globe2,
@@ -37,24 +32,22 @@ import {
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { ThinkingRootGlyph } from "@/components/shell/ThinkingRootGlyph";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
 import { BrainView } from "@/components/brain/BrainView";
-import { BranchesView } from "@/components/branches/BranchesView";
 import { PrivacyDashboard } from "@/components/privacy/PrivacyDashboard";
-import { ReadmeView } from "@/components/readme/ReadmeView";
 import { WorkspaceFilesPanel } from "@/components/shell/WorkspaceFilesPanel";
+import { BranchResolutionRiver } from "@/components/shell/CompileBranchPipeline";
 import { BrowserPanel } from "@/components/browser/BrowserPanel";
 import { TerminalPanel } from "@/components/terminal/TerminalPanel";
 import { BuildersPanel } from "@/components/builders/BuildersPanel";
 import {
-  branchCheckout,
-  branchList,
   workspaceCompile,
   workspaceCompileStop,
   workspaceList,
-  type BranchView,
+  type CompileProgress,
   type IncrementalSummary,
   type WorkspaceView,
 } from "@/lib/tauri";
@@ -72,15 +65,13 @@ const MAX_WIDTH = 800;
 const DEFAULT_WIDTH = 450;
 
 const TABS: { id: RightRailTab; Icon: React.ElementType; label: string }[] = [
-  { id: "compile",  Icon: Hammer,       label: "Compile"  },
-  { id: "files",    Icon: FolderTree,   label: "Files"    },
-  { id: "brain",    Icon: Cpu,          label: "Brain"    },
-  { id: "readme",   Icon: BookOpen,     label: "Readme"   },
-  { id: "branches", Icon: GitBranch,    label: "Branches" },
-  { id: "builders", Icon: Code2,        label: "Builders" },
-  { id: "browser",  Icon: Globe2,       label: "Browser"  },
+  { id: "compile", Icon: Hammer, label: "Compile" },
+  { id: "files", Icon: FolderTree, label: "Files" },
+  { id: "brain", Icon: ThinkingRootGlyph, label: "Knowledge" },
+  { id: "builders", Icon: Code2, label: "Builders" },
+  { id: "browser", Icon: Globe2, label: "Browser" },
   { id: "terminal", Icon: TerminalIcon, label: "Terminal" },
-  { id: "privacy",  Icon: ShieldCheck,  label: "Privacy"  },
+  { id: "privacy", Icon: ShieldCheck, label: "Privacy" },
 ];
 
 export function RightRail() {
@@ -185,7 +176,9 @@ export function RightRail() {
                   : "text-muted-foreground/60 hover:bg-muted/50 hover:text-foreground",
               )}
             >
-              <Icon className="size-3.5" />
+              <Icon
+                className={id === "brain" ? "size-3.5 opacity-90" : "size-3.5"}
+              />
             </button>
           ))}
         </nav>
@@ -232,16 +225,6 @@ export function RightRail() {
         >
           <BrainView panelMode isVisible={activeTab === "brain"} />
         </div>
-        {activeTab === "readme" && (
-          <div className="flex-1 overflow-hidden">
-            <ReadmeView panelMode />
-          </div>
-        )}
-        {activeTab === "branches" && (
-          <div className="flex-1 overflow-hidden">
-            <BranchesView panelMode />
-          </div>
-        )}
         {activeTab === "builders" && (
           <BuildersPanel activeWorkspace={activeWorkspace} />
         )}
@@ -285,7 +268,7 @@ function CompilePanel({ activeWorkspace }: { activeWorkspace: string | null }) {
     <div className="flex flex-col gap-6 overflow-y-auto px-4 py-5">
       <WorkspaceCard activeWorkspace={activeWorkspace} />
       <CompilationProgressIndicator />
-      {activeWorkspace && <BranchPanel workspace={activeWorkspace} />}
+      {activeWorkspace && <BranchResolutionRiver workspace={activeWorkspace} />}
     </div>
   );
 }
@@ -460,89 +443,6 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
   );
 }
 
-function BranchPanel({ workspace }: { workspace: string }) {
-  const [branches, setBranches] = useState<BranchView[]>([]);
-  const [loading, setLoading]   = useState(false);
-  const [error, setError]       = useState<string | null>(null);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setBranches(await branchList(workspace));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => { void load(); }, [workspace]);
-
-  return (
-    <section className="flex flex-col gap-2.5">
-      <header className="flex items-center gap-1.5 text-xs">
-        <GitBranch className="size-3.5 text-muted-foreground" />
-        <h3 className="font-medium">Branches</h3>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="ml-auto h-5 w-5"
-          onClick={load}
-          aria-label="Reload"
-        >
-          <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
-        </Button>
-      </header>
-      {error && <p className="text-[11px] text-destructive">{error}</p>}
-      {!error && branches.length === 0 && !loading && (
-        <p className="text-[10px] text-muted-foreground">
-          No branches yet. Use{" "}
-          <code className="font-mono">/branch &lt;name&gt;</code> in chat to fork.
-        </p>
-      )}
-      <ul className="flex flex-col gap-0.5">
-        {branches.map((b) => (
-          <li key={b.name}>
-            <button
-              type="button"
-              onClick={async () => {
-                try {
-                  await branchCheckout(workspace, b.name);
-                  toast(`HEAD → ${b.name}`, { kind: "success" });
-                  await load();
-                } catch (e) {
-                  toast("Checkout failed", {
-                    kind: "error",
-                    body: e instanceof Error ? e.message : String(e),
-                  });
-                }
-              }}
-              className={cn(
-                "flex w-full items-center gap-1.5 rounded-xl px-2.5 py-2 text-left text-[11px] transition-colors",
-                b.current
-                  ? "bg-accent/12 text-accent"
-                  : "text-foreground hover:bg-muted/35",
-              )}
-              title={b.description ?? b.name}
-            >
-              {b.current ? (
-                <GitMerge className="size-3 shrink-0 text-accent" />
-              ) : (
-                <GitBranch className="size-3 shrink-0 text-muted-foreground" />
-              )}
-              <span className="truncate font-mono">{b.name}</span>
-              <span className="ml-auto font-mono text-[9px] uppercase text-muted-foreground/70">
-                {b.status}
-              </span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
 /**
  * Group an individual `phase` discriminator into the umbrella phase
  * that owns it. Used for ETA bookkeeping: every event in a phase
@@ -574,6 +474,125 @@ function formatBytes(n: number): string {
   if (n < k * k) return `${(n / k).toFixed(2)} KiB`;
   if (n < k * k * k) return `${(n / (k * k)).toFixed(2)} MiB`;
   return `${(n / (k * k * k)).toFixed(2)} GiB`;
+}
+
+/** Discrete segments for the compile “substrate meter” (full-width pixel bar). */
+const SUBSTRATE_SEGMENTS = 40;
+
+const TICK_STEPS = [
+  "reading",
+  "extracting",
+  "linking",
+  "persisting",
+  "packing",
+] as const;
+
+function substrateFilledSegments(percent: number): number {
+  const p = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : 0;
+  return Math.min(
+    SUBSTRATE_SEGMENTS,
+    Math.max(0, Math.round((p / 100) * SUBSTRATE_SEGMENTS)),
+  );
+}
+
+function substrateActiveTickBand(progress: CompileProgress): number {
+  if (progress.phase !== "tick") return -1;
+  const idx = TICK_STEPS.indexOf(progress.step);
+  return idx >= 0 ? idx : 0;
+}
+
+function substrateSegmentClass(
+  lit: boolean,
+  isDone: boolean,
+  isError: boolean,
+  isCancelled: boolean,
+  isBand: boolean,
+  indeterminateTick: boolean,
+  segIndex: number,
+  filledCount: number,
+): string {
+  const tailPulse =
+    indeterminateTick &&
+    lit &&
+    filledCount > 0 &&
+    segIndex >= filledCount - 2;
+  if (lit) {
+    return cn(
+      "h-[12px] min-h-[12px] min-w-0 flex-1 rounded-[1px] transition-[background-color,opacity] duration-200 ease-out motion-reduce:transition-none",
+      tailPulse && "motion-safe:animate-pulse",
+      isDone && "bg-emerald-600 dark:bg-emerald-400",
+      isError && "bg-destructive",
+      isCancelled && "bg-muted-foreground/75",
+      !isDone && !isError && !isCancelled && "bg-primary",
+    );
+  }
+  return cn(
+    "h-[12px] min-h-[12px] min-w-0 flex-1 rounded-[1px] transition-colors duration-200 ease-out motion-reduce:transition-none",
+    isBand
+      ? "bg-muted-foreground/14 dark:bg-muted-foreground/22"
+      : "bg-muted/50 dark:bg-muted/40",
+  );
+}
+
+function SubstrateCompileMeter({
+  filledCount,
+  progressPercent,
+  isDone,
+  isError,
+  isCancelled,
+  activeTickBand,
+  indeterminateTick,
+  ariaValueText,
+}: {
+  filledCount: number;
+  /** Authoritative 0–100 from the same mapping as the legacy bar (ARIA). */
+  progressPercent: number;
+  isDone: boolean;
+  isError: boolean;
+  isCancelled: boolean;
+  activeTickBand: number;
+  indeterminateTick: boolean;
+  ariaValueText: string;
+}) {
+  const busy = !isDone && !isError && !isCancelled;
+  const pct = Math.round(Math.min(100, Math.max(0, progressPercent)));
+
+  return (
+    <div
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={pct}
+      aria-valuetext={ariaValueText}
+      aria-busy={busy}
+      className={cn(
+        "flex w-full gap-px rounded-[1px] p-px",
+        "ring-1 ring-border/60 bg-muted/25 dark:bg-muted/15",
+        busy && "motion-safe:shadow-[inset_0_1px_0_rgba(0,0,0,0.06)] dark:motion-safe:shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]",
+      )}
+    >
+      {Array.from({ length: SUBSTRATE_SEGMENTS }, (_, i) => {
+        const col = Math.floor(i / (SUBSTRATE_SEGMENTS / TICK_STEPS.length));
+        const isBand = activeTickBand >= 0 && col === activeTickBand;
+        const lit = i < filledCount;
+        return (
+          <div
+            key={`substrate-seg-${i}`}
+            className={substrateSegmentClass(
+              lit,
+              isDone,
+              isError,
+              isCancelled,
+              isBand,
+              indeterminateTick,
+              i,
+              filledCount,
+            )}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 function CompilationProgressIndicator() {
@@ -792,71 +811,142 @@ function CompilationProgressIndicator() {
       percent = 100; isError = true; break;
   }
 
+  const filledCount = substrateFilledSegments(percent);
+  const activeTickBand = substrateActiveTickBand(progress);
+  const indeterminateTick =
+    progress.phase === "tick" &&
+    progress.total === 0 &&
+    !isDone &&
+    !isError &&
+    !isCancelled;
+  const meterAriaText = `${title}. ${details || `${Math.round(percent)}%`}`;
+
   return (
-    <section className="relative flex flex-col gap-2.5 overflow-hidden rounded-xl bg-muted/15 p-3">
-      <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-accent/5 to-transparent" />
-      <header className="relative z-10 flex items-center gap-2 text-xs">
-        {isDone ? (
-          <CheckCircle2 className="size-4 text-emerald-500" />
-        ) : isError ? (
-          <AlertCircle className="size-4 text-destructive" />
-        ) : (
-          <Loader2 className="size-4 animate-spin text-accent" />
-        )}
-        <h3 className="font-medium tracking-tight text-foreground">{title}</h3>
-        {!isDone && !isError && !isCancelled && (
-          <>
-            <span className="ml-auto font-mono text-[9px] font-medium text-accent">
-              {eta ? `${percent}% · ETA ${eta}` : `${percent}%`}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleStop}
-              disabled={stopping}
-              aria-label="Stop compile"
-              title="Stop compile"
-              className="h-5 w-5 text-muted-foreground hover:text-destructive"
-            >
-              {stopping ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
-            </Button>
-          </>
-        )}
-      </header>
-      <div className="relative z-10 mt-1 flex flex-col gap-1.5">
-        <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted/50">
-          <div
-            className={cn(
-              "h-full transition-all duration-300 ease-out",
-                isDone
-                  ? "bg-emerald-500"
-                  : isError
-                    ? "bg-destructive"
-                    : isCancelled
-                      ? "bg-muted-foreground"
-                      : "bg-accent",
-            )}
-            style={{ width: `${percent}%` }}
-          />
+    <section
+      role="status"
+      aria-live="polite"
+      aria-label="Compile progress"
+      className="-mx-4 flex flex-col gap-2 border-y border-border/60 bg-muted/[0.06] px-4 py-3 dark:bg-muted/10"
+    >
+      <header className="flex min-w-0 items-start gap-2">
+        <div className="mt-0.5 shrink-0">
+          {isDone ? (
+            <CheckCircle2
+              className="size-4 text-emerald-600 dark:text-emerald-400"
+              aria-hidden
+            />
+          ) : isError ? (
+            <AlertCircle className="size-4 text-destructive" aria-hidden />
+          ) : (
+            <Loader2
+              className="size-4 animate-spin text-primary motion-reduce:animate-none"
+              aria-hidden
+            />
+          )}
         </div>
-        <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground" title={details}>
-          {details}
-        </p>
-        {progress.phase === "extraction_progress" && extractionStalled && !isDone && !isError && !isCancelled && (
-          <p className="text-[10px] leading-snug text-amber-200/90">
-            Over 75s on this count — likely a slow or stuck LLM call. Stop (■) aborts the run; check Settings → Credentials and provider
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-baseline justify-between gap-2">
+            <h3 className="truncate font-mono text-[11px] font-medium leading-tight text-foreground">
+              {title}
+            </h3>
+            {!isDone && !isError && !isCancelled && (
+              <div className="flex shrink-0 items-center gap-1">
+                <span className="whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
+                  {eta ? (
+                    <>
+                      <span className="text-foreground">{Math.round(percent)}%</span>
+                      <span> · </span>
+                      <span className="text-primary">ETA {eta}</span>
+                    </>
+                  ) : (
+                    <span className="text-foreground">{Math.round(percent)}%</span>
+                  )}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleStop}
+                  disabled={stopping}
+                  aria-label="Stop compile"
+                  title="Stop compile"
+                  className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+                >
+                  {stopping ? (
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                  ) : (
+                    <Square className="size-3.5 fill-current" aria-hidden />
+                  )}
+                </Button>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <SubstrateCompileMeter
+        filledCount={filledCount}
+        progressPercent={percent}
+        isDone={isDone}
+        isError={isError}
+        isCancelled={isCancelled}
+        activeTickBand={activeTickBand}
+        indeterminateTick={indeterminateTick}
+        ariaValueText={meterAriaText}
+      />
+
+      {progress.phase === "tick" && (
+        <div className="flex justify-between gap-0.5 font-mono text-[8px] uppercase tracking-wide text-muted-foreground/80">
+          {TICK_STEPS.map((step, i) => (
+            <span
+              key={step}
+              className={cn(
+                "min-w-0 flex-1 truncate text-center leading-none",
+                i === activeTickBand && "font-semibold text-foreground",
+              )}
+              title={step}
+            >
+              {step === "reading"
+                ? "read"
+                : step === "extracting"
+                  ? "extr"
+                  : step === "linking"
+                    ? "link"
+                    : step === "persisting"
+                      ? "save"
+                      : "pkg"}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <p
+        className="font-mono text-[10px] leading-relaxed text-muted-foreground"
+        title={details}
+      >
+        {details}
+      </p>
+      {progress.phase === "extraction_progress" &&
+        extractionStalled &&
+        !isDone &&
+        !isError &&
+        !isCancelled && (
+          <p className="text-[10px] leading-snug text-amber-700 dark:text-amber-300/95">
+            Over 75s on this count — likely a slow or stuck LLM call. Stop
+            (■) aborts the run; check Settings → Credentials and provider
             limits.
           </p>
         )}
-        {progress.phase === "done" && progress.failed_batches !== undefined && progress.failed_batches > 0 && (
-          <p className="text-[10px] leading-snug text-amber-200/90">
-            ⚠ {progress.failed_batches} LLM batches failed permanently — knowledge graph is partial.
+      {progress.phase === "done" &&
+        progress.failed_batches !== undefined &&
+        progress.failed_batches > 0 && (
+          <p className="text-[10px] leading-snug text-amber-700 dark:text-amber-300/95">
+            {progress.failed_batches} LLM batches failed permanently — knowledge
+            graph is partial.
           </p>
         )}
-        {progress.phase === "done" && progress.incremental_summary && (
-          <CompileSummaryPanel summary={progress.incremental_summary} />
-        )}
-      </div>
+      {progress.phase === "done" && progress.incremental_summary && (
+        <CompileSummaryPanel summary={progress.incremental_summary} />
+      )}
     </section>
   );
 }
@@ -888,25 +978,48 @@ function CompileSummaryPanel({ summary }: { summary: IncrementalSummary }) {
   );
   const totalSec = (summary.total_elapsed_ms / 1000).toFixed(1);
   return (
-    <div className="mt-1.5 flex flex-col gap-1 rounded-md border border-border/40 bg-muted/20 p-2">
-      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
-        <span className="font-mono text-foreground">{totalSec}s</span>
-        <span>· {summary.sources_truly_changed}/{summary.sources_total} sources</span>
-        <span>· +{summary.claims_added} −{summary.claims_deleted} claims</span>
-        {summary.llm_calls > 0 && <span>· {summary.llm_calls} LLM calls</span>}
-        {summary.cache_hits > 0 && <span>· {summary.cache_hits} cache hits</span>}
-        {summary.bytes_re_extracted > 0 && (
-          <span>· {formatBytes(summary.bytes_re_extracted)} re-extracted</span>
+    <div className="mt-2 border-t border-border/55 pt-2 font-mono text-[10px] leading-relaxed text-muted-foreground">
+      <p className="text-foreground/90">
+        <span className="tabular-nums">{totalSec}s</span>
+        <span className="text-muted-foreground"> total · </span>
+        <span>
+          {summary.sources_truly_changed}/{summary.sources_total} sources
+        </span>
+        <span className="text-muted-foreground"> · </span>
+        <span>
+          +{summary.claims_added} −{summary.claims_deleted} claims
+        </span>
+        {summary.llm_calls > 0 && (
+          <>
+            <span className="text-muted-foreground"> · </span>
+            <span>{summary.llm_calls} LLM calls</span>
+          </>
         )}
-      </div>
+        {summary.cache_hits > 0 && (
+          <>
+            <span className="text-muted-foreground"> · </span>
+            <span>{summary.cache_hits} cache hits</span>
+          </>
+        )}
+        {summary.bytes_re_extracted > 0 && (
+          <>
+            <span className="text-muted-foreground"> · </span>
+            <span>{formatBytes(summary.bytes_re_extracted)} re-extracted</span>
+          </>
+        )}
+      </p>
       {orderedPhases.length > 0 && (
-        <div className="flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[9px] text-muted-foreground/80">
+        <p className="mt-1.5 break-words text-[9px] leading-snug text-muted-foreground/85">
           {orderedPhases.map((name) => (
-            <span key={name}>
-              {name} <span className="text-foreground">{(summary.phase_timings[name] ?? 0)}ms</span>
+            <span key={name} className="mr-2 inline-block">
+              {name}
+              <span className="text-foreground/90">
+                {" "}
+                {(summary.phase_timings[name] ?? 0)}ms
+              </span>
             </span>
           ))}
-        </div>
+        </p>
       )}
     </div>
   );
