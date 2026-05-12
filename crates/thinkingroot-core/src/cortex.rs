@@ -481,6 +481,77 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// The shared decision function — pure, sync, no I/O.
+///
+/// Given the current state of the world (lockfile, manifest, probe
+/// result, intent, escape-hatch flag), returns the action the
+/// caller should take. Same inputs → same Decision, byte-for-byte
+/// across processes — this is the property that makes CLI and
+/// desktop agree about whether to attach or spawn.
+///
+/// Spec: `docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md` §3.
+pub fn decide(inputs: DecisionInputs) -> Decision {
+    // MCP stdio bypass is unconditional — no lockfile, no listener,
+    // no daemon.
+    if inputs.intent == EngineIntent::McpStdio {
+        return Decision::Stdio;
+    }
+
+    // --in-process global flag is the escape hatch.  Forces the
+    // legacy in-process path regardless of daemon state.
+    if inputs.in_process_flag {
+        return Decision::InProcess;
+    }
+
+    // Healthy or Degraded daemon → attach.  Degraded is still
+    // serving requests; the daemon's /livez carries warnings the
+    // caller can surface separately.
+    if let Some(lock) = inputs.lock.as_ref() {
+        if inputs.lock_pid_alive {
+            match &inputs.probe_result {
+                ProbeResult::Healthy { version } | ProbeResult::Degraded { version, .. } => {
+                    return Decision::Attach {
+                        host: lock.host.clone(),
+                        port: lock.port,
+                        version: version.clone(),
+                    };
+                }
+                ProbeResult::Unhealthy | ProbeResult::NotProbed => {
+                    // Fall through to spawn-or-repair logic.  Caller
+                    // is responsible for cleaning up the stale lock
+                    // before respawning.
+                }
+            }
+        }
+    }
+
+    // No usable daemon.  What we do next depends on intent:
+    //   - Serve: caller becomes the daemon (InProcess).  Doesn't
+    //     need a manifest entry because the caller IS the binary.
+    //   - Command / DesktopBoot: spawn a new daemon.  Need a
+    //     manifest-preferred binary to spawn; without one we
+    //     surface RepairNeeded.
+    match inputs.intent {
+        EngineIntent::Serve => Decision::InProcess,
+        EngineIntent::Command | EngineIntent::DesktopBoot => {
+            match inputs.manifest_preferred_binary {
+                Some(binary_path) => Decision::Spawn {
+                    binary_path,
+                    port: DEFAULT_PORT,
+                    host: DEFAULT_HOST.to_string(),
+                },
+                None => Decision::RepairNeeded {
+                    failing_check_ids: vec![
+                        "binary.cli.installed".to_string(),
+                        "install.manifest.consistent".to_string(),
+                    ],
+                },
+            }
+        }
+        EngineIntent::McpStdio => unreachable!("handled above"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,5 +857,239 @@ mod tests {
             manifest_preferred_binary: None,
             in_process_flag: false,
         };
+    }
+
+    /// Build a synthetic CortexLock for table-driven decide() tests.
+    fn fixture_lock(port: u16) -> CortexLock {
+        CortexLock {
+            schema_version: SCHEMA_VERSION,
+            pid: 12345,
+            port,
+            host: "127.0.0.1".to_string(),
+            version: "0.9.1".to_string(),
+            started_by: StartedBy::Cli,
+            started_at: chrono::Utc::now(),
+            binary_path: std::path::PathBuf::from("/usr/local/bin/root"),
+        }
+    }
+
+    fn fixture_binary() -> std::path::PathBuf {
+        std::path::PathBuf::from("/usr/local/bin/root")
+    }
+
+    #[test]
+    fn decide_table_driven() {
+        use Decision::*;
+        use EngineIntent::*;
+        use ProbeResult::*;
+
+        // Each row: (description, inputs, expected_decision_variant_check)
+        // We check the variant + key field invariants, not full equality
+        // (host/port/binary_path are easy to get wrong by accident).
+
+        // ── Stdio bypass ──────────────────────────────────────────
+        let d = decide(DecisionInputs {
+            intent: McpStdio,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Stdio), "mcp-stdio always bypasses cortex; got: {d:?}");
+
+        // ── --in-process flag is escape hatch ─────────────────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Healthy { version: "0.9.1".into() },
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: true,
+        });
+        assert!(matches!(d, InProcess), "in_process flag forces InProcess even when daemon healthy; got: {d:?}");
+
+        // ── Healthy daemon — Command attaches ─────────────────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Healthy { version: "0.9.1".into() },
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Attach { port: 31760, .. }), "healthy daemon should Attach; got: {d:?}");
+
+        // ── Healthy daemon — Serve also attaches (says "already running") ─
+        let d = decide(DecisionInputs {
+            intent: Serve,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Healthy { version: "0.9.1".into() },
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Attach { .. }), "Serve sees healthy daemon → Attach (caller prints 'already running'); got: {d:?}");
+
+        // ── Degraded daemon also Attach (still serving) ────────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Degraded { version: "0.9.1".into(), warnings: vec!["x".into()] },
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Attach { .. }), "degraded daemon still serves — Attach; got: {d:?}");
+
+        // ── Lock with dead PID — Command spawns ───────────────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Spawn { port: 31760, .. }), "dead-PID lock → Spawn; got: {d:?}");
+
+        // ── Lock with alive PID but probe unhealthy — Command spawns ──
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Unhealthy,
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Spawn { .. }), "alive-PID-but-unhealthy → Spawn; got: {d:?}");
+
+        // ── No lock + Command + binary available → Spawn ──────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Spawn { .. }), "no lock + Command + binary → Spawn; got: {d:?}");
+
+        // ── No lock + Serve → InProcess ───────────────────────────
+        let d = decide(DecisionInputs {
+            intent: Serve,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, InProcess), "Serve with no daemon → InProcess (caller becomes daemon); got: {d:?}");
+
+        // ── DesktopBoot + no lock → Spawn (caller will wrap as SpawnRequired) ─
+        let d = decide(DecisionInputs {
+            intent: DesktopBoot,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: Some(fixture_binary()),
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Spawn { .. }), "DesktopBoot without daemon → Spawn; got: {d:?}");
+
+        // ── No lock + Command + NO binary → RepairNeeded ──────────
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        match d {
+            RepairNeeded { failing_check_ids } => {
+                assert!(failing_check_ids.iter().any(|s| s.starts_with("binary.")),
+                    "RepairNeeded must surface binary.* check id; got: {failing_check_ids:?}");
+            }
+            other => panic!("no binary + Command → RepairNeeded, got: {other:?}"),
+        }
+
+        // ── No lock + DesktopBoot + NO binary → RepairNeeded ──────
+        let d = decide(DecisionInputs {
+            intent: DesktopBoot,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        assert!(matches!(d, RepairNeeded { .. }), "no binary + DesktopBoot → RepairNeeded; got: {d:?}");
+
+        // ── No lock + Serve + NO binary → InProcess still works ───
+        // (root serve doesn't need a binary on disk — it IS the binary)
+        let d = decide(DecisionInputs {
+            intent: Serve,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: NotProbed,
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        assert!(matches!(d, InProcess), "Serve doesn't need manifest binary — InProcess; got: {d:?}");
+
+        // ── Healthy daemon + no manifest binary → still Attach ────
+        // (manifest is for spawning; if a daemon is already alive,
+        // we don't need a fresh binary path)
+        let d = decide(DecisionInputs {
+            intent: Command,
+            lock: Some(fixture_lock(31760)),
+            lock_pid_alive: true,
+            probe_result: Healthy { version: "0.9.1".into() },
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        assert!(matches!(d, Attach { .. }), "Attach doesn't care about manifest when daemon healthy; got: {d:?}");
+    }
+
+    #[test]
+    fn decide_attach_carries_lock_host_and_port() {
+        use Decision::*;
+        let d = decide(DecisionInputs {
+            intent: EngineIntent::Command,
+            lock: Some(fixture_lock(31765)),
+            lock_pid_alive: true,
+            probe_result: ProbeResult::Healthy { version: "0.9.1".into() },
+            manifest_preferred_binary: None,
+            in_process_flag: false,
+        });
+        match d {
+            Attach { host, port, version } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 31765);
+                assert_eq!(version, "0.9.1");
+            }
+            other => panic!("expected Attach, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_spawn_carries_manifest_binary_path_and_default_port() {
+        use Decision::*;
+        let d = decide(DecisionInputs {
+            intent: EngineIntent::Command,
+            lock: None,
+            lock_pid_alive: false,
+            probe_result: ProbeResult::NotProbed,
+            manifest_preferred_binary: Some(std::path::PathBuf::from("/Users/x/.local/bin/root")),
+            in_process_flag: false,
+        });
+        match d {
+            Spawn { binary_path, port, host } => {
+                assert_eq!(binary_path, std::path::PathBuf::from("/Users/x/.local/bin/root"));
+                assert_eq!(port, DEFAULT_PORT);
+                assert_eq!(host, DEFAULT_HOST);
+            }
+            other => panic!("expected Spawn, got: {other:?}"),
+        }
     }
 }
