@@ -362,6 +362,50 @@ pub fn onboarding_status() -> Result<OnboardingStatus, String> {
     })
 }
 
+/// Whether the user has completed first-run setup, per the install
+/// manifest's `setup_complete_at` field. `Some(ts)` means setup is
+/// done; `None` means the wizard should run on next `repair_needed`.
+#[tauri::command]
+pub fn get_setup_complete_at() -> Result<Option<String>, String> {
+    use thinkingroot_core::install_manifest::InstallManifest;
+    match InstallManifest::load() {
+        Ok(Some(m)) => Ok(m.setup_complete_at.map(|t| t.to_rfc3339())),
+        Ok(None) => Ok(None), // No manifest yet → setup not complete.
+        Err(e) => Err(format!("read install manifest: {e}")),
+    }
+}
+
+/// Mark setup as complete. Writes `setup_complete_at = now()` to the
+/// install manifest. Called by the EngineGate wizard when all
+/// setup-relevant checks have flipped to `ok`.
+#[tauri::command]
+pub fn mark_setup_complete() -> Result<(), String> {
+    use thinkingroot_core::install_manifest::InstallManifest;
+
+    // Load-and-rewrite via register_or_update isn't quite right
+    // because the manifest may have zero binaries. Inline the
+    // load → mutate → save pattern, using register_or_update's
+    // sentinel lock indirectly via save().
+    let mut manifest = match InstallManifest::load() {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            // No manifest exists — create a minimal one with just
+            // the setup_complete_at field set.  Slice F's disk-scan
+            // recovery + the desktop's register_desktop_bundle will
+            // populate the binaries[] entries on next launch.
+            InstallManifest {
+                schema_version: thinkingroot_core::install_manifest::SCHEMA_VERSION,
+                binaries: Vec::new(),
+                preferred: None,
+                setup_complete_at: None,
+            }
+        }
+        Err(e) => return Err(format!("read install manifest: {e}")),
+    };
+    manifest.setup_complete_at = Some(chrono::Utc::now());
+    manifest.save().map_err(|e| format!("write install manifest: {e}"))
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Workspace-scoped LLM config (per-workspace `.thinkingroot/config.toml`)
 // ────────────────────────────────────────────────────────────────────
