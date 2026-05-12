@@ -36,6 +36,26 @@ use crate::state::{AppState, SidecarHandle};
 const DEFAULT_PORT: u16 = 31760;
 const HOST: &str = "127.0.0.1";
 
+/// Capture the exit code from a `tokio::process::ExitStatus`.  On
+/// Unix, signal-terminated processes return `code() = None` — we
+/// then read the signal number via `ExitStatusExt::signal()` and
+/// return it as a negative `i32` (the canonical "exit code"
+/// convention used by `is_crash_signal` in
+/// `thinkingroot_core::restart_state`).
+fn capture_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
+    if let Some(code) = status.code() {
+        return Some(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Some(-sig);
+        }
+    }
+    None
+}
+
 /// Spawn the sidecar — or attach to an already-running one.
 ///
 /// **Cortex Protocol contract.** Before spawning, this function calls
@@ -415,7 +435,7 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
         let (exit_code, status_label) = match &status {
             Ok(s) if s.success() => {
                 tracing::info!(?s, pid = ?watchdog_pid, "sidecar exited cleanly");
-                (s.code(), "stopped")
+                (capture_exit_code(s), "stopped")
             }
             Ok(s) => {
                 tracing::error!(
@@ -424,7 +444,7 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
                     "sidecar exited unexpectedly — clearing handle so compile \
                      falls back to in-process"
                 );
-                (s.code(), "crashed")
+                (capture_exit_code(s), "crashed")
             }
             Err(e) => {
                 tracing::error!(
