@@ -267,6 +267,30 @@ impl InstallManifest {
     }
 }
 
+impl BinaryEntry {
+    /// Verify the on-disk file at `self.path` matches
+    /// `self.checksum_blake3`. Streams the file — handles any
+    /// binary size without loading it into memory.
+    ///
+    /// Used by `root doctor` (Slice B) and by Slice F's
+    /// binary-corruption auto-repair.
+    pub fn verify_checksum(&self) -> Result<(), ManifestError> {
+        let mut file = std::fs::File::open(&self.path)?;
+        let mut hasher = blake3::Hasher::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        let actual = hasher.finalize().to_hex().to_string();
+        if actual == self.checksum_blake3 {
+            Ok(())
+        } else {
+            Err(ManifestError::ChecksumMismatch {
+                path: self.path.clone(),
+                expected: self.checksum_blake3.clone(),
+                actual,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +566,38 @@ mod tests {
             Some(BinaryId::CliScript),
             "preferred sticky across new registrations"
         );
+    }
+
+    #[test]
+    fn verify_checksum_matches_recorded_blake3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_path = tmp.path().join("fake-root");
+        let payload = b"#!/bin/sh\necho v0.9.1\n";
+        std::fs::write(&bin_path, payload).unwrap();
+
+        let expected = {
+            let mut h = blake3::Hasher::new();
+            h.update(payload);
+            h.finalize().to_hex().to_string()
+        };
+
+        let entry = BinaryEntry {
+            id: BinaryId::CliScript,
+            path: bin_path.clone(),
+            version: "0.9.1".into(),
+            installed_at: chrono::Utc::now(),
+            checksum_blake3: expected.clone(),
+        };
+        entry.verify_checksum().expect("checksum matches");
+
+        // Mutate the file → mismatch.
+        std::fs::write(&bin_path, b"#!/bin/sh\necho tampered\n").unwrap();
+        let err = entry.verify_checksum().expect_err("mismatch caught");
+        match err {
+            ManifestError::ChecksumMismatch { expected: e, .. } => {
+                assert_eq!(e, expected);
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
     }
 }
