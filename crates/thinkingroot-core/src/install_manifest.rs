@@ -372,4 +372,51 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
     }
+
+    #[test]
+    fn load_refuses_future_schema_version() {
+        let _cfg = ConfigDirOverride::new();
+
+        // `InstallManifest::path()` is the cross-platform truth — on
+        // macOS `dirs::config_dir()` resolves to
+        // `$HOME/Library/Application Support`, not `$HOME` directly,
+        // so we route through the resolver instead of joining
+        // `tmp_path()` by hand.
+        let manifest_path = InstallManifest::path().unwrap();
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+                    "schema_version": {},
+                    "binaries": [],
+                    "preferred": null,
+                    "setup_complete_at": null
+                }}"#,
+                SCHEMA_VERSION + 7,
+            ),
+        )
+        .unwrap();
+
+        let result = InstallManifest::load();
+        match result {
+            Err(ManifestError::IncompatibleSchema { found, supported }) => {
+                assert_eq!(found, SCHEMA_VERSION + 7);
+                assert_eq!(supported, SCHEMA_VERSION);
+            }
+            other => panic!("expected IncompatibleSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_treats_corrupt_file_as_absent() {
+        let _cfg = ConfigDirOverride::new();
+
+        let manifest_path = InstallManifest::path().unwrap();
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        std::fs::write(&manifest_path, b"this is not json").unwrap();
+
+        let result = InstallManifest::load().expect("load() returns Ok for corrupt file");
+        assert!(result.is_none(), "corrupt file treated as absent (Slice F rebuilds)");
+    }
 }
