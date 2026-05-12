@@ -160,18 +160,6 @@ export async function credentialsRemove(envVar: string): Promise<void> {
   return invoke<void>("credentials_remove", { args: { env_var: envVar } });
 }
 
-export interface OnboardingStatusRead {
-  paths: ConfigPaths;
-  has_any_provider_key: boolean;
-  workspace_count: number;
-  active_workspace?: string | null;
-  missing: string[];
-}
-
-export async function onboardingStatus(): Promise<OnboardingStatusRead> {
-  return invoke<OnboardingStatusRead>("onboarding_status");
-}
-
 // ─── First-run setup (install manifest `setup_complete_at`) ──────────
 //
 // Mirrors `get_setup_complete_at` / `mark_setup_complete` in

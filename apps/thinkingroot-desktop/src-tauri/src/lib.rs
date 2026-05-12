@@ -114,7 +114,6 @@ pub fn run() {
             commands::settings::credentials_set,
             commands::settings::credentials_remove,
             commands::settings::mark_setup_complete,
-            commands::settings::onboarding_status,
             commands::settings::workspace_llm_config,
             commands::settings::workspace_llm_write,
             commands::workspaces::workspace_list,

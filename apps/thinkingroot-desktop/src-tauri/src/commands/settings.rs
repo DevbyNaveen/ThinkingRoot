@@ -318,50 +318,6 @@ pub fn credentials_remove(args: CredentialRemoveArgs) -> Result<(), String> {
     Ok(())
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Onboarding status
-// ────────────────────────────────────────────────────────────────────
-
-/// First-run summary the wizard reads: do we have at least one provider
-/// keyed, do we have a workspace registered + selected, and where do
-/// these files live so the UI can show the user.
-#[derive(Debug, Serialize, Clone)]
-pub struct OnboardingStatus {
-    pub paths: ConfigPaths,
-    pub has_any_provider_key: bool,
-    pub workspace_count: usize,
-    pub active_workspace: Option<String>,
-    pub missing: Vec<String>,
-}
-
-#[tauri::command]
-pub fn onboarding_status() -> Result<OnboardingStatus, String> {
-    let creds = Credentials::load().map_err(|e| e.to_string())?;
-    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-
-    let has_any_provider_key = CREDENTIAL_VARS
-        .iter()
-        .any(|name| creds.get(name).is_some() || env_present(name));
-
-    let mut missing = Vec::new();
-    if !has_any_provider_key {
-        missing.push("provider api key".to_string());
-    }
-    if registry.workspaces.is_empty() {
-        missing.push("workspace".to_string());
-    } else if registry.active.is_none() {
-        missing.push("active workspace".to_string());
-    }
-
-    Ok(OnboardingStatus {
-        paths: config_paths()?,
-        has_any_provider_key,
-        workspace_count: registry.workspaces.len(),
-        active_workspace: registry.active,
-        missing,
-    })
-}
-
 /// Whether the user has completed first-run setup, per the install
 /// manifest's `setup_complete_at` field. `Some(ts)` means setup is
 /// done; `None` means the wizard should run on next `repair_needed`.
