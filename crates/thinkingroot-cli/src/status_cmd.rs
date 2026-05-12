@@ -61,6 +61,14 @@ pub async fn run_status(opts: StatusOpts) -> Result<()> {
                 "no running daemon found — start one with `root serve` and retry"
             );
         }
+        EngineConnection::SpawnRequired { .. } => {
+            unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
+        }
+        EngineConnection::RepairNeeded { failing_check_ids } => {
+            bail!(
+                "ThinkingRoot engine cannot start: missing {failing_check_ids:?}. Run `root doctor --fix` to repair."
+            );
+        }
     };
 
     let workspace = match opts.name {

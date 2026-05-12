@@ -20,10 +20,10 @@
 //! continues running — the engine surfaces (Brain, Privacy) just
 //! return empty until the user installs `root` themselves.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use thinkingroot_core::cortex::{self, CortexLock, EngineConnection, EngineIntent, StartedBy};
 use tokio::process::{Child, Command};
 
@@ -50,10 +50,11 @@ const HOST: &str = "127.0.0.1";
 pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     let port = sidecar_port();
 
-    // ── Cortex attach path: check for an existing daemon first ─────
+    // ── Cortex attach path: dispatch on the bridge's decision ─────
     // Skipped silently when DESKTOP_SIDECAR_PORT is overridden to
     // something other than the cortex canonical 31760 (test
-    // isolation case).
+    // isolation case) — there the legacy resolve_binary() path runs
+    // unconditionally so tests can drive the spawn directly.
     if port == cortex::DEFAULT_PORT {
         match cortex_bridge::resolve_engine(EngineIntent::DesktopBoot).await {
             Ok(EngineConnection::Remote {
@@ -81,23 +82,75 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
                 });
                 return;
             }
+            Ok(EngineConnection::SpawnRequired {
+                binary_path,
+                port: spawn_port,
+                host: _,
+            }) => {
+                // Manifest-resolved binary (T6 wired this through
+                // `cortex_bridge::resolve_engine`). Spawn it attached
+                // and own the Child handle for graceful shutdown.
+                tracing::info!(
+                    ?binary_path,
+                    port = spawn_port,
+                    "cortex: SpawnRequired — spawning manifest-resolved binary attached"
+                );
+                spawn_attached(app, &binary_path, spawn_port).await;
+                return;
+            }
             Ok(EngineConnection::InProcess) => {
-                // No daemon found; fall through to the spawn path.
-                // (Note: `DesktopBoot` intent does NOT auto-spawn
-                // inside resolve_engine — the desktop's sidecar
-                // manager wants to keep the Child handle for its
-                // own graceful-shutdown contract, so the spawn
-                // happens below.)
+                // Desktop's `cortex_bridge::resolve_engine` returns
+                // InProcess only when there's no install manifest at
+                // all AND no live daemon — i.e. a dev build running
+                // from `cargo tauri dev` before any manifest entries
+                // have been registered. The engine surfaces will use
+                // the legacy in-process compile path (workspace_compile
+                // falls back to that when sidecar = None).
+                tracing::info!(
+                    "cortex: InProcess — no daemon to attach, no manifest binary; \
+                     engine surfaces will use in-process compile"
+                );
+                return;
             }
             Ok(EngineConnection::Stdio) => {
-                // Cannot happen for DesktopBoot intent; defensive
-                // fall-through to the spawn path.
-                tracing::warn!("cortex returned Stdio for DesktopBoot intent — falling through");
+                // Cannot happen for DesktopBoot intent (only the
+                // CLI's `root serve --mcp-stdio` yields Stdio). Log
+                // honestly and return — there is no engine to wire.
+                tracing::warn!(
+                    "cortex: Stdio returned for DesktopBoot (unexpected) — \
+                     engine surfaces disabled"
+                );
+                return;
+            }
+            Ok(EngineConnection::RepairNeeded { failing_check_ids }) => {
+                // Install manifest is missing or broken. Do NOT silently
+                // fall back to the legacy resolve_binary() path — that's
+                // exactly the bug Slice C is killing. Emit the structured
+                // event so Slice D's blocking-panel UI can render the
+                // failing checks, then return without spawning.
+                tracing::error!(
+                    ?failing_check_ids,
+                    "cortex: engine cannot start — install manifest missing or broken; \
+                     emitting engine_status_changed for Slice D UI"
+                );
+                let _ = app.emit(
+                    "engine_status_changed",
+                    serde_json::json!({
+                        "status": "repair_needed",
+                        "failing_check_ids": failing_check_ids,
+                    }),
+                );
+                return;
             }
             Err(e) => {
+                // Lockfile I/O failure or other bridge-internal error.
+                // Fall through to the legacy resolve_binary() path as
+                // a safety net so a half-broken state directory doesn't
+                // brick the desktop. Slice F revisits whether this
+                // fallback should also flip to RepairNeeded.
                 tracing::warn!(
                     error = %e,
-                    "cortex resolve failed — proceeding with spawn"
+                    "cortex_bridge::resolve_engine failed — proceeding with legacy spawn fallback"
                 );
             }
         }
@@ -108,6 +161,13 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
         );
     }
 
+    // ── Legacy fallback spawn path ────────────────────────────────
+    // Reached when either:
+    //   * the sidecar port is overridden (test isolation), or
+    //   * cortex_bridge::resolve_engine returned Err(_).
+    // Resolves the binary via the pre-cortex search order
+    // (env var → bundled resource_dir → PATH) and hands off to the
+    // same attached-spawn helper that the SpawnRequired path uses.
     let binary = match resolve_binary(app) {
         Some(p) => p,
         None => {
@@ -119,7 +179,24 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
     };
+    spawn_attached(app, &binary, port).await;
+}
 
+/// Spawn `binary` as `root serve --host 127.0.0.1 --port <port>`
+/// attached to this process: stdin null, stdout/stderr piped (forwarded
+/// to tracing), `kill_on_drop(true)`. Waits up to 120s for the
+/// `/livez` endpoint to come up, stores the Child handle in
+/// `AppState::sidecar`, writes the cortex.lock when on the canonical
+/// port, and parks a watchdog that clears the handle if the child
+/// exits unexpectedly.
+///
+/// Shared between the cortex `SpawnRequired` path (manifest-resolved
+/// binary) and the legacy fallback (`resolve_binary()` output). The
+/// only behavioural difference between the two callers is which
+/// `binary` path arrives; everything from `cmd.spawn()` onward is
+/// identical so the lifecycle invariants (shutdown ownership,
+/// watchdog cleanup, lockfile write) hold in both.
+async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16) {
     tracing::info!(
         binary = %binary.display(),
         host = HOST,
@@ -134,7 +211,7 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     // than the primary mechanism.
     cleanup_stale_sidecar(port).await;
 
-    let mut cmd = Command::new(&binary);
+    let mut cmd = Command::new(binary);
     cmd.arg("serve")
         .arg("--host")
         .arg(HOST)
@@ -214,7 +291,8 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
     // the SidecarHandle held only metadata, so `shutdown()` was a
     // no-op (the comment claimed kill_on_drop but the Child had
     // already been moved away from the parent's reach).
-    spawn_log_forwarders(&mut child, &binary);
+    let binary_buf = binary.to_path_buf();
+    spawn_log_forwarders(&mut child, &binary_buf);
 
     // Wait for the sidecar's HTTP server to actually accept connections
     // before storing the handle.  `cmd.spawn()` only forks the OS
@@ -284,7 +362,7 @@ pub async fn spawn<R: Runtime>(app: &AppHandle<R>) {
             port,
             StartedBy::Desktop,
             env!("CARGO_PKG_VERSION"),
-            binary.clone(),
+            binary_buf.clone(),
         );
         // The lock's `pid` defaults to the desktop's own PID via
         // `CortexLock::new`, but we want the sidecar's PID so the

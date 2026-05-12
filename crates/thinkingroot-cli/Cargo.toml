@@ -40,6 +40,9 @@ tr-revocation = { workspace = true }
 tr-render     = { workspace = true }
 
 thinkingroot-core = { workspace = true }
+# Shared async /livez probe — same crate the desktop calls into so
+# both surfaces agree on the wire-level probe semantics.
+thinkingroot-cortex-async = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }

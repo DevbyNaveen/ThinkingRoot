@@ -11,11 +11,17 @@
 //!
 //! The shared sync types and lockfile I/O come from
 //! `thinkingroot_core::cortex` so this module stays the smallest
-//! possible bridge.
+//! possible bridge. The async `/livez` probe lives in
+//! `thinkingroot_cortex_async` so CLI + desktop share one probe
+//! implementation byte-for-byte.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use thinkingroot_core::cortex::{self, CortexError, EngineConnection, EngineIntent};
+use thinkingroot_core::cortex::{
+    self as cortex_core, CortexError, Decision, DecisionInputs, EngineConnection, EngineIntent,
+};
+use thinkingroot_core::install_manifest::InstallManifest;
 
 /// 1s health-check timeout — same as the CLI side. Defined here
 /// rather than imported because the CLI module isn't on the desktop
@@ -23,9 +29,17 @@ use thinkingroot_core::cortex::{self, CortexError, EngineConnection, EngineInten
 /// crate, not a library).
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Bridge errors. Wraps `CortexError` and adds the
-/// "no-daemon-found-and-DesktopBoot" case so the caller (the sidecar
-/// manager) can fall through to its spawn-and-keep-Child path.
+/// Bundled-binary version. Compared against the running daemon's
+/// reported version (carried on `Decision::Attach`) so the desktop
+/// refuses to attach to a stale daemon whose handlers may have bugs
+/// that have been fixed in the bundled binary.
+const EXPECTED_DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Bridge errors. Wraps `CortexError` for I/O failures (filesystem,
+/// lockfile parse) — the in-band decision outcomes (`SpawnRequired`,
+/// `RepairNeeded`) are now expressed as `EngineConnection` variants
+/// rather than errors, since they represent successful resolutions
+/// that the caller must act on.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
     #[error(transparent)]
@@ -34,112 +48,154 @@ pub enum BridgeError {
 
 /// Resolve the engine connection for the desktop's sidecar manager.
 ///
-/// Differs from the CLI's `resolve_engine` in one important way:
-/// when `intent == DesktopBoot` and no daemon is running, this
-/// returns `Ok(InProcess)` to signal "you should spawn one" rather
-/// than auto-spawning. The desktop's sidecar manager handles the
-/// spawn itself because it needs the resulting `Child` handle.
+/// Mirrors `thinkingroot_cli::cortex_client::resolve_engine` in shape
+/// — both gather sync inputs, run the pure `cortex::decide()`, and
+/// map the resulting `Decision` to an `EngineConnection` — but
+/// differs on `Decision::Spawn`: the desktop returns
+/// `EngineConnection::SpawnRequired` so the caller
+/// (`agent_runtime_subprocess::spawn`) can retain the resulting
+/// `tokio::process::Child` handle for graceful-shutdown control. A
+/// CLI-style fire-and-forget detached spawn would lose that handle.
+///
+/// Version-skew check stays here — the desktop is stricter than the
+/// CLI about version match. If the daemon's reported version differs
+/// from this desktop's bundled version, the function surfaces
+/// `EngineConnection::RepairNeeded` with `daemon.version.match` as
+/// the failing check id rather than attaching.
 pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, BridgeError> {
-    if matches!(intent, EngineIntent::McpStdio) {
-        return Ok(EngineConnection::Stdio);
-    }
+    // 1. Gather inputs synchronously.
+    let lock = cortex_core::read_lock()?;
+    let lock_pid_alive = lock
+        .as_ref()
+        .map(|l| cortex_core::process_alive(l.pid))
+        .unwrap_or(false);
 
-    if let Some(lock) = cortex::read_lock()? {
-        if cortex::process_alive(lock.pid) && health_check(&lock.host, lock.port).await {
-            // Version skew check — if the running daemon's binary is
-            // an older build than the one this desktop ships with, its
-            // request handlers may have bugs that have been fixed in
-            // the bundled binary. Attaching to it would let the
+    // 2. Probe /livez only when there's a live-PID lock to probe.
+    //    No lock → no probe; dead PID → no probe (the daemon is
+    //    already known dead, no network round-trip needed).
+    let probe_result = match (&lock, lock_pid_alive) {
+        (Some(l), true) => {
+            thinkingroot_cortex_async::probe_livez(&l.host, l.port, HEALTH_CHECK_TIMEOUT).await
+        }
+        _ => cortex_core::ProbeResult::NotProbed,
+    };
+
+    // 3. Resolve preferred binary from install manifest. Desktop is
+    //    more forgiving than the CLI here — if the preferred entry's
+    //    file is gone, fall back to the first extant binary so a
+    //    half-broken install (preferred-pointer drift) still boots.
+    let manifest_preferred_binary = load_preferred_or_extant_binary();
+
+    // 4. Run the pure decision. Desktop never threads --in-process
+    //    through here.
+    let decision = cortex_core::decide(DecisionInputs {
+        intent,
+        lock: lock.clone(),
+        lock_pid_alive,
+        probe_result,
+        manifest_preferred_binary,
+        in_process_flag: false,
+    });
+
+    // 5. Map decision → connection. Side effects (version-skew
+    //    rejection) live here, not in decide().
+    Ok(match decision {
+        Decision::Attach { host, port, version } => {
+            // Version-skew check — stricter than CLI. The desktop
+            // ships its bundle pinned to a specific engine version;
+            // attaching to a stale daemon whose handlers may have
+            // bugs fixed in the bundled binary would let the
             // desktop's mount call hit a stale handler that returns
             // an empty body or panics mid-response (the production
-            // failure mode we're closing here). We treat a version
-            // mismatch as "stale" — same blast radius as a stale
-            // lockfile — and let the caller respawn.
-            match daemon_version(&lock.host, lock.port).await {
-                Ok(running) if running == EXPECTED_DAEMON_VERSION => {
-                    tracing::debug!(
-                        pid = lock.pid,
-                        port = lock.port,
-                        started_by = lock.started_by.as_str(),
-                        version = running.as_str(),
-                        "cortex_bridge: attached to existing daemon"
-                    );
-                    return Ok(EngineConnection::Remote {
-                        host: lock.host,
-                        port: lock.port,
-                        started_by: lock.started_by,
-                        pid: lock.pid,
-                    });
+            // failure mode that motivated this check).
+            if version != EXPECTED_DAEMON_VERSION {
+                tracing::warn!(
+                    daemon_version = %version,
+                    expected_version = EXPECTED_DAEMON_VERSION,
+                    "cortex_bridge: daemon version mismatch — desktop will not attach"
+                );
+                EngineConnection::RepairNeeded {
+                    failing_check_ids: vec!["daemon.version.match".to_string()],
                 }
-                Ok(running) => {
-                    tracing::warn!(
-                        pid = lock.pid,
-                        port = lock.port,
-                        running_version = running.as_str(),
-                        bundled_version = EXPECTED_DAEMON_VERSION,
-                        "cortex_bridge: daemon version skew — caller should respawn"
-                    );
-                    cortex::remove_lock()?;
-                }
-                Err(e) => {
-                    // /api/v1/version is only present on builds that
-                    // include this fix. A 404 means the daemon is
-                    // older than this desktop; treat as stale.
-                    tracing::warn!(
-                        pid = lock.pid,
-                        port = lock.port,
-                        error = %e,
-                        "cortex_bridge: daemon does not expose /api/v1/version — treating as stale"
-                    );
-                    cortex::remove_lock()?;
+            } else {
+                let lock = lock.expect("decide() Attach implies lock present");
+                tracing::debug!(
+                    pid = lock.pid,
+                    port = lock.port,
+                    started_by = lock.started_by.as_str(),
+                    version = version.as_str(),
+                    "cortex_bridge: attached to existing daemon"
+                );
+                EngineConnection::Remote {
+                    host,
+                    port,
+                    started_by: lock.started_by,
+                    pid: lock.pid,
                 }
             }
-        } else {
-            tracing::info!(
-                pid = lock.pid,
-                port = lock.port,
-                "cortex_bridge: stale lock detected, removing"
-            );
-            cortex::remove_lock()?;
         }
-    }
-
-    // No daemon. Caller (the sidecar manager) decides what to do.
-    Ok(EngineConnection::InProcess)
+        Decision::Spawn {
+            binary_path,
+            port,
+            host,
+        } => EngineConnection::SpawnRequired {
+            binary_path,
+            port,
+            host,
+        },
+        Decision::InProcess => EngineConnection::InProcess,
+        Decision::Stdio => EngineConnection::Stdio,
+        Decision::RepairNeeded { failing_check_ids } => {
+            EngineConnection::RepairNeeded { failing_check_ids }
+        }
+    })
 }
 
-/// Bundled-binary version. Matched against the running daemon's
-/// `/api/v1/version` response to detect stale-binary skew.
-const EXPECTED_DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// GET `<host>:<port>/api/v1/version` and parse the `data.version`
-/// field from the daemon's standard `{ ok, data, error }` envelope.
-async fn daemon_version(host: &str, port: u16) -> Result<String, String> {
-    let url = format!("http://{host}:{port}/api/v1/version");
-    let client = reqwest::Client::builder()
-        .timeout(HEALTH_CHECK_TIMEOUT)
-        .build()
-        .map_err(|e| format!("client build: {e}"))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", resp.status()));
+/// Resolve the install-manifest's preferred binary path, falling back
+/// to the first extant entry if the preferred pointer is stale (file
+/// gone). Returns `None` when the manifest is absent / corrupt / has
+/// no usable entries — `decide()` then surfaces `RepairNeeded` for
+/// spawn intents, surfacing the user-visible "run `root doctor`"
+/// signal in the blocking-panel UI (Slice D).
+fn load_preferred_or_extant_binary() -> Option<PathBuf> {
+    match InstallManifest::load() {
+        Ok(Some(manifest)) => {
+            // First try the preferred pointer, but only if the file
+            // it names still exists on disk.
+            let preferred = manifest
+                .preferred
+                .clone()
+                .and_then(|id| manifest.binaries.iter().find(|e| e.id == id).cloned())
+                .filter(|e| e.path.exists())
+                .map(|e| e.path.clone());
+            preferred.or_else(|| {
+                manifest
+                    .binaries
+                    .into_iter()
+                    .find(|e| e.path.exists())
+                    .map(|e| e.path)
+            })
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "cortex_bridge: install manifest unreadable; treating as absent"
+            );
+            None
+        }
     }
-    let envelope: serde_json::Value = resp.json().await.map_err(|e| format!("decode: {e}"))?;
-    envelope
-        .pointer("/data/version")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("no .data.version in response from {url}"))
 }
 
 /// HTTP GET `<host>:<port>/livez` with the same 1s timeout the CLI
 /// uses. Returns `true` on a 2xx response.
+///
+/// Kept for callers outside `resolve_engine` (e.g. ad-hoc health
+/// pings from the sidecar manager). The cortex resolution path now
+/// goes through `thinkingroot_cortex_async::probe_livez` instead.
+#[allow(dead_code)]
 pub async fn health_check(host: &str, port: u16) -> bool {
-    let url = format!("http://{host}:{port}{}", cortex::LIVENESS_PATH);
+    let url = format!("http://{host}:{port}{}", cortex_core::LIVENESS_PATH);
     let client = match reqwest::Client::builder()
         .timeout(HEALTH_CHECK_TIMEOUT)
         .build()

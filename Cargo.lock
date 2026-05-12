@@ -6224,6 +6224,7 @@ dependencies = [
  "thinkingroot-branch",
  "thinkingroot-compile",
  "thinkingroot-core",
+ "thinkingroot-cortex-async",
  "thinkingroot-extract",
  "thinkingroot-graph",
  "thinkingroot-ground",
@@ -6287,6 +6288,18 @@ dependencies = [
  "tracing",
  "ulid",
  "url",
+]
+
+[[package]]
+name = "thinkingroot-cortex-async"
+version = "0.9.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thinkingroot-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -202,6 +202,14 @@ pub async fn run_mount(
              Start a daemon manually: `root serve` then re-run `root mount`."
         ),
         EngineConnection::Stdio => bail!("MCP-stdio mode is not a mount target"),
+        EngineConnection::SpawnRequired { .. } => {
+            unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
+        }
+        EngineConnection::RepairNeeded { failing_check_ids } => {
+            bail!(
+                "ThinkingRoot engine cannot start: missing {failing_check_ids:?}. Run `root doctor --fix` to repair."
+            );
+        }
     };
 
     // 8. Workspace name selection.  The user can override; otherwise

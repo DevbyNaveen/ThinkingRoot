@@ -169,6 +169,14 @@ pub async fn run_serve(
                 // bare `_` arm that would mask future variants.
                 unreachable!("Stdio connection only returned for McpStdio intent");
             }
+            Ok(cortex::EngineConnection::SpawnRequired { .. }) => {
+                unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
+            }
+            Ok(cortex::EngineConnection::RepairNeeded { failing_check_ids }) => {
+                anyhow::bail!(
+                    "ThinkingRoot engine cannot start: missing {failing_check_ids:?}. Run `root doctor --fix` to repair."
+                );
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "cortex resolve failed; falling back to direct bind");
             }
@@ -230,97 +238,23 @@ pub async fn run_serve(
         workspaces
     };
 
-    // Honesty rule §1 — a workspace registered in workspaces.toml whose
-    // .thinkingroot/ substrate has been deleted out from under us is not a
-    // fatal error for the *whole daemon*. We surface a WARN per offender,
-    // skip them, and keep mounting the rest. If we propagated the first
-    // failure, a single deleted directory would take down every other
-    // workspace, every desktop session attached to this daemon, and every
-    // editor MCP session — exactly the cascade the watcher in Slice 3
-    // (workspace_watcher.rs) was built to prevent. The watcher catches
-    // *runtime* deletion; this catches *startup-time* skew between
-    // registry and disk.
-    //
-    // CLI-explicit cases (`--name <ws>` or single `--path <p>`) still
-    // bail loudly: the user named exactly one workspace, missing it
-    // means there's nothing to do. Multi-workspace start-from-registry
-    // skips, surfaces, and keeps going.
-    let mut engine = QueryEngine::new();
-    let single_explicit = name.is_some() || resolved_paths.len() == 1;
-    let mut skipped: Vec<(String, std::path::PathBuf, String)> = Vec::new();
-    for (ws_name, abs_path, _ws_port) in &resolved_paths {
-        if let Some(ref branch_name) = branch {
-            let data_dir = resolve_data_dir(abs_path, Some(branch_name));
-            if !data_dir.exists() {
-                if single_explicit {
-                    anyhow::bail!(
-                        "branch '{}' not found for workspace '{}' — expected data dir at {}. \
-                         Run `root branch {}` first.",
-                        branch_name,
-                        ws_name,
-                        data_dir.display(),
-                        branch_name,
-                    );
-                }
-                tracing::warn!(
-                    "skipping workspace '{}': branch '{}' data dir missing at {} \
-                     (run `root branch {}` to recreate it, or `root workspace remove {}` to clear the registry entry)",
-                    ws_name, branch_name, data_dir.display(), branch_name, ws_name,
-                );
-                skipped.push((
-                    ws_name.clone(),
-                    abs_path.clone(),
-                    format!("branch '{branch_name}' data dir missing"),
-                ));
-                continue;
-            }
-            match engine
-                .mount_with_data_dir(ws_name.clone(), abs_path.clone(), data_dir.clone())
-                .await
-            {
-                Ok(()) => tracing::info!(
-                    "mounted workspace '{}' from branch '{}' ({})",
-                    ws_name,
-                    branch_name,
-                    data_dir.display()
-                ),
-                Err(e) if single_explicit => return Err(e.into()),
-                Err(e) => {
-                    tracing::warn!(
-                        "skipping workspace '{}' (branch '{}'): {e}",
-                        ws_name, branch_name
-                    );
-                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
-                }
-            }
-        } else {
-            match engine.mount(ws_name.clone(), abs_path.clone()).await {
-                Ok(()) => tracing::info!(
-                    "mounted workspace '{}' from {}",
-                    ws_name,
-                    abs_path.display()
-                ),
-                Err(e) if single_explicit => return Err(e.into()),
-                Err(e) => {
-                    tracing::warn!(
-                        "skipping workspace '{}' at {}: {e}",
-                        ws_name,
-                        abs_path.display()
-                    );
-                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
-                }
-            }
-        }
-    }
-    if !skipped.is_empty() {
-        tracing::warn!(
-            "{} workspace(s) skipped at startup; daemon continues with the rest. \
-             Run `root doctor` for detail or `root workspace remove <name>` to clear stale registry entries.",
-            skipped.len()
-        );
-    }
-
+    // Path split: mcp_stdio never binds a TCP listener and never writes a
+    // cortex.lock (per .claude/rules/cortex-protocol.md "MCP stdio bypasses
+    // cortex"). The HTTP path below reserves the port FIRST, writes the
+    // cortex.lock IMMEDIATELY, and only then begins workspace mounts — so
+    // any panic / error during mount cannot leave a bound port without a
+    // matching lock (Task 8 race fix).
     if mcp_stdio {
+        let mut engine = QueryEngine::new();
+        let single_explicit = name.is_some() || resolved_paths.len() == 1;
+        mount_workspaces_into_engine(
+            &mut engine,
+            &resolved_paths,
+            branch.as_deref(),
+            single_explicit,
+        )
+        .await?;
+
         eprintln!(
             "ThinkingRoot MCP stdio server v{}",
             env!("CARGO_PKG_VERSION")
@@ -340,6 +274,55 @@ pub async fn run_serve(
         thinkingroot_serve::mcp::stdio::run(engine, default_ws, sessions).await;
         return Ok(());
     }
+
+    // ── HTTP path: bind → write_lock → mount → accept ────────────────
+    //
+    // Task 8 (Slice C) race fix: prior to this reordering the listener
+    // was bound after workspace mounts succeeded and the lockfile was
+    // written AFTER bind. That left two distinct crash windows where
+    // `root serve` could leave the port reserved by the OS while no
+    // cortex.lock existed — the next surface that tried to attach saw
+    // no lock and auto-spawned into a "port already in use" conflict.
+    //
+    // New order:
+    //   1. Bind the TCP listener (OS reserves the port).
+    //   2. IMMEDIATELY write cortex.lock with the listener's actual port
+    //      (handles port==0 OS-assigned ports for tests).
+    //   3. Install a `LockfileGuard` RAII sentinel — Drop removes the
+    //      lockfile on any panic / early return between here and the
+    //      accept loop terminating cleanly.
+    //   4. Mount workspaces and build the runtime state.
+    //   5. axum::serve(...).await — accept loop runs until shutdown.
+    //   6. On clean shutdown the explicit `cortex::remove_lock()` call
+    //      below removes the lock; the guard's Drop is then a no-op
+    //      (remove_lock is idempotent on NotFound).
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
+    let actual_port = listener.local_addr()?.port();
+    tracing::info!("server listening on {} (bound port {})", addr, actual_port);
+
+    // Write the lockfile IMMEDIATELY. From this point on, any failure
+    // before the accept loop completes successfully must clean it up —
+    // hence the `LockfileGuard` below.
+    let lock = cortex_client::build_cli_lock(actual_port);
+    cortex::write_lock(&lock)
+        .map_err(|e| anyhow::anyhow!("failed to write cortex.lock: {e}"))?;
+    let _lock_guard = LockfileGuard;
+
+    // Mount workspaces AFTER lock is written — a panic here trips the
+    // guard's Drop and removes the lockfile so the next caller does not
+    // observe a phantom lock pointing at a dead bind.
+    let mut engine = QueryEngine::new();
+    let single_explicit = name.is_some() || resolved_paths.len() == 1;
+    mount_workspaces_into_engine(
+        &mut engine,
+        &resolved_paths,
+        branch.as_deref(),
+        single_explicit,
+    )
+    .await?;
 
     // Print banner.
     let auth_status = if api_key.is_some() {
@@ -420,34 +403,133 @@ pub async fn run_serve(
         .await;
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
-    let addr = format!("{}:{}", host, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("server listening on {}", addr);
-
-    // ── Cortex Protocol: write the lockfile AFTER a successful bind ─
-    // (so a port-in-use crash doesn't leave a misleading lock).
-    // The lock is removed in the graceful_shutdown future below so a
-    // clean Ctrl-C exit cleans up; a SIGKILL leaves the lockfile
-    // behind, which the next caller treats as stale via
-    // `process_alive(pid) == false`.
-    let lock = cortex_client::build_cli_lock(port);
-    if let Err(e) = cortex::write_lock(&lock) {
-        tracing::warn!(error = %e, "failed to write cortex.lock; clients will fall back to spawn");
-    }
 
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await;
 
-    // Best-effort lock cleanup on shutdown. Logging an error here
-    // is informative but not fatal — the next caller will detect
-    // the stale lock via `process_alive == false`.
+    // Best-effort lock cleanup on clean shutdown. `remove_lock` is
+    // idempotent on NotFound, so this is harmless if `_lock_guard`
+    // ends up running first on an unwind.
     if let Err(e) = cortex::remove_lock() {
         tracing::warn!(error = %e, "failed to remove cortex.lock on shutdown");
     }
 
     serve_result?;
     Ok(())
+}
+
+/// Mount each resolved workspace into `engine`, honouring the same
+/// resilience rules as the inline loop used to: a single deleted
+/// substrate is a per-workspace WARN, not a fatal error for the whole
+/// daemon, *unless* the caller explicitly named one workspace (via
+/// `--name <ws>` or a single `--path <p>`), in which case missing it
+/// is fatal because there's nothing else to mount.
+///
+/// Extracted from the inline body of `run_serve` so the HTTP path can
+/// defer mount-time work to AFTER the cortex.lock is written (Task 8
+/// race fix) while the `mcp_stdio` path keeps mounting up-front
+/// without binding a TCP listener.
+async fn mount_workspaces_into_engine(
+    engine: &mut QueryEngine,
+    resolved_paths: &[(String, PathBuf, u16)],
+    branch: Option<&str>,
+    single_explicit: bool,
+) -> anyhow::Result<()> {
+    let mut skipped: Vec<(String, std::path::PathBuf, String)> = Vec::new();
+    for (ws_name, abs_path, _ws_port) in resolved_paths {
+        if let Some(branch_name) = branch {
+            let data_dir = resolve_data_dir(abs_path, Some(branch_name));
+            if !data_dir.exists() {
+                if single_explicit {
+                    anyhow::bail!(
+                        "branch '{}' not found for workspace '{}' — expected data dir at {}. \
+                         Run `root branch {}` first.",
+                        branch_name,
+                        ws_name,
+                        data_dir.display(),
+                        branch_name,
+                    );
+                }
+                tracing::warn!(
+                    "skipping workspace '{}': branch '{}' data dir missing at {} \
+                     (run `root branch {}` to recreate it, or `root workspace remove {}` to clear the registry entry)",
+                    ws_name, branch_name, data_dir.display(), branch_name, ws_name,
+                );
+                skipped.push((
+                    ws_name.clone(),
+                    abs_path.clone(),
+                    format!("branch '{branch_name}' data dir missing"),
+                ));
+                continue;
+            }
+            match engine
+                .mount_with_data_dir(ws_name.clone(), abs_path.clone(), data_dir.clone())
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    "mounted workspace '{}' from branch '{}' ({})",
+                    ws_name,
+                    branch_name,
+                    data_dir.display()
+                ),
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping workspace '{}' (branch '{}'): {e}",
+                        ws_name, branch_name
+                    );
+                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
+                }
+            }
+        } else {
+            match engine.mount(ws_name.clone(), abs_path.clone()).await {
+                Ok(()) => tracing::info!(
+                    "mounted workspace '{}' from {}",
+                    ws_name,
+                    abs_path.display()
+                ),
+                Err(e) if single_explicit => return Err(e.into()),
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping workspace '{}' at {}: {e}",
+                        ws_name,
+                        abs_path.display()
+                    );
+                    skipped.push((ws_name.clone(), abs_path.clone(), e.to_string()));
+                }
+            }
+        }
+    }
+    if !skipped.is_empty() {
+        tracing::warn!(
+            "{} workspace(s) skipped at startup; daemon continues with the rest. \
+             Run `root doctor` for detail or `root workspace remove <name>` to clear stale registry entries.",
+            skipped.len()
+        );
+    }
+    Ok(())
+}
+
+/// Removes cortex.lock on Drop. Used during `root serve` setup to
+/// ensure that a panic or early-return between lock-write and the
+/// accept-loop's clean shutdown does not leave a phantom lockfile
+/// pointing at a port that no live daemon owns.
+///
+/// The clean shutdown path explicitly calls `cortex::remove_lock()`
+/// after `axum::serve(...).await`, so by the time Drop runs the file
+/// is usually already gone — `remove_lock` is idempotent on NotFound
+/// (see `thinkingroot_core::cortex::remove_lock`), so the double-call
+/// is harmless. This guard is defensive only; it earns its keep on
+/// unwind paths where the explicit cleanup is skipped.
+struct LockfileGuard;
+
+impl Drop for LockfileGuard {
+    fn drop(&mut self) {
+        if let Err(e) = cortex::remove_lock() {
+            tracing::warn!(error = %e, "failed to remove cortex.lock during shutdown");
+        }
+    }
 }
 
 /// Variant of [`run_serve`] that accepts a pre-bound [`tokio::net::TcpListener`].

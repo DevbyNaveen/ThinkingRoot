@@ -1259,6 +1259,17 @@ async fn try_resolve_remote(
     match cortex_client::resolve_engine(EngineIntent::Command).await {
         Ok(conn @ EngineConnection::Remote { .. }) => Some(conn),
         Ok(EngineConnection::InProcess) | Ok(EngineConnection::Stdio) => None,
+        Ok(EngineConnection::SpawnRequired { .. }) => {
+            unreachable!("CLI resolve_engine never returns SpawnRequired (handled internally as detached spawn)");
+        }
+        Ok(EngineConnection::RepairNeeded { failing_check_ids }) => {
+            eprintln!("error: ThinkingRoot engine cannot start.\n");
+            for id in &failing_check_ids {
+                eprintln!("  ✗ {id}");
+            }
+            eprintln!("\nRun `root doctor --fix` to repair, or `root doctor --json` for details.");
+            std::process::exit(1);
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
