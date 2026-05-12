@@ -78,13 +78,30 @@ nli_onnx_filename() {
 }
 
 # ── Download helper (curl → wget fallback) ────────────────────────────────────
+#
+# Production users always go through HTTPS — curl's `--proto '=https'`
+# and wget's `--https-only` flags enforce this and refuse plaintext
+# URLs even if a malicious redirect tries to downgrade.  The smoke
+# test at tests/install_sh_manifest_smoke.sh serves a fake release
+# over http://localhost:<port> from Python's http.server, so when
+# TR_TEST_BASE_URL is set we relax the protocol flag for the
+# in-process test only.  Production paths are unaffected because
+# TR_TEST_BASE_URL is never set in the wild.
 
 download() {
   url="$1"; dest="$2"
   if is_cmd curl; then
-    curl --tlsv1.2 --proto '=https' -fSL --progress-bar "$url" -o "$dest"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      curl -fSL --progress-bar "$url" -o "$dest"
+    else
+      curl --tlsv1.2 --proto '=https' -fSL --progress-bar "$url" -o "$dest"
+    fi
   elif is_cmd wget; then
-    wget --https-only -O "$dest" "$url"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      wget -O "$dest" "$url"
+    else
+      wget --https-only -O "$dest" "$url"
+    fi
   else
     err "Neither curl nor wget found. Install one and retry."
   fi
@@ -93,9 +110,17 @@ download() {
 download_quiet() {
   url="$1"; dest="$2"
   if is_cmd curl; then
-    curl --tlsv1.2 --proto '=https' -fsSL "$url" -o "$dest"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      curl -fsSL "$url" -o "$dest"
+    else
+      curl --tlsv1.2 --proto '=https' -fsSL "$url" -o "$dest"
+    fi
   elif is_cmd wget; then
-    wget -q --https-only -O "$dest" "$url"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      wget -q -O "$dest" "$url"
+    else
+      wget -q --https-only -O "$dest" "$url"
+    fi
   else
     err "Neither curl nor wget found."
   fi
@@ -370,6 +395,10 @@ main() {
   [ -z "$VERSION" ] && err "Could not determine latest version. Set VERSION= env var manually."
 
   BASE_URL="https://github.com/${RELEASES_REPO}/releases/download/${VERSION}"
+  # Test-only override: the harness at tests/install_sh_manifest_smoke.sh
+  # sets TR_TEST_BASE_URL to a local http.server URL.  Production users
+  # never set this.
+  BASE_URL="${TR_TEST_BASE_URL:-$BASE_URL}"
   ASSET_URL="${BASE_URL}/${ASSET}"
   CHECKSUM_URL="${BASE_URL}/checksums.txt"
 
@@ -499,7 +528,11 @@ main() {
   esac
 
   # ── Download NLI models ───────────────────────────────────────────────────
-  install_nli_models "$ARCH"
+  if [ "${TR_SKIP_NLI:-0}" = "1" ]; then
+    say_dim "Skipping NLI model download (TR_SKIP_NLI=1)"
+  else
+    install_nli_models "$ARCH"
+  fi
 
   printf '\n'
   say "Done!"
