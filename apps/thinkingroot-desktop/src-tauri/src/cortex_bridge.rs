@@ -167,7 +167,7 @@ pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, Br
 /// spawn intents, surfacing the user-visible "run `root doctor`"
 /// signal in the blocking-panel UI (Slice D).
 fn load_preferred_or_extant_binary() -> Option<PathBuf> {
-    match InstallManifest::load() {
+    let from_manifest = match InstallManifest::load() {
         Ok(Some(manifest)) => {
             // First try the preferred pointer, but only if the file
             // it names still exists on disk.
@@ -193,7 +193,29 @@ fn load_preferred_or_extant_binary() -> Option<PathBuf> {
             );
             None
         }
-    }
+    };
+    // Fallback for `cargo install`-style installs that never wrote an
+    // install manifest: honour THINKINGROOT_ROOT_BINARY override, then
+    // PATH lookup for `root`. Without this, fresh dev machines see
+    // `Decision::RepairNeeded` and the desktop refuses to spawn even
+    // though the binary is sitting at /usr/local/bin/root.
+    from_manifest.or_else(|| {
+        if let Ok(p) = std::env::var("THINKINGROOT_ROOT_BINARY") {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let bin = if cfg!(windows) { "root.exe" } else { "root" };
+        let path_env = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(bin);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    })
 }
 
 /// HTTP GET `<host>:<port>/livez` with the same 1s timeout the CLI

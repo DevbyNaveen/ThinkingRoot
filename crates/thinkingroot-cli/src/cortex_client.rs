@@ -307,22 +307,50 @@ async fn cleanup_wedged_daemon(stale_lock: &CortexLock) {
 /// `decide()` then surfaces `RepairNeeded` for spawn intents, which
 /// is the user-visible signal "run `root doctor`".
 fn load_preferred_manifest_binary() -> Option<PathBuf> {
-    match InstallManifest::load() {
+    let from_manifest = match InstallManifest::load() {
         Ok(Some(manifest)) => {
-            let preferred_id = manifest.preferred?;
-            manifest
-                .binaries
-                .into_iter()
-                .find(|e| e.id == preferred_id)
+            let preferred = manifest
+                .preferred
+                .clone()
+                .and_then(|id| manifest.binaries.iter().find(|e| e.id == id).cloned())
                 .filter(|e| e.path.exists())
-                .map(|e| e.path)
+                .map(|e| e.path.clone());
+            preferred.or_else(|| {
+                manifest
+                    .binaries
+                    .into_iter()
+                    .find(|e| e.path.exists())
+                    .map(|e| e.path)
+            })
         }
         Ok(None) => None,
         Err(e) => {
             tracing::warn!(error = %e, "cortex: install manifest unreadable; treating as absent");
             None
         }
-    }
+    };
+    // Fallback for `cargo install`-style installs that never wrote an
+    // install manifest. Honour THINKINGROOT_ROOT_BINARY override, then
+    // PATH lookup. Without this, fresh dev machines see
+    // Decision::RepairNeeded for every spawn intent even though `root`
+    // is sitting at /usr/local/bin/root.
+    from_manifest.or_else(|| {
+        if let Ok(p) = std::env::var("THINKINGROOT_ROOT_BINARY") {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let bin = if cfg!(windows) { "root.exe" } else { "root" };
+        let path_env = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(bin);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    })
 }
 
 /// HTTP GET `<host>:<port>/livez` with a 1s timeout. Returns `true`
