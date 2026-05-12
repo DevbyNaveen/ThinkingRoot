@@ -78,13 +78,30 @@ nli_onnx_filename() {
 }
 
 # ── Download helper (curl → wget fallback) ────────────────────────────────────
+#
+# Production users always go through HTTPS — curl's `--proto '=https'`
+# and wget's `--https-only` flags enforce this and refuse plaintext
+# URLs even if a malicious redirect tries to downgrade.  The smoke
+# test at tests/install_sh_manifest_smoke.sh serves a fake release
+# over http://localhost:<port> from Python's http.server, so when
+# TR_TEST_BASE_URL is set we relax the protocol flag for the
+# in-process test only.  Production paths are unaffected because
+# TR_TEST_BASE_URL is never set in the wild.
 
 download() {
   url="$1"; dest="$2"
   if is_cmd curl; then
-    curl --tlsv1.2 --proto '=https' -fSL --progress-bar "$url" -o "$dest"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      curl -fSL --progress-bar "$url" -o "$dest"
+    else
+      curl --tlsv1.2 --proto '=https' -fSL --progress-bar "$url" -o "$dest"
+    fi
   elif is_cmd wget; then
-    wget --https-only -O "$dest" "$url"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      wget -O "$dest" "$url"
+    else
+      wget --https-only -O "$dest" "$url"
+    fi
   else
     err "Neither curl nor wget found. Install one and retry."
   fi
@@ -93,9 +110,17 @@ download() {
 download_quiet() {
   url="$1"; dest="$2"
   if is_cmd curl; then
-    curl --tlsv1.2 --proto '=https' -fsSL "$url" -o "$dest"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      curl -fsSL "$url" -o "$dest"
+    else
+      curl --tlsv1.2 --proto '=https' -fsSL "$url" -o "$dest"
+    fi
   elif is_cmd wget; then
-    wget -q --https-only -O "$dest" "$url"
+    if [ -n "${TR_TEST_BASE_URL:-}" ]; then
+      wget -q -O "$dest" "$url"
+    else
+      wget -q --https-only -O "$dest" "$url"
+    fi
   else
     err "Neither curl nor wget found."
   fi
@@ -183,6 +208,170 @@ install_nli_models() {
   say "NLI models ready."
 }
 
+# ── BLAKE3 of a freshly-installed binary ─────────────────────────────────────
+#
+# Shells out to the just-installed `root hash-file <path>` (a hidden
+# subcommand added in the same slice).  Pre-Task-9 the subcommand
+# doesn't exist; we tolerate its absence by emitting an empty string,
+# and Slice F's binary-corruption auto-repair will detect + repair the
+# missing checksum on first daemon start.  Honest fallback — never
+# fabricate a checksum.
+
+blake3sum() {
+  target="$1"
+  if "${INSTALL_DIR}/${BINARY}" hash-file "$target" 2>/dev/null; then
+    return 0
+  fi
+  echo ""
+}
+
+# ── Config-dir resolution ─────────────────────────────────────────────────────
+#
+# Mirrors `dirs::config_dir()` in Rust:
+#   - Linux/BSD: $XDG_CONFIG_HOME, falling back to $HOME/.config
+#   - macOS:     $HOME/Library/Application Support (XDG ignored)
+#   - Windows:   %APPDATA% (handled by the Rust side; install.sh runs
+#                 under WSL/git-bash on Windows, where this branch
+#                 returns the XDG default — Slice A doesn't ship a
+#                 native Windows installer yet)
+
+resolve_config_dir() {
+  if [ "$OS" = "macos" ]; then
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+      # Honour XDG_CONFIG_HOME on macOS when the user sets it
+      # explicitly — matches how `tests/install_sh_manifest_smoke.sh`
+      # (added in Task 11) overrides the path for sandboxed tests.
+      echo "$XDG_CONFIG_HOME"
+    else
+      echo "$HOME/Library/Application Support"
+    fi
+  else
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}"
+  fi
+}
+
+# ── Install manifest registration ─────────────────────────────────────────────
+#
+# Writes/updates the `cli-script` entry in
+# ~/.config/thinkingroot/install-manifest.json (or platform equivalent).
+# Pure shell — no external JSON library required.  The manifest format
+# is owned by crates/thinkingroot-core/src/install_manifest.rs; if the
+# schema bumps, this function must update in lockstep.
+#
+# This is a CLI-install registration only.  An existing `desktop-bundle`
+# entry, if any, is preserved across re-installs by re-emitting it from
+# its read-back state.
+
+write_install_manifest() {
+  bin_path="$1"
+  version="$2"
+  checksum="$3"
+
+  config_dir="$(resolve_config_dir)/thinkingroot"
+  mkdir -p "$config_dir"
+  chmod 700 "$config_dir" 2>/dev/null || true
+  manifest_path="${config_dir}/install-manifest.json"
+  manifest_tmp="${manifest_path}.tr-installing"
+
+  installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Preserve any existing desktop-bundle entry across re-installs.
+  # Pure-shell JSON manipulation is fragile, so we extract the
+  # raw block as text. If extraction fails for any reason, we warn
+  # and write a CLI-only manifest — the desktop will re-register
+  # on its next launch.
+  desktop_entry=""
+  if [ -f "$manifest_path" ] && grep -q '"id": "desktop-bundle"' "$manifest_path" 2>/dev/null; then
+    desktop_entry="$(awk '
+      /\{/ { brace++; if (brace==2) capturing=1 }
+      capturing { buf = buf $0 "\n" }
+      /\}/ { brace--; if (capturing && brace<2) { capturing=0; if (buf ~ /"desktop-bundle"/) { printf "%s", buf; exit } else { buf = "" } } }
+    ' "$manifest_path")"
+    # Strip trailing newline + comma if the original entry was
+    # followed by another binaries[] element (we re-emit with a comma
+    # separator below, so we don't want a double comma).
+    desktop_entry="$(printf '%s' "$desktop_entry" | sed 's/,[[:space:]]*$//')"
+  fi
+
+  # Compose the new manifest.  binaries[] order:
+  # cli-script first, desktop-bundle second (if present).
+  cli_entry=$(cat <<EOF
+    {
+      "id": "cli-script",
+      "path": "${bin_path}",
+      "version": "${version}",
+      "installed_at": "${installed_at}",
+      "checksum_blake3": "${checksum}"
+    }
+EOF
+)
+
+  if [ -n "$desktop_entry" ]; then
+    binaries_block="${cli_entry},
+${desktop_entry}"
+  else
+    binaries_block="${cli_entry}"
+  fi
+
+  # `preferred` rule: keep an existing `preferred` if present and
+  # valid; otherwise default to "cli-script".  Pure-shell extraction
+  # is best-effort here — if the existing manifest is corrupt, the
+  # Rust side will reject it and Slice F will rebuild.
+  preferred="\"cli-script\""
+  if [ -f "$manifest_path" ]; then
+    existing_pref="$(grep -E '"preferred":' "$manifest_path" | head -1 \
+                     | sed -E 's/.*"preferred":[[:space:]]*([^,}]+).*/\1/' \
+                     | tr -d '[:space:]')"
+    if [ -n "$existing_pref" ] && [ "$existing_pref" != "null" ]; then
+      preferred="$existing_pref"
+    fi
+  fi
+
+  # `setup_complete_at` preserved similarly.
+  setup_complete="null"
+  if [ -f "$manifest_path" ]; then
+    existing_setup="$(grep -E '"setup_complete_at":' "$manifest_path" | head -1 \
+                       | sed -E 's/.*"setup_complete_at":[[:space:]]*([^,}]+).*/\1/' \
+                       | tr -d '[:space:]')"
+    if [ -n "$existing_setup" ] && [ "$existing_setup" != "null" ]; then
+      setup_complete="$existing_setup"
+    fi
+  fi
+
+  cat > "$manifest_tmp" <<EOF
+{
+  "schema_version": 1,
+  "binaries": [
+${binaries_block}
+  ],
+  "preferred": ${preferred},
+  "setup_complete_at": ${setup_complete}
+}
+EOF
+  mv "$manifest_tmp" "$manifest_path" \
+    || { rm -f "$manifest_tmp"; err "failed to write install manifest at ${manifest_path}"; }
+  chmod 600 "$manifest_path" 2>/dev/null || true
+  say "Registered install manifest at ${manifest_path}"
+}
+
+# ── checksums.txt caching ────────────────────────────────────────────────────
+#
+# Caches the verified checksums.txt to the config dir.  Slice F's
+# corrupt-manifest disk-scan recovery uses this when it can't trust
+# the manifest's own checksum (because the manifest is the corrupt
+# thing).
+
+cache_checksums_file() {
+  src="$1"
+  config_dir="$(resolve_config_dir)/thinkingroot"
+  mkdir -p "$config_dir"
+  dest="${config_dir}/checksums-cache.txt"
+  dest_tmp="${dest}.tr-installing"
+  cp "$src" "$dest_tmp" || err "failed to cache checksums.txt to ${dest_tmp}"
+  mv "$dest_tmp" "$dest"
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -206,6 +395,10 @@ main() {
   [ -z "$VERSION" ] && err "Could not determine latest version. Set VERSION= env var manually."
 
   BASE_URL="https://github.com/${RELEASES_REPO}/releases/download/${VERSION}"
+  # Test-only override: the harness at tests/install_sh_manifest_smoke.sh
+  # sets TR_TEST_BASE_URL to a local http.server URL.  Production users
+  # never set this.
+  BASE_URL="${TR_TEST_BASE_URL:-$BASE_URL}"
   ASSET_URL="${BASE_URL}/${ASSET}"
   CHECKSUM_URL="${BASE_URL}/checksums.txt"
 
@@ -315,6 +508,15 @@ main() {
     say "Installed: ${INSTALL_DIR}/${BINARY}"
   fi
 
+  # ── Register install in coordinating manifest ───────────────────────────────
+  # Cache the verified checksums.txt for Slice F recovery; register
+  # the binary in the install manifest so CLI + desktop agree on
+  # which `root` is canonical.  See:
+  #   docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md
+  cache_checksums_file "$CHECKSUMS_PATH"
+  manifest_checksum="$(blake3sum "${INSTALL_DIR}/${BINARY}")"
+  write_install_manifest "${INSTALL_DIR}/${BINARY}" "$VERSION" "$manifest_checksum"
+
   # PATH hint
   case "$INSTALL_DIR" in
     "$HOME/.local/bin")
@@ -326,10 +528,18 @@ main() {
   esac
 
   # ── Download NLI models ───────────────────────────────────────────────────
-  install_nli_models "$ARCH"
+  if [ "${TR_SKIP_NLI:-0}" = "1" ]; then
+    say_dim "Skipping NLI model download (TR_SKIP_NLI=1)"
+  else
+    install_nli_models "$ARCH"
+  fi
 
   printf '\n'
   say "Done!"
+  config_dir_check="$(resolve_config_dir)/thinkingroot"
+  if [ -f "${config_dir_check}/install-manifest.json" ]; then
+    say_dim "Install manifest: ${config_dir_check}/install-manifest.json"
+  fi
   "${INSTALL_DIR}/${BINARY}" --version || true
   printf '\n'
   printf '    Get started:\n'

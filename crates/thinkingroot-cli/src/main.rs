@@ -308,6 +308,14 @@ enum Commands {
     },
     /// First-time guided setup wizard
     Setup,
+    /// Print the BLAKE3 hex digest of a file.  Hidden — used by
+    /// `install.sh` to populate the install manifest at install
+    /// time.  No stable contract for external callers.
+    #[command(hide = true)]
+    HashFile {
+        /// Path to the file to hash.
+        path: std::path::PathBuf,
+    },
     /// Manage registered workspaces
     Workspace {
         #[command(subcommand)]
@@ -1539,6 +1547,14 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Setup) => {
             setup::run_setup().await?;
+        }
+        Some(Commands::HashFile { path }) => {
+            let mut file = std::fs::File::open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            let mut hasher = blake3::Hasher::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            println!("{}", hasher.finalize().to_hex());
+            return Ok(());
         }
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Add { path, name, port } => {
