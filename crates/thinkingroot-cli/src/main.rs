@@ -1259,6 +1259,14 @@ async fn try_resolve_remote(
     match cortex_client::resolve_engine(EngineIntent::Command).await {
         Ok(conn @ EngineConnection::Remote { .. }) => Some(conn),
         Ok(EngineConnection::InProcess) | Ok(EngineConnection::Stdio) => None,
+        Ok(EngineConnection::SpawnRequired { .. }) => {
+            // Slice C T5/T6 wires this — for now the variant is constructed
+            // only by the new resolve_engine paths under development.
+            unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+        }
+        Ok(EngineConnection::RepairNeeded { .. }) => {
+            unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,

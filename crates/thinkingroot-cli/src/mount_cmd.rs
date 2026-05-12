@@ -202,6 +202,14 @@ pub async fn run_mount(
              Start a daemon manually: `root serve` then re-run `root mount`."
         ),
         EngineConnection::Stdio => bail!("MCP-stdio mode is not a mount target"),
+        EngineConnection::SpawnRequired { .. } => {
+            // Slice C T5/T6 wires this — for now the variant is constructed
+            // only by the new resolve_engine paths under development.
+            unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+        }
+        EngineConnection::RepairNeeded { .. } => {
+            unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+        }
     };
 
     // 8. Workspace name selection.  The user can override; otherwise

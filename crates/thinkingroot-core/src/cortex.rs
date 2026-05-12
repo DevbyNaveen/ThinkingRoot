@@ -108,7 +108,10 @@ pub enum EngineIntent {
 }
 
 /// What `resolve_engine` returns. `Remote` means attach; `InProcess`
-/// means the caller is the daemon now; `Stdio` means bypass cortex.
+/// means the caller is the daemon now; `Stdio` means bypass cortex;
+/// `SpawnRequired` means "the caller should spawn this binary
+/// itself" (desktop owns Child handles); `RepairNeeded` means
+/// install-time prerequisites are missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineConnection {
     /// A healthy daemon is running. The caller should issue HTTP
@@ -119,11 +122,28 @@ pub enum EngineConnection {
         started_by: StartedBy,
         pid: u32,
     },
-    /// No daemon found and `intent == Serve`. Caller should bind the
-    /// listener and call `write_lock` before serving traffic.
+    /// No daemon found and `intent == Serve`. Caller should bind
+    /// the listener and call `write_lock` before serving traffic.
     InProcess,
     /// `intent == McpStdio`. Cortex bypassed entirely.
     Stdio,
+    /// The caller is responsible for spawning this binary (the
+    /// desktop case — sidecar manager retains the `Child` handle
+    /// for graceful shutdown).  CLI never observes this variant
+    /// because `cortex_client::resolve_engine` performs the
+    /// detached spawn itself and returns `Remote` after attach.
+    SpawnRequired {
+        binary_path: std::path::PathBuf,
+        port: u16,
+        host: String,
+    },
+    /// Install-time prerequisites are missing.  Caller surfaces
+    /// these check IDs to the user (CLI: exit non-zero with the
+    /// list; desktop: render blocking panel).  Maps 1:1 to
+    /// `root doctor` check IDs from Slice B.
+    RepairNeeded {
+        failing_check_ids: Vec<String>,
+    },
 }
 
 /// Outcome of probing the daemon's `/livez` endpoint. Used by
@@ -1091,5 +1111,27 @@ mod tests {
             }
             other => panic!("expected Spawn, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn engine_connection_spawn_required_carries_binary_path() {
+        let c = EngineConnection::SpawnRequired {
+            binary_path: std::path::PathBuf::from("/usr/local/bin/root"),
+            port: 31760,
+            host: "127.0.0.1".to_string(),
+        };
+        let repr = format!("{:?}", c);
+        assert!(repr.contains("SpawnRequired"), "got: {repr}");
+        assert!(repr.contains("/usr/local/bin/root"), "got: {repr}");
+    }
+
+    #[test]
+    fn engine_connection_repair_needed_carries_check_ids() {
+        let c = EngineConnection::RepairNeeded {
+            failing_check_ids: vec!["binary.cli.installed".to_string()],
+        };
+        let repr = format!("{:?}", c);
+        assert!(repr.contains("RepairNeeded"), "got: {repr}");
+        assert!(repr.contains("binary.cli.installed"), "got: {repr}");
     }
 }

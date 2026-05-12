@@ -61,6 +61,14 @@ pub async fn run_status(opts: StatusOpts) -> Result<()> {
                 "no running daemon found — start one with `root serve` and retry"
             );
         }
+        EngineConnection::SpawnRequired { .. } => {
+            // Slice C T5/T6 wires this — for now the variant is constructed
+            // only by the new resolve_engine paths under development.
+            unreachable!("SpawnRequired only emitted by desktop's new resolve_engine in T6");
+        }
+        EngineConnection::RepairNeeded { .. } => {
+            unreachable!("RepairNeeded only emitted by T5/T6 once decide() is wired");
+        }
     };
 
     let workspace = match opts.name {
