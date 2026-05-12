@@ -96,6 +96,105 @@ impl InstallManifest {
         let config_dir = dirs::config_dir().ok_or(ManifestError::NoConfigDir)?;
         Ok(config_dir.join("thinkingroot").join("install-manifest.json"))
     }
+
+    /// Persist the manifest atomically. Uses `tempfile::NamedTempFile`
+    /// + `persist`, which is `rename(2)` on POSIX (atomic) and
+    /// `ReplaceFileW` on Windows (atomic). A concurrent reader can
+    /// never observe a torn write.
+    ///
+    /// Serialises concurrent writers via an exclusive `fs2` lock on a
+    /// sibling `install-manifest.json.write` sentinel — mirrors the
+    /// cortex.lock write-serialisation discipline.
+    pub fn save(&self) -> Result<(), ManifestError> {
+        let final_path = Self::path()?;
+        let parent = final_path
+            .parent()
+            .expect("manifest path always has a parent");
+        std::fs::create_dir_all(parent)?;
+
+        // Advisory write lock (sibling sentinel).
+        let sentinel_path = parent.join("install-manifest.json.write");
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sentinel_path)?;
+        fs2::FileExt::lock_exclusive(&sentinel)?;
+
+        // Write to a temp file in the same dir, then atomic-persist.
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        let json = serde_json::to_string_pretty(self)?;
+        {
+            use std::io::Write;
+            let mut handle = tmp.as_file().try_clone()?;
+            handle.write_all(json.as_bytes())?;
+            handle.sync_all()?;
+        }
+        tmp.persist(&final_path)
+            .map_err(|e| ManifestError::Io(e.error))?;
+
+        // Mode 0600 on Unix — manifest may carry path info worth
+        // protecting from other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&final_path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&final_path, perms)?;
+        }
+
+        // Lock drops with `sentinel` going out of scope, but call
+        // unlock explicitly in case a future panic in Drop leaves it
+        // held on platforms where Drop is best-effort.
+        let _ = fs2::FileExt::unlock(&sentinel);
+        Ok(())
+    }
+
+    /// Read the manifest. Returns:
+    /// - `Ok(None)` when the file doesn't exist (clean state) or is
+    ///   empty / unparseable (corrupt-but-recoverable — Slice F's
+    ///   disk-scan recovery picks up from here).
+    /// - `Err(IncompatibleSchema)` when on-disk `schema_version` is
+    ///   newer than this binary supports — silent downgrade risks
+    ///   silent corruption (Honesty Rule #1).
+    pub fn load() -> Result<Option<Self>, ManifestError> {
+        let path = Self::path()?;
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        // Peek schema_version before fully parsing — gives a typed
+        // error for future-schema instead of a generic parse error.
+        #[derive(Deserialize)]
+        struct VersionPeek {
+            schema_version: u32,
+        }
+        let peek: VersionPeek = match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    ?path,
+                    error = %e,
+                    "install manifest corrupt; treating as absent"
+                );
+                return Ok(None);
+            }
+        };
+        if peek.schema_version > SCHEMA_VERSION {
+            return Err(ManifestError::IncompatibleSchema {
+                found: peek.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let manifest: Self = serde_json::from_slice(&bytes)?;
+        Ok(Some(manifest))
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +321,55 @@ mod tests {
             path.parent().unwrap().file_name().unwrap(),
             "thinkingroot"
         );
+    }
+
+    #[test]
+    fn save_writes_atomically_and_load_round_trips() {
+        let _cfg = ConfigDirOverride::new();
+
+        let manifest = InstallManifest {
+            schema_version: SCHEMA_VERSION,
+            binaries: vec![BinaryEntry {
+                id: BinaryId::CliScript,
+                path: std::path::PathBuf::from("/Users/x/.local/bin/root"),
+                version: "0.9.1".to_string(),
+                installed_at: chrono::Utc::now(),
+                checksum_blake3: "deadbeef".repeat(8),
+            }],
+            preferred: Some(BinaryId::CliScript),
+            setup_complete_at: None,
+        };
+
+        manifest.save().expect("save succeeds");
+
+        let on_disk = InstallManifest::path().unwrap();
+        assert!(on_disk.exists(), "manifest file present at {on_disk:?}");
+
+        let loaded = InstallManifest::load()
+            .expect("load succeeds")
+            .expect("manifest present");
+        assert_eq!(loaded, manifest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_mode_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let _cfg = ConfigDirOverride::new();
+
+        let m = InstallManifest {
+            schema_version: SCHEMA_VERSION,
+            binaries: vec![],
+            preferred: None,
+            setup_complete_at: None,
+        };
+        m.save().unwrap();
+
+        let mode = std::fs::metadata(InstallManifest::path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
     }
 }
