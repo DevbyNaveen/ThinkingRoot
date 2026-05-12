@@ -17,6 +17,7 @@ pub fn run_all(env: &DoctorEnv) -> Vec<CheckResult> {
         binary_cli_on_path(env),
         config_dir_writable(env),
         credentials_any_provider(env),
+        daemon_lockfile_parseable(env),
     ]
 }
 
@@ -164,6 +165,64 @@ pub fn credentials_any_provider(env: &DoctorEnv) -> CheckResult {
                 command: "root provider add".into(),
             }),
         }
+    }
+}
+
+/// Is `cortex.lock` either absent or well-formed JSON?
+/// Status: `Ok` (absent OR valid) / `Warn` (corrupt; Slice F self-heals).
+pub fn daemon_lockfile_parseable(env: &DoctorEnv) -> CheckResult {
+    let lock_path = env.config_dir.join("cortex.lock");
+    if !lock_path.exists() {
+        return CheckResult {
+            id: CheckId::from_static("daemon.lockfile.parseable"),
+            label: "Daemon lockfile state".into(),
+            status: CheckStatus::Ok,
+            detail: "no daemon running (lockfile absent)".into(),
+            fix: None,
+        };
+    }
+    let bytes = match std::fs::read(&lock_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return CheckResult {
+                id: CheckId::from_static("daemon.lockfile.parseable"),
+                label: "Daemon lockfile state".into(),
+                status: CheckStatus::Warn,
+                detail: format!("lockfile read failed: {e}"),
+                fix: Some(FixAction::ShellHint {
+                    command: format!("rm {}", lock_path.display()),
+                }),
+            };
+        }
+    };
+    if bytes.is_empty() {
+        return CheckResult {
+            id: CheckId::from_static("daemon.lockfile.parseable"),
+            label: "Daemon lockfile state".into(),
+            status: CheckStatus::Warn,
+            detail: "lockfile empty".into(),
+            fix: Some(FixAction::ShellHint {
+                command: format!("rm {}", lock_path.display()),
+            }),
+        };
+    }
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(_) => CheckResult {
+            id: CheckId::from_static("daemon.lockfile.parseable"),
+            label: "Daemon lockfile state".into(),
+            status: CheckStatus::Ok,
+            detail: "lockfile present and parseable".into(),
+            fix: None,
+        },
+        Err(_) => CheckResult {
+            id: CheckId::from_static("daemon.lockfile.parseable"),
+            label: "Daemon lockfile state".into(),
+            status: CheckStatus::Warn,
+            detail: "lockfile is not valid JSON".into(),
+            fix: Some(FixAction::ShellHint {
+                command: format!("rm {}", lock_path.display()),
+            }),
+        },
     }
 }
 
@@ -316,5 +375,30 @@ mod tests {
             r.fix,
             Some(FixAction::RunCommand { ref command }) if command.contains("provider add")
         ));
+    }
+
+    #[test]
+    fn daemon_lockfile_parseable_ok_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_lockfile_parseable(&env);
+        assert_eq!(r.status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn daemon_lockfile_parseable_warn_when_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("cortex.lock"), b"not json").unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = daemon_lockfile_parseable(&env);
+        assert_eq!(r.status, CheckStatus::Warn);
     }
 }
