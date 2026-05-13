@@ -26,7 +26,6 @@ use thinkingroot_core::types::{
     Claim, ClaimType, ContentHash, Source, SourceSpan, TrustLevel, WorkspaceId,
 };
 use thinkingroot_extract::ExtractionOutput;
-use thinkingroot_extract::router::{Tier, classify};
 use thinkingroot_extract::structural::extract_structural;
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
@@ -94,22 +93,26 @@ fn run_structural_pipeline_into(
             .expect("byte_store.put");
     }
 
-    // Structural-tier extraction → ExtractionOutput. We bypass the
-    // linker (it requires an entity-graph round-trip the test
-    // doesn't need) and instead build the Claims directly so Phase 6.7
-    // can stamp `content_blake3` onto them. The claims aren't actually
-    // inserted into CozoDB by this test — that means code_signatures /
-    // function_calls / doc_tags rows will have empty `claim_id` strings,
-    // which is fine for Phase 9 (it audits byte ranges, not foreign
-    // keys).
+    // Structural extraction → ExtractionOutput. We bypass the linker
+    // (it requires an entity-graph round-trip the test doesn't need)
+    // and instead build the Claims directly so Phase 6.7 can stamp
+    // `content_blake3` onto them. The claims aren't actually inserted
+    // into CozoDB by this test — that means code_signatures /
+    // function_calls / doc_tags rows will have empty `claim_id`
+    // strings, which is fine for Phase 9 (it audits byte ranges, not
+    // foreign keys).
+    //
+    // Post-Witness-Mesh-cutover (2026-05-11): every chunk runs through
+    // structural extraction unconditionally; the legacy `Tier::Llm` /
+    // `router::classify` gate was deleted alongside the LLM-batch
+    // extraction path. `extract_structural` itself is a no-op for
+    // chunks it doesn't recognise, so the change is behaviour-
+    // preserving for the canonical fixture.
     let workspace_id = WorkspaceId::new();
     let mut extraction = ExtractionOutput::default();
     extraction.sources_processed = docs.len();
     for doc in &docs {
         for chunk in &doc.chunks {
-            if classify(chunk) != Tier::Structural {
-                continue;
-            }
             let result = extract_structural(chunk, &doc.uri);
             for ext_claim in result.claims {
                 let claim_type = map_claim_type(&ext_claim.claim_type);
