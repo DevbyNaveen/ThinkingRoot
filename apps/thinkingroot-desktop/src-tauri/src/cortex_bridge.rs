@@ -166,7 +166,7 @@ pub async fn resolve_engine(intent: EngineIntent) -> Result<EngineConnection, Br
 /// no usable entries — `decide()` then surfaces `RepairNeeded` for
 /// spawn intents, surfacing the user-visible "run `root doctor`"
 /// signal in the blocking-panel UI (Slice D).
-fn load_preferred_or_extant_binary() -> Option<PathBuf> {
+pub fn load_preferred_or_extant_binary() -> Option<PathBuf> {
     let from_manifest = match InstallManifest::load() {
         Ok(Some(manifest)) => {
             // First try the preferred pointer, but only if the file

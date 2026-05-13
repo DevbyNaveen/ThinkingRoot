@@ -165,6 +165,8 @@ pub fn run() {
             commands::cloud::cloud_refresh_me,
             commands::cloud::cloud_credits_poll,
             commands::cloud::cloud_open_upgrade,
+            commands::cloud::cloud_push_workspace,
+            commands::cloud::cloud_pull_pack,
             commands::conversations::conversations_list,
             commands::conversations::conversations_create,
             commands::conversations::conversations_get,

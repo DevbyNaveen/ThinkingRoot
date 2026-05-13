@@ -275,3 +275,78 @@ pub async fn cloud_open_upgrade(app: AppHandle) -> Result<(), String> {
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
 }
+
+// ─── Packs (push / pull) ────────────────────────────────────────────
+//
+// Both commands subprocess into the resolved `root` binary (manifest →
+// env override → PATH fallback, mirroring cortex_bridge's discipline).
+// Honesty rule: failures surface as `PackOpResult { success: false,
+// error: Some(stderr) }` so the UI never claims a push happened when
+// stderr says otherwise.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PackOpResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn cloud_push_workspace(
+    workspace_path: String,
+    visibility: Option<String>,
+) -> Result<PackOpResult, String> {
+    let bin = crate::cortex_bridge::load_preferred_or_extant_binary()
+        .ok_or_else(|| "no root binary found".to_string())?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("push").arg(&workspace_path);
+    if let Some(v) = visibility {
+        cmd.arg("--visibility").arg(v);
+    }
+    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
+        Ok(PackOpResult {
+            success: true,
+            output: stdout,
+            error: None,
+        })
+    } else {
+        Ok(PackOpResult {
+            success: false,
+            output: stdout,
+            error: Some(stderr),
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn cloud_pull_pack(
+    pack_ref: String,
+    target_dir: Option<String>,
+) -> Result<PackOpResult, String> {
+    let bin = crate::cortex_bridge::load_preferred_or_extant_binary()
+        .ok_or_else(|| "no root binary found".to_string())?;
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("pull").arg(&pack_ref);
+    if let Some(t) = target_dir {
+        cmd.arg("--target").arg(t);
+    }
+    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
+        Ok(PackOpResult {
+            success: true,
+            output: stdout,
+            error: None,
+        })
+    } else {
+        Ok(PackOpResult {
+            success: false,
+            output: stdout,
+            error: Some(stderr),
+        })
+    }
+}

@@ -1520,6 +1520,30 @@ export const cloudRefreshMe = (): Promise<AuthState> => invoke("cloud_refresh_me
 export const cloudCreditsPoll = (): Promise<CreditsSnapshot> => invoke("cloud_credits_poll");
 export const cloudOpenUpgrade = (): Promise<void> => invoke("cloud_open_upgrade");
 
+// ─── Cloud packs (push / pull) ───────────────────────────────────────
+//
+// Subprocess wrappers around `root push` and `root pull` exposed as
+// Tauri commands. `PackOpResult.error` is `null` on success and
+// carries stderr on failure — the UI renders either path honestly.
+
+export interface PackOpResult {
+  success: boolean;
+  output: string;
+  error?: string | null;
+}
+
+export const cloudPushWorkspace = (
+  workspacePath: string,
+  visibility?: "public" | "private",
+): Promise<PackOpResult> =>
+  invoke("cloud_push_workspace", { workspacePath, visibility });
+
+export const cloudPullPack = (
+  packRef: string,
+  targetDir?: string,
+): Promise<PackOpResult> =>
+  invoke("cloud_pull_pack", { packRef, targetDir });
+
 // ─── Embedded terminal (PTY) ─────────────────────────────────────────
 //
 // Mirror of `apps/.../src-tauri/src/commands/terminal.rs`. Each method
