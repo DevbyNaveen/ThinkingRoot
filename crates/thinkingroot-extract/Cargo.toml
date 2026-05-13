@@ -49,4 +49,10 @@ phf = { version = "0.11", features = ["macros"] }
 toml = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+thinkingroot-cloud-auth = { workspace = true }
+thinkingroot-core = { workspace = true, features = ["test-helpers"] }
+axum = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
