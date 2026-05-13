@@ -6386,6 +6386,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thinkingroot-cloud-auth",
  "thinkingroot-core",
  "thinkingroot-parse",
  "thiserror 2.0.18",

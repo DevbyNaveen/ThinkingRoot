@@ -510,6 +510,27 @@ enum Provider {
     OpenAi(OpenAiProvider),
     Anthropic(AnthropicProvider),
     Ollama(OllamaProvider),
+    /// ThinkingRoot Cloud managed-model provider. Bearer token is
+    /// sourced from `~/.config/thinkingroot/auth.json` at request
+    /// time — no inline `api_key` field. When auth.json is absent or
+    /// `token` is empty, calls return [`Error::NotLoggedIn`].
+    ///
+    /// Wire format is OpenAI Chat Completions compatible (spec §6.2);
+    /// the request envelope reuses [`send_openai_compat`] against
+    /// `{server}/v1/chat/completions`. Full header-parsing +
+    /// 401/402/403/429/5xx error mapping lands in Slice 2 Task 4.
+    /// Today the arm returns Ok on 2xx and falls back to the generic
+    /// [`Error::LlmProvider`] path on non-2xx.
+    ///
+    /// `#[allow(dead_code)]` is on the variant until Slice 2 Task 5
+    /// teaches `LlmClient::new` to construct it from
+    /// `[llm].default_provider = "thinkingroot-cloud"`. The match
+    /// arms and the struct are already exercised by direct construction
+    /// in the matching tests.
+    ///
+    /// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.1.
+    #[allow(dead_code)]
+    CloudManaged(CloudManagedProvider),
     /// No-op provider used when no LLM is configured and the extractor falls
     /// back to structural-only (Tier 0) extraction.  `chat` and
     /// `extract_batch_raw` are never called when `llm_work` is empty, but
@@ -526,6 +547,7 @@ impl Provider {
             Provider::OpenAi(p) => p.chat(system, user).await,
             Provider::Anthropic(p) => p.chat(system, user).await,
             Provider::Ollama(p) => p.chat(system, user).await,
+            Provider::CloudManaged(p) => p.chat(system, user).await,
             Provider::StructuralOnly => Err(thinkingroot_core::Error::MissingConfig(
                 "structural-only extractor cannot make LLM calls".into(),
             )),
@@ -548,6 +570,7 @@ impl Provider {
             // any OpenAI-compatible host) — one SSE parser unlocks
             // them all.
             Provider::OpenAi(p) => p.chat_stream(system, user).await,
+            Provider::CloudManaged(p) => p.chat_stream(system, user).await,
             // Bedrock and Ollama fall through to the one-shot wrap —
             // their native streaming APIs (InvokeModelWithResponseStream
             // / NDJSON) follow different shapes and aren't load-bearing
@@ -578,6 +601,7 @@ impl Provider {
             Provider::OpenAi(p) => &p.model,
             Provider::Anthropic(p) => &p.model,
             Provider::Ollama(p) => &p.model,
+            Provider::CloudManaged(p) => &p.model,
             Provider::StructuralOnly => "structural-only",
         }
     }
@@ -589,6 +613,7 @@ impl Provider {
             Provider::OpenAi(p) => p.provider_name.as_str(),
             Provider::Anthropic(_) => "anthropic",
             Provider::Ollama(_) => "ollama",
+            Provider::CloudManaged(_) => "thinkingroot-cloud",
             Provider::StructuralOnly => "structural-only",
         }
     }
@@ -623,6 +648,10 @@ impl Provider {
                     .await
             }
             Provider::Ollama(p) => {
+                p.chat_with_tools(system, messages, tools, tool_choice)
+                    .await
+            }
+            Provider::CloudManaged(p) => {
                 p.chat_with_tools(system, messages, tools, tool_choice)
                     .await
             }
@@ -1640,6 +1669,317 @@ impl OpenAiProvider {
             message: e.to_string(),
         })?;
         parse_openai_tool_response(&json, limits, &self.provider_name)
+    }
+}
+
+// ── ThinkingRoot Cloud Managed Provider (Slice 2 Task 3) ─────────
+//
+// Wire format is OpenAI Chat Completions compatible (spec §6.2), so
+// the three call paths (chat / chat_stream / chat_with_tools) reuse
+// `send_openai_compat` against `{server}/v1/chat/completions` exactly
+// like `OpenAiProvider` does — only the token source differs.
+//
+// Token lookup is done at REQUEST time via
+// `thinkingroot_cloud_auth::config::load()`, not at construction
+// time. Three reasons:
+//
+//  1. `root login` rotates the token in-place via
+//     `cloud_auth::config::update`. Caching the token at struct
+//     construction would force users to restart the daemon after
+//     login — a regression vs the BYOK keyring-watch path.
+//  2. `cloud_auth::config::load` returns the typed `CloudError` ladder
+//     (IncompatibleSchema, Io, JsonParse, …); we collapse all of
+//     them to `Error::NotLoggedIn` for the caller because the user's
+//     remediation is identical ("run `root login`"). Slice 2 Task 4
+//     refines this with a typed mapping.
+//  3. Cost is one ~150-byte file read per LLM dispatch — negligible
+//     next to the LLM round-trip itself.
+//
+// Full HTTP status mapping (401 → AuthExpired, 402 → CreditsExhausted,
+// etc.) lands in Slice 2 Task 4. For now non-2xx falls back to the
+// generic `Error::LlmProvider` path so the variant compiles and
+// users see a real error message instead of a panic.
+//
+// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.1 + §6.3.
+
+struct CloudManagedProvider {
+    client: reqwest::Client,
+    /// User-facing model name (e.g. `claude-3-5-sonnet-20241022`).
+    /// Forwarded verbatim in the `model` field of the request body.
+    model: String,
+    /// Cloud API base URL — typically `https://api.thinkingroot.dev`.
+    /// Stored without a trailing slash so the per-request format
+    /// string can append `/v1/chat/completions` deterministically.
+    server: String,
+    max_output_tokens: i32,
+}
+
+impl CloudManagedProvider {
+    #[allow(dead_code)] // wired into LlmClient::new in Slice 2 Task 5
+    fn new(model: &str, server: &str, timeout_secs: u64) -> Result<Self> {
+        let max_output_tokens = model_max_output_tokens(model);
+        let server = server.trim_end_matches('/').to_string();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| Error::LlmProvider {
+                provider: "thinkingroot-cloud".into(),
+                message: format!("reqwest client build failed: {e}"),
+            })?;
+        Ok(Self {
+            client,
+            model: model.to_string(),
+            server,
+            max_output_tokens,
+        })
+    }
+
+    /// Load the bearer token from `~/.config/thinkingroot/auth.json`.
+    /// Any failure mode (file absent, empty token, IO error, parse
+    /// error, schema mismatch) collapses to [`Error::NotLoggedIn`]
+    /// — the user's remediation is the same in every case (`root login`).
+    /// Task 4 refines this with a typed mapping.
+    fn bearer_token() -> Result<String> {
+        let cfg = thinkingroot_cloud_auth::config::load()
+            .map_err(|_| Error::NotLoggedIn)?
+            .ok_or(Error::NotLoggedIn)?;
+        match cfg.token {
+            Some(t) if !t.is_empty() => Ok(t),
+            _ => Err(Error::NotLoggedIn),
+        }
+    }
+
+    async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
+        let token = Self::bearer_token()?;
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            "temperature": 0.1,
+        });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let url = format!("{}/v1/chat/completions", self.server);
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &token,
+                provider: "thinkingroot-cloud",
+                body: &body,
+                extra_headers: Vec::new(),
+            },
+        )
+        .await?;
+
+        // Rate-limit and detailed status mapping land in Task 4. For
+        // now we surface the generic LlmProvider fallback on non-2xx
+        // so users see a real error message rather than the variant
+        // silently swallowing failures.
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider: "thinkingroot-cloud".into(),
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| Error::LlmProvider {
+            provider: "thinkingroot-cloud".into(),
+            message: e.to_string(),
+        })?;
+
+        let finish_reason = json["choices"][0]["finish_reason"].as_str().unwrap_or("");
+        let truncated = finish_reason == "length";
+        if truncated {
+            tracing::warn!(
+                "thinkingroot-cloud: output truncated for model {} (finish_reason=length, max_tokens={})",
+                self.model,
+                self.max_output_tokens
+            );
+        }
+
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| ChatOutput {
+                text: s.to_string(),
+                truncated,
+                limits,
+            })
+            .ok_or_else(|| Error::LlmProvider {
+                provider: "thinkingroot-cloud".into(),
+                message: format!("unexpected response: {json}"),
+            })
+    }
+
+    async fn chat_stream(&self, system: &str, user: &str) -> Result<ChatStream> {
+        use eventsource_stream::Eventsource;
+        use futures::StreamExt;
+
+        let token = Self::bearer_token()?;
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            "temperature": 0.1,
+            "stream": true,
+        });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let url = format!("{}/v1/chat/completions", self.server);
+        let provider = "thinkingroot-cloud".to_string();
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &token,
+                provider: &provider,
+                body: &body,
+                extra_headers: vec![("accept", "text/event-stream")],
+            },
+        )
+        .await?;
+
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider,
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+        let mut events = resp.bytes_stream().eventsource();
+        let provider_for_stream = provider.clone();
+
+        let stream = async_stream::stream! {
+            let mut truncated = false;
+            while let Some(item) = events.next().await {
+                match item {
+                    Err(e) => {
+                        yield Err(Error::LlmProvider {
+                            provider: provider_for_stream.clone(),
+                            message: format!("sse parse: {e}"),
+                        });
+                        return;
+                    }
+                    Ok(ev) => {
+                        if ev.data == "[DONE]" {
+                            yield Ok(ChatChunk {
+                                text: String::new(),
+                                finish: Some(ChatFinish {
+                                    truncated,
+                                    limits: limits.clone(),
+                                }),
+                            });
+                            return;
+                        }
+                        let json: serde_json::Value =
+                            match serde_json::from_str(&ev.data) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    yield Err(Error::LlmProvider {
+                                        provider: provider_for_stream.clone(),
+                                        message: format!("decode delta: {e}"),
+                                    });
+                                    return;
+                                }
+                            };
+                        let choice = &json["choices"][0];
+                        if let Some(text) = choice["delta"]["content"].as_str()
+                            && !text.is_empty()
+                        {
+                            yield Ok(ChatChunk {
+                                text: text.to_string(),
+                                finish: None,
+                            });
+                        }
+                        if choice["finish_reason"].as_str() == Some("length") {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
+            // Best-effort terminal chunk if upstream closes without [DONE].
+            yield Ok(ChatChunk {
+                text: String::new(),
+                finish: Some(ChatFinish {
+                    truncated,
+                    limits: limits.clone(),
+                }),
+            });
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn chat_with_tools(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[Tool],
+        tool_choice: &ToolChoice,
+    ) -> Result<ToolUseResponse> {
+        let token = Self::bearer_token()?;
+        let uses_new_param = requires_max_completion_tokens(&self.model);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": openai_messages_array(system, messages),
+            "tools": openai_tools_array(tools),
+            "tool_choice": openai_tool_choice(tool_choice),
+            "temperature": 0.1,
+        });
+        if uses_new_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let url = format!("{}/v1/chat/completions", self.server);
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &token,
+                provider: "thinkingroot-cloud",
+                body: &body,
+                extra_headers: Vec::new(),
+            },
+        )
+        .await?;
+
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::LlmProvider {
+                provider: "thinkingroot-cloud".into(),
+                message: format!("http {s}: {body}"),
+            });
+        }
+
+        let limits = HeaderRateLimits::from_headers(resp.headers());
+        let json: serde_json::Value = resp.json().await.map_err(|e| Error::LlmProvider {
+            provider: "thinkingroot-cloud".into(),
+            message: e.to_string(),
+        })?;
+        parse_openai_tool_response(&json, limits, "thinkingroot-cloud")
     }
 }
 
