@@ -17,6 +17,10 @@ fn use_temp_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+// ENV_GUARD must be held for the test's lifetime to keep HOME/XDG
+// pointing at this test's tempdir; clippy's await-holding-lock advice
+// is too generic here. Matches the pattern in browser_flow_smoke.rs.
+#[allow(clippy::await_holding_lock)]
 async fn twenty_concurrent_updates_leave_file_consistent() {
     let (_home, _guard) = use_temp_home();
 
