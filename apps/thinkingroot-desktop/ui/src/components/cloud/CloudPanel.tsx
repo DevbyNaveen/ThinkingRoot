@@ -1,16 +1,27 @@
 import { useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { CloudOff, LogIn, LogOut, Loader2, RefreshCw } from "lucide-react";
+import {
+  CloudOff,
+  Download,
+  LogIn,
+  LogOut,
+  Loader2,
+  RefreshCw,
+  Send,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
   type AuthState,
   type CloudStatusEventPayload,
+  type PackOpResult,
   CLOUD_STATUS_EVENT,
   authState,
   cloudCreditsPoll,
   cloudLoginStart,
   cloudLogout,
+  cloudPullPack,
+  cloudPushWorkspace,
   cloudRefreshMe,
 } from "@/lib/tauri";
 
@@ -37,6 +48,41 @@ const POLL_INTERVAL_MS = 60_000;
 export function CloudPanel() {
   const [ui, setUi] = useState<UiState>({ kind: "loading" });
   const [error, setError] = useState<string | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushResult, setPushResult] = useState<PackOpResult | null>(null);
+  const [pullRef, setPullRef] = useState("");
+  const [pullBusy, setPullBusy] = useState(false);
+  const [pullResult, setPullResult] = useState<PackOpResult | null>(null);
+
+  const onPush = async () => {
+    setPushBusy(true);
+    setPushResult(null);
+    try {
+      // Use the desktop's current working directory as the workspace
+      // path. The Tauri subprocess inherits the parent process's cwd
+      // when no explicit path is passed; "." resolves there.
+      const r = await cloudPushWorkspace(".");
+      setPushResult(r);
+    } catch (e) {
+      setPushResult({ success: false, output: "", error: String(e) });
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const onPull = async () => {
+    if (!pullRef.trim()) return;
+    setPullBusy(true);
+    setPullResult(null);
+    try {
+      const r = await cloudPullPack(pullRef.trim());
+      setPullResult(r);
+    } catch (e) {
+      setPullResult({ success: false, output: "", error: String(e) });
+    } finally {
+      setPullBusy(false);
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -202,6 +248,84 @@ export function CloudPanel() {
         <Button variant="outline" size="sm" onClick={() => cloudLogout()} className="gap-2">
           <LogOut className="h-3 w-3" /> Sign out
         </Button>
+      </div>
+
+      {/*
+       * Packs section — subprocesses into `root push` / `root pull`
+       * via the cloud_push_workspace / cloud_pull_pack Tauri
+       * commands. Honest UX: stderr is surfaced verbatim on failure;
+       * no fabricated "last pushed N ago" timestamps (those need a
+       * hub-side endpoint that does not exist yet).
+       */}
+      <div className="rounded-md border p-3 text-sm space-y-3">
+        <p className="font-medium">Packs</p>
+
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onPush}
+            disabled={pushBusy}
+            className="gap-1.5"
+          >
+            {pushBusy ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Send className="h-3 w-3" />
+            )}
+            Push this workspace
+          </Button>
+        </div>
+        {pushResult && (
+          <p
+            className={
+              pushResult.success
+                ? "text-xs text-green-600"
+                : "text-xs text-destructive"
+            }
+          >
+            {pushResult.success
+              ? "Pushed."
+              : `Push failed: ${pushResult.error ?? "unknown"}`}
+          </p>
+        )}
+
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            placeholder="owner/slug or owner/slug@version"
+            value={pullRef}
+            onChange={(e) => setPullRef(e.target.value)}
+            className="flex-1 px-2 py-1 border rounded text-xs"
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={onPull}
+            disabled={pullBusy || !pullRef.trim()}
+            className="gap-1.5"
+          >
+            {pullBusy ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Download className="h-3 w-3" />
+            )}
+            Pull
+          </Button>
+        </div>
+        {pullResult && (
+          <p
+            className={
+              pullResult.success
+                ? "text-xs text-green-600"
+                : "text-xs text-destructive"
+            }
+          >
+            {pullResult.success
+              ? "Pulled."
+              : `Pull failed: ${pullResult.error ?? "unknown"}`}
+          </p>
+        )}
       </div>
     </section>
   );
