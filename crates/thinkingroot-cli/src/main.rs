@@ -113,6 +113,13 @@ enum Commands {
         /// is wanted without nuking `.thinkingroot/` first.
         #[arg(long)]
         no_incremental: bool,
+        /// Offload the compile to ThinkingRoot Cloud GPUs. Requires a
+        /// signed-in session (`root login`). Streams progress; downloads
+        /// the result pack; mounts locally. Internally delegates to the
+        /// `publish` flow with visibility: Private. Mutually exclusive
+        /// with `--watch` (cloud compile is one-shot).
+        #[arg(long)]
+        cloud: bool,
     },
     /// Show the knowledge health score
     Health {
@@ -1407,7 +1414,34 @@ async fn async_main() -> anyhow::Result<()> {
             watch,
             debounce,
             no_incremental,
+            cloud,
         }) => {
+            if cloud {
+                // `--cloud` offloads to the hub's compile-worker. The
+                // current implementation delegates to `publish::run`
+                // with visibility: Private. A future enhancement may
+                // add `register_pack: false` so cloud compile downloads
+                // the result without registering a publicly-visible
+                // pack (spec §2 punch-list item).
+                if watch {
+                    anyhow::bail!(
+                        "--cloud is mutually exclusive with --watch (cloud compile is one-shot)"
+                    );
+                }
+                println!(
+                    "{} offloading compile to ThinkingRoot Cloud",
+                    console::style("→").cyan()
+                );
+                cloud::publish::run(
+                    path,
+                    /* wait */ true,
+                    /* timeout */ 600,
+                    /* server */ None,
+                    /* visibility */ Some(cloud::publish::Visibility::Private),
+                )
+                .await?;
+                return Ok(());
+            }
             // Cortex Protocol: prefer the daemon. Falls back to
             // in-process on `--in-process` or daemon error.
             if let Some(conn) = try_resolve_remote(in_process_flag).await {
