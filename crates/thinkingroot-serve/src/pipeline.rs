@@ -714,63 +714,16 @@ async fn run_pipeline_inner(
         cache_hits = 0;
         extraction = thinkingroot_extract::ExtractionOutput::default();
     } else {
-        let extractor = {
-            // Open the in-flight checkpoint log under <data_dir>.  If
-            // a previous run was interrupted mid-extract, the loader
-            // surfaces those completed batches so the resume path can
-            // log "resuming from N batches" without redoing them
-            // (correctness is provided by the per-chunk content cache;
-            // the checkpoint adds attribution + observability).
-            let e = thinkingroot_extract::Extractor::new(&config)
-                .await?
-                .with_cache_dir(&data_dir)
-                .with_cancel(cancel.clone())
-                .with_checkpoint(&data_dir)?;
-            if let Some(ref tx) = progress {
-                let tx_chunk = tx.clone();
-                let pf = Arc::new(
-                    move |event: thinkingroot_extract::ExtractionProgressEvent| {
-                        let progress_event = match event {
-                            thinkingroot_extract::ExtractionProgressEvent::Start {
-                                total_chunks,
-                                batch_size,
-                                total_batches,
-                            } => ProgressEvent::ExtractionStart {
-                                total_chunks,
-                                batch_size,
-                                total_batches,
-                            },
-                            thinkingroot_extract::ExtractionProgressEvent::BatchStart {
-                                batch_index,
-                                total_batches,
-                                range_start,
-                                range_end,
-                                batch_chunks,
-                            } => ProgressEvent::ExtractionBatchStart {
-                                batch_index,
-                                total_batches,
-                                range_start,
-                                range_end,
-                                batch_chunks,
-                            },
-                            thinkingroot_extract::ExtractionProgressEvent::ChunkDone {
-                                done,
-                                total,
-                                source_uri,
-                            } => ProgressEvent::ChunkDone {
-                                done,
-                                total,
-                                source_uri,
-                            },
-                        };
-                        let _ = tx_chunk.send(progress_event);
-                    },
-                ) as thinkingroot_extract::ChunkProgressFn;
-                e.with_progress(pf)
-            } else {
-                e
-            }
-        };
+        // Witness Mesh era (2026-05-14): the extractor carries no
+        // progress callback, cache, checkpoint, or cancellation handle
+        // — structural extraction is pure CPU and runs in microseconds
+        // per chunk. Cancellation is checked at pipeline phase
+        // boundaries, not inside the extractor. The
+        // `ProgressEvent::ExtractionStart` / `ExtractionBatchStart` /
+        // `ChunkDone` SSE variants remain on `ProgressEvent` for
+        // wire-format stability but are no longer emitted from the
+        // extract phase.
+        let extractor = thinkingroot_extract::Extractor::new(&config).await?;
         // Source-granular re-extraction (T12).  When incremental cutoffs are
         // enabled, restrict extraction to the `potentially_changed` set only —
         // these are the documents that failed the Phase 1 content-hash check.

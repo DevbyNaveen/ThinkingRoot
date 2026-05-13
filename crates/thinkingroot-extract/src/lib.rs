@@ -42,7 +42,7 @@ pub mod structural;
 pub mod test_assertions;
 pub mod witness_mesh;
 
-pub use extractor::{ChunkProgressFn, ExtractionOutput, ExtractionProgressEvent, Extractor};
+pub use extractor::{ExtractionOutput, Extractor};
 pub use rule_catalog::{
     CATALOG_VERSION, RULE_CATALOG, RuleDescriptor, rule_catalog_toml,
 };

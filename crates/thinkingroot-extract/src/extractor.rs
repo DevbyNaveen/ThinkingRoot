@@ -1,15 +1,4 @@
-// Many LLM-batch-era fields + methods on `Extractor` are now
-// unreachable post-Witness-Mesh cutover. They are kept for struct
-// stability during the dual-write transition; a follow-up session
-// removes them entirely when `extractor.rs` is fully rewritten to
-// drop the LlmClient handle. `#![allow(dead_code)]` suppresses the
-// transitional warnings without hiding genuine issues — every new
-// edit in this file should still treat unused-code warnings as bugs.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 use thinkingroot_core::Result;
 use thinkingroot_core::config::Config;
@@ -22,56 +11,6 @@ use thinkingroot_core::types::*;
 // metadata.
 use crate::schema::ExtractionResult;
 
-
-/// **Deprecated** — pre-cutover this was the fallback batch size for
-/// LLM dispatch. Witness Mesh has no batches. Kept as `pub const` for
-/// source-compat with the few legacy tests that import the symbol.
-pub const EXTRACTION_BATCH_SIZE: usize = 6;
-
-/// Progress events emitted by the extractor so the CLI can render a live,
-/// batch-aware extraction bar without compromising batch size.
-#[derive(Debug, Clone)]
-pub enum ExtractionProgressEvent {
-    /// Extraction is ready to begin.
-    Start {
-        total_chunks: usize,
-        batch_size: usize,
-        total_batches: usize,
-    },
-    /// A new LLM batch has started running.
-    BatchStart {
-        batch_index: usize,
-        total_batches: usize,
-        range_start: usize,
-        range_end: usize,
-        batch_chunks: usize,
-    },
-    /// One original chunk finished (cache hit or completed LLM batch result).
-    ChunkDone {
-        done: usize,
-        total: usize,
-        source_uri: String,
-    },
-}
-
-/// Callback fired for extractor progress updates.
-pub type ChunkProgressFn = Arc<dyn Fn(ExtractionProgressEvent) + Send + Sync>;
-
-/// Metadata that flows alongside each spawned batch's success result.
-/// Captured at spawn time so the collect loop can record the batch in
-/// the in-flight checkpoint log without re-deriving the batch's
-/// position.  `batch_idx` mirrors the 0-indexed slot used by
-/// `llm_work.chunks(batch_size).enumerate()`; the `range_*` fields
-/// are 1-indexed inclusive chunk numbers (same vocabulary as
-/// `ProgressEvent::ExtractionBatchStart`).
-#[derive(Debug, Clone, Copy)]
-struct BatchMeta {
-    batch_idx: usize,
-    range_start: usize,
-    range_end: usize,
-    batch_chunks: usize,
-}
-
 /// The main extraction engine. Takes DocumentIRs and produces
 /// Claims, Entities, and Relations via structural extraction (Witness
 /// Mesh era — no LLM, no batches, no scheduler). Constructed by
@@ -79,14 +18,16 @@ struct BatchMeta {
 /// chunk via `extract_all`.
 pub struct Extractor {
     min_confidence: f64,
-    progress: Option<ChunkProgressFn>,
-    /// Cancellation token consulted between phases in `extract_all`.
-    /// `None` = opt-out (test callers). The pipeline orchestrator
-    /// installs one via `with_cancel`.
-    cancel: Option<CancellationToken>,
 }
 
 /// The combined output of extraction across all documents.
+///
+/// The `cache_hits`, `failed_batches`, `failed_batch_ranges`, and
+/// `claim_source_quotes` fields are LLM-batch-era counters that the
+/// Witness Mesh path never populates — they remain on the struct
+/// because `PipelineResult` (a wire type consumed by the CLI, REST,
+/// and the desktop) reads them. Always 0 / empty in the post-cutover
+/// world.
 #[derive(Debug, Default)]
 pub struct ExtractionOutput {
     pub claims: Vec<Claim>,
@@ -98,27 +39,23 @@ pub struct ExtractionOutput {
     pub sources_processed: usize,
     pub chunks_processed: usize,
     /// Chunks served from the content-addressable extraction cache (no LLM call made).
+    /// Always 0 post-cutover; retained for wire-compat with `PipelineResult`.
     pub cache_hits: usize,
     /// Chunks extracted via structural (Tier 0) extraction — no LLM call made.
     pub structural_extractions: usize,
-    /// Maps SourceId → the raw source text that was sent to the LLM.
-    /// Used by the grounding system to verify claims against source.
+    /// Maps SourceId → the raw source text seen by extraction. Used
+    /// by legacy AEP `source_authority` joins that reference the
+    /// full source text by source id.
     pub source_texts: HashMap<SourceId, String>,
-    /// Maps ClaimId → the LLM's cited source_quote for that claim.
-    /// Used by Judge 2 (span attribution) in the grounding system.
+    /// Maps ClaimId → an LLM-era citation quote. Always empty
+    /// post-cutover; retained for wire-compat with `PipelineResult`.
     pub claim_source_quotes: HashMap<ClaimId, String>,
-    /// Number of LLM batches that exhausted retries and produced no
-    /// claims.  Pre-fix these failures were silently dropped: the
-    /// orchestrator reported "extraction complete" with claims missing.
-    /// Surfaced to callers so the CLI / desktop can render a partial-
-    /// failure warning, and so the next compile knows which chunks to
-    /// re-target.
+    /// LLM-batch-era partial-failure counter. Always 0 post-cutover;
+    /// retained for wire-compat with `PipelineResult` + the
+    /// `ProgressEvent::ExtractionPartial` SSE event shape.
     pub failed_batches: usize,
-    /// `(range_start, range_end)` chunk-index ranges (1-indexed,
-    /// inclusive) of every batch that failed permanently.  Mirrors the
-    /// shape of `ProgressEvent::ExtractionBatchStart::range_*` so a
-    /// single user-visible vocabulary describes both states.  Empty
-    /// when `failed_batches == 0`.
+    /// LLM-batch-era partial-failure detail. Always empty post-cutover;
+    /// retained for wire-compat with `PipelineResult`.
     pub failed_batch_ranges: Vec<(usize, usize)>,
     // ─── Compile Completeness Contract §5 — decorations carried to Phase 6.7
     /// Per-claim quantity rows extracted from the claim's statement.
@@ -139,10 +76,7 @@ pub struct ExtractionOutput {
     /// extractors (`comment_claims`, `parse_doc_rules`,
     /// `test_assertions`, `lsp_rules`). Populated by
     /// `Extractor::collect_witnesses_from_documents`, called from
-    /// `extract_all` after the existing claim extraction. Empty when
-    /// the caller has not opted into the Witness Mesh pass (the
-    /// pipeline integration runs it unconditionally; tests that
-    /// only exercise the claim path may leave this empty).
+    /// `extract_all` after the existing claim extraction.
     pub witnesses: Vec<thinkingroot_core::types::Witness>,
 }
 
@@ -156,11 +90,11 @@ pub struct SourcedRelation {
 /// every document and return the collected, deduplicated Witnesses.
 ///
 /// Why a free function (not a method on `Extractor`): the witness
-/// pass needs none of the LLM scheduler / batch-checkpoint state
-/// that `Extractor` carries — its inputs are pure (DocumentIRs in,
-/// Witnesses out). Keeping it free lets `backfill_witness_mesh` and
-/// pipeline integration tests call it directly without spinning up
-/// the full LLM stack.
+/// pass needs none of the configuration state that `Extractor`
+/// carries — its inputs are pure (DocumentIRs in, Witnesses out).
+/// Keeping it free lets `backfill_witness_mesh` and pipeline
+/// integration tests call it directly without constructing an
+/// `Extractor`.
 ///
 /// Mesh assembly (dedup, SAFETY-rule cross-check, deterministic
 /// sort) runs at the caller's discretion via
@@ -243,59 +177,22 @@ pub fn collect_witnesses_from_documents(
 impl Extractor {
     /// Construct a new extractor. Witness Mesh era: no LLM client is
     /// initialised; no scheduler, cache, or checkpoint. The
-    /// `config` parameter is honoured only for `min_confidence` —
-    /// every other historical field is dead.
+    /// `config` parameter is honoured only for `min_confidence`.
     pub async fn new(config: &Config) -> Result<Self> {
         Ok(Self {
             min_confidence: config.extraction.min_confidence,
-            progress: None,
-            cancel: None,
         })
     }
 
-    /// Install a cancellation token consulted between extraction
-    /// phases. When the token is tripped, `extract_all` returns
-    /// `Err(Error::Cancelled)` at the next phase boundary.
-    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
-        self.cancel = Some(cancel);
-        self
-    }
-
-    /// Attach a progress callback. Called once per chunk processed.
-    /// Arguments: `ExtractionProgressEvent`.
-    pub fn with_progress(mut self, f: ChunkProgressFn) -> Self {
-        self.progress = Some(f);
-        self
-    }
-
-    // ── Deprecated builders kept as no-ops for source compat ───────
-    // These were load-bearing in the LLM era. Post-cutover they're
-    // no-ops so existing callers keep compiling; the next release
-    // removes them after callers migrate.
-
-    /// **Deprecated, no-op.** Pre-cutover this installed the LLM
-    /// in-flight checkpoint log; post-cutover there are no batches
-    /// to checkpoint. Retained as a no-op for compile compatibility.
-    pub fn with_checkpoint(self, _data_dir: &std::path::Path) -> Result<Self> {
-        Ok(self)
-    }
-
-    /// **Deprecated, no-op.** Pre-cutover this enabled the LLM
-    /// extraction cache; post-cutover structural extraction is
-    /// deterministic and runs in microseconds — no cache layer
-    /// helps. Retained as a no-op.
-    pub fn with_cache_dir(self, _data_dir: &std::path::Path) -> Self {
-        self
-    }
-
-    /// Extract knowledge from a batch of documents — all chunks run concurrently.
+    /// Extract knowledge from a batch of documents. Structural
+    /// extraction is pure CPU and runs per-chunk; no batching or
+    /// concurrency layer is needed.
     ///
     /// `sources_to_extract`: when `Some`, only documents whose `source_id` is
     /// present in the set are processed; documents not in the set are skipped
-    /// entirely — before any cache lookup or LLM dispatch.  `None` means
-    /// extract all documents, which preserves the pre-T12 behaviour.  An empty
-    /// `Some(HashSet::new())` is a valid degenerate case that produces an empty
-    /// `ExtractionOutput` without error.
+    /// entirely — before any work is dispatched.  `None` means extract all
+    /// documents.  An empty `Some(HashSet::new())` is a valid degenerate
+    /// case that produces an empty `ExtractionOutput` without error.
     pub async fn extract_all(
         &self,
         documents: &[DocumentIR],
@@ -303,11 +200,9 @@ impl Extractor {
         sources_to_extract: Option<std::collections::HashSet<thinkingroot_core::types::SourceId>>,
     ) -> Result<ExtractionOutput> {
         // Source-granular re-extraction (T12): filter at the DocumentIR level
-        // BEFORE any cache lookup or LLM dispatch so unchanged documents never
-        // even enter the work queues.  `None` = extract all (pre-T12 behaviour).
-        // Cloning the filtered subset is proportional to the truly-changed set
-        // (typically 1 document in the "1 file edited" hot path), not the full
-        // corpus — the cost is negligible compared to extraction itself.
+        // so unchanged documents never enter the work queue. Cloning the
+        // filtered subset is proportional to the truly-changed set
+        // (typically 1 document in the "1 file edited" hot path).
         let filtered: Vec<DocumentIR>;
         let work: &[DocumentIR] = if let Some(ref filter) = sources_to_extract {
             filtered = documents
@@ -330,21 +225,15 @@ impl Extractor {
         Ok(output)
     }
 
-    /// Inner implementation that operates on the (already-filtered) document slice.
-    /// Called by `extract_all` after the source-id filter is applied.
     /// Inner extraction — Witness Mesh era.
     ///
-    /// Pre-cutover this method dispatched chunks through an LLM batch
-    /// pipeline. Post-cutover (2026-05-11) it runs structural-only:
-    /// every chunk goes through `structural::extract_structural`, no
-    /// LLM is consulted, no cache is hit, no batches are packed.
-    ///
-    /// The legacy path's complexity (semaphores, batch packing,
-    /// schedulers, in-flight checkpoints, retries) is gone because
-    /// structural extraction is purely CPU — runs in microseconds
-    /// per chunk and produces deterministic output. Whatever the
-    /// LLM produced is now obviated by the Witness Mesh substrate
-    /// populated in parallel via `collect_witnesses_from_documents`.
+    /// Runs structural-only: every chunk goes through
+    /// `structural::extract_structural`, no LLM is consulted, no
+    /// cache is hit, no batches are packed. The complexity of the
+    /// pre-cutover LLM path (semaphores, batch packing, schedulers,
+    /// in-flight checkpoints, retries) is gone because structural
+    /// extraction is purely CPU — runs in microseconds per chunk and
+    /// produces deterministic output.
     async fn extract_all_inner(
         &self,
         documents: &[DocumentIR],
@@ -430,7 +319,7 @@ impl Extractor {
         Ok(output)
     }
 
-    /// Convert LLM extraction results into core types (static so spawned tasks can call it).
+    /// Convert structural extraction results into core types.
     fn convert_result_static(
         result: ExtractionResult,
         source_id: SourceId,
@@ -528,10 +417,10 @@ impl Extractor {
             {
                 output.claim_source_quotes.insert(claim.id, quote.clone());
             }
-            // Wire optional predicate from LLM output. Invalid entries
-            // (unknown language, regex that fails to compile) are dropped
-            // silently so the claim lands in `Attested` tier rather than
-            // failing extraction.
+            // Wire optional predicate from structural output. Invalid
+            // entries (unknown language, regex that fails to compile)
+            // are dropped silently so the claim lands in `Attested`
+            // tier rather than failing extraction.
             if let Some(ref ext_pred) = ext_claim.predicate
                 && let Some(pred) = convert_predicate(ext_pred)
             {
@@ -557,7 +446,7 @@ impl Extractor {
                     continue;
                 };
 
-                // Reject low-confidence relations (LLM was too uncertain).
+                // Reject low-confidence relations.
                 let confidence = ext_rel.confidence.clamp(0.0, 1.0);
                 if confidence < 0.3 {
                     tracing::debug!(
@@ -601,206 +490,8 @@ pub(crate) fn apply_source_filter<'a>(
     }
 }
 
-/// Backfill the v3 byte-range citation triple onto every claim in
-/// `result` that doesn't already carry one. Called from both the
-/// cache-hit path and the LLM-batch path of `Extractor::extract` so the
-/// downstream `convert_result_static` always sees a populated
-/// `(source_path, byte_start, byte_end)` triple — even when the cached
-/// entry pre-dates the v3 schema or the LLM hasn't been taught to emit
-/// per-claim byte spans yet.
-///
-/// `chunk_byte_start == chunk_byte_end == 0` is the "parser hasn't been
-/// upgraded" sentinel; in that case byte ranges are left at (0, 0) and
-/// the v3 pack writer + provenance probe fall back to file-level scope.
-fn backfill_chunk_origin(
-    result: &mut ExtractionResult,
-    source_uri: &str,
-    chunk_byte_start: u64,
-    chunk_byte_end: u64,
-) {
-    for claim in &mut result.claims {
-        if claim.source_path.is_empty() {
-            claim.source_path = source_uri.to_string();
-        }
-        if claim.byte_start == 0 && claim.byte_end == 0 && chunk_byte_end > chunk_byte_start {
-            claim.byte_start = chunk_byte_start;
-            claim.byte_end = chunk_byte_end;
-        }
-    }
-}
-
-/// Wedge 1: estimate the input-token cost of a string for the batch packer.
-/// Reuses the engine-wide `chars / 4` heuristic (matches
-/// `split_to_token_budget` and the throughput scheduler) so all call sites
-/// agree.  Always returns at least 1 — a chunk that contributes zero tokens
-/// would otherwise let the packer accumulate infinite items.
-pub(crate) fn estimate_tokens_chars(chars: usize) -> usize {
-    (chars / 4).max(1)
-}
-
-/// Wedge 1: token-aware batch packer for the variable-size LLM call grouping.
-///
-/// Walks `items` left-to-right and seals a batch when adding the next item
-/// would push the running token total past `token_budget` *or* the item
-/// count past `max_chunks`.  Returns half-open index ranges `[start, end)`
-/// into `items`.
-///
-/// Guarantees:
-/// - Every input is covered by exactly one range (Σ (end - start) ==
-///   items.len()).
-/// - No empty range is produced.
-/// - An item larger than `token_budget` becomes its own batch (size 1) — we
-///   never silently drop oversized items, and `split_to_token_budget` has
-///   already split content above the per-chunk cap before we get here.
-/// - Provider chunk-count caps from `model_batch_size` (Bedrock = 8,
-///   Perplexity = 1, …) flow in via `max_chunks`.
-pub(crate) fn pack_batches<T>(
-    items: &[T],
-    token_budget: usize,
-    max_chunks: usize,
-    cost: impl Fn(&T) -> usize,
-) -> Vec<(usize, usize)> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let max_chunks = max_chunks.max(1);
-    let token_budget = token_budget.max(1);
-
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    let mut acc_tokens: usize = 0;
-    for (i, w) in items.iter().enumerate() {
-        let item_cost = cost(w);
-        let count_in_batch = i - start;
-        let would_exceed_tokens = acc_tokens + item_cost > token_budget && count_in_batch > 0;
-        let would_exceed_count = count_in_batch >= max_chunks;
-        if would_exceed_tokens || would_exceed_count {
-            out.push((start, i));
-            start = i;
-            acc_tokens = 0;
-        }
-        acc_tokens += item_cost;
-    }
-    if start < items.len() {
-        out.push((start, items.len()));
-    }
-    out
-}
-
-// `split_chunk_to_token_budget` deleted in Witness Mesh cutover —
-// chunk splitting for LLM context windows is moot when there is no
-// LLM. Structural extraction operates on the full chunk regardless
-// of size. The `split_to_token_budget_lines` helper below is kept
-// because its tests exercise edge-case fallback logic that's still
-// useful for future text-segmentation needs.
-
-/// Legacy line-based splitter — preserved as the universal fallback for
-/// chunks where AST / sentence splitting can't help (unknown language,
-/// pathological single-line input).
-fn split_to_token_budget_lines(content: &str, max_tokens: usize) -> Vec<String> {
-    // chars/4 is a conservative token approximation that works across all tokenizers.
-    let max_chars = max_tokens.saturating_mul(4).max(1);
-
-    if content.len() <= max_chars {
-        return vec![content.to_string()];
-    }
-
-    let lines: Vec<&str> = content.lines().collect();
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for line in lines {
-        // If adding this line would exceed budget, flush current and start new chunk.
-        if !current.is_empty() && current.len() + line.len() + 1 > max_chars {
-            chunks.push(current.trim().to_string());
-            current = String::new();
-        }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-
-    if !current.trim().is_empty() {
-        chunks.push(current.trim().to_string());
-    }
-
-    if chunks.is_empty() {
-        vec![content.to_string()]
-    } else {
-        chunks
-    }
-}
-
-/// Deduplicate claims by normalized statement text.
-///
-/// Normalization: lowercase + strip trailing sentence punctuation + collapse whitespace.
-/// When duplicates found: the claim with the highest confidence survives.
-///
-/// Called once, after all batch LLM calls complete, before returning ExtractionOutput.
-/// Prevents graph bloat when overlapping chunks extract the same fact.
-fn dedup_claims(output: &mut ExtractionOutput) {
-    fn normalize(s: &str) -> String {
-        s.to_lowercase()
-            .trim_end_matches(['.', '!', '?'])
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    // First pass: for each normalized key, find the index of the highest-confidence claim.
-    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, claim) in output.claims.iter().enumerate() {
-        let key = normalize(&claim.statement);
-        best.entry(key)
-            .and_modify(|prev_idx| {
-                if claim.confidence.value() > output.claims[*prev_idx].confidence.value() {
-                    *prev_idx = i;
-                }
-            })
-            .or_insert(i);
-    }
-
-    // Collect the winning indices into a set.
-    let keep: std::collections::HashSet<usize> = best.into_values().collect();
-
-    let before = output.claims.len();
-    let mut idx = 0usize;
-    output.claims.retain(|_| {
-        let keep_this = keep.contains(&idx);
-        idx += 1;
-        keep_this
-    });
-
-    let removed = before - output.claims.len();
-    if removed > 0 {
-        tracing::debug!(
-            "dedup_claims: removed {removed} duplicate claims, kept {}",
-            output.claims.len()
-        );
-    }
-}
-
-impl ExtractionOutput {
-    fn merge(&mut self, other: ExtractionOutput) {
-        self.claims.extend(other.claims);
-        self.entities.extend(other.entities);
-        self.relations.extend(other.relations);
-        self.claim_entity_names.extend(other.claim_entity_names);
-        self.sources_processed += other.sources_processed;
-        self.chunks_processed += other.chunks_processed;
-        self.cache_hits += other.cache_hits;
-        self.structural_extractions += other.structural_extractions;
-        self.source_texts.extend(other.source_texts);
-        self.claim_source_quotes.extend(other.claim_source_quotes);
-        self.failed_batches += other.failed_batches;
-        self.failed_batch_ranges.extend(other.failed_batch_ranges);
-        self.claim_quantities.extend(other.claim_quantities);
-        self.claim_expirations.extend(other.claim_expirations);
-    }
-}
-
-/// Convert the LLM's raw predicate payload into a validated core `Predicate`.
+/// Convert a structural-extracted predicate payload into a validated
+/// core `Predicate`.
 ///
 /// Returns `None` when:
 /// - the language string isn't one we support (`regex`, `rust_ast`, `jsonpath`)
@@ -888,110 +579,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deduplicate_claims_by_normalized_statement() {
-        use thinkingroot_core::types::{Claim, ClaimType, SourceId, WorkspaceId};
-
-        let src = SourceId::new();
-        let ws = WorkspaceId::new();
-
-        let claim_a = Claim::new("Rust is fast", ClaimType::Fact, src, ws).with_confidence(0.8);
-        let claim_b = Claim::new("Rust is fast", ClaimType::Fact, src, ws).with_confidence(0.9);
-        let claim_c = Claim::new("Go is simple", ClaimType::Fact, src, ws).with_confidence(0.7);
-
-        let mut output = ExtractionOutput {
-            claims: vec![claim_a, claim_b, claim_c],
-            ..Default::default()
-        };
-
-        dedup_claims(&mut output);
-
-        assert_eq!(output.claims.len(), 2, "duplicate claim must be removed");
-        let rust_claim = output
-            .claims
-            .iter()
-            .find(|c| c.statement == "Rust is fast")
-            .unwrap();
-        assert!(
-            (rust_claim.confidence.value() - 0.9).abs() < 0.001,
-            "surviving claim must have max confidence 0.9, got {}",
-            rust_claim.confidence.value()
-        );
-    }
-
-    #[test]
-    fn dedup_claims_normalizes_case_and_trailing_punctuation() {
-        use thinkingroot_core::types::{Claim, ClaimType, SourceId, WorkspaceId};
-
-        let src = SourceId::new();
-        let ws = WorkspaceId::new();
-
-        let claims = vec![
-            Claim::new("Rust is FAST.", ClaimType::Fact, src, ws).with_confidence(0.8),
-            Claim::new("rust is fast", ClaimType::Fact, src, ws).with_confidence(0.9),
-        ];
-
-        let mut output = ExtractionOutput {
-            claims,
-            ..Default::default()
-        };
-        dedup_claims(&mut output);
-
-        assert_eq!(
-            output.claims.len(),
-            1,
-            "case/punctuation variants must be deduped"
-        );
-    }
-
-    #[test]
-    fn batch_size_constant_is_six() {
-        assert_eq!(
-            EXTRACTION_BATCH_SIZE, 6,
-            "batch size must be 6 — see perf analysis"
-        );
-    }
-
-    #[test]
-    fn split_to_token_budget_no_split_needed() {
-        let content = "hello world\nfoo bar";
-        let chunks = split_to_token_budget_lines(content, 10000);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], content);
-    }
-
-    #[test]
-    fn split_to_token_budget_splits_at_line_boundary() {
-        // 4 chars per token, budget of 5 tokens = 20 chars max.
-        let line_a = "AAAAAAAAAA"; // 10 chars
-        let line_b = "BBBBBBBBBB"; // 10 chars
-        let line_c = "CCCCCCCCCC"; // 10 chars
-        let content = format!("{line_a}\n{line_b}\n{line_c}");
-        let chunks = split_to_token_budget_lines(&content, 5); // 20 chars budget
-        // line_a + line_b = 21 chars (with \n), so they can't both fit.
-        assert!(chunks.len() >= 2);
-        // Every line must appear in some chunk.
-        let rejoined = chunks.join("\n");
-        assert!(rejoined.contains(line_a));
-        assert!(rejoined.contains(line_b));
-        assert!(rejoined.contains(line_c));
-    }
-
-    #[test]
-    fn split_to_token_budget_single_large_line_kept_intact() {
-        // A single line larger than budget is kept as-is (can't split mid-line).
-        let big_line = "X".repeat(1000);
-        let chunks = split_to_token_budget_lines(&big_line, 10); // 40 chars budget
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], big_line);
-    }
-
-    // ── Wedge 3 split tests deleted in Witness Mesh cutover ─────────
-    // `split_chunk_to_token_budget` itself was deleted because
-    // chunk splitting for LLM context windows is moot post-cutover.
-    // The line-based fallback (`split_to_token_budget_lines`) and
-    // its three tests above are retained for unrelated future use.
-
-    #[test]
     fn unknown_relation_type_is_rejected_not_mapped_to_related_to() {
         let result = parse_relation_type("blah_relation");
         assert!(
@@ -1028,128 +615,10 @@ mod tests {
     fn extraction_output_default_has_no_failed_batches() {
         // Regression for C4: pre-fix the partial-failure counter didn't
         // exist; failed batches were silently dropped.  A fresh
-        // ExtractionOutput must start clean so the merge accumulator
-        // produces 0 in the no-failures case.
+        // ExtractionOutput must start clean.
         let out = ExtractionOutput::default();
         assert_eq!(out.failed_batches, 0);
         assert!(out.failed_batch_ranges.is_empty());
-    }
-
-    #[test]
-    fn extraction_output_merge_accumulates_failed_batches() {
-        // The pipeline calls `output.merge(converted)` for every chunk
-        // result; failed_batches must roll forward end-to-end so the
-        // CLI summary + ProgressEvent::ExtractionPartial see the right
-        // total.  Mirrors how the merge of cache_hits / chunks_processed
-        // already works.
-        let mut a = ExtractionOutput {
-            failed_batches: 1,
-            failed_batch_ranges: vec![(1, 6)],
-            ..Default::default()
-        };
-        let b = ExtractionOutput {
-            failed_batches: 2,
-            failed_batch_ranges: vec![(13, 18), (25, 30)],
-            ..Default::default()
-        };
-        a.merge(b);
-        assert_eq!(a.failed_batches, 3);
-        assert_eq!(a.failed_batch_ranges, vec![(1, 6), (13, 18), (25, 30)]);
-    }
-
-    // ── Wedge 1: token-aware mega-batches ────────────────────────────────
-
-    #[test]
-    fn pack_batches_empty_input_yields_no_ranges() {
-        let v: Vec<usize> = Vec::new();
-        let packed = pack_batches(&v, 1000, 64, |_| 100);
-        assert!(packed.is_empty());
-    }
-
-    #[test]
-    fn pack_batches_respects_token_budget() {
-        let costs = vec![100usize, 200, 300, 400, 100, 100];
-        let packed = pack_batches(&costs, 600, 64, |&c| c);
-        // Greedy fill: [100,200,300]=600 → seal, [400,100]=500 → seal at next
-        // would-overflow, [100] stays.  Last batch is whatever fit at end.
-        // Actual run: 100+200=300, +300=600 (== budget, not over), +400 would
-        // be 1000 → seal at idx 3.  Then 400+100=500, +100=600, end.
-        let totals: Vec<usize> = packed
-            .iter()
-            .map(|&(s, e)| costs[s..e].iter().sum())
-            .collect();
-        assert!(totals.iter().all(|&t| t <= 600));
-        // Round-trip: every item is covered exactly once.
-        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
-        assert_eq!(total_count, costs.len());
-    }
-
-    #[test]
-    fn pack_batches_respects_max_chunks_cap() {
-        // Tiny chunks, generous token budget — chunk-count cap should
-        // dominate.
-        let costs = vec![1usize; 200];
-        let packed = pack_batches(&costs, 1_000_000, 32, |&c| c);
-        assert!(
-            packed.iter().all(|&(s, e)| e - s <= 32),
-            "no batch may exceed max_chunks: {packed:?}"
-        );
-        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
-        assert_eq!(total_count, costs.len());
-    }
-
-    #[test]
-    fn pack_batches_passes_through_oversized_item() {
-        // A single item bigger than the budget must still appear (as its own
-        // batch of size 1) — never silently dropped.
-        let costs = vec![50usize, 99_999, 50];
-        let packed = pack_batches(&costs, 100, 64, |&c| c);
-        // Expect: [50] | [99_999] | [50]  (oversized item alone)
-        // Or: [50, 99_999 won't fit] -> [50], [99_999], [50].
-        assert_eq!(packed.len(), 3);
-        let total_count: usize = packed.iter().map(|&(s, e)| e - s).sum();
-        assert_eq!(total_count, 3);
-        // Middle range carries exactly the oversized item.
-        let middle = packed[1];
-        assert_eq!(middle.1 - middle.0, 1);
-    }
-
-    #[test]
-    fn pack_batches_produces_no_empty_ranges() {
-        let costs = vec![10usize; 5];
-        let packed = pack_batches(&costs, 25, 3, |&c| c);
-        assert!(packed.iter().all(|&(s, e)| e > s));
-    }
-
-    #[test]
-    fn pack_batches_handles_zero_token_budget_safely() {
-        // Budget clamped internally to 1; oversized-item rule kicks in.
-        let costs = vec![5usize, 5, 5];
-        let packed = pack_batches(&costs, 0, 64, |&c| c);
-        assert_eq!(packed.len(), 3);
-        assert!(packed.iter().all(|&(s, e)| e - s == 1));
-    }
-
-    #[test]
-    fn estimate_tokens_chars_floors_at_one() {
-        assert_eq!(estimate_tokens_chars(0), 1);
-        assert_eq!(estimate_tokens_chars(3), 1);
-        assert_eq!(estimate_tokens_chars(4), 1);
-        assert_eq!(estimate_tokens_chars(5), 1);
-        assert_eq!(estimate_tokens_chars(8), 2);
-        assert_eq!(estimate_tokens_chars(400), 100);
-    }
-
-    #[test]
-    fn pack_batches_provider_caps_via_max_chunks() {
-        // Bedrock's 8-cap and Perplexity's 1-cap arrive via max_chunks.
-        let costs = vec![50usize; 100];
-        let bedrock = pack_batches(&costs, 1_000_000, 8, |&c| c);
-        assert!(bedrock.iter().all(|&(s, e)| e - s <= 8));
-
-        let sonar = pack_batches(&costs, 1_000_000, 1, |&c| c);
-        assert_eq!(sonar.len(), 100);
-        assert!(sonar.iter().all(|&(s, e)| e - s == 1));
     }
 }
 
@@ -1197,11 +666,6 @@ mod tiered_tests {
             "structural extractor must tag claims with ExtractionTier::Structural"
         );
     }
-
-    // `router_correctly_splits_mixed_document` test deleted in
-    // Witness Mesh cutover — the tier router (`crate::router`) was
-    // deleted because there's no longer an LLM tier to route to.
-    // All chunks now flow through structural extraction unconditionally.
 }
 
 // ── T12: source-granular re-extract filter tests ─────────────────────────────
