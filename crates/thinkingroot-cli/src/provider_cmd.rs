@@ -300,9 +300,17 @@ pub async fn run_provider_use(
     //
     // GLOBAL mode: full credential collection as usual.
     let new_llm = if local {
-        let model_str = resolve_model(&theme, model, &[])?;
-        base_llm_config(name, &model_str)
-        // providers block is intentionally empty — write_to_workspace never writes it
+        // Slice 2 Task 9: 'thinkingroot-cloud' refuses the local path
+        // for the same reason it refuses the credential prompt — the
+        // bearer token + server URL come from auth.json (a global
+        // surface), not from workspace config.toml.
+        if name == "thinkingroot-cloud" {
+            collect_thinkingroot_cloud(model).await?
+        } else {
+            let model_str = resolve_model(&theme, model, &[])?;
+            base_llm_config(name, &model_str)
+            // providers block is intentionally empty — write_to_workspace never writes it
+        }
     } else {
         match name {
             "bedrock" => collect_bedrock(&theme, model).await?,
@@ -319,6 +327,10 @@ pub async fn run_provider_use(
                 .await?
             }
             "ollama" => collect_ollama(&theme, model, base_url).await?,
+            // Slice 2 Task 9: cloud-managed provider — no API-key
+            // prompt; refuses if auth.json is absent; validates the
+            // picked model against the /v1/models catalogue.
+            "thinkingroot-cloud" => collect_thinkingroot_cloud(model).await?,
             _ => collect_generic(&theme, pdef, model, key, base_url, no_validate).await?,
         }
     };
@@ -569,6 +581,69 @@ async fn collect_ollama(
         default_model: None,
     });
     Ok(llm)
+}
+
+// ── ThinkingRoot Cloud (managed) collection ───────────────────────
+//
+// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.6.
+//
+// Unlike BYOK providers, the cloud-managed path:
+//   1. Refuses to run if auth.json is absent (no API-key prompt).
+//   2. Fetches the model catalogue from `/v1/models` (1-hour cached).
+//   3. Validates the requested model is in the catalogue.
+//   4. Persists `[llm] provider = "thinkingroot-cloud", model = <id>`
+//      via the same `write_to_global` / `write_to_workspace` helpers
+//      every other provider uses — the providers block stays empty
+//      because the bearer + server live in auth.json, not config.toml.
+async fn collect_thinkingroot_cloud(model: Option<&str>) -> anyhow::Result<LlmConfig> {
+    // Refuse early if not signed in — running the model picker against
+    // an absent session would surface a confusing 'NotLoggedIn' from
+    // deep inside the catalogue fetcher. Better honest error.
+    let cfg = thinkingroot_cloud_auth::config::load()
+        .map_err(|e| anyhow::anyhow!("could not read auth.json: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "ThinkingRoot Cloud requires a signed-in session. \
+                 Run `root login` first."
+            )
+        })?;
+    if !cfg.is_signed_in() {
+        anyhow::bail!(
+            "ThinkingRoot Cloud requires a signed-in session. \
+             Run `root login` first."
+        );
+    }
+
+    let models = thinkingroot_cloud_auth::models_catalogue::fetch_models(false)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not fetch model catalogue: {e}"))?;
+    if models.is_empty() {
+        anyhow::bail!("cloud returned an empty model catalogue");
+    }
+
+    let model_picked = match model {
+        Some(m) if !m.is_empty() => {
+            if models.iter().any(|entry| entry.id == m) {
+                m.to_string()
+            } else {
+                let known: Vec<&str> = models.iter().map(|e| e.id.as_str()).collect();
+                anyhow::bail!(
+                    "model `{m}` not in catalogue. Known: {}",
+                    known.join(", ")
+                );
+            }
+        }
+        _ => {
+            // Default to the first catalogue entry (the hub sorts these
+            // by preferred-tier ordering server-side).
+            models[0].id.clone()
+        }
+    };
+
+    // base_llm_config carries provider id + model + a sensible timeout
+    // (`provider_timeout_secs("thinkingroot-cloud")`). The providers
+    // block stays empty by design — credentials live in auth.json.
+    Ok(base_llm_config("thinkingroot-cloud", &model_picked))
 }
 
 // ── Generic (OpenAI-compatible) collection ────────────────────────

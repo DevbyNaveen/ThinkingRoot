@@ -522,14 +522,10 @@ enum Provider {
     /// Today the arm returns Ok on 2xx and falls back to the generic
     /// [`Error::LlmProvider`] path on non-2xx.
     ///
-    /// `#[allow(dead_code)]` is on the variant until Slice 2 Task 5
-    /// teaches `LlmClient::new` to construct it from
-    /// `[llm].default_provider = "thinkingroot-cloud"`. The match
-    /// arms and the struct are already exercised by direct construction
-    /// in the matching tests.
+    /// Wired into `LlmClient::new` for `[llm].default_provider =
+    /// "thinkingroot-cloud"` in Slice 2 Task 9.
     ///
     /// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.1.
-    #[allow(dead_code)]
     CloudManaged(CloudManagedProvider),
     /// No-op provider used when no LLM is configured and the extractor falls
     /// back to structural-only (Tier 0) extraction.  `chat` and
@@ -1715,7 +1711,6 @@ struct CloudManagedProvider {
 }
 
 impl CloudManagedProvider {
-    #[allow(dead_code)] // wired into LlmClient::new in Slice 2 Task 5
     fn new(model: &str, server: &str, timeout_secs: u64) -> Result<Self> {
         let max_output_tokens = model_max_output_tokens(model);
         let server = server.trim_end_matches('/').to_string();
@@ -3159,9 +3154,37 @@ impl LlmClient {
                     timeout_secs,
                 )?)
             }
+            // Slice 2 Task 9: ThinkingRoot Cloud managed-model provider.
+            // Bearer token + server URL both live in auth.json (not in
+            // workspace config.toml + not in a process env var). We
+            // load the server URL from auth.json here; the per-request
+            // bearer is loaded by `CloudManagedProvider::bearer_token`
+            // at chat time so a `tr login` between LlmClient::new and
+            // the first call picks up the new token without a restart.
+            //
+            // Honesty: construction succeeds even when auth.json is
+            // absent (server defaults to the cloud-auth crate's
+            // `DEFAULT_SERVER`). The NotLoggedIn surface fires at
+            // chat-time per spec §6.5 I-CA10 — same path Provider::
+            // CloudManaged already exercises in its `chat` /
+            // `chat_stream` / `chat_with_tools` arms.
+            //
+            // Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.1.
+            "thinkingroot-cloud" => {
+                let server = thinkingroot_cloud_auth::config::load()
+                    .ok()
+                    .flatten()
+                    .map(|c| c.server)
+                    .unwrap_or_else(|| "https://api.thinkingroot.dev".to_string());
+                Provider::CloudManaged(CloudManagedProvider::new(
+                    &config.extraction_model,
+                    &server,
+                    timeout_secs,
+                )?)
+            }
             other => {
                 return Err(Error::MissingConfig(format!(
-                    "unsupported provider: {other}. Supported: bedrock, azure, openai, anthropic, ollama, groq, deepseek, openrouter, together, perplexity, litellm, custom"
+                    "unsupported provider: {other}. Supported: bedrock, azure, openai, anthropic, ollama, groq, deepseek, openrouter, together, perplexity, litellm, custom, thinkingroot-cloud"
                 )));
             }
         };

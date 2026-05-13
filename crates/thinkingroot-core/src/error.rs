@@ -249,6 +249,19 @@ impl Error {
             // never going to succeed on retry; surface immediately.
             Self::SecurityViolation(_) => true,
             Self::UnsupportedFileType { .. } => true,
+            // ThinkingRoot Cloud terminal states (Slice 2 Task 9): a
+            // stale token, an unfunded balance, or a feature outside
+            // the user's tier all re-fail identically on retry — and
+            // an absent auth.json never grows a token by waiting.
+            // Surface immediately so the user fixes the underlying
+            // condition (`root login`, top-up, plan upgrade) instead
+            // of grinding the retry budget for 60–180s per call.
+            // Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md
+            // §6.5 invariant I-CA10 (no silent fallback to BYOK).
+            Self::NotLoggedIn => true,
+            Self::AuthExpired => true,
+            Self::CreditsExhausted { .. } => true,
+            Self::TierRequired { .. } => true,
             // LlmProvider errors carry a free-form message; recognise the
             // common HTTP-status fingerprints upstream surfaces emit.
             // Anything we don't explicitly recognise is treated as
@@ -303,6 +316,9 @@ impl Error {
     pub fn is_rate_limited(&self) -> bool {
         match self {
             Self::RateLimited { .. } => true,
+            // ThinkingRoot Cloud's 429 surface (carries retry-after).
+            // Spec §6.5 invariant I-CA7.
+            Self::RateLimitedCloud { .. } => true,
             Self::LlmProvider { message, .. } => {
                 let m = message.to_lowercase();
                 m.contains("throttl")

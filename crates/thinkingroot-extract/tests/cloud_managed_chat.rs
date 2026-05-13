@@ -5,10 +5,8 @@
 //!   Provider::CloudManaged → send_openai_compat → fake_cloud
 //!   → parse_managed_headers → persist_managed_headers → auth.json.
 //!
-//! All four scenarios are gated `#[ignore]` until Task 9 wires the
-//! `"thinkingroot-cloud"` arm into `LlmClient::new`. The fixture +
-//! seed helpers compile today against the public surface; once Task 9
-//! lands, drop the `#[ignore]` attribute and the tests run real.
+//! All four scenarios run real against fake_cloud once Task 9 wires
+//! the `"thinkingroot-cloud"` arm into `LlmClient::new`.
 //!
 //! Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md
 //! §6.2, §6.5.
@@ -58,8 +56,7 @@ fn cloud_llm_config(model: &str) -> LlmConfig {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "unblocks when Task 9 wires the 'thinkingroot-cloud' arm into LlmClient::new"]
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cloud_managed_chat_completion_streams_and_updates_credits() {
     let (_home, _guard) = use_temp_home();
@@ -75,14 +72,24 @@ async fn cloud_managed_chat_completion_streams_and_updates_credits() {
         .await
         .expect("LlmClient::new should accept thinkingroot-cloud after Task 9");
 
-    let out = client
-        .chat("you are a helpful assistant", "say hi")
+    // fake_cloud's success path emits SSE deltas with "Hello " / "world!".
+    // We exercise the streaming surface because that's what fake_cloud
+    // serves on 200; the non-stream `chat()` path expects a JSON envelope
+    // that fake_cloud does not produce.
+    use futures::StreamExt;
+    let mut stream = client
+        .chat_stream("you are a helpful assistant", "say hi")
         .await
-        .expect("cloud chat ok");
-    // fake_cloud canned response is OpenAI-shape JSON (non-stream path);
-    // the stream path emits SSE deltas with "Hello " / "world!". Either
-    // way, expect non-empty text after the headers persist.
-    let _ = out;
+        .expect("cloud chat_stream ok");
+    let mut text = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("stream chunk ok");
+        text.push_str(&chunk.text);
+        if chunk.finish.is_some() {
+            break;
+        }
+    }
+    assert!(text.contains("Hello"), "stream should include the canned text, got `{text}`");
 
     let cfg = thinkingroot_cloud_auth::config::load()
         .expect("load")
@@ -93,8 +100,7 @@ async fn cloud_managed_chat_completion_streams_and_updates_credits() {
     fake.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "unblocks when Task 9 wires the 'thinkingroot-cloud' arm into LlmClient::new"]
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cloud_managed_402_surfaces_credits_exhausted() {
     let (_home, _guard) = use_temp_home();
@@ -127,8 +133,7 @@ async fn cloud_managed_402_surfaces_credits_exhausted() {
     fake.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "unblocks when Task 9 wires the 'thinkingroot-cloud' arm into LlmClient::new"]
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cloud_managed_401_surfaces_auth_expired() {
     let (_home, _guard) = use_temp_home();
@@ -156,8 +161,7 @@ async fn cloud_managed_401_surfaces_auth_expired() {
     fake.shutdown();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "unblocks when Task 9 wires the 'thinkingroot-cloud' arm into LlmClient::new"]
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn cloud_managed_no_auth_json_surfaces_not_logged_in() {
     let (_home, _guard) = use_temp_home();

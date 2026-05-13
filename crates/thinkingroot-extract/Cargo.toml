@@ -56,3 +56,4 @@ thinkingroot-core = { workspace = true, features = ["test-helpers"] }
 axum = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
+futures = { workspace = true }
