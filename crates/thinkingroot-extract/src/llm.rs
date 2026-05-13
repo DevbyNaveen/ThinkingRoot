@@ -1358,17 +1358,18 @@ impl OpenAiProvider {
             body["max_tokens"] = serde_json::json!(self.max_output_tokens);
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::LlmProvider {
-                provider: self.provider_name.clone(),
-                message: e.to_string(),
-            })?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &self.api_key,
+                provider: &self.provider_name,
+                body: &body,
+                extra_headers: Vec::new(),
+            },
+        )
+        .await?;
 
         // Detect rate-limit before consuming body.
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1454,18 +1455,23 @@ impl OpenAiProvider {
         }
 
         let provider = self.provider_name.clone();
-        let resp = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::LlmProvider {
-                provider: provider.clone(),
-                message: format!("connect: {e}"),
-            })?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        // Note: we route through send_openai_compat for the POST envelope.
+        // Connect failures here are surfaced as Error::LlmProvider with the
+        // raw reqwest message (no "connect: " prefix anymore — the prefix
+        // was diagnostic-only and the underlying message is already
+        // explicit about connection state).
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &self.api_key,
+                provider: &provider,
+                body: &body,
+                extra_headers: vec![("accept", "text/event-stream")],
+            },
+        )
+        .await?;
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = resp
@@ -1593,17 +1599,18 @@ impl OpenAiProvider {
             body["max_tokens"] = serde_json::json!(self.max_output_tokens);
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::LlmProvider {
-                provider: self.provider_name.clone(),
-                message: e.to_string(),
-            })?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let resp = send_openai_compat(
+            &self.client,
+            OpenAiCompatRequest {
+                url: &url,
+                bearer: &self.api_key,
+                provider: &self.provider_name,
+                body: &body,
+                extra_headers: Vec::new(),
+            },
+        )
+        .await?;
 
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let retry_after = resp
@@ -3702,6 +3709,71 @@ fn extract_json_from_text(text: &str) -> &str {
     }
 
     text
+}
+
+// ─── Shared OpenAI-compatible helpers (Slice 2 Task 1) ──────────────
+//
+// These helpers are extracted from the existing `Provider::OpenAi`
+// arms so the new `Provider::CloudManaged` arm (Slice 2 Task 3) can
+// call them with a different base URL + bearer-token source. No
+// behavior change for the OpenAI path — same request shape, same
+// SSE parsing.
+//
+// The helper deliberately owns ONLY the POST + bearer + JSON-body
+// envelope (the part that's truly identical across `OpenAi` and
+// `CloudManaged`). Response decoding (JSON vs SSE) and rate-limit
+// header parsing remain inline in each call site because those
+// already differ between `chat()` and `chat_stream()` and would
+// not benefit from a second layer of abstraction.
+//
+// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.3.
+
+/// Request envelope for an OpenAI-compatible chat/completions POST.
+///
+/// `provider` is the human-readable name surfaced in
+/// [`Error::LlmProvider::provider`] when the request itself fails
+/// (network error, JSON encode failure). It's not used for any
+/// wire-level decision.
+#[derive(Debug)]
+pub(crate) struct OpenAiCompatRequest<'a> {
+    /// Fully-qualified endpoint URL (e.g. `https://api.openai.com/v1/chat/completions`).
+    pub url: &'a str,
+    /// Bearer token. Sent verbatim in the `Authorization: Bearer …` header.
+    pub bearer: &'a str,
+    /// Provider name for diagnostic error rendering.
+    pub provider: &'a str,
+    /// JSON body. Caller owns construction (model / messages / streaming flag /
+    /// tool-calling shape) — the helper only serialises + transmits.
+    pub body: &'a serde_json::Value,
+    /// Additional request headers (e.g. `("accept", "text/event-stream")`
+    /// for the streaming variant). `content-type: application/json` is
+    /// applied unconditionally via [`reqwest::RequestBuilder::json`].
+    pub extra_headers: Vec<(&'a str, &'a str)>,
+}
+
+/// POST an OpenAI-compatible chat/completions request.
+///
+/// Returns the raw [`reqwest::Response`] so each call site can apply
+/// its own status-code handling (429 → [`Error::RateLimited`], !is_success
+/// → [`Error::LlmProvider`]) and its own body parser (one-shot JSON vs
+/// SSE stream). Doing the dispatch here would force the helper to
+/// know about both shapes, which is exactly the coupling §6.3 asks us
+/// to avoid.
+pub(crate) async fn send_openai_compat(
+    http: &reqwest::Client,
+    req: OpenAiCompatRequest<'_>,
+) -> Result<reqwest::Response> {
+    let mut builder = http
+        .post(req.url)
+        .header("Authorization", format!("Bearer {}", req.bearer))
+        .json(req.body);
+    for (k, v) in &req.extra_headers {
+        builder = builder.header(*k, *v);
+    }
+    builder.send().await.map_err(|e| Error::LlmProvider {
+        provider: req.provider.to_string(),
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]
