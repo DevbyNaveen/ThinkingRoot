@@ -12,7 +12,7 @@ use console::style;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use super::{config, http};
+use super::{http, load_or_default, require_token};
 
 const MANIFEST_NAME: &str = "tr-pack.toml";
 const ALWAYS_EXCLUDED: &[&str] = &[".git", ".thinkingroot", "target", "node_modules"];
@@ -100,8 +100,8 @@ pub async fn run(
     timeout_secs: u64,
     server_override: Option<String>,
 ) -> Result<()> {
-    let cfg = config::load_or_default(server_override.as_deref())?;
-    let token = config::require_token(&cfg)?;
+    let cfg = load_or_default(server_override.as_deref())?;
+    let token = require_token(&cfg)?;
     let user_id = cfg
         .user_id
         .as_deref()

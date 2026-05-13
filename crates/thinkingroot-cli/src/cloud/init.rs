@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use console::style;
 
-use super::config;
+use super::load_or_default;
 
 pub const MANIFEST_NAME: &str = "tr-pack.toml";
 
@@ -23,7 +23,7 @@ pub async fn run(
         ));
     }
 
-    let cfg = config::load_or_default(server_override.as_deref())?;
+    let cfg = load_or_default(server_override.as_deref())?;
 
     let slug = slug
         .or_else(|| {

@@ -6262,6 +6262,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thinkingroot-branch",
+ "thinkingroot-cloud-auth",
  "thinkingroot-compile",
  "thinkingroot-core",
  "thinkingroot-cortex-async",

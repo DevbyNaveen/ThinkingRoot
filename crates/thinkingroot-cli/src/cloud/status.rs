@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use console::style;
 use serde::Deserialize;
 
-use super::{config, http};
+use super::{http, load_or_default, require_token};
 
 #[derive(Debug, Deserialize)]
 struct Job {
@@ -25,8 +25,8 @@ struct JobsResponse {
 }
 
 pub async fn run(limit: u32, server_override: Option<String>) -> Result<()> {
-    let cfg = config::load_or_default(server_override.as_deref())?;
-    let token = config::require_token(&cfg)?;
+    let cfg = load_or_default(server_override.as_deref())?;
+    let token = require_token(&cfg)?;
     let user_id = cfg
         .user_id
         .as_deref()

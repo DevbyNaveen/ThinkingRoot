@@ -59,6 +59,31 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     .await
 }
 
+/// POST raw bytes with bearer auth + caller-supplied content-type.
+///
+/// No retry by design: the consumer is `root publish`'s large-body
+/// archive upload (tar+zstd of the workspace). Retries would re-stream
+/// tens of MiB; the operation is idempotent server-side (content
+/// addressed by BLAKE3) but the wire cost is paid every attempt, so
+/// we let the caller decide whether to re-run.
+pub async fn post_bytes<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    bearer: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<T, CloudError> {
+    let resp = http
+        .post(url)
+        .bearer_auth(bearer)
+        .header("content-type", content_type)
+        .body(body)
+        .send()
+        .await
+        .map_err(CloudError::Http)?;
+    handle_json(resp).await
+}
+
 /// Retry policy from spec §8.5:
 /// - `CloudUnavailable`: up to 3 retries at 250ms / 1s / 4s.
 /// - `RateLimited`: 1 retry respecting Retry-After (capped 30s).

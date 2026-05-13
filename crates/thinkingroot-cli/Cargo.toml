@@ -43,6 +43,10 @@ thinkingroot-core = { workspace = true }
 # Shared async /livez probe — same crate the desktop calls into so
 # both surfaces agree on the wire-level probe semantics.
 thinkingroot-cortex-async = { workspace = true }
+# Shared cloud auth substrate: auth.json reader/writer, /me + credits
+# pollers, HTTP retry policy, browser-flow login. Same crate the
+# desktop calls into so both surfaces agree on auth.json semantics.
+thinkingroot-cloud-auth = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }

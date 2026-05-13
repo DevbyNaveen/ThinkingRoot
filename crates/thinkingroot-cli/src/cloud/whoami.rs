@@ -5,7 +5,7 @@ use anyhow::Result;
 use console::style;
 use serde::Deserialize;
 
-use super::{config, http};
+use super::{http, load_or_default, require_token};
 
 #[derive(Debug, Deserialize)]
 struct MeUser {
@@ -19,8 +19,8 @@ struct MeResponse {
 }
 
 pub async fn run(server_override: Option<String>) -> Result<()> {
-    let cfg = config::load_or_default(server_override.as_deref())?;
-    let token = config::require_token(&cfg)?;
+    let cfg = load_or_default(server_override.as_deref())?;
+    let token = require_token(&cfg)?;
     let http = http::client()?;
     let me: MeResponse = http::get_json(
         &http,

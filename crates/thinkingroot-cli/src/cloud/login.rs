@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use console::style;
 use serde::Deserialize;
 
-use super::{config, http};
+use super::{config, http, load_or_default};
 
 #[derive(Debug, Deserialize)]
 struct MeUser {
@@ -23,7 +23,7 @@ struct MeResponse {
 
 pub async fn run(token: Option<String>, server: Option<String>) -> Result<()> {
     let server = server
-        .or_else(|| config::load_or_default(None).ok().map(|c| c.server))
+        .or_else(|| load_or_default(None).ok().map(|c| c.server))
         .unwrap_or_else(|| "https://api.thinkingroot.dev".into());
 
     let token = match token {
@@ -47,7 +47,7 @@ pub async fn run(token: Option<String>, server: Option<String>) -> Result<()> {
     )
     .await?;
 
-    let mut cfg = config::load_or_default(None).unwrap_or_else(|_| config::Config::empty());
+    let mut cfg = load_or_default(None).unwrap_or_else(|_| config::Config::empty());
     cfg.token = Some(token);
     cfg.server = server.clone();
     cfg.handle = Some(me.user.handle.clone());
