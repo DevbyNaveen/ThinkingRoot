@@ -750,6 +750,24 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(cloud::publish::Visibility))]
         visibility: Option<cloud::publish::Visibility>,
     },
+    /// Pull a pack from ThinkingRoot Cloud into the local workspace.
+    /// Alias for `root install owner/slug[@version]`.
+    Pull {
+        /// Pack reference in the form `owner/slug` or `owner/slug@version`.
+        pack_ref: String,
+        /// Target directory. Defaults to
+        /// `~/.thinkingroot/packs/<owner>/<slug>/<version>/`.
+        #[arg(long)]
+        target: Option<PathBuf>,
+    },
+    /// Clone a pack into a new directory. Alias for `root pull`
+    /// with a required `target`.
+    Clone {
+        /// Pack reference in the form `owner/slug` or `owner/slug@version`.
+        pack_ref: String,
+        /// Destination directory for the clone.
+        target: PathBuf,
+    },
     /// List your recent cloud compile jobs. Replaces `tr status` —
     /// the existing `root status` continues to show local branch
     /// state.
@@ -1917,6 +1935,12 @@ async fn async_main() -> anyhow::Result<()> {
             visibility,
         }) => {
             cloud::push::run(path, !no_wait, timeout, server, visibility).await?;
+        }
+        Some(Commands::Pull { pack_ref, target }) => {
+            cloud::pull::run(pack_ref, target).await?;
+        }
+        Some(Commands::Clone { pack_ref, target }) => {
+            cloud::pull::run(pack_ref, Some(target)).await?;
         }
         Some(Commands::Jobs { limit, server }) => {
             cloud::status::run(limit, server).await?;
