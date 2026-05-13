@@ -26,19 +26,16 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Structured desktop-only state.
+///
+/// Cloud session state (token, API base, handle, tier, credits) is NOT
+/// stored here. As of Task 16 (OSS Cloud-Readiness Slice 1) it lives in
+/// `~/.config/thinkingroot/auth.json` and is owned by the
+/// `thinkingroot-cloud-auth` crate. The `legacy_cloud_*` accessors below
+/// reach back into the raw on-disk TOML so a one-time migration can
+/// import pre-Slice-1 sign-ins; new code MUST read cloud session state
+/// through `thinkingroot_cloud_auth::config::load()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesktopState {
-    /// Cloud session token (set by the in-app login flow). Stored here
-    /// rather than in `credentials.toml` because it is per-user, not
-    /// per-provider, and is rotated by a different code path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloud_token: Option<String>,
-    /// Cloud API base URL override (testing / on-prem).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloud_api_base: Option<String>,
-    /// Cloud handle / username for display.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloud_handle: Option<String>,
     /// Directories the workspace-scan command should walk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scan_roots: Vec<PathBuf>,
@@ -129,6 +126,90 @@ impl DesktopState {
         state.save()?;
         Ok(state)
     }
+
+    /// Read the raw on-disk TOML *without* deserialising into
+    /// `DesktopState`. Used by the cloud-session migration helpers below
+    /// to recover fields that the typed struct no longer holds.
+    fn raw_toml_value() -> Option<toml::Value> {
+        let path = Self::path()?;
+        let bytes = std::fs::read(&path).ok()?;
+        toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()
+    }
+
+    /// Legacy pre-Slice-1 cloud token from `desktop.toml`, if still
+    /// present. Returns `None` after migration removes the field.
+    pub(crate) fn legacy_cloud_token(&self) -> Option<String> {
+        Self::raw_toml_value()?
+            .get("cloud_token")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// Legacy pre-Slice-1 cloud API base URL from `desktop.toml`, if
+    /// still present.
+    pub(crate) fn legacy_cloud_api_base(&self) -> Option<String> {
+        Self::raw_toml_value()?
+            .get("cloud_api_base")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// Legacy pre-Slice-1 cloud handle from `desktop.toml`, if still
+    /// present.
+    pub(crate) fn legacy_cloud_handle(&self) -> Option<String> {
+        Self::raw_toml_value()?
+            .get("cloud_handle")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+}
+
+/// One-time migration: if a legacy `cloud_token` field is present in
+/// `desktop.toml` AND no `auth.json` exists, copy the legacy fields
+/// into a fresh auth.json so users who signed in via the pre-Slice-1
+/// paste flow don't get logged out by this rename.
+///
+/// Best-effort verification: after copying the token we call `/me`. If
+/// it fails the user just sees "session expired" on next launch which
+/// prompts re-login — honest, no silent fallback.
+///
+/// Spec: `docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md` §7.6.
+pub async fn migrate_legacy_cloud_fields_on_first_run() -> anyhow::Result<()> {
+    let state = match DesktopState::load() {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let Some(legacy_token) = state.legacy_cloud_token().filter(|t| !t.is_empty()) else {
+        return Ok(());
+    };
+    if thinkingroot_cloud_auth::config::load()?.is_some() {
+        return Ok(());
+    }
+    let mut cfg = thinkingroot_cloud_auth::config::Config::empty();
+    cfg.token = Some(legacy_token);
+    if let Some(base) = state.legacy_cloud_api_base() {
+        cfg.server = base;
+    }
+    if let Some(handle) = state.legacy_cloud_handle() {
+        cfg.handle = Some(handle);
+    }
+    thinkingroot_cloud_auth::config::save(&cfg)?;
+
+    // Best-effort: verify via /me; if it fails the user just sees
+    // "session expired" on next launch which prompts re-login —
+    // honest, no silent fallback.
+    if let Ok(me) = thinkingroot_cloud_auth::me::fetch_me(&cfg).await {
+        let _ = thinkingroot_cloud_auth::config::update(|c| {
+            c.user_id = Some(me.user.id);
+            c.handle = Some(me.user.handle);
+            c.tier = Some(me.user.tier);
+            c.credit_period_end = Some(me.credit_period_end);
+            c.token_expires_at = Some(me.token_expires_at);
+            c.me_refreshed_at = Some(chrono::Utc::now());
+        });
+    }
+
+    Ok(())
 }
 
 /// Try to read the legacy `~/.config/thinkingroot/desktop.toml`.
@@ -212,22 +293,10 @@ fn migrate_legacy(state: &mut DesktopState, legacy: &toml::Table) {
         let _ = creds.save();
     }
 
-    // Cloud session — pure pass-through.
-    if let Some(v) = legacy.get("TR_CLOUD_TOKEN").and_then(|v| v.as_str()) {
-        if state.cloud_token.is_none() && !v.is_empty() {
-            state.cloud_token = Some(v.to_string());
-        }
-    }
-    if let Some(v) = legacy.get("TR_CLOUD_API_BASE").and_then(|v| v.as_str()) {
-        if state.cloud_api_base.is_none() && !v.is_empty() {
-            state.cloud_api_base = Some(v.to_string());
-        }
-    }
-    if let Some(v) = legacy.get("TR_CLOUD_HANDLE").and_then(|v| v.as_str()) {
-        if state.cloud_handle.is_none() && !v.is_empty() {
-            state.cloud_handle = Some(v.to_string());
-        }
-    }
+    // Cloud session — handled by `migrate_legacy_cloud_fields_on_first_run`,
+    // which reads the raw TOML and copies into the cloud-auth crate's
+    // auth.json. Not migrated here because Slice 1 (Task 16) moved cloud
+    // session state out of `DesktopState` entirely.
 
     // Scan roots — accept either an array or a comma-separated string.
     if state.scan_roots.is_empty() {

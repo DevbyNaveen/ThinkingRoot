@@ -68,6 +68,19 @@ pub fn run() {
             // engine surface.  Failures are logged + swallowed.
             install_manifest_bridge::register_desktop_bundle(app.handle());
 
+            // One-time migration of pre-Slice-1 cloud session state
+            // from `desktop.toml` into the cloud-auth crate's
+            // `auth.json`. No-op when there's nothing to migrate or
+            // when a new auth.json already exists. Async because the
+            // best-effort `/me` verification call blocks.
+            tauri::async_runtime::spawn(async {
+                if let Err(e) =
+                    config::migrate_legacy_cloud_fields_on_first_run().await
+                {
+                    tracing::warn!(error = %e, "legacy cloud field migration failed");
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
