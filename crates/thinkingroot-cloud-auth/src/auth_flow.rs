@@ -49,7 +49,7 @@ pub struct LoginOutcome {
 }
 
 /// Process-global guard: only one in-flight login at a time.
-static LOGIN_IN_FLIGHT: Mutex<bool> = Mutex::const_new(false);
+static LOGIN_IN_FLIGHT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -66,20 +66,26 @@ pub async fn run_browser_login(
     surface: Surface,
     cancel: CancellationToken,
 ) -> Result<LoginOutcome, CloudError> {
-    // Concurrency guard.
+    // Concurrency guard. std::sync::Mutex keeps the critical section
+    // sync so the scopeguard release below can run without spawning a
+    // tokio task (which would leak the flag if the runtime shuts down
+    // between the spawn and the task poll).
     {
-        let mut in_flight = LOGIN_IN_FLIGHT.lock().await;
+        let mut in_flight = LOGIN_IN_FLIGHT
+            .lock()
+            .expect("LOGIN_IN_FLIGHT mutex poisoned");
         if *in_flight {
             return Err(CloudError::AlreadyInFlight);
         }
         *in_flight = true;
     }
-    // Release the guard via a drop-bomb so panics + early returns clear it.
+    // Release the guard synchronously on drop. With std::sync::Mutex
+    // the closure runs inline — no tokio::spawn, no runtime-shutdown
+    // race that could leak the flag.
     let _guard = scopeguard::guard((), |()| {
-        let _ = tokio::spawn(async {
-            let mut in_flight = LOGIN_IN_FLIGHT.lock().await;
-            *in_flight = false;
-        });
+        if let Ok(mut g) = LOGIN_IN_FLIGHT.lock() {
+            *g = false;
+        }
     });
 
     let state = ulid::Ulid::new().to_string();
