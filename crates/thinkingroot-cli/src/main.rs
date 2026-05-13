@@ -730,6 +730,26 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(cloud::publish::Visibility))]
         visibility: Option<cloud::publish::Visibility>,
     },
+    /// Push this workspace as a pack to ThinkingRoot Cloud. Alias
+    /// for `root publish` with GitHub-feel UX.
+    Push {
+        /// Path to the workspace root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Don't poll the compile job — return immediately after
+        /// enqueue.
+        #[arg(long)]
+        no_wait: bool,
+        /// Override the configured cloud server.
+        #[arg(long, env = "TR_SERVER")]
+        server: Option<String>,
+        /// Wait timeout in seconds when polling.
+        #[arg(long, default_value = "300")]
+        timeout: u64,
+        /// Override the manifest's `pack.visibility` value.
+        #[arg(long, value_parser = clap::value_parser!(cloud::publish::Visibility))]
+        visibility: Option<cloud::publish::Visibility>,
+    },
     /// List your recent cloud compile jobs. Replaces `tr status` —
     /// the existing `root status` continues to show local branch
     /// state.
@@ -1888,6 +1908,15 @@ async fn async_main() -> anyhow::Result<()> {
             visibility,
         }) => {
             cloud::publish::run(path, !no_wait, timeout, server, visibility).await?;
+        }
+        Some(Commands::Push {
+            path,
+            no_wait,
+            server,
+            timeout,
+            visibility,
+        }) => {
+            cloud::push::run(path, !no_wait, timeout, server, visibility).await?;
         }
         Some(Commands::Jobs { limit, server }) => {
             cloud::status::run(limit, server).await?;
