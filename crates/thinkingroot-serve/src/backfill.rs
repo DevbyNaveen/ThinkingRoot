@@ -27,7 +27,7 @@ use thinkingroot_core::Result;
 use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_extract::ExtractionOutput;
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 
 use crate::structural_persist::phase_6_7_structural_persist;
 

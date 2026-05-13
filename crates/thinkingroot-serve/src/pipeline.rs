@@ -1138,7 +1138,7 @@ async fn run_pipeline_inner(
         thinkingroot_core::CompileStep::Persisting,
         truly_changed.len() as u64,
     );
-    let byte_store = thinkingroot_rooting::FileSystemSourceStore::new(&data_dir)
+    let byte_store = thinkingroot_graph::FileSystemSourceStore::new(&data_dir)
         .map_err(|e| thinkingroot_core::Error::Config(format!("rooting byte store: {e}")))?;
     for doc in &truly_changed {
         let source = thinkingroot_core::Source::new(doc.uri.clone(), doc.source_type)
@@ -1156,7 +1156,7 @@ async fn run_pipeline_inner(
             .map(|c| c.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        use thinkingroot_rooting::SourceByteStore;
+        use thinkingroot_graph::SourceByteStore;
         byte_store
             .put(doc.source_id, &doc.content_hash, text.as_bytes())
             .map_err(|e| thinkingroot_core::Error::Config(format!("rooting put: {e}")))?;

@@ -25,9 +25,20 @@ mod config;
 mod predicate;
 mod probes;
 mod rooter;
-mod source_store;
 pub mod storage;
 mod verdict;
+
+/// Transitional re-export. The byte-store primitives moved to
+/// `thinkingroot_graph::source_store` on 2026-05-14 (Phase 1 of the rooting
+/// crate dissolution); this module exists so internal probe + rooter modules
+/// and any out-of-tree consumer that still imports
+/// `thinkingroot_rooting::{source_store, FileSystemSourceStore, …}` keeps
+/// compiling until Phase 6 deletes the rooting crate entirely.
+pub mod source_store {
+    pub use thinkingroot_graph::source_store::{
+        FileSystemSourceStore, SourceByteStore, SourceBytes,
+    };
+}
 
 pub use thinkingroot_core::types::{
     AdmissionTier, DerivationProof, Predicate, PredicateLanguage, PredicateScope,
@@ -38,6 +49,7 @@ pub use crate::config::RootingConfig;
 pub use crate::predicate::{PredicateEngine, PredicateEvaluation};
 pub use crate::probes::{Probe, ProbeContext, ProbeName, ProbeResult};
 pub use crate::rooter::{CandidateClaim, Rooter, RootingOutput, RootingProgressFn};
+// Transitional re-export — see `mod source_store` above.
 pub use crate::source_store::{FileSystemSourceStore, SourceByteStore, SourceBytes};
 pub use crate::verdict::TrialVerdict;
 
@@ -56,6 +68,18 @@ pub enum RootingError {
     /// Serialization failure when building a certificate or verdict.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+/// Bridge to the engine-wide `Error` type. The byte-store primitives moved to
+/// `thinkingroot-graph` on 2026-05-14 and now surface
+/// `thinkingroot_core::Error` from their `Result`s; the rooting probes still
+/// use `?` against those calls so we need a flat `From` to keep the existing
+/// error-propagation shape. Maps every variant onto `RootingError::Graph` —
+/// good enough for an inert crate scheduled for Phase 6 deletion.
+impl From<thinkingroot_core::Error> for RootingError {
+    fn from(e: thinkingroot_core::Error) -> Self {
+        RootingError::Graph(e.to_string())
+    }
 }
 
 /// Crate-local result alias.

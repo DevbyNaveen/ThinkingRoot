@@ -24,7 +24,7 @@ use thinkingroot_graph::hybrid_queries::{
     Q_HR_HAS_DOC_TAG_WITH_TARGET, Q_HR_HAS_MARKER, Q_HR_IN_CALL_GRAPH_OF, Q_HR_QUANTITY_RANGE,
     Q_HR_REFERENCED_BY, Q_HR_SOURCE_TRUST_AT_LEAST, Q_HR_SUPERSEDES_CLAIM,
 };
-use thinkingroot_rooting::SourceByteStore;
+use thinkingroot_graph::SourceByteStore;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{

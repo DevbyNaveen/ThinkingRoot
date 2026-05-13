@@ -29,7 +29,7 @@ use thinkingroot_extract::ExtractionOutput;
 use thinkingroot_extract::router::{Tier, classify};
 use thinkingroot_extract::structural::extract_structural;
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 use thinkingroot_serve::structural_persist::phase_6_7_structural_persist;
 
 fn fixture_path() -> PathBuf {

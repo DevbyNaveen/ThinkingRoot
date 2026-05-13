@@ -1,8 +1,15 @@
 //! Durable byte-store for source documents, keyed by content hash.
 //!
-//! Rooting probes re-execute months after ingestion, so source bytes must
-//! outlive the in-memory extraction pipeline. This module defines the trait
-//! and the default filesystem-backed implementation.
+//! Source bytes must outlive the in-memory extraction pipeline so that
+//! downstream consumers (witness verification, hybrid retrieval re-ranking,
+//! probe re-execution months after ingestion) can re-read the exact bytes a
+//! claim/witness was derived from. This module defines the trait and the
+//! default filesystem-backed implementation.
+//!
+//! Lived in `thinkingroot-rooting` historically because Rooting probes were
+//! the first consumer; moved here in 2026-05-14 so the substrate is reachable
+//! from every crate that depends on `thinkingroot-graph` without dragging in
+//! the (now-defunct) Rooting probe stack.
 
 use std::collections::HashSet;
 use std::fs;
@@ -10,8 +17,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use thinkingroot_core::types::{ContentHash, SourceId};
-
-use crate::{Result, RootingError};
+use thinkingroot_core::{Error, Result};
 
 /// A source document's bytes plus identifying metadata.
 #[derive(Debug, Clone)]
@@ -61,6 +67,10 @@ pub trait SourceByteStore: Send + Sync {
 /// Layout: `{root}/rooting/sources/{hash[0..2]}/{hash[2..4]}/{full_hash}.bin`
 /// Git-style fan-out sharding avoids single-directory explosion at scale
 /// (thousands of sources → ~256 first-level dirs × 256 second-level dirs).
+///
+/// The `rooting/sources/` subpath is preserved for backward compatibility with
+/// existing `.thinkingroot/` workspace layouts — renaming would break every
+/// already-mounted workspace.
 ///
 /// A companion sidecar file `{full_hash}.src` stores the owning `source_id`
 /// so we can rebuild the SourceBytes envelope on read without touching the
@@ -140,7 +150,7 @@ impl SourceByteStore for FileSystemSourceStore {
             Ok(s) => s
                 .trim()
                 .parse::<SourceId>()
-                .map_err(|_| RootingError::Graph("invalid source_id sidecar".into()))?,
+                .map_err(|_| Error::GraphStorage("invalid source_id sidecar".into()))?,
             Err(_) => SourceId::new(),
         };
         Ok(Some(SourceBytes {

@@ -150,7 +150,7 @@ pub fn run_pack(
 /// The flow:
 ///
 ///  1. Open the workspace's CozoDB at `.thinkingroot/graph.db` and the
-///     [`thinkingroot_rooting::FileSystemSourceStore`] at
+///     [`thinkingroot_graph::FileSystemSourceStore`] at
 ///     `.thinkingroot/rooting/sources/`.
 ///  2. Walk every `(uri, content_hash)` source row. For each non-empty
 ///     hash, fetch the source bytes from the byte store and stage them
@@ -174,7 +174,7 @@ fn run_pack_v3(
     sign_keyless: bool,
     branch: Option<&str>,
 ) -> Result<()> {
-    use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+    use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 
     let workspace_engine_dir = workspace.join(".thinkingroot");
     if !workspace_engine_dir.exists() {
@@ -1379,7 +1379,7 @@ mod tests {
         use thinkingroot_core::types::{ContentHash, SourceSpan, SourceType, WorkspaceId};
         use thinkingroot_core::{Claim, ClaimType, Source};
         use thinkingroot_graph::graph::GraphStore;
-        use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+        use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 
         let workspace = dir.to_path_buf();
         let engine = workspace.join(".thinkingroot");

@@ -43,7 +43,7 @@ use thinkingroot_graph::rows::{
 };
 use thinkingroot_graph::Blake3Cache;
 use thinkingroot_graph::graph::{GraphStore, PerSourceRows};
-use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 
 mod code_metrics;
 mod git_blame;

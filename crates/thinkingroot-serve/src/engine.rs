@@ -1715,7 +1715,7 @@ impl QueryEngine {
     /// were never persisted (older workspaces).
     pub async fn read_source(&self, ws: &str, claim_id: &str) -> Result<ReadSourceResult> {
         use thinkingroot_core::Error;
-        use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+        use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
@@ -4240,14 +4240,14 @@ Rules: \
     /// Construct a workspace-scoped source byte-store for content-hash-keyed
     /// range reads (RARP's BLAKE3 verification path). Mirrors the on-demand
     /// construction at engine.rs:2226 — `FileSystemSourceStore::new` is
-    /// infallible (`crates/thinkingroot-rooting/src/source_store.rs:76-79`)
+    /// infallible (`crates/thinkingroot-graph/src/source_store.rs:88-91`)
     /// so this only returns `None` when the workspace is not mounted.
     pub fn byte_store(
         &self,
         ws: &str,
-    ) -> Option<Arc<dyn thinkingroot_rooting::SourceByteStore>> {
+    ) -> Option<Arc<dyn thinkingroot_graph::SourceByteStore>> {
         let h = self.workspaces.get(ws)?;
-        let store = thinkingroot_rooting::FileSystemSourceStore::new(
+        let store = thinkingroot_graph::FileSystemSourceStore::new(
             &h.root_path.join(".thinkingroot"),
         )
         .ok()?;

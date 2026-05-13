@@ -29,7 +29,7 @@ use thinkingroot_graph::aep_queries::{
     self as aepq, dv_str_list, run_aep,
 };
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_rooting::SourceByteStore;
+use thinkingroot_graph::SourceByteStore;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

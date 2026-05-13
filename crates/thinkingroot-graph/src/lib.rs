@@ -5,12 +5,15 @@ pub mod spreading_activation;
 pub mod per_source_rows;
 pub mod row_blake3;
 pub mod rows;
+pub mod source_store;
 pub mod storage;
 pub mod structural_inserts;
 pub mod vector;
 pub mod witness_inserts;
 
 pub use per_source_rows::PerSourceRows;
+
+pub use source_store::{FileSystemSourceStore, SourceByteStore, SourceBytes};
 
 pub use row_blake3::{row_blake3, Blake3Cache};
 pub use rows::{

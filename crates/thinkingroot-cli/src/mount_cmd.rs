@@ -50,7 +50,7 @@ use thinkingroot_core::types::{
     SourceSpan, SourceType, TrustLevel, WorkspaceId,
 };
 use thinkingroot_graph::storage::StorageEngine;
-use thinkingroot_rooting::{FileSystemSourceStore, SourceByteStore};
+use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
 use tr_format::{ClaimRecord, V3Pack, read_v3_pack};
 
 use crate::cortex_client;
