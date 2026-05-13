@@ -61,6 +61,8 @@ thinkingroot-reflect = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken for browser-flow login Ctrl+C handling.
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }

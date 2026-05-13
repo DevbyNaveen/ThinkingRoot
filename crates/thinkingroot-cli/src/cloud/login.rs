@@ -1,78 +1,109 @@
-//! `root login` — paste your API token, validate against the cloud's
-//! `/me` endpoint, persist server + token + cached identity.
+//! `root login` — opens a browser for sign-in; falls back to
+//! `--token <T>` paste mode for headless / sandbox environments.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 use console::style;
-use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
-use super::{config, http, load_or_default};
+use thinkingroot_cloud_auth::auth_flow::{Surface, run_browser_login};
+use thinkingroot_cloud_auth::{config, me};
 
-#[derive(Debug, Deserialize)]
-struct MeUser {
-    id: String,
-    handle: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    display_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeResponse {
-    user: MeUser,
-}
-
-pub async fn run(token: Option<String>, server: Option<String>) -> Result<()> {
+/// Run the login flow.
+///
+/// - `token: Some(t)` → paste-mode (uses `t`, validates via `/me`,
+///   persists). Prints a warning that the token will be in shell
+///   history.
+/// - `token: None` → browser-flow (opens browser, waits 60s for
+///   callback, persists, prefetches credits).
+/// - `server` overrides the configured server URL.
+/// - `no_browser: true` → never opens a browser, only honours
+///   `--token`. Surfaces an error if both are absent.
+pub async fn run(
+    token: Option<String>,
+    server: Option<String>,
+    no_browser: bool,
+) -> Result<()> {
     let server = server
-        .or_else(|| load_or_default(None).ok().map(|c| c.server))
+        .or_else(|| config::load().ok().flatten().map(|c| c.server))
         .unwrap_or_else(|| "https://api.thinkingroot.dev".into());
 
-    let token = match token {
-        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => prompt_token()?,
-    };
-    if token.is_empty() {
-        return Err(anyhow!("token required"));
+    match (token, no_browser) {
+        (Some(t), _) => {
+            eprintln!(
+                "{} note: `--token` puts your token in shell history. \
+                 Prefer the browser flow (omit `--token`) when possible.",
+                style("⚠").yellow(),
+            );
+            run_paste_mode(t, server).await
+        }
+        (None, true) => {
+            anyhow::bail!(
+                "no token provided and --no-browser is set. \
+                 Run `root login --token <T>` with a token from the hub."
+            );
+        }
+        (None, false) => run_browser_mode(server).await,
     }
+}
 
+async fn run_paste_mode(token: String, server: String) -> Result<()> {
     println!(
         "{} authenticating against {}",
         style("→").cyan(),
         style(&server).dim()
     );
-    let http = http::client()?;
-    let me: MeResponse = http::get_json(
-        &http,
-        &format!("{}/me", server.trim_end_matches('/')),
-        &token,
-    )
-    .await?;
-
-    let mut cfg = load_or_default(None).unwrap_or_else(|_| config::Config::empty());
+    let mut cfg = config::load()
+        .context("load auth.json")?
+        .unwrap_or_else(config::Config::empty);
     cfg.token = Some(token);
     cfg.server = server.clone();
-    cfg.handle = Some(me.user.handle.clone());
-    cfg.user_id = Some(me.user.id.clone());
-    config::save(&cfg)?;
-
-    println!(
-        "{} signed in as {} ({})",
-        style("✓").green(),
-        style(format!("@{}", me.user.handle)).bold(),
-        style(&me.user.id).dim()
-    );
-    println!(
-        "  config: {}",
-        style(config::config_path()?.display()).dim()
-    );
+    let me_resp = me::fetch_me(&cfg)
+        .await
+        .context("verify token via /me")?;
+    cfg.user_id = Some(me_resp.user.id.clone());
+    cfg.handle = Some(me_resp.user.handle.clone());
+    cfg.tier = Some(me_resp.user.tier.clone());
+    cfg.token_expires_at = Some(me_resp.token_expires_at);
+    cfg.credit_period_end = Some(me_resp.credit_period_end);
+    cfg.me_refreshed_at = Some(chrono::Utc::now());
+    config::save(&cfg).context("save auth.json")?;
+    print_success(&me_resp.user.handle, &me_resp.user.tier);
     Ok(())
 }
 
-fn prompt_token() -> Result<String> {
+async fn run_browser_mode(server: String) -> Result<()> {
     println!(
-        "{} create a token at {} → /settings/api-tokens, then paste it here.",
-        style("?").cyan(),
-        style("the hub").bold()
+        "{} opening browser to sign in at {}",
+        style("→").cyan(),
+        style(&server).dim()
     );
-    let t = rpassword::prompt_password("token: ")?;
-    Ok(t.trim().to_string())
+    let cancel = CancellationToken::new();
+    let cancel_for_ctrlc = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        cancel_for_ctrlc.cancel();
+    });
+    let outcome = run_browser_login(&server, Surface::Cli, cancel)
+        .await
+        .context("browser-flow login")?;
+    print_success(&outcome.handle, &outcome.tier);
+    if let Some(credits) = outcome.credits_remaining {
+        println!(
+            "  credits: {}",
+            style(format!("{credits} remaining")).cyan()
+        );
+    }
+    Ok(())
+}
+
+fn print_success(handle: &str, tier: &str) {
+    println!(
+        "{} signed in as {} ({} tier)",
+        style("✓").green(),
+        style(format!("@{handle}")).bold(),
+        style(tier).cyan(),
+    );
+    if let Ok(p) = config::config_path() {
+        println!("  config: {}", style(p.display()).dim());
+    }
 }

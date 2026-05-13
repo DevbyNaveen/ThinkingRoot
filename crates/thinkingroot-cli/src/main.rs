@@ -674,12 +674,17 @@ enum Commands {
     // -------------------------------------------------------------------------
     /// Save your cloud API token. Replaces the legacy `tr login`.
     Login {
-        /// API token. If omitted, you'll be prompted to paste.
-        #[arg(long)]
+        /// Bearer token from the hub's `/settings/api-tokens`.
+        /// Omit to use the browser-flow login (recommended).
+        #[arg(long, env = "THINKINGROOT_API_TOKEN")]
         token: Option<String>,
         /// Cloud server URL. Defaults to https://api.thinkingroot.dev.
-        #[arg(long)]
+        #[arg(long, env = "THINKINGROOT_API_SERVER")]
         server: Option<String>,
+        /// Skip the browser flow — only use `--token <T>` when set.
+        /// Useful in headless CI environments.
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Print the cloud identity associated with your saved token.
     /// Replaces the legacy `tr whoami`.
@@ -1853,8 +1858,8 @@ async fn async_main() -> anyhow::Result<()> {
         }) => {
             mount_cmd::run_mount(pack, name, no_verify, recompile).await?;
         }
-        Some(Commands::Login { token, server }) => {
-            cloud::login::run(token, server).await?;
+        Some(Commands::Login { token, server, no_browser }) => {
+            cloud::login::run(token, server, no_browser).await?;
         }
         Some(Commands::Whoami { server }) => {
             cloud::whoami::run(server).await?;
