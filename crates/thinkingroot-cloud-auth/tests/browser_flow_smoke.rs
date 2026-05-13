@@ -57,6 +57,11 @@ fn use_temp_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
 /// attempt — sometimes first finishes before second tries, sometimes
 /// not. Unreachable URL → deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// ENV_GUARD must be held for the test's lifetime to keep HOME pointing
+// at this test's tempdir; clippy's await-holding-lock advice is too
+// generic here. Semantically the same as install_manifest.rs::tests
+// which holds the same guard across `cargo test` sync code.
+#[allow(clippy::await_holding_lock)]
 async fn second_login_returns_already_in_flight() {
     let (_home, _guard) = use_temp_home();
     let uri1 = "http://127.0.0.1:1".to_string();
@@ -98,6 +103,10 @@ async fn second_login_returns_already_in_flight() {
 /// unreachable server keeps the future parked on the callback
 /// channel; the only way out is the cancel arm of the select.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// ENV_GUARD must be held for the test's lifetime to keep HOME pointing
+// at this test's tempdir; clippy's await-holding-lock advice is too
+// generic here.
+#[allow(clippy::await_holding_lock)]
 async fn cancel_returns_cancelled_error() {
     let (_home, _guard) = use_temp_home();
     // Port 1 is reserved + unreachable; webbrowser::open will load
