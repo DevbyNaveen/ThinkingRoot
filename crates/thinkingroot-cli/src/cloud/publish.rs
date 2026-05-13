@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use clap::ValueEnum;
 use console::style;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -16,6 +17,32 @@ use super::{http, load_or_default, require_token};
 
 const MANIFEST_NAME: &str = "tr-pack.toml";
 const ALWAYS_EXCLUDED: &[&str] = &[".git", ".thinkingroot", "target", "node_modules"];
+
+/// Override for `pack.visibility` in `tr-pack.toml`. Used by the
+/// `--visibility` flag on `root publish` / `root push`. When absent,
+/// the manifest's value (or its `default_visibility` "public") wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        }
+    }
+}
+
+/// Resolve the effective visibility string sent to the registry —
+/// CLI override takes precedence over the manifest value.
+pub fn effective_visibility(manifest: &Manifest, override_: Option<Visibility>) -> String {
+    override_
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_else(|| manifest.pack.visibility.clone())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -99,6 +126,7 @@ pub async fn run(
     wait: bool,
     timeout_secs: u64,
     server_override: Option<String>,
+    visibility: Option<Visibility>,
 ) -> Result<()> {
     let cfg = load_or_default(server_override.as_deref())?;
     let token = require_token(&cfg)?;
@@ -108,10 +136,12 @@ pub async fn run(
         .ok_or_else(|| anyhow!("missing user_id in config — run `root login` again"))?;
 
     let manifest = load_manifest(&path)?;
+    let effective_vis = effective_visibility(&manifest, visibility);
     println!(
-        "{} publishing {}",
+        "{} publishing {} ({})",
         style("→").cyan(),
-        style(format!("{}/{}", manifest.pack.owner, manifest.pack.slug)).bold()
+        style(format!("{}/{}", manifest.pack.owner, manifest.pack.slug)).bold(),
+        style(&effective_vis).dim(),
     );
 
     let http = http::client()?;
@@ -127,7 +157,7 @@ pub async fn run(
             slug: manifest.pack.slug.clone(),
             description: manifest.pack.description.clone(),
             license: manifest.pack.license.clone(),
-            visibility: manifest.pack.visibility.clone(),
+            visibility: effective_vis.clone(),
         },
     )
     .await
@@ -403,6 +433,44 @@ mod tests {
         .unwrap();
         let err = load_manifest(dir.path()).unwrap_err();
         assert!(err.to_string().contains("owner"));
+    }
+
+    #[test]
+    fn effective_visibility_override_wins() {
+        let manifest = Manifest {
+            pack: PackSection {
+                owner: "alice".into(),
+                slug: "demo".into(),
+                description: String::new(),
+                license: default_license(),
+                visibility: "public".into(),
+            },
+            publish: None,
+        };
+        assert_eq!(effective_visibility(&manifest, None), "public");
+        assert_eq!(
+            effective_visibility(&manifest, Some(Visibility::Private)),
+            "private"
+        );
+        assert_eq!(
+            effective_visibility(&manifest, Some(Visibility::Public)),
+            "public"
+        );
+    }
+
+    #[test]
+    fn effective_visibility_falls_back_to_manifest() {
+        let manifest = Manifest {
+            pack: PackSection {
+                owner: "alice".into(),
+                slug: "demo".into(),
+                description: String::new(),
+                license: default_license(),
+                visibility: "private".into(),
+            },
+            publish: None,
+        };
+        assert_eq!(effective_visibility(&manifest, None), "private");
     }
 
     #[test]

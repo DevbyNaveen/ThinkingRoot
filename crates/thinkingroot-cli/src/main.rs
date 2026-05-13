@@ -725,6 +725,10 @@ enum Commands {
         /// Override the configured cloud server.
         #[arg(long, env = "TR_SERVER")]
         server: Option<String>,
+        /// Override the manifest's `pack.visibility` value. The hub's
+        /// private-packs gate (Pro-tier only) is enforced server-side.
+        #[arg(long, value_parser = clap::value_parser!(cloud::publish::Visibility))]
+        visibility: Option<cloud::publish::Visibility>,
     },
     /// List your recent cloud compile jobs. Replaces `tr status` —
     /// the existing `root status` continues to show local branch
@@ -1881,8 +1885,9 @@ async fn async_main() -> anyhow::Result<()> {
             no_wait,
             timeout,
             server,
+            visibility,
         }) => {
-            cloud::publish::run(path, !no_wait, timeout, server).await?;
+            cloud::publish::run(path, !no_wait, timeout, server, visibility).await?;
         }
         Some(Commands::Jobs { limit, server }) => {
             cloud::status::run(limit, server).await?;
