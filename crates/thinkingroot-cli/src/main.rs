@@ -686,6 +686,8 @@ enum Commands {
         #[arg(long)]
         no_browser: bool,
     },
+    /// Sign out of ThinkingRoot Cloud — wipes the local auth file.
+    Logout,
     /// Print the cloud identity associated with your saved token.
     /// Replaces the legacy `tr whoami`.
     Whoami {
@@ -1860,6 +1862,9 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Commands::Login { token, server, no_browser }) => {
             cloud::login::run(token, server, no_browser).await?;
+        }
+        Some(Commands::Logout) => {
+            cloud::logout::run().await?;
         }
         Some(Commands::Whoami { server }) => {
             cloud::whoami::run(server).await?;

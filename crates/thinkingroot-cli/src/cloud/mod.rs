@@ -13,6 +13,7 @@
 
 pub mod init;
 pub mod login;
+pub mod logout;
 pub mod publish;
 pub mod status;
 pub mod whoami;
