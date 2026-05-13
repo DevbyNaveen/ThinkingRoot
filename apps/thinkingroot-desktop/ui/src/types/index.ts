@@ -37,7 +37,8 @@ export type SettingsSectionId =
   | "workspace"
   | "appearance"
   | "mcp"
-  | "channels";
+  | "channels"
+  | "cloud";
 
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {

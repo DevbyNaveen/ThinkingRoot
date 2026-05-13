@@ -965,6 +965,8 @@ export interface BranchView {
   status: string;
   current: boolean;
   description: string | null;
+  /** Daemon `BranchKind` JSON (`#[serde(tag = "kind")]`) when present. */
+  kind?: unknown;
 }
 
 export async function branchList(workspace: string): Promise<BranchView[]> {
@@ -1134,11 +1136,12 @@ export async function branchDiff(branch: string): Promise<KnowledgeDiff> {
 // The Rust shape is `BranchEventEnvelope` (see
 // `apps/thinkingroot-desktop/src-tauri/src/commands/branch_extras.rs`).
 // `kind` is the discriminator; the optional fields are populated per
-// variant (`event` only for `event`, `missed` only for `lagged`,
-// `reason` only for `disconnected`).
+// variant (`event` for `event`, `head` for `head_changed`, `missed`
+// for `lagged`, `reason` for `disconnected`).
 
 export type BranchEventEnvelope =
   | { kind: "event"; branch: string; event: unknown }
+  | { kind: "head_changed"; head: string }
   | { kind: "lagged"; missed: number }
   | { kind: "disconnected"; reason: string };
 
@@ -1455,18 +1458,67 @@ export async function engramExpire(args: {
   });
 }
 
-// ─── Auth state (honest local/cloud read) ────────────────────────────
+// ─── Cloud auth (Slice 1) ────────────────────────────────────────────
+//
+// Mirrors the Rust types in `src-tauri/src/commands/cloud.rs`. The
+// `cloud_status_changed` event carries discriminated-union payloads
+// that surface state transitions in real time (login flow, credit
+// updates, auth-expired). All cloud writes live in `thinkingroot-cloud-auth`;
+// these bindings just shuttle the typed shapes across the IPC boundary.
 
 export interface AuthState {
   signed_in: boolean;
-  cloud_base_url: string | null;
-  handle: string | null;
-  storage: { local: boolean; cloud: boolean };
+  handle?: string | null;
+  tier?: string | null;
+  credits_remaining?: number | null;
+  credits_total?: number | null;
+  period_end?: string | null;
+  server: string;
+  last_refresh_at?: string | null;
+  token_redacted?: string | null;
 }
 
-export async function authState(): Promise<AuthState> {
-  return invoke<AuthState>("auth_state");
+export interface CreditsSnapshot {
+  remaining: number;
+  total: number;
+  period_end: string;
 }
+
+export type CloudStatusEventPayload =
+  | { status: "signed_out" }
+  | { status: "logging_in"; manual_url?: string }
+  | {
+      status: "signed_in";
+      handle: string;
+      tier: "free" | "pro";
+      credits_remaining: number;
+      credits_total: number;
+      period_end: string;
+    }
+  | {
+      status: "login_failed";
+      reason:
+        | "timeout"
+        | "state_mismatch"
+        | "bind_failed"
+        | "cancelled"
+        | "already_in_flight"
+        | "hub_reject";
+      detail?: string;
+    }
+  | { status: "auth_expired" }
+  | { status: "credits_updated"; remaining: number; total: number }
+  | { status: "tier_changed"; new_tier: "free" | "pro" };
+
+export const CLOUD_STATUS_EVENT = "cloud_status_changed";
+
+export const authState = (): Promise<AuthState> => invoke("auth_state");
+export const cloudLoginStart = (): Promise<void> => invoke("cloud_login_start");
+export const cloudLoginCancel = (): Promise<void> => invoke("cloud_login_cancel");
+export const cloudLogout = (): Promise<void> => invoke("cloud_logout");
+export const cloudRefreshMe = (): Promise<AuthState> => invoke("cloud_refresh_me");
+export const cloudCreditsPoll = (): Promise<CreditsSnapshot> => invoke("cloud_credits_poll");
+export const cloudOpenUpgrade = (): Promise<void> => invoke("cloud_open_upgrade");
 
 // ─── Embedded terminal (PTY) ─────────────────────────────────────────
 //

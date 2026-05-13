@@ -29,6 +29,7 @@ import { toast } from "@/store/toast";
 import { Button } from "@/components/ui/button";
 import { PasswordInput } from "@/components/ui/password-input";
 import { cn } from "@/lib/utils";
+import { CloudPanel } from "@/components/cloud/CloudPanel";
 import type { SettingsSectionId, Theme } from "@/types";
 
 /** Provider keys the Settings UI surfaces. The `env_var` matches the
@@ -81,6 +82,11 @@ const SETTINGS_PAGE_META: Record<SettingsSectionId, { title: string; subtitle: s
   channels: {
     title: "Channels",
     subtitle: "Optional Telegram, Slack, or Discord surfaces when the channel bridge ships.",
+  },
+  cloud: {
+    title: "Cloud",
+    subtitle:
+      "Sign in to ThinkingRoot Cloud to push packs to the hub, use managed models, and monitor credit balance.",
   },
 };
 
@@ -570,6 +576,8 @@ export function SettingsView() {
                 </p>
               </SettingsGroup>
             )}
+
+            {settingsSection === "cloud" && <CloudPanel />}
           </div>
         </div>
       </div>

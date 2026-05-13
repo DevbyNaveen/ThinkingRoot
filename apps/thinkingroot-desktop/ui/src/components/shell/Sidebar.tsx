@@ -36,6 +36,7 @@ import {
   FolderOpen,
   Paintbrush,
   Bell,
+  Cloud,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -77,6 +78,7 @@ const SETTINGS_NAV: Array<{
   { id: "appearance", label: "Appearance", icon: Paintbrush },
   { id: "mcp", label: "MCP", icon: Plug },
   { id: "channels", label: "Channels", icon: Bell },
+  { id: "cloud", label: "Cloud", icon: Cloud },
 ];
 
 type WorkspaceWithConvs = WorkspaceView & {
@@ -475,11 +477,11 @@ function authLabel(auth: AuthState | null): string {
   if (auth == null) return "…";
   if (!auth.signed_in) return "Login";
   if (auth.handle) return `@${auth.handle}`;
-  if (auth.cloud_base_url) {
+  if (auth.server) {
     try {
-      return new URL(auth.cloud_base_url).host;
+      return new URL(auth.server).host;
     } catch {
-      return auth.cloud_base_url;
+      return auth.server;
     }
   }
   return "Signed in";
@@ -592,15 +594,19 @@ function SidebarAuthStrip() {
               <p className="font-medium text-foreground/90">Cloud session</p>
               {auth.handle ? (
                 <p className="truncate">@{auth.handle}</p>
-              ) : auth.cloud_base_url ? (
-                <p className="truncate">{auth.cloud_base_url}</p>
+              ) : auth.server ? (
+                <p className="truncate">{auth.server}</p>
               ) : (
                 <p>Signed in</p>
               )}
-              <p className="text-muted-foreground/80">
-                Local {auth.storage.local ? "on" : "off"} · Cloud{" "}
-                {auth.storage.cloud ? "on" : "off"}
-              </p>
+              {auth.tier && (
+                <p className="text-muted-foreground/80">
+                  {auth.tier} tier
+                  {auth.credits_remaining != null && auth.credits_total != null
+                    ? ` · ${auth.credits_remaining}/${auth.credits_total} credits`
+                    : ""}
+                </p>
+              )}
             </div>
           ) : (
             <div className="space-y-1 px-3 py-2 text-[10px] leading-snug text-muted-foreground">
