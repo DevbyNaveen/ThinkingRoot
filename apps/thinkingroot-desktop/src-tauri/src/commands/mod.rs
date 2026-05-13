@@ -7,7 +7,16 @@
 //! re-export here — re-exports would resolve to the visible function
 //! but hide the macro-generated helper.
 
-pub mod auth;
+// `commands::auth` is superseded by `commands::cloud` (Task 15 of the
+// OSS cloud-readiness work). The legacy module redefined `auth_state`
+// with a different shape and a different storage substrate
+// (`DesktopState` rather than `thinkingroot-cloud-auth::config`); the
+// `#[tauri::command]` macro mints a crate-level `__cmd__auth_state`
+// helper so leaving both modules wired causes a multi-definition
+// error. The file itself stays in the tree until Task 16 deletes it;
+// excluding it from compilation here keeps that follow-up as a
+// pure-deletion patch.
+// pub mod auth;
 pub mod brain;
 pub mod branch;
 pub mod branch_data;
@@ -17,6 +26,7 @@ pub mod browser;
 pub mod browser_save;
 pub mod chat;
 pub mod claims;
+pub mod cloud;
 pub mod conversations;
 pub mod doctor;
 pub mod engram;

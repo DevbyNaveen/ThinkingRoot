@@ -48,6 +48,7 @@ thinkingroot-core          = { path = "../../../crates/thinkingroot-core" }
 thinkingroot-cortex-async  = { path = "../../../crates/thinkingroot-cortex-async" }
 thinkingroot-serve         = { path = "../../../crates/thinkingroot-serve", default-features = false }
 thinkingroot-branch        = { path = "../../../crates/thinkingroot-branch" }
+thinkingroot-cloud-auth    = { path = "../../../crates/thinkingroot-cloud-auth" }
 
 # Trust + preview surface for the `.tr` file-association flow. Each
 # crate is path-deped because the desktop sits outside the parent

@@ -37,6 +37,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .manage::<commands::cloud::LoginInFlightState>(std::sync::Arc::new(
+            tokio::sync::Mutex::new(commands::cloud::LoginInFlight::default()),
+        ))
         .setup(|app| {
             app.manage(state::AppState::default());
             tray::install(app.handle())?;
@@ -140,7 +143,15 @@ pub fn run() {
             commands::privacy::privacy_summary,
             commands::privacy::privacy_forget,
             commands::scan::workspace_scan,
-            commands::auth::auth_state,
+            // Cloud-auth surface (Task 15 — replaces legacy
+            // commands::auth::auth_state; Task 16 deletes commands/auth.rs).
+            commands::cloud::auth_state,
+            commands::cloud::cloud_login_start,
+            commands::cloud::cloud_login_cancel,
+            commands::cloud::cloud_logout,
+            commands::cloud::cloud_refresh_me,
+            commands::cloud::cloud_credits_poll,
+            commands::cloud::cloud_open_upgrade,
             commands::conversations::conversations_list,
             commands::conversations::conversations_create,
             commands::conversations::conversations_get,
