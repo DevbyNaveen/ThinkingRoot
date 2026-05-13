@@ -38,6 +38,8 @@ import {
   FolderOpen,
   ClipboardPaste,
   Code2,
+  Copy,
+  Share2,
 } from "lucide-react";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -79,6 +81,7 @@ import { GapCards } from "./GapCards";
 import { ReasoningTrace } from "./ReasoningTrace";
 import { TrustReceiptChip } from "./TrustReceipt";
 import { runSlashCommand } from "./slashCommands";
+import { UpgradeBanner, parseUpgradeReason } from "@/components/cloud/UpgradeBanner";
 
 /** Stable pretty-print of a tool-call input for display in a claim
  *  card. Errors fall back to the original .toString() so the card
@@ -113,6 +116,33 @@ function buildHistoryPayload(messages: ChatMessage[]): ChatTurnPayload[] {
     }
   }
   return turns.slice(-MAX_HISTORY_TURNS);
+}
+
+/** Collapse temp-id + disk-id echo pairs left in cache from older builds. */
+function collapseClientDiskEcho(msgs: ChatMessage[]): ChatMessage[] {
+  const THRESH_MS = 8000;
+  const out: ChatMessage[] = [];
+  for (const m of msgs) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.kind === m.kind &&
+      prev.body === m.body &&
+      Math.abs(m.at.getTime() - prev.at.getTime()) <= THRESH_MS
+    ) {
+      const prevTemp = prev.id.startsWith("m-");
+      const curTemp = m.id.startsWith("m-");
+      if (prevTemp && !curTemp) {
+        out[out.length - 1] = m;
+        continue;
+      }
+      if (!prevTemp && curTemp) {
+        continue;
+      }
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 export function ChatView() {
@@ -222,7 +252,7 @@ export function ChatView() {
           seen.add(m.id);
           return true;
         });
-        setMessages(activeWorkspace, activeConv, deduped);
+        setMessages(activeWorkspace, activeConv, collapseClientDiskEcho(deduped));
       } catch (e) {
         toast("Load conversation failed", {
           kind: "error",
@@ -387,79 +417,90 @@ export function ChatView() {
         const msgBody =
           ev.type === "final" ? ev.full_text : `⚠️ ${ev.message}`;
 
-        // Persist to disk + UI cache when we know which conversation
-        // to write to. The on-disk write is fire-and-forget; UI cache
-        // is what makes the bubble appear.
+        // Snapshot streaming steps before any await — `setStreaming(null)`
+        // clears them; assistant row must carry the frozen trace.
+        const flushedActivations = turnEngramActivations.get(ev.turn_id);
+        const flushedGaps = turnGaps.get(ev.turn_id);
+        const snap = useApp.getState();
+        const flushedSteps =
+          snap.streaming?.turnId === ev.turn_id
+            ? [...snap.streaming.agentSteps]
+            : [];
+
         if (ctx && ctx.convId) {
-          if (ev.type === "final") {
-            conversationsAppendMessage({
-              workspace: ctx.workspace,
-              conversationId: ctx.convId,
-              role: "assistant",
-              content: ev.full_text,
-              claimsUsed: [],
-            }).catch((e) => {
-              toast("Persist message failed", {
-                kind: "warn",
-                body: e instanceof Error ? e.message : String(e),
+          void (async () => {
+            let messageId: string;
+            if (ev.type === "final") {
+              try {
+                const saved = await conversationsAppendMessage({
+                  workspace: ctx.workspace,
+                  conversationId: ctx.convId,
+                  role: "assistant",
+                  content: ev.full_text,
+                  claimsUsed: [],
+                });
+                messageId = saved.id;
+              } catch (e) {
+                toast("Persist message failed", {
+                  kind: "warn",
+                  body: e instanceof Error ? e.message : String(e),
+                });
+                messageId = `m-${Date.now()}-a`;
+              }
+            } else {
+              messageId = `m-${Date.now()}-e`;
+            }
+
+            appendMessage(ctx.workspace, ctx.convId, {
+              id: messageId,
+              kind: "assistant",
+              body: msgBody,
+              at: new Date(),
+              engramActivations:
+                flushedActivations && flushedActivations.length > 0
+                  ? flushedActivations
+                  : undefined,
+              gaps: flushedGaps && flushedGaps.length > 0 ? flushedGaps : undefined,
+              agentSteps: flushedSteps.length > 0 ? flushedSteps : undefined,
+            });
+
+            if (ev.type === "final") {
+              lastAssistantMessage.set(ev.turn_id, {
+                workspace: ctx.workspace,
+                convId: ctx.convId,
+                messageId,
               });
-            });
-          }
-          const messageId = `m-${Date.now()}-${ev.type === "final" ? "a" : "e"}`;
-          const flushedActivations = turnEngramActivations.get(ev.turn_id);
-          const flushedGaps = turnGaps.get(ev.turn_id);
-          // Reasoning-trace snapshot: copy the streaming.agentSteps
-          // off the active StreamState (read BEFORE setStreaming(null)
-          // below clears it). Empty arrays drop to undefined so the
-          // accordion is hidden when there's nothing to expand.
-          const flushedSteps =
-            cur.streaming?.turnId === ev.turn_id
-              ? [...cur.streaming.agentSteps]
-              : [];
-          appendMessage(ctx.workspace, ctx.convId, {
-            id: messageId,
-            kind: "assistant",
-            body: msgBody,
-            at: new Date(),
-            engramActivations:
-              flushedActivations && flushedActivations.length > 0
-                ? flushedActivations
-                : undefined,
-            gaps: flushedGaps && flushedGaps.length > 0 ? flushedGaps : undefined,
-            agentSteps: flushedSteps.length > 0 ? flushedSteps : undefined,
-          });
-          // Remember this message id for the matching trust_receipt
-          // event that arrives shortly after `final` on the same SSE
-          // stream. Only meaningful for `final` (errors don't carry
-          // a verifier verdict).
-          if (ev.type === "final") {
-            lastAssistantMessage.set(ev.turn_id, {
-              workspace: ctx.workspace,
-              convId: ctx.convId,
-              messageId,
-            });
-          }
+            }
+
+            const latest = useApp.getState();
+            if (latest.streaming?.turnId === ev.turn_id) {
+              setStreaming(null);
+            }
+            if (ev.type === "error") {
+              latest.clearTurn(ev.turn_id);
+              citationParsers.delete(ev.turn_id);
+              lastAssistantMessage.delete(ev.turn_id);
+              turnEngramActivations.delete(ev.turn_id);
+              turnGaps.delete(ev.turn_id);
+            }
+          })();
         } else {
           // eslint-disable-next-line no-console
           console.warn(
             "[chat-event] no ctx for final/error — bubble suppressed but state cleared",
             { turn_id: ev.turn_id, fromMap, fromActive },
           );
-        }
-
-        if (cur.streaming?.turnId === ev.turn_id) {
-          setStreaming(null);
-        }
-        // For `final`, do NOT clearTurn — the trust_receipt may still
-        // be in flight. We clear in the trust_receipt handler below,
-        // and also after a short timeout below in case the stream
-        // closes without one. For `error`, clear immediately.
-        if (ev.type === "error") {
-          cur.clearTurn(ev.turn_id);
-          citationParsers.delete(ev.turn_id);
-          lastAssistantMessage.delete(ev.turn_id);
-          turnEngramActivations.delete(ev.turn_id);
-          turnGaps.delete(ev.turn_id);
+          const latest = useApp.getState();
+          if (latest.streaming?.turnId === ev.turn_id) {
+            setStreaming(null);
+          }
+          if (ev.type === "error") {
+            latest.clearTurn(ev.turn_id);
+            citationParsers.delete(ev.turn_id);
+            lastAssistantMessage.delete(ev.turn_id);
+            turnEngramActivations.delete(ev.turn_id);
+            turnGaps.delete(ev.turn_id);
+          }
         }
         return;
       }
@@ -675,25 +716,29 @@ export function ChatView() {
                 if (!ws) return;
                 const cid = useApp.getState().activeConversationId;
                 if (!cid) return;
-                const id = `m-${Date.now()}-u`;
+                const tempId = `m-${Date.now()}-u`;
                 appendMessage(ws, cid, {
-                  id,
+                  id: tempId,
                   kind: "user",
                   body: content,
                   at: new Date(),
                 });
-                conversationsAppendMessage({
+                void conversationsAppendMessage({
                   workspace: ws,
                   conversationId: cid,
                   role: "user",
                   content,
-                }).catch((e) => {
-                  useApp.getState().removeMessage(ws, cid, id);
-                  toast("Could not save your message — try again", {
-                    kind: "error",
-                    body: e instanceof Error ? e.message : String(e),
+                })
+                  .then((saved) => {
+                    useApp.getState().replaceMessageId(ws, cid, tempId, saved.id);
+                  })
+                  .catch((e) => {
+                    useApp.getState().removeMessage(ws, cid, tempId);
+                    toast("Could not save your message — try again", {
+                      kind: "error",
+                      body: e instanceof Error ? e.message : String(e),
+                    });
                   });
-                });
               }}
               onStartTurn={(turnId, ws, cid) => {
                 useApp.getState().registerTurn(turnId, ws, cid);
@@ -722,18 +767,18 @@ export function ChatView() {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <div className="border-b border-border/40 bg-background/80 px-8 py-2 backdrop-blur">
-        <div className="mx-auto flex min-w-0 max-w-3xl items-center gap-1.5">
-          <span className="min-w-0 truncate text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
+      <div className="border-b border-border/40 bg-background/80 px-8 py-2.5 backdrop-blur supports-[backdrop-filter]:bg-background/70">
+        <div className="mx-auto flex min-w-0 max-w-3xl items-baseline gap-x-2 font-sans antialiased">
+          <span className="min-w-0 shrink truncate text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
             {activeWorkspace}
           </span>
           <span
-            className="shrink-0 select-none text-[10px] text-muted-foreground/40"
+            className="shrink-0 translate-y-[0.5px] select-none text-xs font-medium tabular-nums leading-none text-muted-foreground/50"
             aria-hidden
           >
             /
           </span>
-          <div className="min-w-0 shrink">
+          <div className="min-w-0 shrink leading-none">
             <BranchChip workspace={activeWorkspace} />
           </div>
         </div>
@@ -817,24 +862,29 @@ export function ChatView() {
           if (!ws) return;
           const cid = useApp.getState().activeConversationId;
           if (!cid) return;
-          const id = `m-${Date.now()}-u`;
+          const tempId = `m-${Date.now()}-u`;
           appendMessage(ws, cid, {
-            id,
+            id: tempId,
             kind: "user",
             body: content,
             at: new Date(),
           });
-          conversationsAppendMessage({
+          void conversationsAppendMessage({
             workspace: ws,
             conversationId: cid,
             role: "user",
             content,
-          }).catch((e) => {
-            toast("Persist user message failed", {
-              kind: "warn",
-              body: e instanceof Error ? e.message : String(e),
+          })
+            .then((saved) => {
+              useApp.getState().replaceMessageId(ws, cid, tempId, saved.id);
+            })
+            .catch((e) => {
+              useApp.getState().removeMessage(ws, cid, tempId);
+              toast("Persist user message failed", {
+                kind: "warn",
+                body: e instanceof Error ? e.message : String(e),
+              });
             });
-          });
         }}
         onStartTurn={(turnId, ws, cid) => {
           useApp.getState().registerTurn(turnId, ws, cid);
@@ -1061,28 +1111,49 @@ async function shareAssistantMessage(body: string) {
   }
 }
 
-function AssistantMessageActions({ body }: { body: string }) {
-  if (!body.trim()) return null;
+function AssistantMessageFooter({
+  body,
+  trustReceipt,
+  pending,
+}: {
+  body: string;
+  trustReceipt: ChatMessage["trustReceipt"];
+  pending?: boolean;
+}) {
+  const showActions = body.trim().length > 0;
+  const showTrust = Boolean(!pending && trustReceipt);
+
+  if (!showActions && !showTrust) return null;
+
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-1 border-t border-border/30 pt-2">
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground"
-        onClick={() => void copyAssistantMessage(body)}
-      >
-        Copy
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground"
-        onClick={() => void shareAssistantMessage(body)}
-      >
-        Share
-      </Button>
+    <div className="mt-3 flex min-h-8 items-center justify-between gap-3">
+      <div className="min-w-0 flex-1">
+        {showTrust && trustReceipt ? <TrustReceiptChip receipt={trustReceipt} /> : null}
+      </div>
+      {showActions ? (
+        <div className="flex shrink-0 items-center gap-0.5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 text-muted-foreground hover:text-foreground"
+            aria-label="Copy message"
+            onClick={() => void copyAssistantMessage(body)}
+          >
+            <Copy className="size-4" strokeWidth={2} aria-hidden />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 text-muted-foreground hover:text-foreground"
+            aria-label="Share message"
+            onClick={() => void shareAssistantMessage(body)}
+          >
+            <Share2 className="size-4" strokeWidth={2} aria-hidden />
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1118,7 +1189,25 @@ function MessageBubble({
     return <ThinkingLoader label={pendingLabel} />;
   }
 
-  // AI Message: No bubble, full width, rendered with Markdown
+  // AI Message: No bubble, full width, rendered with Markdown.
+  //
+  // Honesty wire-up: chat-error events arrive as assistant messages
+  // with body prefixed by `⚠️ ` (see the `final | error` handler in
+  // the chat-event listener above). When that error stringifies into
+  // a known upgrade reason (credits exhausted, tier required, private
+  // pack pre-flight), surface the structured `UpgradeBanner` rather
+  // than the raw markdown so the user sees the actionable CTA. The
+  // generic markdown render still covers every non-upgrade error.
+  const upgradeReason = !isUser ? parseUpgradeReason(msg.body) : null;
+  if (!isUser && upgradeReason) {
+    return (
+      <div className={cn("flex w-full px-2", pending && "opacity-90")}>
+        <div className="w-full max-w-3xl">
+          <UpgradeBanner reason={upgradeReason} />
+        </div>
+      </div>
+    );
+  }
   if (!isUser) {
     return (
       <div className={cn("flex w-full px-2", pending && "opacity-90")}>
@@ -1173,7 +1262,11 @@ function MessageBubble({
           {pending && (
             <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
           )}
-          <AssistantMessageActions body={msg.body} />
+          <AssistantMessageFooter
+            body={msg.body}
+            trustReceipt={msg.trustReceipt}
+            pending={pending}
+          />
           {!pending && msg.engramActivations && msg.engramActivations.length > 0 && (
             <div className="mt-2">
               <EngramTimeline activations={msg.engramActivations} />
@@ -1187,11 +1280,6 @@ function MessageBubble({
           {!pending && msg.agentSteps && msg.agentSteps.length > 0 && (
             <div className="mt-2">
               <ReasoningTrace steps={msg.agentSteps} />
-            </div>
-          )}
-          {!pending && msg.trustReceipt && (
-            <div className="mt-2">
-              <TrustReceiptChip receipt={msg.trustReceipt} />
             </div>
           )}
         </div>
