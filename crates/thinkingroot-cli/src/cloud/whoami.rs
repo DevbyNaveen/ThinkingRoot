@@ -1,39 +1,59 @@
-//! `root whoami` — print the cloud identity associated with the saved
-//! API token.
+//! `root whoami` — print the logged-in identity, tier, and credits.
 
 use anyhow::Result;
 use console::style;
-use serde::Deserialize;
 
-use super::{http, load_or_default, require_token};
+use thinkingroot_cloud_auth::config::{self, Config};
 
-#[derive(Debug, Deserialize)]
-struct MeUser {
-    id: String,
-    handle: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeResponse {
-    user: MeUser,
-}
-
-pub async fn run(server_override: Option<String>) -> Result<()> {
-    let cfg = load_or_default(server_override.as_deref())?;
-    let token = require_token(&cfg)?;
-    let http = http::client()?;
-    let me: MeResponse = http::get_json(
-        &http,
-        &format!("{}/me", cfg.server.trim_end_matches('/')),
-        token,
-    )
-    .await?;
-    println!(
-        "{} @{} ({})",
-        style("•").cyan(),
-        style(&me.user.handle).bold(),
-        style(&me.user.id).dim()
-    );
-    println!("  server: {}", style(&cfg.server).dim());
+pub async fn run(server: Option<String>) -> Result<()> {
+    let mut cfg = config::load()?.unwrap_or_else(Config::empty);
+    if let Some(s) = server {
+        cfg.server = s;
+    }
+    print!("{}", format_local_summary(&cfg));
     Ok(())
+}
+
+/// Pure formatter — reads only persisted fields; does NOT hit the
+/// network. The future `--refresh` flag re-runs `/me` first.
+pub fn format_local_summary(cfg: &Config) -> String {
+    if !cfg.is_signed_in() {
+        return format!(
+            "{} not signed in. Run `root login` to start a session.\n",
+            style("ⓘ").dim()
+        );
+    }
+    let handle = cfg.handle.as_deref().unwrap_or("?");
+    let tier = cfg.tier.as_deref().unwrap_or("free");
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} signed in as {} ({} tier)\n",
+        style("✓").green(),
+        style(format!("@{handle}")).bold(),
+        style(tier).cyan(),
+    ));
+    if let (Some(remaining), Some(total)) = (cfg.credits_remaining, cfg.credits_total) {
+        out.push_str(&format!(
+            "  credits: {} / {}",
+            style(remaining.to_string()).cyan(),
+            style(total.to_string()).dim(),
+        ));
+        if let Some(end) = cfg.credit_period_end {
+            out.push_str(&format!(
+                " · resets {}",
+                style(end.format("%Y-%m-%d")).dim()
+            ));
+        }
+        out.push('\n');
+    }
+    if let Some(expires) = cfg.token_expires_at {
+        out.push_str(&format!(
+            "  token expires: {}\n",
+            style(expires.format("%Y-%m-%d")).dim()
+        ));
+    }
+    if let Ok(p) = config::config_path() {
+        out.push_str(&format!("  config: {}\n", style(p.display()).dim()));
+    }
+    out
 }
