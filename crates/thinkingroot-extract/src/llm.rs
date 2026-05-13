@@ -1779,18 +1779,21 @@ impl CloudManagedProvider {
         )
         .await?;
 
-        // Rate-limit and detailed status mapping land in Task 4. For
-        // now we surface the generic LlmProvider fallback on non-2xx
-        // so users see a real error message rather than the variant
-        // silently swallowing failures.
+        // Slice 2 Task 4: parse + persist X-TR-Credits-* headers BEFORE
+        // consuming the body so a body-parse failure or non-2xx branch
+        // doesn't lose the meter update. The cloud commits the spend
+        // server-side on every billable response, including error ones
+        // (e.g. 402 carries the post-debit remaining); reflecting that
+        // to auth.json keeps the UI honest.
+        let managed = parse_managed_headers(resp.headers());
+        persist_managed_headers(&managed);
+
         let limits = HeaderRateLimits::from_headers(resp.headers());
         if !resp.status().is_success() {
-            let s = resp.status();
+            let status = resp.status();
+            let retry_after = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::LlmProvider {
-                provider: "thinkingroot-cloud".into(),
-                message: format!("http {s}: {body}"),
-            });
+            return Err(map_cloud_managed_error(status, &body, retry_after));
         }
 
         let json: serde_json::Value = resp.json().await.map_err(|e| Error::LlmProvider {
@@ -1856,13 +1859,21 @@ impl CloudManagedProvider {
         )
         .await?;
 
+        // Slice 2 Task 4: parse + persist X-TR-Credits-* BEFORE the
+        // stream starts. Once we hand off `resp.bytes_stream()` the
+        // headers are still readable on `resp` itself, but consuming
+        // the stream is one-shot — so we extract everything header-side
+        // up front. For error responses the body comes back as JSON
+        // not SSE, so we can `.text()` it normally; the typed mapper
+        // surfaces the same variant ladder as `chat`.
+        let managed = parse_managed_headers(resp.headers());
+        persist_managed_headers(&managed);
+        let retry_after = retry_after_seconds(resp.headers());
+
         if !resp.status().is_success() {
-            let s = resp.status();
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::LlmProvider {
-                provider,
-                message: format!("http {s}: {body}"),
-            });
+            return Err(map_cloud_managed_error(status, &body, retry_after));
         }
 
         let limits = HeaderRateLimits::from_headers(resp.headers());
@@ -1965,13 +1976,18 @@ impl CloudManagedProvider {
         )
         .await?;
 
+        // Slice 2 Task 4: same header-first discipline as `chat`. Tool-
+        // calling responses on a managed model are billed identically
+        // to plain chat (input + output token spend), so the X-TR-*
+        // headers carry the same delta semantics.
+        let managed = parse_managed_headers(resp.headers());
+        persist_managed_headers(&managed);
+
         if !resp.status().is_success() {
-            let s = resp.status();
+            let status = resp.status();
+            let retry_after = retry_after_seconds(resp.headers());
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::LlmProvider {
-                provider: "thinkingroot-cloud".into(),
-                message: format!("http {s}: {body}"),
-            });
+            return Err(map_cloud_managed_error(status, &body, retry_after));
         }
 
         let limits = HeaderRateLimits::from_headers(resp.headers());
@@ -4114,6 +4130,156 @@ pub(crate) async fn send_openai_compat(
         provider: req.provider.to_string(),
         message: e.to_string(),
     })
+}
+
+// ─── Cloud-managed response metadata (Slice 2 Task 4) ──────────────
+//
+// Every cloud-managed response carries credit-balance headers that
+// must be reflected to auth.json so the desktop HeaderChip and the
+// CLI `root status` line show fresh counts without a separate /me
+// poll. The parse step is infallible (absent / malformed headers
+// degrade to `None`); the persist step is best-effort via
+// `tracing::warn!` because the cloud is the authoritative source —
+// an auth.json write failure here doesn't break correctness, it
+// just delays the observed credit delta to the next response.
+//
+// Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.2.
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ManagedResponseHeaders {
+    pub credits_remaining: Option<u64>,
+    pub credits_total: Option<u64>,
+    pub period_end: Option<chrono::DateTime<chrono::Utc>>,
+    pub tier: Option<String>,
+}
+
+pub(crate) fn parse_managed_headers(h: &reqwest::header::HeaderMap) -> ManagedResponseHeaders {
+    let read_u64 = |name: &str| {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+    let read_str = |name: &str| {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
+    let read_dt = |name: &str| {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+    ManagedResponseHeaders {
+        credits_remaining: read_u64("x-tr-credits-remaining"),
+        credits_total: read_u64("x-tr-credits-total"),
+        period_end: read_dt("x-tr-period-end"),
+        tier: read_str("x-tr-tier"),
+    }
+}
+
+/// Persist any cloud-managed response metadata to auth.json. Atomic,
+/// race-safe, no-op on absent headers.
+pub(crate) fn persist_managed_headers(parsed: &ManagedResponseHeaders) {
+    if parsed.credits_remaining.is_none()
+        && parsed.credits_total.is_none()
+        && parsed.period_end.is_none()
+        && parsed.tier.is_none()
+    {
+        return;
+    }
+    // Best-effort: if the auth.json write fails (e.g., file gone, disk full),
+    // log and continue. The credit-balance update is observability, not
+    // correctness — the cloud is authoritative.
+    if let Err(e) = thinkingroot_cloud_auth::config::update(|cfg| {
+        if let Some(v) = parsed.credits_remaining {
+            cfg.credits_remaining = Some(v);
+        }
+        if let Some(v) = parsed.credits_total {
+            cfg.credits_total = Some(v);
+        }
+        if let Some(v) = parsed.period_end {
+            cfg.credit_period_end = Some(v);
+        }
+        if let Some(v) = parsed.tier.as_ref() {
+            cfg.tier = Some(v.clone());
+        }
+        cfg.me_refreshed_at = Some(chrono::Utc::now());
+    }) {
+        tracing::warn!(error = %e, "failed to persist cloud-managed response headers");
+    }
+}
+
+/// Parse a `403 tier_required` body's `feature` field, if present.
+pub(crate) fn parse_feature(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        feature: Option<String>,
+    }
+    serde_json::from_str::<B>(body).ok()?.feature
+}
+
+/// Parse a `402 credits_exhausted` body's `(needed, remaining)` fields.
+pub(crate) fn parse_credits_exhausted_body(body: &str) -> Option<(u64, u64)> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        needed: Option<u64>,
+        remaining: Option<u64>,
+    }
+    let parsed: B = serde_json::from_str(body).ok()?;
+    Some((parsed.needed?, parsed.remaining?))
+}
+
+/// Best-effort `error` field extraction for body-content matching.
+pub(crate) fn parse_error_code(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct B {
+        error: Option<String>,
+    }
+    serde_json::from_str::<B>(body).ok()?.error
+}
+
+/// Map a non-2xx cloud-managed HTTP status + body to a typed
+/// [`Error`] variant per spec §6.5. Returns `None` if the status is
+/// 2xx (caller should not invoke this on success).
+pub(crate) fn map_cloud_managed_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after_secs: Option<u32>,
+) -> Error {
+    let s = status.as_u16();
+    let err_code = parse_error_code(body);
+    match s {
+        401 => Error::AuthExpired,
+        403 if err_code.as_deref() == Some("token_invalid") => Error::AuthExpired,
+        403 if err_code.as_deref() == Some("tier_required") => Error::TierRequired {
+            feature: parse_feature(body).unwrap_or_default(),
+        },
+        402 => match parse_credits_exhausted_body(body) {
+            Some((needed, remaining)) => Error::CreditsExhausted { needed, remaining },
+            None => Error::CreditsExhausted {
+                needed: 0,
+                remaining: 0,
+            },
+        },
+        429 => Error::RateLimitedCloud {
+            retry_after_secs: retry_after_secs.unwrap_or(5),
+        },
+        500..=599 => Error::CloudUnavailable { last_status: s },
+        _ => Error::LlmProvider {
+            provider: "thinkingroot-cloud".into(),
+            message: format!("http {status}: {body}"),
+        },
+    }
+}
+
+/// Read `Retry-After` header as seconds (RFC 7231: either a delta-seconds
+/// integer or an HTTP-date; we only honor the integer form, falling back
+/// to `None` for date form — cloud spec §6.5 guarantees seconds).
+pub(crate) fn retry_after_seconds(h: &reqwest::header::HeaderMap) -> Option<u32> {
+    h.get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
 }
 
 #[cfg(test)]
