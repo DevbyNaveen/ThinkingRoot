@@ -52,6 +52,57 @@ pub enum Error {
         retry_after_ms: u64,
     },
 
+    // --- ThinkingRoot Cloud managed-provider surfacing variants ----
+    //
+    // Distinct from the generic `LlmProvider` / `RateLimited`
+    // variants so the CLI + Desktop UI can render the failure as a
+    // specific actionable banner (re-login vs upgrade vs retry)
+    // rather than a generic red toast. Surfaced by
+    // `Provider::CloudManaged`'s response mapper per
+    // `docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md` §6.5.
+    /// auth.json is absent OR `token` is empty. Pre-network check —
+    /// no request reaches the cloud.
+    #[error("not signed in to ThinkingRoot Cloud — run `root login` first")]
+    NotLoggedIn,
+
+    /// Cloud returned 401 `{"error":"token_invalid"}` — token was
+    /// revoked, expired, or rotated server-side. UX: wipe auth.json,
+    /// emit `cloud_status_changed { status: "auth_expired" }` on
+    /// the desktop, prompt for re-login.
+    #[error("session expired — your token was revoked. Run `root login` again.")]
+    AuthExpired,
+
+    /// Cloud returned 402 `{"error":"credits_exhausted","needed":N,"remaining":M}`.
+    /// UX: CLI prints the actionable hint; Desktop renders
+    /// `UpgradeBanner`.
+    #[error(
+        "credits exhausted: needed {needed}, only {remaining} remaining this cycle. \
+         Run `root upgrade` or switch provider with `root provider set <name>`."
+    )]
+    CreditsExhausted { needed: u64, remaining: u64 },
+
+    /// Cloud returned 403 `{"error":"tier_required","feature":"…"}`.
+    /// UX: CLI + Desktop both surface as "Pro tier required for
+    /// `<feature>`" so the user understands the gate is not random.
+    #[error("Pro tier required for feature `{feature}`. Run `root upgrade`.")]
+    TierRequired { feature: String },
+
+    /// Cloud returned 429 `{"error":"rate_limited","retry_after":N}`.
+    /// Distinct from the generic `RateLimited` variant because the
+    /// retry mechanics differ — cloud carries seconds not millis and
+    /// the UX hint is provider-agnostic ("ThinkingRoot Cloud" not
+    /// e.g. "azure").
+    #[error("rate limited — retry after {retry_after_secs}s")]
+    RateLimitedCloud { retry_after_secs: u32 },
+
+    /// Cloud returned 5xx after the retry budget was exhausted. UX:
+    /// "Local features unaffected" — BYOK providers + structural
+    /// compile still work; only managed-model requests are blocked.
+    #[error(
+        "ThinkingRoot Cloud is unavailable (HTTP {last_status}). Local features unaffected."
+    )]
+    CloudUnavailable { last_status: u16 },
+
     #[error("extraction failed for source {source_id}: {message}")]
     Extraction { source_id: String, message: String },
 
