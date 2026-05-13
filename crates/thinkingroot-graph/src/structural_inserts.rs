@@ -577,20 +577,33 @@ impl GraphStore {
     /// Pull every claim's `(id, symbol)` where `symbol` is non-empty.
     /// Phase 7e builds a `symbol → claim_id` map from this for
     /// `function_calls.callee_name → callee_claim_id` resolution.
+    ///
+    /// Phase 4 Witness Mesh transition (2026-05-14): post-cutover
+    /// workspaces have no rows in `claims`; the pipeline writes only
+    /// witnesses. Include `(witness_id, symbol)` pairs in the result
+    /// so Phase 7e can still resolve `function_calls.callee_claim_id`
+    /// against witness ids — `function_calls.callee_claim_id` is a
+    /// String column with no foreign-key gate, so a Witness id slots
+    /// in cleanly. Without this, I-W3 resolution-revalidation runs
+    /// against an empty symbol map and every cross-source call edge
+    /// becomes external (callee_claim_id = "") for witness-only
+    /// workspaces.
     pub fn list_claim_symbols(&self) -> Result<Vec<(String, String)>> {
-        let result = self.query_read(
+        let claim_rows = self.query_read(
             "?[id, symbol] := *claims{id, symbol}, symbol != ''",
         )?;
-        Ok(result
-            .rows
-            .iter()
-            .filter_map(|r| {
-                if r.len() < 2 {
-                    return None;
-                }
-                Some((dv_to_string(&r[0]), dv_to_string(&r[1])))
-            })
-            .collect())
+        let witness_rows = self.query_read(
+            "?[id, symbol] := *witnesses{id, symbol}, symbol != ''",
+        )?;
+        let mut out: Vec<(String, String)> =
+            Vec::with_capacity(claim_rows.rows.len() + witness_rows.rows.len());
+        for r in claim_rows.rows.iter().chain(witness_rows.rows.iter()) {
+            if r.len() < 2 {
+                continue;
+            }
+            out.push((dv_to_string(&r[0]), dv_to_string(&r[1])));
+        }
+        Ok(out)
     }
 
     /// Pull every source's `(id, uri)`. Phase 7e builds a normalised
@@ -781,14 +794,26 @@ impl GraphStore {
     /// Look up the source_id of a claim. Used by Phase 7e to detect
     /// cross-source `function_calls` rows for `source_references` of
     /// `reference_kind = "import"`.
+    ///
+    /// Phase 4 Witness Mesh transition (2026-05-14): falls back to
+    /// `witnesses` when the `claims` row is absent — Phase 7e calls
+    /// this against ids that `list_claim_symbols` returned, which now
+    /// includes witness ids.
     pub fn lookup_claim_source(&self, claim_id: &str) -> Result<Option<String>> {
         let mut params = BTreeMap::new();
         params.insert("id".into(), DataValue::Str(claim_id.into()));
         let result = self.query(
             "?[source_id] := *claims{id: $id, source_id}",
+            params.clone(),
+        )?;
+        if let Some(s) = result.rows.first().and_then(|r| r.first()).map(dv_to_string) {
+            return Ok(Some(s));
+        }
+        let w_result = self.query(
+            "?[source_id] := *witnesses{id: $id, source_id}",
             params,
         )?;
-        Ok(result.rows.first().and_then(|r| r.first()).map(dv_to_string))
+        Ok(w_result.rows.first().and_then(|r| r.first()).map(dv_to_string))
     }
 
     /// Return the source_id that owns a given claim_id.  Returns `None` if

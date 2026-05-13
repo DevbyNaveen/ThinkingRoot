@@ -10,6 +10,19 @@
 //! All queries are `pub const` strings except `build_in_heading_path` —
 //! the `InHeadingPath` predicate's query shape varies with path length and
 //! is built per-call.
+//!
+//! **Phase 4 Witness Mesh transition (2026-05-14).** Per
+//! `.claude/rules/hybrid-retrieval.md` "Witness Mesh transition": the
+//! predicates here still join `*claims{...}` + `claim_entity_edges` +
+//! `entity_relations` + `function_calls.callee_claim_id` because the
+//! Witness Mesh substrate doesn't populate any of those join columns
+//! today. Retargeting BM25 onto `witness_type + content_blake3 +
+//! spans_json` and vector recall onto Witness span text materialised
+//! from `source.tar.zst` is the Commit-2 cutover work — it requires
+//! the recall tier to read span text at index time, which means a
+//! byte-store round-trip the current `engine.search_scoped` boundary
+//! doesn't have. Until then, witness-only workspaces see empty
+//! hybrid retrieval responses; this is honest behaviour, not a bug.
 
 use std::collections::BTreeMap;
 

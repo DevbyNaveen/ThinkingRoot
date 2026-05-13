@@ -5,6 +5,21 @@
 //! is a verbatim translation of a numbered step in the spec, sized to the
 //! actual CozoDB schema verified at `crates/thinkingroot-graph/src/graph.rs:140-605`.
 //!
+//! **Phase 4 Witness Mesh transition (2026-05-14).** Per
+//! `.claude/rules/aep-v2.md`: the 20 cluster queries + 9 probe
+//! templates in this module **deliberately remain on the legacy
+//! `claims` substrate** during the dual-write transition. They join
+//! against tables (`claim_temporal`, `admission_tier`, `trial_scores`,
+//! `contradictions`, `supersession_chain`, `claim_entity_edges`) that
+//! the Witness Mesh substrate does not populate. Migrating to the
+//! `witnesses` table is the Commit-2 cutover work; that ship will
+//! retarget the cluster materialisation onto Witness sub-meshes and
+//! collapse `admission_tier` reads into the implicit "admitted by
+//! construction" semantics of the Witness model. Until then,
+//! workspaces that contain only Witnesses (no legacy claims) will see
+//! empty AEP probe answers — surface this honestly via the existing
+//! `ProbeCaveat::LowConfidence` path rather than fabricating rows.
+//!
 //! Conventions:
 //!
 //! - Queries take parameters via `BTreeMap<String, DataValue>` and execute

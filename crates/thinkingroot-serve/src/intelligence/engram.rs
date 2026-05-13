@@ -16,6 +16,19 @@
 //! mirrors the `SessionStore` pattern. Datalog runs against a cloned
 //! `GraphStore` (cheap — DbInstance is `Arc`-internal) so no engine-or
 //! storage-lock is held for the duration of a multi-rule materialise.
+//!
+//! **Phase 4 Witness Mesh transition (2026-05-14).** Per
+//! `.claude/rules/aep-v2.md` "Witness Mesh transition": engram payloads
+//! remain claim-id-shaped during the dual-write transition. The 20
+//! cluster queries + 9 probe templates this module dispatches against
+//! still hit the legacy `claims` table (not `witnesses`) because they
+//! join through tables (`admission_tier`, `claim_temporal`,
+//! `contradictions`, `supersession_chain`, `claim_entity_edges`,
+//! `known_unknowns`) that the Witness Mesh substrate doesn't populate
+//! today. Read-side parity for the new substrate is exposed via the
+//! `list_witnesses` MCP tool / REST endpoint, not through this engine.
+//! Commit-2 cutover flips engram materialise + probe paths onto
+//! `WitnessId` sub-meshes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

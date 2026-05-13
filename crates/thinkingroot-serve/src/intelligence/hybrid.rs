@@ -9,6 +9,21 @@
 //! whole call; concurrent reads serialise on Cozo's internal SQLite mutex
 //! rather than on the outer `Arc<Mutex<StorageEngine>>`. Cancellation is
 //! checked at every layer boundary.
+//!
+//! **Phase 4 Witness Mesh transition (2026-05-14).** Per
+//! `.claude/rules/hybrid-retrieval.md` "Witness Mesh transition":
+//! `hybrid_retrieve` still scores legacy `claims`, not `witnesses` —
+//! the 11-component fusion joins through `admission_tier` /
+//! `trial_scores` / `claim_entity_edges` / `claim_temporal` /
+//! `contradictions` / `code_signatures` / `code_metrics` /
+//! `git_blame` / `quantities` / `events`, none of which reference
+//! the `witnesses` table today. The Commit-2 cutover retargets BM25
+//! onto `witness_type + content_blake3 + spans_json` and recall
+//! onto Witness span text materialised from `source.tar.zst` — that
+//! work belongs in a follow-up that also adds an `engine.search_scoped`
+//! variant that knows how to read span text at index time. Until
+//! then, witness-only workspaces see empty hybrid retrieval; this is
+//! honest behaviour, not a bug.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
