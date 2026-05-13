@@ -17,7 +17,7 @@ use crate::error::CloudError;
 /// reader refuses v3+ with `CloudError::IncompatibleSchema`.
 pub const SCHEMA_VERSION: u16 = 2;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u16,
@@ -114,6 +114,15 @@ impl std::fmt::Display for Config {
     }
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delegate to Display, which redacts the token. This makes
+        // tracing::debug!(?config), dbg!(cfg), and {:?} formatting
+        // all token-safe.
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 fn redacted_token(token: &Option<String>) -> String {
     match token.as_deref() {
         None => "<none>".to_string(),
@@ -123,6 +132,20 @@ fn redacted_token(token: &Option<String>) -> String {
             format!("<redacted…{tail}>")
         }
     }
+}
+
+#[cfg(unix)]
+fn chmod_0600(path: &std::path::Path) -> Result<(), CloudError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).map_err(CloudError::Io)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms).map_err(CloudError::Io)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chmod_0600(_path: &std::path::Path) -> Result<(), CloudError> {
+    Ok(())
 }
 
 pub fn config_path() -> Result<PathBuf, CloudError> {
@@ -155,9 +178,16 @@ pub fn load() -> Result<Option<Config>, CloudError> {
     Ok(Some(cfg))
 }
 
-/// Save auth.json atomically. Holds an exclusive lock on the sentinel
-/// lockfile for the duration; this serialises concurrent writers (CLI +
-/// desktop running in the same user account both bump credit balance).
+/// Atomically save the config. Acquires the sentinel lockfile.
+///
+/// **Do NOT call from within `update()`** — `update` holds the same
+/// sentinel lock; calling `save` from inside the closure would
+/// deadlock on the second `lock_exclusive` attempt. Use the internal
+/// `save_locked` helper from inside the locked region.
+///
+/// Holds an exclusive lock on the sentinel lockfile for the duration;
+/// this serialises concurrent writers (CLI + desktop running in the
+/// same user account both bump credit balance).
 pub fn save(cfg: &Config) -> Result<(), CloudError> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
@@ -175,16 +205,11 @@ pub fn save(cfg: &Config) -> Result<(), CloudError> {
 
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(CloudError::Io)?;
     serde_json::to_writer_pretty(tmp.as_file(), cfg).map_err(CloudError::JsonParse)?;
+    tmp.as_file().sync_all().map_err(CloudError::Io)?;
     tmp.persist(&path)
         .map_err(|e| CloudError::Io(e.error))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path).map_err(CloudError::Io)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path, perms).map_err(CloudError::Io)?;
-    }
+    chmod_0600(&path)?;
 
     let _ = fs2::FileExt::unlock(&lock_file);
     Ok(())
@@ -246,15 +271,10 @@ fn save_locked(cfg: &Config) -> Result<(), CloudError> {
     }
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(CloudError::Io)?;
     serde_json::to_writer_pretty(tmp.as_file(), cfg).map_err(CloudError::JsonParse)?;
+    tmp.as_file().sync_all().map_err(CloudError::Io)?;
     tmp.persist(&path).map_err(|e| CloudError::Io(e.error))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path).map_err(CloudError::Io)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path, perms).map_err(CloudError::Io)?;
-    }
+    chmod_0600(&path)?;
 
     Ok(())
 }
@@ -352,6 +372,16 @@ mod tests {
         let rendered = format!("{cfg}");
         assert!(rendered.contains("api.example.com"));
         assert!(!rendered.contains("topsecret"));
+    }
+
+    #[test]
+    fn debug_redacts_token_same_as_display() {
+        let mut cfg = Config::empty();
+        cfg.token = Some("tr_live_topsecret_abcd".to_string());
+        let debug_rendered = format!("{cfg:?}");
+        let display_rendered = format!("{cfg}");
+        assert_eq!(debug_rendered, display_rendered, "Debug must delegate to Display");
+        assert!(!debug_rendered.contains("topsecret"), "Debug leaked token");
     }
 
     #[test]
