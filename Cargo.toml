@@ -144,6 +144,9 @@ fs2 = "0.4"
 # Atomic write-then-rename helper for cortex.lock and other files
 # that must never be observed half-written.
 tempfile = "3"
+# RAII drop-bomb guard used by cloud-auth's browser-flow login to
+# clear the in-flight mutex on panic or early return.
+scopeguard = "1"
 
 # Graph DB (Datalog-based, embedded, community edition)
 cozo = { package = "cozo-ce", version = "0.7.13-alpha.3", default-features = false, features = ["minimal", "rayon"] }

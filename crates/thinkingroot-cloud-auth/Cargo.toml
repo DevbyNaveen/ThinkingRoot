@@ -13,6 +13,7 @@ chrono = { workspace = true, features = ["serde"] }
 dirs = { workspace = true }
 fs2 = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream", "rustls-tls"] }
+scopeguard = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
