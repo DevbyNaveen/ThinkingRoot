@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use console::style;
 use serde::{Deserialize, Serialize};
 use thinkingroot_core::Config;
-use thinkingroot_extract::llm::LlmClient;
+use thinkingroot_llm::llm::LlmClient;
 use thinkingroot_serve::engine::QueryEngine;
 use thinkingroot_serve::intelligence::synthesizer::{AskRequest, ask};
 

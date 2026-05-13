@@ -1,6 +1,6 @@
 [package]
 name = "thinkingroot-extract"
-description = "Stage 2: LLM-powered knowledge extraction for ThinkingRoot"
+description = "Mechanical Witness Mesh extraction (structural, rule-catalog) for ThinkingRoot"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -14,31 +14,13 @@ rust-version.workspace  = true
 
 [dependencies]
 thinkingroot-core = { workspace = true }
-thinkingroot-parse = { workspace = true }
-# Slice 2 Task 3: Provider::CloudManaged sources its bearer token from
-# auth.json at request time via thinkingroot_cloud_auth::config::load.
-thinkingroot-cloud-auth = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-reqwest = { workspace = true }
-futures = { workspace = true }
-eventsource-stream = { workspace = true }
-async-stream = { workspace = true }
-aws-config = { workspace = true }
-aws-sdk-bedrockruntime = { workspace = true }
-aws-smithy-types = { workspace = true }
 blake3 = { workspace = true }
 regex = { workspace = true }
-# Wedge 3: tree-sitter for AST-aware chunk splitting at statement boundaries.
-# Grammars are pulled in transitively via `thinkingroot-parse` so we don't
-# duplicate the language-name match arm.
-tree-sitter = { workspace = true }
 # Witness Mesh rule catalog: static string-keyed map of RuleDescriptor.
 phf = { version = "0.11", features = ["macros"] }
 
@@ -51,9 +33,5 @@ toml = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
-thinkingroot-cloud-auth = { workspace = true }
 thinkingroot-core = { workspace = true, features = ["test-helpers"] }
-axum = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
-futures = { workspace = true }

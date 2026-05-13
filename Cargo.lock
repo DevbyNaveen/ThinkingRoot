@@ -6271,6 +6271,7 @@ dependencies = [
  "thinkingroot-ground",
  "thinkingroot-health",
  "thinkingroot-link",
+ "thinkingroot-llm",
  "thinkingroot-parse",
  "thinkingroot-reflect",
  "thinkingroot-rooting",
@@ -6372,30 +6373,18 @@ dependencies = [
 name = "thinkingroot-extract"
 version = "0.9.1"
 dependencies = [
- "async-stream",
- "aws-config",
- "aws-sdk-bedrockruntime",
- "aws-smithy-types",
  "blake3",
  "chrono",
- "eventsource-stream",
- "futures",
  "phf",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
- "thinkingroot-cloud-auth",
  "thinkingroot-core",
- "thinkingroot-parse",
- "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "toml",
  "tracing",
- "tree-sitter",
 ]
 
 [[package]]
@@ -6456,6 +6445,31 @@ dependencies = [
  "thinkingroot-extract",
  "thinkingroot-graph",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "thinkingroot-llm"
+version = "0.9.1"
+dependencies = [
+ "async-stream",
+ "aws-config",
+ "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
+ "axum",
+ "chrono",
+ "eventsource-stream",
+ "futures",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thinkingroot-cloud-auth",
+ "thinkingroot-core",
+ "thinkingroot-extract",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -6602,6 +6616,7 @@ dependencies = [
  "thinkingroot-ground",
  "thinkingroot-health",
  "thinkingroot-link",
+ "thinkingroot-llm",
  "thinkingroot-parse",
  "thinkingroot-pr",
  "thinkingroot-reflect",

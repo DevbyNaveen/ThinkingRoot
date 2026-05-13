@@ -16,9 +16,10 @@ use thinkingroot_core::config::Config;
 use thinkingroot_core::ir::DocumentIR;
 use thinkingroot_core::types::*;
 
-// LLM client + scheduler imports removed in Witness Mesh cutover.
-// `crate::llm` and `crate::scheduler` modules will be deleted once
-// the remaining LLM file bodies are excised.
+// LLM client + scheduler moved to `thinkingroot-llm` (Phase 2 cleanup,
+// 2026-05-14). The Witness Mesh substrate consults no LLM at compile
+// time; structural extraction parses tree-sitter / regex over chunk
+// metadata.
 use crate::schema::ExtractionResult;
 
 
@@ -284,14 +285,6 @@ impl Extractor {
     /// deterministic and runs in microseconds — no cache layer
     /// helps. Retained as a no-op.
     pub fn with_cache_dir(self, _data_dir: &std::path::Path) -> Self {
-        self
-    }
-
-    /// **Deprecated no-op.** Pre-cutover this primed LLM prompts
-    /// with graph context. Post-cutover structural extraction
-    /// doesn't consult an LLM; retained as a no-op for compile
-    /// compat with `pipeline.rs::extract_phase`.
-    pub fn with_known_entities(self, _ctx: crate::graph_context::GraphPrimedContext) -> Self {
         self
     }
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use thinkingroot_extract::llm::Tool;
+use thinkingroot_llm::llm::Tool;
 use tokio::sync::RwLock;
 
 use crate::engine::{ClaimFilter, QueryEngine};

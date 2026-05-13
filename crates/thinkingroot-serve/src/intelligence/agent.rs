@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use thinkingroot_core::{Error, Result};
-use thinkingroot_extract::llm::{
+use thinkingroot_llm::llm::{
     ChatMessage, LlmClient, Tool, ToolCall, ToolChoice, ToolResult, ToolUseResponse,
 };
 use tokio::sync::mpsc;
@@ -655,7 +655,7 @@ mod tests {
     use crate::intelligence::tools::{ToolHandler, ToolHandlerResult};
     use serde_json::json;
     use std::sync::Mutex;
-    use thinkingroot_extract::scheduler::HeaderRateLimits;
+    use thinkingroot_llm::scheduler::HeaderRateLimits;
 
     /// Stub LLM backend that replays a fixed script of responses.
     /// Each `chat_with_tools` call pops the next scripted response.

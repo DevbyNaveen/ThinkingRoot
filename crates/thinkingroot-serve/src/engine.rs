@@ -757,7 +757,7 @@ struct WorkspaceHandle {
     cache: Arc<RwLock<KnowledgeGraph>>,
     config: Config,
     /// LLM client for ReAct synthesis — None if provider is not configured.
-    llm: Option<Arc<thinkingroot_extract::llm::LlmClient>>,
+    llm: Option<Arc<thinkingroot_llm::llm::LlmClient>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1017,7 @@ impl QueryEngine {
                 cache.entity_count()
             );
         }
-        let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
+        let llm = match thinkingroot_llm::llm::LlmClient::new(&config.llm).await {
             Ok(client) => {
                 tracing::debug!("LLM client initialised for workspace '{name}'");
                 Some(Arc::new(client))
@@ -1090,7 +1090,7 @@ impl QueryEngine {
                 cache.entity_count()
             );
         }
-        let llm = match thinkingroot_extract::llm::LlmClient::new(&config.llm).await {
+        let llm = match thinkingroot_llm::llm::LlmClient::new(&config.llm).await {
             Ok(client) => Some(Arc::new(client)),
             Err(_) => None,
         };
@@ -4118,7 +4118,7 @@ Rules: \
     }
 
     /// Return the LLM client for a workspace, if one was successfully initialised.
-    pub fn workspace_llm(&self, ws: &str) -> Option<Arc<thinkingroot_extract::llm::LlmClient>> {
+    pub fn workspace_llm(&self, ws: &str) -> Option<Arc<thinkingroot_llm::llm::LlmClient>> {
         self.workspaces.get(ws).and_then(|h| h.llm.clone())
     }
 

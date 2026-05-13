@@ -2627,7 +2627,7 @@ async fn run_query(path: &PathBuf, query: &str, top_k: usize) -> anyhow::Result<
 async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyhow::Result<()> {
     use std::collections::{HashMap, HashSet};
     use thinkingroot_core::Config;
-    use thinkingroot_extract::llm::LlmClient;
+    use thinkingroot_llm::llm::LlmClient;
     use thinkingroot_serve::engine::QueryEngine;
     use thinkingroot_serve::intelligence::router::{QueryPath, classify_query};
     use thinkingroot_serve::intelligence::session::SessionContext;

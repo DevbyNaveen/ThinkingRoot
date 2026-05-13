@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use thinkingroot_extract::llm::Tool;
+use thinkingroot_llm::llm::Tool;
 
 /// What a tool returns to the agent loop. The `content` is what the
 /// LLM sees as the next-turn `ChatMessage::ToolResults` payload, so it

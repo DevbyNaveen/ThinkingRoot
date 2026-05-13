@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use thinkingroot_extract::llm::{ChatMessage, LlmClient, ToolChoice};
+use thinkingroot_llm::llm::{ChatMessage, LlmClient, ToolChoice};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::engine::QueryEngine;

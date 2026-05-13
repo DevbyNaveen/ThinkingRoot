@@ -6,6 +6,7 @@ members = [
     "crates/thinkingroot-graph",
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
+    "crates/thinkingroot-llm",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
     "crates/thinkingroot-health",
@@ -36,6 +37,7 @@ default-members = [
     "crates/thinkingroot-graph",
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
+    "crates/thinkingroot-llm",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
     "crates/thinkingroot-health",
@@ -76,6 +78,7 @@ thinkingroot-cortex-async = { path = "crates/thinkingroot-cortex-async", version
 thinkingroot-graph   = { path = "crates/thinkingroot-graph",   version = "0.9.0", default-features = false }
 thinkingroot-parse   = { path = "crates/thinkingroot-parse",   version = "0.9.0" }
 thinkingroot-extract = { path = "crates/thinkingroot-extract", version = "0.9.0" }
+thinkingroot-llm     = { path = "crates/thinkingroot-llm",     version = "0.9.1" }
 thinkingroot-link    = { path = "crates/thinkingroot-link",    version = "0.9.0" }
 thinkingroot-compile = { path = "crates/thinkingroot-compile", version = "0.9.0" }
 thinkingroot-health  = { path = "crates/thinkingroot-health",  version = "0.9.0" }

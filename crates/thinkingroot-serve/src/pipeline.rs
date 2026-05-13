@@ -701,45 +701,13 @@ async fn run_pipeline_inner(
     let cache_hits;
     let extraction;
 
-    // ── Graph-Primed Context: inject known entities into extraction ──
-    let known_entities = match storage.graph.get_known_entities() {
-        Ok(entities) if !entities.is_empty() => {
-            tracing::info!(
-                "graph-primed context: {} known entities loaded",
-                entities.len()
-            );
-            thinkingroot_extract::GraphPrimedContext::from_tuples(entities)
-        }
-        Ok(_) => thinkingroot_extract::GraphPrimedContext::new(Vec::new()),
-        Err(e) => {
-            tracing::warn!("failed to load known entities for graph-priming: {e}");
-            thinkingroot_extract::GraphPrimedContext::new(Vec::new())
-        }
-    };
-
-    // ── Graph-Primed Context: also inject known relations ──
-    let ctx_with_relations = match storage.graph.get_known_relations() {
-        Ok(relations) if !relations.is_empty() => {
-            tracing::info!(
-                "graph-primed context: {} known relations loaded",
-                relations.len()
-            );
-            let known_rels: Vec<thinkingroot_extract::KnownRelation> = relations
-                .into_iter()
-                .map(|(from, to, rel_type)| thinkingroot_extract::KnownRelation {
-                    from,
-                    to,
-                    relation_type: rel_type,
-                })
-                .collect();
-            known_entities.with_relations(known_rels)
-        }
-        Ok(_) => known_entities,
-        Err(e) => {
-            tracing::warn!("failed to load known relations for graph-priming: {e}");
-            known_entities
-        }
-    };
+    // Graph-Primed Context (known entities / relations) was wired
+    // into a `with_known_entities` no-op on the LLM extractor.  The
+    // function + its `GraphPrimedContext` parameter were removed in
+    // the Phase 2 `thinkingroot-llm` split (2026-05-14) because
+    // structural extraction consults no prompts.  `GraphStore::
+    // get_known_entities` / `get_known_relations` remain available
+    // for any future chat-time consumer that needs them.
 
     if potentially_changed.is_empty() {
         // Only deletions — no extraction needed.
@@ -756,7 +724,6 @@ async fn run_pipeline_inner(
             let e = thinkingroot_extract::Extractor::new(&config)
                 .await?
                 .with_cache_dir(&data_dir)
-                .with_known_entities(ctx_with_relations)
                 .with_cancel(cancel.clone())
                 .with_checkpoint(&data_dir)?;
             if let Some(ref tx) = progress {
@@ -1400,7 +1367,7 @@ async fn run_pipeline_inner(
         if entity_name_to_id.is_empty() {
             tracing::warn!("event calendar: entity table empty after linking — skipping");
         } else {
-            let extractor = thinkingroot_extract::EventExtractor::new();
+            let extractor = thinkingroot_llm::EventExtractor::new();
             let extracted_events =
                 extractor.extract_from_claims(&claims_for_svo, &entity_name_to_id);
 
@@ -1586,7 +1553,7 @@ async fn run_pipeline_inner(
     // Failure is non-fatal (a stale .in-flight.jsonl just means the
     // next run logs a misleading "resuming" message, then produces
     // identical output via cache hits).
-    if let Err(e) = thinkingroot_extract::InFlightCheckpoint::clear(&data_dir) {
+    if let Err(e) = thinkingroot_llm::InFlightCheckpoint::clear(&data_dir) {
         tracing::warn!("failed to clear in-flight checkpoint after Phase 7: {e}");
     }
 
@@ -1701,7 +1668,7 @@ async fn synthesise_and_persist_readme(
     root_path: &Path,
     storage: &StorageEngine,
 ) -> Result<()> {
-    use thinkingroot_extract::readme;
+    use thinkingroot_llm::readme;
 
     let workspace_name: String = root_path
         .file_name()

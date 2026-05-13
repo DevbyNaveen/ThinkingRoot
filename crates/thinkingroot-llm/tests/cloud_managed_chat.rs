@@ -68,7 +68,7 @@ async fn cloud_managed_chat_completion_streams_and_updates_credits() {
     .await;
     seed_auth_json(&fake.uri);
 
-    let client = thinkingroot_extract::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
+    let client = thinkingroot_llm::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
         .await
         .expect("LlmClient::new should accept thinkingroot-cloud after Task 9");
 
@@ -114,7 +114,7 @@ async fn cloud_managed_402_surfaces_credits_exhausted() {
     .await;
     seed_auth_json(&fake.uri);
 
-    let client = thinkingroot_extract::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
+    let client = thinkingroot_llm::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
         .await
         .expect("LlmClient::new should accept thinkingroot-cloud after Task 9");
 
@@ -145,7 +145,7 @@ async fn cloud_managed_401_surfaces_auth_expired() {
     .await;
     seed_auth_json(&fake.uri);
 
-    let client = thinkingroot_extract::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
+    let client = thinkingroot_llm::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
         .await
         .expect("LlmClient::new should accept thinkingroot-cloud after Task 9");
 
@@ -168,7 +168,7 @@ async fn cloud_managed_no_auth_json_surfaces_not_logged_in() {
     // Deliberately do NOT seed auth.json — the user is signed out.
     let fake = FakeCloud::spawn(FakeCloudConfig::default()).await;
 
-    let client = thinkingroot_extract::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
+    let client = thinkingroot_llm::llm::LlmClient::new(&cloud_llm_config("claude-opus-4-7"))
         .await
         .expect("LlmClient::new should accept thinkingroot-cloud after Task 9");
 

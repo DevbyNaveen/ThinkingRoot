@@ -89,14 +89,14 @@ pub struct ReActResult {
 pub struct ReActEngine<'q> {
     engine: &'q QueryEngine,
     ws: &'q str,
-    llm: Option<Arc<thinkingroot_extract::llm::LlmClient>>,
+    llm: Option<Arc<thinkingroot_llm::llm::LlmClient>>,
 }
 
 impl<'q> ReActEngine<'q> {
     pub fn new(
         engine: &'q QueryEngine,
         ws: &'q str,
-        llm: Option<Arc<thinkingroot_extract::llm::LlmClient>>,
+        llm: Option<Arc<thinkingroot_llm::llm::LlmClient>>,
     ) -> Self {
         Self { engine, ws, llm }
     }

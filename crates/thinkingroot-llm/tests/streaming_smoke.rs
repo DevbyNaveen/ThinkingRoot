@@ -15,14 +15,14 @@
 //!   `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION` env vars.
 //!
 //! Run all (gated tests skip when unset):
-//!   cargo test -p thinkingroot-extract --tests
+//!   cargo test -p thinkingroot-llm --tests
 //! Or explicitly:
-//!   AZURE_OPENAI_API_KEY=... cargo test -p thinkingroot-extract \
+//!   AZURE_OPENAI_API_KEY=... cargo test -p thinkingroot-llm \
 //!     --test streaming_smoke -- --nocapture
 
 use futures::StreamExt;
 use thinkingroot_core::config::{AzureConfig, LlmConfig, ProviderConfig, ProvidersConfig};
-use thinkingroot_extract::llm::LlmClient;
+use thinkingroot_llm::llm::LlmClient;
 
 #[tokio::test]
 #[ignore = "live API call — requires ANTHROPIC_API_KEY; run with `cargo test -- --ignored`"]

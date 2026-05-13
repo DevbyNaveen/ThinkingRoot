@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use tempfile::tempdir;
-use thinkingroot_extract::readme::{BEGIN_MARKER, END_MARKER};
+use thinkingroot_llm::readme::{BEGIN_MARKER, END_MARKER};
 use thinkingroot_serve::pipeline::{PipelineOptions, run_pipeline_with_options};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

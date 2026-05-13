@@ -28,7 +28,7 @@ export interface BrainCitation {
   claimId: string;
 }
 
-/** Mirrors the engine-side `thinkingroot_extract::citation::CitationParser`. */
+/** Mirrors the engine-side `thinkingroot_llm::citation::CitationParser`. */
 export class BrainCitationParser {
   private buf = "";
   private seen = new Set<string>();

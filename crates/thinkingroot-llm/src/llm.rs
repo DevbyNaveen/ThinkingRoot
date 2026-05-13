@@ -5,7 +5,7 @@ use thinkingroot_core::{Error, Result};
 
 use crate::prompts;
 use crate::scheduler::{HeaderRateLimits, ThroughputScheduler};
-use crate::schema::ExtractionResult;
+use thinkingroot_extract::schema::ExtractionResult;
 
 /// Output of a single provider chat call.
 struct ChatOutput {

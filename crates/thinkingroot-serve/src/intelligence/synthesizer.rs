@@ -59,8 +59,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use thinkingroot_core::config::{ChatPersona, ChatVerbosity, ResolvedChat};
-use thinkingroot_extract::citation::CITATION_PROMPT;
-use thinkingroot_extract::llm::{ChatStream, LlmClient};
+use thinkingroot_llm::citation::CITATION_PROMPT;
+use thinkingroot_llm::llm::{ChatStream, LlmClient};
 
 use crate::engine::ClaimSearchHit;
 use crate::intelligence::augmenter::{extract_relevant_snippets, load_raw_sources};
@@ -269,7 +269,7 @@ pub fn build_system_prompt(chat: ResolvedChat) -> &'static str {
 ///
 /// The citation contract — emit `[claim:<id>]` after every cited claim
 /// — must agree by literal byte match with the streaming
-/// [`thinkingroot_extract::citation::CitationParser`] grammar. Pulling
+/// [`thinkingroot_llm::citation::CitationParser`] grammar. Pulling
 /// the instruction out of `extract::citation` (its canonical home) and
 /// concatenating it onto the warm-voice prompt at runtime keeps that
 /// agreement automatic: a future edit to the parser-side wording

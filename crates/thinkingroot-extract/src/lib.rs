@@ -21,46 +21,29 @@
 //!   path: `expiration`, `quantity`, `sensitivity` (regex-only
 //!   PII classifier).
 //!
-//! Deleted modules: `llm`, `prompts`, `focused_prompts`, `batch`,
-//! `scheduler`, `cache`, `checkpoint`, `ast_split`, `prose_split`,
-//! `events`, `readme`, `citation`, `graph_context`, `router`,
-//! `extractor_consts`. See `.claude/rules/witness-mesh.md` for the
+//! Moved to `thinkingroot-llm` crate (Phase 2 cleanup): `llm`,
+//! `prompts`, `scheduler`, `citation`, `readme`, `graph_context`,
+//! `events`, `checkpoint`. The chat-time LLM substrate is now
+//! honestly separated from mechanical Witness Mesh extraction; the
+//! `thinkingroot-extract` name reflects only the compile-time
+//! extraction story. See `.claude/rules/witness-mesh.md` for the
 //! cutover record.
 
-pub mod checkpoint;
-pub mod citation;
 pub mod comment_claims;
-pub mod events;
 pub mod expiration;
 pub mod extractor;
-pub mod graph_context;
-pub mod llm;
 pub mod lsp_rules;
 pub mod parse_doc_rules;
-pub mod prompts;
 pub mod quantity;
-pub mod readme;
 pub mod rule_catalog;
-pub mod scheduler;
 pub mod schema;
 pub mod sensitivity;
 pub mod structural;
 pub mod test_assertions;
 pub mod witness_mesh;
 
-pub use checkpoint::InFlightCheckpoint;
-pub use events::EventExtractor;
 pub use extractor::{ChunkProgressFn, ExtractionOutput, ExtractionProgressEvent, Extractor};
-pub use graph_context::{GraphPrimedContext, KnownEntity, KnownRelation};
 pub use rule_catalog::{
     CATALOG_VERSION, RULE_CATALOG, RuleDescriptor, rule_catalog_toml,
 };
 pub use witness_mesh::{AssembledMesh, MeshError, assemble as assemble_witness_mesh};
-
-// `llm`, `citation`, `readme` are retained for the **chat-time
-// synthesizer** in `thinkingroot-serve::intelligence::*`. They are
-// NOT used at compile time (the Witness Mesh substrate is purely
-// mechanical). A future refactor will relocate them into a dedicated
-// `thinkingroot-llm` crate or `thinkingroot-serve::llm` module so
-// the `thinkingroot-extract` name reflects only the compile-time
-// extraction story.

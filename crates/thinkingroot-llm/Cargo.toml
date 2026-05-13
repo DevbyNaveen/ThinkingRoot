@@ -1,0 +1,48 @@
+[package]
+name = "thinkingroot-llm"
+description = "Chat-time LLM substrate for ThinkingRoot — provider-agnostic client, prompts, scheduler, and chat-time decorators"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace        = true
+repository.workspace    = true
+homepage.workspace      = true
+documentation.workspace = true
+keywords.workspace      = true
+categories.workspace    = true
+rust-version.workspace  = true
+
+[dependencies]
+thinkingroot-core = { workspace = true }
+# `crate::llm` parses results into `thinkingroot_extract::schema::ExtractionResult`.
+# The schema lives with the (structural) extractor because both the LLM and
+# structural extractors produce values of this shape; structural is the
+# only path at compile time post-Witness-Mesh.
+thinkingroot-extract = { workspace = true }
+# Provider::CloudManaged sources its bearer token from auth.json at request
+# time via thinkingroot_cloud_auth::config::load.
+thinkingroot-cloud-auth = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+eventsource-stream = { workspace = true }
+async-stream = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-bedrockruntime = { workspace = true }
+aws-smithy-types = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+thinkingroot-cloud-auth = { workspace = true }
+thinkingroot-core = { workspace = true, features = ["test-helpers"] }
+axum = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+futures = { workspace = true }

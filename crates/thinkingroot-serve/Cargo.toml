@@ -30,6 +30,7 @@ thinkingroot-branch = { workspace = true }
 thinkingroot-pr = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
+thinkingroot-llm = { workspace = true }
 thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
 thinkingroot-health = { workspace = true }
