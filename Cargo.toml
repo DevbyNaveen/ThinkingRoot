@@ -17,6 +17,7 @@ members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/thinkingroot-cloud-auth",
     "crates/tr-format",
     "crates/tr-identity",
     "crates/tr-render",
@@ -46,6 +47,7 @@ default-members = [
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
+    "crates/thinkingroot-cloud-auth",
     "crates/tr-format",
     "crates/tr-identity",
     "crates/tr-render",
@@ -83,6 +85,7 @@ thinkingroot-pr      = { path = "crates/thinkingroot-pr",      version = "0.9.0"
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
 thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }
 thinkingroot-reflect = { path = "crates/thinkingroot-reflect", version = "0.9.0" }
+thinkingroot-cloud-auth = { path = "crates/thinkingroot-cloud-auth" }
 tr-format            = { path = "crates/tr-format",            version = "1.0.0" }
 tr-identity          = { path = "crates/tr-identity",          version = "0.9.1" }
 tr-render            = { path = "crates/tr-render",            version = "0.9.1" }
@@ -192,6 +195,14 @@ async-stream = "0.3"
 criterion = { version = "0.6", default-features = false, features = ["html_reports"] }
 divan = "0.1"
 rand = "0.9"
+
+# Browser launcher — used by thinkingroot-cloud-auth's browser-flow login
+# to open the hub's /auth/cli URL in the user's default browser.
+webbrowser = "1"
+
+# HTTP mocking for cloud-auth dev tests (wiremock-rs spins up a local
+# Axum-backed mock hub).
+wiremock = "0.6"
 
 [profile.release]
 opt-level = 3
