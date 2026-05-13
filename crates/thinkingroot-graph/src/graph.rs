@@ -3417,6 +3417,19 @@ impl GraphStore {
     /// Count claims grouped by their Rooting admission tier.
     /// Returns `(rooted, attested, quarantined, rejected)`. Used by the
     /// Health Score calculation and by `root rooting report`.
+    /// Count claims grouped by admission tier (rooted / attested /
+    /// quarantined / rejected).
+    ///
+    /// Phase 4 (Witness Mesh cutover, 2026-05-14): when the legacy
+    /// `claims` table is empty, every Witness counts as `attested`
+    /// because the Witness Mesh substrate replaces the Rooting
+    /// admission gate (Phase 6.5 was deleted in the cutover).
+    /// Witnesses are admitted by construction — they're mechanically
+    /// derived from primary bytes via a named rule from a fixed
+    /// catalog — so collapsing them into the `attested` bucket is
+    /// the honest mapping. `rooted` / `quarantined` / `rejected` stay
+    /// at 0 for witness-only workspaces because those tiers no
+    /// longer apply.
     pub fn count_claims_by_admission_tier(&self) -> Result<(usize, usize, usize, usize)> {
         let result = self.query_read("?[tier, count(id)] := *claims{id, admission_tier: tier}")?;
         let mut rooted = 0usize;
@@ -3438,6 +3451,13 @@ impl GraphStore {
                 "quarantined" => quarantined = count,
                 "rejected" => rejected = count,
                 _ => attested = count,
+            }
+        }
+        if rooted + attested + quarantined + rejected == 0 {
+            // Witness Mesh fallback — count witnesses as `attested`.
+            let w_count = self.count_witnesses()?;
+            if w_count > 0 {
+                attested = w_count as usize;
             }
         }
         Ok((rooted, attested, quarantined, rejected))
@@ -3509,18 +3529,35 @@ impl GraphStore {
     }
 
     /// Get all claims with their source URIs (for bulk artifact generation).
+    ///
+    /// Phase 4 (Witness Mesh cutover, 2026-05-14): when the legacy
+    /// `claims` table is empty (the post-cutover pipeline writes only
+    /// `witnesses`), this falls back to a projection over the
+    /// `witnesses` table. The projection synthesises a `statement`
+    /// from `(witness_type, symbol)` so cache + REST + UI consumers
+    /// see the substrate. **No source-byte text is read here** —
+    /// rendering the span text requires a byte-store round-trip and
+    /// belongs in a follow-up at the engine layer (where the byte
+    /// store is reachable). See `.claude/rules/witness-mesh.md`.
+    ///
+    /// Confidence comes from the row's denormalised
+    /// `witnesses.confidence` column (populated from the rule catalog
+    /// at write time — never fabricated). `event_date` is 0.0 for
+    /// witnesses because the Witness model doesn't carry an
+    /// extracted event date; the historical signal for that came
+    /// from LLM extraction (deleted by the cutover).
     #[allow(clippy::type_complexity)]
     pub fn get_all_claims_with_sources(
         &self,
     ) -> Result<Vec<(String, String, String, f64, String, f64)>> {
-        let result = self.query_read(
+        let claims = self.query_read(
             r#"?[id, statement, claim_type, confidence, uri, event_date] :=
                 *claims{id, statement, claim_type, confidence, event_date},
                 *claim_source_edges{claim_id: id, source_id: sid},
                 *sources{id: sid, uri}"#,
         )?;
 
-        Ok(result
+        let mut out: Vec<(String, String, String, f64, String, f64)> = claims
             .rows
             .iter()
             .map(|row| {
@@ -3541,7 +3578,58 @@ impl GraphStore {
                     },
                 )
             })
-            .collect())
+            .collect();
+
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        // Witness Mesh fallback. Fresh workspaces (post-cutover) have
+        // an empty `claims` table — the pipeline writes only
+        // witnesses. Project to the same wire shape so every
+        // downstream reader (cache reload, REST `/claims`,
+        // `brain_load`) sees the substrate without churning their
+        // internals. Confidence carries through from
+        // `witnesses.confidence` (denormalised from the rule catalog
+        // at write time).
+        let witnesses = self.query_read(
+            r#"?[id, witness_type, rule, symbol, confidence, uri, byte_start, byte_end] :=
+                *witnesses{id, witness_type, rule, symbol, confidence, source_id, byte_start, byte_end},
+                *sources{id: source_id, uri}"#,
+        )?;
+        out.reserve(witnesses.rows.len());
+        for row in &witnesses.rows {
+            if row.len() < 8 {
+                continue;
+            }
+            let id = dv_to_string(&row[0]);
+            let witness_type = dv_to_string(&row[1]);
+            let rule = dv_to_string(&row[2]);
+            let symbol = dv_to_string(&row[3]);
+            let confidence = match &row[4] {
+                DataValue::Num(Num::Float(f)) => *f,
+                DataValue::Num(Num::Int(i)) => *i as f64,
+                _ => 0.99,
+            };
+            let uri = dv_to_string(&row[5]);
+            let byte_start = match &row[6] {
+                DataValue::Num(Num::Int(i)) => *i as u64,
+                DataValue::Num(Num::Float(f)) => *f as u64,
+                _ => 0,
+            };
+            let byte_end = match &row[7] {
+                DataValue::Num(Num::Int(i)) => *i as u64,
+                DataValue::Num(Num::Float(f)) => *f as u64,
+                _ => 0,
+            };
+            let statement = if !symbol.is_empty() {
+                format!("[{witness_type}] {symbol} @{byte_start}..{byte_end}")
+            } else {
+                format!("[{witness_type}] via {rule} @{byte_start}..{byte_end}")
+            };
+            out.push((id, statement, witness_type, confidence, uri, 0.0));
+        }
+        Ok(out)
     }
 
     /// T2.4 — bitemporal "as-of" claim query.  Returns every claim
