@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod http;
 pub mod me;
+pub mod models_catalogue;
 pub mod auth_flow;
 
 pub use error::CloudError;
