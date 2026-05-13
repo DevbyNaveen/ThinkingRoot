@@ -24,5 +24,6 @@ ulid = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
+thinkingroot-core = { workspace = true, features = ["test-helpers"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
