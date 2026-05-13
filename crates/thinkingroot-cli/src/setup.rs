@@ -106,6 +106,23 @@ pub(crate) static PROVIDERS: &[ProviderDef] = &[
         base_url: None,
         validate_url: None,
     },
+    // Slice 2 Task 8: ThinkingRoot Cloud managed-model provider. The
+    // bearer token comes from `~/.config/thinkingroot/auth.json`, not
+    // an env var — so `default_env` is empty (same convention as
+    // Bedrock + Ollama). `base_url` is None because the cloud server
+    // URL also lives in auth.json (`Config.server`), keyed off
+    // `root login`. `validate_url` stays None because validation
+    // routes through the signed-in check in Task 9's
+    // `set_provider_cloud_managed`, not a public `/models` GET.
+    //
+    // Spec: docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md §6.6.
+    ProviderDef {
+        label: "ThinkingRoot Cloud  (managed, no API key — sign in with `root login`)",
+        id: "thinkingroot-cloud",
+        default_env: "",
+        base_url: None,
+        validate_url: None,
+    },
 ];
 
 // ── Main entry point ─────────────────────────────────────────────
