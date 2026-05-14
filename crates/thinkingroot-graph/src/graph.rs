@@ -3674,63 +3674,36 @@ impl GraphStore {
     pub fn get_all_claims_with_sources(
         &self,
     ) -> Result<Vec<(String, String, String, f64, String, f64)>> {
-        let claims = self.query_read(
-            r#"?[id, statement, claim_type, confidence, uri, event_date] :=
-                *claims{id, statement, claim_type, confidence, event_date},
-                *claim_source_edges{claim_id: id, source_id: sid},
-                *sources{id: sid, uri}"#,
-        )?;
-
-        let mut out: Vec<(String, String, String, f64, String, f64)> = claims
-            .rows
-            .iter()
-            .map(|row| {
-                (
-                    dv_to_string(&row[0]),
-                    dv_to_string(&row[1]),
-                    dv_to_string(&row[2]),
-                    match &row[3] {
-                        DataValue::Num(Num::Float(f)) => *f,
-                        DataValue::Num(Num::Int(i)) => *i as f64,
-                        _ => 0.8,
-                    },
-                    dv_to_string(&row[4]),
-                    match &row[5] {
-                        DataValue::Num(Num::Float(f)) => *f,
-                        DataValue::Num(Num::Int(i)) => *i as f64,
-                        _ => 0.0,
-                    },
-                )
-            })
-            .collect();
-
-        if !out.is_empty() {
-            return Ok(out);
-        }
-
-        // Witness Mesh bridge. Fresh workspaces (post-cutover) have
-        // an empty `claims` table — the pipeline writes only
-        // witnesses. Project to the same wire shape so every
-        // downstream reader (cache reload, REST `/claims`,
-        // `brain_load`) sees the substrate without churning their
-        // internals. Confidence carries through from
-        // `witnesses.confidence` (denormalised from the rule catalog
-        // at write time).
+        // Phase 5 (Witness Mesh cutover, 2026-05-15): witnesses are
+        // now the PRIMARY read path. The legacy `claims` table is the
+        // back-compat fallback for workspaces that haven't yet had a
+        // Witness Mesh-aware compile run against them (pre-migration
+        // workspaces, test fixtures with hand-rolled claim inserts).
         //
-        // Phase 5 (Witness Mesh cutover, 2026-05-14): `statement`
-        // text now comes from `materialize_statement` — the actual
-        // source bytes at `[byte_start, byte_end)` decoded as UTF-8.
-        // When the byte store is unavailable (testing fixtures, or a
-        // workspace whose byte store was GC'd), we fall back to the
-        // synthesised `[witness_type] symbol @byte_start..byte_end`
-        // form so callers always get a non-empty string but the
-        // fallback is explicit, not lossy-by-design.
+        // The flip vs. the prior implementation is deliberate: every
+        // freshly-compiled workspace now sees the witness substrate
+        // directly through this bridge, with no intermediate
+        // claims-table read. The `claims` table remains populated by
+        // dual-write so legacy queries that join against
+        // `*claims{...}` directly still resolve — that broader
+        // cutover happens incrementally through Phase 5.1/5.2 over
+        // multiple commits.
+        //
+        // `statement` text comes from `materialize_statement` — the
+        // actual source bytes at `[byte_start, byte_end)` decoded as
+        // UTF-8. When the byte store is unavailable (testing
+        // fixtures, or a workspace whose byte store was GC'd), we
+        // fall back to a structurally-distinct `[witness_type]
+        // symbol @byte_start..byte_end` form so callers always get a
+        // non-empty string but the fallback is explicit — never
+        // confused for a quote.
         let witnesses = self.query_read(
             r#"?[id, source_id, witness_type, rule, symbol, confidence, uri, byte_start, byte_end] :=
                 *witnesses{id, witness_type, rule, symbol, confidence, source_id, byte_start, byte_end},
                 *sources{id: source_id, uri}"#,
         )?;
-        out.reserve(witnesses.rows.len());
+        let mut out: Vec<(String, String, String, f64, String, f64)> =
+            Vec::with_capacity(witnesses.rows.len());
         for row in &witnesses.rows {
             if row.len() < 9 {
                 continue;
@@ -3761,12 +3734,6 @@ impl GraphStore {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| {
-                    // Honest fallback when source bytes aren't
-                    // materialised (test fixtures, post-GC, etc.):
-                    // surface the rule/symbol metadata so the caller
-                    // can still display *something* — the fallback
-                    // is structurally distinct from real source text
-                    // (`[…]` prefix), never confused for a quote.
                     if !symbol.is_empty() {
                         format!("[{witness_type}] {symbol} @{byte_start}..{byte_end}")
                     } else {
@@ -3775,7 +3742,45 @@ impl GraphStore {
                 });
             out.push((id, statement, witness_type, confidence, uri, 0.0));
         }
-        Ok(out)
+
+        if !out.is_empty() {
+            return Ok(out);
+        }
+
+        // Legacy fallback: a workspace with NO witnesses yet (pre-
+        // migration / test fixtures) still surfaces its claims rows
+        // so the broader cutover can land incrementally without
+        // breaking legacy paths.
+        let claims = self.query_read(
+            r#"?[id, statement, claim_type, confidence, uri, event_date] :=
+                *claims{id, statement, claim_type, confidence, event_date},
+                *claim_source_edges{claim_id: id, source_id: sid},
+                *sources{id: sid, uri}"#,
+        )?;
+        let legacy: Vec<(String, String, String, f64, String, f64)> = claims
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    match &row[3] {
+                        DataValue::Num(Num::Float(f)) => *f,
+                        DataValue::Num(Num::Int(i)) => *i as f64,
+                        _ => 0.8,
+                    },
+                    dv_to_string(&row[4]),
+                    match &row[5] {
+                        DataValue::Num(Num::Float(f)) => *f,
+                        DataValue::Num(Num::Int(i)) => *i as f64,
+                        _ => 0.0,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(legacy)
     }
 
     /// T2.4 — bitemporal "as-of" claim query.  Returns every claim
