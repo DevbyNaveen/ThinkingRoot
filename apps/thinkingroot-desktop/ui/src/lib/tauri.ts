@@ -1860,3 +1860,13 @@ export interface PlaygroundSource {
 export async function playgroundSources(): Promise<PlaygroundSource[]> {
   return invoke<PlaygroundSource[]>("playground_sources");
 }
+
+/** Per-source witness count for the active workspace. Sources with
+ * zero witnesses are absent from the response — treat missing as zero. */
+export interface WitnessesPerSourceRow {
+  source_id: string;
+  count: number;
+}
+export async function playgroundWitnessesBySource(): Promise<WitnessesPerSourceRow[]> {
+  return invoke<WitnessesPerSourceRow[]>("playground_witnesses_by_source");
+}

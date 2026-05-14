@@ -7,7 +7,11 @@ import {
   RotateCcw,
 } from "lucide-react";
 
-import { playgroundSources, type PlaygroundSource } from "@/lib/tauri";
+import {
+  playgroundSources,
+  playgroundWitnessesBySource,
+  type PlaygroundSource,
+} from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
 /**
@@ -33,23 +37,37 @@ export function SourceLibrary({
   refreshNonce?: number;
 }) {
   const [sources, setSources] = useState<PlaygroundSource[] | null>(null);
+  const [witnessCounts, setWitnessCounts] = useState<Map<string, number>>(
+    new Map(),
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!workspace) {
       setSources(null);
+      setWitnessCounts(new Map());
       setError(null);
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      const rows = await playgroundSources();
+      // Fetch sources + witness counts in parallel — both are cheap
+      // sidecar GETs over loopback; serialising them would add an
+      // unnecessary round-trip to the panel-open time.
+      const [rows, counts] = await Promise.all([
+        playgroundSources(),
+        playgroundWitnessesBySource().catch(() => []),
+      ]);
       setSources(rows);
+      const m = new Map<string, number>();
+      for (const r of counts) m.set(r.source_id, r.count);
+      setWitnessCounts(m);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setSources(null);
+      setWitnessCounts(new Map());
     } finally {
       setLoading(false);
     }
@@ -98,7 +116,13 @@ export function SourceLibrary({
         ) : (
           <ul className="flex flex-col py-1">
             {grouped.map(({ kind, label, items }) => (
-              <SourceGroup key={kind} kind={kind} label={label} items={items} />
+              <SourceGroup
+                key={kind}
+                kind={kind}
+                label={label}
+                items={items}
+                witnessCounts={witnessCounts}
+              />
             ))}
           </ul>
         )}
@@ -113,10 +137,12 @@ function SourceGroup({
   kind,
   label,
   items,
+  witnessCounts,
 }: {
   kind: SourceKind;
   label: string;
   items: PlaygroundSource[];
+  witnessCounts: Map<string, number>;
 }) {
   if (items.length === 0) return null;
   return (
@@ -125,19 +151,35 @@ function SourceGroup({
         {label} ({items.length})
       </p>
       <ul>
-        {items.map((s) => (
-          <li
-            key={s.id}
-            className={cn(
-              "group flex items-center gap-2 px-3 py-1 text-xs text-foreground/90",
-              "hover:bg-muted/40",
-            )}
-            title={s.uri}
-          >
-            <KindIcon kind={kind} />
-            <span className="truncate">{basenameFromUri(s.uri)}</span>
-          </li>
-        ))}
+        {items.map((s) => {
+          const count = witnessCounts.get(s.id) ?? 0;
+          return (
+            <li
+              key={s.id}
+              className={cn(
+                "group flex items-center gap-2 px-3 py-1 text-xs text-foreground/90",
+                "hover:bg-muted/40",
+              )}
+              title={s.uri}
+            >
+              <KindIcon kind={kind} />
+              <span className="min-w-0 flex-1 truncate">
+                {basenameFromUri(s.uri)}
+              </span>
+              <span
+                className={cn(
+                  "shrink-0 rounded px-1.5 py-px font-mono text-[10px]",
+                  count > 0
+                    ? "bg-accent/15 text-accent"
+                    : "bg-muted/40 text-muted-foreground",
+                )}
+                title={`${count} witness${count === 1 ? "" : "es"}`}
+              >
+                {count}
+              </span>
+            </li>
+          );
+        })}
       </ul>
     </li>
   );

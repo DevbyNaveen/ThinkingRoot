@@ -358,6 +358,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // consumers here too.
             .route("/ws/{ws}/witnesses", get(list_witnesses_handler))
             .route("/ws/{ws}/witnesses/count", get(witnesses_count_handler))
+            .route(
+                "/ws/{ws}/witnesses/by-source",
+                get(witnesses_by_source_handler),
+            )
             .route("/ws/{ws}/witnesses/{id}", get(get_witness_handler))
             .route("/ws/{ws}/witnesses/{id}/walk", get(walk_mesh_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
@@ -1353,6 +1357,31 @@ async fn witnesses_count_handler(
     let engine = state.engine.read().await;
     match engine.count_witnesses(&ws).await {
         Ok(count) => ok_response(serde_json::json!({ "count": count })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/witnesses/by-source` — witness count per
+/// source row. Used by the Playground SourceLibrary to badge each
+/// source with its witness count. Returns
+/// `[{ "source_id": "...", "count": N }, ...]` so JS consumers
+/// don't have to handle Vec<(String, u64)>'s tuple-encoding
+/// surprises across runtimes.
+async fn witnesses_by_source_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.count_witnesses_by_source(&ws).await {
+        Ok(rows) => {
+            let body: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(source_id, count)| {
+                    serde_json::json!({ "source_id": source_id, "count": count })
+                })
+                .collect();
+            ok_response(body).into_response()
+        }
         Err(e) => match_engine_error(e),
     }
 }

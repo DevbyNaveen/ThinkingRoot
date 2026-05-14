@@ -1291,6 +1291,20 @@ impl QueryEngine {
         storage.graph.count_witnesses()
     }
 
+    /// Witness count grouped by `source_id`. Returned as a Vec so
+    /// it serialises straight onto the wire without a HashMap → JSON
+    /// shape ambiguity (some JS consumers can't reliably round-trip
+    /// numeric-keyed maps). The Playground Source Library aggregates
+    /// these into per-source badges.
+    pub async fn count_witnesses_by_source(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<(String, u64)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.count_witnesses_by_source()
+    }
+
     /// Walk the Witness Mesh DAG starting from a witness id. Returns
     /// every Witness reachable via `witness_input_edges` within
     /// `max_depth` hops + the edges that connect them. Used by the

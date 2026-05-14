@@ -248,6 +248,34 @@ impl GraphStore {
         Ok(0)
     }
 
+    /// Witness count grouped by `source_id`. Returns
+    /// `(source_id, count)` pairs — sources with zero witnesses are
+    /// not present in the result (no `LEFT JOIN`; the SourceLibrary
+    /// caller handles "missing" as zero). Used by the Playground
+    /// Source Library to badge each source with its witness count.
+    pub fn count_witnesses_by_source(&self) -> Result<Vec<(String, u64)>> {
+        let script = "?[source_id, count(id)] := *witnesses{id, source_id}";
+        let result = self
+            .query_read(script)
+            .map_err(|e| Error::GraphStorage(format!("count_witnesses_by_source: {e}")))?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let source_id = match &row[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => continue,
+            };
+            let count = match &row[1] {
+                DataValue::Num(Num::Int(n)) => (*n).max(0) as u64,
+                _ => 0,
+            };
+            out.push((source_id, count));
+        }
+        Ok(out)
+    }
+
     /// Fetch a single Witness by its content-derived id (lower-hex).
     /// Returns `None` when no row exists; surface this honestly rather
     /// than returning a fake "empty" Witness because consumers gate

@@ -324,6 +324,30 @@ pub async fn playground_sources(app: AppHandle) -> Result<Vec<PlaygroundSource>,
     Ok(rows)
 }
 
+/// One row of `GET /api/v1/ws/{ws}/witnesses/by-source`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct WitnessesPerSourceRow {
+    pub source_id: String,
+    pub count: u64,
+}
+
+/// Tauri command: per-source witness counts via the sidecar. The
+/// Source Library badges each entry with its count. Sources with
+/// zero witnesses are absent from the response — UI treats missing
+/// as zero.
+#[tauri::command]
+pub async fn playground_witnesses_by_source(
+    app: AppHandle,
+) -> Result<Vec<WitnessesPerSourceRow>, String> {
+    let client = crate::commands::sidecar_client::SidecarClient::ensure_active(&app).await?;
+    let path = format!(
+        "/api/v1/ws/{}/witnesses/by-source",
+        urlencode(&client.workspace)
+    );
+    let rows: Vec<WitnessesPerSourceRow> = client.get(&path).await?;
+    Ok(rows)
+}
+
 /// Minimal URL encoder for path components — same shape as the helper
 /// in `memory.rs`, duplicated locally to avoid pulling that module's
 /// other imports into the playground command surface.
