@@ -2977,6 +2977,48 @@ fn run_migrate(
     Ok(())
 }
 
+/// Default `.rootignore` written into a fresh workspace by `root init`.
+/// Precedence (`.rootignore` > `.gitignore`) keeps secrets and personal
+/// files out of compiled cognition independently of git tracking.
+/// Mirrors `.dockerignore` / `.npmignore` semantics; honoured by
+/// `thinkingroot_parse::walker::walk` via `add_custom_ignore_filename`.
+const DEFAULT_ROOTIGNORE: &str = "\
+# .rootignore — files ThinkingRoot will skip during compile.
+# Same syntax as .gitignore. Loaded ahead of .gitignore so anything
+# matched here is excluded even if git would otherwise track it.
+
+# Secrets — never compile credentials into cognition
+*.env
+*.env.*
+credentials*
+*.key
+*.pem
+*.p12
+id_rsa*
+
+# Personal / private folders
+personal/
+private/
+financial/
+
+# Heavy binaries / archives (waste compile time, no useful extraction)
+*.zip
+*.tar.gz
+*.iso
+*.dmg
+*.bin
+
+# Build / cache / vendor
+.cache/
+node_modules/
+target/
+dist/
+build/
+venv/
+.venv/
+__pycache__/
+";
+
 fn run_init(path: &Path) -> anyhow::Result<()> {
     let data_dir = path.join(".thinkingroot");
 
@@ -2994,6 +3036,24 @@ fn run_init(path: &Path) -> anyhow::Result<()> {
     // Users who need per-workspace overrides can create .thinkingroot/config.toml manually.
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| anyhow::anyhow!("could not create {}: {e}", data_dir.display()))?;
+
+    // Write a sensible-default `.rootignore` so a fresh workspace
+    // immediately keeps secrets, personal files, and build artefacts
+    // out of the compiled cognition. The walker honours this on the
+    // very next `root compile`. Skipped silently if the user already
+    // dropped their own .rootignore into the workspace.
+    let rootignore_path = path.join(".rootignore");
+    if !rootignore_path.exists() {
+        if let Err(e) = std::fs::write(&rootignore_path, DEFAULT_ROOTIGNORE) {
+            // Non-fatal: workspace still works, just without the default
+            // privacy guard. Warn loudly so the user can spot it.
+            eprintln!(
+                "  {} could not write {}: {e}",
+                style("warning:").yellow().bold(),
+                rootignore_path.display()
+            );
+        }
+    }
 
     println!(
         "  {} initialized at {}",
