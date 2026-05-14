@@ -348,6 +348,116 @@ pub async fn playground_witnesses_by_source(
     Ok(rows)
 }
 
+/// One row of `playground_source_witnesses` — the Playground
+/// click-through detail panel shape. Carries the witness's identity
+/// + rule + confidence + first-span byte range; the heavier fields
+/// (`inputs`, full `spans` vec) stay server-side. The `statement`
+/// field is the materialised source-byte slice (lossless,
+/// post-Phase-5-bridge-polish) so the panel renders real source
+/// text inline — same wire shape the existing
+/// `GET /api/v1/ws/{ws}/claims` returns for legacy callers.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PlaygroundWitnessRow {
+    pub id: String,
+    pub witness_type: String,
+    pub rule: String,
+    pub symbol: Option<String>,
+    pub confidence: f64,
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+/// Tauri command: witnesses anchored to a single source row. Used
+/// when a researcher clicks a file in the Playground SourceLibrary
+/// to inspect what got extracted from it. Returns the
+/// `Witness` wire shape via the sidecar's existing
+/// `GET /api/v1/ws/{ws}/witnesses?source_id=...` endpoint.
+#[tauri::command]
+pub async fn playground_source_witnesses(
+    app: AppHandle,
+    source_id: String,
+) -> Result<Vec<PlaygroundWitnessRow>, String> {
+    let client = crate::commands::sidecar_client::SidecarClient::ensure_active(&app).await?;
+    let path = format!(
+        "/api/v1/ws/{}/witnesses?source_id={}",
+        urlencode(&client.workspace),
+        urlencode(&source_id),
+    );
+    // The full Witness wire shape carries inputs_json + spans_json
+    // (10+ fields); deserialise into `serde_json::Value` and
+    // project to the slim PlaygroundWitnessRow so the UI doesn't
+    // depend on the full Witness type binding (which would drag in
+    // the WitnessInput / WitnessSpan / SourceId / WorkspaceId
+    // shape).
+    let raw: Vec<serde_json::Value> = client.get(&path).await?;
+    let mut out: Vec<PlaygroundWitnessRow> = Vec::with_capacity(raw.len());
+    for v in raw {
+        // Tolerant projection: missing fields collapse to defaults
+        // so a wire-shape bump doesn't blow up the panel.
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let witness_type = v
+            .get("witness_type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let rule = v
+            .get("rule")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let symbol = v
+            .get("symbol")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let confidence = v
+            .get("confidence")
+            .and_then(|x| {
+                if let Some(f) = x.as_f64() {
+                    Some(f)
+                } else if let Some(n) = x.as_u64() {
+                    Some(n as f64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
+        // The byte range lives on `spans[0]` per the Witness Mesh
+        // contract; the wire JSON also carries denormalised
+        // `byte_start` / `byte_end` columns from the graph for
+        // join speed.
+        let byte_start = v
+            .get("byte_start")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("spans")
+                    .and_then(|spans| spans.get(0))
+                    .and_then(|s| s.get("start"))
+                    .and_then(|x| x.as_u64())
+            })
+            .unwrap_or(0);
+        let byte_end = v
+            .get("byte_end")
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("spans")
+                    .and_then(|spans| spans.get(0))
+                    .and_then(|s| s.get("end"))
+                    .and_then(|x| x.as_u64())
+            })
+            .unwrap_or(0);
+        out.push(PlaygroundWitnessRow {
+            id,
+            witness_type,
+            rule,
+            symbol,
+            confidence,
+            byte_start,
+            byte_end,
+        });
+    }
+    Ok(out)
+}
+
 /// Minimal URL encoder for path components — same shape as the helper
 /// in `memory.rs`, duplicated locally to avoid pulling that module's
 /// other imports into the playground command surface.

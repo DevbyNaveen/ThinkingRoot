@@ -1267,6 +1267,19 @@ impl QueryEngine {
         storage.graph.list_witnesses(limit)
     }
 
+    /// List every Witness anchored to a specific source. Used by the
+    /// Playground SourceLibrary click-through to render the witness
+    /// detail panel for a clicked source row.
+    pub async fn list_witnesses_by_source(
+        &self,
+        ws: &str,
+        source_id: &str,
+    ) -> Result<Vec<thinkingroot_core::types::Witness>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_witnesses_by_source(source_id)
+    }
+
     /// Fetch a single Witness by id from a workspace. Returns `None`
     /// when the id is unknown — surfaces the absence honestly rather
     /// than fabricating an empty Witness, because callers gate

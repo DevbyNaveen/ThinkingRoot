@@ -21,20 +21,19 @@ import { cn } from "@/lib/utils";
  * researcher immediately sees "what's in here": text, images,
  * audio, anything else. Refetches on workspace switch + on
  * compile-progress "done" events the parent passes through
- * `refreshNonce`.
- *
- * Today the panel surfaces only URIs (with display-friendly
- * basenames). Per-source witness counts + click-to-jump land in a
- * follow-up — the substrate exposes them via the existing
- * `/api/v1/ws/{ws}/witnesses` REST endpoint, just not yet wired in
- * the UI.
+ * `refreshNonce`. Clicking a row signals the parent via
+ * `onSelect` (the parent renders SourceDetailPanel).
  */
 export function SourceLibrary({
   workspace,
   refreshNonce,
+  selectedSourceId,
+  onSelect,
 }: {
   workspace: string | null;
   refreshNonce?: number;
+  selectedSourceId?: string | null;
+  onSelect?: (source: PlaygroundSource | null) => void;
 }) {
   const [sources, setSources] = useState<PlaygroundSource[] | null>(null);
   const [witnessCounts, setWitnessCounts] = useState<Map<string, number>>(
@@ -122,6 +121,8 @@ export function SourceLibrary({
                 label={label}
                 items={items}
                 witnessCounts={witnessCounts}
+                selectedSourceId={selectedSourceId}
+                onSelect={onSelect}
               />
             ))}
           </ul>
@@ -138,11 +139,15 @@ function SourceGroup({
   label,
   items,
   witnessCounts,
+  selectedSourceId,
+  onSelect,
 }: {
   kind: SourceKind;
   label: string;
   items: PlaygroundSource[];
   witnessCounts: Map<string, number>;
+  selectedSourceId?: string | null;
+  onSelect?: (source: PlaygroundSource | null) => void;
 }) {
   if (items.length === 0) return null;
   return (
@@ -153,30 +158,39 @@ function SourceGroup({
       <ul>
         {items.map((s) => {
           const count = witnessCounts.get(s.id) ?? 0;
+          const selected = selectedSourceId === s.id;
           return (
-            <li
-              key={s.id}
-              className={cn(
-                "group flex items-center gap-2 px-3 py-1 text-xs text-foreground/90",
-                "hover:bg-muted/40",
-              )}
-              title={s.uri}
-            >
-              <KindIcon kind={kind} />
-              <span className="min-w-0 flex-1 truncate">
-                {basenameFromUri(s.uri)}
-              </span>
-              <span
+            <li key={s.id}>
+              <button
+                type="button"
+                onClick={() => onSelect?.(selected ? null : s)}
+                aria-pressed={selected}
                 className={cn(
-                  "shrink-0 rounded px-1.5 py-px font-mono text-[10px]",
-                  count > 0
-                    ? "bg-accent/15 text-accent"
-                    : "bg-muted/40 text-muted-foreground",
+                  "group flex w-full items-center gap-2 px-3 py-1 text-left text-xs transition-colors",
+                  selected
+                    ? "bg-accent/10 text-accent"
+                    : "text-foreground/90 hover:bg-muted/40",
                 )}
-                title={`${count} witness${count === 1 ? "" : "es"}`}
+                title={s.uri}
               >
-                {count}
-              </span>
+                <KindIcon kind={kind} />
+                <span className="min-w-0 flex-1 truncate">
+                  {basenameFromUri(s.uri)}
+                </span>
+                <span
+                  className={cn(
+                    "shrink-0 rounded px-1.5 py-px font-mono text-[10px]",
+                    selected
+                      ? "bg-accent text-accent-foreground"
+                      : count > 0
+                        ? "bg-accent/15 text-accent"
+                        : "bg-muted/40 text-muted-foreground",
+                  )}
+                  title={`${count} witness${count === 1 ? "" : "es"}`}
+                >
+                  {count}
+                </span>
+              </button>
             </li>
           );
         })}

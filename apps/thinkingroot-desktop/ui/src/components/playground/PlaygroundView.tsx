@@ -5,8 +5,10 @@ import { useApp } from "@/store/app";
 import { ChatView } from "@/components/chat/ChatView";
 import { DropZone } from "@/components/playground/DropZone";
 import { PaperPanel } from "@/components/playground/PaperPanel";
+import { SourceDetailPanel } from "@/components/playground/SourceDetailPanel";
 import { SourceLibrary } from "@/components/playground/SourceLibrary";
 import { cn } from "@/lib/utils";
+import type { PlaygroundSource } from "@/lib/tauri";
 
 type PlaygroundTab = "paper" | "chat";
 
@@ -32,6 +34,9 @@ export function PlaygroundView() {
   const surface = useApp((s) => s.surface);
   const compileProgress = useApp((s) => s.compileProgress);
   const [tab, setTab] = useState<PlaygroundTab>("paper");
+  const [selectedSource, setSelectedSource] = useState<PlaygroundSource | null>(
+    null,
+  );
   // Refresh SourceLibrary + PaperPanel whenever a compile finishes
   // by bumping a nonce. Both children depend on `refreshNonce` /
   // `workspace`; we don't reload mid-compile (the substrate is in
@@ -46,6 +51,12 @@ export function PlaygroundView() {
       setRefreshNonce((n) => n + 1);
     }
   }, [compileProgress?.phase]);
+  // Clear selection on workspace switch — selected source IDs are
+  // workspace-scoped (ULIDs), keeping a stale one open would show
+  // "no witnesses" because the new workspace doesn't carry the id.
+  useEffect(() => {
+    setSelectedSource(null);
+  }, [workspace]);
 
   return (
     <div className="flex h-full flex-col">
@@ -60,7 +71,12 @@ export function PlaygroundView() {
         <DropZone workspace={workspace} visible={surface === "playground"} />
       </div>
       <div className="flex flex-1 overflow-hidden">
-        <SourceLibrary workspace={workspace} refreshNonce={refreshNonce} />
+        <SourceLibrary
+          workspace={workspace}
+          refreshNonce={refreshNonce}
+          selectedSourceId={selectedSource?.id ?? null}
+          onSelect={setSelectedSource}
+        />
         <section className="flex min-w-0 flex-1 flex-col">
           <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface/20 px-2 py-1">
             <TabButton
@@ -84,6 +100,13 @@ export function PlaygroundView() {
             )}
           </div>
         </section>
+        {selectedSource && (
+          <SourceDetailPanel
+            sourceId={selectedSource.id}
+            sourceUri={selectedSource.uri}
+            onClose={() => setSelectedSource(null)}
+          />
+        )}
       </div>
     </div>
   );

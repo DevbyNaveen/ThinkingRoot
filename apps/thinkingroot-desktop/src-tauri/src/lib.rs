@@ -272,6 +272,7 @@ pub fn run() {
             commands::playground::playground_drop,
             commands::playground::playground_sources,
             commands::playground::playground_witnesses_by_source,
+            commands::playground::playground_source_witnesses,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

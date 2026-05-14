@@ -1870,3 +1870,25 @@ export interface WitnessesPerSourceRow {
 export async function playgroundWitnessesBySource(): Promise<WitnessesPerSourceRow[]> {
   return invoke<WitnessesPerSourceRow[]>("playground_witnesses_by_source");
 }
+
+/** One row in the Playground source-detail panel. Slim projection
+ * of the full Witness wire shape — enough to render the panel but
+ * without dragging in the full WitnessInput / WitnessSpan binding. */
+export interface PlaygroundWitnessRow {
+  id: string;
+  witness_type: string;
+  rule: string;
+  symbol: string | null;
+  confidence: number;
+  byte_start: number;
+  byte_end: number;
+}
+
+/** List every witness anchored to a specific source. */
+export async function playgroundSourceWitnesses(
+  sourceId: string,
+): Promise<PlaygroundWitnessRow[]> {
+  return invoke<PlaygroundWitnessRow[]>("playground_source_witnesses", {
+    sourceId,
+  });
+}

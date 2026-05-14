@@ -1306,12 +1306,14 @@ async fn list_claims(
 
 /// Query parameters accepted by `GET /api/v1/ws/{ws}/witnesses`.
 /// `limit` caps the row count; `rule` filters to a specific catalog
-/// rule. Both are optional — passing neither lists every Witness in
-/// the workspace.
+/// rule; `source_id` scopes to one source row's witnesses (used by
+/// the Playground SourceLibrary click-through). All optional —
+/// passing none lists every Witness in the workspace.
 #[derive(serde::Deserialize)]
 struct WitnessListParams {
     limit: Option<usize>,
     rule: Option<String>,
+    source_id: Option<String>,
 }
 
 async fn list_witnesses_handler(
@@ -1320,10 +1322,23 @@ async fn list_witnesses_handler(
     Query(params): Query<WitnessListParams>,
 ) -> Response {
     let engine = state.engine.read().await;
-    match engine.list_witnesses(&ws, params.limit).await {
+    let result = if let Some(sid) = params.source_id.as_deref() {
+        engine.list_witnesses_by_source(&ws, sid).await
+    } else {
+        engine.list_witnesses(&ws, params.limit).await
+    };
+    match result {
         Ok(mut witnesses) => {
             if let Some(rule_filter) = &params.rule {
                 witnesses.retain(|w| &w.rule == rule_filter);
+            }
+            // `source_id` already scoped server-side; apply `limit`
+            // post-hoc when both source_id + limit are supplied so
+            // the caller still gets predictable truncation.
+            if params.source_id.is_some() {
+                if let Some(limit) = params.limit {
+                    witnesses.truncate(limit);
+                }
             }
             ok_response(witnesses).into_response()
         }
