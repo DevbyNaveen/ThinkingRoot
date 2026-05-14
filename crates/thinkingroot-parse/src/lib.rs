@@ -1,3 +1,4 @@
+pub mod audio_meta;
 pub mod code;
 pub mod csv_data;
 pub mod doctags;
@@ -56,6 +57,12 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
         // histogram, edge summary, EXIF, dominant colours).
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "tiff" | "tif" | "bmp" | "pnm" | "ppm"
         | "pgm" | "pbm" => image_meta::parse(path),
+        // Audio formats — chunkless DocumentIRs. Witness Mesh
+        // feature extractors in
+        // `thinkingroot-extract::audio_rules` run at extract time
+        // and emit per-rule witnesses (duration, spectral
+        // fingerprint, decode-fail honest absence).
+        "wav" | "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" => audio_meta::parse(path),
         // Manifest files get structured dependency parsing.
         "toml"
             if path
@@ -186,16 +193,18 @@ mod tests {
 
     #[test]
     fn parse_directory_skips_unsupported_files_silently() {
-        // No assertion on count — pdf-extract may or may not pull in
-        // a binary blob.  Just confirms the function returns Ok with
-        // an unsupported (`.png`) file present.
+        // `.xyz` is genuinely unsupported (no image/audio/video/text
+        // dispatch arm). `.png` was used here before catalog v1.1
+        // added image-family rules — images are now registered as
+        // chunkless DocumentIRs, so the test moves to a real
+        // unsupported extension.
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("ok.md"), "# hi").unwrap();
-        std::fs::write(tmp.path().join("blob.png"), b"\x89PNG\r\n").unwrap();
+        std::fs::write(tmp.path().join("blob.xyz"), b"\x00\x01\x02opaque").unwrap();
         let docs = parse_directory(tmp.path(), &cfg()).expect("parse_directory");
         assert!(docs.iter().any(|d| d.uri.ends_with("ok.md")));
         assert!(
-            !docs.iter().any(|d| d.uri.ends_with("blob.png")),
+            !docs.iter().any(|d| d.uri.ends_with("blob.xyz")),
             "unsupported types must be silently filtered out"
         );
     }

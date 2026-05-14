@@ -46,7 +46,11 @@ include!(concat!(env!("OUT_DIR"), "/grammar_versions.rs"));
 /// extraction of image content: perceptual hash, color histogram,
 /// edge summary, EXIF metadata, dominant colors. Pure-Rust
 /// deterministic; no shell-outs.
-pub const CATALOG_VERSION: &str = "1.1.0";
+///
+/// `1.2.0` — added audio-family rules: duration / sample-rate /
+/// channels metadata, spectral fingerprint via FFT, decode-fail
+/// honest absence. Pure-Rust via symphonia + rustfft.
+pub const CATALOG_VERSION: &str = "1.2.0";
 
 /// One rule in the catalog. The `'static` lifetime everywhere is
 /// load-bearing: descriptors live in a `phf` static map and the
@@ -775,6 +779,45 @@ pub static RULE_CATALOG: phf::Map<&'static str, RuleDescriptor> = phf::phf_map! 
         default_confidence: 0.99,
         default_sensitivity: "Public",
         description: "Image format unsupported / decode failed — honest absence (mirrors lsp::skipped@v1)",
+    },
+
+    // ── Audio-family rules (mathematical extraction; no LLM) ──
+    // Catalog v1.2 adds pure-Rust audio feature extractors. Each
+    // rule consumes the whole file bytes as a single span; the
+    // Witness payload encodes the deterministic feature. Backend:
+    // symphonia for decode + rustfft for the spectral fingerprint.
+    "audio::duration@v1" => RuleDescriptor {
+        name: "audio::duration@v1",
+        family: "audio",
+        input_types: &["raw_bytes"],
+        output_type: "audio::duration",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Duration (samples), sample rate, channel count from the codec header",
+    },
+    "audio::spectral-fingerprint@v1" => RuleDescriptor {
+        name: "audio::spectral-fingerprint@v1",
+        family: "audio",
+        input_types: &["raw_bytes"],
+        output_type: "audio::spectral-fingerprint",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Log-magnitude spectral signature averaged over the file — near-duplicate detection across re-encodings",
+    },
+    "audio::skipped@v1" => RuleDescriptor {
+        name: "audio::skipped@v1",
+        family: "audio",
+        input_types: &["raw_bytes"],
+        output_type: "audio::skipped",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Audio format unsupported / decode failed — honest absence (mirrors image::skipped@v1)",
     },
 };
 

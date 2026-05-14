@@ -100,19 +100,30 @@ pub struct SourcedRelation {
 /// sort) runs at the caller's discretion via
 /// `witness_mesh::assemble` — this function returns the raw stream
 /// so callers can attach per-document context if needed.
+/// Pull the lower-case extension off a DocumentIR's `uri`.
+/// Returns an empty string when the URI carries no `.`.
+fn doc_extension(doc: &DocumentIR) -> String {
+    doc.uri
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 /// Detect a chunkless image DocumentIR by URI extension. The parser
 /// emits image documents via `thinkingroot_parse::image_meta::parse`
 /// which routes off the same extension set as
 /// [`crate::image_rules::is_image_extension`]. Keep the two
 /// extension catalogues in lockstep by delegating here.
 fn is_image_document(doc: &DocumentIR) -> bool {
-    let ext = doc
-        .uri
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    crate::image_rules::is_image_extension(&ext)
+    crate::image_rules::is_image_extension(&doc_extension(doc))
+}
+
+/// Detect a chunkless audio DocumentIR by URI extension. Mirrors
+/// [`is_image_document`]; backed by
+/// [`crate::audio_rules::is_audio_extension`].
+fn is_audio_document(doc: &DocumentIR) -> bool {
+    crate::audio_rules::is_audio_extension(&doc_extension(doc))
 }
 
 pub fn collect_witnesses_from_documents(
@@ -159,6 +170,27 @@ pub fn collect_witnesses_from_documents(
             // Image documents have no text chunks; the rest of the
             // per-chunk loop below would be a no-op anyway, but
             // skipping it explicitly keeps the witness flow clear.
+            continue;
+        }
+
+        // Audio-family dispatch. Same shape as image: read bytes,
+        // call into `audio_rules`. Failures surface as
+        // `audio::skipped@v1`.
+        if is_audio_document(doc) {
+            if let Ok(bytes) = std::fs::read(&doc.uri) {
+                out.extend(crate::audio_rules::extract_audio_witnesses(
+                    &bytes,
+                    &file_blake3,
+                    doc.source_id,
+                    workspace_id,
+                    now,
+                ));
+            } else {
+                tracing::warn!(
+                    uri = %doc.uri,
+                    "audio document unreadable at extract time — skipping audio::* rules"
+                );
+            }
             continue;
         }
 

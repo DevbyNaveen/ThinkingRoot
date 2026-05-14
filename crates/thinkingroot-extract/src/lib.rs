@@ -29,6 +29,7 @@
 //! extraction story. See `.claude/rules/witness-mesh.md` for the
 //! cutover record.
 
+pub mod audio_rules;
 pub mod comment_claims;
 pub mod expiration;
 pub mod extractor;
