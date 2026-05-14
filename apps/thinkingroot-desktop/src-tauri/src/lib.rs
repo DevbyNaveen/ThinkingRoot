@@ -112,19 +112,28 @@ pub fn run() {
                     });
                 }
                 tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
-                    // Forward only `.tr` paths to the front-end. The
-                    // sheet UI listens for `tr-file-opened` and routes
-                    // the first match to `install_tr_file`.
+                    // Two consumers of drag-drop:
+                    //   1. `.tr` pack install sheet — listens for
+                    //      `tr-file-opened` (single path payload).
+                    //   2. Playground DropZone — listens for
+                    //      `playground-files-dropped` (Vec<String>
+                    //      of every non-`.tr` path in the drop).
+                    let mut other_paths: Vec<String> = Vec::new();
                     for path in paths {
-                        if path
+                        let is_tr = path
                             .extension()
                             .and_then(|s| s.to_str())
                             .map(|s| s.eq_ignore_ascii_case("tr"))
-                            .unwrap_or(false)
-                        {
+                            .unwrap_or(false);
+                        if is_tr {
                             let payload = path.display().to_string();
                             let _ = window.emit("tr-file-opened", payload);
+                        } else {
+                            other_paths.push(path.display().to_string());
                         }
+                    }
+                    if !other_paths.is_empty() {
+                        let _ = window.emit("playground-files-dropped", other_paths);
                     }
                 }
                 _ => {}
@@ -260,6 +269,7 @@ pub fn run() {
             commands::browser_save::browser_extract_callback,
             commands::playground::playground_ensure,
             commands::playground::paper_get,
+            commands::playground::playground_drop,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

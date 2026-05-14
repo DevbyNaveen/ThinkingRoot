@@ -259,6 +259,16 @@ export function onTrFileOpened(
   return listen<string>("tr-file-opened", (e) => handler(e.payload));
 }
 
+/** Tauri emits `playground-files-dropped` with the array of every
+ * non-`.tr` OS-level path in a drag-drop. The Playground DropZone
+ * is the sole consumer today; the lib.rs window-event handler
+ * filters `.tr` paths off to the install sheet first. */
+export function onPlaygroundFilesDropped(
+  handler: (paths: string[]) => void,
+): Promise<UnlistenFn> {
+  return listen<string[]>("playground-files-dropped", (e) => handler(e.payload));
+}
+
 // ─── Pack export (Slice 9) ───────────────────────────────────────────
 
 export interface PackEstimate {
@@ -1811,4 +1821,28 @@ export interface PaperPayload {
  * `<root>/.thinkingroot/paper.md` off the main thread. */
 export async function paperGet(workspace: string): Promise<PaperPayload> {
   return invoke<PaperPayload>("paper_get", { workspace });
+}
+
+/** Honest outcome of a Playground drop. `copied` is the file count
+ * that landed in inbox/; `skipped_duplicate` counts same-name
+ * collisions (no overwrite — the user can rename + retry);
+ * `skipped_unreadable` counts permissions / race-deleted sources. */
+export interface DropOutcome {
+  copied: number;
+  skipped_duplicate: number;
+  skipped_unreadable: number;
+  destination_paths: string[];
+}
+
+/** Copy dropped files into the workspace's inbox/ directory. The
+ * Playground DropZone calls this after the Tauri window emits a
+ * `playground-files-dropped` event with the OS-level file paths. */
+export async function playgroundDrop(
+  workspace: string,
+  filePaths: string[],
+): Promise<DropOutcome> {
+  return invoke<DropOutcome>("playground_drop", {
+    workspace,
+    filePaths,
+  });
 }

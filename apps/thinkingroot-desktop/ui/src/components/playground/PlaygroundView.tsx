@@ -1,13 +1,14 @@
 import { FlaskConical } from "lucide-react";
 
 import { useApp } from "@/store/app";
+import { DropZone } from "@/components/playground/DropZone";
 import { PaperPanel } from "@/components/playground/PaperPanel";
 
 /**
  * Playground surface — the researcher / student-facing workspace
- * view. v1 ships the Living Paper viewer as the primary panel;
- * subsequent commits add the drop-zone, citation chips, the
- * three-pane layout, and the cross-workspace chat.
+ * view. v1 ships the DropZone (drag-drop file ingest + auto-compile)
+ * on top of the Living Paper viewer; subsequent commits add citation
+ * chips, the three-pane layout, and the cross-workspace chat.
  *
  * The naming convention: "Playground" is the surface the user
  * selects from the icon rail; underneath it composes the same
@@ -16,6 +17,7 @@ import { PaperPanel } from "@/components/playground/PaperPanel";
  */
 export function PlaygroundView() {
   const workspace = useApp((s) => s.activeWorkspace);
+  const surface = useApp((s) => s.surface);
 
   return (
     <div className="flex h-full flex-col">
@@ -26,6 +28,9 @@ export function PlaygroundView() {
           Drop sources, ask questions, watch the Living Paper grow.
         </span>
       </header>
+      <div className="shrink-0 border-b border-border bg-background px-4 py-2">
+        <DropZone workspace={workspace} visible={surface === "playground"} />
+      </div>
       <div className="flex flex-1 overflow-hidden">
         <PaperPanel workspace={workspace} />
       </div>

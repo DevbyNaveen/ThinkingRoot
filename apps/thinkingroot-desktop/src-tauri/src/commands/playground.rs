@@ -193,6 +193,108 @@ pub struct PaperPayload {
     pub markdown: String,
 }
 
+/// Outcome of a Playground drop. Surfaced to the UI so the
+/// DropZone can render an honest summary toast ("3 added, 1 skipped
+/// — already present").
+#[derive(Debug, Clone, Serialize)]
+pub struct DropOutcome {
+    /// Number of files actually copied into `inbox/`.
+    pub copied: u64,
+    /// Number of files skipped because a same-name file already
+    /// existed at the destination.
+    pub skipped_duplicate: u64,
+    /// Number of files skipped because the source path could not
+    /// be read (deleted between drop and ingest, permissions, etc.).
+    pub skipped_unreadable: u64,
+    /// Relative paths inside the workspace that the copy landed at,
+    /// in the order they were processed. Useful for the toast +
+    /// future "show in source library" jump.
+    pub destination_paths: Vec<String>,
+}
+
+/// Tauri command: copy dropped files into a workspace's `inbox/`
+/// directory. The Playground UI calls this after the Tauri window
+/// emits a `playground-files-dropped` event; the engine's walker
+/// honours `inbox/` like any other source directory on the next
+/// compile.
+///
+/// Rules:
+/// - Resolves the workspace's on-disk root via `WorkspaceRegistry`.
+/// - Creates `<workspace>/inbox/` if it doesn't already exist.
+/// - Same-name collisions are skipped (no overwrite — the user can
+///   rename the source and retry). Hidden because honest:
+///   silently overwriting on drag-drop is the kind of "helpful"
+///   that loses work.
+/// - Unreadable sources are logged + counted, not fatal.
+/// - Returns a typed `DropOutcome` so the UI surfaces an honest
+///   summary instead of a fabricated "N files added".
+#[tauri::command]
+pub async fn playground_drop(
+    workspace: String,
+    file_paths: Vec<String>,
+) -> Result<DropOutcome, String> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<DropOutcome, String> {
+        let registry = WorkspaceRegistry::load()
+            .map_err(|e| format!("workspace registry load: {e}"))?;
+        let entry = registry
+            .workspaces
+            .into_iter()
+            .find(|e| e.name == workspace)
+            .ok_or_else(|| format!("workspace `{workspace}` not registered"))?;
+        let inbox = entry.path.join("inbox");
+        fs::create_dir_all(&inbox).map_err(|e| format!("create inbox: {e}"))?;
+
+        let mut copied: u64 = 0;
+        let mut skipped_duplicate: u64 = 0;
+        let mut skipped_unreadable: u64 = 0;
+        let mut destination_paths: Vec<String> = Vec::new();
+
+        for src_str in file_paths {
+            let src = PathBuf::from(&src_str);
+            let filename = match src.file_name() {
+                Some(n) => n.to_owned(),
+                None => {
+                    skipped_unreadable += 1;
+                    continue;
+                }
+            };
+            let dest = inbox.join(&filename);
+            if dest.exists() {
+                skipped_duplicate += 1;
+                continue;
+            }
+            match fs::copy(&src, &dest) {
+                Ok(_) => {
+                    copied += 1;
+                    destination_paths.push(
+                        dest.strip_prefix(&entry.path)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| dest.to_string_lossy().into_owned()),
+                    );
+                }
+                Err(e) => {
+                    skipped_unreadable += 1;
+                    tracing::warn!(
+                        src = %src_str,
+                        error = %e,
+                        "playground_drop: skipping unreadable source"
+                    );
+                }
+            }
+        }
+
+        Ok(DropOutcome {
+            copied,
+            skipped_duplicate,
+            skipped_unreadable,
+            destination_paths,
+        })
+    })
+    .await
+    .map_err(|e| format!("playground_drop task panicked: {e}"))??;
+    Ok(outcome)
+}
+
 /// Tauri command: read the Living Paper for a workspace by name.
 ///
 /// Resolves the workspace's on-disk root via [`WorkspaceRegistry`],
