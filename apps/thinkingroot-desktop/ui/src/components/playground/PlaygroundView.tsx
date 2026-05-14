@@ -1,17 +1,26 @@
 import { useEffect, useState } from "react";
-import { FlaskConical } from "lucide-react";
+import { FileText, FlaskConical, MessageSquareText } from "lucide-react";
 
 import { useApp } from "@/store/app";
+import { ChatView } from "@/components/chat/ChatView";
 import { DropZone } from "@/components/playground/DropZone";
 import { PaperPanel } from "@/components/playground/PaperPanel";
 import { SourceLibrary } from "@/components/playground/SourceLibrary";
+import { cn } from "@/lib/utils";
+
+type PlaygroundTab = "paper" | "chat";
 
 /**
  * Playground surface — the researcher / student-facing workspace
- * view. v1 ships the DropZone (drag-drop file ingest + auto-compile)
- * + SourceLibrary (left-rail file list) + Living Paper viewer.
- * Subsequent commits add citation chips, the cross-workspace chat,
- * and the provenance-trace right panel.
+ * view. v1 ships:
+ *   - DropZone (drag-drop file ingest + auto-compile)
+ *   - SourceLibrary (left-rail file list grouped by kind)
+ *   - Paper / Chat tab switcher in the center pane:
+ *       · Paper tab → Living Paper viewer
+ *       · Chat tab  → ChatView (the same workspace-scoped chat the
+ *         Conversations surface uses; the differentiator is the
+ *         surrounding Playground context, not a separate chat
+ *         engine)
  *
  * The naming convention: "Playground" is the surface the user
  * selects from the icon rail; underneath it composes the same
@@ -22,6 +31,7 @@ export function PlaygroundView() {
   const workspace = useApp((s) => s.activeWorkspace);
   const surface = useApp((s) => s.surface);
   const compileProgress = useApp((s) => s.compileProgress);
+  const [tab, setTab] = useState<PlaygroundTab>("paper");
   // Refresh SourceLibrary + PaperPanel whenever a compile finishes
   // by bumping a nonce. Both children depend on `refreshNonce` /
   // `workspace`; we don't reload mid-compile (the substrate is in
@@ -51,8 +61,59 @@ export function PlaygroundView() {
       </div>
       <div className="flex flex-1 overflow-hidden">
         <SourceLibrary workspace={workspace} refreshNonce={refreshNonce} />
-        <PaperPanel workspace={workspace} refreshNonce={refreshNonce} />
+        <section className="flex min-w-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center gap-1 border-b border-border bg-surface/20 px-2 py-1">
+            <TabButton
+              active={tab === "paper"}
+              onClick={() => setTab("paper")}
+              icon={<FileText className="size-3.5" />}
+              label="Paper"
+            />
+            <TabButton
+              active={tab === "chat"}
+              onClick={() => setTab("chat")}
+              icon={<MessageSquareText className="size-3.5" />}
+              label="Chat"
+            />
+          </div>
+          <div className="flex flex-1 overflow-hidden">
+            {tab === "paper" ? (
+              <PaperPanel workspace={workspace} refreshNonce={refreshNonce} />
+            ) : (
+              <ChatView />
+            )}
+          </div>
+        </section>
       </div>
     </div>
+  );
+}
+
+function TabButton({
+  active,
+  onClick,
+  icon,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+        active
+          ? "bg-accent/15 text-accent"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
   );
 }
