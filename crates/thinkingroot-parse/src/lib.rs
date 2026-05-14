@@ -2,6 +2,7 @@ pub mod code;
 pub mod csv_data;
 pub mod doctags;
 pub mod git;
+pub mod image_meta;
 pub mod json_data;
 pub mod manifest;
 pub mod markdown;
@@ -48,6 +49,13 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
         "hs" => code::parse(path, "haskell"),
         "r" => code::parse(path, "r"),
         "pdf" => pdf::parse(path),
+        // Image formats — registered as chunkless DocumentIRs. The
+        // Witness Mesh feature extractors in
+        // `thinkingroot-extract::image_rules` run at extract time
+        // and emit per-rule witnesses (perceptual hash, colour
+        // histogram, edge summary, EXIF, dominant colours).
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "tiff" | "tif" | "bmp" | "pnm" | "ppm"
+        | "pgm" | "pbm" => image_meta::parse(path),
         // Manifest files get structured dependency parsing.
         "toml"
             if path

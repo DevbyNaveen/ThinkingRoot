@@ -100,6 +100,21 @@ pub struct SourcedRelation {
 /// sort) runs at the caller's discretion via
 /// `witness_mesh::assemble` — this function returns the raw stream
 /// so callers can attach per-document context if needed.
+/// Detect a chunkless image DocumentIR by URI extension. The parser
+/// emits image documents via `thinkingroot_parse::image_meta::parse`
+/// which routes off the same extension set as
+/// [`crate::image_rules::is_image_extension`]. Keep the two
+/// extension catalogues in lockstep by delegating here.
+fn is_image_document(doc: &DocumentIR) -> bool {
+    let ext = doc
+        .uri
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    crate::image_rules::is_image_extension(&ext)
+}
+
 pub fn collect_witnesses_from_documents(
     documents: &[DocumentIR],
     workspace_id: WorkspaceId,
@@ -117,6 +132,33 @@ pub fn collect_witnesses_from_documents(
         // unanchored row slip past the I-W8 verifier.
         let file_blake3 = doc.content_hash.0.clone();
         if file_blake3.is_empty() {
+            continue;
+        }
+
+        // Image-family dispatch (chunkless DocumentIR). The image
+        // rule modules operate on the whole file bytes, not on
+        // text chunks — re-read the bytes via `doc.uri` and emit
+        // image::* witnesses. Decode failures and oversized files
+        // surface as `image::skipped@v1` (honest absence), never
+        // as a missing row.
+        if is_image_document(doc) {
+            if let Ok(bytes) = std::fs::read(&doc.uri) {
+                out.extend(crate::image_rules::extract_image_witnesses(
+                    &bytes,
+                    &file_blake3,
+                    doc.source_id,
+                    workspace_id,
+                    now,
+                ));
+            } else {
+                tracing::warn!(
+                    uri = %doc.uri,
+                    "image document unreadable at extract time — skipping image::* rules"
+                );
+            }
+            // Image documents have no text chunks; the rest of the
+            // per-chunk loop below would be a no-op anyway, but
+            // skipping it explicitly keeps the witness flow clear.
             continue;
         }
 
