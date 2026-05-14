@@ -16,7 +16,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped from 1 → 2 with the addition of compile-failure tracking
+/// (`compile_attempts` + `compile_breaker_until`). Both new fields
+/// carry `#[serde(default)]` so an existing v1 file on disk still
+/// deserialises cleanly under v2 — schema_version is reader-bumped,
+/// so a v1 reader still refuses a v2 file (`SCHEMA_VERSION > N`).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Window for "consecutive failures" — only failures within this
 /// window contribute to the restart cap.  Spec §7.
@@ -34,6 +39,34 @@ pub const BREAKER_DURATION: Duration = Duration::from_secs(5 * 60);
 /// breaker (in addition to MAX_ATTEMPTS plain failures).
 /// Spec §7: 3.
 pub const CRASH_SIGNAL_TRIP_THRESHOLD: usize = 3;
+
+/// Compile failures are longer-lived than process crashes so the
+/// window is wider: a flaky LLM provider or transient disk pressure
+/// shouldn't trip the breaker on a single bad afternoon.
+pub const COMPILE_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Trip the compile breaker after this many compile failures in
+/// `COMPILE_FAILURE_WINDOW`. Lower than `MAX_ATTEMPTS` because a
+/// compile is a heavyweight retry — three consecutive failures is
+/// already strong evidence of a deterministic underlying issue.
+pub const COMPILE_MAX_ATTEMPTS: usize = 3;
+
+/// How long the compile breaker stays tripped before auto-clearing.
+/// 10 minutes — long enough that a flaky provider should have
+/// recovered, short enough that the user isn't blocked overnight.
+pub const COMPILE_BREAKER_DURATION: Duration = Duration::from_secs(10 * 60);
+
+/// Backoff schedule for the Nth compile retry attempt (1-indexed).
+/// First retry is fast (1 s) so a transient blip recovers quickly;
+/// later retries back off so a hard-stuck provider isn't hammered.
+pub fn compile_backoff_for_attempt(attempt: usize) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(5),
+        3 => Duration::from_secs(15),
+        _ => Duration::from_secs(30),
+    }
+}
 
 /// Backoff schedule for the Nth restart attempt (1-indexed).
 /// Spec §7: 0ms, 500ms, 2s, 5s; subsequent calls cap at 5s.
@@ -70,6 +103,30 @@ pub enum AttemptOutcome {
     SpawnFailed,
 }
 
+/// One recorded compile failure / success. Parallel to
+/// `RestartAttempt` but scoped to pipeline outcomes rather than
+/// process-level crashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompileAttempt {
+    pub ts: DateTime<Utc>,
+    pub workspace: String,
+    pub outcome: CompileAttemptOutcome,
+    /// Trimmed error message for diagnostic context. Empty on success.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompileAttemptOutcome {
+    /// Pipeline returned a Failed result.
+    Failed,
+    /// User clicked Stop / client disconnected mid-stream.
+    Cancelled,
+    /// Pipeline returned a Done result, possibly after a retry.
+    Succeeded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestartState {
     pub schema_version: u32,
@@ -78,6 +135,14 @@ pub struct RestartState {
     /// Slice F T3 wires the trip + auto-clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker_until: Option<DateTime<Utc>>,
+    /// Compile-scoped failure history. Parallel to `attempts` but
+    /// pruned on a longer window (`COMPILE_FAILURE_WINDOW`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compile_attempts: Vec<CompileAttempt>,
+    /// When set, the compile-scoped breaker is tripped — auto-retry
+    /// is disabled until this timestamp passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_breaker_until: Option<DateTime<Utc>>,
 }
 
 impl Default for RestartState {
@@ -108,6 +173,8 @@ impl RestartState {
             schema_version: SCHEMA_VERSION,
             attempts: Vec::new(),
             circuit_breaker_until: None,
+            compile_attempts: Vec::new(),
+            compile_breaker_until: None,
         }
     }
 
@@ -259,6 +326,106 @@ impl RestartState {
         self.recent_failure_count() >= MAX_ATTEMPTS
             || self.recent_crash_signal_count() >= CRASH_SIGNAL_TRIP_THRESHOLD
     }
+
+    // ── Compile-scoped tracking ──────────────────────────────────
+
+    /// Drop compile attempts older than `COMPILE_FAILURE_WINDOW`.
+    /// Cheap; call before every compile decision.
+    pub fn prune_compile_attempts(&mut self) {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(COMPILE_FAILURE_WINDOW)
+                .expect("COMPILE_FAILURE_WINDOW fits chrono::Duration");
+        self.compile_attempts.retain(|a| a.ts >= cutoff);
+    }
+
+    /// Count `Failed` compile outcomes in the recent window for the
+    /// given workspace. `prune_compile_attempts()` should be called
+    /// first.
+    pub fn recent_compile_failure_count(&self, workspace: &str) -> usize {
+        self.compile_attempts
+            .iter()
+            .filter(|a| a.workspace == workspace)
+            .filter(|a| matches!(a.outcome, CompileAttemptOutcome::Failed))
+            .count()
+    }
+
+    /// True iff the compile-scoped breaker is currently tripped for
+    /// the workspace. Auto-clears when the stored timestamp passes.
+    /// The breaker is workspace-scoped in semantics but the storage
+    /// uses one timestamp per state file — a tripped breaker blocks
+    /// auto-retry for every workspace until it clears. Manual user
+    /// clicks of Compile in the UI bypass the breaker (the user has
+    /// taken explicit responsibility); only the auto-retry path
+    /// consults `compile_breaker_active`.
+    pub fn compile_breaker_active(&self) -> bool {
+        match self.compile_breaker_until {
+            Some(until) => until > Utc::now(),
+            None => false,
+        }
+    }
+
+    /// True iff the count of recent compile failures for this
+    /// workspace meets `COMPILE_MAX_ATTEMPTS`.
+    pub fn compile_should_trip(&self, workspace: &str) -> bool {
+        self.recent_compile_failure_count(workspace) >= COMPILE_MAX_ATTEMPTS
+    }
+
+    /// Trip the compile-scoped breaker for `COMPILE_BREAKER_DURATION`.
+    /// Returns the `until` timestamp.
+    pub fn trip_compile_breaker(&mut self) -> DateTime<Utc> {
+        let until = Utc::now()
+            + chrono::Duration::from_std(COMPILE_BREAKER_DURATION)
+                .expect("COMPILE_BREAKER_DURATION fits chrono::Duration");
+        self.compile_breaker_until = Some(until);
+        until
+    }
+
+    /// Manually clear the compile-scoped breaker. Also drops the
+    /// stored failure history so the next compile starts at attempt 1.
+    pub fn reset_compile_breaker(&mut self) {
+        self.compile_breaker_until = None;
+        self.compile_attempts.clear();
+    }
+
+    pub fn record_compile_failure(
+        &mut self,
+        workspace: impl Into<String>,
+        error: impl Into<String>,
+    ) {
+        self.compile_attempts.push(CompileAttempt {
+            ts: Utc::now(),
+            workspace: workspace.into(),
+            outcome: CompileAttemptOutcome::Failed,
+            error: error.into(),
+        });
+    }
+
+    pub fn record_compile_cancellation(&mut self, workspace: impl Into<String>) {
+        // Cancellations are recorded but do NOT count toward the
+        // breaker — the user (or agent) chose to stop, that's not
+        // evidence of a deterministic issue.
+        self.compile_attempts.push(CompileAttempt {
+            ts: Utc::now(),
+            workspace: workspace.into(),
+            outcome: CompileAttemptOutcome::Cancelled,
+            error: String::new(),
+        });
+    }
+
+    pub fn record_compile_success(&mut self, workspace: impl Into<String>) {
+        // Successes clear the workspace's failure history so a
+        // recovered flaky-provider doesn't keep counting old failures
+        // toward future trips.
+        let ws: String = workspace.into();
+        self.compile_attempts
+            .retain(|a| !(a.workspace == ws && matches!(a.outcome, CompileAttemptOutcome::Failed)));
+        self.compile_attempts.push(CompileAttempt {
+            ts: Utc::now(),
+            workspace: ws,
+            outcome: CompileAttemptOutcome::Succeeded,
+            error: String::new(),
+        });
+    }
 }
 
 /// True if `exit_code` indicates a crash signal vs a graceful
@@ -393,5 +560,108 @@ mod breaker_tests {
         // Manually set the breaker to expire in the past.
         state.circuit_breaker_until = Some(Utc::now() - chrono::Duration::seconds(10));
         assert!(!state.breaker_active(), "past timestamp → inactive");
+    }
+}
+
+#[cfg(test)]
+mod compile_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn compile_backoff_schedule_matches_spec() {
+        assert_eq!(compile_backoff_for_attempt(1), Duration::from_secs(1));
+        assert_eq!(compile_backoff_for_attempt(2), Duration::from_secs(5));
+        assert_eq!(compile_backoff_for_attempt(3), Duration::from_secs(15));
+        assert_eq!(compile_backoff_for_attempt(99), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn three_compile_failures_trip_breaker() {
+        let mut state = RestartState::new();
+        state.record_compile_failure("ws", "boom 1");
+        state.record_compile_failure("ws", "boom 2");
+        state.record_compile_failure("ws", "boom 3");
+        assert!(state.compile_should_trip("ws"));
+    }
+
+    #[test]
+    fn compile_breaker_is_workspace_scoped_for_counting() {
+        let mut state = RestartState::new();
+        state.record_compile_failure("ws-a", "boom");
+        state.record_compile_failure("ws-a", "boom");
+        state.record_compile_failure("ws-b", "boom");
+        assert!(!state.compile_should_trip("ws-a"));
+        assert!(!state.compile_should_trip("ws-b"));
+    }
+
+    #[test]
+    fn compile_success_clears_workspace_failure_history() {
+        let mut state = RestartState::new();
+        state.record_compile_failure("ws-a", "boom");
+        state.record_compile_failure("ws-a", "boom");
+        assert_eq!(state.recent_compile_failure_count("ws-a"), 2);
+        state.record_compile_success("ws-a");
+        assert_eq!(
+            state.recent_compile_failure_count("ws-a"),
+            0,
+            "success clears workspace failure history"
+        );
+    }
+
+    #[test]
+    fn cancellation_does_not_count_toward_breaker() {
+        let mut state = RestartState::new();
+        state.record_compile_failure("ws", "boom");
+        state.record_compile_cancellation("ws");
+        state.record_compile_cancellation("ws");
+        state.record_compile_cancellation("ws");
+        assert!(!state.compile_should_trip("ws"));
+        assert_eq!(state.recent_compile_failure_count("ws"), 1);
+    }
+
+    #[test]
+    fn prune_compile_attempts_drops_old_rows() {
+        let mut state = RestartState::new();
+        let old = Utc::now() - chrono::Duration::seconds(10 * 60);
+        state.compile_attempts.push(CompileAttempt {
+            ts: old,
+            workspace: "ws".into(),
+            outcome: CompileAttemptOutcome::Failed,
+            error: "old".into(),
+        });
+        state.record_compile_failure("ws", "new");
+        state.prune_compile_attempts();
+        assert_eq!(state.compile_attempts.len(), 1);
+    }
+
+    #[test]
+    fn compile_breaker_auto_clears_when_until_in_past() {
+        let mut state = RestartState::new();
+        state.compile_breaker_until = Some(Utc::now() - chrono::Duration::seconds(10));
+        assert!(!state.compile_breaker_active());
+    }
+
+    #[test]
+    fn reset_compile_breaker_clears_history_and_until() {
+        let mut state = RestartState::new();
+        state.record_compile_failure("ws", "boom");
+        state.trip_compile_breaker();
+        state.reset_compile_breaker();
+        assert!(!state.compile_breaker_active());
+        assert!(state.compile_attempts.is_empty());
+    }
+
+    #[test]
+    fn schema_v1_state_round_trips_through_v2() {
+        // Old v1 state file: no compile_attempts, no compile_breaker_until.
+        let v1_json = serde_json::json!({
+            "schema_version": 1,
+            "attempts": [],
+        });
+        // Deserialize with v2 defaults applied to missing fields.
+        let parsed: RestartState =
+            serde_json::from_value(v1_json).expect("v1 file deserialises with v2 defaults");
+        assert!(parsed.compile_attempts.is_empty());
+        assert!(parsed.compile_breaker_until.is_none());
     }
 }

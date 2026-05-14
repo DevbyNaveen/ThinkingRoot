@@ -16,7 +16,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   PanelRight,
-  Folder,
   Hammer,
   ShieldCheck,
   CheckCircle2,
@@ -42,6 +41,7 @@ import { BrowserPanel } from "@/components/browser/BrowserPanel";
 import { TerminalPanel } from "@/components/terminal/TerminalPanel";
 import {
   workspaceCompile,
+  workspaceCompileStatus,
   workspaceCompileStop,
   workspaceList,
   type CompileProgress,
@@ -332,7 +332,6 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         Workspace
       </div>
       <div className="flex items-center gap-1.5 text-xs">
-        <Folder className="size-3.5 text-muted-foreground" />
         <span className="truncate font-medium">{activeWorkspace}</span>
         <span
           className={cn(
@@ -380,8 +379,26 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           onClick={async () => {
             setBusy(true);
             try {
+              // Pre-flight: ask the Tauri side whether a compile is
+              // already running. Pre-fix this was skipped, so a
+              // stale slot (event drop, prior crash) surfaced as a
+              // hard-error toast on click. Now we surface a soft
+              // warning the user can act on.
+              const status = await workspaceCompileStatus();
+              if (status.running && status.workspace !== activeWorkspace) {
+                toast("Compile already running", {
+                  kind: "warn",
+                  body: `Another workspace (${
+                    status.workspace ?? "unknown"
+                  }) is being compiled. Stop it first or wait for it to finish.`,
+                });
+                return;
+              }
               await workspaceCompile({ target: activeWorkspace });
-              toast("Compile queued", {
+              // Pre-fix: "Compile queued" — there is no queue; the
+              // single slot either accepts the click or rejects it.
+              // The honest message reflects what actually happened.
+              toast("Compile started", {
                 kind: "info",
                 body: "Progress shown below.",
               });

@@ -88,6 +88,70 @@ const AmbientGraph = () => {
   return <canvas ref={canvasRef} className="ambient-background" />;
 };
 
+// Universal install section — single-source-of-truth one-liners.
+// Mirrors the install paths shipped from this repo:
+//   install.sh  → macOS + Linux (curl one-liner)
+//   install.ps1 → Windows (PowerShell one-liner)
+// Strings must stay byte-identical with the URLs published in the
+// GitHub release. No tracking, no telemetry, no JS-side mutation.
+const INSTALL_COMMANDS = {
+  macos: 'curl -fsSL https://thinkingroot.com/install.sh | sh',
+  linux: 'curl -fsSL https://thinkingroot.com/install.sh | sh',
+  windows: 'irm https://thinkingroot.com/install.ps1 | iex',
+};
+
+const InstallSection = () => {
+  const [active, setActive] = useState('macos');
+  const [copied, setCopied] = useState(false);
+  const command = INSTALL_COMMANDS[active];
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Older browsers without the Clipboard API. Honest fallback —
+      // we don't pretend it copied; the command is still visible
+      // for manual selection.
+    }
+  };
+
+  return (
+    <div className="install-section reveal">
+      <h3 className="section-eyebrow" style={{ textAlign: 'center' }}>
+        Install in one line
+      </h3>
+      <div className="install-tabs">
+        {['macos', 'linux', 'windows'].map((os) => (
+          <button
+            key={os}
+            type="button"
+            className={`install-tab ${active === os ? 'active' : ''}`}
+            onClick={() => setActive(os)}
+          >
+            {os === 'macos' ? 'macOS' : os === 'linux' ? 'Linux' : 'Windows'}
+          </button>
+        ))}
+      </div>
+      <div className="install-command-wrapper glass-frame">
+        <code className="install-command">{command}</code>
+        <button
+          type="button"
+          className={`install-copy ${copied ? 'copied' : ''}`}
+          onClick={handleCopy}
+          aria-label="Copy install command"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <p className="install-note">
+        CLI + desktop app + daemon auto-start. Open-source, no telemetry, no signing fees.
+      </p>
+    </div>
+  );
+};
+
 // Tribunal Component
 const TribunalInput = () => {
   const [input, setInput] = useState('');
@@ -359,6 +423,7 @@ function App() {
               </svg> View on GitHub
             </a>
           </div>
+          <InstallSection />
         </section>
 
         {/* FEATURES / COMPILER SEQUENCE */}

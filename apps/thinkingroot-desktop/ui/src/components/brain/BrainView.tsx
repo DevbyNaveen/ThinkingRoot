@@ -10,7 +10,7 @@
  * ratio survives a reload.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Folder, RefreshCw, AlertTriangle } from "lucide-react";
+import { RefreshCw, AlertTriangle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/store/app";
@@ -202,7 +202,6 @@ export function BrainView({
       ) : (
         <>
           <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
-            <Folder className="size-4 text-muted-foreground" />
             <span className="text-sm font-medium">{activeWorkspace}</span>
             <span className="text-muted-foreground">·</span>
             <span className="text-xs text-muted-foreground">Brain</span>

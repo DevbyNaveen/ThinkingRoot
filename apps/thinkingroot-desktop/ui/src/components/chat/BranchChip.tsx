@@ -32,29 +32,10 @@ import {
   type BranchView,
   type BranchEventEnvelope,
 } from "@/lib/tauri";
+import { branchListNeedsRefetchFromEnvelope } from "@/lib/branchEvents";
 
 interface BranchChipProps {
   workspace: string;
-}
-
-const REFRESH_TRIGGERS = new Set([
-  "Created",
-  "Merged",
-  "Abandoned",
-  "CheckedOut",
-  "Checkout",
-  "Deleted",
-]);
-
-function isRefreshTrigger(event: unknown): boolean {
-  if (event && typeof event === "object") {
-    const obj = event as Record<string, unknown>;
-    if (typeof obj.kind === "string" && REFRESH_TRIGGERS.has(obj.kind)) return true;
-    if (typeof obj.type === "string" && REFRESH_TRIGGERS.has(obj.type)) return true;
-    const keys = Object.keys(obj);
-    if (keys.length === 1 && REFRESH_TRIGGERS.has(keys[0]!)) return true;
-  }
-  return false;
 }
 
 export function BranchChip({ workspace }: BranchChipProps) {
@@ -90,13 +71,7 @@ export function BranchChip({ workspace }: BranchChipProps) {
       }
       if (cancelled) return;
       unlisten = await onBranchEvent((envelope: BranchEventEnvelope) => {
-        if (envelope.kind === "lagged" || envelope.kind === "disconnected") {
-          void load();
-          return;
-        }
-        if (envelope.kind === "event" && isRefreshTrigger(envelope.event)) {
-          void load();
-        }
+        if (branchListNeedsRefetchFromEnvelope(envelope)) void load();
       });
     })();
 
@@ -165,19 +140,17 @@ export function BranchChip({ workspace }: BranchChipProps) {
     // Substrate may not be mounted, or the daemon may not be reachable
     // yet. Show branch label only (no interactive affordance).
     return (
-      <span className="inline-flex items-center gap-1 font-mono text-[11px] text-muted-foreground">
-        main
-      </span>
+      <span className="text-xs font-medium text-muted-foreground">main</span>
     );
   }
 
   return (
-    <div className="relative inline-block" ref={containerRef}>
+    <div className="relative inline-block leading-none" ref={containerRef}>
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          "inline-flex max-w-[min(220px,100%)] cursor-pointer items-center gap-1 rounded-sm py-0.5 text-left font-mono text-[11px] transition-colors",
+          "inline-flex max-w-[min(220px,100%)] cursor-pointer items-center gap-1 rounded-sm py-0.5 text-left text-xs font-medium transition-colors",
           "hover:text-foreground",
           "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/55 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
           open ? "text-foreground" : isMain ? "text-muted-foreground" : "text-foreground/85",
@@ -189,7 +162,7 @@ export function BranchChip({ workspace }: BranchChipProps) {
         <span className="min-w-0 truncate">{activeName}</span>
         <ChevronDown
           className={cn(
-            "h-3.5 w-3.5 shrink-0 opacity-70 transition-transform",
+            "h-3 w-3 shrink-0 opacity-70 transition-transform",
             open && "rotate-180",
           )}
           aria-hidden
@@ -223,7 +196,7 @@ export function BranchChip({ workspace }: BranchChipProps) {
                     ) : (
                       <span className="block h-3 w-3 flex-shrink-0" />
                     )}
-                    <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{b.name}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{b.name}</span>
                     {b.parent && b.parent !== b.name && (
                       <span className="max-w-20 truncate text-[10px] text-muted-foreground">
                         ← {b.parent}

@@ -224,4 +224,35 @@
     --brain-pulse-color: hsl(30 80% 65% / 0.45); /* orange — long-term memory */
     animation: brain-pulse 3s ease-out infinite;
   }
+
+  /*
+   * Branch graph — one-shot merge pulse.
+   *
+   * Drawn on the SVG dot for a recently-merged branch (driven by the
+   * SSE `merged` event over `branch-event`). Pairs with the persistent
+   * diamond `mergeGlyph` rendered next to the dot — the pulse is the
+   * "it just happened" cue, the diamond is the "it happened here"
+   * record.
+   *
+   * `forwards` keeps the final keyframe state so the ring doesn't
+   * snap back to opacity 1 between the keyframe and the React state
+   * eviction (which happens ~`MERGE_PULSE_MS` later). Single-shot;
+   * removal from the DOM stops the animation cleanly.
+   */
+  @keyframes branch-merge-pulse {
+    0% {
+      transform-origin: center;
+      transform: scale(1);
+      opacity: 1;
+    }
+    100% {
+      transform-origin: center;
+      transform: scale(2.4);
+      opacity: 0;
+    }
+  }
+  .branch-merge-pulse {
+    transform-box: fill-box;
+    animation: branch-merge-pulse 800ms ease-out 1 forwards;
+  }
 }

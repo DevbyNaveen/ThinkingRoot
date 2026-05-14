@@ -40,6 +40,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-os = "2"
 tauri-plugin-window-state = "2"
+# In-app auto-update: pulls latest.json from the GitHub release,
+# verifies via the public key pinned in tauri.conf.json, and
+# installs over the running .app/.exe/.AppImage at quit.
+tauri-plugin-updater = "2"
 
 # OSS engine path-deps reaching into the parent workspace. The
 # desktop talks directly to the engine's QueryEngine — no helloroot

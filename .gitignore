@@ -93,6 +93,11 @@ crates/thinkingroot-serve/src/graph.html
 # NLI model binaries — too large for git, use Git LFS or download separately
 crates/thinkingroot-ground/models/
 
+# Tauri updater signing keys — private key MUST stay out of git.
+# The matching .pub file is committed (it's safe) and the private
+# key is provided to CI via the TAURI_SIGNING_PRIVATE_KEY secret.
+apps/thinkingroot-desktop/src-tauri/keys/updater.key
+
 # Local dev artifacts
 generate_chart.py
 latency_chart.png

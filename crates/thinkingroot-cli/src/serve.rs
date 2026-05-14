@@ -704,125 +704,13 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received, stopping server...");
 }
 
-/// Generate and install an OS-native service file so `root serve` starts on login.
+/// Generate and install the OS login agent so `root serve` auto-starts.
+///
+/// Thin shim over [`crate::service::install`] — kept so the existing
+/// `root serve --install-service` flag works during the cutover.
+/// Prefer `root service install` for new call sites.
 pub fn install_service() -> anyhow::Result<()> {
-    let binary = std::env::current_exe()
-        .context("cannot resolve current executable path")?
-        .display()
-        .to_string();
-
-    let log_path = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir"))?
-        .join("thinkingroot")
-        .join("serve.log");
-
-    #[cfg(target_os = "macos")]
-    {
-        let agents_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve home dir"))?
-            .join("Library")
-            .join("LaunchAgents");
-        std::fs::create_dir_all(&agents_dir)?;
-        let plist_path = agents_dir.join("dev.thinkingroot.plist");
-
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>             <string>dev.thinkingroot</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{binary}</string>
-        <string>serve</string>
-    </array>
-    <key>RunAtLoad</key>         <true/>
-    <key>KeepAlive</key>         <true/>
-    <key>StandardOutPath</key>   <string>{log}</string>
-    <key>StandardErrorPath</key> <string>{log}</string>
-</dict>
-</plist>"#,
-            binary = binary,
-            log = log_path.display()
-        );
-
-        std::fs::write(&plist_path, plist)?;
-        println!();
-        println!(
-            "  {} {}",
-            console::style("✓ Service file:").green().bold(),
-            plist_path.display()
-        );
-        println!();
-        println!("  To start now:");
-        println!("    launchctl load {}", plist_path.display());
-        println!("    launchctl start dev.thinkingroot");
-        println!();
-        println!("  ThinkingRoot will start automatically on login.");
-        println!("  Logs: {}", log_path.display());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let systemd_dir = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir"))?
-            .join("systemd")
-            .join("user");
-        std::fs::create_dir_all(&systemd_dir)?;
-        let service_path = systemd_dir.join("thinkingroot.service");
-
-        let unit = format!(
-            "[Unit]\nDescription=ThinkingRoot Knowledge Server\nAfter=network.target\n\n\
-             [Service]\nExecStart={binary} serve\nRestart=on-failure\n\
-             StandardOutput=append:{log}\nStandardError=append:{log}\n\n\
-             [Install]\nWantedBy=default.target\n",
-            binary = binary,
-            log = log_path.display()
-        );
-
-        std::fs::write(&service_path, unit)?;
-        println!();
-        println!(
-            "  {} {}",
-            console::style("✓ Service file:").green().bold(),
-            service_path.display()
-        );
-        println!();
-        println!("  To enable:");
-        println!("    systemctl --user daemon-reload");
-        println!("    systemctl --user enable thinkingroot");
-        println!("    systemctl --user start thinkingroot");
-        println!();
-        println!("  Logs: {}", log_path.display());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let ps_path = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve home dir"))?
-            .join("thinkingroot-service.ps1");
-
-        let script = format!(
-            "# ThinkingRoot Windows Service — run as Administrator\r\n\
-             sc.exe create \"ThinkingRoot\" binPath= \"{binary} serve\" start= auto\r\n\
-             sc.exe start \"ThinkingRoot\"\r\n",
-            binary = binary
-        );
-
-        std::fs::write(&ps_path, script)?;
-        println!();
-        println!(
-            "  {} {}",
-            console::style("✓ Script:").green().bold(),
-            ps_path.display()
-        );
-        println!();
-        println!("  Run as Administrator:");
-        println!(
-            "    powershell -ExecutionPolicy Bypass -File {}",
-            ps_path.display()
-        );
-    }
-
-    Ok(())
+    let outcome = crate::service::install()
+        .map_err(|e| anyhow::anyhow!("install login agent: {e}"))?;
+    crate::service::print_outcome(&outcome, crate::service::OutcomeKind::Install)
 }

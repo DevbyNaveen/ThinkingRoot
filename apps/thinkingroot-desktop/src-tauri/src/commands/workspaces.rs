@@ -355,36 +355,122 @@ pub enum CompileProgress {
 /// `CancellationToken` lives in `AppState.active_compile` for the
 /// lifetime of the run.  Pre-fix the only way to stop a compile was
 /// to kill the desktop process, which discarded all extraction work.
+/// Sidecar-boot wait: 20 polls × 500 ms = **10 s**. Pre-Witness-Mesh
+/// the cap was 60 s with stale justification of "large NLI ONNX model
+/// + first-run fastembed download". Both deps are gone (verified via
+/// `crates/thinkingroot-ground/Cargo.toml:17` and
+/// `crates/thinkingroot-extract/src/extractor.rs:76`), so a healthy
+/// sidecar boots in 2–4 s — 10 s gives 4–5× headroom while feeling
+/// instant on the click that just sat through 60 s of dead spinner.
+const SIDECAR_BOOT_MAX_ATTEMPTS: u32 = 20;
+
+/// Maximum supersede-clear wait. Beyond this the prior task is
+/// considered wedged and we **abort the JoinHandle** (force-kill the
+/// tokio task) before registering the new one. Without abort, the
+/// previous task could keep running and emit a `Cancelled` Tauri
+/// event after the new compile had already started — racing the new
+/// `Started` event into the UI.
+const SLOT_CLEAR_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// Resolution of `WorkspaceCompileArgs.target` into the pair the
+/// helper task actually needs: a workspace URL alias the sidecar's
+/// `/api/v1/ws/{ws}/compile/stream` endpoint understands, and the
+/// canonical filesystem root path.
+struct ResolvedCompileTarget {
+    /// The registered workspace name when `args.target` matched a
+    /// `workspaces.toml` entry; otherwise `"_"` — the placeholder
+    /// the server-side `compile_stream` handler accepts for
+    /// path-based workspace lookup. Pre-fix this was hardcoded to
+    /// `"desktop"`, which only happened to work because the engine
+    /// canonicalises by `root_path` regardless of alias — but it
+    /// produced misleading status-actor keys and broke any future
+    /// per-alias routing.
+    url_alias: String,
+    /// Canonical filesystem path of the workspace root. Passed in
+    /// the request body so the sidecar locates the right
+    /// `.thinkingroot/` directory.
+    path: PathBuf,
+}
+
+fn resolve_compile_target(target: &str) -> Result<ResolvedCompileTarget, String> {
+    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
+    if let Some(entry) = registry.workspaces.iter().find(|w| w.name == target) {
+        return Ok(ResolvedCompileTarget {
+            url_alias: entry.name.clone(),
+            path: entry.path.clone(),
+        });
+    }
+    let canonical = std::fs::canonicalize(target).map_err(|e| {
+        format!("not a registered workspace and not a path: {target} ({e})")
+    })?;
+    // When the user picks a folder via the file dialog (not via the
+    // registry), the registry's canonicalized paths sometimes still
+    // match — handle that case too so we don't surface a spurious
+    // `_` alias when the path is actually known.
+    if let Some(entry) = registry
+        .workspaces
+        .iter()
+        .find(|w| w.path == canonical)
+    {
+        return Ok(ResolvedCompileTarget {
+            url_alias: entry.name.clone(),
+            path: entry.path.clone(),
+        });
+    }
+    Ok(ResolvedCompileTarget {
+        url_alias: "_".to_string(),
+        path: canonical,
+    })
+}
+
 #[tauri::command]
 pub async fn workspace_compile(
     app: AppHandle,
     args: WorkspaceCompileArgs,
 ) -> Result<String, String> {
-    let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
-    let path: PathBuf = match registry.workspaces.iter().find(|w| w.name == args.target) {
-        Some(e) => e.path.clone(),
-        None => std::fs::canonicalize(&args.target).map_err(|e| {
-            format!(
-                "not a registered workspace and not a path: {} ({e})",
-                args.target
-            )
-        })?,
-    };
-    let workspace_label = path.display().to_string();
+    let target = resolve_compile_target(&args.target)?;
+    let workspace_label = target.path.display().to_string();
     let branch = args.branch;
 
-    // One in-flight compile slot for the whole desktop process. A second
-    // workspace must wait or call `workspace_compile_stop`. For the *same*
-    // workspace root, treat a repeat `workspace_compile` as supersede:
-    // cancel the tracked run and wait for the slot to clear so a wedged
-    // sidecar / lost SSE `finally` does not brick the UI until restart.
+    // ── Compile-scoped breaker pre-check ───────────────────────────
+    // The self-heal substrate (`thinkingroot_core::restart_state`)
+    // tracks compile failures separately from process crashes. If 3
+    // failures landed in the last 5 minutes, the breaker is tripped
+    // for 10 minutes — refuse the click loud-and-honest rather than
+    // letting the user hammer a deterministically broken provider.
+    // The auto-retry path inside the spawned task ALSO consults this
+    // breaker so a single user-initiated compile can't kick off
+    // retry storms.
+    {
+        let mut rs = thinkingroot_core::restart_state::RestartState::load().unwrap_or_default();
+        rs.prune_compile_attempts();
+        if rs.compile_breaker_active() {
+            let until = rs
+                .compile_breaker_until
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "<unknown>".into());
+            let count = rs.recent_compile_failure_count(&target.url_alias);
+            return Err(format!(
+                "Compile is paused after repeated failures (last 5 min: {count}). \
+                 Auto-clears at {until}. Open Help → Recovery Log to inspect; \
+                 the breaker can be reset manually via `root doctor --fix`."
+            ));
+        }
+    }
+
+    // ── Slot supersede / force-abort ───────────────────────────────
+    // One in-flight compile slot per desktop process. A second
+    // workspace returns a hard error; the same workspace cancels the
+    // prior run + waits up to 5 s for the slot to clear, then aborts
+    // the wedged task's JoinHandle and force-clears.
     {
         let state = app.state::<AppState>();
-        let mut guard = state.active_compile.lock().await;
+        let guard = state.active_compile.lock().await;
         if let Some(handle) = guard.as_ref() {
             if handle.workspace_label != workspace_label {
                 return Err(format!(
-                    "compile already in progress for {}; call workspace_compile_stop first or wait for it to finish",
+                    "compile already in progress for {}; call workspace_compile_stop \
+                     first or wait for it to finish",
                     handle.workspace_label
                 ));
             }
@@ -396,7 +482,6 @@ pub async fn workspace_compile(
         }
     }
     let wait_started = Instant::now();
-    const SLOT_CLEAR_MAX_WAIT: Duration = Duration::from_secs(5);
     loop {
         let slot_free = {
             let state = app.state::<AppState>();
@@ -407,187 +492,352 @@ pub async fn workspace_compile(
             break;
         }
         if wait_started.elapsed() >= SLOT_CLEAR_MAX_WAIT {
-            let state = app.state::<AppState>();
-            let mut guard = state.active_compile.lock().await;
-            if guard.is_some() {
+            // Force-clear path: take the old CompileHandle out of the
+            // slot, drop the guard, and abort the JoinHandle. Pre-fix
+            // we only set `*guard = None`, which left the old tokio
+            // task running in the background — it could still emit a
+            // `Cancelled` Tauri event AFTER the new task had emitted
+            // `Started`, producing the UI's "compile briefly works
+            // then says it stopped" glitch.
+            let zombie: Option<CompileHandle> = {
+                let state = app.state::<AppState>();
+                let mut guard = state.active_compile.lock().await;
+                guard.take()
+            };
+            if let Some(handle) = zombie {
                 tracing::error!(
                     workspace = %workspace_label,
-                    "active_compile still set after supersede cancel + 5s wait — forcing clear (zombie compile)"
+                    "active_compile still set after supersede cancel + {}s wait — \
+                     aborting task JoinHandle (zombie compile)",
+                    SLOT_CLEAR_MAX_WAIT.as_secs()
                 );
-                *guard = None;
+                // Trip once more for good measure (no-op if already tripped).
+                handle.cancel.cancel();
+                handle.task.abort();
             }
             break;
         }
+        // Cancel-aware wait: if a Stop click trips a fresh token in
+        // the meantime, exit the wait immediately rather than burn
+        // the full 5 s window. We don't have OUR cancel yet (this
+        // is pre-task), so we just sleep — but interleave with a
+        // tokio::task::yield to keep the runtime responsive.
         tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::task::yield_now().await;
     }
 
-    // Register the compile so workspace_compile_stop can find the
-    // cancellation token.  Must be in place BEFORE we spawn the task
-    // so a fast UI Stop click can't miss the registration.
+    // ── Spawn the compile task ─────────────────────────────────────
     let cancel = CancellationToken::new();
+    let app_for_task = app.clone();
+    let path_for_task = target.path.clone();
+    let label_for_task = workspace_label.clone();
+    let url_alias_for_task = target.url_alias.clone();
+    let cancel_for_task = cancel.clone();
+
+    let task = tokio::spawn(async move {
+        run_desktop_compile_task(
+            app_for_task,
+            url_alias_for_task,
+            path_for_task,
+            label_for_task,
+            branch,
+            cancel_for_task,
+        )
+        .await;
+    });
+
+    // Register the handle (with JoinHandle) so:
+    //   - workspace_compile_stop can trip the cancel
+    //   - the next force-clear can abort() the task
+    //   - the task itself can clear the slot on completion
     {
         let state = app.state::<AppState>();
         let mut guard = state.active_compile.lock().await;
         *guard = Some(CompileHandle {
             workspace_label: workspace_label.clone(),
-            cancel: cancel.clone(),
+            cancel,
+            task,
         });
     }
 
-    let app_for_task = app.clone();
-    let path_for_task = path.clone();
-    let label_for_task = workspace_label.clone();
-    let cancel_for_task = cancel.clone();
+    Ok(workspace_label)
+}
 
-    tokio::spawn(async move {
-        let _ = app_for_task.emit(
-            "workspace_compile_progress",
-            CompileProgress::Started {
-                workspace: label_for_task.clone(),
-            },
-        );
+/// Limit for auto-retry on a transient compile failure. The first
+/// attempt is the user's click; we add at most one quiet retry when
+/// the failure looks transient (and the breaker hasn't tripped).
+const COMPILE_AUTO_RETRY_LIMIT: u32 = 1;
 
-        // P4 (H5): prefer the sidecar so the desktop process is never
-        // the writer of `graph.db`.  When the sidecar handle is
-        // populated (the bundled `root` binary spawned successfully),
-        // route compile through the sidecar's SSE compile/stream
-        // endpoint.
-        //
-        // The sidecar handle is stored only after `spawn()` completes
-        // its readiness probe (polling /livez for up to 120s AND
-        // checking that the child process hasn't crashed).
-        //
-        // **UX**: pre-fix the user clicked Compile and sat watching a
-        // dead spinner for up to 120s while the sidecar booted, with
-        // no signal that anything was happening.  Now we emit a
-        // `Booting` phase up-front so the UI can render an
-        // explanatory state, and we drop the global cap to 60 s —
-        // a healthy sidecar boots in 2–4 s; 60 s already covers the
-        // worst observed cold-start (large NLI ONNX model + first-run
-        // fastembed download) by 5×.  Beyond that the sidecar is
-        // wedged and we should fail fast rather than block the user.
-        const SIDECAR_BOOT_MAX_ATTEMPTS: u32 = 120; // 120 * 500 ms = 60 s
-        let mut emitted_booting = false;
-        let sidecar = {
-            let state = app_for_task.state::<AppState>();
-            let mut result = None;
-            for _attempt in 0u32..SIDECAR_BOOT_MAX_ATTEMPTS {
-                {
-                    let guard = state.sidecar.lock().await;
-                    if let Some(h) = guard.as_ref() {
-                        result = Some((h.host.clone(), h.port));
-                        break;
-                    }
-                }
-                if !emitted_booting {
-                    emitted_booting = true;
-                    tracing::info!(
-                        workspace = %label_for_task,
-                        "sidecar handle not yet available — waiting for sidecar to finish booting",
-                    );
-                    let _ = app_for_task.emit(
-                        "workspace_compile_progress",
-                        CompileProgress::Booting {
-                            workspace: label_for_task.clone(),
-                        },
-                    );
-                }
-                // Check cancellation so a Stop click during the wait
-                // doesn't block for the full 60 s.
-                if cancel_for_task.is_cancelled() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            result
-        };
+/// Body of the spawned compile task. Owns:
+///
+/// - Sidecar boot wait (10 s cap, cancel-aware).
+/// - First attempt: SSE compile via the sidecar.
+/// - Auto-retry: on `Failed` and no active breaker, sleep
+///   `compile_backoff_for_attempt(1)` and try once more — typically
+///   recovers from transient `ECONNRESET` during sidecar workspace
+///   mount, or a flaky provider's 502.
+/// - Self-heal accounting: every outcome records into `RestartState`
+///   (`record_compile_failure` / `record_compile_success` /
+///   `record_compile_cancellation`) and writes a
+///   `recovery_log::RecoveryEvent` so the doctor + recovery log
+///   surface both reflect compile health.
+/// - Tauri event emission (`Started` / `Booting` / `Done` / `Failed`
+///   / `Cancelled`) plus the `workspaces-changed` notification.
+/// - Final slot clear so the next `workspace_compile` can start
+///   fresh.
+async fn run_desktop_compile_task(
+    app: AppHandle,
+    url_alias: String,
+    path: PathBuf,
+    workspace_label: String,
+    branch: Option<String>,
+    cancel: CancellationToken,
+) {
+    use thinkingroot_core::recovery_log::{self, RecoveryEvent};
+    use thinkingroot_core::restart_state::{self, RestartState};
 
-        let outcome = if let Some((host, port)) = sidecar {
-            let sidecar_result = drive_compile_via_sidecar(
-                app_for_task.clone(),
+    let _ = app.emit(
+        "workspace_compile_progress",
+        CompileProgress::Started {
+            workspace: workspace_label.clone(),
+        },
+    );
+
+    // Sidecar boot wait — emits a single Booting event on first miss
+    // so the UI shows "Waiting for engine…" instead of a dead spinner.
+    let sidecar = await_sidecar_handle(&app, &workspace_label, &cancel).await;
+
+    let first_attempt = match sidecar {
+        Some((host, port)) => {
+            drive_compile_via_sidecar(
+                app.clone(),
                 host,
                 port,
-                path_for_task.clone(),
-                label_for_task.clone(),
+                path.clone(),
+                workspace_label.clone(),
+                url_alias.clone(),
                 branch.clone(),
-                cancel_for_task.clone(),
+                cancel.clone(),
             )
-            .await;
+            .await
+        }
+        None if cancel.is_cancelled() => Err(CompileDriveError::Cancelled),
+        None => Err(CompileDriveError::Failed(
+            "Engine sidecar did not finish booting within 10 seconds. \
+             Check the logs (Help → Open Logs) — the bundled `root` binary \
+             may be missing or the data directory may be unwritable."
+                .to_string(),
+        )),
+    };
 
-            match sidecar_result {
-                Err(CompileDriveError::Failed(ref msg)) => {
-                    tracing::error!(
-                        workspace = %label_for_task,
-                        error = %msg,
-                        "sidecar compile failed",
-                    );
-                    Err(CompileDriveError::Failed(msg.clone()))
-                }
-                other => other,
-            }
-        } else if cancel_for_task.is_cancelled() {
-            // User clicked Stop during the boot-wait window.  Emit the
-            // neutral cancelled state rather than a red error toast —
-            // the compile never actually started, so there's nothing
-            // to undo.
-            Err(CompileDriveError::Cancelled)
-        } else {
-            tracing::error!(
-                workspace = %label_for_task,
-                "sidecar unavailable after 60s boot timeout — failing compile",
+    let outcome = match first_attempt {
+        Ok(result) => Ok(result),
+        Err(CompileDriveError::Cancelled) => Err(CompileDriveError::Cancelled),
+        Err(CompileDriveError::Failed(first_err)) => {
+            // ── Auto-retry once when the breaker hasn't tripped ────
+            tracing::warn!(
+                workspace = %workspace_label,
+                error = %first_err,
+                "compile failed; checking auto-retry eligibility"
             );
-            Err(CompileDriveError::Failed(
-                "Engine sidecar did not finish booting within 60 seconds. \
-                 Check the logs (Help → Open Logs) — the bundled `root` binary \
-                 may be missing or the data directory may be unwritable."
-                    .to_string(),
-            ))
-        };
+            let _ = recovery_log::append(&RecoveryEvent::compile_failed(
+                &url_alias,
+                &first_err,
+                0,
+            ));
 
-        match outcome {
-            Ok(result) => {
-                let cache_dirty = result.cache_dirty;
-                let _ = app_for_task.emit(
-                    "workspace_compile_progress",
-                    CompileProgress::Done {
-                        files_parsed: result.files_parsed,
-                        claims: result.claims_count,
-                        entities: result.entities_count,
-                        relations: result.relations_count,
-                        contradictions: result.contradictions_count,
-                        artifacts: result.artifacts_count,
-                        health_score: result.health_score,
-                        cache_dirty,
-                        failed_batches: result.failed_batches,
-                        failed_chunk_ranges: result.failed_chunk_ranges.clone(),
-                        incremental_summary: Some(result.incremental_summary.clone()),
-                    },
+            let should_retry = {
+                let mut rs = RestartState::load().unwrap_or_default();
+                rs.prune_compile_attempts();
+                rs.record_compile_failure(&url_alias, &first_err);
+                if rs.compile_should_trip(&url_alias) {
+                    let until = rs.trip_compile_breaker();
+                    let count = rs.recent_compile_failure_count(&url_alias);
+                    tracing::error!(
+                        workspace = %url_alias,
+                        attempts = count,
+                        ?until,
+                        "compile breaker tripped — disabling auto-retry until breaker clears"
+                    );
+                    let _ = recovery_log::append(&RecoveryEvent::compile_breaker_tripped(
+                        &url_alias,
+                        count as u32,
+                        until,
+                    ));
+                    let _ = rs.save();
+                    false
+                } else {
+                    let active = rs.compile_breaker_active();
+                    let _ = rs.save();
+                    !active && !cancel.is_cancelled()
+                }
+            };
+
+            if !should_retry {
+                Err(CompileDriveError::Failed(first_err))
+            } else {
+                let backoff = restart_state::compile_backoff_for_attempt(1);
+                let _ = recovery_log::append(&RecoveryEvent::compile_retry_scheduled(
+                    &url_alias,
+                    1,
+                    backoff,
+                ));
+                tracing::info!(
+                    workspace = %url_alias,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "compile auto-retry scheduled (attempt 2/{})",
+                    COMPILE_AUTO_RETRY_LIMIT + 1
                 );
-                // `graph.db` / README may have changed — sidebar compiled
-                // badge reads `workspace_list`, not the compile payload.
-                emit_workspaces_changed(&app_for_task);
-            }
-            Err(CompileDriveError::Cancelled) => {
-                let _ = app_for_task.emit("workspace_compile_progress", CompileProgress::Cancelled);
-                emit_workspaces_changed(&app_for_task);
-            }
-            Err(CompileDriveError::Failed(msg)) => {
-                let _ = app_for_task.emit(
-                    "workspace_compile_progress",
-                    CompileProgress::Failed { error: msg },
-                );
-                emit_workspaces_changed(&app_for_task);
+
+                // Cancel-aware sleep — if user clicks Stop during
+                // the backoff, bail immediately with Cancelled.
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        Err(CompileDriveError::Cancelled)
+                    }
+                    _ = tokio::time::sleep(backoff) => {
+                        // Re-await sidecar handle in case it crashed and
+                        // restarted between the two attempts.
+                        let sidecar2 = await_sidecar_handle(&app, &workspace_label, &cancel).await;
+                        match sidecar2 {
+                            Some((host, port)) => {
+                                let retry_outcome = drive_compile_via_sidecar(
+                                    app.clone(),
+                                    host,
+                                    port,
+                                    path.clone(),
+                                    workspace_label.clone(),
+                                    url_alias.clone(),
+                                    branch.clone(),
+                                    cancel.clone(),
+                                )
+                                .await;
+                                if let Ok(ref _result) = retry_outcome {
+                                    let _ = recovery_log::append(
+                                        &RecoveryEvent::compile_recovered(&url_alias, 1),
+                                    );
+                                    tracing::info!(
+                                        workspace = %url_alias,
+                                        "compile auto-retry succeeded"
+                                    );
+                                }
+                                retry_outcome
+                            }
+                            None if cancel.is_cancelled() => {
+                                Err(CompileDriveError::Cancelled)
+                            }
+                            None => Err(CompileDriveError::Failed(
+                                "Engine sidecar did not finish booting within 10 seconds (retry). \
+                                 Check Help → Open Logs."
+                                    .to_string(),
+                            )),
+                        }
+                    }
+                }
             }
         }
+    };
 
-        // Compile is over — clear the active-compile slot so a
-        // subsequent click of "Compile" can start fresh.
-        let state = app_for_task.state::<AppState>();
-        let mut guard = state.active_compile.lock().await;
-        *guard = None;
-    });
+    // ── Emit the terminal Tauri event + record outcome ─────────────
+    match outcome {
+        Ok(result) => {
+            // Record success — clears the workspace's failure history
+            // so a previously-flaky provider doesn't keep counting
+            // toward the next breaker trip.
+            {
+                let mut rs = RestartState::load().unwrap_or_default();
+                rs.prune_compile_attempts();
+                rs.record_compile_success(&url_alias);
+                let _ = rs.save();
+            }
+            let cache_dirty = result.cache_dirty;
+            let _ = app.emit(
+                "workspace_compile_progress",
+                CompileProgress::Done {
+                    files_parsed: result.files_parsed,
+                    claims: result.claims_count,
+                    entities: result.entities_count,
+                    relations: result.relations_count,
+                    contradictions: result.contradictions_count,
+                    artifacts: result.artifacts_count,
+                    health_score: result.health_score,
+                    cache_dirty,
+                    failed_batches: result.failed_batches,
+                    failed_chunk_ranges: result.failed_chunk_ranges.clone(),
+                    incremental_summary: Some(result.incremental_summary.clone()),
+                },
+            );
+            emit_workspaces_changed(&app);
+        }
+        Err(CompileDriveError::Cancelled) => {
+            // Cancellations are recorded but DO NOT contribute to
+            // the breaker — they're user-initiated, not a sign of a
+            // deterministically broken pipeline.
+            {
+                let mut rs = RestartState::load().unwrap_or_default();
+                rs.prune_compile_attempts();
+                rs.record_compile_cancellation(&url_alias);
+                let _ = rs.save();
+            }
+            let _ = app.emit("workspace_compile_progress", CompileProgress::Cancelled);
+            emit_workspaces_changed(&app);
+        }
+        Err(CompileDriveError::Failed(msg)) => {
+            // The failure has already been recorded into
+            // RestartState above (in the auto-retry decision block),
+            // so we don't double-record here. We just emit the
+            // failure event for the UI.
+            let _ = app.emit(
+                "workspace_compile_progress",
+                CompileProgress::Failed { error: msg },
+            );
+            emit_workspaces_changed(&app);
+        }
+    }
 
-    Ok(workspace_label)
+    // Compile is over — clear the active-compile slot.
+    let state = app.state::<AppState>();
+    let mut guard = state.active_compile.lock().await;
+    *guard = None;
+}
+
+/// Wait for the sidecar's `host:port` to appear in `AppState.sidecar`.
+/// Bounded by `SIDECAR_BOOT_MAX_ATTEMPTS * 500ms` (10 s). Emits a
+/// single `Booting` Tauri event on first miss. Cancel-aware: a Stop
+/// click during the wait bails immediately.
+async fn await_sidecar_handle(
+    app: &AppHandle,
+    workspace_label: &str,
+    cancel: &CancellationToken,
+) -> Option<(String, u16)> {
+    let state = app.state::<AppState>();
+    let mut emitted_booting = false;
+    for _attempt in 0u32..SIDECAR_BOOT_MAX_ATTEMPTS {
+        {
+            let guard = state.sidecar.lock().await;
+            if let Some(h) = guard.as_ref() {
+                return Some((h.host.clone(), h.port));
+            }
+        }
+        if !emitted_booting {
+            emitted_booting = true;
+            tracing::info!(
+                workspace = %workspace_label,
+                "sidecar handle not yet available — waiting for sidecar to finish booting"
+            );
+            let _ = app.emit(
+                "workspace_compile_progress",
+                CompileProgress::Booting {
+                    workspace: workspace_label.to_string(),
+                },
+            );
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    None
 }
 
 /// Outcome distinct from a raw `Result<PipelineResult, String>` so the
@@ -612,19 +862,43 @@ enum CompileDriveError {
 /// we drop the response body (which trips the server-side DropGuard
 /// that owns the pipeline's cancel token) and surface
 /// `CompileDriveError::Cancelled` to the dispatcher.
+/// How many times to retry the initial `POST /compile/stream` on
+/// `reqwest` connection error before declaring the sidecar
+/// unreachable. Each retry sleeps 2 s, **cancel-aware** so a Stop
+/// click during the retry window doesn't block the UI.
+const MAX_COMPILE_RETRIES: u8 = 5;
+
+/// Stall watchdog window — if no SSE event arrives in this duration
+/// (no `progress` tick, no `done`/`failed`/`cancelled` terminator,
+/// not even the server's `keep-alive` comment), declare the stream
+/// stalled. The server emits a `keep-alive` every 15 s
+/// (`rest.rs::compile_stream`), so 60 s is 4× headroom on the
+/// quietest expected interval; a stream that's been silent that
+/// long has wedged on either the server or the network and the user
+/// shouldn't sit forever staring at a frozen progress bar.
+const SSE_STALL_WATCHDOG: Duration = Duration::from_secs(60);
+
 async fn drive_compile_via_sidecar(
     app: AppHandle,
     host: String,
     port: u16,
     path: PathBuf,
     label: String,
+    url_alias: String,
     branch: Option<String>,
     cancel: CancellationToken,
 ) -> Result<PipelineResult, CompileDriveError> {
     use eventsource_stream::Eventsource;
     use futures::StreamExt;
 
-    let url = format!("http://{host}:{port}/api/v1/ws/desktop/compile/stream");
+    // Dynamic workspace alias — pre-fix this was hardcoded `"desktop"`.
+    // When the sidecar didn't mount a workspace under that name,
+    // every compile request failed with the engine's
+    // `WorkspaceNotMounted` error envelope. Now we route through the
+    // registered workspace name (or `"_"` placeholder if the target
+    // wasn't in the registry — the engine then matches by
+    // `root_path` from the body).
+    let url = format!("http://{host}:{port}/api/v1/ws/{url_alias}/compile/stream");
     let body = serde_json::json!({
         "root_path": path.display().to_string(),
         "branch": branch,
@@ -632,20 +906,19 @@ async fn drive_compile_via_sidecar(
     });
 
     let client = reqwest::Client::new();
-    // Per-request timeout is intentionally absent — compiles legitimately
-    // run for minutes on first-time large workspaces.  The streaming
-    // SSE response keeps the connection alive via the server's
-    // KeepAlive `keep-alive` events; reqwest's connection-pool idle
-    // timeout never fires while bytes are flowing.
+    // Per-request timeout is intentionally absent on the streaming
+    // body — compiles legitimately run for minutes on first-time
+    // large workspaces. The stall watchdog below bounds the gap
+    // BETWEEN events instead, which is the honest property we
+    // actually want.
     //
-    // Retry up to MAX_COMPILE_RETRIES times with 2-second backoff in
-    // case the sidecar is still booting (CozoDB mount can take a few
-    // seconds even after the HTTP listener binds, and the readiness
-    // probe in spawn() polls /livez which returns OK as soon as axum
-    // starts — before all workspace mounts have completed). Transient
-    // ECONNREFUSED or ECONNRESET errors during startup are the primary
-    // failure mode surfaced as "sidecar compile request failed".
-    const MAX_COMPILE_RETRIES: u8 = 5;
+    // Initial-connect retry: the sidecar's readiness probe in
+    // `spawn()` returns OK as soon as axum starts — before all
+    // workspace mounts complete. Transient `ECONNREFUSED` /
+    // `ECONNRESET` errors land here and we retry with a fixed 2 s
+    // backoff. **Cancel-aware**: pre-fix a Stop click during this
+    // retry loop was silently ignored for up to 10 s
+    // (`MAX_COMPILE_RETRIES * 2 s`).
     let resp = {
         let mut last_err: Option<reqwest::Error> = None;
         let mut result = None;
@@ -655,17 +928,35 @@ async fn drive_compile_via_sidecar(
                     attempt,
                     url = %url,
                     error = %last_err.as_ref().unwrap(),
-                    "sidecar compile request failed, retrying in 2s",
+                    "sidecar compile request failed, retrying in 2s"
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            match client.post(&url).json(&body).send().await {
-                Ok(r) => {
-                    result = Some(r);
-                    break;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(CompileDriveError::Cancelled);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
-                Err(e) => {
-                    last_err = Some(e);
+            }
+            // The request itself races against cancellation too —
+            // pre-fix a wedged sidecar (slow TLS handshake, slow
+            // workspace mount) could swallow up to ~30 s of "Stop
+            // does nothing" per attempt.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(CompileDriveError::Cancelled);
+                }
+                req = client.post(&url).json(&body).send() => {
+                    match req {
+                        Ok(r) => {
+                            result = Some(r);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
+                    }
                 }
             }
         }
@@ -702,16 +993,31 @@ async fn drive_compile_via_sidecar(
             _ = cancel.cancelled() => {
                 // Drop the stream → reqwest closes the body → axum
                 // detects the disconnect → server-side DropGuard
-                // fires → pipeline exits.  We don't wait for the
-                // "cancelled" SSE terminator here because the user
+                // fires → pipeline exits. We don't wait for the
+                // `cancelled` SSE terminator here because the user
                 // wants the UI to react immediately.
                 cancelled = true;
                 break;
             }
-            ev = stream.next() => {
+            // Stall watchdog: bound the gap BETWEEN events. The
+            // server's `KeepAlive::new().interval(15s).text("keep-alive")`
+            // (rest.rs::compile_stream) emits SSE comments that the
+            // eventsource decoder surfaces as `Ok(event)` with empty
+            // `event` field — so 60 s of silence means BOTH the
+            // server stopped emitting progress AND the keep-alive
+            // timer somehow lapsed. That's a wedged stream; fail
+            // loud rather than block forever.
+            ev = tokio::time::timeout(SSE_STALL_WATCHDOG, stream.next()) => {
                 match ev {
-                    None => break,
-                    Some(Ok(event)) => {
+                    Err(_) => {
+                        error = Some(format!(
+                            "sidecar SSE stream stalled — no event for {}s",
+                            SSE_STALL_WATCHDOG.as_secs()
+                        ));
+                        break;
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Ok(event))) => {
                         match event.event.as_str() {
                             "progress" => {
                                 match serde_json::from_str::<ProgressEvent>(&event.data) {
@@ -767,7 +1073,7 @@ async fn drive_compile_via_sidecar(
                             _ => {}
                         }
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         error = Some(format!("SSE stream error: {e}"));
                         break;
                     }
@@ -810,12 +1116,18 @@ pub async fn workspace_compile_stop(app: AppHandle) -> Result<bool, String> {
 }
 
 /// Lightweight read-only status: which workspace (if any) is being
-/// compiled right now.  React polls this from a long-lived "Compile"
-/// modal so the Stop button can stay disabled when nothing is running
-/// without depending on event ordering.
+/// compiled right now.  React reads this from the Right-Rail Compile
+/// button's onClick handler so a stale-slot mismatch surfaces as an
+/// inline warning instead of a hard-error toast.
+///
+/// Field name `running` matches the TypeScript `CompileStatus`
+/// binding in `apps/thinkingroot-desktop/ui/src/lib/tauri.ts:489`.
+/// Pre-fix this struct shipped `active: bool` (server) vs
+/// `running: bool` (TS), so every UI poll returned `running:
+/// undefined` and the pre-flight check silently no-op'd.
 #[derive(Debug, Serialize)]
 pub struct CompileStatus {
-    pub active: bool,
+    pub running: bool,
     pub workspace: Option<String>,
 }
 
@@ -825,11 +1137,11 @@ pub async fn workspace_compile_status(app: AppHandle) -> Result<CompileStatus, S
     let guard = state.active_compile.lock().await;
     Ok(match guard.as_ref() {
         Some(h) => CompileStatus {
-            active: true,
+            running: true,
             workspace: Some(h.workspace_label.clone()),
         },
         None => CompileStatus {
-            active: false,
+            running: false,
             workspace: None,
         },
     })

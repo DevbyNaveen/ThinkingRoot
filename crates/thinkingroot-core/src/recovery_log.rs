@@ -59,6 +59,29 @@ pub enum RecoveryEventKind {
         expected: String,
         actual: String,
     },
+    /// A workspace compile failed (pipeline error, not a process crash).
+    CompileFailed {
+        workspace: String,
+        error: String,
+        retry_attempt: u32,
+    },
+    /// A compile retry was scheduled after a failure.
+    CompileRetryScheduled {
+        workspace: String,
+        attempt: u32,
+        backoff_ms: u64,
+    },
+    /// Compile-scoped circuit breaker tripped — too many failures in window.
+    CompileBreakerTripped {
+        workspace: String,
+        consecutive_failures: u32,
+        until_rfc3339: String,
+    },
+    /// A retried compile completed successfully.
+    CompileRecovered {
+        workspace: String,
+        retry_attempt: u32,
+    },
 }
 
 impl RecoveryEvent {
@@ -135,6 +158,61 @@ impl RecoveryEvent {
                 path,
                 expected: expected.into(),
                 actual: actual.into(),
+            },
+        }
+    }
+
+    pub fn compile_failed(
+        workspace: impl Into<String>,
+        error: impl Into<String>,
+        retry_attempt: u32,
+    ) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: RecoveryEventKind::CompileFailed {
+                workspace: workspace.into(),
+                error: error.into(),
+                retry_attempt,
+            },
+        }
+    }
+
+    pub fn compile_retry_scheduled(
+        workspace: impl Into<String>,
+        attempt: u32,
+        backoff: std::time::Duration,
+    ) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: RecoveryEventKind::CompileRetryScheduled {
+                workspace: workspace.into(),
+                attempt,
+                backoff_ms: backoff.as_millis() as u64,
+            },
+        }
+    }
+
+    pub fn compile_breaker_tripped(
+        workspace: impl Into<String>,
+        consecutive_failures: u32,
+        until: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: RecoveryEventKind::CompileBreakerTripped {
+                workspace: workspace.into(),
+                consecutive_failures,
+                until_rfc3339: until.to_rfc3339(),
+            },
+        }
+    }
+
+    pub fn compile_recovered(workspace: impl Into<String>, retry_attempt: u32) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: RecoveryEventKind::CompileRecovered {
+                workspace: workspace.into(),
+                retry_attempt,
             },
         }
     }
@@ -238,6 +316,56 @@ mod tests {
         assert!(json.contains("\"action\":\"respawn\""), "got: {json}");
         assert!(json.contains("\"attempt\":2"), "got: {json}");
         assert!(json.contains("\"backoff_ms\":500"), "got: {json}");
+    }
+
+    #[test]
+    fn compile_failed_serializes_with_workspace_and_retry() {
+        let ev = RecoveryEvent::compile_failed("home-notes", "boom", 1);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"action\":\"compile_failed\""), "got: {json}");
+        assert!(json.contains("\"workspace\":\"home-notes\""), "got: {json}");
+        assert!(json.contains("\"retry_attempt\":1"), "got: {json}");
+    }
+
+    #[test]
+    fn compile_retry_scheduled_carries_backoff() {
+        let ev = RecoveryEvent::compile_retry_scheduled(
+            "home-notes",
+            2,
+            std::time::Duration::from_millis(500),
+        );
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"action\":\"compile_retry_scheduled\""),
+            "got: {json}"
+        );
+        assert!(json.contains("\"backoff_ms\":500"), "got: {json}");
+    }
+
+    #[test]
+    fn compile_breaker_tripped_carries_until() {
+        let until = Utc::now() + chrono::Duration::seconds(600);
+        let ev = RecoveryEvent::compile_breaker_tripped("home-notes", 3, until);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"action\":\"compile_breaker_tripped\""),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"consecutive_failures\":3"),
+            "got: {json}"
+        );
+    }
+
+    #[test]
+    fn compile_recovered_carries_workspace() {
+        let ev = RecoveryEvent::compile_recovered("home-notes", 2);
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(
+            json.contains("\"action\":\"compile_recovered\""),
+            "got: {json}"
+        );
+        assert!(json.contains("\"retry_attempt\":2"), "got: {json}");
     }
 
     #[test]

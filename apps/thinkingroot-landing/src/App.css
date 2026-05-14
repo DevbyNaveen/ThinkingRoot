@@ -871,3 +871,100 @@
     margin: 0;
   }
 }
+
+/* ── Install one-liner section ─────────────────────────────────────── */
+.install-section {
+  max-width: 720px;
+  margin: 4rem auto 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+}
+.install-tabs {
+  display: inline-flex;
+  gap: 0;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 999px;
+  padding: 4px;
+  background: rgba(253, 251, 247, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.install-tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0.55rem 1.4rem;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--color-text-secondary, #6b6a66);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.install-tab:hover {
+  color: #1a1916;
+}
+.install-tab.active {
+  background: #1a1916;
+  color: #fdfbf7;
+}
+.install-command-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+  padding: 1.1rem 1.4rem;
+  border-radius: 12px;
+}
+.install-command {
+  flex: 1 1 auto;
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, Monaco, monospace);
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #1a1916;
+  word-break: break-all;
+  user-select: all;
+}
+.install-copy {
+  appearance: none;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: transparent;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.45rem 0.95rem;
+  border-radius: 999px;
+  cursor: pointer;
+  color: #1a1916;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+.install-copy:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.install-copy.copied {
+  background: #1a1916;
+  color: #fdfbf7;
+  border-color: #1a1916;
+}
+.install-note {
+  font-size: 0.85rem;
+  color: var(--color-text-secondary, #6b6a66);
+  margin: 0;
+  text-align: center;
+}
+@media (max-width: 640px) {
+  .install-command-wrapper {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+  .install-copy {
+    align-self: flex-end;
+  }
+}

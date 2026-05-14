@@ -75,7 +75,7 @@ async fn session_actor(
 /// whose separator semantics are platform-specific. On Unix hosts only `/`
 /// is treated as a separator; backslash-style paths only normalise when the
 /// server is built for Windows.
-fn resolve_workspace_arg(
+pub(crate) fn resolve_workspace_arg(
     arg: Option<&str>,
     default_ws: Option<&str>,
     engine: &QueryEngine,

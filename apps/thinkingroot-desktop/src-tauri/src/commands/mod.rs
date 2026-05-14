@@ -45,5 +45,6 @@ pub mod sidecar;
 pub mod sidecar_client;
 pub mod tag;
 pub mod terminal;
+pub mod updater;
 pub mod workspace_status;
 pub mod workspaces;

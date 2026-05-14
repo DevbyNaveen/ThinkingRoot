@@ -46,6 +46,7 @@ import {
   type BranchView,
   type BranchEventEnvelope,
 } from "@/lib/tauri";
+import { branchListShouldRefresh } from "@/lib/branchEvents";
 
 interface BranchNode extends BranchView {
   children: BranchNode[];
@@ -192,21 +193,18 @@ export function BranchTree({
           next.set(envelope.branch, { lastEventAt: now, lastEventLabel: label });
           return next;
         });
-        // The branch-list cache (parent / status / current) only
-        // changes on Created / Merged / Abandoned / Checkout — for
-        // those, refresh the list. Cheap (one daemon call per actual
-        // mutation; not per claim contributed).
-        if (
-          label === "Created" ||
-          label === "Merged" ||
-          label === "Abandoned" ||
-          label === "CheckedOut" ||
-          label === "Checkout"
-        ) {
+        // The branch-list cache (parent / status / current) changes on
+        // branch lifecycle events, permission/redaction updates, bulk
+        // contribute, HEAD checkout (`head_changed` envelope), or when
+        // the relay signals staleness.
+        if (branchListShouldRefresh(envelope.event)) {
           void load();
         }
-      } else if (envelope.kind === "lagged" || envelope.kind === "disconnected") {
-        // Local view is stale; refresh.
+      } else if (
+        envelope.kind === "head_changed" ||
+        envelope.kind === "lagged" ||
+        envelope.kind === "disconnected"
+      ) {
         void load();
       }
     }

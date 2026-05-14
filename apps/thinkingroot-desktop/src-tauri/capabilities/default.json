@@ -10,6 +10,7 @@
     "opener:default",
     "notification:default",
     "os:default",
-    "window-state:default"
+    "window-state:default",
+    "updater:default"
   ]
 }

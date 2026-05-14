@@ -148,6 +148,10 @@ pub enum BranchEventEnvelope {
         branch: String,
         event: Value,
     },
+    /// Workspace HEAD moved (`POST /branches/{name}/checkout`). Not a
+    /// `BranchEvent` on any branch; UIs must refetch `/head` and
+    /// `/branches` (via `branch_list`).
+    HeadChanged { head: String },
     /// The broadcast channel dropped messages because the relay fell
     /// behind. UI surfaces should refresh their state from a fresh
     /// `branch_list` call when they see this — the event log they
@@ -261,6 +265,24 @@ async fn run_branch_event_subscription(
                         let _ = app.emit(
                             "branch-event",
                             BranchEventEnvelope::Lagged { missed },
+                        );
+                    }
+                    "head_changed" => {
+                        let json: Value = match serde_json::from_str(&ev.data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("head_changed decode: {e}");
+                                continue;
+                            }
+                        };
+                        let head = json
+                            .get("head")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = app.emit(
+                            "branch-event",
+                            BranchEventEnvelope::HeadChanged { head },
                         );
                     }
                     // Keep-alive comments + unknown event types are

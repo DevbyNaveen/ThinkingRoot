@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ThinkingRoot Desktop",
+  "productName": "ThinkingRoot",
   "version": "0.1.0",
   "identifier": "dev.thinkingroot.desktop",
   "build": {
@@ -57,7 +57,17 @@
         "role": "Editor",
         "mimeType": "application/vnd.thinkingroot.capsule"
       }
-    ]
+    ],
+    "createUpdaterArtifacts": true
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/DevbyNaveen/releases/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQzRTc5RkNDNzRBOTJEQzYKUldUR0xhbDB6Si9uUTVsZTdvMWgrK3Y1Tk54OTdVQjVqNHJQeUk5blBiQXRuSW1PcWE1RnlVUHkK"
+    }
+  }
 }

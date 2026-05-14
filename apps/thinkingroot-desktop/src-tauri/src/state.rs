@@ -84,7 +84,18 @@ pub struct AppState {
 }
 
 /// Live handle for an in-progress workspace compile.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone` because `task: JoinHandle<()>` isn't `Clone`. The
+/// handle is owned by `AppState.active_compile` and consumed in one
+/// of two ways: the compile task itself takes it on completion to
+/// clear the slot, or `workspace_compile_stop` / supersede / the
+/// 5 s force-clear path takes it to fire `cancel.cancel()` (which
+/// trips the server-side DropGuard via reqwest stream drop) and, on
+/// the force-clear path only, calls `task.abort()` to kill a task
+/// whose cancel propagation appears wedged. Aborting on the normal
+/// stop path would race the clean-shutdown emitter that yields the
+/// `Cancelled` Tauri event the UI needs.
+#[derive(Debug)]
 pub struct CompileHandle {
     /// Workspace path being compiled — surfaced by `compile_status`
     /// so the UI can render which workspace is busy.
@@ -92,6 +103,12 @@ pub struct CompileHandle {
     /// Tripping this aborts the pipeline at the next phase boundary
     /// (see `thinkingroot_serve::pipeline::run_pipeline_with_cancel`).
     pub cancel: CancellationToken,
+    /// Join handle for the spawned compile task. Stored so the
+    /// 5 s force-clear path in `workspace_compile` can abort a
+    /// task whose cancel signal didn't propagate — without this
+    /// the slot was freed but the task kept running, racing the
+    /// next compile's events into the UI.
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 /// Live metadata for the running sidecar.

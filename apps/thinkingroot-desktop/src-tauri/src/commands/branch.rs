@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
+use thinkingroot_core::{BranchRef, BranchStatus};
 
 use crate::commands::sidecar_client::SidecarClient;
 
@@ -24,6 +25,27 @@ pub struct BranchView {
     pub status: String,
     pub current: bool,
     pub description: Option<String>,
+    /// Engine `BranchKind` JSON (tagged `kind`). Present on current
+    /// daemons; older servers omit it — UI falls back to name heuristics.
+    #[serde(default = "default_branch_kind_json")]
+    pub kind: serde_json::Value,
+}
+
+fn default_branch_kind_json() -> serde_json::Value {
+    serde_json::json!({ "kind": "feature" })
+}
+
+fn infer_kind_from_branch_name(name: &str) -> serde_json::Value {
+    if name == "main" {
+        serde_json::json!({ "kind": "main" })
+    } else if let Some(rest) = name.strip_prefix("stream/") {
+        serde_json::json!({
+            "kind": "stream",
+            "session_id": rest,
+        })
+    } else {
+        serde_json::json!({ "kind": "feature" })
+    }
 }
 
 /// Wire shape of `BranchRef` as serialized by `list_branches_handler`
@@ -35,6 +57,8 @@ struct BranchRefWire {
     status: serde_json::Value,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    kind: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +69,14 @@ struct BranchesResponse {
 #[derive(Debug, Deserialize)]
 struct HeadResponse {
     head: String,
+}
+
+fn branch_status_label(status: &BranchStatus) -> &'static str {
+    match status {
+        BranchStatus::Active => "active",
+        BranchStatus::Merged { .. } => "merged",
+        BranchStatus::Abandoned { .. } => "abandoned",
+    }
 }
 
 fn status_label(value: &serde_json::Value) -> &'static str {
@@ -82,9 +114,19 @@ pub async fn branch_list(app: AppHandle, args: BranchListArgs) -> Result<Vec<Bra
             parent: b.parent,
             status: status_label(&b.status).to_string(),
             description: b.description,
-            name: b.name,
+            name: b.name.clone(),
+            kind: b.kind.unwrap_or_else(|| infer_kind_from_branch_name(&b.name)),
         })
         .collect())
+}
+
+/// `POST /api/v1/branches` returns `ok_response({ "branch": BranchRef })`
+/// (see `create_branch_handler` in thinkingroot-serve). The desktop
+/// previously decoded `data` as a flat `BranchRefWire`, which serde
+/// rejected (`missing field name`) even though the branch was created.
+#[derive(Debug, Deserialize)]
+struct CreateBranchResponse {
+    branch: BranchRef,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,13 +146,18 @@ pub async fn branch_create(app: AppHandle, args: BranchCreateArgs) -> Result<Bra
         "parent": args.parent,
         "description": args.description,
     });
-    let created: BranchRefWire = client.post("/api/v1/branches", &body).await?;
+    let resp: CreateBranchResponse = client.post("/api/v1/branches", &body).await?;
+    let created = resp.branch;
+    let kind = serde_json::to_value(&created.kind).unwrap_or_else(|_| {
+        infer_kind_from_branch_name(&created.name)
+    });
     Ok(BranchView {
         current: false,
         parent: created.parent,
-        status: status_label(&created.status).to_string(),
+        status: branch_status_label(&created.status).to_string(),
         description: created.description,
-        name: created.name,
+        name: created.name.clone(),
+        kind,
     })
 }
 

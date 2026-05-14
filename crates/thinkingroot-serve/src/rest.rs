@@ -70,6 +70,11 @@ pub struct AppState {
     /// SSE events. Per-branch fan-out at `branch_event_hub` is
     /// preserved for clients that want a focused stream.
     pub branch_event_aggregate: broadcast::Sender<(String, BranchEvent)>,
+    /// HEAD-only updates (`POST /branches/{name}/checkout`) — not a
+    /// `BranchEvent` on any `BranchRef`, but UIs must refetch
+    /// `/head` + `/branches`. Merged into `/branch-events/stream` as
+    /// `event: head_changed` alongside `branch_event`.
+    pub head_change_tx: broadcast::Sender<String>,
     /// T1.5 — in-flight merge `CancellationToken`s keyed by merge id
     /// (a ULID generated at handler entry).  `POST /merges/{id}/cancel`
     /// looks up and trips the matching token; the merge phase-boundary
@@ -120,6 +125,7 @@ impl AppState {
             ),
             branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
             branch_event_aggregate: broadcast::channel(256).0,
+            head_change_tx: broadcast::channel(64).0,
             active_merges: Arc::new(RwLock::new(HashMap::new())),
             workspace_watcher: Arc::new(RwLock::new(None)),
             workspace_status: Arc::new(WorkspaceStateRegistry::new()),
@@ -1709,12 +1715,354 @@ struct CompileStreamRequest {
     no_rooting: bool,
 }
 
+/// Request shape for [`run_unified_compile`]. Cleanly separates the
+/// SSE wire body from the helper's internal contract — callers that
+/// don't speak SSE (the MCP `compile` tool) construct the same shape
+/// without depending on the axum body extractor.
+#[derive(Debug, Clone)]
+pub(crate) struct UnifiedCompileRequest {
+    /// The `{ws}` URL path component, or `"_"` when the caller is the
+    /// CLI placeholder. The helper resolves it to the canonical
+    /// workspace name via `engine.list_workspaces()` when it's `"_"`
+    /// (matched by `root_path`) or the registered name when it's a
+    /// real alias.
+    pub ws_url_alias: String,
+    /// Already-canonicalized workspace root.
+    pub root_path: PathBuf,
+    pub branch: Option<String>,
+    pub no_rooting: bool,
+}
+
+/// Outcome of [`run_unified_compile`]. The first field is the
+/// canonical workspace name (resolved by the helper); the second is
+/// the typed outcome. Both SSE and MCP callers branch on the outcome
+/// to emit their wire-format terminator.
+#[derive(Debug)]
+pub(crate) enum UnifiedCompileOutcome {
+    Done(crate::pipeline::PipelineResult),
+    Cancelled,
+    Failed(String),
+}
+
+/// Shared compile workflow used by the SSE `/compile/stream` endpoint
+/// AND the MCP `compile` tool dispatch. Owns the **complete** post-
+/// compile reconciliation contract: workspace remount, vector-index
+/// rebuild, LLM-probe stamping, mount-success dispatch, terminal
+/// `CompileFinished` actor message, **and** EngramManager cache
+/// invalidation when `cache_dirty` (which the legacy streaming path
+/// silently skipped — every agent-driven compile prior to this ship
+/// could return AEP probes against GC'd claim ids).
+///
+/// Cancellation is end-to-end: the caller owns the [`CancellationToken`]
+/// (typically via a [`tokio_util::sync::CancellationToken::drop_guard`]
+/// in its scope) and trips it on client disconnect or agent-turn
+/// abort. The pipeline observes the same token via `PipelineOptions`
+/// and bails at the next phase boundary with `Error::Cancelled`.
+///
+/// `progress_tx` is forwarded straight to the pipeline; the SSE
+/// caller passes its sibling-task channel sender so events stream as
+/// they fire, and the MCP caller passes `None` so events are dropped
+/// (the agent waits for the final result, not the wire stream).
+pub(crate) async fn run_unified_compile(
+    state: Arc<AppState>,
+    req: UnifiedCompileRequest,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::pipeline::ProgressEvent>>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (String, UnifiedCompileOutcome) {
+    use crate::pipeline::{PipelineOptions, run_pipeline_with_options};
+
+    let compile_started = std::time::Instant::now();
+
+    // Resolve the canonical workspace name. When the CLI POSTs to
+    // `/api/v1/ws/_/compile/stream` (the `_` placeholder used by
+    // `cortex_remote::run_compile_remote`), `ws` is literally the
+    // string `_` — match by `root_path` against the engine's
+    // mounted-workspace registry so `workspace_status` dispatches
+    // land on the right actor key. Mirrors the bugfix 2026-05-10
+    // logic from the original compile_stream body.
+    let status_name = if req.ws_url_alias == "_" {
+        let engine = state.engine.read().await;
+        match engine.list_workspaces().await {
+            Ok(list) => list
+                .into_iter()
+                .find(|w| std::path::PathBuf::from(&w.path) == req.root_path)
+                .map(|w| w.name)
+                .unwrap_or_else(|| req.ws_url_alias.clone()),
+            Err(_) => req.ws_url_alias.clone(),
+        }
+    } else {
+        req.ws_url_alias.clone()
+    };
+
+    state
+        .workspace_status
+        .dispatch(
+            &status_name,
+            req.root_path.clone(),
+            WorkspaceStatusMsg::CompileStarted,
+        )
+        .await;
+
+    // Run the pipeline directly in this task. The caller controls
+    // cancellation via `cancel`; the pipeline writes progress events
+    // straight to `progress_tx` (caller's channel) so a sibling task
+    // forwarding SSE events sees them as they fire, with no internal
+    // forwarding loop in the helper.
+    let pipeline_result = run_pipeline_with_options(
+        &req.root_path,
+        req.branch.as_deref(),
+        progress_tx,
+        PipelineOptions {
+            cancel,
+            no_rooting: req.no_rooting,
+            skip_byte_audit: false,
+            no_incremental: false,
+        },
+    )
+    .await;
+
+    let duration_ms = compile_started.elapsed().as_millis() as u64;
+
+    match pipeline_result {
+        Ok(result) => {
+            finalize_successful_compile(
+                state.as_ref(),
+                &status_name,
+                &req.root_path,
+                &result,
+                duration_ms,
+            )
+            .await;
+            (status_name, UnifiedCompileOutcome::Done(result))
+        }
+        Err(e) if e.is_cancelled() => {
+            state
+                .workspace_status
+                .dispatch(
+                    &status_name,
+                    req.root_path.clone(),
+                    WorkspaceStatusMsg::CompileFinished {
+                        outcome: thinkingroot_core::types::CompileOutcome::Cancelled {
+                            phase: "unknown".into(),
+                        },
+                        duration_ms,
+                        claim_count: 0,
+                        entity_count: 0,
+                        graph_db_bytes: 0,
+                    },
+                )
+                .await;
+            (status_name, UnifiedCompileOutcome::Cancelled)
+        }
+        Err(e) => {
+            state
+                .workspace_status
+                .dispatch(
+                    &status_name,
+                    req.root_path.clone(),
+                    WorkspaceStatusMsg::CompileFinished {
+                        outcome: thinkingroot_core::types::CompileOutcome::Failed {
+                            phase: "unknown".into(),
+                            reason: e.to_string(),
+                        },
+                        duration_ms,
+                        claim_count: 0,
+                        entity_count: 0,
+                        graph_db_bytes: 0,
+                    },
+                )
+                .await;
+            (status_name, UnifiedCompileOutcome::Failed(e.to_string()))
+        }
+    }
+}
+
+/// Post-compile reconciliation extracted from the legacy
+/// `compile_stream` body. Runs on the `Ok(PipelineResult)` branch of
+/// [`run_unified_compile`]. Single owner of:
+///
+/// - Daemon in-memory cache reload (`engine.mount`) so a subsequent
+///   `/search` / `/claims` against the fresh graph doesn't return the
+///   pre-compile empty view.
+/// - Vector index rebuild so `/search/hybrid` and AEP probes work
+///   immediately after compile (the v3 pipeline deliberately does
+///   not embed — consumer's responsibility).
+/// - `LlmProbed { Healthy }` stamp so `readiness.for_query` /
+///   `readiness.for_chat` flip true on the post-compile status snapshot
+///   (the just-finished compile is empirical evidence the LLM is
+///   reachable; the heartbeat decays this back to `Configured` if no
+///   fresh probe lands within `LLM_HEALTH_WINDOW`).
+/// - `MountSucceeded` dispatch so the mount kind moves
+///   `not_mounted → mounted`.
+/// - Final `CompileFinished` actor message carrying the success
+///   outcome + counts.
+/// - `EngramManager.invalidate_workspace` when `cache_dirty` so AEP
+///   probes after a writing compile don't return GC'd claim ids.
+///   This matches the MCP `compile` handler's pre-refactor behaviour
+///   and silently closes the same gap on the streaming path.
+async fn finalize_successful_compile(
+    state: &AppState,
+    status_name: &str,
+    root_path: &std::path::Path,
+    result: &crate::pipeline::PipelineResult,
+    duration_ms: u64,
+) {
+    let outcome = if result.failed_batches > 0 {
+        thinkingroot_core::types::CompileOutcome::Partial {
+            extracted_claims: result.claims_count as u64,
+            failed_batches: result.failed_batches as u64,
+            summary: format!("{} LLM batches", result.failed_batches),
+        }
+    } else {
+        thinkingroot_core::types::CompileOutcome::Success {
+            extracted_claims: result.claims_count as u64,
+            sources_processed: result.files_parsed as u64,
+        }
+    };
+
+    let graph_db_bytes = match tokio::fs::metadata(
+        root_path
+            .join(".thinkingroot")
+            .join("graph")
+            .join("graph.db"),
+    )
+    .await
+    {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+
+    // Daemon in-memory cache reload — see doc comment above.
+    let mut remount_ok = false;
+    {
+        let mut engine = state.engine.write().await;
+        match engine
+            .mount(status_name.to_string(), root_path.to_path_buf())
+            .await
+        {
+            Ok(()) => {
+                remount_ok = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %status_name,
+                    "post-compile cache reload failed: {e} — \
+                     substrate is on disk but daemon's in-memory \
+                     view is stale; restart the daemon or POST \
+                     /api/v1/workspaces to remount"
+                );
+            }
+        }
+    }
+
+    if remount_ok {
+        match state
+            .engine
+            .read()
+            .await
+            .rebuild_vector_index(status_name)
+            .await
+        {
+            Ok((entities, claims)) => {
+                tracing::info!(
+                    workspace = %status_name,
+                    "post-compile vector index built: {} entities + {} claims",
+                    entities, claims
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %status_name,
+                    "post-compile vector index rebuild failed: {e} — \
+                     keyword search will work but semantic search and \
+                     AEP probes will return empty results until the \
+                     index is built"
+                );
+            }
+        }
+    }
+
+    if remount_ok {
+        let (counts, llm_summary) = {
+            let engine = state.engine.read().await;
+            let counts = engine.list_workspaces().await.ok().and_then(|list| {
+                list.into_iter()
+                    .find(|w| w.name == status_name)
+                    .map(|w| {
+                        (
+                            w.claim_count as u64,
+                            w.entity_count as u64,
+                            w.source_count as u64,
+                        )
+                    })
+            });
+            let llm = engine.workspace_llm_summary(status_name);
+            (counts, llm)
+        };
+        if let Some((provider, model)) = llm_summary {
+            state
+                .workspace_status
+                .dispatch(
+                    status_name,
+                    root_path.to_path_buf(),
+                    WorkspaceStatusMsg::LlmProbed {
+                        state: thinkingroot_core::types::LlmState::Healthy {
+                            provider,
+                            model: Some(model),
+                            last_probed_at: chrono::Utc::now(),
+                        },
+                    },
+                )
+                .await;
+        }
+        if let Some((claim_count, entity_count, source_count)) = counts {
+            state
+                .workspace_status
+                .dispatch(
+                    status_name,
+                    root_path.to_path_buf(),
+                    WorkspaceStatusMsg::MountSucceeded {
+                        claim_count,
+                        entity_count,
+                        source_count_at_last_compile: source_count,
+                        graph_db_bytes,
+                    },
+                )
+                .await;
+        }
+    }
+
+    state
+        .workspace_status
+        .dispatch(
+            status_name,
+            root_path.to_path_buf(),
+            WorkspaceStatusMsg::CompileFinished {
+                outcome,
+                duration_ms,
+                claim_count: result.claims_count as u64,
+                entity_count: result.entities_count as u64,
+                graph_db_bytes,
+            },
+        )
+        .await;
+
+    // Engram cache invalidation — matches the legacy `engine.compile`
+    // path's contract. Without this, a probe after a writing compile
+    // can return rows whose claim ids were just GC'd by the new
+    // substrate write. The legacy `compile_stream` body skipped this
+    // because it didn't go through `QueryEngine::compile`; folding it
+    // into the helper closes the gap for every caller in one place.
+    if result.cache_dirty {
+        state.engram_manager.invalidate_workspace(status_name).await;
+    }
+}
+
 async fn compile_stream(
     State(state): State<Arc<AppState>>,
     Path(ws): Path<String>,
     Json(body): Json<CompileStreamRequest>,
 ) -> Response {
-    use crate::pipeline::{PipelineOptions, ProgressEvent, run_pipeline_with_options};
     use tokio_util::sync::CancellationToken;
 
     let root_path = match (body.root_path.as_deref(), state.current_workspace_root().await) {
@@ -1745,81 +2093,47 @@ async fn compile_stream(
         );
     }
 
-    let branch = body.branch.clone();
-    let no_rooting = body.no_rooting;
-
-    // Slice 0 — flag the actor that compile started so subscribers
-    // see `CompileState::Running`. The actor is keyed by URL `ws` name;
-    // if the request bypassed the registry (workspace not registered)
-    // we still spawn an actor for the path so refresh / status calls
-    // work after the first compile.
-    //
-    // Bugfix 2026-05-10 — when the CLI POSTs to `/api/v1/ws/_/compile/stream`
-    // (the `_` placeholder used by `cortex_remote::run_compile_remote`),
-    // `ws` is literally the string `_`. Using it as the actor key leaves
-    // the canonical workspace's actor (e.g. `CipherVault`) without a
-    // CompileFinished update, so `/workspaces/{name}/status` keeps
-    // reporting `substrate.kind=empty` after a successful compile. Resolve
-    // the canonical name from the engine's mounted-workspace registry by
-    // matching `root_path`; fall back to the URL `ws` if no match (e.g.
-    // first-time compile of an un-registered workspace).
-    let status_name = if ws == "_" {
-        let engine = state.engine.read().await;
-        match engine.list_workspaces().await {
-            Ok(list) => list
-                .into_iter()
-                .find(|w| std::path::PathBuf::from(&w.path) == root_path)
-                .map(|w| w.name)
-                .unwrap_or_else(|| ws.clone()),
-            Err(_) => ws.clone(),
-        }
-    } else {
-        ws.clone()
+    // Build the helper request. All path / `_`-alias / canonical-
+    // name resolution + workspace_status dispatching + post-compile
+    // remount/vector-rebuild lives inside `run_unified_compile` so
+    // the MCP `compile` tool gets the exact same behaviour.
+    let req = UnifiedCompileRequest {
+        ws_url_alias: ws.clone(),
+        root_path: root_path.clone(),
+        branch: body.branch.clone(),
+        no_rooting: body.no_rooting,
     };
-    let status_path = root_path.clone();
-    state
-        .workspace_status
-        .dispatch(&status_name, status_path.clone(), WorkspaceStatusMsg::CompileStarted)
-        .await;
-    let compile_started = std::time::Instant::now();
+
+    // Channel that the helper writes to and the SSE stream below
+    // pumps events from.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
 
     // The DropGuard fires the cancel token when the SSE stream is
     // dropped (client disconnect, axum body cancellation, etc.).
-    // The pipeline task receives the same token and bails at the
-    // next phase boundary.
+    // The pipeline observes the same token via `PipelineOptions` and
+    // bails at the next phase boundary — the engine-pipeline.md
+    // cancellation contract (every stateful REST handler binds a
+    // CancellationToken + DropGuard inside its response body).
     let cancel = CancellationToken::new();
-    let cancel_for_task = cancel.clone();
+    let cancel_for_helper = cancel.clone();
     let drop_guard = cancel.drop_guard();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
-    let root_for_task = root_path.clone();
-
-    let pipeline_handle = tokio::spawn(async move {
-        run_pipeline_with_options(
-            &root_for_task,
-            branch.as_deref(),
-            Some(tx),
-            PipelineOptions {
-                cancel: cancel_for_task,
-                no_rooting,
-                skip_byte_audit: false,
-                no_incremental: false,
-            },
-        )
-        .await
+    // Spawn the helper as a sibling task so the SSE stream below
+    // pumps `progress_rx` concurrently with the pipeline running.
+    // The helper owns ALL the post-compile reconciliation (remount,
+    // vector-index rebuild, LLM-probe stamp, mount-success dispatch,
+    // terminal CompileFinished, engram cache invalidation); when it
+    // returns we just yield the wire terminator.
+    let helper_state = state.clone();
+    let helper_handle = tokio::spawn(async move {
+        run_unified_compile(helper_state, req, Some(progress_tx), cancel_for_helper).await
     });
 
     let stream = async_stream::stream! {
-        // Keep the drop guard alive for the lifetime of the stream.
-        // Dropping it (client disconnect / response cancel) trips
-        // the pipeline's CancellationToken — that's the cleanup
-        // path that turns "user closed the modal" into "stop the
-        // pipeline cleanly" without requiring an explicit
-        // cancel-by-id route.
         let _guard = drop_guard;
-        let mut handle = Some(pipeline_handle);
 
-        while let Some(event) = rx.recv().await {
+        while let Some(event) = progress_rx.recv().await {
             let payload = match serde_json::to_string(&event) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1841,287 +2155,31 @@ async fn compile_stream(
             yield Ok(Event::default().event("progress").data(payload));
         }
 
-        // Channel closed → the pipeline task has finished. Await
-        // its outcome and emit a single terminator event.
-        if let Some(h) = handle.take() {
-            // Slice 0 — translate the pipeline outcome into a
-            // `CompileFinished` actor message before yielding the
-            // terminator event. The actor moves substrate to
-            // Populated/Empty (or holds steady on Failed/Cancelled)
-            // so every UI surface sees the same post-compile state
-            // without re-probing.
-            let duration_ms = compile_started.elapsed().as_millis() as u64;
-            match h.await {
-                Ok(Ok(result)) => {
-                    let outcome = if result.failed_batches > 0 {
-                        thinkingroot_core::types::CompileOutcome::Partial {
-                            extracted_claims: result.claims_count as u64,
-                            failed_batches: result.failed_batches as u64,
-                            summary: format!("{} LLM batches", result.failed_batches),
-                        }
-                    } else {
-                        thinkingroot_core::types::CompileOutcome::Success {
-                            extracted_claims: result.claims_count as u64,
-                            sources_processed: result.files_parsed as u64,
-                        }
-                    };
-                    let graph_db_bytes = match tokio::fs::metadata(
-                        status_path
-                            .join(".thinkingroot")
-                            .join("graph")
-                            .join("graph.db"),
-                    )
-                    .await
-                    {
-                        Ok(m) => m.len(),
-                        Err(_) => 0,
-                    };
-
-                    // Bugfix 2026-05-10 — refresh the daemon's in-memory
-                    // KnowledgeGraph cache for this workspace. The compile
-                    // pipeline opened its own `StorageEngine::init(...)`,
-                    // committed claims to graph.db, and dropped that handle.
-                    // The daemon's pre-existing cache (loaded at startup
-                    // via `engine.mount(...)`) is now stale — every
-                    // post-compile read (`/workspaces`, `/ws/{ws}/claims`,
-                    // `/ws/{ws}/search`) returns the empty pre-compile view
-                    // until the workspace is re-mounted. Re-mount in place
-                    // so the freshly-written claims/entities/sources are
-                    // immediately queryable from the same daemon process.
-                    //
-                    // Idempotent: `engine.mount` does a HashMap insert
-                    // which replaces the prior handle. The old
-                    // Arc<Mutex<StorageEngine>> drops when its last
-                    // outstanding clone is released, closing the previous
-                    // Cozo connection cleanly.
-                    let mut remount_ok = false;
-                    {
-                        let mut engine = state.engine.write().await;
-                        match engine.mount(status_name.clone(), status_path.clone()).await {
-                            Ok(()) => {
-                                remount_ok = true;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    workspace = %status_name,
-                                    "post-compile cache reload failed: {e} — \
-                                     substrate is on disk but daemon's in-memory \
-                                     view is stale; restart the daemon or POST \
-                                     /api/v1/workspaces to remount"
-                                );
-                            }
-                        }
-                    }
-
-                    // Bugfix 2026-05-10 — rebuild the vector index after
-                    // a successful compile so the daemon's
-                    // `/search`, `/search/hybrid`, and `/engrams`
-                    // endpoints work immediately. v3 `root compile`
-                    // deliberately does not embed (the compile pipeline
-                    // owns the substrate; consumers choose their own
-                    // embedding model — see `pipeline.rs:1551`), so the
-                    // index has to be built once afterward. The in-process
-                    // CLI path already does this lazily in
-                    // `thinkingroot-cli/src/main.rs:2361`, but the daemon
-                    // path had no equivalent — every cortex-routed query
-                    // against a fresh compile returned `[]` even though
-                    // graph.db was fully populated.
-                    if remount_ok {
-                        match state.engine.read().await
-                            .rebuild_vector_index(&status_name)
-                            .await
-                        {
-                            Ok((entities, claims)) => {
-                                tracing::info!(
-                                    workspace = %status_name,
-                                    "post-compile vector index built: {} entities + {} claims",
-                                    entities, claims
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    workspace = %status_name,
-                                    "post-compile vector index rebuild failed: {e} — \
-                                     keyword search will work but semantic search and \
-                                     AEP probes will return empty results until the \
-                                     index is built"
-                                );
-                            }
-                        }
-                    }
-
-                    // Bugfix 2026-05-10 — also tell the workspace_status
-                    // actor that the workspace is now mounted in the
-                    // engine. Without this, `mount.kind` stays
-                    // `not_mounted` after a CLI-driven compile (the CLI
-                    // path never sends an explicit `POST /workspaces` to
-                    // mount), and `readiness.for_query` is gated false
-                    // even though `root query` works against the engine
-                    // immediately. Read live counts off the freshly-
-                    // remounted handle so the actor's mount snapshot
-                    // matches the post-compile reality.
-                    if remount_ok {
-                        let (counts, llm_summary) = {
-                            let engine = state.engine.read().await;
-                            let counts = engine.list_workspaces().await.ok().and_then(|list| {
-                                list.into_iter().find(|w| w.name == status_name).map(|w| {
-                                    (
-                                        w.claim_count as u64,
-                                        w.entity_count as u64,
-                                        w.source_count as u64,
-                                    )
-                                })
-                            });
-                            let llm = engine.workspace_llm_summary(&status_name);
-                            (counts, llm)
-                        };
-                        // Bugfix 2026-05-10 — push a real LLM probe state
-                        // when the workspace mount produced a usable
-                        // client. Without this the status actor's `llm`
-                        // axis stays `Unconfigured` and
-                        // `readiness.for_query`/`readiness.for_chat` are
-                        // gated false forever (both require
-                        // `LlmState::Healthy`, see
-                        // `crates/thinkingroot-core/src/types/workspace_status.rs:529`).
-                        //
-                        // The compile that just succeeded exercised the
-                        // extraction LLM client end-to-end (token-budget,
-                        // schema parsing, retries) — that is empirical
-                        // evidence the provider is reachable from this
-                        // host's network and the configured key is valid.
-                        // Stamping `Healthy` with `last_probed_at = now`
-                        // is honest under that contract; the heartbeat in
-                        // `workspace_state.rs:321` decays back to
-                        // `Configured` after `LLM_HEALTH_WINDOW` elapses
-                        // without a fresh probe, so we never claim
-                        // healthier-than-truth for long.
-                        if let Some((provider, model)) = llm_summary {
-                            state
-                                .workspace_status
-                                .dispatch(
-                                    &status_name,
-                                    status_path.clone(),
-                                    WorkspaceStatusMsg::LlmProbed {
-                                        state: thinkingroot_core::types::LlmState::Healthy {
-                                            provider,
-                                            model: Some(model),
-                                            last_probed_at: chrono::Utc::now(),
-                                        },
-                                    },
-                                )
-                                .await;
-                        }
-                        if let Some((claim_count, entity_count, source_count)) = counts {
-                            let graph_db_bytes_for_mount = match tokio::fs::metadata(
-                                status_path
-                                    .join(".thinkingroot")
-                                    .join("graph")
-                                    .join("graph.db"),
-                            )
-                            .await
-                            {
-                                Ok(m) => m.len(),
-                                Err(_) => 0,
-                            };
-                            state
-                                .workspace_status
-                                .dispatch(
-                                    &status_name,
-                                    status_path.clone(),
-                                    WorkspaceStatusMsg::MountSucceeded {
-                                        claim_count,
-                                        entity_count,
-                                        source_count_at_last_compile: source_count,
-                                        graph_db_bytes: graph_db_bytes_for_mount,
-                                    },
-                                )
-                                .await;
-                        }
-                    }
-
-                    state
-                        .workspace_status
-                        .dispatch(
-                            &status_name,
-                            status_path.clone(),
-                            WorkspaceStatusMsg::CompileFinished {
-                                outcome,
-                                duration_ms,
-                                claim_count: result.claims_count as u64,
-                                entity_count: result.entities_count as u64,
-                                graph_db_bytes,
-                            },
-                        )
-                        .await;
-                    let payload = serde_json::to_string(&result)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    yield Ok(Event::default().event("done").data(payload));
-                }
-                Ok(Err(e)) if e.is_cancelled() => {
-                    state
-                        .workspace_status
-                        .dispatch(
-                            &status_name,
-                            status_path.clone(),
-                            WorkspaceStatusMsg::CompileFinished {
-                                outcome: thinkingroot_core::types::CompileOutcome::Cancelled {
-                                    phase: "unknown".into(),
-                                },
-                                duration_ms,
-                                claim_count: 0,
-                                entity_count: 0,
-                                graph_db_bytes: 0,
-                            },
-                        )
-                        .await;
-                    yield Ok(Event::default().event("cancelled").data("{}"));
-                }
-                Ok(Err(e)) => {
-                    state
-                        .workspace_status
-                        .dispatch(
-                            &status_name,
-                            status_path.clone(),
-                            WorkspaceStatusMsg::CompileFinished {
-                                outcome: thinkingroot_core::types::CompileOutcome::Failed {
-                                    phase: "unknown".into(),
-                                    reason: e.to_string(),
-                                },
-                                duration_ms,
-                                claim_count: 0,
-                                entity_count: 0,
-                                graph_db_bytes: 0,
-                            },
-                        )
-                        .await;
-                    let payload =
-                        serde_json::json!({ "error": e.to_string() }).to_string();
-                    yield Ok(Event::default().event("failed").data(payload));
-                }
-                Err(e) => {
-                    state
-                        .workspace_status
-                        .dispatch(
-                            &status_name,
-                            status_path.clone(),
-                            WorkspaceStatusMsg::CompileFinished {
-                                outcome: thinkingroot_core::types::CompileOutcome::Failed {
-                                    phase: "unknown".into(),
-                                    reason: format!("task panicked: {e}"),
-                                },
-                                duration_ms,
-                                claim_count: 0,
-                                entity_count: 0,
-                                graph_db_bytes: 0,
-                            },
-                        )
-                        .await;
-                    let payload = serde_json::json!({
-                        "error": format!("pipeline task panicked: {e}"),
-                    })
-                    .to_string();
-                    yield Ok(Event::default().event("failed").data(payload));
-                }
+        // Channel closed → the helper task has finished. Yield the
+        // single terminator event that matches its outcome. The
+        // helper has already stamped the workspace_status actor +
+        // remounted the workspace + invalidated engrams, so the
+        // terminator is the *only* thing the SSE stream still owes
+        // the client.
+        match helper_handle.await {
+            Ok((_status_name, UnifiedCompileOutcome::Done(result))) => {
+                let payload = serde_json::to_string(&result)
+                    .unwrap_or_else(|_| "{}".to_string());
+                yield Ok(Event::default().event("done").data(payload));
+            }
+            Ok((_, UnifiedCompileOutcome::Cancelled)) => {
+                yield Ok(Event::default().event("cancelled").data("{}"));
+            }
+            Ok((_, UnifiedCompileOutcome::Failed(msg))) => {
+                let payload = serde_json::json!({ "error": msg }).to_string();
+                yield Ok(Event::default().event("failed").data(payload));
+            }
+            Err(e) => {
+                let payload = serde_json::json!({
+                    "error": format!("compile task panicked: {e}"),
+                })
+                .to_string();
+                yield Ok(Event::default().event("failed").data(payload));
             }
         }
     };
@@ -2534,8 +2592,10 @@ async fn stream_all_branch_events_handler(
     use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-    let rx = state.branch_event_aggregate.subscribe();
-    let stream = BroadcastStream::new(rx).map(move |res| match res {
+    let rx_br = state.branch_event_aggregate.subscribe();
+    let rx_hd = state.head_change_tx.subscribe();
+
+    let s1 = BroadcastStream::new(rx_br).map(move |res| match res {
         Ok((branch, event)) => {
             let payload = serde_json::json!({
                 "branch": branch,
@@ -2551,6 +2611,21 @@ async fn stream_all_branch_events_handler(
             Ok(Event::default().event("lagged").data(payload))
         }
     });
+
+    let s2 = BroadcastStream::new(rx_hd).map(move |res| match res {
+        Ok(head) => {
+            let payload = serde_json::json!({ "head": head }).to_string();
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("head_changed").data(payload),
+            )
+        }
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Ok(Event::default().event("lagged").data(payload))
+        }
+    });
+
+    let stream = s1.merge(s2);
 
     Sse::new(stream)
         .keep_alive(
@@ -3389,7 +3464,10 @@ async fn checkout_branch_handler(
         }
     };
     match thinkingroot_branch::write_head_branch(&root, &branch) {
-        Ok(_) => ok_response(serde_json::json!({ "head": branch })).into_response(),
+        Ok(_) => {
+            let _ = state.head_change_tx.send(branch.clone());
+            ok_response(serde_json::json!({ "head": branch })).into_response()
+        }
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "BRANCH_ERROR",
@@ -4351,6 +4429,25 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         .conversation_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // River v1.0 — symmetric stream-branch auto-create on the REST chat
+    // path. The MCP `tools/call` path has called this since T0.6; the
+    // REST path previously did NOT, so agent contributions from desktop
+    // chat landed on `main` even when `streams.auto_session_branch =
+    // true`. The shared helper at `mcp::auto_create_session_branch` is
+    // idempotent (skips when session.active_branch is already set) and
+    // creates the SessionContext lazily if absent — safe to call before
+    // `spawn_agent_run` mints the session via tools.
+    {
+        let engine_guard = state.engine.read().await;
+        crate::mcp::auto_create_session_branch(
+            &ws,
+            &engine_guard,
+            &conversation_id,
+            &state.sessions,
+        )
+        .await;
+    }
 
     // C2 (Task 5) + Task 9: build the reactive `<system-reminder>` bus
     // payload. The agent path now emits the FULL bus — workspace +

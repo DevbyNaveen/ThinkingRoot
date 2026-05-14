@@ -1,14 +1,28 @@
 /**
- * Compile tab — git-style branch graph: main spine, per-branch columns,
- * T-forks from main, side-rail growth, merge-back when status is merged.
+ * Compile tab — git-style branch graph: main spine, three fixed side
+ * rails (Feature+Tag, Sandbox, Stream) from `BranchView.kind`, merge-back
+ * when status is merged, compile row on the spine only.
  *
- * Rows are derived from `BranchView` (parent, status). Stream paths get
- * optional synthetic session dots when previewing or when HEAD is a stream.
+ * River v1.0 additions on top of the per-branch row layout:
+ *   - Persistent diamond `mergeGlyph` at the spine join for merged
+ *     history rows — the merge is visible after the animation fades.
+ *   - Transient 800ms pulse ring on the row when an SSE `merged` event
+ *     arrives over `branch-event`. Lets the user see merges land live
+ *     even when their cursor is somewhere else on the screen.
+ *
+ * The REST chat path now auto-creates `stream/{conversation_id}`
+ * branches symmetric with the MCP `tools/call` path (see
+ * `thinkingroot-serve::mcp::auto_create_session_branch`), so every
+ * conversation appears on the stream rail without per-client glue.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { GitBranchPlus, Loader2, Plus } from "lucide-react";
 
+import {
+  branchListNeedsRefetchFromEnvelope,
+  branchListShouldRefresh,
+} from "@/lib/branchEvents";
 import { cn } from "@/lib/utils";
 import { RefreshIcon } from "@/components/ui/refresh-icon";
 import { useApp } from "@/store/app";
@@ -22,6 +36,7 @@ import {
   branchEventSubscribe,
   onBranchEvent,
   type BranchView,
+  type BranchEventEnvelope,
   type CompileProgress,
 } from "@/lib/tauri";
 
@@ -31,19 +46,57 @@ const PAD_Y = 8;
 const COL_GAP = 22;
 /** Max parallel side columns (narrow rail). */
 const MAX_SIDE_LANES = 3;
+/** Pulse-ring lifetime after an SSE `merged` event lands. */
+const MERGE_PULSE_MS = 800;
 
-export type GraphTone = "main" | "stream" | "feature" | "compile" | "merged" | "abandoned";
+export type GraphTone =
+  | "main"
+  | "stream"
+  | "feature"
+  | "sandbox"
+  | "compile"
+  | "merged"
+  | "abandoned";
 
 export interface GraphNode {
   id: string;
-  /** 0 = main spine; 1..N = side columns. */
+  /** 0 = main spine; 1 = feature/tag, 2 = sandbox, 3 = stream. */
   lane: number;
   label: string;
   branch?: BranchView;
   tone: GraphTone;
   head?: boolean;
-  /** Mid-rail session marker (no branch checkout). */
-  synthetic?: boolean;
+  /** Persistent diamond rendered at the spine join — for merged-tone
+   *  history rows. The diamond outlives the pulse animation. */
+  mergeGlyph?: boolean;
+  /** Transient pulse ring driven by SSE `merged` events. The ring is
+   *  in the SVG only while the node id is in `recentMerges`; the
+   *  enclosing effect clears it after `MERGE_PULSE_MS`. */
+  pulsing?: boolean;
+}
+
+type BranchKindKey = "main" | "feature" | "stream" | "sandbox" | "tag";
+
+function branchKindKey(b: BranchView): BranchKindKey {
+  const raw = b.kind;
+  if (raw && typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const tag = (raw as { kind?: string }).kind;
+    if (tag === "main") return "main";
+    if (tag === "feature") return "feature";
+    if (tag === "stream") return "stream";
+    if (tag === "sandbox") return "sandbox";
+    if (tag === "tag") return "tag";
+  }
+  if (b.name === "main") return "main";
+  if (b.name.startsWith("stream/")) return "stream";
+  return "feature";
+}
+
+/** Side column: 1 feature+tag, 2 sandbox, 3 stream. */
+function logicalRailColumn(kind: BranchKindKey): number {
+  if (kind === "stream") return 3;
+  if (kind === "sandbox") return 2;
+  return 1;
 }
 
 function effectiveParent(b: BranchView, byName: Map<string, BranchView>): string {
@@ -52,12 +105,14 @@ function effectiveParent(b: BranchView, byName: Map<string, BranchView>): string
   return p;
 }
 
-function branchTone(name: string, status: string): GraphTone {
-  const s = status.toLowerCase();
+function branchToneFromBranch(b: BranchView): GraphTone {
+  const s = b.status.toLowerCase();
   if (s === "merged") return "merged";
   if (s === "abandoned" || s === "deleted") return "abandoned";
-  if (name.startsWith("stream/")) return "stream";
-  if (name === "main") return "main";
+  const k = branchKindKey(b);
+  if (k === "main") return "main";
+  if (k === "stream") return "stream";
+  if (k === "sandbox") return "sandbox";
   return "feature";
 }
 
@@ -69,6 +124,8 @@ function dotFill(tone: GraphTone): string {
       return "#a371f7";
     case "feature":
       return "#d29922";
+    case "sandbox":
+      return "#3fb950";
     case "compile":
       return "hsl(var(--muted-foreground) / 0.75)";
     case "merged":
@@ -116,9 +173,6 @@ function truncate(s: string, max: number): string {
 }
 
 function dotTooltipBody(node: GraphNode): string {
-  if (node.synthetic) {
-    return "Activity point on a stream line (not a separate checkout row).";
-  }
   if (node.id === "compile") {
     return `Local compile / substrate refresh\n${node.label}\n\nSits on the main spine — not a merge from a side branch.`;
   }
@@ -131,6 +185,7 @@ function dotTooltipBody(node: GraphNode): string {
     ];
     if (b.description) lines.push(`desc: ${b.description}`);
     if (node.head) lines.push("current HEAD");
+    if (node.mergeGlyph) lines.push("merged into main");
     return lines.join("\n");
   }
   if (node.id === "main") {
@@ -145,15 +200,19 @@ function laneX(lane: number): number {
 }
 
 /**
- * DFS: main first, then each child of main (streams first), subtrees.
- * Appends compile on main lane (cloud hub row omitted until Hub sync ships).
+ * DFS from main: spine row, then children of main on fixed kind rails
+ * (1 feature+tag, 2 sandbox, 3 stream); merged/abandoned collapse to
+ * the spine; nested branches inherit the parent's side column.
+ *
+ * `recentMerges` carries branch names that received an SSE `merged`
+ * event within the last `MERGE_PULSE_MS` — those nodes get a transient
+ * pulse ring drawn around their dot. Merged-tone rows additionally get
+ * a persistent diamond glyph so the spine reads as a real merge join.
  */
 function buildGraphNodes(
   branches: BranchView[],
   compile: CompileProgress | null,
-  opts: {
-    streamSyntheticDots: number;
-  },
+  recentMerges: ReadonlySet<string>,
 ): GraphNode[] {
   const byName = new Map(branches.map((b) => [b.name, b]));
   const mainName = branches.find((b) => b.name === "main")?.name ?? "main";
@@ -166,13 +225,22 @@ function buildGraphNodes(
     list.push(b);
     children.set(par, list);
   }
+
+  const graphOrder = (a: BranchView, b: BranchView) => {
+    const ta = branchToneFromBranch(a);
+    const tb = branchToneFromBranch(b);
+    const spineFirst = (t: GraphTone) => (t === "merged" || t === "abandoned" ? 0 : 1);
+    if (spineFirst(ta) !== spineFirst(tb)) return spineFirst(ta) - spineFirst(tb);
+    if (ta !== "merged" && ta !== "abandoned" && tb !== "merged" && tb !== "abandoned") {
+      const ca = logicalRailColumn(branchKindKey(a));
+      const cb = logicalRailColumn(branchKindKey(b));
+      if (ca !== cb) return ca - cb;
+    }
+    return a.name.localeCompare(b.name);
+  };
+
   for (const [, list] of children) {
-    list.sort((a, b) => {
-      const as = a.name.startsWith("stream/") ? 0 : 1;
-      const bs = b.name.startsWith("stream/") ? 0 : 1;
-      if (as !== bs) return as - bs;
-      return a.name.localeCompare(b.name);
-    });
+    list.sort(graphOrder);
   }
 
   const out: GraphNode[] = [];
@@ -189,54 +257,39 @@ function buildGraphNodes(
     head: onMain,
   });
 
-  /** Assign side column index among siblings of main (1..MAX). Merged / abandoned sit on main (lane 0). */
-  const mainKids = children.get(mainName) ?? [];
+  const mainKids = [...(children.get(mainName) ?? [])].sort(graphOrder);
   const laneByBranch = new Map<string, number>();
-  mainKids.forEach((b, i) => {
-    const t = branchTone(b.name, b.status);
-    const lane = t === "merged" || t === "abandoned" ? 0 : 1 + Math.min(i, MAX_SIDE_LANES - 1);
+  for (const b of mainKids) {
+    const tone = branchToneFromBranch(b);
+    const lane =
+      tone === "merged" || tone === "abandoned" ? 0 : logicalRailColumn(branchKindKey(b));
     laneByBranch.set(b.name, lane);
-  });
+  }
 
   function assignLanesDeep(parentName: string) {
     const kids = children.get(parentName) ?? [];
-    const base = laneByBranch.get(parentName) ?? 1;
-    kids.forEach((b, i) => {
+    const base = laneByBranch.get(parentName) ?? 0;
+    for (const b of kids) {
       if (!laneByBranch.has(b.name)) {
-        laneByBranch.set(b.name, Math.min(base + 1 + i, MAX_SIDE_LANES));
+        const tone = branchToneFromBranch(b);
+        if (tone === "merged" || tone === "abandoned") {
+          laneByBranch.set(b.name, 0);
+        } else if (base > 0) {
+          laneByBranch.set(b.name, base);
+        } else {
+          laneByBranch.set(b.name, logicalRailColumn(branchKindKey(b)));
+        }
       }
       assignLanesDeep(b.name);
-    });
+    }
   }
-  mainKids.forEach((b) => assignLanesDeep(b.name));
+  for (const b of mainKids) assignLanesDeep(b.name);
 
   function emitBranch(b: BranchView, depth: number) {
-    const tone = branchTone(b.name, b.status);
+    const tone = branchToneFromBranch(b);
     const rawLane = laneByBranch.get(b.name) ?? Math.min(1 + depth, MAX_SIDE_LANES);
     const lane = tone === "merged" || tone === "abandoned" ? 0 : rawLane;
-    const isStream = b.name.startsWith("stream/");
     const isHead = b.current;
-    const nSynth =
-      opts.streamSyntheticDots > 0 &&
-      isStream &&
-      tone !== "merged" &&
-      tone !== "abandoned" &&
-      lane > 0
-        ? opts.streamSyntheticDots
-        : 0;
-
-    if (nSynth > 0) {
-      for (let s = 0; s < nSynth; s++) {
-        out.push({
-          id: `${b.name}·synth·${s}`,
-          lane,
-          label: "",
-          tone: "stream",
-          synthetic: true,
-          head: false,
-        });
-      }
-    }
 
     const label =
       isHead
@@ -252,9 +305,11 @@ function buildGraphNodes(
       branch: b,
       tone,
       head: isHead,
+      mergeGlyph: tone === "merged",
+      pulsing: recentMerges.has(b.name),
     });
 
-    const sub = children.get(b.name) ?? [];
+    const sub = [...(children.get(b.name) ?? [])].sort(graphOrder);
     for (const c of sub) emitBranch(c, depth + 1);
   }
 
@@ -394,23 +449,50 @@ function BranchGraphSvg({
   const dots = nodes.map((node, i) => {
     const cx = laneX(node.lane);
     const y = cy(i);
-    const r = node.synthetic ? 2.25 : node.head ? 3.5 : 3;
+    const r = node.head ? 3.5 : 3;
     const fill = dotFill(node.tone);
-    const stroke =
-      node.head && !node.synthetic
-        ? "hsl(var(--background))"
-        : "none";
-    const sw = node.head && !node.synthetic ? 1.75 : 0;
+    const stroke = node.head ? "hsl(var(--background))" : "none";
+    const sw = node.head ? 1.75 : 0;
+    const overlays: ReactElement[] = [];
+
+    if (node.mergeGlyph) {
+      overlays.push(
+        <polygon
+          key={`mg-${node.id}`}
+          points={`${cx},${y - 4} ${cx + 4},${y} ${cx},${y + 4} ${cx - 4},${y}`}
+          fill="hsl(var(--muted-foreground) / 0.55)"
+          stroke="hsl(var(--background))"
+          strokeWidth={1}
+        />,
+      );
+    }
+    if (node.pulsing) {
+      overlays.push(
+        <circle
+          key={`pulse-${node.id}`}
+          cx={cx}
+          cy={y}
+          r={r + 1}
+          fill="none"
+          stroke={fill}
+          strokeWidth={1.5}
+          className="branch-merge-pulse"
+        />,
+      );
+    }
+
     return (
-      <circle
-        key={node.id}
-        cx={cx}
-        cy={y}
-        r={r}
-        fill={fill}
-        stroke={stroke}
-        strokeWidth={sw}
-      />
+      <g key={node.id}>
+        <circle
+          cx={cx}
+          cy={y}
+          r={r}
+          fill={fill}
+          stroke={stroke}
+          strokeWidth={sw}
+        />
+        {overlays}
+      </g>
     );
   });
 
@@ -447,7 +529,7 @@ function BranchGraphSvg({
               type="button"
               className="absolute z-[1] size-8 -translate-x-1/2 -translate-y-1/2 rounded-full bg-transparent hover:bg-foreground/[0.06] focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
               style={{ left: laneX(node.lane), top: cy(i) }}
-              aria-label={`Graph node: ${node.synthetic ? "session" : node.label || node.id}`}
+              aria-label={`Graph node: ${node.label || node.id}`}
             />
           </TooltipTrigger>
           <TooltipContent
@@ -461,26 +543,6 @@ function BranchGraphSvg({
       ))}
     </div>
   );
-}
-
-const REFRESH_TRIGGERS = new Set([
-  "Created",
-  "Merged",
-  "Abandoned",
-  "CheckedOut",
-  "Checkout",
-  "Deleted",
-]);
-
-function isRefreshTrigger(event: unknown): boolean {
-  if (event && typeof event === "object") {
-    const obj = event as Record<string, unknown>;
-    if (typeof obj.kind === "string" && REFRESH_TRIGGERS.has(obj.kind)) return true;
-    if (typeof obj.type === "string" && REFRESH_TRIGGERS.has(obj.type)) return true;
-    const keys = Object.keys(obj);
-    if (keys.length === 1 && REFRESH_TRIGGERS.has(keys[0]!)) return true;
-  }
-  return false;
 }
 
 const BRANCH_FORM_INPUT =
@@ -646,6 +708,28 @@ function BranchCreatePanel({
   );
 }
 
+/** Pulls the merged branch name out of an SSE `branch_event` envelope.
+ *  The engine emits `{"kind": "merged", ...}` post-T0.6 thanks to
+ *  `#[serde(tag = "kind", rename_all = "snake_case")]`; older daemons
+ *  emitted the single-key shape `{"Merged": ...}` which Cozo's serde
+ *  occasionally still produces. Both are handled defensively. */
+function extractMergedBranchName(envelope: BranchEventEnvelope): string | null {
+  if (envelope.kind !== "event") return null;
+  if (!branchListShouldRefresh(envelope.event)) return null;
+  const ev = envelope.event;
+  if (!ev || typeof ev !== "object") return null;
+  const obj = ev as Record<string, unknown>;
+  const tag =
+    typeof obj.kind === "string"
+      ? obj.kind.toLowerCase()
+      : Object.keys(obj).find((k) => k.toLowerCase() === "merged")?.toLowerCase();
+  if (tag !== "merged") return null;
+  if (typeof envelope.branch === "string" && envelope.branch.length > 0) {
+    return envelope.branch;
+  }
+  return null;
+}
+
 export function BranchResolutionRiver({ workspace }: { workspace: string }) {
   const compileProgress = useApp((s) => s.compileProgress);
 
@@ -653,9 +737,13 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [recentMerges, setRecentMerges] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
 
   useEffect(() => {
     setCreateOpen(false);
+    setRecentMerges(new Set());
   }, [workspace]);
 
   const load = useCallback(async () => {
@@ -677,6 +765,29 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
+    const pulseTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    const triggerPulse = (name: string) => {
+      setRecentMerges((prev) => {
+        if (prev.has(name)) return prev;
+        const next = new Set(prev);
+        next.add(name);
+        return next;
+      });
+      const existing = pulseTimers.get(name);
+      if (existing) clearTimeout(existing);
+      const t = setTimeout(() => {
+        setRecentMerges((prev) => {
+          if (!prev.has(name)) return prev;
+          const next = new Set(prev);
+          next.delete(name);
+          return next;
+        });
+        pulseTimers.delete(name);
+      }, MERGE_PULSE_MS);
+      pulseTimers.set(name, t);
+    };
+
     void (async () => {
       try {
         await branchEventSubscribe();
@@ -685,23 +796,40 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
       }
       if (cancelled) return;
       unlisten = await onBranchEvent((env) => {
-        if (env.kind === "lagged" || env.kind === "disconnected") void load();
-        if (env.kind === "event" && isRefreshTrigger(env.event)) void load();
+        const mergedName = extractMergedBranchName(env);
+        if (mergedName) triggerPulse(mergedName);
+        if (branchListNeedsRefetchFromEnvelope(env)) void load();
       });
     })();
+
     return () => {
       cancelled = true;
       unlisten?.();
+      for (const t of pulseTimers.values()) clearTimeout(t);
+      pulseTimers.clear();
     };
   }, [load]);
 
-  const head = branches.find((b) => b.current);
-  const streamSynth =
-    branches.length === 0
-      ? 0
-      : head?.name.startsWith("stream/") && head.status === "active"
-        ? 2
-        : 0;
+  const railSummary = useMemo(() => {
+    let feature = 0;
+    let sandbox = 0;
+    let stream = 0;
+    for (const b of branches) {
+      const s = b.status.toLowerCase();
+      if (s === "merged" || s === "abandoned") continue;
+      const k = branchKindKey(b);
+      if (k === "stream") stream++;
+      else if (k === "sandbox") sandbox++;
+      else if (k === "feature" || k === "tag") feature++;
+    }
+    const parts: string[] = [];
+    const label = (n: number, singular: string) =>
+      n === 1 ? singular : `${singular} · ${n}`;
+    if (feature > 0) parts.push(label(feature, "Feature"));
+    if (sandbox > 0) parts.push(label(sandbox, "Sandbox"));
+    if (stream > 0) parts.push(label(stream, "Stream"));
+    return parts;
+  }, [branches]);
 
   const { nodes, emptyBranchList } = useMemo(() => {
     if (branches.length === 0) {
@@ -710,14 +838,12 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
         emptyBranchList: true as const,
       };
     }
-    const built = buildGraphNodes(branches, compileProgress, {
-      streamSyntheticDots: streamSynth,
-    });
+    const built = buildGraphNodes(branches, compileProgress, recentMerges);
     return {
       nodes: mergeCompileIntoNodes(built, compileProgress),
       emptyBranchList: false as const,
     };
-  }, [branches, compileProgress, streamSynth]);
+  }, [branches, compileProgress, recentMerges]);
 
   const onBranchClick = useCallback(
     async (name: string) => {
@@ -801,18 +927,18 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
           }}
         >
           {nodes.map((node) => {
-            const clickable = Boolean(node.branch && !node.synthetic && !emptyBranchList);
+            const clickable = Boolean(node.branch && !emptyBranchList);
             const label = (
               <span
                 className={cn(
                   "flex min-h-[26px] items-center truncate font-mono text-[11px] leading-snug text-foreground/85",
-                  node.synthetic && "text-transparent select-none",
                   node.tone === "merged" && "text-muted-foreground",
                   node.tone === "abandoned" && "text-muted-foreground/60 line-through",
+                  node.pulsing && "text-foreground",
                 )}
-                title={node.synthetic ? "session" : node.label}
+                title={node.label}
               >
-                {node.synthetic ? "·" : node.label}
+                {node.label}
               </span>
             );
             return (
@@ -841,7 +967,9 @@ export function BranchResolutionRiver({ workspace }: { workspace: string }) {
       {!emptyBranchList && branches.length > 1 && (
         <details className="text-[10px] text-muted-foreground">
           <summary className="cursor-pointer select-none font-mono hover:text-foreground">
-            {branches.length} branches
+            {railSummary.length > 0
+              ? `${railSummary.join(" · ")} · ${branches.length} branches`
+              : `${branches.length} branches`}
           </summary>
           <ul className="mt-1 max-h-32 overflow-y-auto border-t border-border/40 pt-1">
             {branches.map((b) => (

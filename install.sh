@@ -21,6 +21,13 @@ RELEASES_REPO="DevbyNaveen/releases"
 NLI_MODELS_TAG="nli-models"
 BINARY="root"
 INSTALL_DIR="${INSTALL_DIR:-}"
+# Skip switches — defaults give the "no-headache" install the user
+# expects from a curl-one-liner. Each is opt-in to disable.
+#   TR_SKIP_SERVICE=1   skip login-agent registration (`root service install`)
+#   TR_SKIP_APP=1       skip desktop .app/.AppImage download
+#   TR_SKIP_NLI=1       skip the ~83 MB NLI model download
+TR_SKIP_SERVICE="${TR_SKIP_SERVICE:-0}"
+TR_SKIP_APP="${TR_SKIP_APP:-0}"
 # Optional minisign public key for verifying `checksums.txt`.  When
 # unset the installer falls back to TLS-only trust on the checksum
 # file — a CA-level MITM (or a release-pipeline compromise that can
@@ -354,6 +361,121 @@ EOF
   say "Registered install manifest at ${manifest_path}"
 }
 
+# ── Desktop app install (optional, best-effort) ──────────────────────────────
+#
+# Downloads the bundled desktop .app (macOS) or .AppImage (Linux) from
+# the same release tag and installs into a location that the system
+# launcher / Spotlight / .desktop-file scanner already indexes:
+#   macOS: `/Applications/ThinkingRoot Desktop.app` (system-wide if
+#          writable, else `$HOME/Applications/...`).
+#   Linux: `$HOME/.local/share/thinkingroot/ThinkingRoot.AppImage` +
+#          a `.desktop` entry under `$HOME/.local/share/applications`
+#          so GNOME/KDE launchers list it.
+#
+# Honest skip semantics: if the desktop asset is not in this release
+# (some tagged releases ship CLI-only), we say so and continue — we
+# do NOT fabricate a working install. The CLI is fully functional
+# on its own; the desktop is a thin GUI on top.
+
+install_desktop_macos() {
+  asset_url="$1"
+  asset_path="$2"
+
+  if ! download_quiet "$asset_url" "$asset_path" 2>/dev/null; then
+    say_dim "Desktop bundle not in this release — skipping (CLI is fully functional)."
+    return 0
+  fi
+  case "$asset_path" in
+    *.tar.gz|*.tgz) ;;
+    *)
+      warn "unexpected desktop asset extension on $asset_path — skipping"
+      return 0
+      ;;
+  esac
+
+  # Pick target dir: /Applications if writable (system-wide), else
+  # ~/Applications (per-user; macOS Finder + Spotlight both index it).
+  if [ -w /Applications ]; then
+    APP_TARGET_DIR="/Applications"
+  else
+    APP_TARGET_DIR="$HOME/Applications"
+    mkdir -p "$APP_TARGET_DIR" || { warn "cannot create $APP_TARGET_DIR — skipping desktop install"; return 0; }
+  fi
+  STAGE="$(mktemp -d)"
+  tar -xzf "$asset_path" -C "$STAGE" || { rm -rf "$STAGE"; warn "desktop bundle extract failed — skipping"; return 0; }
+  # The tarball is expected to contain exactly one top-level `*.app`
+  # directory. Don't guess if there are zero or many.
+  APP_PATH="$(find "$STAGE" -maxdepth 2 -type d -name '*.app' | head -1)"
+  if [ -z "$APP_PATH" ]; then
+    rm -rf "$STAGE"
+    warn "desktop bundle did not contain a .app — skipping"
+    return 0
+  fi
+  APP_NAME="$(basename "$APP_PATH")"
+  FINAL_PATH="$APP_TARGET_DIR/$APP_NAME"
+  # Replace any prior install in place. rm -rf is scoped to the
+  # specific path we just resolved; no glob expansion hazards.
+  rm -rf "$FINAL_PATH"
+  mv "$APP_PATH" "$FINAL_PATH" || { rm -rf "$STAGE"; warn "failed to move .app to $FINAL_PATH"; return 0; }
+  rm -rf "$STAGE"
+  # Strip the quarantine xattr so first launch from Finder doesn't
+  # trip Gatekeeper's "downloaded from internet" prompt. The bundle
+  # arrived via curl which doesn't set quarantine, but a defensive
+  # clear is safe and matches `xattr -dr` patterns used by signed
+  # vendors during postinstall.
+  xattr -dr com.apple.quarantine "$FINAL_PATH" 2>/dev/null || true
+  say "Installed: $FINAL_PATH"
+}
+
+install_desktop_linux() {
+  asset_url="$1"
+  asset_path="$2"
+
+  if ! download_quiet "$asset_url" "$asset_path" 2>/dev/null; then
+    say_dim "Desktop bundle not in this release — skipping (CLI is fully functional)."
+    return 0
+  fi
+
+  APP_TARGET_DIR="$HOME/.local/share/thinkingroot"
+  mkdir -p "$APP_TARGET_DIR" || { warn "cannot create $APP_TARGET_DIR — skipping desktop install"; return 0; }
+  FINAL_PATH="$APP_TARGET_DIR/ThinkingRoot.AppImage"
+  mv "$asset_path" "$FINAL_PATH" || { warn "failed to move AppImage to $FINAL_PATH"; return 0; }
+  chmod +x "$FINAL_PATH"
+
+  # Write a `.desktop` entry so the GNOME/KDE/XFCE app menu lists
+  # it. Idempotent — same path on every re-install.
+  DESKTOP_DIR="$HOME/.local/share/applications"
+  mkdir -p "$DESKTOP_DIR" || true
+  cat > "$DESKTOP_DIR/thinkingroot-desktop.desktop" <<EOF
+[Desktop Entry]
+Name=ThinkingRoot Desktop
+Comment=Local-first AI memory you can audit
+Exec=$FINAL_PATH
+Icon=thinkingroot
+Terminal=false
+Type=Application
+Categories=Development;Utility;
+EOF
+  say "Installed: $FINAL_PATH"
+  say_dim "Launcher entry: $DESKTOP_DIR/thinkingroot-desktop.desktop"
+}
+
+# ── Login-agent registration ─────────────────────────────────────────────────
+#
+# Calls `root service install` to write the OS-native login agent
+# (launchd plist / systemd --user unit / Task Scheduler entry — see
+# crates/thinkingroot-cli/src/service.rs). Idempotent. Best-effort:
+# a failure here does NOT abort the install; the CLI still works,
+# the user just won't get the daemon-at-login behaviour.
+
+register_login_agent() {
+  bin_path="$1"
+  if "$bin_path" service install; then
+    return 0
+  fi
+  warn "login-agent registration failed — run \`root service install\` manually if you want auto-start."
+}
+
 # ── checksums.txt caching ────────────────────────────────────────────────────
 #
 # Caches the verified checksums.txt to the config dir.  Slice F's
@@ -534,6 +656,45 @@ main() {
     install_nli_models "$ARCH"
   fi
 
+  # ── Install desktop app (best-effort) ─────────────────────────────────────
+  if [ "$TR_SKIP_APP" = "1" ]; then
+    say_dim "Skipping desktop app install (TR_SKIP_APP=1)"
+  else
+    case "$OS" in
+      macos)
+        # Tauri 2 emits `<productName>_<version>_<arch>.app.tar.gz`
+        # for the updater channel. productName="ThinkingRoot" (set
+        # in tauri.conf.json with no spaces to keep URLs clean).
+        # Arch label matches Tauri's: aarch64 or x64.
+        case "$ARCH" in
+          arm64) TR_TAURI_ARCH="aarch64" ;;
+          *)     TR_TAURI_ARCH="x64" ;;
+        esac
+        DESKTOP_ASSET="ThinkingRoot_${VERSION}_${TR_TAURI_ARCH}.app.tar.gz"
+        install_desktop_macos \
+          "${BASE_URL}/${DESKTOP_ASSET}" \
+          "${TMP_DIR}/${DESKTOP_ASSET}"
+        ;;
+      linux)
+        case "$ARCH" in
+          arm64) TR_TAURI_ARCH="aarch64" ;;
+          *)     TR_TAURI_ARCH="amd64" ;;
+        esac
+        DESKTOP_ASSET="ThinkingRoot_${VERSION}_${TR_TAURI_ARCH}.AppImage"
+        install_desktop_linux \
+          "${BASE_URL}/${DESKTOP_ASSET}" \
+          "${TMP_DIR}/${DESKTOP_ASSET}"
+        ;;
+    esac
+  fi
+
+  # ── Register login agent ──────────────────────────────────────────────────
+  if [ "$TR_SKIP_SERVICE" = "1" ]; then
+    say_dim "Skipping login-agent registration (TR_SKIP_SERVICE=1)"
+  else
+    register_login_agent "${INSTALL_DIR}/${BINARY}"
+  fi
+
   printf '\n'
   say "Done!"
   config_dir_check="$(resolve_config_dir)/thinkingroot"
@@ -548,9 +709,13 @@ main() {
   "${INSTALL_DIR}/${BINARY}" --version || true
   printf '\n'
   printf '    Get started:\n'
-  printf '      root setup         # interactive wizard\n'
-  printf '      root compile .     # compile your first knowledge base\n'
+  printf '      root setup            # interactive credentials wizard\n'
+  printf '      root compile .        # compile your first knowledge base\n'
   printf '      root ask "what does this codebase do?"\n'
+  printf '\n'
+  printf '    Service management:\n'
+  printf '      root service install     # register login agent (already done)\n'
+  printf '      root service uninstall   # remove login agent\n'
   printf '\n'
 }
 

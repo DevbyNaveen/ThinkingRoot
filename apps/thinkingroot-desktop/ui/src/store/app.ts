@@ -124,6 +124,14 @@ interface AppStore {
     conversationId: string,
     messageId: string,
   ) => void;
+  /** After `conversations_append_message`, swap a temp client id for the
+   *  canonical UUID so hydration never duplicates the same bubble. */
+  replaceMessageId: (
+    workspace: string,
+    conversationId: string,
+    fromId: string,
+    toId: string,
+  ) => void;
   setMessages: (workspace: string, conversationId: string, msgs: ChatMessage[]) => void;
   streaming: StreamState | null;
   setStreaming: (s: StreamState | null) => void;
@@ -278,6 +286,15 @@ export const useApp = create<AppStore>()(
               [k]: current.filter((m) => m.id !== messageId),
             },
           };
+        }),
+      replaceMessageId: (workspace, conversationId, fromId, toId) =>
+        set((s) => {
+          const k = key(workspace, conversationId);
+          const current = s.messages[k] ?? [];
+          const next = current.map((m) =>
+            m.id === fromId ? { ...m, id: toId } : m,
+          );
+          return { messages: { ...s.messages, [k]: next } };
         }),
       setMessages: (workspace, conversationId, msgs) =>
         set((s) => ({

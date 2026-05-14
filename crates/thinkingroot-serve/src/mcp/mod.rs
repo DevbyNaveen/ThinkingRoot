@@ -225,7 +225,6 @@ async fn maybe_auto_create_branch(
     session_id: &str,
     sessions: &crate::intelligence::session::SessionStore,
 ) {
-    // ── 1. Resolve workspace ──────────────────────────────────────────────────
     let ws = match params
         .get("arguments")
         .and_then(|a| a.get("workspace"))
@@ -235,8 +234,32 @@ async fn maybe_auto_create_branch(
         Some(w) => w.to_string(),
         None => return,
     };
+    auto_create_session_branch(&ws, engine, session_id, sessions).await;
+}
 
-    // ── 2. Skip if session already has a branch ───────────────────────────────
+/// Workspace-resolved entry point for stream-branch auto-creation.
+///
+/// Shared by the MCP `tools/call` dispatcher (via [`maybe_auto_create_branch`])
+/// and the REST `agent_stream_response` chat handler. The REST chat path
+/// previously did NOT auto-create stream branches even when
+/// `streams.auto_session_branch = true` was set — only MCP-driven sessions
+/// got isolation. This is the canonical helper both surfaces now share.
+///
+/// Idempotent: if the session already has an `active_branch`, this is a no-op.
+/// Idempotent against the registry too: if the branch already exists (e.g.
+/// reconnect of an earlier session), the create call returns Err and we still
+/// set the session's `active_branch` to the existing branch name.
+///
+/// All failure modes are non-fatal — they `tracing::warn!` and let the caller
+/// proceed without an active branch (claims will land on main in that case,
+/// which is the pre-T0.6 default behaviour).
+pub async fn auto_create_session_branch(
+    workspace: &str,
+    engine: &crate::engine::QueryEngine,
+    session_id: &str,
+    sessions: &crate::intelligence::session::SessionStore,
+) {
+    // ── 1. Skip if session already has a branch ───────────────────────────────
     {
         let store = sessions.lock().await;
         if store
@@ -248,8 +271,8 @@ async fn maybe_auto_create_branch(
         }
     }
 
-    // ── 3. Check config ───────────────────────────────────────────────────────
-    let streams_cfg = match engine.workspace_streams_config(&ws) {
+    // ── 2. Check config ───────────────────────────────────────────────────────
+    let streams_cfg = match engine.workspace_streams_config(workspace) {
         Some(c) => c,
         None => return,
     };
@@ -257,13 +280,13 @@ async fn maybe_auto_create_branch(
         return;
     }
 
-    // ── 4. Get workspace root path ────────────────────────────────────────────
-    let root = match engine.workspace_root_path(&ws) {
+    // ── 3. Get workspace root path ────────────────────────────────────────────
+    let root = match engine.workspace_root_path(workspace) {
         Some(p) => p,
         None => return,
     };
 
-    // ── 5. Create the stream branch (idempotent — ignore "already exists") ────
+    // ── 4. Create the stream branch (idempotent — ignore "already exists") ────
     //
     // T0.6: tag the branch with `BranchKind::Stream { session_id }` and
     // `MergePolicy::AutoOnSessionEnd` so `maintenance::cleanup_once` can
@@ -288,6 +311,7 @@ async fn maybe_auto_create_branch(
         Ok(_) => {
             tracing::info!(
                 session_id,
+                workspace,
                 branch = %branch_name,
                 "auto session branch created"
             );
@@ -296,20 +320,31 @@ async fn maybe_auto_create_branch(
             // Branch may already exist from a reconnected session — not an error.
             tracing::debug!(
                 session_id,
+                workspace,
                 branch = %branch_name,
                 "create_branch returned (may already exist): {e}"
             );
         }
     }
 
-    // ── 6. Set the branch on the session ─────────────────────────────────────
+    // ── 5. Set the branch on the session ─────────────────────────────────────
+    //
+    // The REST chat path can call this BEFORE the agent loop has lazily
+    // created a `SessionContext` (sessions are normally minted on first
+    // `contribute` — see `engine.rs:3096`). Use `entry().or_insert_with(...)`
+    // so we never silently no-op the branch assignment when the session
+    // hasn't been minted yet. Idempotent against the MCP path which may
+    // already hold a populated session for the same id.
     let mut store = sessions.lock().await;
-    if let Some(session) = store.get_mut(session_id) {
-        if session.owner.is_none() {
-            session.set_owner(session_id.to_string());
-        }
-        session.set_branch(branch_name);
+    let session = store
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            crate::intelligence::session::SessionContext::new(session_id, workspace)
+        });
+    if session.owner.is_none() {
+        session.set_owner(session_id.to_string());
     }
+    session.set_branch(branch_name);
 }
 
 #[tracing::instrument(

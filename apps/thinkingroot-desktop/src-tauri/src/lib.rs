@@ -37,6 +37,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // Auto-update: signed updates pulled from the latest GitHub
+        // release. Verified against the public key pinned in
+        // tauri.conf.json. See commands::updater::check_for_updates.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage::<commands::cloud::LoginInFlightState>(std::sync::Arc::new(
             tokio::sync::Mutex::new(commands::cloud::LoginInFlight::default()),
         ))
@@ -79,6 +83,16 @@ pub fn run() {
                 {
                     tracing::warn!(error = %e, "legacy cloud field migration failed");
                 }
+            });
+
+            // Launch-time auto-update check. Pulls latest.json from
+            // the GitHub release, verifies against the pinned pubkey,
+            // and silently installs any available update. Emits an
+            // `update-installed` event when done so the webview can
+            // surface a "Relaunch to update" affordance.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::updater::check_for_updates(handle).await;
             });
 
             Ok(())
@@ -245,6 +259,7 @@ pub fn run() {
             commands::browser_save::browser_save_page,
             commands::browser_save::browser_extract_callback,
             commands::playground::playground_ensure,
+            commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ThinkingRoot Desktop");

@@ -69,6 +69,7 @@ import {
   onChatEvent,
   type ChatEvent,
   type ChatTurnPayload,
+  type IncrementalSummary,
   type LlmHealth,
 } from "@/lib/tauri";
 import { BrainCitationParser, useBrainActivation } from "@/store/brain";
@@ -310,6 +311,16 @@ export function ChatView() {
     // Per-turn reflection-gap accumulator. Same pattern as
     // turnEngramActivations.
     const turnGaps = new Map<string, GapEntry[]>();
+    // Per-tool_use_id workspace label for AI-triggered `compile`
+    // tool calls. Populated on `tool_call_proposed` so the
+    // executing / finished / rejected handlers can synthesize the
+    // matching `workspace_compile_progress`-style payload into the
+    // app store — without this, an agent-clicks-Compile run is
+    // invisible to the Right-Rail progress bar (the SSE compile
+    // events flow inside the sidecar, never out through the Tauri
+    // `workspace_compile_progress` channel the desktop subscribes
+    // to). Cleared on `final` / `error` / `tool_call_rejected`.
+    const compileToolWorkspace = new Map<string, string>();
     onChatEvent((ev: ChatEvent) => {
       if (!running) return;
       // Stream E — keep this as debug-level so it's silenced in
@@ -377,6 +388,20 @@ export function ChatView() {
           isWrite: ev.is_write,
           status: "proposed",
         });
+        // Capture the workspace target for compile-tool calls so the
+        // executing / finished handlers can drive the Right-Rail
+        // progress bar.
+        if (ev.name === "compile") {
+          const workspaceFromInput =
+            typeof ev.input === "object" && ev.input !== null
+              ? typeof (ev.input as { workspace?: unknown }).workspace === "string"
+                ? ((ev.input as { workspace?: string }).workspace as string)
+                : cur.activeWorkspace ?? ""
+              : cur.activeWorkspace ?? "";
+          if (workspaceFromInput) {
+            compileToolWorkspace.set(ev.id, workspaceFromInput);
+          }
+        }
         return;
       }
       if (ev.type === "approval_requested") {
@@ -393,6 +418,18 @@ export function ChatView() {
       if (ev.type === "tool_call_executing") {
         if (cur.streaming?.turnId !== ev.turn_id) return;
         cur.patchAgentStep(ev.id, { status: "executing" });
+        // Synthesize a `Started` compile-progress payload so the
+        // Right-Rail progress bar reflects the AI-driven compile.
+        // The actual SSE events fire inside the sidecar and do NOT
+        // propagate to the desktop's `workspace_compile_progress`
+        // channel; this synthetic `Started` → `Done` bracket gives
+        // the user honest "compile is running on your behalf" UX
+        // without claiming intermediate progress we don't have.
+        const ws = compileToolWorkspace.get(ev.id);
+        if (ws) {
+          cur.setCompileRootPath(ws);
+          cur.setCompileProgress({ phase: "started", workspace: ws });
+        }
         return;
       }
       if (ev.type === "tool_call_finished") {
@@ -402,6 +439,54 @@ export function ChatView() {
           output: ev.content,
           isError: ev.is_error,
         });
+        if (compileToolWorkspace.has(ev.id)) {
+          if (ev.is_error) {
+            cur.setCompileProgress({
+              phase: "failed",
+              error: ev.content || "compile tool returned an error",
+            });
+          } else {
+            // The agent's compile tool returned a serialized
+            // `PipelineResult` in `ev.content`; parse it if we can,
+            // otherwise emit a zero-count Done so the bar still
+            // resolves. The Right-Rail's Done renderer tolerates
+            // missing optional fields via `#[serde(default)]` on
+            // the Rust wire type.
+            let parsed: {
+              files_parsed?: number;
+              claims_count?: number;
+              entities_count?: number;
+              relations_count?: number;
+              contradictions_count?: number;
+              artifacts_count?: number;
+              health_score?: number;
+              cache_dirty?: boolean;
+              failed_batches?: number;
+              failed_chunk_ranges?: [number, number][];
+              incremental_summary?: IncrementalSummary;
+            } | null = null;
+            try {
+              parsed = JSON.parse(ev.content);
+            } catch {
+              parsed = null;
+            }
+            cur.setCompileProgress({
+              phase: "done",
+              files_parsed: parsed?.files_parsed ?? 0,
+              claims: parsed?.claims_count ?? 0,
+              entities: parsed?.entities_count ?? 0,
+              relations: parsed?.relations_count ?? 0,
+              contradictions: parsed?.contradictions_count ?? 0,
+              artifacts: parsed?.artifacts_count ?? 0,
+              health_score: parsed?.health_score ?? 0,
+              cache_dirty: parsed?.cache_dirty ?? false,
+              failed_batches: parsed?.failed_batches ?? 0,
+              failed_chunk_ranges: parsed?.failed_chunk_ranges ?? [],
+              incremental_summary: parsed?.incremental_summary,
+            });
+          }
+          compileToolWorkspace.delete(ev.id);
+        }
         return;
       }
       if (ev.type === "tool_call_rejected") {
@@ -410,6 +495,10 @@ export function ChatView() {
           status: "rejected",
           output: ev.reason,
         });
+        if (compileToolWorkspace.has(ev.id)) {
+          cur.setCompileProgress({ phase: "cancelled" });
+          compileToolWorkspace.delete(ev.id);
+        }
         return;
       }
 
@@ -482,6 +571,10 @@ export function ChatView() {
               lastAssistantMessage.delete(ev.turn_id);
               turnEngramActivations.delete(ev.turn_id);
               turnGaps.delete(ev.turn_id);
+              // Any in-flight compile-tool entry on this turn is now
+              // orphaned; clearing the whole map is safe because new
+              // turns mint fresh tool_use_ids.
+              compileToolWorkspace.clear();
             }
           })();
         } else {
@@ -500,6 +593,7 @@ export function ChatView() {
             lastAssistantMessage.delete(ev.turn_id);
             turnEngramActivations.delete(ev.turn_id);
             turnGaps.delete(ev.turn_id);
+            compileToolWorkspace.clear();
           }
         }
         return;

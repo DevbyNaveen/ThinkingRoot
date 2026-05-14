@@ -14,8 +14,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use super::JsonRpcRequest;
-use crate::rest::AppState;
+use super::{JsonRpcRequest, JsonRpcResponse};
+use crate::rest::{AppState, UnifiedCompileOutcome, UnifiedCompileRequest, run_unified_compile};
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 // ─── Session State ───────────────────────────────────────────
 
@@ -90,6 +92,117 @@ async fn handle_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+/// If `request` is a `tools/call name="compile"` payload, run the
+/// unified compile flow and return the synthesised JSON-RPC response.
+/// Otherwise return `None` so the caller falls through to the normal
+/// MCP dispatch.
+///
+/// This bypasses `mcp::dispatch` for the compile tool specifically so
+/// that the unified post-compile reconciliation (remount, vector
+/// rebuild, workspace_status actor, engram invalidation) runs against
+/// the same `Arc<AppState>` the SSE transport already owns. The
+/// legacy stdio transport (which has no AppState) continues to hit
+/// the `engine.compile()` arm inside `tools::handle_call`.
+async fn compile_request_fastpath(
+    request: &JsonRpcRequest,
+    state: &Arc<AppState>,
+) -> Option<JsonRpcResponse> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    let tool_name = request.params.get("name").and_then(|v| v.as_str())?;
+    if tool_name != "compile" {
+        return None;
+    }
+    let id = request.id.clone();
+    let arguments = request
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+
+    // Resolve the workspace argument against the live engine, then
+    // look up its registered root path. Hold the read lock just long
+    // enough to read both — drop before the helper write-locks engine.
+    let (ws, root_path) = {
+        let engine = state.engine.read().await;
+        let default_ws = engine
+            .list_workspaces()
+            .await
+            .ok()
+            .and_then(|list| list.first().map(|w| w.name.clone()));
+        let ws = crate::mcp::tools::resolve_workspace_arg(
+            arguments.get("workspace").and_then(|v| v.as_str()),
+            default_ws.as_deref(),
+            &engine,
+        );
+        let root_path = engine.workspace_root_path(&ws);
+        (ws, root_path)
+    };
+
+    let root_path = match root_path {
+        Some(p) => p,
+        None => {
+            return Some(JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("workspace `{ws}` is not mounted on this daemon"),
+            ));
+        }
+    };
+
+    // Cancellation flows through `_drop_guard` — when this future is
+    // dropped (agent turn cancellation, transport disconnect), the
+    // guard fires the token and `run_unified_compile`'s pipeline
+    // bails at the next phase boundary.
+    let cancel = CancellationToken::new();
+    let _drop_guard = cancel.clone().drop_guard();
+
+    let req = UnifiedCompileRequest {
+        ws_url_alias: ws,
+        root_path,
+        branch: arguments
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        no_rooting: arguments
+            .get("no_rooting")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+
+    let (_status_name, outcome) =
+        run_unified_compile(state.clone(), req, None, cancel).await;
+
+    let response = match outcome {
+        UnifiedCompileOutcome::Done(result) => {
+            // Match the legacy `mcp_text_result` shape exactly: a
+            // single text content block whose payload is the
+            // pretty-printed PipelineResult JSON. The agent's tool
+            // result parser is already tuned to this shape, and
+            // re-using it preserves wire-format parity with stdio
+            // MCP clients that still hit `tools::handle_call`'s
+            // legacy `engine.compile(ws)` arm.
+            match serde_json::to_string_pretty(&result) {
+                Ok(content) => JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{ "type": "text", "text": content }],
+                    }),
+                ),
+                Err(e) => {
+                    JsonRpcResponse::error(id, -32603, format!("serialize result: {e}"))
+                }
+            }
+        }
+        UnifiedCompileOutcome::Cancelled => {
+            JsonRpcResponse::error(id, -32603, "compile cancelled".to_string())
+        }
+        UnifiedCompileOutcome::Failed(msg) => JsonRpcResponse::error(id, -32603, msg),
+    };
+    Some(response)
+}
+
 /// POST /mcp?sessionId=X
 ///
 /// Receives a JSON-RPC request, dispatches it, and routes the response back
@@ -116,23 +229,42 @@ async fn handle_post(
         }
     };
 
-    let engine = state.engine.read().await;
-    let default_ws = engine
-        .list_workspaces()
-        .await
-        .ok()
-        .and_then(|ws| ws.first().map(|w| w.name.clone()));
+    // Compile fast-path — when the chat agent calls the `compile` MCP
+    // tool, route through `run_unified_compile` instead of the legacy
+    // `engine.compile()` dispatch arm. The unified helper performs the
+    // post-compile remount + vector-index rebuild + workspace_status
+    // actor messages + engram cache invalidation that the legacy arm
+    // skips. Without this fast-path, an agent-driven compile would
+    // succeed but leave every downstream query path returning the
+    // pre-compile empty view until the workspace is manually
+    // remounted.
+    //
+    // The early-drop is structural: `run_unified_compile` write-locks
+    // `state.engine` for remount, which deadlocks if a read guard is
+    // still held in this scope. We resolve the workspace path while
+    // holding the read briefly, drop it, then run the unified compile.
+    let response = if let Some(fastpath) = compile_request_fastpath(&request, &state).await {
+        fastpath
+    } else {
+        let engine = state.engine.read().await;
+        let default_ws = engine
+            .list_workspaces()
+            .await
+            .ok()
+            .and_then(|ws| ws.first().map(|w| w.name.clone()));
 
-    let response = super::dispatch(
-        &request,
-        &engine,
-        default_ws.as_deref(),
-        &session_id,
-        &state.sessions,
-        &state.engram_manager,
-    )
-    .await;
-    drop(engine);
+        let response = super::dispatch(
+            &request,
+            &engine,
+            default_ws.as_deref(),
+            &session_id,
+            &state.sessions,
+            &state.engram_manager,
+        )
+        .await;
+        drop(engine);
+        response
+    };
 
     let json_str = match serde_json::to_string(&response) {
         Ok(s) => s,

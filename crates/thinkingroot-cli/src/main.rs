@@ -37,6 +37,7 @@ mod retrieve_cmd;
 // check) + `witness_verifier::verify_witness_anchor` (per-witness BLAKE3
 // re-check), both of which already have their own CLI surfaces.
 mod serve;
+mod service;
 mod setup;
 mod status_cmd;
 mod tag_cmd;
@@ -326,6 +327,13 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Manage the login-agent that auto-starts `root serve`
+    /// on macOS (launchd), Linux (systemd --user), and Windows
+    /// (Task Scheduler at-logon).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Write MCP configuration to detected AI tools
     Connect {
@@ -1247,6 +1255,15 @@ enum WorkspaceAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install + activate the login agent so `root serve` starts on
+    /// every login (and right now). Idempotent.
+    Install,
+    /// Stop and remove the login agent. Idempotent.
+    Uninstall,
+}
+
 fn main() {
     // Worker stack of 8 MB. Default is 2 MB but the synthesis path
     // transitively pulls in fastembed → ONNX Runtime, which can blow
@@ -1714,6 +1731,18 @@ async fn async_main() -> anyhow::Result<()> {
             }
             WorkspaceAction::Scan { roots } => {
                 workspace::run_workspace_scan(roots)?;
+            }
+        },
+        Some(Commands::Service { action }) => match action {
+            ServiceAction::Install => {
+                let outcome = service::install()
+                    .map_err(|e| anyhow::anyhow!("install login agent: {e}"))?;
+                service::print_outcome(&outcome, service::OutcomeKind::Install)?;
+            }
+            ServiceAction::Uninstall => {
+                let outcome = service::uninstall()
+                    .map_err(|e| anyhow::anyhow!("uninstall login agent: {e}"))?;
+                service::print_outcome(&outcome, service::OutcomeKind::Uninstall)?;
             }
         },
         Some(Commands::Connect {

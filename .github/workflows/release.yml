@@ -9,8 +9,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
+  # ── CLI binary build ────────────────────────────────────────────────────────
+  # Builds the `root` CLI for every supported (OS, arch) tuple.
+  # The desktop bundle build (below) depends on the matching CLI
+  # binary for that OS — Tauri stages it as `externalBin`.
+  build-cli:
+    name: Build CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,15 +24,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: root-linux-amd64
 
-          # Native ARM64 runner — no cross-compilation, no Docker issues.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: root-linux-arm64
 
-          # Cross-compile from ARM64 macOS to Intel.
-          # ort dropped x86_64-apple-darwin prebuilt in v2.0.0-rc.11, so we
-          # supply Microsoft's official ORT dylib and dynamically link.
-          # Ships as .tar.gz bundle (binary + dylib); installer extracts both.
+          # macOS Intel cross-compile. ort dropped its x86_64
+          # prebuilt in v2.0.0-rc.11, so we supply Microsoft's
+          # official ORT dylib and dynamically link.
           - os: macos-14
             target: x86_64-apple-darwin
             artifact: root-macos-amd64.tar.gz
@@ -53,7 +55,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # macOS Intel: download ORT dylib and set env vars for dynamic linking.
       - name: Download ONNX Runtime (macOS Intel)
         if: matrix.ort_manual
         run: |
@@ -68,10 +69,9 @@ jobs:
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
           echo "ORT_SKIP_DOWNLOAD=1" >> "$GITHUB_ENV"
 
-      - name: Build
+      - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }} -p thinkingroot-cli
 
-      # macOS Intel: bundle binary + ORT dylib into tar.gz (binary needs dylib at runtime).
       - name: Bundle binary + ORT dylib (macOS Intel)
         if: matrix.ort_manual
         run: |
@@ -97,10 +97,141 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
+  # ── Desktop bundle build ────────────────────────────────────────────────────
+  # Tauri 2 desktop bundles. tauri-action stages the matching CLI
+  # binary as the `externalBin` sidecar, signs the updater bundle
+  # with TAURI_SIGNING_PRIVATE_KEY (matching the pubkey pinned in
+  # tauri.conf.json), and emits:
+  #   macOS:   <productName>_<version>_<arch>.app.tar.gz + .sig + .dmg
+  #   Linux:   <productName>_<version>_<arch>.AppImage   + .sig + .deb
+  #   Windows: <productName>_<version>_<arch>-setup.exe  + .sig + .msi
+  # plus a `latest.json` manifest used by tauri-plugin-updater.
+  build-desktop:
+    name: Build Desktop (${{ matrix.platform }})
+    needs: build-cli
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            os: macos-latest
+            cli_artifact: root-macos-arm64
+            cli_triple: aarch64-apple-darwin
+          - platform: macos-x64
+            os: macos-14
+            cli_artifact: root-macos-amd64.tar.gz
+            cli_triple: x86_64-apple-darwin
+          - platform: linux-amd64
+            os: ubuntu-latest
+            cli_artifact: root-linux-amd64
+            cli_triple: x86_64-unknown-linux-gnu
+          - platform: windows-x64
+            os: windows-latest
+            cli_artifact: root-windows-amd64.exe
+            cli_triple: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cli_triple }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.platform }}
+          workspaces: 'apps/thinkingroot-desktop/src-tauri'
+
+      # Linux Tauri builds need WebKitGTK + libsoup at build time.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libsoup-3.0-dev \
+            patchelf
+
+      # Pull the matching CLI artifact built in `build-cli` and stage
+      # it as the Tauri sidecar at `binaries/thinkingroot-agent-runtime-<triple>`.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.cli_artifact }}
+          path: cli-artifact
+
+      - name: Stage CLI as Tauri sidecar
+        shell: bash
+        run: |
+          mkdir -p apps/thinkingroot-desktop/src-tauri/binaries
+          TRIPLE="${{ matrix.cli_triple }}"
+          DST="apps/thinkingroot-desktop/src-tauri/binaries/thinkingroot-agent-runtime-${TRIPLE}"
+          if [[ "${{ matrix.cli_artifact }}" == *.tar.gz ]]; then
+            # macOS Intel ships as tar.gz (binary + ORT dylib).
+            tar -xzf "cli-artifact/${{ matrix.cli_artifact }}" -C cli-artifact
+            cp cli-artifact/root "${DST}"
+          elif [[ "${{ matrix.cli_artifact }}" == *.exe ]]; then
+            cp "cli-artifact/${{ matrix.cli_artifact }}" "${DST}.exe"
+          else
+            cp "cli-artifact/${{ matrix.cli_artifact }}" "${DST}"
+          fi
+          chmod +x "${DST}"* || true
+
+      - name: Install frontend deps
+        working-directory: apps/thinkingroot-desktop/ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build + sign desktop bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/thinkingroot-desktop/src-tauri
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.cli_triple }}
+
+      - name: Collect desktop artifacts
+        shell: bash
+        run: |
+          mkdir -p desktop-out
+          BUNDLE_DIR="apps/thinkingroot-desktop/src-tauri/target/${{ matrix.cli_triple }}/release/bundle"
+          # macOS bundles: .app.tar.gz + .sig, .dmg
+          find "$BUNDLE_DIR" -maxdepth 4 \( \
+            -name '*.app.tar.gz' -o \
+            -name '*.app.tar.gz.sig' -o \
+            -name '*.dmg' -o \
+            -name '*.AppImage' -o \
+            -name '*.AppImage.sig' -o \
+            -name '*.deb' -o \
+            -name '*-setup.exe' -o \
+            -name '*-setup.exe.sig' -o \
+            -name '*.msi' \
+          \) -exec cp {} desktop-out/ \;
+          ls -la desktop-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: desktop-out/
+
+  # ── Release publication ─────────────────────────────────────────────────────
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build-cli, build-desktop]
     permissions:
       contents: write
     steps:
@@ -111,7 +242,7 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: Generate checksums.txt
+      - name: Generate checksums.txt for CLI binaries
         run: |
           cd artifacts
           for f in root-linux-amd64 root-linux-arm64 root-macos-amd64.tar.gz root-macos-arm64 root-windows-amd64.exe; do
@@ -124,6 +255,70 @@ jobs:
                     root-windows-amd64.exe \
             > checksums.txt
           cat checksums.txt
+
+      # Assemble latest.json for tauri-plugin-updater. The plugin
+      # fetches this once on launch; each platform key points at a
+      # signed bundle hosted on the release. The .sig payload is the
+      # base64-encoded minisign signature emitted by tauri-action.
+      - name: Generate latest.json (tauri-plugin-updater)
+        run: |
+          set -eu
+          cd artifacts
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/DevbyNaveen/releases/releases/download/${GITHUB_REF_NAME}"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+
+          sig() { [ -f "$1" ] && cat "$1" || echo ""; }
+          urlencode() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+
+          MAC_AARCH64_TGZ="ThinkingRoot_${VERSION}_aarch64.app.tar.gz"
+          MAC_X64_TGZ="ThinkingRoot_${VERSION}_x64.app.tar.gz"
+          LINUX_AMD64_AI="ThinkingRoot_${VERSION}_amd64.AppImage"
+          WIN_X64_NSIS="ThinkingRoot_${VERSION}_x64-setup.exe"
+
+          MAC_AARCH64_SIG="$(sig "${MAC_AARCH64_TGZ}.sig")"
+          MAC_X64_SIG="$(sig "${MAC_X64_TGZ}.sig")"
+          LINUX_AMD64_SIG="$(sig "${LINUX_AMD64_AI}.sig")"
+          WIN_X64_SIG="$(sig "${WIN_X64_NSIS}.sig")"
+
+          cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "notes": "ThinkingRoot ${GITHUB_REF_NAME}",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${MAC_AARCH64_SIG}",
+                "url": "${BASE}/$(urlencode "${MAC_AARCH64_TGZ}")"
+              },
+              "darwin-x86_64": {
+                "signature": "${MAC_X64_SIG}",
+                "url": "${BASE}/$(urlencode "${MAC_X64_TGZ}")"
+              },
+              "linux-x86_64": {
+                "signature": "${LINUX_AMD64_SIG}",
+                "url": "${BASE}/$(urlencode "${LINUX_AMD64_AI}")"
+              },
+              "windows-x86_64": {
+                "signature": "${WIN_X64_SIG}",
+                "url": "${BASE}/$(urlencode "${WIN_X64_NSIS}")"
+              }
+            }
+          }
+          EOF
+          # Strip platform blocks whose signature is empty (a bundle
+          # that didn't build for this release shouldn't be advertised
+          # to the updater — the plugin would 404 and confuse users).
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("latest.json")
+          data = json.loads(p.read_text())
+          data["platforms"] = {
+              k: v for k, v in data["platforms"].items() if v.get("signature")
+          }
+          p.write_text(json.dumps(data, indent=2))
+          PY
+          cat latest.json
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -139,23 +334,22 @@ jobs:
             artifacts/root-macos-arm64
             artifacts/root-windows-amd64.exe
             artifacts/checksums.txt
-            scripts/install.sh
-            scripts/install.ps1
+            artifacts/latest.json
+            artifacts/ThinkingRoot_*.app.tar.gz
+            artifacts/ThinkingRoot_*.app.tar.gz.sig
+            artifacts/ThinkingRoot_*.dmg
+            artifacts/ThinkingRoot_*.AppImage
+            artifacts/ThinkingRoot_*.AppImage.sig
+            artifacts/ThinkingRoot_*.deb
+            artifacts/ThinkingRoot_*-setup.exe
+            artifacts/ThinkingRoot_*-setup.exe.sig
+            artifacts/ThinkingRoot_*.msi
+            install.sh
+            install.ps1
           generate_release_notes: false
           draft: false
-          fail_on_unmatched_files: true
-
-  homebrew-bump:
-    name: Bump Homebrew formula
-    runs-on: ubuntu-latest
-    needs: release
-    continue-on-error: true
-    steps:
-      - uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: root
-          homebrew-tap: DevbyNaveen/homebrew-thinkingroot
-          tag-name: ${{ github.ref_name }}
-          download-url: https://github.com/DevbyNaveen/releases/releases/download/${{ github.ref_name }}/root-macos-arm64
-        env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_PR_PAT }}
+          # Don't fail on unmatched globs — some bundles legitimately
+          # may not build for every release (e.g. a macOS-only patch).
+          # The latest.json generator above already prunes platforms
+          # with no signature.
+          fail_on_unmatched_files: false
