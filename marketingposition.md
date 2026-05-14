@@ -134,7 +134,7 @@ Every AI tool today builds its own private brain — ChatGPT memory, Cursor rule
 
 ### Layer 5 — Regulators / auditors (compliance)
 - EU AI Act Article 50 verification tooling
-- C2PA-style provenance chain audit
+- Provenance chain audit over signed `.tr` packs
 - Use case: *"Show me every fact this AI used to make this decision, signed by who, when."*
 
 ---
@@ -334,14 +334,11 @@ A: Layered: free OSS engine drives adoption; freemium registry ($X/mo for privat
 **Q: Why now?**
 A: EU AI Act Article 50 in force August 2, 2026 (87 days). Plus MCP just proved the protocol-substrate playbook works. Plus RAG growing 42% CAGR. Plus Sigstore is enterprise-baseline now.
 
-**Q: What about C2PA / IPTC provenance standards?**
-A: Complementary. C2PA targets media. We target structured knowledge claims. Both can coexist; we have `tr-c2pa` interop on the post-v0.1 roadmap.
-
 **Q: What's already shipped?**
-A: 22 crates, 1,470 tests, zero stubs. Cortex protocol (singleton-engine, atomic lockfile). Branch v1.0 (95% spec coverage). Water-flow incremental compile (p95 = 98ms). 16 cloud microservices, 424 tests. Full trust chain wired into `root install` (Sigstore + Rekor + revocation + BLAKE3).
+A: 24 crates, 1,470 tests, zero stubs. Cortex protocol (singleton-engine, atomic lockfile). Branch v1.0 (100% spec coverage). Water-flow incremental compile (p95 = 98ms). 16 cloud microservices, 424 tests. Full trust chain wired into `root install` (Sigstore + Rekor + revocation + BLAKE3). Mechanical structural extraction — code, prose, tests, configs — via the 56-rule Witness Mesh catalog.
 
 **Q: What's not shipped?**
-A: Multimodal extractors (image/audio/video/PDF) — deferred 5-6 weeks. tr-c2pa interop — deferred (needs tr/3.0→3.1 schema bump). Sigstore live keyless — gated behind `sigstore-impl` feature, awaits Sigstore credentials. Public registry hosting at `thinkingroot.dev` — depends on funding.
+A: Sigstore live keyless — gated behind `sigstore-impl` feature, awaits Sigstore credentials. Public registry hosting at `thinkingroot.dev` — depends on funding.
 
 ---
 
@@ -362,8 +359,6 @@ A: Multimodal extractors (image/audio/video/PDF) — deferred 5-6 weeks. tr-c2pa
 - Phase F polish: Rekor URL configurability, author-key validation, Rekor caching, revocation UX (~24h verified scope)
 - Phase G hardening: full deprecation messaging on cloud `tr` shim, end-to-end CI for OSS+Cloud bridge
 - `thinkingroot.dev` registry public launch + DNS/CDN
-- Multimodal extractors (Phase E): image (fastembed), audio (whisper-rs), video (ffmpeg-next), PDF (pdfium-render) — 5-6 weeks
-- `tr-c2pa` interop: tr/3.0 → tr/3.1 schema bump + C2PA-rs integration
 - Compliance bundle: pre-built EU AI Act Art. 50 audit artifacts
 - 2-3 additional engineers
 

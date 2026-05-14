@@ -151,20 +151,19 @@ pub struct ManifestV3 {
     pub author_key_id: Option<String>,
 
     /// Per-source detail rows. Empty/absent on `tr/3`; populated on
-    /// `tr/3.1` packs that opt in to multimodal extractors. Each entry
-    /// names a source file by its relative path inside `source.tar.zst`,
-    /// its BLAKE3 content hash, byte count, optional MIME type, and any
-    /// derived-content hashes (thumbnails, transcripts, summaries). A
-    /// non-empty value requires `format_version == "tr/3.1"`.
+    /// `tr/3.1` packs that carry per-file metadata. Each entry names a
+    /// source file by its relative path inside `source.tar.zst`, its
+    /// BLAKE3 content hash, byte count, optional MIME type, and any
+    /// derived-content hashes. A non-empty value requires
+    /// `format_version == "tr/3.1"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceEntry>,
 }
 
 /// Per-source detail row. Introduced in `tr/3.1`. Each entry describes
 /// one file inside the inner `source.tar.zst` bundle. The list is the
-/// authoritative inventory consumed by the cloud registry, the EU AI
-/// Act compliance bundle (`root compliance --eu-ai-act`), and the
-/// multimodal extractor pipeline.
+/// authoritative inventory consumed by the cloud registry and the EU
+/// AI Act compliance bundle (`root compliance --eu-ai-act`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceEntry {
     /// Path inside `source.tar.zst`, relative, forward-slash-separated.

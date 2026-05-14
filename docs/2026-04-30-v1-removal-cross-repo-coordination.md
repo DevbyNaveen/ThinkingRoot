@@ -14,7 +14,6 @@ surface from `tr-format` and the v1 trust verifier from `tr-verify`.
 | `tr_verify::Verifier`, `VerifierConfig` | **deleted** |
 | `tr_verify::Verdict`, `RevokedDetails`, `TamperedKind`, `VerifiedDetails` | **deleted** |
 | `tr_verify::AuthorKeyStore`, `TrustedAuthorKey` | **deleted** |
-| `tr-c2pa` crate (deferred to v3.2+ per v3 spec §11) | **deleted** |
 | `Capabilities` v1 wire (`tr_format::capabilities`) | **deleted** |
 
 What remains in `tr_format`: `ManifestV3`, `V3PackBuilder`, `read_v3_pack`,

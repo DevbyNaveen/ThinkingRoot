@@ -100,7 +100,7 @@ impl fmt::Display for Did {
 
 /// Result of resolving a DID document. Phase F.1 only consumes the
 /// public-key half of the document; richer service-endpoint fields
-/// land in the `tr-c2pa` integration (Step 16).
+/// land in a follow-up.
 #[derive(Debug, Clone)]
 pub struct ResolvedDid {
     /// The DID that was resolved.
@@ -123,10 +123,10 @@ pub trait DidResolver: Send + Sync {
     async fn resolve(&self, did: &Did) -> Result<ResolvedDid>;
 }
 
-/// Trait stub for verifiable-credential verification. Implementations
-/// land in `tr-c2pa` (Step 16) where C2PA + Sigstore together carry
-/// VC payloads attached to packs. We declare the trait here so
-/// downstream callers can program against the contract today.
+/// Trait for verifiable-credential verification. Implementations land
+/// in a follow-up where Sigstore carries VC payloads attached to
+/// packs. We declare the trait here so downstream callers can program
+/// against the contract today.
 #[async_trait::async_trait]
 pub trait VcVerifier: Send + Sync {
     /// Verify a VC payload signed by the named DID. Returns `Ok(())`

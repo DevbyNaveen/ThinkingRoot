@@ -58,9 +58,6 @@ Symbols deleted (commit `a53c56a`):
   `VerifiedDetails`
 - `tr_verify::AuthorKeyStore`, `TrustedAuthorKey`
 
-`tr-c2pa` stub crate was deleted in commit `5fa9066`; C2PA
-support is deferred to v3.2+ per v3 final plan §11.
-
 What remains in `tr-format`: `ManifestV3`, `V3PackBuilder`,
 `read_v3_pack`, `V3Pack`, `ClaimRecord`. What remains in
 `tr-verify`: `verify_v3_pack`, `verify_v3_pack_with_revocation`,
