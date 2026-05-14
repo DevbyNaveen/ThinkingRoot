@@ -32,6 +32,7 @@
 pub mod comment_claims;
 pub mod expiration;
 pub mod extractor;
+pub mod image_rules;
 pub mod lsp_rules;
 pub mod parse_doc_rules;
 pub mod quantity;

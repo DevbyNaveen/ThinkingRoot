@@ -23,6 +23,15 @@ blake3 = { workspace = true }
 regex = { workspace = true }
 # Witness Mesh rule catalog: static string-keyed map of RuleDescriptor.
 phf = { version = "0.11", features = ["macros"] }
+# Image-family rules (catalog v1.1) — pure-Rust image decode +
+# perceptual hashing + EXIF. No shell-outs, no ffmpeg, no C deps.
+# Sized for a CTO-class "drop a folder of photos" path: ~50 MiB of
+# stable rust crates that decode JPEG/PNG/GIF/WebP/TIFF/BMP/PNM out
+# of the box.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "gif", "webp", "tiff", "bmp", "pnm"
+] }
+kamadak-exif = "0.5"
 
 [build-dependencies]
 # build.rs reads Cargo.lock at the workspace root and pins each

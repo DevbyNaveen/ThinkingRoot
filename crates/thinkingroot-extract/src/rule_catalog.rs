@@ -41,7 +41,12 @@ include!(concat!(env!("OUT_DIR"), "/grammar_versions.rs"));
 /// - minor: new rules added (old packs still readable).
 /// - major: breaking changes to existing rule outputs (old packs
 ///   need migration).
-pub const CATALOG_VERSION: &str = "1.0.0";
+///
+/// `1.1.0` — added image-family rules for mathematical (no-LLM)
+/// extraction of image content: perceptual hash, color histogram,
+/// edge summary, EXIF metadata, dominant colors. Pure-Rust
+/// deterministic; no shell-outs.
+pub const CATALOG_VERSION: &str = "1.1.0";
 
 /// One rule in the catalog. The `'static` lifetime everywhere is
 /// load-bearing: descriptors live in a `phf` static map and the
@@ -699,6 +704,78 @@ pub static RULE_CATALOG: phf::Map<&'static str, RuleDescriptor> = phf::phf_map! 
         default_sensitivity: "Public",
         description: "`FIXME:` / `XXX:` / `HACK:` markers in code comments",
     },
+
+    // ── Image-family rules (mathematical extraction; no LLM) ──
+    // Catalog v1.1 adds pure-Rust feature extractors for raster
+    // images: every rule consumes the whole-file byte range as a
+    // single span (`spans[0] = (file_blake3, 0, len)`) and emits a
+    // Witness whose payload is the deterministic feature.
+    "image::phash@v1" => RuleDescriptor {
+        name: "image::phash@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::phash",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "8x8 DCT perceptual hash — near-duplicate detection across visually similar images",
+    },
+    "image::color-histogram@v1" => RuleDescriptor {
+        name: "image::color-histogram@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::color-histogram",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "RGB color distribution at 16-bucket resolution per channel (4096 buckets total)",
+    },
+    "image::edge-summary@v1" => RuleDescriptor {
+        name: "image::edge-summary@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::edge-summary",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Sobel-edge density + mean intensity — coarse structural fingerprint",
+    },
+    "image::exif@v1" => RuleDescriptor {
+        name: "image::exif@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::exif",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "EXIF metadata key/value pairs — camera, lens, timestamps, GPS when present",
+    },
+    "image::dominant-colors@v1" => RuleDescriptor {
+        name: "image::dominant-colors@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::dominant-colors",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Top-K dominant RGB clusters via online quantisation — palette fingerprint",
+    },
+    "image::skipped@v1" => RuleDescriptor {
+        name: "image::skipped@v1",
+        family: "image",
+        input_types: &["raw_bytes"],
+        output_type: "image::skipped",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Image format unsupported / decode failed — honest absence (mirrors lsp::skipped@v1)",
+    },
 };
 
 /// Look up a rule descriptor by name. Returns `None` if the rule is
@@ -875,7 +952,10 @@ mod tests {
             toml.starts_with("catalog_blake3 = \""),
             "catalog TOML must start with its own BLAKE3"
         );
-        assert!(toml.contains("catalog_version = \"1.0.0\""));
+        // Pin against the constant rather than a hardcoded version
+        // string so the assertion survives minor bumps that add
+        // rules without changing test intent.
+        assert!(toml.contains(&format!("catalog_version = \"{}\"", CATALOG_VERSION)));
     }
 
     #[test]
