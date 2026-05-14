@@ -4005,13 +4005,26 @@ Rules: \
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
         let now = chrono::Utc::now();
-        thinkingroot_paper::synthesize_and_persist(
-            &storage.graph,
-            &handle.root_path,
-            &handle.name,
-            now,
-        )
-        .map_err(|e| Error::Config(format!("paper regenerate failed: {e}")))
+        // Use the same LLM client the workspace was mounted with so
+        // the AI narrative renders when a provider is configured.
+        match &handle.llm {
+            Some(client) => thinkingroot_paper::synthesize_and_persist_with_llm(
+                &storage.graph,
+                &handle.root_path,
+                &handle.name,
+                now,
+                client.as_ref(),
+            )
+            .await
+            .map_err(|e| Error::Config(format!("paper regenerate failed: {e}"))),
+            None => thinkingroot_paper::synthesize_and_persist(
+                &storage.graph,
+                &handle.root_path,
+                &handle.name,
+                now,
+            )
+            .map_err(|e| Error::Config(format!("paper regenerate failed: {e}"))),
+        }
     }
 
     /// Cross-workspace reflect — aggregate co-occurrence across every

@@ -12,7 +12,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for one section in a `paper.md` file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum SectionId {
     /// **v1 deterministic.** Workspace + witness + source + branch
@@ -113,6 +115,25 @@ pub const V1_RENDER_ORDER: &[SectionId] = &[
     SectionId::PromisesItKeeps,
     SectionId::HowItIsTested,
     SectionId::Provenance,
+];
+
+/// Ordered list of v1.1 AI-narrative sections. Rendered AFTER the v1
+/// deterministic skeleton when an LLM is wired in. Each section is
+/// citation-grounded — the synthesiser refuses to emit text without
+/// `[[witness:<id>]]` markers (validated against the workspace's
+/// real witness ids post-synthesis).
+///
+/// Display order: Abstract → KeyIdeas → HowItFitsTogether →
+/// RecentChanges → HowToUseIt. This is the read order a researcher
+/// is most likely to skim — "what is this, what are the highlights,
+/// how do the parts connect, what changed recently, where do I
+/// start?"
+pub const V1_1_AI_ORDER: &[SectionId] = &[
+    SectionId::Abstract,
+    SectionId::KeyIdeas,
+    SectionId::HowItFitsTogether,
+    SectionId::RecentChanges,
+    SectionId::HowToUseIt,
 ];
 
 #[cfg(test)]

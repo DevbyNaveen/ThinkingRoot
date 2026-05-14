@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use thinkingroot_graph::graph::GraphStore;
+use thinkingroot_llm::llm::LlmClient;
 
 use crate::frontmatter::{new_frontmatter, section_entry, Frontmatter};
 use crate::mermaid::{render_graph_lr, ConceptEdge, ConceptNode};
-use crate::sections::{SectionId, V1_RENDER_ORDER};
+use crate::narrate::{narrate, SectionCache};
+use crate::sections::{SectionId, V1_1_AI_ORDER, V1_RENDER_ORDER};
 use crate::PAPER_FILE_NAME;
 
 /// All the ways paper synthesis can honestly fail. Every failure
@@ -149,6 +151,154 @@ pub fn synthesize_and_persist(
         bytes = output.byte_length,
         sections = output.frontmatter.sections.len(),
         "paper.md synthesised"
+    );
+    Ok(output)
+}
+
+/// v1.1 async variant: synthesise WITH the AI narrative layer.
+///
+/// Runs the deterministic skeleton first (identical bytes to
+/// [`synthesize`] for those sections), then asks the supplied
+/// `LlmClient` to narrate the five AI sections in [`V1_1_AI_ORDER`].
+/// Every AI section is citation-validated post-synthesis — markers
+/// referencing witnesses that don't exist are stripped; sections
+/// with no surviving citations fall back to an honest stub.
+///
+/// `prior_cache` is the [`SectionCache`] read from
+/// `<root>/.thinkingroot/paper-cache.json`. Cache hits short-circuit
+/// the LLM call entirely. Callers should persist the returned
+/// cache via `cache_out.save(&path)` so the next compile benefits.
+pub async fn synthesize_with_llm(
+    graph: &GraphStore,
+    workspace_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    llm: &LlmClient,
+    prior_cache: SectionCache,
+) -> Result<(PaperOutput, SectionCache), PaperSynthesisError> {
+    let witness_count = graph.count_witnesses().unwrap_or(0);
+    let source_count = graph
+        .get_sources_with_hashes()
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
+    let branch_count = 1;
+    let rule_catalog_blake3 = read_rule_catalog_blake3(graph).unwrap_or_default();
+
+    let mut fm = new_frontmatter(
+        workspace_name,
+        now,
+        witness_count,
+        source_count,
+        branch_count,
+        rule_catalog_blake3,
+    );
+
+    let mut body = String::with_capacity(2048);
+
+    // Phase 1: deterministic skeleton (identical to synthesize).
+    for section in V1_RENDER_ORDER {
+        let (input_bytes, rendered_body) = render_section(*section, graph, &fm)?;
+        let entry = section_entry(*section, &input_bytes, &rendered_body);
+        fm.sections.push(entry);
+        body.push_str(&format!("## {}\n\n", section.title()));
+        body.push_str(&rendered_body);
+        if !rendered_body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+
+    // Phase 2: AI narrative. Per-section failure falls back to a stub
+    // (no hard error reaches us — `narrate` swallows LLM errors).
+    let ai = narrate(graph, workspace_name, llm, prior_cache).await;
+    for section in V1_1_AI_ORDER {
+        let rendered_body = ai
+            .sections
+            .get(section)
+            .cloned()
+            .unwrap_or_else(|| String::from("_Narrator did not return this section._\n"));
+        // Frontmatter index uses the cache key (input_blake3) for AI
+        // sections — same content-derived identity as the cache.
+        let input_bytes = ai
+            .cache
+            .entries
+            .get(section.kebab())
+            .map(|e| e.input_blake3.as_bytes().to_vec())
+            .unwrap_or_else(|| rendered_body.as_bytes().to_vec());
+        let entry = section_entry(*section, &input_bytes, &rendered_body);
+        fm.sections.push(entry);
+        body.push_str(&format!("## {}\n\n", section.title()));
+        body.push_str(&rendered_body);
+        if !rendered_body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+
+    let head = fm.to_markdown_block();
+    let markdown = format!("{head}# {workspace_name} — Living Paper\n\n{body}");
+    let byte_length = markdown.len();
+
+    Ok((
+        PaperOutput {
+            markdown,
+            frontmatter: fm,
+            byte_length,
+        },
+        ai.cache,
+    ))
+}
+
+/// v1.1 async variant: synthesise + persist with AI narrative.
+///
+/// Reads the prior `paper-cache.json` (best-effort — missing /
+/// corrupt cache files produce an empty starting cache, which just
+/// regenerates every AI section). Writes both `paper.md` and the
+/// refreshed `paper-cache.json` atomically. Cache-write failures are
+/// logged as warnings and don't propagate — a stale cache file is
+/// less harmful than a failed compile.
+pub async fn synthesize_and_persist_with_llm(
+    graph: &GraphStore,
+    workspace_root: &Path,
+    workspace_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    llm: &LlmClient,
+) -> Result<PaperOutput, PaperSynthesisError> {
+    let data_dir = workspace_root.join(".thinkingroot");
+    std::fs::create_dir_all(&data_dir).map_err(|e| PaperSynthesisError::Write {
+        path: data_dir.clone(),
+        source: e,
+    })?;
+    let cache_path = data_dir.join("paper-cache.json");
+    let prior_cache = SectionCache::load(&cache_path);
+
+    let (output, new_cache) =
+        synthesize_with_llm(graph, workspace_name, now, llm, prior_cache).await?;
+
+    let final_path = data_dir.join(PAPER_FILE_NAME);
+    let tmp_path = data_dir.join(format!("{PAPER_FILE_NAME}.tmp"));
+    std::fs::write(&tmp_path, output.markdown.as_bytes()).map_err(|e| {
+        PaperSynthesisError::Write {
+            path: tmp_path.clone(),
+            source: e,
+        }
+    })?;
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| PaperSynthesisError::Write {
+        path: final_path.clone(),
+        source: e,
+    })?;
+    if let Err(e) = new_cache.save(&cache_path) {
+        tracing::warn!(
+            target: "paper",
+            error = %e,
+            path = %cache_path.display(),
+            "paper-cache write failed; next compile will regenerate every AI section"
+        );
+    }
+    tracing::info!(
+        path = %final_path.display(),
+        bytes = output.byte_length,
+        sections = output.frontmatter.sections.len(),
+        "paper.md synthesised (v1.1 with AI narrative)"
     );
     Ok(output)
 }

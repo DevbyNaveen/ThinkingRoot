@@ -36,10 +36,15 @@
 
 pub mod frontmatter;
 pub mod mermaid;
+pub mod narrate;
 pub mod sections;
 pub mod synthesizer;
 
-pub use synthesizer::{synthesize, synthesize_and_persist, PaperOutput, PaperSynthesisError};
+pub use narrate::{narrate, AiNarrative, SectionCache, SectionCacheEntry};
+pub use synthesizer::{
+    synthesize, synthesize_and_persist, synthesize_and_persist_with_llm, synthesize_with_llm,
+    PaperOutput, PaperSynthesisError,
+};
 
 /// Default filename for the Living Paper artefact inside a workspace.
 /// Loaded by the pack-export path (`V3PackBuilder::with_paper`) and the

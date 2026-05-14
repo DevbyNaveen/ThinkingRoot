@@ -1517,8 +1517,14 @@ async fn run_pipeline_inner(
     // AI narrative sections in v1.1). Single file with YAML
     // frontmatter (machine-readable spine) + markdown body (human
     // body + Mermaid architecture diagram). Same `branch` gating as
-    // Phase 10 README: the paper is workspace-level state, not
+    // Phase 10b — Living Paper synthesis. Workspace-level state, not
     // per-branch. Non-fatal — a stale paper is not a corrupt graph.
+    //
+    // When the workspace has a configured LLM provider, drive the
+    // v1.1 async variant so the five AI-narrative sections render
+    // with citation-validated `[[witness:<id>]]` markers. Without a
+    // provider we fall back to the v1 deterministic-only path so a
+    // misconfigured workspace still yields a (skeleton-only) paper.
     if matches!(branch, None | Some("main")) {
         let workspace_name: String = root_path
             .file_name()
@@ -1526,12 +1532,42 @@ async fn run_pipeline_inner(
             .unwrap_or("workspace")
             .to_string();
         let now = chrono::Utc::now();
-        if let Err(e) = thinkingroot_paper::synthesize_and_persist(
-            &storage.graph,
-            root_path,
-            &workspace_name,
-            now,
-        ) {
+
+        // Try to build an LlmClient from the merged workspace+user
+        // config. Failure (no provider, missing key, etc.) maps to
+        // None — the deterministic path always succeeds.
+        let llm_client: Option<thinkingroot_llm::llm::LlmClient> =
+            match thinkingroot_llm::llm::LlmClient::new(&config.llm).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "paper",
+                        error = %e,
+                        "LLM not configured; rendering deterministic skeleton only"
+                    );
+                    None
+                }
+            };
+
+        let result = match &llm_client {
+            Some(client) => thinkingroot_paper::synthesize_and_persist_with_llm(
+                &storage.graph,
+                root_path,
+                &workspace_name,
+                now,
+                client,
+            )
+            .await
+            .map(|_| ()),
+            None => thinkingroot_paper::synthesize_and_persist(
+                &storage.graph,
+                root_path,
+                &workspace_name,
+                now,
+            )
+            .map(|_| ()),
+        };
+        if let Err(e) = result {
             tracing::warn!(
                 target: "paper",
                 error = %e,
