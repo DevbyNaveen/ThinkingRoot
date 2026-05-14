@@ -1846,3 +1846,17 @@ export async function playgroundDrop(
     filePaths,
   });
 }
+
+/** One row in the Source Library. Same shape as the engine's
+ * `SourceInfo` wire type. */
+export interface PlaygroundSource {
+  id: string;
+  uri: string;
+  source_type: string;
+  content_hash: string;
+}
+
+/** List every source in the active workspace via the sidecar. */
+export async function playgroundSources(): Promise<PlaygroundSource[]> {
+  return invoke<PlaygroundSource[]>("playground_sources");
+}

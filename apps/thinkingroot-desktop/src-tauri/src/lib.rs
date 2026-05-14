@@ -270,6 +270,7 @@ pub fn run() {
             commands::playground::playground_ensure,
             commands::playground::paper_get,
             commands::playground::playground_drop,
+            commands::playground::playground_sources,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

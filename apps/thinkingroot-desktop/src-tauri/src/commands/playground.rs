@@ -295,6 +295,54 @@ pub async fn playground_drop(
     Ok(outcome)
 }
 
+/// One row in the Source Library view. Mirrors the engine's
+/// `SourceInfo` wire shape (`crates/thinkingroot-serve/src/engine.rs`)
+/// plus a `display_name` derived from the URI's basename so the UI
+/// doesn't have to do path-parsing in JS.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PlaygroundSource {
+    pub id: String,
+    pub uri: String,
+    pub source_type: String,
+    /// BLAKE3 hex of the source bytes; empty for agent-contributed
+    /// claims with no underlying file.
+    #[serde(default)]
+    pub content_hash: String,
+}
+
+/// Tauri command: list every source in the active workspace via the
+/// sidecar's `GET /api/v1/ws/{ws}/sources`. Returns the raw
+/// `SourceInfo`-shaped rows; the UI sorts + renders.
+///
+/// Routes through `SidecarClient` per the Cortex Protocol
+/// single-writer rule — the desktop never opens `graph.db` directly.
+#[tauri::command]
+pub async fn playground_sources(app: AppHandle) -> Result<Vec<PlaygroundSource>, String> {
+    let client = crate::commands::sidecar_client::SidecarClient::ensure_active(&app).await?;
+    let path = format!("/api/v1/ws/{}/sources", urlencode(&client.workspace));
+    let rows: Vec<PlaygroundSource> = client.get(&path).await?;
+    Ok(rows)
+}
+
+/// Minimal URL encoder for path components — same shape as the helper
+/// in `memory.rs`, duplicated locally to avoid pulling that module's
+/// other imports into the playground command surface.
+fn urlencode(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Tauri command: read the Living Paper for a workspace by name.
 ///
 /// Resolves the workspace's on-disk root via [`WorkspaceRegistry`],

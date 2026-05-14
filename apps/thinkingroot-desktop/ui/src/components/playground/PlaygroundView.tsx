@@ -1,14 +1,17 @@
+import { useEffect, useState } from "react";
 import { FlaskConical } from "lucide-react";
 
 import { useApp } from "@/store/app";
 import { DropZone } from "@/components/playground/DropZone";
 import { PaperPanel } from "@/components/playground/PaperPanel";
+import { SourceLibrary } from "@/components/playground/SourceLibrary";
 
 /**
  * Playground surface — the researcher / student-facing workspace
  * view. v1 ships the DropZone (drag-drop file ingest + auto-compile)
- * on top of the Living Paper viewer; subsequent commits add citation
- * chips, the three-pane layout, and the cross-workspace chat.
+ * + SourceLibrary (left-rail file list) + Living Paper viewer.
+ * Subsequent commits add citation chips, the cross-workspace chat,
+ * and the provenance-trace right panel.
  *
  * The naming convention: "Playground" is the surface the user
  * selects from the icon rail; underneath it composes the same
@@ -18,6 +21,21 @@ import { PaperPanel } from "@/components/playground/PaperPanel";
 export function PlaygroundView() {
   const workspace = useApp((s) => s.activeWorkspace);
   const surface = useApp((s) => s.surface);
+  const compileProgress = useApp((s) => s.compileProgress);
+  // Refresh SourceLibrary + PaperPanel whenever a compile finishes
+  // by bumping a nonce. Both children depend on `refreshNonce` /
+  // `workspace`; we don't reload mid-compile (the substrate is in
+  // flux) — only on the "done" / "failed" / "cancelled" terminal.
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  useEffect(() => {
+    if (
+      compileProgress?.phase === "done" ||
+      compileProgress?.phase === "failed" ||
+      compileProgress?.phase === "cancelled"
+    ) {
+      setRefreshNonce((n) => n + 1);
+    }
+  }, [compileProgress?.phase]);
 
   return (
     <div className="flex h-full flex-col">
@@ -32,7 +50,8 @@ export function PlaygroundView() {
         <DropZone workspace={workspace} visible={surface === "playground"} />
       </div>
       <div className="flex flex-1 overflow-hidden">
-        <PaperPanel workspace={workspace} />
+        <SourceLibrary workspace={workspace} refreshNonce={refreshNonce} />
+        <PaperPanel workspace={workspace} refreshNonce={refreshNonce} />
       </div>
     </div>
   );

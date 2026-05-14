@@ -22,7 +22,13 @@ import { cn } from "@/lib/utils";
  * markdown, so a future viewer (or the public hub) renders it
  * without changing the `paper.md` byte-stream.
  */
-export function PaperPanel({ workspace }: { workspace: string | null }) {
+export function PaperPanel({
+  workspace,
+  refreshNonce,
+}: {
+  workspace: string | null;
+  refreshNonce?: number;
+}) {
   const [payload, setPayload] = useState<PaperPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,7 +54,7 @@ export function PaperPanel({ workspace }: { workspace: string | null }) {
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, refreshNonce]);
 
   const { frontmatter, body } = useMemo(() => splitFrontmatter(payload?.markdown), [
     payload?.markdown,
