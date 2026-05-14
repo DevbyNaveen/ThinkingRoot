@@ -7,6 +7,7 @@ members = [
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
     "crates/thinkingroot-llm",
+    "crates/thinkingroot-paper",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
     "crates/thinkingroot-health",
@@ -37,6 +38,7 @@ default-members = [
     "crates/thinkingroot-parse",
     "crates/thinkingroot-extract",
     "crates/thinkingroot-llm",
+    "crates/thinkingroot-paper",
     "crates/thinkingroot-link",
     "crates/thinkingroot-compile",
     "crates/thinkingroot-health",
@@ -77,6 +79,7 @@ thinkingroot-graph   = { path = "crates/thinkingroot-graph",   version = "0.9.0"
 thinkingroot-parse   = { path = "crates/thinkingroot-parse",   version = "0.9.0" }
 thinkingroot-extract = { path = "crates/thinkingroot-extract", version = "0.9.0" }
 thinkingroot-llm     = { path = "crates/thinkingroot-llm",     version = "0.9.1" }
+thinkingroot-paper   = { path = "crates/thinkingroot-paper",   version = "0.9.1" }
 thinkingroot-link    = { path = "crates/thinkingroot-link",    version = "0.9.0" }
 thinkingroot-compile = { path = "crates/thinkingroot-compile", version = "0.9.0" }
 thinkingroot-health  = { path = "crates/thinkingroot-health",  version = "0.9.0" }
@@ -97,6 +100,7 @@ tr-verify            = { path = "crates/tr-verify",            version = "0.9.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 rmp-serde = "1.3"
 
 # Async

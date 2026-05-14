@@ -309,6 +309,34 @@ fn run_pack_v3(
         claim_count += 1;
     }
 
+    // 4b. Stage the Living Paper if the workspace has one. Phase 10b
+    //     of the pipeline writes `.thinkingroot/paper.md` per compile;
+    //     attaching it here ships the same artefact inside the pack
+    //     so hub consumers (and any future installer preview) see
+    //     the human-readable summary without needing the engine to
+    //     replay the workspace. Missing paper is non-fatal — older
+    //     workspaces compiled before Phase 10b shipped still pack
+    //     cleanly without it.
+    let paper_path = workspace.join(".thinkingroot").join("paper.md");
+    let mut packed_paper = false;
+    if paper_path.exists() {
+        match fs::read_to_string(&paper_path) {
+            Ok(paper_md) => {
+                // `with_paper` is a builder-style method — re-bind
+                // builder to capture the move-through-self result.
+                builder = builder.with_paper(paper_md);
+                packed_paper = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %paper_path.display(),
+                    error = %e,
+                    "paper.md present but unreadable; pack will ship without it"
+                );
+            }
+        }
+    }
+
     // 5. Seal the pack. If a signing key was supplied, drive
     //    `build_signed` so a Sigstore Bundle is appended as the 4th
     //    outer-tar entry. Otherwise emit unsigned — `root verify`
@@ -347,14 +375,16 @@ fn run_pack_v3(
     } else {
         ""
     };
+    let paper_label = if packed_paper { " + paper.md" } else { "" };
     println!(
-        "  packed{} {} {} (tr/3 — {} files, {} source bytes, {} claims, {} pack bytes) -> {}",
+        "  packed{} {} {} (tr/3 — {} files, {} source bytes, {} claims{}, {} pack bytes) -> {}",
         signed_label,
         pack_name,
         pack_version,
         packed_paths.len(),
         source_bytes_added,
         claim_count,
+        paper_label,
         bytes.len(),
         out_path.display()
     );

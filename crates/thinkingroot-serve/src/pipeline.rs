@@ -1146,6 +1146,11 @@ async fn run_pipeline_inner(
     // are logged at WARN — the pipeline does not abort because the
     // legacy `claims` flow is still load-bearing during the
     // Witness-Mesh transition.
+    // Track how many witnesses Phase 6.45 actually persisted so the
+    // pipeline's `claims_count` honestly reflects substrate growth
+    // even when the LLM-extraction path produced zero claims (the
+    // post-cutover default). See `PipelineResult.claims_count` below.
+    let mut persisted_witness_count: usize = 0;
     if !filtered_extraction.witnesses.is_empty() {
         let raw_witness_count = filtered_extraction.witnesses.len();
         emit!(ProgressEvent::WitnessMeshStart { raw: raw_witness_count });
@@ -1167,16 +1172,17 @@ async fn run_pipeline_inner(
                 .graph
                 .insert_witness_input_edges_batch(&assembled.edges)?;
         }
+        persisted_witness_count = assembled.witnesses.len();
         tracing::info!(
             raw = raw_witness_count,
-            persisted = assembled.witnesses.len(),
+            persisted = persisted_witness_count,
             edges = assembled.edges.len(),
             deduped = assembled.dedup_count,
             errors = assembled.errors.len(),
             "Witness Mesh: persisted to graph"
         );
         emit!(ProgressEvent::WitnessMeshDone {
-            persisted: assembled.witnesses.len(),
+            persisted: persisted_witness_count,
             deduped: assembled.dedup_count,
             edges: assembled.edges.len(),
             errors: assembled.errors.len(),
@@ -1239,7 +1245,15 @@ async fn run_pipeline_inner(
     let entities_total = filtered_extraction.entities.len() as u64;
     progress_state.set_step(thinkingroot_core::CompileStep::Linking, entities_total);
 
-    let claims_count = filtered_extraction.claims.len();
+    // Phase 5 Witness Mesh cutover (2026-05-14): `claims_count` is
+    // the pipeline's "this compile produced N substrate rows" signal
+    // surfaced to CLI summary + desktop progress + REST `compile`
+    // response. With Witness Mesh as the primary write path, witnesses
+    // produced by Phase 6.45 contribute to the count alongside any
+    // legacy claims from Phase 7 (Linker). For witness-only workspaces
+    // (the post-cutover default), `filtered_extraction.claims.len()`
+    // is 0 and the witness count carries the signal.
+    let claims_count = filtered_extraction.claims.len() + persisted_witness_count;
     let entities_count = filtered_extraction.entities.len();
     let relations_count = filtered_extraction.relations.len();
     // Snapshot failed-batch attribution before Linker moves the
@@ -1494,6 +1508,34 @@ async fn run_pipeline_inner(
                 target: "readme",
                 error = %e,
                 "README synthesis failed; .thinkingroot/README.md may be stale"
+            );
+        }
+    }
+
+    // ─── Phase 10b: Living Paper synthesis ───
+    // Per-compile `paper.md` artefact (deterministic skeleton in v1;
+    // AI narrative sections in v1.1). Single file with YAML
+    // frontmatter (machine-readable spine) + markdown body (human
+    // body + Mermaid architecture diagram). Same `branch` gating as
+    // Phase 10 README: the paper is workspace-level state, not
+    // per-branch. Non-fatal — a stale paper is not a corrupt graph.
+    if matches!(branch, None | Some("main")) {
+        let workspace_name: String = root_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        let now = chrono::Utc::now();
+        if let Err(e) = thinkingroot_paper::synthesize_and_persist(
+            &storage.graph,
+            root_path,
+            &workspace_name,
+            now,
+        ) {
+            tracing::warn!(
+                target: "paper",
+                error = %e,
+                "paper synthesis failed; .thinkingroot/paper.md may be stale"
             );
         }
     }
