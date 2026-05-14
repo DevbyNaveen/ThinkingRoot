@@ -57,7 +57,6 @@ thinkingroot-health = { workspace = true }
 thinkingroot-serve = { workspace = true }
 thinkingroot-branch = { workspace = true }
 thinkingroot-ground = { workspace = true }
-thinkingroot-rooting = { workspace = true }
 thinkingroot-reflect = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

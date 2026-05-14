@@ -35,7 +35,6 @@ thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
 thinkingroot-health = { workspace = true }
 thinkingroot-ground = { workspace = true }
-thinkingroot-rooting = { workspace = true }
 thinkingroot-reflect = { workspace = true }
 tr-sigstore = { workspace = true }
 blake3 = { workspace = true }
@@ -76,7 +75,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tower = { version = "0.5", features = ["util"] }
 cozo = { workspace = true }
 thinkingroot-parse = { workspace = true }
-thinkingroot-rooting = { workspace = true }
 
 [[bench]]
 name = "incremental_smoke"

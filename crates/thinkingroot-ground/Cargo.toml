@@ -20,8 +20,9 @@ rust-version.workspace = true
 [dependencies]
 thinkingroot-core = { workspace = true }
 thinkingroot-extract = { workspace = true }
-# `unicode-segmentation` is still used by the surviving `LexicalJudge`
-# (kept temporarily for `thinkingroot_rooting::probes::provenance`).
+# `unicode-segmentation` is used by the surviving `LexicalJudge`
+# tokenizer (retained for downstream consumers that score lexical
+# overlap; the Rooting crate that originally drove it is deleted).
 unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
 # Witness anchor verification — BLAKE3 over source byte slices.

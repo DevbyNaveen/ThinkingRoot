@@ -14,7 +14,6 @@ members = [
     "crates/thinkingroot-branch",
     "crates/thinkingroot-pr",
     "crates/thinkingroot-ground",
-    "crates/thinkingroot-rooting",
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
@@ -45,7 +44,6 @@ default-members = [
     "crates/thinkingroot-branch",
     "crates/thinkingroot-pr",
     "crates/thinkingroot-ground",
-    "crates/thinkingroot-rooting",
     "crates/thinkingroot-reflect",
     "crates/thinkingroot-cli",
     "crates/thinkingroot-bench",
@@ -86,7 +84,6 @@ thinkingroot-serve   = { path = "crates/thinkingroot-serve",   version = "0.9.0"
 thinkingroot-branch  = { path = "crates/thinkingroot-branch",  version = "0.9.0", default-features = false }
 thinkingroot-pr      = { path = "crates/thinkingroot-pr",      version = "0.9.0" }
 thinkingroot-ground  = { path = "crates/thinkingroot-ground",  version = "0.9.0", default-features = false }
-thinkingroot-rooting = { path = "crates/thinkingroot-rooting", version = "0.9.0" }
 thinkingroot-reflect = { path = "crates/thinkingroot-reflect", version = "0.9.0" }
 thinkingroot-cloud-auth = { path = "crates/thinkingroot-cloud-auth" }
 tr-format            = { path = "crates/tr-format",            version = "1.0.0" }

@@ -1680,10 +1680,9 @@ fn verify_provenance(
     }
     // Resolve content_hash via primary source. byte_store is keyed on hash,
     // not source_id; we rely on the substrate's source_id == content_hash
-    // convention from `crates/thinkingroot-rooting/src/source_store.rs:32-57`
-    // for FileSystemSourceStore. When no row hash matches we treat as
-    // unknown (cache as false) so subsequent verify calls don't re-spend
-    // disk IO.
+    // convention from `crates/thinkingroot-graph/src/source_store.rs` for
+    // FileSystemSourceStore. When no row hash matches we treat as unknown
+    // (cache as false) so subsequent verify calls don't re-spend disk IO.
     let bytes = byte_store
         .get_range(
             &thinkingroot_core::types::ContentHash(c.primary_source_id.clone()),

@@ -16,9 +16,10 @@
 //!   content_blake3`. The one mechanical check the Witness Mesh
 //!   substrate needs. ~10µs per witness; replaces ~57KB of judges
 //!   with ~200 LOC of cryptographic comparison.
-//! - `lexical.rs` — kept temporarily as a tokenizer for
-//!   `thinkingroot_rooting::probes::provenance` (Rooting crate is
-//!   itself slated for deletion in the next cutover pass).
+//! - `lexical.rs` — `LexicalJudge` tokenizer + Jaccard overlap
+//!   scorer. The Rooting crate that originally consumed it has
+//!   been deleted (post-Witness-Mesh cleanup, 2026-05-14); the
+//!   helper stays here as the single home for lexical scoring.
 
 mod lexical;
 mod witness_verifier;
