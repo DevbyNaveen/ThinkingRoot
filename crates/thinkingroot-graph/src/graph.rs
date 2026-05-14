@@ -1,16 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono;
 use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
 use serde::Serialize;
-use thinkingroot_core::types::{Entity, EntityType};
+use thinkingroot_core::types::{ContentHash, Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
 // T7 — re-export `PerSourceRows` so callers can write
 // `use thinkingroot_graph::graph::PerSourceRows;` alongside the existing
 // `use thinkingroot_graph::graph::GraphStore;`.
 pub use crate::per_source_rows::PerSourceRows;
+
+use crate::source_store::{FileSystemSourceStore, SourceByteStore};
 
 /// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
 /// adjacent shape: every field maps directly onto the v3 spec §3.3
@@ -55,6 +58,15 @@ pub struct V3ClaimExportRow {
 #[derive(Clone)]
 pub struct GraphStore {
     db: DbInstance,
+    /// Optional byte store used by the Witness Mesh bridge to
+    /// materialise lossless `statement` text from `(source_id,
+    /// byte_start, byte_end)` triples. `Some` for production
+    /// `GraphStore::init(path)` calls (wired to
+    /// `{path}/rooting/sources/`); `None` for in-memory test
+    /// fixtures via `from_db_for_testing` (the bridge then falls
+    /// back to the pre-Phase-5 synthesised text). Phase 5 of the
+    /// Witness Mesh cutover.
+    byte_store: Option<Arc<dyn SourceByteStore>>,
 }
 
 impl GraphStore {
@@ -67,13 +79,105 @@ impl GraphStore {
         &self.db
     }
 
+    /// Hand out a clone of the workspace byte store (if attached) so
+    /// downstream consumers (engine layer, REST handlers, branch diff)
+    /// can read source bytes for span materialisation without
+    /// re-opening the store on every call.
+    ///
+    /// Returns `None` for `from_db_for_testing` instances and any
+    /// fixture path that never attached a store via `init`.
+    pub fn byte_store(&self) -> Option<Arc<dyn SourceByteStore>> {
+        self.byte_store.clone()
+    }
+
+    /// Materialise lossless statement text for a witness anchored at
+    /// `(source_id, byte_start, byte_end)`. Looks up the source's
+    /// `content_hash` from the `sources` table, reads the byte range
+    /// via the attached [`SourceByteStore`], and returns the bytes
+    /// decoded as UTF-8 (lossy fallback for binary witnesses such as
+    /// image/audio media).
+    ///
+    /// Returns `None` when:
+    /// - no byte store is attached (`from_db_for_testing` instances),
+    /// - the source row doesn't exist (caller passed a stale id),
+    /// - `content_hash` is missing on the source row (pre-CCC
+    ///   workspace that never backfilled the column),
+    /// - the byte store has no entry for the hash (post-GC, or the
+    ///   pipeline wrote witnesses without persisting bytes).
+    ///
+    /// Honesty contract: the function never fabricates text. A `None`
+    /// return tells the caller "I don't have lossless bytes for this
+    /// witness" — the caller then falls back to the synthesised
+    /// `[witness_type] symbol @byte_start..byte_end` form, which
+    /// makes the lossy fallback explicit at the call site rather
+    /// than silently in the bridge.
+    ///
+    /// Phase 5 of the Witness Mesh cutover. CCC I-2 + I-4 give us the
+    /// byte-anchored content_blake3 triple per row; this helper is
+    /// what turns it into human-readable text without an LLM.
+    pub fn materialize_statement(
+        &self,
+        source_id: &str,
+        byte_start: u64,
+        byte_end: u64,
+    ) -> Result<Option<String>> {
+        let byte_store = match self.byte_store.as_ref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let hash_hex = match self.get_source_content_hash(source_id)? {
+            Some(h) if !h.is_empty() => h,
+            _ => return Ok(None),
+        };
+        let content_hash = ContentHash(hash_hex);
+        let bytes = match byte_store.get_range(
+            &content_hash,
+            byte_start as usize,
+            byte_end as usize,
+        )? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    /// Look up a source's `content_hash` hex string by row id. The
+    /// `sources` table denormalises `content_hash` per row; CCC's
+    /// migration ensured every row in a v3-substrate workspace
+    /// carries it. Returns `None` for missing rows or empty hashes
+    /// (pre-CCC backfill remainder).
+    fn get_source_content_hash(&self, source_id: &str) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("sid".to_string(), DataValue::Str(source_id.into()));
+        let result = self
+            .db
+            .run_script(
+                r#"?[content_hash] :=
+                    *sources{id, content_hash},
+                    id = $sid"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("source content_hash lookup failed: {e}")))?;
+        let hash = result
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .map(|v| dv_to_string(&v));
+        Ok(hash)
+    }
+
     /// Build a `GraphStore` from a pre-opened in-memory `DbInstance` for
     /// fixture tests in sibling modules (e.g. `aep_queries::tests`). Pairs
     /// with `init_for_testing` to set up the schema without forcing every
     /// test through the on-disk `init` path.
     #[doc(hidden)]
     pub fn from_db_for_testing(db: DbInstance) -> Self {
-        Self { db }
+        Self {
+            db,
+            byte_store: None,
+        }
     }
 
     /// Run the schema-creation step against a `from_db_for_testing` store
@@ -97,7 +201,19 @@ impl GraphStore {
         let db = DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
             .map_err(|e| Error::GraphStorage(format!("failed to open cozo db: {e}")))?;
 
-        let store = Self { db };
+        // Wire the byte store to the same workspace data dir so the
+        // Witness Mesh bridge can materialise lossless statement text
+        // from `(source_id, byte_start, byte_end)` at read time.
+        // `FileSystemSourceStore::new` is infallible — it just builds
+        // the path; the actual directory is created lazily on first
+        // write by Phase 6 of the pipeline.
+        let byte_store: Arc<dyn SourceByteStore> =
+            Arc::new(FileSystemSourceStore::new(path)?);
+
+        let store = Self {
+            db,
+            byte_store: Some(byte_store),
+        };
         store.create_schema()?;
         store.migrate_claims_extraction_tier()?;
         store.migrate_structural_patterns_schema()?;
@@ -3530,15 +3646,23 @@ impl GraphStore {
 
     /// Get all claims with their source URIs (for bulk artifact generation).
     ///
-    /// Phase 4 (Witness Mesh cutover, 2026-05-14): when the legacy
+    /// Phase 5 (Witness Mesh cutover, 2026-05-14): when the legacy
     /// `claims` table is empty (the post-cutover pipeline writes only
     /// `witnesses`), this falls back to a projection over the
-    /// `witnesses` table. The projection synthesises a `statement`
-    /// from `(witness_type, symbol)` so cache + REST + UI consumers
-    /// see the substrate. **No source-byte text is read here** —
-    /// rendering the span text requires a byte-store round-trip and
-    /// belongs in a follow-up at the engine layer (where the byte
-    /// store is reachable). See `.claude/rules/witness-mesh.md`.
+    /// `witnesses` table with **lossless source-byte materialisation**
+    /// via [`Self::materialize_statement`]. Each witness row's
+    /// `(source_id, byte_start, byte_end)` triple is resolved against
+    /// the attached `FileSystemSourceStore` and decoded as UTF-8 so
+    /// chat citations, the Brain UI, and REST `/claims` consumers see
+    /// the actual source content — not a synthesised summary.
+    ///
+    /// When the byte store is unavailable (test fixtures via
+    /// `from_db_for_testing`, or a workspace whose source bytes were
+    /// garbage-collected), the bridge falls back to a structurally
+    /// distinct `[witness_type] symbol @byte_start..byte_end` form
+    /// so callers always get a non-empty string but the fallback is
+    /// explicit (never confused for real source text). See
+    /// `.claude/rules/witness-mesh.md`.
     ///
     /// Confidence comes from the row's denormalised
     /// `witnesses.confidence` column (populated from the rule catalog
@@ -3584,7 +3708,7 @@ impl GraphStore {
             return Ok(out);
         }
 
-        // Witness Mesh fallback. Fresh workspaces (post-cutover) have
+        // Witness Mesh bridge. Fresh workspaces (post-cutover) have
         // an empty `claims` table — the pipeline writes only
         // witnesses. Project to the same wire shape so every
         // downstream reader (cache reload, REST `/claims`,
@@ -3592,41 +3716,63 @@ impl GraphStore {
         // internals. Confidence carries through from
         // `witnesses.confidence` (denormalised from the rule catalog
         // at write time).
+        //
+        // Phase 5 (Witness Mesh cutover, 2026-05-14): `statement`
+        // text now comes from `materialize_statement` — the actual
+        // source bytes at `[byte_start, byte_end)` decoded as UTF-8.
+        // When the byte store is unavailable (testing fixtures, or a
+        // workspace whose byte store was GC'd), we fall back to the
+        // synthesised `[witness_type] symbol @byte_start..byte_end`
+        // form so callers always get a non-empty string but the
+        // fallback is explicit, not lossy-by-design.
         let witnesses = self.query_read(
-            r#"?[id, witness_type, rule, symbol, confidence, uri, byte_start, byte_end] :=
+            r#"?[id, source_id, witness_type, rule, symbol, confidence, uri, byte_start, byte_end] :=
                 *witnesses{id, witness_type, rule, symbol, confidence, source_id, byte_start, byte_end},
                 *sources{id: source_id, uri}"#,
         )?;
         out.reserve(witnesses.rows.len());
         for row in &witnesses.rows {
-            if row.len() < 8 {
+            if row.len() < 9 {
                 continue;
             }
             let id = dv_to_string(&row[0]);
-            let witness_type = dv_to_string(&row[1]);
-            let rule = dv_to_string(&row[2]);
-            let symbol = dv_to_string(&row[3]);
-            let confidence = match &row[4] {
+            let source_id = dv_to_string(&row[1]);
+            let witness_type = dv_to_string(&row[2]);
+            let rule = dv_to_string(&row[3]);
+            let symbol = dv_to_string(&row[4]);
+            let confidence = match &row[5] {
                 DataValue::Num(Num::Float(f)) => *f,
                 DataValue::Num(Num::Int(i)) => *i as f64,
                 _ => 0.99,
             };
-            let uri = dv_to_string(&row[5]);
-            let byte_start = match &row[6] {
+            let uri = dv_to_string(&row[6]);
+            let byte_start = match &row[7] {
                 DataValue::Num(Num::Int(i)) => *i as u64,
                 DataValue::Num(Num::Float(f)) => *f as u64,
                 _ => 0,
             };
-            let byte_end = match &row[7] {
+            let byte_end = match &row[8] {
                 DataValue::Num(Num::Int(i)) => *i as u64,
                 DataValue::Num(Num::Float(f)) => *f as u64,
                 _ => 0,
             };
-            let statement = if !symbol.is_empty() {
-                format!("[{witness_type}] {symbol} @{byte_start}..{byte_end}")
-            } else {
-                format!("[{witness_type}] via {rule} @{byte_start}..{byte_end}")
-            };
+            let statement = self
+                .materialize_statement(&source_id, byte_start, byte_end)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    // Honest fallback when source bytes aren't
+                    // materialised (test fixtures, post-GC, etc.):
+                    // surface the rule/symbol metadata so the caller
+                    // can still display *something* — the fallback
+                    // is structurally distinct from real source text
+                    // (`[…]` prefix), never confused for a quote.
+                    if !symbol.is_empty() {
+                        format!("[{witness_type}] {symbol} @{byte_start}..{byte_end}")
+                    } else {
+                        format!("[{witness_type}] via {rule} @{byte_start}..{byte_end}")
+                    }
+                });
             out.push((id, statement, witness_type, confidence, uri, 0.0));
         }
         Ok(out)
@@ -5925,7 +6071,10 @@ mod tests {
 
     fn mem_store() -> GraphStore {
         let db = DbInstance::new("mem", "", "").unwrap();
-        let store = GraphStore { db };
+        let store = GraphStore {
+            db,
+            byte_store: None,
+        };
         store.create_schema().unwrap();
         store
     }
