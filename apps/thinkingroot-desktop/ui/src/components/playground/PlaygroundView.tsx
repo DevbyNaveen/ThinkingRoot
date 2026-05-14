@@ -5,6 +5,7 @@ import { useApp } from "@/store/app";
 import { ChatView } from "@/components/chat/ChatView";
 import { DropZone } from "@/components/playground/DropZone";
 import { PaperPanel } from "@/components/playground/PaperPanel";
+import { PlaygroundActions } from "@/components/playground/PlaygroundActions";
 import { SourceDetailPanel } from "@/components/playground/SourceDetailPanel";
 import { SourceLibrary } from "@/components/playground/SourceLibrary";
 import { cn } from "@/lib/utils";
@@ -70,6 +71,7 @@ export function PlaygroundView() {
       <div className="shrink-0 border-b border-border bg-background px-4 py-2">
         <DropZone workspace={workspace} visible={surface === "playground"} />
       </div>
+      <PlaygroundActions workspace={workspace} />
       <div className="flex flex-1 overflow-hidden">
         <SourceLibrary
           workspace={workspace}

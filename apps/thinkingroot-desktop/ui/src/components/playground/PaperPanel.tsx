@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { FileText, RotateCcw } from "lucide-react";
+import { FileText, RefreshCw, RotateCcw } from "lucide-react";
 
-import { paperGet, type PaperPayload } from "@/lib/tauri";
+import {
+  paperGet,
+  paperRegenerate,
+  type PaperPayload,
+} from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
 /**
@@ -32,6 +36,7 @@ export function PaperPanel({
   const [payload, setPayload] = useState<PaperPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
 
   const load = useCallback(async () => {
     if (!workspace) {
@@ -55,6 +60,27 @@ export function PaperPanel({
   useEffect(() => {
     void load();
   }, [load, refreshNonce]);
+
+  // Trigger a server-side resynthesis. The sidecar writes the new
+  // bytes atomically before returning, so we hydrate state from the
+  // command's response directly — no follow-up `paperGet` round-trip.
+  const regenerate = useCallback(async () => {
+    if (!workspace || regenerating) return;
+    setRegenerating(true);
+    setError(null);
+    try {
+      const out = await paperRegenerate(workspace);
+      setPayload((prev) => ({
+        path: prev?.path ?? "",
+        exists: true,
+        markdown: out.markdown,
+      }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRegenerating(false);
+    }
+  }, [workspace, regenerating]);
 
   const { frontmatter, body } = useMemo(() => splitFrontmatter(payload?.markdown), [
     payload?.markdown,
@@ -109,14 +135,34 @@ export function PaperPanel({
             </span>
           )}
         </div>
-        <button
-          type="button"
-          onClick={load}
-          aria-label="Refresh paper"
-          className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-        >
-          <RotateCcw className="size-3.5" />
-        </button>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={regenerate}
+            disabled={regenerating}
+            aria-label="Regenerate paper"
+            title="Regenerate from the current Witness Mesh state"
+            className={cn(
+              "flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors",
+              regenerating
+                ? "text-muted-foreground/60"
+                : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+            )}
+          >
+            <RefreshCw
+              className={cn("size-3.5", regenerating && "animate-spin")}
+            />
+            {regenerating ? "Synthesising…" : "Regenerate"}
+          </button>
+          <button
+            type="button"
+            onClick={load}
+            aria-label="Reload paper"
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+          >
+            <RotateCcw className="size-3.5" />
+          </button>
+        </div>
       </header>
       <div className="prose prose-sm dark:prose-invert max-w-none flex-1 overflow-auto px-6 py-4">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>

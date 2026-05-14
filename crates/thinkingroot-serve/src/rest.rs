@@ -364,6 +364,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/witnesses/{id}", get(get_witness_handler))
             .route("/ws/{ws}/witnesses/{id}/walk", get(walk_mesh_handler))
+            // Playground v1 — Living Paper + gaps surface. Both
+            // delegate to existing QueryEngine methods (see
+            // `engine.rs::regenerate_paper` + `list_gaps_branched`).
+            .route("/ws/{ws}/paper/regenerate", post(paper_regenerate_handler))
+            .route("/ws/{ws}/gaps", get(gaps_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
             .route("/ws/{ws}/readme", get(workspace_readme_handler))
@@ -1397,6 +1402,58 @@ async fn witnesses_by_source_handler(
                 .collect();
             ok_response(body).into_response()
         }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/paper/regenerate` — rerun the Living Paper
+/// synthesiser against the workspace's current Witness Mesh state
+/// without driving a full compile. Returns the rendered paper bytes
+/// (the same content written to `<root>/.thinkingroot/paper.md`).
+async fn paper_regenerate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.regenerate_paper(&ws).await {
+        Ok(output) => ok_response(serde_json::json!({
+            "byte_length": output.byte_length,
+            "sections": output.frontmatter.sections.len(),
+            "markdown": output.markdown,
+        }))
+        .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Query parameters for `GET /api/v1/ws/{ws}/gaps`. All optional —
+/// callers can list every gap by omitting them. Mirrors the MCP `gaps`
+/// tool's argument shape.
+#[derive(serde::Deserialize)]
+struct GapsParams {
+    entity: Option<String>,
+    min_confidence: Option<f64>,
+    branch: Option<String>,
+}
+
+/// `GET /api/v1/ws/{ws}/gaps` — list Phase 9 known-unknowns inferred
+/// from structural co-occurrence patterns. Same shape the MCP `gaps`
+/// tool returns; the Playground "Find gaps" panel renders these
+/// inline.
+async fn gaps_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<GapsParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let min_conf = params.min_confidence.unwrap_or(0.5);
+    let entity = params.entity.as_deref();
+    let branch = params.branch.as_deref();
+    match engine
+        .list_gaps_branched(&ws, entity, min_conf, branch)
+        .await
+    {
+        Ok(rows) => ok_response(rows).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

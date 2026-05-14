@@ -1892,3 +1892,167 @@ export async function playgroundSourceWitnesses(
     sourceId,
   });
 }
+
+// ─── Playground v1 — 8 researcher-facing verbs ────────────────
+
+/** Outcome of `playground_save_note` — surfaces the persisted path
+ * + size so the UI can offer "Reveal in Finder" and the SourceLibrary
+ * refresh picks the note up after the next compile. */
+export interface SaveNoteOutcome {
+  path: string;
+  relative_path: string;
+  bytes: number;
+  /** `true` when a brand-new file was written; `false` when an existing
+   * note at the same path was overwritten. */
+  created: boolean;
+}
+
+/** Persist the AI's reply (or any markdown body) as a note under the
+ * active workspace. Writes atomically — tempfile + rename — and stamps
+ * YAML frontmatter so the next compile attributes provenance correctly. */
+export async function playgroundSaveNote(
+  workspace: string,
+  title: string,
+  body: string,
+): Promise<SaveNoteOutcome> {
+  return invoke<SaveNoteOutcome>("playground_save_note", {
+    workspace,
+    title,
+    body,
+  });
+}
+
+/** Outcome of `playground_open_proposal` — id + branch only. The full
+ * proposal record is fetchable via the existing `proposal_*` commands. */
+export interface OpenProposalOutcome {
+  proposal_id: string;
+  branch: string;
+}
+
+/** Open a Knowledge Proposal under the given branch (Playground default
+ * is `playground`). Delegates to the sidecar's branch-proposals route. */
+export async function playgroundOpenProposal(
+  workspace: string,
+  branch: string,
+  title: string,
+  body: string,
+): Promise<OpenProposalOutcome> {
+  return invoke<OpenProposalOutcome>("playground_open_proposal", {
+    args: { workspace, branch, title, body },
+  });
+}
+
+/** Outcome of `playground_branch_conversation`. */
+export interface BranchConversationOutcome {
+  branch: string;
+  parent: string | null;
+}
+
+/** Create a knowledge branch off `parent` (or `main` when omitted) so
+ * subsequent agent contributions land in an isolated graph. */
+export async function playgroundBranchConversation(
+  workspace: string,
+  name: string,
+  parent?: string,
+  description?: string,
+): Promise<BranchConversationOutcome> {
+  return invoke<BranchConversationOutcome>("playground_branch_conversation", {
+    args: { workspace, name, parent, description },
+  });
+}
+
+/** One quiz row. Citations are real witness ids the answer is grounded
+ * in; empty `citations` ⇒ the underlying retriever returned no
+ * provenance, so the UI surfaces a "low-confidence" tag. */
+export interface QuizItem {
+  question: string;
+  answer: string;
+  citations: string[];
+}
+
+/** Generate a corpus quiz on `topic`. Pipes a quiz-shaped prompt
+ * through the brain.investigate route so cited witness ids are real. */
+export async function playgroundQuiz(
+  workspace: string,
+  topic: string,
+  count?: number,
+): Promise<QuizItem[]> {
+  return invoke<QuizItem[]>("playground_quiz", { workspace, topic, count });
+}
+
+/** Outcome of `playground_export_tr` — absolute pack path + byte count. */
+export interface ExportTrOutcome {
+  path: string;
+  bytes: number;
+}
+
+/** Export the workspace as a `.tr` pack. Default destination is
+ * `~/Downloads/<workspace>.tr`. */
+export async function playgroundExportTr(
+  workspace: string,
+  outPath?: string,
+): Promise<ExportTrOutcome> {
+  return invoke<ExportTrOutcome>("playground_export_tr", {
+    args: { workspace, out_path: outPath },
+  });
+}
+
+/** Hand-off URL + MCP config snippet for external agents. */
+export interface HandoffUrl {
+  url: string;
+  mcp_config_snippet: string;
+}
+
+/** Produce a `tr+mcp://` deep-link plus a paste-ready mcp.json snippet
+ * an external editor agent (Claude Code, Cursor, Codex) can use to
+ * mount this workspace via the local MCP server. */
+export async function playgroundHandoffUrl(
+  workspace: string,
+): Promise<HandoffUrl> {
+  return invoke<HandoffUrl>("playground_handoff_url", { workspace });
+}
+
+/** One row of `playground_gaps` — slim projection of the full
+ * GapReport shape from `thinkingroot-reflect`. */
+export interface GapRow {
+  gap_id: string;
+  entity: string;
+  entity_type: string;
+  missing_claim_type: string;
+  pattern_confidence: number;
+  status: string;
+}
+
+/** List known-unknowns for a workspace. Empty list when reflect hasn't
+ * run yet — empty state is honest, not an error. */
+export async function playgroundGaps(
+  workspace: string,
+  options?: {
+    entity?: string;
+    minConfidence?: number;
+    branch?: string;
+  },
+): Promise<GapRow[]> {
+  return invoke<GapRow[]>("playground_gaps", {
+    workspace,
+    entity: options?.entity,
+    minConfidence: options?.minConfidence,
+    branch: options?.branch,
+  });
+}
+
+/** Outcome of `paper_regenerate` — the rendered paper bytes, so the
+ * UI can refresh the PaperPanel inline without a follow-up `paper_get`. */
+export interface PaperRegenerateOutcome {
+  byte_length: number;
+  sections: number;
+  markdown: string;
+}
+
+/** Rerun the Living Paper synthesiser against the current Witness
+ * Mesh state without driving a full compile. */
+export async function paperRegenerate(
+  workspace: string,
+): Promise<PaperRegenerateOutcome> {
+  return invoke<PaperRegenerateOutcome>("paper_regenerate", { workspace });
+}

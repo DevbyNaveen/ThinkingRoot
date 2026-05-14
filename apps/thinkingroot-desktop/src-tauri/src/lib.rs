@@ -273,6 +273,14 @@ pub fn run() {
             commands::playground::playground_sources,
             commands::playground::playground_witnesses_by_source,
             commands::playground::playground_source_witnesses,
+            commands::playground::playground_save_note,
+            commands::playground::playground_open_proposal,
+            commands::playground::playground_branch_conversation,
+            commands::playground::playground_quiz,
+            commands::playground::playground_export_tr,
+            commands::playground::playground_handoff_url,
+            commands::playground::playground_gaps,
+            commands::playground::paper_regenerate,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

@@ -3992,6 +3992,28 @@ Rules: \
         }
     }
 
+    /// Regenerate the Living Paper (`<root>/.thinkingroot/paper.md`)
+    /// for a workspace without running a full compile. Reads the
+    /// current Witness Mesh state, synthesises the deterministic
+    /// skeleton (plus AI narrative when an LLM is configured), and
+    /// writes the result atomically. Returns the bytes-and-frontmatter
+    /// summary the caller can surface in a toast.
+    pub async fn regenerate_paper(
+        &self,
+        ws: &str,
+    ) -> Result<thinkingroot_paper::PaperOutput> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let now = chrono::Utc::now();
+        thinkingroot_paper::synthesize_and_persist(
+            &storage.graph,
+            &handle.root_path,
+            &handle.name,
+            now,
+        )
+        .map_err(|e| Error::Config(format!("paper regenerate failed: {e}")))
+    }
+
     /// Cross-workspace reflect — aggregate co-occurrence across every
     /// named workspace and apply the resulting patterns to each one.
     /// Useful when no single workspace has enough instances of a given
