@@ -1,9 +1,9 @@
 //! `.tr` file-association handler.
 //!
-//! Stream E — wired against the v3 reader (`tr_format::read_v3_pack`)
-//! and renderer (`tr_render::render_preview`) so the install sheet
-//! shows the actual pack identity / counts / signature status instead
-//! of a stub error.
+//! Wired against the v3 reader (`tr_format::read_v3_pack`) and
+//! renderer (`tr_render::render_preview`) so the install sheet shows
+//! the actual pack identity / counts / signature status instead of a
+//! stub error.
 //!
 //! The trust-tier classification is conservative: signed packs land
 //! at `T1` (Sigstore Bundle present); unsigned packs land at `T0`. The
@@ -28,6 +28,17 @@ pub struct InstallPreview {
     pub source_count: u64,
     pub claim_count: u64,
     pub source_archive_bytes: u64,
+    /// Number of Witness Mesh rows packed in the `.tr` file.
+    /// Zero on `tr/3`/`tr/3.1` packs and `tr/3.2` packs without
+    /// witnesses.
+    pub witness_count: u64,
+    /// First ~500 chars of the Living Paper body (YAML frontmatter
+    /// stripped) when the pack ships `paper.md`. `None` otherwise.
+    pub paper_preview_md: Option<String>,
+    /// `true` iff the pack carries the Witness Mesh pair
+    /// (`witnesses.cbor` + `rule_catalog.toml`) — used to badge a
+    /// pack as "witness-grounded" in the install sheet.
+    pub has_witness_mesh: bool,
 }
 
 #[tauri::command]
@@ -69,5 +80,8 @@ pub async fn install_tr_file(path: String) -> Result<InstallPreview, String> {
         source_count: preview.source_count,
         claim_count: preview.claim_count,
         source_archive_bytes: preview.source_archive_bytes,
+        witness_count: preview.witness_count,
+        paper_preview_md: preview.paper_preview_md,
+        has_witness_mesh: preview.has_witness_mesh,
     })
 }

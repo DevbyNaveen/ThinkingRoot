@@ -107,3 +107,100 @@ fn signed_pack_renders_self_signed_label() {
     );
     assert!(preview.manifest_table.contains("ed25519"));
 }
+
+#[test]
+fn v32_pack_with_witnesses_reports_witness_count_and_badge() {
+    use tr_format::{WitnessRecord, WitnessRecordInput, WitnessRecordSpan};
+
+    let mut b = V3PackBuilder::new(ManifestV3::new(
+        "alice/v32-render",
+        Version::parse("0.1.0").unwrap(),
+    ));
+    b.add_source_file("a.md", b"hello\n").unwrap();
+    for i in 0..3 {
+        b.add_witness(WitnessRecord {
+            id: format!("{:0>64}", format!("w{i:x}")),
+            witness_type: "declares::function".into(),
+            rule: "tree-sitter::function-decl@v1".into(),
+            inputs: vec![WitnessRecordInput::Bytes {
+                file: "a.md".into(),
+                start: 0,
+                end: 5,
+            }],
+            spans: vec![WitnessRecordSpan {
+                file: "a.md".into(),
+                start: 0,
+                end: 5,
+            }],
+            content_blake3: format!("{:0>64}", "abc"),
+            symbol: Some(format!("fn_{i}")),
+            sensitivity: "Public".into(),
+            confidence: 0.99,
+        });
+    }
+    let b = b.with_rule_catalog_toml("catalog_version = \"1.0.0\"\n[rules]\n");
+    let bytes = b.build().unwrap();
+
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
+
+    assert_eq!(preview.witness_count, 3, "render_preview must surface witness count");
+    assert!(
+        preview.has_witness_mesh,
+        "render_preview must flag the witness-mesh pair"
+    );
+    assert!(preview.paper_preview_md.is_none(), "no paper attached");
+}
+
+#[test]
+fn v32_pack_with_paper_strips_frontmatter_in_preview() {
+    let mut b = V3PackBuilder::new(ManifestV3::new(
+        "alice/v32-paper",
+        Version::parse("0.1.0").unwrap(),
+    ));
+    b.add_source_file("a.md", b"hello\n").unwrap();
+    let paper = "\
+---
+paper_version: 1
+workspace: v32-paper
+witness_count: 0
+---
+
+# Living Paper
+
+This is the human-readable opening. The reader should see this, not
+the YAML spine above.
+";
+    let b = b.with_paper(paper);
+    let bytes = b.build().unwrap();
+
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
+
+    let preview_body = preview
+        .paper_preview_md
+        .as_ref()
+        .expect("preview must include paper body when paper.md present");
+    assert!(
+        preview_body.starts_with("# Living Paper"),
+        "preview must strip YAML frontmatter, got: {preview_body:?}"
+    );
+    assert!(
+        !preview_body.contains("paper_version"),
+        "frontmatter keys must not leak into the human preview"
+    );
+}
+
+#[test]
+fn non_v32_pack_has_no_witness_or_paper_fields() {
+    // Regression guard: v3/v3.1 packs (no witnesses, no paper) must
+    // produce empty/zero fields on the preview — never None confused
+    // with "unknown / try harder".
+    let bytes = make_pack();
+    let pack = read_v3_pack(&bytes).unwrap();
+    let preview = render_preview(&pack).unwrap();
+
+    assert_eq!(preview.witness_count, 0);
+    assert!(!preview.has_witness_mesh);
+    assert!(preview.paper_preview_md.is_none());
+}

@@ -15,7 +15,10 @@ use std::io::{Cursor, Read};
 use crate::{
     error::{Error, Result},
     manifest::ManifestV3,
-    writer_v3::{CLAIMS_NAME, MANIFEST_NAME, SIGNATURE_NAME, SOURCE_BUNDLE_NAME},
+    writer_v3::{
+        CLAIMS_NAME, MANIFEST_NAME, PAPER_NAME, RULE_CATALOG_NAME, SIGNATURE_NAME,
+        SOURCE_BUNDLE_NAME, WITNESSES_NAME,
+    },
 };
 
 pub use tr_sigstore::SigstoreBundle;
@@ -38,13 +41,44 @@ pub struct V3Pack {
     /// outer tar; `None` when the pack was emitted unsigned (test
     /// fixtures, `--no-sign` flow).
     pub signature: Option<SigstoreBundle>,
+    /// Raw `witnesses.cbor` payload — canonical-CBOR-encoded
+    /// `Vec<WitnessRecord>` sorted by `id` ASC. `Some` only on
+    /// `tr/3.2` packs. Consumers needing typed witness rows decode
+    /// via `ciborium::from_reader::<Vec<WitnessRecord>>`.
+    pub witnesses_cbor: Option<Vec<u8>>,
+    /// Raw `rule_catalog.toml` payload — verbatim catalog the
+    /// witnesses were derived under. `Some` only on `tr/3.2` packs
+    /// carrying witnesses. Pinning the catalog into the pack lets
+    /// `tr-verify` reject witnesses whose rule names don't exist in
+    /// the shipped catalog (I-W10 / I-W11 contract).
+    pub rule_catalog_toml: Option<Vec<u8>>,
+    /// Raw `paper.md` payload — Living Paper artefact, UTF-8
+    /// markdown with YAML frontmatter. `Some` only on `tr/3.2` packs
+    /// that shipped a per-compile paper. Renderers and the desktop
+    /// install preview consume this byte-for-byte; tampering is
+    /// detected by recomputing `pack_hash`.
+    pub paper_md: Option<Vec<u8>>,
 }
 
 impl V3Pack {
     /// Recompute the BLAKE3 pack hash from this pack's components per
-    /// spec §3.1. Returns `blake3:<hex>` matching the format the
-    /// manifest's `pack_hash` field uses. The verifier asserts this
-    /// equals `manifest.pack_hash` to detect post-sign tampering.
+    /// spec §3.1 (v3 / v3.1) and the witness-mesh design (v3.2).
+    /// Returns `blake3:<hex>` matching the format the manifest's
+    /// `pack_hash` field uses. The verifier asserts this equals
+    /// `manifest.pack_hash` to detect post-sign tampering.
+    ///
+    /// Canonical bytes recipe (matches `writer_v3::prepare_canonical`):
+    /// ```text
+    /// manifest_with_pack_hash_blanked || NUL || source.tar.zst
+    ///   || NUL || claims.jsonl
+    ///   [|| NUL || witnesses.cbor || NUL || rule_catalog.toml]
+    ///   [|| NUL || paper.md]
+    /// ```
+    ///
+    /// Each optional member is chained iff the corresponding `V3Pack`
+    /// field is `Some`. v3 / v3.1 packs leave them `None` and skip
+    /// the trailing legs; v3.2 packs chain the legs whose bodies
+    /// were present in the outer tar.
     pub fn recompute_pack_hash(&self) -> String {
         let canonical = {
             let mut clone = self.manifest.clone();
@@ -52,13 +86,35 @@ impl V3Pack {
             clone.to_canonical_toml()
         };
         let mut input = Vec::with_capacity(
-            canonical.len() + 1 + self.source_archive.len() + 1 + self.claims_jsonl.len(),
+            canonical.len()
+                + 1
+                + self.source_archive.len()
+                + 1
+                + self.claims_jsonl.len()
+                + self.witnesses_cbor.as_ref().map_or(0, |b| b.len() + 1)
+                + self
+                    .rule_catalog_toml
+                    .as_ref()
+                    .map_or(0, |b| b.len() + 1)
+                + self.paper_md.as_ref().map_or(0, |b| b.len() + 1),
         );
         input.extend_from_slice(&canonical);
         input.push(0);
         input.extend_from_slice(&self.source_archive);
         input.push(0);
         input.extend_from_slice(&self.claims_jsonl);
+        if let Some(w) = self.witnesses_cbor.as_ref() {
+            input.push(0);
+            input.extend_from_slice(w);
+        }
+        if let Some(c) = self.rule_catalog_toml.as_ref() {
+            input.push(0);
+            input.extend_from_slice(c);
+        }
+        if let Some(p) = self.paper_md.as_ref() {
+            input.push(0);
+            input.extend_from_slice(p);
+        }
         format!("blake3:{}", crate::digest::blake3_hex(&input))
     }
 }
@@ -111,6 +167,9 @@ pub fn read_v3_pack_with_cap(bytes: &[u8], max_bytes: u64) -> Result<V3Pack> {
     let mut source_bytes: Option<Vec<u8>> = None;
     let mut claims_bytes: Option<Vec<u8>> = None;
     let mut signature_bytes: Option<Vec<u8>> = None;
+    let mut witnesses_cbor: Option<Vec<u8>> = None;
+    let mut rule_catalog_toml: Option<Vec<u8>> = None;
+    let mut paper_md: Option<Vec<u8>> = None;
 
     let mut archive = tar::Archive::new(Cursor::new(bytes));
     let entries = archive.entries().map_err(|e| Error::Invalid {
@@ -142,9 +201,12 @@ pub fn read_v3_pack_with_cap(bytes: &[u8], max_bytes: u64) -> Result<V3Pack> {
             SOURCE_BUNDLE_NAME => source_bytes = Some(buf),
             CLAIMS_NAME => claims_bytes = Some(buf),
             SIGNATURE_NAME => signature_bytes = Some(buf),
+            WITNESSES_NAME => witnesses_cbor = Some(buf),
+            RULE_CATALOG_NAME => rule_catalog_toml = Some(buf),
+            PAPER_NAME => paper_md = Some(buf),
             // Unknown entries are forward-compatible: a future
-            // `tr/3.1` could ship optional sidecars without breaking
-            // current readers. We log + skip rather than reject.
+            // wire-format bump could ship optional sidecars without
+            // breaking current readers. We log + skip rather than reject.
             other => {
                 tracing::debug!(entry = %other, "skipping unknown entry in v3 pack");
             }
@@ -166,6 +228,31 @@ pub fn read_v3_pack_with_cap(bytes: &[u8], max_bytes: u64) -> Result<V3Pack> {
 
     let manifest = ManifestV3::parse(&manifest_bytes)?;
 
+    // v3.2 packs that carry witnesses MUST also carry the rule catalog
+    // (and vice versa) — `tr-verify` cannot validate Witness Mesh
+    // rule references without the catalog, and a catalog without
+    // witnesses serves no purpose. Refuse half-pairs at read time
+    // rather than letting them slip through to a confused verifier.
+    match (witnesses_cbor.as_ref(), rule_catalog_toml.as_ref()) {
+        (Some(_), None) => {
+            return Err(Error::Invalid {
+                what: "package.tr",
+                detail: format!(
+                    "v3.2 pack has `{WITNESSES_NAME}` but is missing `{RULE_CATALOG_NAME}`"
+                ),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(Error::Invalid {
+                what: "package.tr",
+                detail: format!(
+                    "v3.2 pack has `{RULE_CATALOG_NAME}` but is missing `{WITNESSES_NAME}`"
+                ),
+            });
+        }
+        _ => {}
+    }
+
     let signature = match signature_bytes {
         Some(bytes) => Some(
             serde_json::from_slice::<SigstoreBundle>(&bytes).map_err(|e| Error::Invalid {
@@ -181,6 +268,9 @@ pub fn read_v3_pack_with_cap(bytes: &[u8], max_bytes: u64) -> Result<V3Pack> {
         source_archive,
         claims_jsonl,
         signature,
+        witnesses_cbor,
+        rule_catalog_toml,
+        paper_md,
     })
 }
 
@@ -353,6 +443,180 @@ mod tests {
             pack.recompute_pack_hash(),
             pack.manifest.pack_hash,
             "byte tampering must surface as a hash divergence"
+        );
+    }
+
+    // ── v3.2 reader expansion (witnesses + rule catalog + paper) ────
+
+    fn fixture_witness_record(id_seed: u8) -> crate::WitnessRecord {
+        crate::WitnessRecord {
+            id: format!("{:0>64}", format!("a{id_seed:x}")),
+            witness_type: "declares::function".into(),
+            rule: "tree-sitter::function-decl@v1".into(),
+            inputs: vec![crate::WitnessRecordInput::Bytes {
+                file: "hello.md".into(),
+                start: 0,
+                end: 8,
+            }],
+            spans: vec![crate::WitnessRecordSpan {
+                file: "hello.md".into(),
+                start: 0,
+                end: 8,
+            }],
+            content_blake3: format!("{:0>64}", "deadbeef"),
+            symbol: Some("hello".into()),
+            sensitivity: "Public".into(),
+            confidence: 0.99,
+        }
+    }
+
+    fn fixture_v32_pack(with_witnesses: bool, with_paper: bool) -> Vec<u8> {
+        let mut b = V3PackBuilder::new(ManifestV3::new(
+            "alice/v32-reader-test",
+            Version::parse("1.0.0").unwrap(),
+        ));
+        b.add_source_file("hello.md", b"# Hello\n").unwrap();
+        b.add_claim(ClaimRecord::new(
+            "c-1",
+            "Greeting",
+            vec!["Hello".into()],
+            "hello.md",
+            0,
+            8,
+        ));
+        if with_witnesses {
+            b.add_witness(fixture_witness_record(1));
+            b.add_witness(fixture_witness_record(2));
+            b = b.with_rule_catalog_toml("catalog_version = \"1.0.0\"\n[rules]\n");
+        }
+        if with_paper {
+            b = b.with_paper(
+                "---\npaper_version: 1\nworkspace: v32-reader-test\n---\n\n# Living Paper\n\nHello.\n",
+            );
+        }
+        b.build().unwrap()
+    }
+
+    #[test]
+    fn v32_read_round_trip_returns_witnesses_catalog_and_paper() {
+        let bytes = fixture_v32_pack(true, true);
+        let pack = read_v3_pack(&bytes).unwrap();
+
+        assert_eq!(pack.manifest.format_version, crate::FORMAT_VERSION_V32);
+        assert!(
+            pack.witnesses_cbor.is_some(),
+            "v3.2 pack must surface witnesses.cbor through the reader"
+        );
+        assert!(
+            pack.rule_catalog_toml.is_some(),
+            "v3.2 pack must surface rule_catalog.toml through the reader"
+        );
+        assert!(
+            pack.paper_md.is_some(),
+            "v3.2 pack with paper.md must surface paper through the reader"
+        );
+
+        let paper = std::str::from_utf8(pack.paper_md.as_ref().unwrap()).unwrap();
+        assert!(paper.starts_with("---\npaper_version: 1"));
+        assert!(paper.contains("# Living Paper"));
+    }
+
+    #[test]
+    fn v32_recompute_pack_hash_chains_v32_members() {
+        // The v3.2 canonical chain must include witnesses + catalog +
+        // paper — otherwise a reader's recompute and the writer's
+        // pack_hash diverge by construction. Pin the symmetry here.
+        let bytes = fixture_v32_pack(true, true);
+        let pack = read_v3_pack(&bytes).unwrap();
+        assert_eq!(
+            pack.recompute_pack_hash(),
+            pack.manifest.pack_hash,
+            "v3.2 reader's recomputed pack_hash must match the writer's declared pack_hash"
+        );
+    }
+
+    #[test]
+    fn v32_paper_only_round_trip_excludes_witnesses() {
+        // A pack may ship a Living Paper without witnesses (e.g. a
+        // prose-only workspace where no extractor fired). The reader
+        // must surface the paper and leave witness fields None.
+        let bytes = fixture_v32_pack(false, true);
+        let pack = read_v3_pack(&bytes).unwrap();
+
+        assert!(pack.witnesses_cbor.is_none());
+        assert!(pack.rule_catalog_toml.is_none());
+        assert!(pack.paper_md.is_some());
+        assert_eq!(pack.manifest.format_version, crate::FORMAT_VERSION_V32);
+        assert_eq!(pack.recompute_pack_hash(), pack.manifest.pack_hash);
+    }
+
+    #[test]
+    fn v32_paper_tampering_is_detected_by_pack_hash() {
+        let bytes = fixture_v32_pack(false, true);
+        let mut tampered = bytes.clone();
+        // Flip one byte inside the paper body.
+        let needle = b"Hello.";
+        let pos = tampered
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("fixture paper must contain the marker");
+        tampered[pos] ^= 0x01;
+
+        let pack = read_v3_pack(&tampered).unwrap();
+        assert_ne!(
+            pack.recompute_pack_hash(),
+            pack.manifest.pack_hash,
+            "paper.md tampering must surface as a hash divergence"
+        );
+    }
+
+    #[test]
+    fn v32_reader_refuses_witnesses_without_catalog() {
+        // Build a tar manually that has witnesses but no rule_catalog.
+        // This is the half-pair forbidden state — the reader's job is
+        // to refuse it before tr-verify gets a confusing input.
+        use crate::ManifestV3;
+        let mut b = V3PackBuilder::new(ManifestV3::new(
+            "alice/half-pair",
+            Version::parse("1.0.0").unwrap(),
+        ));
+        b.add_source_file("hello.md", b"# Hello\n").unwrap();
+        b.add_witness(fixture_witness_record(5));
+        b = b.with_rule_catalog_toml("catalog_version = \"1.0.0\"\n[rules]\n");
+        let valid = b.build().unwrap();
+
+        // Strip the rule_catalog.toml entry from the outer tar.
+        let stripped = {
+            let mut out = Vec::new();
+            {
+                let cursor = std::io::Cursor::new(&mut out);
+                let mut tar_b = tar::Builder::new(cursor);
+                tar_b.mode(tar::HeaderMode::Deterministic);
+                let mut archive = tar::Archive::new(std::io::Cursor::new(&valid));
+                for entry in archive.entries().unwrap() {
+                    let mut entry = entry.unwrap();
+                    let path = entry.path().unwrap().to_string_lossy().into_owned();
+                    if path == RULE_CATALOG_NAME {
+                        continue;
+                    }
+                    let mut body = Vec::new();
+                    std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(body.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_cksum();
+                    tar_b.append_data(&mut header, &path, &body[..]).unwrap();
+                }
+                tar_b.finish().unwrap();
+            }
+            out
+        };
+
+        let err = read_v3_pack(&stripped).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(WITNESSES_NAME) && msg.contains(RULE_CATALOG_NAME),
+            "error must point at the missing catalog: {msg}"
         );
     }
 }

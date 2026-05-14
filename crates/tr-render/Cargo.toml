@@ -15,6 +15,10 @@ path = "src/lib.rs"
 [dependencies]
 tr-format = { workspace = true }
 thiserror = { workspace = true }
+# Used to count witness rows for the v3.2 install preview by parsing
+# `witnesses.cbor`'s outer array length (header-only walk; no allocation
+# of per-row fields). Matches the encoder choice in `tr-format`.
+ciborium = "0.2"
 
 [dev-dependencies]
 semver = { version = "1", features = ["serde"] }

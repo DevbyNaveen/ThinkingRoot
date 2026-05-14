@@ -8634,6 +8634,7 @@ dependencies = [
 name = "tr-render"
 version = "0.9.1"
 dependencies = [
+ "ciborium",
  "thiserror 2.0.18",
  "tr-format",
 ]

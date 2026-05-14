@@ -85,6 +85,11 @@ struct CanonicalPack {
     /// The verbatim TOML the builder was staged with via
     /// `with_rule_catalog_toml`.
     rule_catalog_toml: Option<Vec<u8>>,
+    /// `paper.md` body for v3.2 packs. `None` when no Living Paper
+    /// was staged. UTF-8 markdown with YAML frontmatter; emitted
+    /// verbatim into the outer tar AND chained into `pack_hash`
+    /// after `rule_catalog.toml`.
+    paper_md: Option<Vec<u8>>,
 }
 
 /// Path of the inner source bundle inside the outer `.tr` tar.
@@ -102,6 +107,13 @@ pub const WITNESSES_NAME: &str = "witnesses.cbor";
 /// Path of the rule catalog inside the outer `.tr` tar — present only
 /// in v3.2 packs alongside `witnesses.cbor`.
 pub const RULE_CATALOG_NAME: &str = "rule_catalog.toml";
+/// Path of the Living Paper inside the outer `.tr` tar — present only
+/// in v3.2 packs that ship the per-compile `paper.md` artefact. The
+/// paper is a single file with YAML frontmatter (machine-readable) +
+/// markdown body (human-readable, includes Mermaid diagrams). When
+/// present, its bytes are appended to the pack-hash canonical chain
+/// after `rule_catalog.toml`.
+pub const PAPER_NAME: &str = "paper.md";
 
 /// Programmatic builder for a v3 `.tr` pack. Cheaply constructed; build
 /// via [`V3PackBuilder::build`] when ready.
@@ -126,6 +138,12 @@ pub struct V3PackBuilder {
     /// `manifest.derived_hashes[].kind = "rule_catalog.toml.blake3"`
     /// so a tampered catalog fails `tr-verify`.
     rule_catalog_toml: Option<String>,
+    /// Optional `paper.md` body for `tr/3.2` packs (Living Paper). When
+    /// present, the bytes are appended to the canonical hash chain
+    /// after `rule_catalog.toml`, and emitted as the `paper.md` entry
+    /// in the outer tar between `rule_catalog.toml` and any
+    /// `signature.sig`. Triggers v3.2 wire-format on `build()`.
+    paper_md: Option<String>,
 }
 
 impl V3PackBuilder {
@@ -139,6 +157,7 @@ impl V3PackBuilder {
             inner_zstd_level: 3,
             witnesses: Vec::new(),
             rule_catalog_toml: None,
+            paper_md: None,
         }
     }
 
@@ -170,12 +189,27 @@ impl V3PackBuilder {
         self
     }
 
+    /// Stage the Living Paper body (`paper.md`) for inclusion in this
+    /// pack. When set, the verbatim bytes become the `paper.md` entry
+    /// in the outer tar AND extend the canonical hash chain after
+    /// `rule_catalog.toml`, so any tampering — even byte-level
+    /// rewrites of the prose — invalidates `pack_hash`. Triggers
+    /// v3.2 wire-format on `build()`.
+    pub fn with_paper(mut self, paper: impl Into<String>) -> Self {
+        self.paper_md = Some(paper.into());
+        self
+    }
+
     /// True iff this builder will emit a v3.2 pack rather than a
-    /// v3 / v3.1 pack. v3.2 mode activates when either witnesses
-    /// have been staged or a rule catalog has been attached — both
-    /// are required by `build()` once either is present.
+    /// v3 / v3.1 pack. v3.2 mode activates when witnesses have been
+    /// staged, a rule catalog has been attached, OR a Living Paper
+    /// body has been attached. The first two are paired (build()
+    /// requires the catalog when witnesses are present); the paper
+    /// is independent — a pack with only a paper is still v3.2.
     pub fn is_v32(&self) -> bool {
-        !self.witnesses.is_empty() || self.rule_catalog_toml.is_some()
+        !self.witnesses.is_empty()
+            || self.rule_catalog_toml.is_some()
+            || self.paper_md.is_some()
     }
 
     /// Encode the staged witnesses as canonical CBOR. The output is
@@ -250,6 +284,7 @@ impl V3PackBuilder {
             None,
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
+            prepared.paper_md.as_deref(),
         )
     }
 
@@ -293,42 +328,50 @@ impl V3PackBuilder {
         );
         self.manifest.claim_count = Some(self.claims.len() as u64);
 
-        // ── Witness Mesh v3.2 extension ───────────────────────────
-        // Encode witnesses + record rule catalog; both bodies feed
-        // into the canonical bytes recipe AND surface as new
-        // `derived_hashes` entries so `tr-verify` can re-check them
-        // independently of the pack hash.
-        let (witnesses_cbor, rule_catalog_toml_bytes) = if self.is_v32() {
-            let witnesses = self.encode_witnesses_cbor()?;
-            let catalog_str = self.rule_catalog_toml.clone().ok_or_else(|| {
-                Error::Invalid {
-                    what: "rule_catalog.toml",
-                    detail: "v3.2 pack requires a rule catalog; call \
-                             `V3PackBuilder::with_rule_catalog_toml` before `build`"
-                        .into(),
-                }
-            })?;
-            let catalog = catalog_str.into_bytes();
-            // Bump format version to v3.2. The witness + catalog
-            // bodies' BLAKE3 are implicitly covered by `pack_hash`
-            // via the canonical_bytes recipe extension below — no
-            // separate `derived_hashes` entries are needed for tamper
-            // detection. (The top-level `ManifestV3` does not carry
-            // a pack-wide `derived_hashes` field today; the
-            // per-`SourceEntry` `derived_hashes` is unrelated to
-            // pack-level Witness Mesh artefacts.)
+        // ── Witness Mesh + Living Paper v3.2 extension ────────────
+        // Encode witnesses + record rule catalog + (optional) paper;
+        // every body feeds into the canonical bytes recipe so any
+        // tampering invalidates `pack_hash`. The witness+catalog pair
+        // moves together (the catalog explains what every Witness's
+        // rule means); the paper is independent — a v3.2 pack may
+        // ship a paper without witnesses, or witnesses without a
+        // paper.
+        let (witnesses_cbor, rule_catalog_toml_bytes) =
+            if !self.witnesses.is_empty() || self.rule_catalog_toml.is_some() {
+                let witnesses = self.encode_witnesses_cbor()?;
+                let catalog_str = self.rule_catalog_toml.clone().ok_or_else(|| {
+                    Error::Invalid {
+                        what: "rule_catalog.toml",
+                        detail: "v3.2 pack with witnesses requires a rule catalog; call \
+                                 `V3PackBuilder::with_rule_catalog_toml` before `build`"
+                            .into(),
+                    }
+                })?;
+                (Some(witnesses), Some(catalog_str.into_bytes()))
+            } else {
+                (None, None)
+            };
+        let paper_md_bytes = self.paper_md.as_ref().map(|s| s.as_bytes().to_vec());
+        if self.is_v32() {
+            // Any v3.2 trigger (witnesses, catalog, OR paper) bumps the
+            // format version. The bodies' BLAKE3 are implicitly covered
+            // by `pack_hash` via the canonical_bytes recipe extension
+            // below — no separate `derived_hashes` entries are needed
+            // for pack-level tamper detection. (Per-`SourceEntry`
+            // `derived_hashes` is unrelated to pack-level Witness Mesh
+            // + Living Paper artefacts.)
             self.manifest.format_version = crate::FORMAT_VERSION_V32.to_string();
-            (Some(witnesses), Some(catalog))
-        } else {
-            (None, None)
-        };
+        }
 
         let canonical_manifest = self.manifest.canonical_bytes_for_hashing();
         // Canonical bytes recipe:
         //   manifest || NUL || source.tar.zst || NUL || claims.jsonl
         // v3.2 extension (append in fixed order so the recipe is
         // invariant across runs):
-        //   || NUL || witnesses.cbor || NUL || rule_catalog.toml
+        //   [|| NUL || witnesses.cbor || NUL || rule_catalog.toml]
+        //   [|| NUL || paper.md]
+        // Each optional pair is independent: a pack may ship witnesses
+        // without a paper, a paper without witnesses, or both.
         let mut canonical_bytes = Vec::with_capacity(
             canonical_manifest.len()
                 + 1
@@ -338,7 +381,8 @@ impl V3PackBuilder {
                 + witnesses_cbor.as_ref().map_or(0, |b| b.len() + 1)
                 + rule_catalog_toml_bytes
                     .as_ref()
-                    .map_or(0, |b| b.len() + 1),
+                    .map_or(0, |b| b.len() + 1)
+                + paper_md_bytes.as_ref().map_or(0, |b| b.len() + 1),
         );
         canonical_bytes.extend_from_slice(&canonical_manifest);
         canonical_bytes.push(0);
@@ -353,6 +397,10 @@ impl V3PackBuilder {
             canonical_bytes.push(0);
             canonical_bytes.extend_from_slice(c);
         }
+        if let Some(ref p) = paper_md_bytes {
+            canonical_bytes.push(0);
+            canonical_bytes.extend_from_slice(p);
+        }
         let pack_hash = format!("blake3:{}", blake3_hex(&canonical_bytes));
         self.manifest.pack_hash = pack_hash.clone();
 
@@ -366,6 +414,7 @@ impl V3PackBuilder {
             pack_hash,
             witnesses_cbor,
             rule_catalog_toml: rule_catalog_toml_bytes,
+            paper_md: paper_md_bytes,
         })
     }
 
@@ -412,6 +461,7 @@ impl V3PackBuilder {
             Some(&bundle_bytes),
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
+            prepared.paper_md.as_deref(),
         )
     }
 
@@ -459,6 +509,7 @@ impl V3PackBuilder {
             Some(&bundle_bytes),
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
+            prepared.paper_md.as_deref(),
         )
     }
 
@@ -507,8 +558,12 @@ impl V3PackBuilder {
     }
 }
 
-/// Emit the outer tar for a v3 pack. Used by both `build` (no
-/// signature) and `build_signed` (4th entry `signature.sig`).
+/// Emit the outer tar for a v3 pack. Used by `build` (no signature),
+/// `build_signed` (Ed25519 self-signed), and `build_with_signer`
+/// (Sigstore-keyless DSSE). v3.2 packs may interleave any of
+/// `witnesses.cbor`, `rule_catalog.toml`, and `paper.md` between
+/// `claims.jsonl` and the optional `signature.sig`. Entry order is
+/// fixed for reproducibility.
 fn emit_outer_tar(
     manifest_toml: &[u8],
     source_tar_zst: &[u8],
@@ -516,6 +571,7 @@ fn emit_outer_tar(
     signature_sig: Option<&[u8]>,
     witnesses_cbor: Option<&[u8]>,
     rule_catalog_toml: Option<&[u8]>,
+    paper_md: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut outer = Vec::with_capacity(
         manifest_toml.len()
@@ -524,6 +580,7 @@ fn emit_outer_tar(
             + signature_sig.map(<[u8]>::len).unwrap_or(0)
             + witnesses_cbor.map(<[u8]>::len).unwrap_or(0)
             + rule_catalog_toml.map(<[u8]>::len).unwrap_or(0)
+            + paper_md.map(<[u8]>::len).unwrap_or(0)
             + 4096,
     );
     {
@@ -532,10 +589,11 @@ fn emit_outer_tar(
         tar_builder.mode(HeaderMode::Deterministic);
         // Tar entry order is fixed for reproducibility:
         //   manifest.toml, source.tar.zst, claims.jsonl,
-        //   [witnesses.cbor], [rule_catalog.toml],
+        //   [witnesses.cbor], [rule_catalog.toml], [paper.md],
         //   [signature.sig].
         // v3 packs stop at claims.jsonl; v3.2 inserts the Witness
-        // Mesh members between claims.jsonl and signature.sig.
+        // Mesh + Living Paper members between claims.jsonl and
+        // signature.sig.
         append_file(&mut tar_builder, MANIFEST_NAME, manifest_toml)?;
         append_file(&mut tar_builder, SOURCE_BUNDLE_NAME, source_tar_zst)?;
         append_file(&mut tar_builder, CLAIMS_NAME, claims_jsonl)?;
@@ -544,6 +602,9 @@ fn emit_outer_tar(
         }
         if let Some(c) = rule_catalog_toml {
             append_file(&mut tar_builder, RULE_CATALOG_NAME, c)?;
+        }
+        if let Some(p) = paper_md {
+            append_file(&mut tar_builder, PAPER_NAME, p)?;
         }
         if let Some(sig) = signature_sig {
             append_file(&mut tar_builder, SIGNATURE_NAME, sig)?;
