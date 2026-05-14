@@ -53,6 +53,7 @@ import { cn } from "@/lib/utils";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
+import { transformCitations } from "@/components/playground/CitationChip";
 import {
   pickPrimaryDiagnostic,
   useWorkspaceStatus,
@@ -1332,10 +1333,18 @@ function MessageBubble({
                   </code>
                 );
               },
-              p: ({ children }) => <p className="mb-4 last:mb-0 leading-relaxed">{children}</p>,
+              p: ({ children }) => (
+                <p className="mb-4 last:mb-0 leading-relaxed">
+                  {transformCitations(children)}
+                </p>
+              ),
               ul: ({ children }) => <ul className="mb-4 list-disc pl-6 last:mb-0 space-y-1">{children}</ul>,
               ol: ({ children }) => <ol className="mb-4 list-decimal pl-6 last:mb-0 space-y-1">{children}</ol>,
-              li: ({ children }) => <li className="mb-1 leading-relaxed">{children}</li>,
+              li: ({ children }) => (
+                <li className="mb-1 leading-relaxed">
+                  {transformCitations(children)}
+                </li>
+              ),
               h1: ({ children }) => <h1 className="mb-4 mt-6 text-2xl font-bold">{children}</h1>,
               h2: ({ children }) => <h2 className="mb-4 mt-6 text-xl font-bold border-b border-border/50 pb-2">{children}</h2>,
               h3: ({ children }) => <h3 className="mb-4 mt-4 text-lg font-bold">{children}</h3>,

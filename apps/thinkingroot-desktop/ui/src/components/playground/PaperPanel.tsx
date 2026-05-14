@@ -8,6 +8,7 @@ import {
   paperRegenerate,
   type PaperPayload,
 } from "@/lib/tauri";
+import { transformCitations } from "@/components/playground/CitationChip";
 import { cn } from "@/lib/utils";
 
 /**
@@ -165,7 +166,16 @@ export function PaperPanel({
         </div>
       </header>
       <div className="prose prose-sm dark:prose-invert max-w-none flex-1 overflow-auto px-6 py-4">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            p: ({ children }) => <p>{transformCitations(children)}</p>,
+            li: ({ children }) => <li>{transformCitations(children)}</li>,
+            td: ({ children }) => <td>{transformCitations(children)}</td>,
+          }}
+        >
+          {body}
+        </ReactMarkdown>
       </div>
     </div>
   );
