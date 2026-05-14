@@ -174,3 +174,59 @@ pub async fn playground_ensure(app: AppHandle) -> Result<PlaygroundView, String>
     let _ = app.emit("workspaces-changed", true);
     Ok(view)
 }
+
+/// Living Paper payload returned by [`paper_get`]. The frontend
+/// renders `markdown` via ReactMarkdown + Mermaid plugin; `path`
+/// surfaces the on-disk location for the "open in editor" affordance.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaperPayload {
+    /// On-disk path of the paper.md the engine wrote (always
+    /// `<workspace>/.thinkingroot/paper.md`).
+    pub path: String,
+    /// Whether the file actually exists. `false` means the
+    /// workspace hasn't compiled yet (or Phase 10b failed and
+    /// `.thinkingroot/paper.md` is absent — the synthesis is
+    /// non-fatal per the pipeline's honesty rule).
+    pub exists: bool,
+    /// File contents — verbatim YAML frontmatter + markdown body.
+    /// Empty string when `exists == false`.
+    pub markdown: String,
+}
+
+/// Tauri command: read the Living Paper for a workspace by name.
+///
+/// Resolves the workspace's on-disk root via [`WorkspaceRegistry`],
+/// then reads `<root>/.thinkingroot/paper.md` synchronously off the
+/// main thread (the file caps at a few KiB on real workspaces).
+/// Returns a `PaperPayload` whose `exists` flag tells the UI
+/// whether the workspace has compiled at least once.
+#[tauri::command]
+pub async fn paper_get(workspace: String) -> Result<PaperPayload, String> {
+    let payload = tokio::task::spawn_blocking(move || -> Result<PaperPayload, String> {
+        let registry = WorkspaceRegistry::load()
+            .map_err(|e| format!("workspace registry load: {e}"))?;
+        let entry = registry
+            .workspaces
+            .into_iter()
+            .find(|e| e.name == workspace)
+            .ok_or_else(|| format!("workspace `{workspace}` not registered"))?;
+        let path = entry.path.join(".thinkingroot").join("paper.md");
+        if !path.exists() {
+            return Ok(PaperPayload {
+                path: path.to_string_lossy().into_owned(),
+                exists: false,
+                markdown: String::new(),
+            });
+        }
+        let markdown = fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        Ok(PaperPayload {
+            path: path.to_string_lossy().into_owned(),
+            exists: true,
+            markdown,
+        })
+    })
+    .await
+    .map_err(|e| format!("paper_get task panicked: {e}"))??;
+    Ok(payload)
+}

@@ -29,7 +29,13 @@ export type WorkspaceInspectorPage = "readme" | "folder";
  * inspector rail are coordinated from here for palette shortcuts.
  * Legacy persisted value `"branches"` is normalized to `"chats"` on
  * rehydrate — branch tooling lives on the Compile rail tab. */
-export type Surface = "chats" | "settings" | "docs" | "brain" | "privacy";
+export type Surface =
+  | "chats"
+  | "playground"
+  | "settings"
+  | "docs"
+  | "brain"
+  | "privacy";
 
 /** Left-rail categories when the main pane is on Settings. */
 export type SettingsSectionId =

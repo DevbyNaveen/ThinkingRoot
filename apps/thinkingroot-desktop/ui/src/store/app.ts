@@ -48,6 +48,7 @@ function normalizeSurface(surface: unknown): Surface {
   if (surface === "branches") return "chats";
   if (
     surface === "chats" ||
+    surface === "playground" ||
     surface === "settings" ||
     surface === "docs" ||
     surface === "brain" ||

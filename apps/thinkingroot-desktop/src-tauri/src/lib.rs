@@ -259,6 +259,7 @@ pub fn run() {
             commands::browser_save::browser_save_page,
             commands::browser_save::browser_extract_callback,
             commands::playground::playground_ensure,
+            commands::playground::paper_get,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())
