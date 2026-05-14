@@ -1,5 +1,6 @@
 import type { ElementType } from "react";
 import {
+  FlaskConical,
   MessageSquareText,
   ShieldCheck,
   SlidersHorizontal,
@@ -24,13 +25,19 @@ interface RailItem {
 
 const TOP: RailItem[] = [
   { id: "chats", label: "Conversations", Icon: MessageSquareText, hint: "⌘1" },
-  { id: "brain", label: "Knowledge", Icon: KnowledgeMark, hint: "⌘2" },
+  {
+    id: "playground",
+    label: "Playground",
+    Icon: FlaskConical,
+    hint: "⌘2",
+  },
+  { id: "brain", label: "Knowledge", Icon: KnowledgeMark, hint: "⌘3" },
   // "satellites" (multi-agent orbit view) and "trace" (Ed25519 trace
   // log) lived here pre-transplant; both are helloroot-only concepts
   // (see CLAUDE.md "Desktop transplant uses helloroot's shell, NOT
   // its multi-agent framework").  Removed as part of the v0.1
   // residue-cleanup pass.
-  { id: "privacy", label: "Privacy", Icon: ShieldCheck, hint: "⌘3" },
+  { id: "privacy", label: "Privacy", Icon: ShieldCheck, hint: "⌘4" },
 ];
 
 const BOTTOM: RailItem[] = [

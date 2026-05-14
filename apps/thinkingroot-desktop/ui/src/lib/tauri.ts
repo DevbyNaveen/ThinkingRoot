@@ -1796,3 +1796,19 @@ export interface PlaygroundView {
 export async function playgroundEnsure(): Promise<PlaygroundView> {
   return invoke<PlaygroundView>("playground_ensure");
 }
+
+/** Living Paper payload returned by `paper_get`. `exists == false`
+ * honestly signals that the workspace hasn't compiled yet (or
+ * Phase 10b synthesis failed; the paper is non-fatal). */
+export interface PaperPayload {
+  path: string;
+  exists: boolean;
+  markdown: string;
+}
+
+/** Read the Living Paper for a workspace by name. Resolves the
+ * workspace via the on-disk WorkspaceRegistry, reads
+ * `<root>/.thinkingroot/paper.md` off the main thread. */
+export async function paperGet(workspace: string): Promise<PaperPayload> {
+  return invoke<PaperPayload>("paper_get", { workspace });
+}

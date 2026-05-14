@@ -23,6 +23,7 @@ import {
   Code2,
   Command,
   Copy,
+  FlaskConical,
   Cpu,
   DollarSign,
   Download,
@@ -119,10 +120,18 @@ export interface CommandDef {
   keywords?: string[];
 }
 
-const SURFACE_IDS: Surface[] = ["chats", "brain", "privacy", "settings", "docs"];
+const SURFACE_IDS: Surface[] = [
+  "chats",
+  "playground",
+  "brain",
+  "privacy",
+  "settings",
+  "docs",
+];
 
 const SURFACE_ICONS: Record<Surface, LucideIcon> = {
   chats: Activity,
+  playground: FlaskConical,
   brain: Brain,
   privacy: ShieldCheck,
   settings: SettingsIcon,

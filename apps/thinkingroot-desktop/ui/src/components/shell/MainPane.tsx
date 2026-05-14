@@ -1,11 +1,12 @@
 import { ChatView } from "@/components/chat/ChatView";
 import { DocsView } from "@/components/docs/DocsView";
+import { PlaygroundView } from "@/components/playground/PlaygroundView";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { useApp } from "@/store/app";
 
 /**
- * Main working area — always Chat or Settings.
- * Brain / Branches / Privacy have moved to the resizable right panel.
+ * Main working area — Chat / Playground / Settings / Docs.
+ * Brain / Branches / Privacy live in the resizable right panel.
  */
 export function MainPane() {
   const surface = useApp((s) => s.surface);
@@ -17,6 +18,8 @@ export function MainPane() {
           <SettingsView />
         ) : surface === "docs" ? (
           <DocsView />
+        ) : surface === "playground" ? (
+          <PlaygroundView />
         ) : (
           <ChatView />
         )}
