@@ -48,7 +48,10 @@ const FINGERPRINT_BUCKETS: usize = 32;
 /// File extensions this module accepts. Walker / parser wire-through
 /// uses the same set.
 pub const AUDIO_EXTENSIONS: &[&str] =
-    &["wav", "flac", "mp3", "ogg", "opus", "m4a", "aac", "mp4"];
+    &["wav", "flac", "mp3", "ogg", "opus", "m4a", "aac"];
+// Note: `.mp4` is intentionally NOT in this list — it routes to
+// `video_rules` since the dominant use is video, and the M4A
+// extension covers audio-only ISOBMFF.
 
 /// True when `ext` is a recognised audio extension (lower-case
 /// comparison; caller normalises the dot off).

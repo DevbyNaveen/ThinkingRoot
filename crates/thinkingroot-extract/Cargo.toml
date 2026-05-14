@@ -40,6 +40,11 @@ symphonia = { version = "0.5", default-features = false, features = [
     "wav", "pcm", "flac", "mp3", "vorbis", "ogg", "isomp4", "aac"
 ] }
 rustfft = "6"
+# Video-family rules — pure-Rust MP4/ISOBMFF demuxer. Firefox's
+# production demuxer; covers MP4 / MOV / 3GP containers. Other
+# containers (WebM, MKV, AVI) emit `video::skipped@v1` honest
+# absence rather than blocking compile on unsupported codecs.
+mp4 = "0.14"
 
 [build-dependencies]
 # build.rs reads Cargo.lock at the workspace root and pins each

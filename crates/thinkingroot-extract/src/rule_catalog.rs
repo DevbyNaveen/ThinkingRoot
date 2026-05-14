@@ -50,7 +50,7 @@ include!(concat!(env!("OUT_DIR"), "/grammar_versions.rs"));
 /// `1.2.0` — added audio-family rules: duration / sample-rate /
 /// channels metadata, spectral fingerprint via FFT, decode-fail
 /// honest absence. Pure-Rust via symphonia + rustfft.
-pub const CATALOG_VERSION: &str = "1.2.0";
+pub const CATALOG_VERSION: &str = "1.3.0";
 
 /// One rule in the catalog. The `'static` lifetime everywhere is
 /// load-bearing: descriptors live in a `phf` static map and the
@@ -818,6 +818,70 @@ pub static RULE_CATALOG: phf::Map<&'static str, RuleDescriptor> = phf::phf_map! 
         default_confidence: 0.99,
         default_sensitivity: "Public",
         description: "Audio format unsupported / decode failed — honest absence (mirrors image::skipped@v1)",
+    },
+
+    // ─── Video family (catalog v1.3) ──────────────────────────────
+    //
+    // Pure-Rust demux of MP4 / MOV / 3GP via the `mp4` crate. v1
+    // ships demux-only — per-keyframe perceptual hashing requires a
+    // pixel decoder (transitively pulls in heavy C/C++ deps), so
+    // every video rule is byte-anchored on container metadata, never
+    // on decoded pixel data. Other containers (WebM, MKV, AVI) emit
+    // `video::skipped@v1` rather than failing compile.
+    "video::duration@v1" => RuleDescriptor {
+        name: "video::duration@v1",
+        family: "video",
+        input_types: &["raw_bytes"],
+        output_type: "video::duration",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Movie duration + track summary (video/audio track counts) from the mp4 mvhd box",
+    },
+    "video::keyframe@v1" => RuleDescriptor {
+        name: "video::keyframe@v1",
+        family: "video",
+        input_types: &["raw_bytes"],
+        output_type: "video::keyframe",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "One witness per sync sample (I-frame) — byte-anchored to the sample's offset+size when known, timestamp from the codec timescale",
+    },
+    "video::keyframe-overflow@v1" => RuleDescriptor {
+        name: "video::keyframe-overflow@v1",
+        family: "video",
+        input_types: &["raw_bytes"],
+        output_type: "video::keyframe",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Emitted when a file produces more keyframes than the per-file cap — records the truncation count so the workspace stays honest about partial extraction",
+    },
+    "video::scene-change@v1" => RuleDescriptor {
+        name: "video::scene-change@v1",
+        family: "video",
+        input_types: &["raw_bytes"],
+        output_type: "video::scene-change",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Inferred scene cut — pair of consecutive keyframes whose temporal gap exceeds the threshold (most encoders insert keyframes at scene boundaries)",
+    },
+    "video::skipped@v1" => RuleDescriptor {
+        name: "video::skipped@v1",
+        family: "video",
+        input_types: &["raw_bytes"],
+        output_type: "video::skipped",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.99,
+        default_sensitivity: "Public",
+        description: "Video container not demuxable (WebM/MKV/AVI) or parse failed — honest absence (mirrors audio::skipped@v1)",
     },
 };
 

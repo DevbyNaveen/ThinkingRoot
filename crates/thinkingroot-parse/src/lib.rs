@@ -1,4 +1,5 @@
 pub mod audio_meta;
+pub mod video_meta;
 pub mod code;
 pub mod csv_data;
 pub mod doctags;
@@ -63,6 +64,13 @@ pub fn parse_file(path: &Path) -> Result<DocumentIR> {
         // and emit per-rule witnesses (duration, spectral
         // fingerprint, decode-fail honest absence).
         "wav" | "flac" | "mp3" | "ogg" | "opus" | "m4a" | "aac" => audio_meta::parse(path),
+        // Video formats — chunkless DocumentIRs. Witness Mesh
+        // feature extractors in `thinkingroot-extract::video_rules`
+        // run at extract time and emit per-rule witnesses (duration,
+        // per-keyframe, scene-change inference, honest-absence
+        // skipped for non-MP4 containers).
+        "mp4" | "mov" | "m4v" | "3gp" | "3gpp" | "webm" | "mkv" | "avi" | "flv"
+        | "wmv" | "ogv" => video_meta::parse(path),
         // Manifest files get structured dependency parsing.
         "toml"
             if path

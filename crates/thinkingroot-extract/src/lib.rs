@@ -42,6 +42,7 @@ pub mod schema;
 pub mod sensitivity;
 pub mod structural;
 pub mod test_assertions;
+pub mod video_rules;
 pub mod witness_mesh;
 
 pub use extractor::{ExtractionOutput, Extractor};

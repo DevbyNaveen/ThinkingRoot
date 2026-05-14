@@ -126,6 +126,13 @@ fn is_audio_document(doc: &DocumentIR) -> bool {
     crate::audio_rules::is_audio_extension(&doc_extension(doc))
 }
 
+/// Detect a chunkless video DocumentIR by URI extension. Mirrors
+/// [`is_image_document`] / [`is_audio_document`]; backed by
+/// [`crate::video_rules::is_video_extension`].
+fn is_video_document(doc: &DocumentIR) -> bool {
+    crate::video_rules::is_video_extension(&doc_extension(doc))
+}
+
 pub fn collect_witnesses_from_documents(
     documents: &[DocumentIR],
     workspace_id: WorkspaceId,
@@ -189,6 +196,30 @@ pub fn collect_witnesses_from_documents(
                 tracing::warn!(
                     uri = %doc.uri,
                     "audio document unreadable at extract time — skipping audio::* rules"
+                );
+            }
+            continue;
+        }
+
+        // Video-family dispatch. Demux-only — pure-Rust MP4/ISOBMFF
+        // walker via the `mp4` crate; no pixel-level decoding. Other
+        // containers (WebM, MKV, AVI) emit `video::skipped@v1` so the
+        // workspace catalog stays honest about partial coverage.
+        if is_video_document(doc) {
+            if let Ok(bytes) = std::fs::read(&doc.uri) {
+                let ext = doc_extension(doc);
+                out.extend(crate::video_rules::extract_video_witnesses(
+                    &bytes,
+                    &file_blake3,
+                    &ext,
+                    doc.source_id,
+                    workspace_id,
+                    now,
+                ));
+            } else {
+                tracing::warn!(
+                    uri = %doc.uri,
+                    "video document unreadable at extract time — skipping video::* rules"
                 );
             }
             continue;
