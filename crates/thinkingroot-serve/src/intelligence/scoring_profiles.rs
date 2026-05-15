@@ -28,6 +28,24 @@ impl ScoringProfile {
             recency_half_life_days: base.recency_half_life_days,
             require_rooted_only: true,
             total_candidate_threshold: base.total_candidate_threshold,
+            // Compliance / audit calls already commit to >100ms latency
+            // for the rooted-only Datalog joins, so cross-encoder rerank
+            // is a free win on accuracy.
+            use_cross_encoder: true,
+            cross_encoder_weight: base.cross_encoder_weight,
+        }
+    }
+
+    /// Deep-mode profile: opt into the cross-encoder rerank without
+    /// otherwise changing the balanced defaults. Use for Playground
+    /// "investigate", paper synthesis, `/find-gaps`, and other flows
+    /// where the user has already accepted >100ms latency in exchange
+    /// for higher answer accuracy. Lifts LongMemEval-class probe
+    /// accuracy by an estimated +2-3 points.
+    pub fn deep_mode() -> Self {
+        Self {
+            use_cross_encoder: true,
+            ..ScoringProfile::default()
         }
     }
 
@@ -39,6 +57,7 @@ impl ScoringProfile {
         match name {
             "default" => Some(Self::default()),
             "compliance" => Some(Self::compliance()),
+            "deep_mode" | "deep" => Some(Self::deep_mode()),
             _ => None,
         }
     }

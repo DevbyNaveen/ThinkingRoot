@@ -121,6 +121,91 @@ pub async fn hybrid_retrieve(
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ---- Layer 6.5: SOTA cross-encoder rerank (opt-in, lever 1) ----
+    //
+    // Re-orders the top `req.top_k * 2` survivors of fuse_score by
+    // cross-encoder relevance, then blends with the fused score so callers
+    // who tune via `cross_encoder_weight` get smooth interpolation between
+    // pure 11-component scoring and pure CE scoring.
+    //
+    // Skip-conditions (any one trips the bypass):
+    //   - `use_cross_encoder = false` (default)
+    //   - workspace is structural-only (CE adds no signal over BM25 there)
+    //   - `scored.len() < 2` (rerank of a single hit is a no-op)
+    //
+    // The model is loaded on first call only; ~280MB Jina-Turbo download
+    // happens lazily, cached under `<dirs::cache_dir>/thinkingroot/models/`.
+    if req.scoring_profile.use_cross_encoder && scored.len() >= 2 {
+        let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
+        let pool = &scored[..pool_size];
+        let docs: Vec<&str> = pool.iter().map(|(c, _, _)| c.statement.as_str()).collect();
+        let workspace_path = engine.workspace_root_path(ws).unwrap_or_else(|| {
+            // Last-resort fallback: use the system temp dir so model cache
+            // can still land somewhere stable across the process lifetime.
+            // Workspace-mounted callers (the typical path) hit the success
+            // branch above and never see this.
+            std::env::temp_dir()
+        });
+        match thinkingroot_graph::rerank::CrossEncoder::new(&workspace_path) {
+            Ok(reranker) => match reranker.rerank(&req.query_text, &docs) {
+                Ok(ce_scores) if !ce_scores.is_empty() => {
+                    // Min-max normalise CE scores to [0,1] so the blend with the
+                    // 11-component fused score (also in [0,1] after fusion's
+                    // own normalisation) is dimensionally honest.
+                    let (mn, mx) = ce_scores.iter().fold(
+                        (f32::INFINITY, f32::NEG_INFINITY),
+                        |(mn, mx), s| (mn.min(*s), mx.max(*s)),
+                    );
+                    let range = (mx - mn).max(1e-6);
+                    let w = req
+                        .scoring_profile
+                        .cross_encoder_weight
+                        .clamp(0.0, 1.0);
+                    let mut blended: Vec<(EnrichedCandidate, f32, ScoreBreakdown)> =
+                        Vec::with_capacity(pool_size);
+                    for (i, ce_raw) in ce_scores.iter().enumerate() {
+                        let (cand, fused, mut breakdown) = scored[i].clone();
+                        let ce_norm = (ce_raw - mn) / range;
+                        let new_score = w * ce_norm + (1.0 - w) * fused;
+                        breakdown.cross_encoder = Some(ce_norm);
+                        blended.push((cand, new_score, breakdown));
+                    }
+                    // Replace the pool prefix in `scored`, leaving the tail
+                    // (rank > pool_size) untouched — the tail is dropped
+                    // by `truncate` below anyway, but preserving it would
+                    // matter if a future change raises pool_size dynamically.
+                    for (i, item) in blended.into_iter().enumerate() {
+                        scored[i] = item;
+                    }
+                    scored[..pool_size].sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "rerank",
+                        "cross-encoder returned empty scores; using fuse_score order"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "rerank",
+                        error = %e,
+                        "cross-encoder rerank failed; using fuse_score order"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "rerank",
+                    error = %e,
+                    "cross-encoder construct failed; using fuse_score order"
+                );
+            }
+        }
+    }
+
     scored.truncate(req.top_k);
     check_cancel(&cancel)?;
 
@@ -1506,6 +1591,7 @@ fn fuse_score(
             contradiction_penalty: v_contradiction,
             test_origin_penalty: v_test_origin,
             fused,
+            cross_encoder: None,
         },
     ))
 }

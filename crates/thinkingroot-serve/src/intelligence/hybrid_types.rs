@@ -211,6 +211,11 @@ pub struct ScoreBreakdown {
     pub contradiction_penalty: f32,
     pub test_origin_penalty: f32,
     pub fused: f32,
+    /// SOTA Lever 1 — normalised cross-encoder relevance score in [0,1]
+    /// when `ScoringProfile::use_cross_encoder = true`, else `None`. The
+    /// final returned score is `weight * cross_encoder + (1 - weight) * fused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_encoder: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +287,27 @@ pub struct ScoringProfile {
     /// Below this candidate count, the planner forces Datalog-only mode
     /// (spec §17 Q3 — small workspaces don't benefit from vector recall).
     pub total_candidate_threshold: usize,
+    /// SOTA Lever 1 — opt-in cross-encoder rerank as the final stage.
+    /// Default `false` because the rerank pass adds ~120-200ms p95 on top-20
+    /// CPU inference (Jina Turbo v1, 137M params), which busts our
+    /// `<25ms p95` instant-retrieval budget. Enable for Playground deep-mode,
+    /// paper synthesis, `/find-gaps` — flows where >100ms latency is
+    /// already acceptable for higher answer accuracy.
+    ///
+    /// Serde-defaults to `false` so legacy `ScoringProfile` JSON round-trips
+    /// stay byte-equal.
+    #[serde(default)]
+    pub use_cross_encoder: bool,
+    /// Blend weight applied to the cross-encoder score when fusing with the
+    /// 11-component pre-rerank score. `0.0` = ignore CE, `1.0` = trust CE
+    /// only. Default `0.7` matches OMEGA's published blend coefficient.
+    /// Ignored when `use_cross_encoder = false`.
+    #[serde(default = "default_cross_encoder_weight")]
+    pub cross_encoder_weight: f32,
+}
+
+fn default_cross_encoder_weight() -> f32 {
+    0.7
 }
 
 impl Default for ScoringProfile {
@@ -300,6 +326,8 @@ impl Default for ScoringProfile {
             recency_half_life_days: 180.0,
             require_rooted_only: false,
             total_candidate_threshold: 500,
+            use_cross_encoder: false,
+            cross_encoder_weight: 0.7,
         }
     }
 }
@@ -438,6 +466,7 @@ mod tests {
                 contradiction_penalty: 0.0,
                 test_origin_penalty: 0.0,
                 fused: 0.42,
+                cross_encoder: None,
             },
             caveats: vec![],
         }

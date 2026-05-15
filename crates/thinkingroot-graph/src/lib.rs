@@ -3,6 +3,7 @@ pub mod graph;
 pub mod hybrid_queries;
 pub mod spreading_activation;
 pub mod per_source_rows;
+pub mod rerank;
 pub mod row_blake3;
 pub mod rows;
 pub mod source_store;
