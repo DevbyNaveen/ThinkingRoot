@@ -3473,7 +3473,13 @@ impl GraphStore {
             .collect())
     }
 
-    /// Count stale claims (created_at older than cutoff_timestamp).
+    /// Count stale knowledge units (`created_at` older than
+    /// `cutoff_timestamp`) across BOTH the legacy `claims` table and
+    /// the Witness Mesh `witnesses` table. Mirrors the
+    /// `get_counts`-union pattern: post-Track-14 the compile pipeline
+    /// only writes witnesses, so a claims-only count returns 0 for
+    /// every freshly-compiled workspace — fake data per CLAUDE.md
+    /// Honesty Rule §1.
     pub fn count_stale_claims(&self, cutoff_timestamp: f64) -> Result<usize> {
         let mut params = BTreeMap::new();
         params.insert(
@@ -3481,15 +3487,33 @@ impl GraphStore {
             DataValue::Num(Num::Float(cutoff_timestamp)),
         );
 
+        let claims_count = self.count_query_with_cutoff(
+            "?[count(id)] := *claims{id, created_at}, created_at < $cutoff",
+            params.clone(),
+            "count_stale_claims (claims)",
+        )?;
+        let witnesses_count = self.count_query_with_cutoff(
+            "?[count(id)] := *witnesses{id, created_at}, created_at < $cutoff",
+            params,
+            "count_stale_claims (witnesses)",
+        )?;
+        Ok(claims_count + witnesses_count)
+    }
+
+    /// Helper: run a count query with a `$cutoff` parameter and
+    /// extract the integer result. Factored out so both halves of
+    /// `count_stale_claims` share the same parsing + error-context
+    /// shape.
+    fn count_query_with_cutoff(
+        &self,
+        script: &str,
+        params: BTreeMap<String, DataValue>,
+        ctx: &str,
+    ) -> Result<usize> {
         let result = self
             .db
-            .run_script(
-                "?[count(id)] := *claims{id, created_at}, created_at < $cutoff",
-                params,
-                ScriptMutability::Immutable,
-            )
-            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
-
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| Error::GraphStorage(format!("{ctx}: {e}")))?;
         if let Some(row) = result.rows.first() {
             match &row[0] {
                 DataValue::Num(Num::Int(n)) => Ok(*n as usize),
@@ -3501,14 +3525,22 @@ impl GraphStore {
         }
     }
 
-    /// Count claims with grounding_score below a threshold.
+    /// Count legacy claims with `grounding_score` below a threshold.
     /// Ignores ungrounded claims (score = -1.0).
+    ///
+    /// **Legacy-substrate-only metric (post-Track-14).** The
+    /// `grounding_score` column was populated by Phase 8 Grounding,
+    /// which was deleted along with the LLM-extraction path. Witnesses
+    /// don't carry this field — their trust signal is the rule
+    /// catalog's per-rule `confidence` (0.95–0.99 mechanically pinned).
+    /// For pre-Track-14 workspaces this counter still surfaces real
+    /// data; for fresh post-Track-14 workspaces it returns 0 (no
+    /// grounding_score-bearing rows exist), which is honest — there
+    /// is no "low-grounding" concept on the mechanical substrate.
     ///
     /// Pure read — uses `ScriptMutability::Immutable` so the health
     /// scorer (which calls this) doesn't acquire CozoDB's write lock
-    /// and serialise concurrent Brain reads behind it.  Pre-fix the
-    /// helper went through `self.query` which is `Mutable`, inflating
-    /// `brain_load` latency every time `root health` ran.
+    /// and serialise concurrent Brain reads behind it.
     pub fn count_low_grounding_claims(&self, threshold: f64) -> Result<usize> {
         let mut params = BTreeMap::new();
         params.insert("threshold".into(), DataValue::Num(Num::Float(threshold)));
@@ -4322,13 +4354,38 @@ impl GraphStore {
         }))
     }
 
-    /// Count orphaned claims (claims whose source_id has no matching source).
+    /// Count orphaned knowledge units (rows whose `source_id` has no
+    /// matching `sources` row) across BOTH legacy `claims` and the
+    /// Witness Mesh `witnesses` table. Same honesty bridge as
+    /// `count_stale_claims` / `get_counts`: post-Track-14 the compile
+    /// pipeline only writes witnesses, so a claims-only orphan count
+    /// silently misses any orphan witnesses left by a partial cascade.
+    /// Phase 9 byte-coverage audit + I-W1 cascade completeness should
+    /// keep this at 0 — but the count is the canary that catches a
+    /// cascade-completeness regression early.
     pub fn count_orphaned_claims(&self) -> Result<usize> {
-        let result = self.query_read(
+        let claims_orphans = self.count_query_simple(
             r#"?[count(cid)] :=
                 *claims{id: cid, source_id},
                 not *sources{id: source_id}"#,
+            "count_orphaned_claims (claims)",
         )?;
+        let witness_orphans = self.count_query_simple(
+            r#"?[count(wid)] :=
+                *witnesses{id: wid, source_id},
+                not *sources{id: source_id}"#,
+            "count_orphaned_claims (witnesses)",
+        )?;
+        Ok(claims_orphans + witness_orphans)
+    }
+
+    /// Helper: run a parameter-less count query and extract the
+    /// integer result. Same shape as `count_query_with_cutoff` minus
+    /// the parameter map — used by `count_orphaned_claims`.
+    fn count_query_simple(&self, script: &str, ctx: &str) -> Result<usize> {
+        let result = self
+            .query_read(script)
+            .map_err(|e| Error::GraphStorage(format!("{ctx}: {e}")))?;
         if let Some(row) = result.rows.first() {
             match &row[0] {
                 DataValue::Num(Num::Int(n)) => Ok(*n as usize),
@@ -6207,6 +6264,108 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn count_stale_claims_includes_stale_witnesses() {
+        // Witness-only workspaces (post-Track-14 compile path) need
+        // the stale-count to see witness rows too. A claims-only
+        // query would return 0 and the health verifier would
+        // silently never warn about freshness, even on year-old
+        // data — fake data per CLAUDE.md Honesty Rule §1.
+        use thinkingroot_core::types::{
+            Confidence, Sensitivity, SourceId, Witness, WitnessInput, WitnessSpan, WorkspaceId,
+        };
+        use chrono::{TimeZone, Utc};
+
+        let store = mem_store();
+        // Insert a witness whose created_at is well in the past.
+        let old = Utc.timestamp_opt(1_000_000_000, 0).unwrap(); // 2001
+        let w = Witness::new(
+            "tree-sitter::function-decl@v1".to_string(),
+            "declares::function".to_string(),
+            vec![WitnessInput::ByteRef {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            vec![WitnessSpan {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            SourceId::new(),
+            WorkspaceId::new(),
+            Sensitivity::Public,
+            Confidence::new(0.99),
+            blake3::hash(b"body").to_hex().to_string(),
+            old,
+        );
+        store.insert_witness(&w).expect("insert witness");
+
+        // Cutoff = now → everything before now is stale.
+        let cutoff = Utc::now().timestamp() as f64;
+        let stale = store.count_stale_claims(cutoff).unwrap();
+        assert_eq!(
+            stale, 1,
+            "witness from 2001 must register as stale even with empty claims table"
+        );
+
+        // Cutoff = year 2000 → nothing is stale.
+        let early_cutoff = Utc
+            .timestamp_opt(946_684_800, 0) // 2000-01-01
+            .unwrap()
+            .timestamp() as f64;
+        let pre_stale = store.count_stale_claims(early_cutoff).unwrap();
+        assert_eq!(
+            pre_stale, 0,
+            "with cutoff before the witness's created_at, nothing is stale"
+        );
+    }
+
+    #[test]
+    fn count_orphaned_claims_includes_orphan_witnesses() {
+        // I-W1 cascade completeness should keep this at 0, but the
+        // count is the canary that catches a cascade-completeness
+        // regression. Pre-fix a claims-only orphan count would
+        // silently return 0 even when witnesses were orphaned, so
+        // the cascade bug would persist undetected.
+        use thinkingroot_core::types::{
+            Confidence, Sensitivity, SourceId, Witness, WitnessInput, WitnessSpan, WorkspaceId,
+        };
+        use chrono::Utc;
+
+        let store = mem_store();
+        // Insert a witness whose source_id points to a non-existent
+        // source row — i.e., orphan-by-construction.
+        let phantom_source = SourceId::new();
+        let w = Witness::new(
+            "tree-sitter::function-decl@v1".to_string(),
+            "declares::function".to_string(),
+            vec![WitnessInput::ByteRef {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            vec![WitnessSpan {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            phantom_source,
+            WorkspaceId::new(),
+            Sensitivity::Public,
+            Confidence::new(0.99),
+            blake3::hash(b"body").to_hex().to_string(),
+            Utc::now(),
+        );
+        store.insert_witness(&w).expect("insert witness");
+
+        let orphan_count = store.count_orphaned_claims().unwrap();
+        assert_eq!(
+            orphan_count, 1,
+            "orphan witness must register in the union count"
+        );
     }
 
     #[test]
