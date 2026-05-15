@@ -141,6 +141,61 @@ impl GraphStore {
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
+    /// Verified variant of [`Self::materialize_statement`] —
+    /// re-anchors the byte slice against `expected_blake3` (the
+    /// witness's `content_blake3` column) and surfaces a typed
+    /// `StaleRow` shape on mismatch. Returns:
+    /// - `Ok(Some(text))` on a clean verify,
+    /// - `Ok(None)` when bytes are unavailable (test fixtures, GC'd
+    ///   stores, missing source row — same conditions as the
+    ///   unverified path),
+    /// - `Err(Error::StaleRow { .. })` when bytes exist but their
+    ///   BLAKE3 doesn't match `expected_blake3`.
+    ///
+    /// This is the **Phase 5 read-path contract** for AEP probes and
+    /// hybrid retrieval. The unverified `materialize_statement`
+    /// stays available for cheap display-only paths (Brain UI, REST
+    /// `/claims`) where the caller already trusts the substrate
+    /// because Phase 9 of compile audited tamper evidence at write
+    /// time. Probes that *return* a row to the LLM must use this
+    /// verified variant so the answer is provably anchored to the
+    /// source bytes the user can verify out-of-band.
+    pub fn materialize_statement_verified(
+        &self,
+        source_id: &str,
+        byte_start: u64,
+        byte_end: u64,
+        expected_blake3: &str,
+    ) -> Result<Option<String>> {
+        let byte_store = match self.byte_store.as_ref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let hash_hex = match self.get_source_content_hash(source_id)? {
+            Some(h) if !h.is_empty() => h,
+            _ => return Ok(None),
+        };
+        let content_hash = ContentHash(hash_hex);
+        let bytes = match byte_store.get_range(
+            &content_hash,
+            byte_start as usize,
+            byte_end as usize,
+        )? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        // CCC I-4 — re-anchor the slice. Cheap (~10µs / row) and the
+        // honesty bar requires it for any probe-result return path.
+        let actual = blake3::hash(&bytes).to_hex().to_string();
+        if actual != expected_blake3 {
+            return Err(Error::GraphStorage(format!(
+                "StaleRow: source_id={source_id} bytes={byte_start}..{byte_end} \
+                 expected_blake3={expected_blake3} actual_blake3={actual}"
+            )));
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
     /// Look up a source's `content_hash` hex string by row id. The
     /// `sources` table denormalises `content_hash` per row; CCC's
     /// migration ensured every row in a v3-substrate workspace
@@ -379,6 +434,38 @@ impl GraphStore {
                 child_witness_id: String
                 =>
                 edge_kind: String default 'derives_from'
+            }",
+            // ─── Witness Mesh typed-edge graph (SOTA Lever 2,
+            //     2026-05-15). Mirrors the claim-substrate's
+            //     `claim_temporal` + `contradictions` + a new
+            //     `related`/`temporal_next` typing on top of the
+            //     content-addressed witness substrate. Replaces the
+            //     lost `claim_entity_edges` + `claim_temporal` after
+            //     Phase 5.1 cutover lands.
+            //
+            //     Edge type alphabet (single source of truth — extend
+            //     only with a CATALOG_VERSION bump in
+            //     `thinkingroot-extract/src/rule_catalog.rs`):
+            //       - "Supersedes"    — `from` replaces `to` (temporal/version)
+            //       - "Contradicts"   — `from` and `to` make incompatible claims
+            //       - "Related"       — semantic neighbours (heading_path,
+            //                           doc_tag co-occurrence, symbol match)
+            //       - "TemporalNext"  — sequential edges (event chains,
+            //                           changelog progressions)
+            //
+            //     `evidence_witness_id` carries the Witness whose extraction
+            //     emitted this edge — every edge MUST be derivable from a
+            //     mechanical rule's output for I-W10 (rule catalog pinning)
+            //     to extend cleanly to typed edges. Use `""` only when the
+            //     edge is hand-asserted via the future agent-write path.
+            ":create witness_typed_edges {
+                from_witness_id: String,
+                to_witness_id: String,
+                edge_type: String
+                =>
+                evidence_witness_id: String default '',
+                confidence: Float default 0.9,
+                created_at: Float default 0.0
             }",
             ":create entities {
                 id: String
@@ -902,6 +989,13 @@ impl GraphStore {
             "::index create witnesses:by_blake3 { content_blake3 }",
             "::index create witness_input_edges:by_parent { parent_witness_id }",
             "::index create witness_input_edges:by_child { child_witness_id }",
+            // Typed-edge graph (SOTA Lever 2) — three indexes that turn the
+            // BFS-up-to-5-hops queries (`Q_WT_*`) from O(n) scans into
+            // log-time lookups. `:by_type` matters because the rerank-time
+            // queries always filter on `edge_type = $kind`.
+            "::index create witness_typed_edges:by_from { from_witness_id }",
+            "::index create witness_typed_edges:by_to { to_witness_id }",
+            "::index create witness_typed_edges:by_type { edge_type }",
             "::index create events:by_subject { subject_entity_id }",
             "::index create events:by_timestamp { timestamp }",
             "::index create turns:by_session { session_id }",

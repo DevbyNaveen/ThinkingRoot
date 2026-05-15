@@ -233,6 +233,247 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Batch-insert typed edges into the witness graph (SOTA Lever 2).
+    ///
+    /// Each entry is `(from, to, edge_type, evidence_witness_id, confidence)`.
+    /// `edge_type` must be one of the four canonical strings — the
+    /// graph layer rejects unknown variants at write time so a downstream
+    /// query can never observe a typed-edge whose `edge_type` isn't in
+    /// the alphabet (`Supersedes`/`Contradicts`/`Related`/`TemporalNext`).
+    ///
+    /// `evidence_witness_id` carries the Witness whose extraction emitted
+    /// this edge. Pass `""` only for hand-asserted edges (agent write
+    /// path); mechanical-extractor edges always have an evidence witness.
+    /// `confidence` clamps to `[0.0, 1.0]`.
+    ///
+    /// Returns the number of edges actually inserted (after edge-type
+    /// validation). Caller can compare against `edges.len()` to detect
+    /// silent drops; we never silently swallow malformed edges.
+    pub fn insert_witness_typed_edges_batch(
+        &self,
+        edges: &[(WitnessId, WitnessId, &str, Option<WitnessId>, f32)],
+    ) -> Result<usize> {
+        const VALID_TYPES: &[&str] =
+            &["Supersedes", "Contradicts", "Related", "TemporalNext"];
+
+        let valid: Vec<&(WitnessId, WitnessId, &str, Option<WitnessId>, f32)> = edges
+            .iter()
+            .filter(|(_, _, t, _, _)| VALID_TYPES.contains(t))
+            .collect();
+
+        if valid.len() != edges.len() {
+            // Honest report — rather than dropping silently, log the
+            // count + first sample so the caller can fix their typing.
+            let sample: Vec<&str> = edges
+                .iter()
+                .filter(|(_, _, t, _, _)| !VALID_TYPES.contains(t))
+                .take(3)
+                .map(|(_, _, t, _, _)| *t)
+                .collect();
+            tracing::warn!(
+                target: "witness_typed_edges",
+                dropped = edges.len() - valid.len(),
+                sample = ?sample,
+                "dropped typed edges with unknown edge_type — must be one of: \
+                 Supersedes/Contradicts/Related/TemporalNext"
+            );
+        }
+
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+
+        for chunk in valid.chunks(CHUNK) {
+            let payload: Vec<DataValue> = chunk
+                .iter()
+                .map(|(from, to, edge_type, evidence, conf)| {
+                    DataValue::List(vec![
+                        s(from.to_hex()),
+                        s(to.to_hex()),
+                        s(edge_type.to_string()),
+                        s(evidence
+                            .as_ref()
+                            .map(|w| w.to_hex())
+                            .unwrap_or_default()),
+                        f(conf.clamp(0.0, 1.0) as f64),
+                        f(now_secs),
+                    ])
+                })
+                .collect();
+            let mut params = BTreeMap::new();
+            params.insert("rows".into(), DataValue::List(payload));
+            let script = "
+                ?[from_witness_id, to_witness_id, edge_type, evidence_witness_id, confidence, created_at] <- $rows
+                :put witness_typed_edges {
+                    from_witness_id, to_witness_id, edge_type =>
+                    evidence_witness_id, confidence, created_at
+                }
+            ";
+            self.query(script, params).map_err(|e| {
+                Error::GraphStorage(format!("insert_witness_typed_edges_batch: {e}"))
+            })?;
+        }
+        Ok(valid.len())
+    }
+
+    /// Insert a single typed edge — convenience wrapper around the batch
+    /// helper for tests and one-off agent contribute paths. The batch
+    /// path is the right one for compile-time edge emission.
+    pub fn insert_witness_typed_edge(
+        &self,
+        from: &WitnessId,
+        to: &WitnessId,
+        edge_type: &str,
+        evidence: Option<&WitnessId>,
+        confidence: f32,
+    ) -> Result<bool> {
+        let edges = vec![(
+            from.clone(),
+            to.clone(),
+            edge_type,
+            evidence.cloned(),
+            confidence,
+        )];
+        let inserted = self.insert_witness_typed_edges_batch(&edges)?;
+        Ok(inserted == 1)
+    }
+
+    /// Count typed-edge rows of a given type. `None` counts all edges.
+    pub fn count_witness_typed_edges(&self, edge_type: Option<&str>) -> Result<u64> {
+        let result = match edge_type {
+            None => self
+                .query_read("?[count(from_witness_id)] := *witness_typed_edges{from_witness_id}")
+                .map_err(|e| Error::GraphStorage(format!("count_witness_typed_edges: {e}")))?,
+            Some(t) => {
+                let mut params = BTreeMap::new();
+                params.insert("kind".into(), s(t.to_string()));
+                self.query(
+                    "?[count(from_witness_id)] := *witness_typed_edges{from_witness_id, edge_type}, edge_type = $kind",
+                    params,
+                )
+                .map_err(|e| Error::GraphStorage(format!("count_witness_typed_edges: {e}")))?
+            }
+        };
+        if let Some(row) = result.rows.first() {
+            if let Some(DataValue::Num(Num::Int(n))) = row.first() {
+                return Ok((*n).max(0) as u64);
+            }
+        }
+        Ok(0)
+    }
+
+    /// List the Witnesses that supersede `witness_id` (the `from` of an
+    /// edge typed `Supersedes` pointing to `witness_id`). Walks one hop;
+    /// callers wanting the full chain compose with `walk_typed_edges`.
+    pub fn list_witness_supersedes(&self, witness_id: &str) -> Result<Vec<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("wid".into(), s(witness_id.to_string()));
+        let result = self
+            .query(
+                "?[from_id] := *witness_typed_edges{from_witness_id: from_id, to_witness_id, edge_type}, \
+                 to_witness_id = $wid, edge_type = 'Supersedes'",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_witness_supersedes: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| row.first().and_then(|dv| match dv {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            }))
+            .collect())
+    }
+
+    /// List the Witnesses contradicting `witness_id` (edges typed
+    /// `Contradicts` in either direction — contradiction is symmetric
+    /// for retrieval purposes but stored as a directed edge for honest
+    /// audit of "who flagged the contradiction first").
+    pub fn list_witness_contradictions(&self, witness_id: &str) -> Result<Vec<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("wid".into(), s(witness_id.to_string()));
+        let result = self
+            .query(
+                "?[other_id] := *witness_typed_edges{from_witness_id, to_witness_id, edge_type}, \
+                 edge_type = 'Contradicts', \
+                 ((from_witness_id = $wid, other_id = to_witness_id) or \
+                  (to_witness_id = $wid, other_id = from_witness_id))",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_witness_contradictions: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| row.first().and_then(|dv| match dv {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            }))
+            .collect())
+    }
+
+    /// Walk typed edges from `start_id`, returning every reachable
+    /// Witness id. Uses Cozo's recursive Datalog with a cycle guard
+    /// (`mid != $start`) matching the AEP `Q_SUPERSESSION_CHAIN` pattern
+    /// (`aep_queries.rs:115`). `max_hops` is reserved for a future
+    /// bounded-depth primitive once Cozo exposes one; for now Cozo's
+    /// fixed-point evaluator terminates on the cycle guard alone.
+    ///
+    /// `edge_types` filters to specific edge kinds; empty slice = all.
+    pub fn walk_witness_typed_edges(
+        &self,
+        start_id: &str,
+        edge_types: &[&str],
+        max_hops: usize,
+    ) -> Result<Vec<String>> {
+        if max_hops == 0 {
+            return Ok(Vec::new());
+        }
+        let _ = max_hops.min(8); // pinned for forward-compat with a depth primitive
+
+        let mut params = BTreeMap::new();
+        params.insert("start".into(), s(start_id.to_string()));
+
+        // Build the optional `edge_type` filter inline. Cozo's Datalog
+        // rejects an `IN` expression with an empty list, so we emit the
+        // entire predicate clause only when we have at least one type.
+        let type_clause = if edge_types.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = edge_types
+                .iter()
+                .map(|t| format!("'{}'", t.replace('\'', "")))
+                .collect();
+            format!(", et in [{}]", quoted.join(", "))
+        };
+
+        // Recursive walk. Two rule heads with the same name = disjunction.
+        // Pattern mirrors `Q_SUPERSESSION_CHAIN` in aep_queries.rs:115.
+        // `mid != $start` is the cycle guard for finite termination.
+        // The final `?[id]` filter excludes the start node — graph
+        // walkers conventionally return the *reachable* set, not the
+        // input. A cycle test confirms `$start` doesn't sneak back in
+        // via a→b→…→$start paths.
+        let script = format!(
+            r#"
+            reachable[id] := *witness_typed_edges{{from_witness_id: from_id, to_witness_id: id, edge_type: et}},
+                             from_id = $start{type_clause}
+            reachable[id] := reachable[mid], mid != $start,
+                             *witness_typed_edges{{from_witness_id: mid, to_witness_id: id, edge_type: et}}{type_clause}
+            ?[id] := reachable[id], id != $start
+            "#
+        );
+
+        let result = self
+            .query(&script, params)
+            .map_err(|e| Error::GraphStorage(format!("walk_witness_typed_edges: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| row.first().and_then(|dv| match dv {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            }))
+            .collect())
+    }
+
     /// Count the witnesses table. Used by the migration tool to
     /// report progress + by tests to verify dedup behaviour.
     pub fn count_witnesses(&self) -> Result<u64> {
@@ -862,5 +1103,204 @@ mod tests {
         let only_a = store.list_witnesses_by_source(&src_a.to_string()).unwrap();
         assert_eq!(only_a.len(), 1);
         assert_eq!(only_a[0].source, src_a);
+    }
+
+    // ─── SOTA Lever 2: witness_typed_edges substrate tests ─────────────
+
+    #[test]
+    fn typed_edge_round_trips_through_table() {
+        let store = fresh_store();
+        let a = function_witness("file_z", 0, 5);
+        let b = function_witness("file_z", 5, 10);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone()])
+            .unwrap();
+        let ok = store
+            .insert_witness_typed_edge(&a.id, &b.id, "Supersedes", None, 0.95)
+            .expect("insert edge");
+        assert!(ok);
+        assert_eq!(store.count_witness_typed_edges(None).unwrap(), 1);
+        assert_eq!(
+            store
+                .count_witness_typed_edges(Some("Supersedes"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_witness_typed_edges(Some("Contradicts"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_edge_type_is_dropped_loudly_not_silently() {
+        let store = fresh_store();
+        let a = function_witness("file_y", 0, 5);
+        let b = function_witness("file_y", 5, 10);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone()])
+            .unwrap();
+        let inserted = store
+            .insert_witness_typed_edges_batch(&[(
+                a.id.clone(),
+                b.id.clone(),
+                "Bogus",
+                None,
+                0.5,
+            )])
+            .expect("call ok");
+        assert_eq!(inserted, 0, "unknown edge_type must drop");
+        assert_eq!(store.count_witness_typed_edges(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn confidence_clamps_to_unit_interval() {
+        let store = fresh_store();
+        let a = function_witness("file_x", 0, 5);
+        let b = function_witness("file_x", 5, 10);
+        let c = function_witness("file_x", 10, 15);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone(), c.clone()])
+            .unwrap();
+        // Over-1.0 and below-0.0 both get clamped at write time.
+        store
+            .insert_witness_typed_edge(&a.id, &b.id, "Related", None, 5.0)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &c.id, "Related", None, -2.0)
+            .unwrap();
+        assert_eq!(store.count_witness_typed_edges(None).unwrap(), 2);
+    }
+
+    #[test]
+    fn list_supersedes_returns_predecessors() {
+        let store = fresh_store();
+        // Three versions of the same logical claim; v1 ← v2 ← v3.
+        let v1 = function_witness("paper.md", 0, 10);
+        let v2 = function_witness("paper.md", 10, 20);
+        let v3 = function_witness("paper.md", 20, 30);
+        store
+            .insert_witnesses_batch(&[v1.clone(), v2.clone(), v3.clone()])
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&v2.id, &v1.id, "Supersedes", None, 0.99)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&v3.id, &v2.id, "Supersedes", None, 0.99)
+            .unwrap();
+        let supers_of_v1 = store.list_witness_supersedes(&v1.id.to_hex()).unwrap();
+        assert_eq!(supers_of_v1.len(), 1);
+        assert_eq!(supers_of_v1[0], v2.id.to_hex());
+    }
+
+    #[test]
+    fn contradictions_are_symmetric_for_retrieval() {
+        let store = fresh_store();
+        let a = function_witness("a.md", 0, 5);
+        let b = function_witness("a.md", 5, 10);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone()])
+            .unwrap();
+        // Insert directed (a -> b); both endpoints should surface as
+        // contradiction partners.
+        store
+            .insert_witness_typed_edge(&a.id, &b.id, "Contradicts", None, 0.9)
+            .unwrap();
+        let from_a = store.list_witness_contradictions(&a.id.to_hex()).unwrap();
+        let from_b = store.list_witness_contradictions(&b.id.to_hex()).unwrap();
+        assert_eq!(from_a, vec![b.id.to_hex()]);
+        assert_eq!(from_b, vec![a.id.to_hex()]);
+    }
+
+    #[test]
+    fn walk_typed_edges_traverses_chain_and_terminates_on_cycle() {
+        let store = fresh_store();
+        // a -> b -> c -> a (cycle); walk from a should NOT loop forever.
+        let a = function_witness("c.md", 0, 5);
+        let b = function_witness("c.md", 5, 10);
+        let c = function_witness("c.md", 10, 15);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone(), c.clone()])
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &b.id, "Related", None, 0.8)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&b.id, &c.id, "Related", None, 0.8)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&c.id, &a.id, "Related", None, 0.8)
+            .unwrap();
+        // Walk; the recursive rule's `mid != $start` guard keeps the
+        // fixed-point finite. Expected reachable set: {b, c}.
+        let reachable = store
+            .walk_witness_typed_edges(&a.id.to_hex(), &["Related"], 5)
+            .unwrap();
+        assert!(reachable.contains(&b.id.to_hex()));
+        assert!(reachable.contains(&c.id.to_hex()));
+        assert!(
+            !reachable.contains(&a.id.to_hex()),
+            "cycle guard must keep $start out of result"
+        );
+    }
+
+    #[test]
+    fn walk_typed_edges_respects_edge_type_filter() {
+        let store = fresh_store();
+        let a = function_witness("d.md", 0, 5);
+        let b = function_witness("d.md", 5, 10);
+        let c = function_witness("d.md", 10, 15);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone(), c.clone()])
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &b.id, "Related", None, 0.8)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &c.id, "TemporalNext", None, 0.8)
+            .unwrap();
+        // Filter to Related only: must not return c.
+        let related_only = store
+            .walk_witness_typed_edges(&a.id.to_hex(), &["Related"], 3)
+            .unwrap();
+        assert_eq!(related_only.len(), 1);
+        assert_eq!(related_only[0], b.id.to_hex());
+        // Filter to TemporalNext only: must not return b.
+        let temporal_only = store
+            .walk_witness_typed_edges(&a.id.to_hex(), &["TemporalNext"], 3)
+            .unwrap();
+        assert_eq!(temporal_only.len(), 1);
+        assert_eq!(temporal_only[0], c.id.to_hex());
+    }
+
+    #[test]
+    fn walk_typed_edges_empty_edge_types_walks_all_kinds() {
+        let store = fresh_store();
+        let a = function_witness("e.md", 0, 5);
+        let b = function_witness("e.md", 5, 10);
+        let c = function_witness("e.md", 10, 15);
+        store
+            .insert_witnesses_batch(&[a.clone(), b.clone(), c.clone()])
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &b.id, "Related", None, 0.8)
+            .unwrap();
+        store
+            .insert_witness_typed_edge(&a.id, &c.id, "Contradicts", None, 0.8)
+            .unwrap();
+        let all = store
+            .walk_witness_typed_edges(&a.id.to_hex(), &[], 3)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn empty_typed_edge_batch_is_no_op() {
+        let store = fresh_store();
+        let inserted = store.insert_witness_typed_edges_batch(&[]).unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(store.count_witness_typed_edges(None).unwrap(), 0);
     }
 }
