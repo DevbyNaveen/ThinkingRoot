@@ -4457,12 +4457,36 @@ impl GraphStore {
         }
     }
 
-    /// Get total counts of sources, claims, and entities.
+    /// Get total counts of sources, **knowledge units** (claims +
+    /// witnesses), and entities.
+    ///
+    /// Phase 5 honesty fix (2026-05-15): post-Track-14 the compile
+    /// pipeline writes Witness Mesh rows only — never `claims` — so a
+    /// straight `count_relation("claims")` returns 0 for every freshly-
+    /// compiled workspace. Downstream consumers (`root health`,
+    /// `pipeline.rs` README synthesis, `engine.rs` brief generation,
+    /// `compile/compiler.rs` summary) consume the middle tuple element
+    /// as "how much knowledge does this workspace hold" — returning 0
+    /// when the witness table is full would be fake data per CLAUDE.md
+    /// Honesty Rule §1.
+    ///
+    /// The fix sums both substrates: `claims + witnesses`. The two ID
+    /// spaces are disjoint by construction (claims are ULIDs, witnesses
+    /// are content-addressed BLAKE3) so union counting never double-
+    /// counts. For pre-Track-14 workspaces the witness count is 0 and
+    /// the total reduces to the legacy claims count — back-compat
+    /// preserved without any caller changes.
+    ///
+    /// Note the variable name `claim_count` survives at most call sites
+    /// because renaming would touch ~10 files for zero behaviour change;
+    /// the docstring is the canonical source of truth on what the count
+    /// means now.
     pub fn get_counts(&self) -> Result<(usize, usize, usize)> {
         let s = self.count_relation("sources")?;
         let c = self.count_relation("claims")?;
+        let w = self.count_relation("witnesses")?;
         let e = self.count_relation("entities")?;
-        Ok((s, c, e))
+        Ok((s, c + w, e))
     }
 
     fn count_relation(&self, name: &str) -> Result<usize> {
@@ -6183,6 +6207,55 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn get_counts_includes_witnesses_when_claims_empty() {
+        // Phase 5 honesty fix: post-Track-14 the compile path writes
+        // only the `witnesses` table — never `claims`. A
+        // `count_relation("claims")`-only `get_counts` would return 0
+        // for every freshly-compiled workspace, surfacing as
+        // "0 claims" in `root health` / README / brief — fake data per
+        // CLAUDE.md Honesty Rule §1.
+        //
+        // The fix sums `claims + witnesses`. This regression test
+        // pins the union semantics by inserting a witness with NO
+        // accompanying claim and asserting the second tuple element
+        // is nonzero.
+        use thinkingroot_core::types::{
+            Confidence, Sensitivity, SourceId, Witness, WitnessInput, WitnessSpan, WorkspaceId,
+        };
+        use chrono::Utc;
+        let store = mem_store();
+        let w = Witness::new(
+            "tree-sitter::function-decl@v1".to_string(),
+            "declares::function".to_string(),
+            vec![WitnessInput::ByteRef {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            vec![WitnessSpan {
+                file_blake3: "f".into(),
+                start: 0,
+                end: 10,
+            }],
+            SourceId::new(),
+            WorkspaceId::new(),
+            Sensitivity::Public,
+            Confidence::new(0.99),
+            blake3::hash(b"body").to_hex().to_string(),
+            Utc::now(),
+        );
+        store.insert_witness(&w).expect("insert witness");
+
+        let (sources, knowledge_units, entities) = store.get_counts().unwrap();
+        assert_eq!(sources, 0, "no source row inserted");
+        assert_eq!(entities, 0, "no entity row inserted");
+        assert_eq!(
+            knowledge_units, 1,
+            "witness-only workspace must report 1 knowledge unit, not 0"
+        );
     }
 
     #[test]
