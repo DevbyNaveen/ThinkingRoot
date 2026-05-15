@@ -12,12 +12,10 @@
 #      `%LOCALAPPDATA%\Programs\ThinkingRoot\app` when available
 #   7. Registers a Task Scheduler ONLOGON entry so the daemon
 #      auto-starts (via `root service install`)
-#   8. Downloads the NLI ONNX model unless TR_SKIP_NLI=1
 #
 # Tunable via environment variables:
 #   $env:TR_SKIP_SERVICE = "1"   # skip Task Scheduler registration
 #   $env:TR_SKIP_APP     = "1"   # skip desktop bundle download
-#   $env:TR_SKIP_NLI     = "1"   # skip ~83 MB NLI model
 #   $env:VERSION         = "v0.9.1"  # pin to a specific release
 #   $env:TR_TEST_BASE_URL = "..."  # tests only — point at local http.server
 
@@ -26,10 +24,8 @@ $ErrorActionPreference = 'Stop'
 # ── Constants ────────────────────────────────────────────────────────────────
 
 $RELEASES_REPO = 'DevbyNaveen/releases'
-$NLI_MODELS_TAG = 'nli-models'
 $BinaryName = 'root.exe'
 $Asset = 'root-windows-amd64.exe'
-$NliOnnx = 'model_quint8_avx2.onnx'
 
 # ── Install paths ────────────────────────────────────────────────────────────
 
@@ -37,7 +33,6 @@ $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\ThinkingRoot'
 $InstallBin  = Join-Path $InstallRoot 'bin'
 $InstallApp  = Join-Path $InstallRoot 'app'
 $ConfigDir   = Join-Path $env:APPDATA 'thinkingroot'
-$ModelDir    = Join-Path $env:LOCALAPPDATA 'thinkingroot\models'
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -136,40 +131,6 @@ function Write-InstallManifest([string]$binPath, [string]$version, [string]$chec
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
     Say "Registered install manifest at $manifestPath"
-}
-
-function Install-NliModel {
-    if (-not (Test-Path $ModelDir)) {
-        New-Item -ItemType Directory -Force -Path $ModelDir | Out-Null
-    }
-    $base = "https://github.com/$RELEASES_REPO/releases/download/$NLI_MODELS_TAG"
-    $onnxDest = Join-Path $ModelDir $NliOnnx
-    $tokenizerDest = Join-Path $ModelDir 'tokenizer.json'
-
-    if (Test-Path $onnxDest) {
-        SayDim "NLI model already cached: $onnxDest"
-    } else {
-        Say "Downloading NLI model (~83 MB, one-time)..."
-        try {
-            Invoke-WebRequest -Uri "$base/$NliOnnx" -OutFile $onnxDest -UseBasicParsing
-            SayDim "Saved to $onnxDest"
-        } catch {
-            Warn "NLI model download failed — grounding will use judges 1-3 only. Re-run installer to retry."
-            return
-        }
-    }
-    if (Test-Path $tokenizerDest) {
-        SayDim "Tokenizer already cached."
-    } else {
-        try {
-            Invoke-WebRequest -Uri "$base/tokenizer.json" -OutFile $tokenizerDest -UseBasicParsing
-            SayDim "Saved to $tokenizerDest"
-        } catch {
-            Warn "Tokenizer download failed — re-run installer to retry."
-            return
-        }
-    }
-    Say "NLI models ready."
 }
 
 function Install-DesktopApp([string]$baseUrl, [string]$version) {
@@ -301,13 +262,6 @@ try {
 
     # ── Cache checksums.txt for recovery ─────────────────────────
     Copy-Item -Force $checksumsPath (Join-Path $ConfigDir 'checksums-cache.txt')
-
-    # ── NLI models ───────────────────────────────────────────────
-    if ($env:TR_SKIP_NLI -eq '1') {
-        SayDim "Skipping NLI model download (TR_SKIP_NLI=1)"
-    } else {
-        Install-NliModel
-    }
 
     # ── Desktop app ──────────────────────────────────────────────
     if ($env:TR_SKIP_APP -eq '1') {

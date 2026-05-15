@@ -12,18 +12,15 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 
-# `vector` feature deleted in Witness Mesh cutover — the ML judges
-# (Judge 3 semantic cosine + Judge 4 NLI cross-encoder) are gone.
-# Feature-gating no longer applies. The `ort` + `tokenizers` + `dirs`
-# + `thinkingroot-graph` deps that backed them are removed below.
+# `vector` feature + ML judges (Judge 3 semantic cosine + Judge 4
+# NLI cross-encoder) deleted in Witness Mesh cutover (2026-05-11).
+# `LexicalJudge` + `unicode-segmentation` removed 2026-05-15 along
+# with the ~175 MB of checked-in NLI ONNX models + tokenizer.
+# What remains is a single mechanical BLAKE3 anchor-verification helper.
 
 [dependencies]
 thinkingroot-core = { workspace = true }
 thinkingroot-extract = { workspace = true }
-# `unicode-segmentation` is used by the surviving `LexicalJudge`
-# tokenizer (retained for downstream consumers that score lexical
-# overlap; the Rooting crate that originally drove it is deleted).
-unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
 # Witness anchor verification — BLAKE3 over source byte slices.
 blake3 = { workspace = true }

@@ -18,14 +18,12 @@ IFS='
 
 REPO="DevbyNaveen/ThinkingRoot"
 RELEASES_REPO="DevbyNaveen/releases"
-NLI_MODELS_TAG="nli-models"
 BINARY="root"
 INSTALL_DIR="${INSTALL_DIR:-}"
 # Skip switches — defaults give the "no-headache" install the user
 # expects from a curl-one-liner. Each is opt-in to disable.
 #   TR_SKIP_SERVICE=1   skip login-agent registration (`root service install`)
 #   TR_SKIP_APP=1       skip desktop .app/.AppImage download
-#   TR_SKIP_NLI=1       skip the ~83 MB NLI model download
 TR_SKIP_SERVICE="${TR_SKIP_SERVICE:-0}"
 TR_SKIP_APP="${TR_SKIP_APP:-0}"
 # Optional minisign public key for verifying `checksums.txt`.  When
@@ -72,15 +70,6 @@ detect_arch() {
       fi
       ;;
     *) err "Unsupported architecture: $arch. Install manually from https://github.com/${REPO}/releases" ;;
-  esac
-}
-
-# Returns the NLI ONNX filename for this arch
-nli_onnx_filename() {
-  ARCH="$1"
-  case "$ARCH" in
-    arm64|aarch64) echo "model_qint8_arm64.onnx" ;;
-    *)             echo "model_quint8_avx2.onnx" ;;
   esac
 }
 
@@ -165,16 +154,6 @@ select_install_dir() {
   fi
 }
 
-# ── Model cache dir ───────────────────────────────────────────────────────────
-
-model_cache_dir() {
-  if [ "$(uname -s)" = "Darwin" ]; then
-    echo "${HOME}/Library/Caches/thinkingroot/models"
-  else
-    echo "${HOME}/.cache/thinkingroot/models"
-  fi
-}
-
 # ── Fetch latest version ──────────────────────────────────────────────────────
 
 fetch_latest_version() {
@@ -182,37 +161,6 @@ fetch_latest_version() {
     "https://api.github.com/repos/${RELEASES_REPO}/releases/latest" \
     /dev/stdout 2>/dev/null \
     | grep '"tag_name"' | cut -d'"' -f4
-}
-
-# ── Install NLI models ────────────────────────────────────────────────────────
-
-install_nli_models() {
-  ARCH="$1"
-  MODEL_DIR="$(model_cache_dir)"
-  ONNX_FILE="$(nli_onnx_filename "$ARCH")"
-  BASE="https://github.com/${RELEASES_REPO}/releases/download/${NLI_MODELS_TAG}"
-
-  mkdir -p "$MODEL_DIR" || err "Cannot create model cache dir: $MODEL_DIR"
-
-  if [ -f "${MODEL_DIR}/${ONNX_FILE}" ]; then
-    say_dim "NLI model already cached: ${MODEL_DIR}/${ONNX_FILE}"
-  else
-    say "Downloading NLI model (~83 MB, one-time)..."
-    download "${BASE}/${ONNX_FILE}" "${MODEL_DIR}/${ONNX_FILE}" \
-      || { warn "NLI model download failed — grounding will use judges 1-3 only. Re-run installer to retry."; return 0; }
-    say_dim "Saved to ${MODEL_DIR}/${ONNX_FILE}"
-  fi
-
-  if [ -f "${MODEL_DIR}/tokenizer.json" ]; then
-    say_dim "Tokenizer already cached."
-  else
-    say "Downloading tokenizer..."
-    download_quiet "${BASE}/tokenizer.json" "${MODEL_DIR}/tokenizer.json" \
-      || { warn "Tokenizer download failed — re-run installer to retry."; return 0; }
-    say_dim "Saved to ${MODEL_DIR}/tokenizer.json"
-  fi
-
-  say "NLI models ready."
 }
 
 # ── BLAKE3 of a freshly-installed binary ─────────────────────────────────────
@@ -648,13 +596,6 @@ main() {
       esac
       ;;
   esac
-
-  # ── Download NLI models ───────────────────────────────────────────────────
-  if [ "${TR_SKIP_NLI:-0}" = "1" ]; then
-    say_dim "Skipping NLI model download (TR_SKIP_NLI=1)"
-  else
-    install_nli_models "$ARCH"
-  fi
 
   # ── Install desktop app (best-effort) ─────────────────────────────────────
   if [ "$TR_SKIP_APP" = "1" ]; then

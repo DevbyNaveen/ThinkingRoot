@@ -35,7 +35,6 @@ thinkingroot-paper = { workspace = true }
 thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
 thinkingroot-health = { workspace = true }
-thinkingroot-ground = { workspace = true }
 thinkingroot-reflect = { workspace = true }
 tr-sigstore = { workspace = true }
 blake3 = { workspace = true }

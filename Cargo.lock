@@ -6543,7 +6543,6 @@ dependencies = [
  "thinkingroot-cortex-async",
  "thinkingroot-extract",
  "thinkingroot-graph",
- "thinkingroot-ground",
  "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-llm",
@@ -6694,7 +6693,6 @@ dependencies = [
  "thinkingroot-extract",
  "thiserror 2.0.18",
  "tracing",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -6889,7 +6887,6 @@ dependencies = [
  "thinkingroot-core",
  "thinkingroot-extract",
  "thinkingroot-graph",
- "thinkingroot-ground",
  "thinkingroot-health",
  "thinkingroot-link",
  "thinkingroot-llm",
