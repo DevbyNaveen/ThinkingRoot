@@ -227,6 +227,21 @@ impl Observer {
             .unwrap_or(false)
     }
 
+    /// Re-stage a previously-drained observation. Called by the
+    /// engine's flush path on persistence failure so the observation
+    /// isn't silently lost. The honest semantics: failed flushes
+    /// stay queued for the next retry.
+    pub fn restage(&self, staged: StagedObservation) {
+        let mut guard = match self.buffers.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let buf = guard
+            .entry(staged.session_id.clone())
+            .or_default();
+        buf.staged_observations.push(staged);
+    }
+
     /// Force-condense any pending turns for a session (e.g. at
     /// session-end). Even partial windows produce an observation if
     /// they have ≥ 1 turn.
@@ -440,6 +455,36 @@ fn synthetic_session_anchor(session_id: &str) -> String {
     blake3::hash(format!("session-anchor::{session_id}").as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// Derive a stable `WorkspaceId` from a workspace name. Observations
+/// inherit the workspace they were captured in; the substrate's
+/// `WorkspaceId` is a typed `Ulid` so we content-derive it from the
+/// workspace name's BLAKE3 hash so re-runs of the same workspace
+/// produce the same id (matters for substrate dedup across process
+/// restarts).
+pub fn observation_workspace_id(workspace: &str) -> WorkspaceId {
+    let hash = blake3::hash(format!("ws-anchor::{workspace}").as_bytes());
+    let bytes = hash.as_bytes();
+    // Take the first 16 bytes as a ULID payload. ULID's internal
+    // encoding doesn't require a real timestamp; any 16-byte value
+    // round-trips through `Ulid` cleanly.
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&bytes[..16]);
+    let ulid = ulid::Ulid::from_bytes(buf);
+    WorkspaceId::from_ulid(ulid)
+}
+
+/// Derive a stable `SourceId` from a session id. Same content-
+/// addressing argument as `observation_workspace_id` — re-runs land
+/// on the same id.
+pub fn observation_source_id(session_id: &str) -> SourceId {
+    let hash = blake3::hash(format!("session-source::{session_id}").as_bytes());
+    let bytes = hash.as_bytes();
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&bytes[..16]);
+    let ulid = ulid::Ulid::from_bytes(buf);
+    SourceId::from_ulid(ulid)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

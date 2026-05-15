@@ -857,6 +857,11 @@ pub struct QueryEngine {
     /// preserve the "one DbInstance per branch" invariant (see
     /// `branch_cache` module docs for why).
     branch_engines: Arc<crate::branch_cache::BranchEngineCache>,
+    /// SOTA Lever 3 — process-wide Observer cache for conversation
+    /// memory. Per-session buffers live inside; staged observations
+    /// drain through [`Self::flush_observations`] into the workspace's
+    /// witness substrate as `conversation::observation@v1` rows.
+    observer: Arc<crate::intelligence::observer::Observer>,
 }
 
 impl Default for QueryEngine {
@@ -871,6 +876,7 @@ impl QueryEngine {
         Self {
             workspaces: HashMap::new(),
             branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::default_cache()),
+            observer: Arc::new(crate::intelligence::observer::Observer::new()),
         }
     }
 
@@ -881,7 +887,104 @@ impl QueryEngine {
         Self {
             workspaces: HashMap::new(),
             branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::new(cfg)),
+            observer: Arc::new(crate::intelligence::observer::Observer::new()),
         }
+    }
+
+    /// Shared handle to the process-wide Observer. Callers that want
+    /// to record chat turns into long-term substrate call
+    /// `observer().record_turn(...)`; staged observations later drain
+    /// into the witness substrate via [`Self::flush_observations`].
+    pub fn observer(&self) -> Arc<crate::intelligence::observer::Observer> {
+        self.observer.clone()
+    }
+
+    /// Drain staged observations + (optionally) emit a reflection for
+    /// `session_id` and persist everything to the workspace's witness
+    /// substrate. Returns the count of newly-inserted Witness rows
+    /// (observations + reflections, after the substrate's content-
+    /// addressed dedup may collapse some).
+    ///
+    /// Designed to be called periodically (e.g. background sweep
+    /// every N seconds) AND at session end. Both call sites are safe
+    /// — the underlying `:put witnesses` is idempotent on
+    /// content-derived ids.
+    ///
+    /// On any failure, the staged observations remain in the buffer
+    /// for the next flush attempt rather than being dropped — partial
+    /// flushes are honest-incomplete, never silent-lossy. Returns
+    /// `Ok(0)` when no observations are staged.
+    pub async fn flush_observations(
+        &self,
+        ws: &str,
+        session_id: &str,
+    ) -> Result<usize> {
+        let observer = self.observer.clone();
+        let staged = observer.take_staged(session_id);
+        if staged.is_empty() {
+            return Ok(0);
+        }
+        let handle = self
+            .workspaces
+            .get(ws)
+            .ok_or_else(|| Error::EntityNotFound(format!("workspace '{ws}' not mounted")))?;
+        let workspace_id =
+            crate::intelligence::observer::observation_workspace_id(ws);
+        let source_id = crate::intelligence::observer::observation_source_id(session_id);
+        let now = chrono::Utc::now();
+
+        let mut to_insert: Vec<thinkingroot_core::types::Witness> = staged
+            .iter()
+            .map(|s| {
+                crate::intelligence::observer::materialise_observation_witness(
+                    s,
+                    workspace_id,
+                    source_id,
+                    now,
+                )
+            })
+            .collect();
+
+        // Emit a reflection when the session crosses the Observer's
+        // reflect threshold. The reflection's inputs reference the
+        // observations by WitnessRef, so the substrate carries the
+        // turn → observation → reflection provenance chain.
+        if observer.should_reflect(session_id) {
+            if let Some(reflection) =
+                crate::intelligence::observer::materialise_reflection_witness(
+                    &to_insert,
+                    workspace_id,
+                    source_id,
+                    now,
+                )
+            {
+                to_insert.push(reflection);
+            }
+        }
+
+        let inserted = to_insert.len();
+        // Hold the storage lock just long enough for the batch insert.
+        let storage = handle.storage.lock().await;
+        if let Err(e) = storage
+            .graph
+            .insert_witnesses_batch(&to_insert)
+        {
+            // Rollback in-memory state — re-stage so a retry can pick
+            // them up. Without this, a transient storage failure would
+            // silently lose conversation memory.
+            for s in staged {
+                observer.restage(s);
+            }
+            return Err(e);
+        }
+        tracing::info!(
+            target: "observer",
+            workspace = ws,
+            session = session_id,
+            inserted,
+            "flushed observations + reflection to witness substrate"
+        );
+        Ok(inserted)
     }
 
     /// Test/telemetry accessor for the branch engine cache.
