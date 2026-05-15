@@ -23,6 +23,7 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
         workspace_registry_parseable(env),
         workspace_active_exists(env),
         install_manifest_consistent(env),
+        models_bundle_present(env),
     ]
 }
 
@@ -436,6 +437,124 @@ pub fn install_manifest_consistent(env: &DoctorEnv) -> CheckResult {
                 command: "root setup --as-cli".into(),
             }),
         }
+    }
+}
+
+/// Track 32 — verifies the ONNX model bundle (`embed.{onnx,tokenizer.json}` +
+/// `rerank.{onnx,tokenizer.json}`) is present on disk and matches the
+/// BLAKE3 anchors recorded in `install-manifest.json::model_bundle`.
+///
+/// Status:
+/// - `Skipped` when no install manifest exists yet (Slice A's hand-off)
+/// - `Fail` when manifest exists but carries no `model_bundle` (legacy
+///   pre-Track-32 install, or `TR_SKIP_MODELS=1` opt-out)
+/// - `Fail` when one or more files are missing on disk
+/// - `Warn` when files exist but BLAKE3 anchors mismatch (corrupt /
+///   tampered download)
+/// - `Ok` when both pairs verify against their anchors
+///
+/// Fix command: re-run the installer. The download steps are
+/// idempotent — already-cached files with matching SHA-256 skip
+/// the network fetch entirely.
+pub fn models_bundle_present(env: &DoctorEnv) -> CheckResult {
+    let id = CheckId::from_static("models.bundle_present");
+    let label = "Model bundle (embed + rerank ONNX)".to_string();
+
+    let manifest_path = env.config_dir.join("install-manifest.json");
+    if !manifest_path.exists() {
+        return CheckResult {
+            id,
+            label,
+            status: CheckStatus::Skipped,
+            detail: "no install manifest yet — run `install.sh` to fetch the bundle".into(),
+            fix: None,
+        };
+    }
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return CheckResult {
+                id,
+                label,
+                status: CheckStatus::Warn,
+                detail: format!("manifest unreadable: {e}"),
+                fix: None,
+            };
+        }
+    };
+    let manifest: InstallManifest = match serde_json::from_slice(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return CheckResult {
+                id,
+                label,
+                status: CheckStatus::Warn,
+                detail: format!("manifest unparseable: {e}"),
+                fix: None,
+            };
+        }
+    };
+
+    let bundle = match &manifest.model_bundle {
+        Some(b) => b,
+        None => {
+            return CheckResult {
+                id,
+                label,
+                status: CheckStatus::Fail,
+                detail: "no model bundle recorded — install was pre-Track-32 or skipped models"
+                    .into(),
+                fix: Some(FixAction::RunCommand {
+                    command: "curl -fsSL https://thinkingroot.com/install.sh | sh".into(),
+                }),
+            };
+        }
+    };
+
+    if !bundle.files_exist() {
+        return CheckResult {
+            id,
+            label,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "model files missing — embed.onnx: {}, rerank.onnx: {}",
+                if bundle.embed.onnx_path.exists() {
+                    "ok"
+                } else {
+                    "MISSING"
+                },
+                if bundle.rerank.onnx_path.exists() {
+                    "ok"
+                } else {
+                    "MISSING"
+                },
+            ),
+            fix: Some(FixAction::RunCommand {
+                command: "curl -fsSL https://thinkingroot.com/install.sh | sh".into(),
+            }),
+        };
+    }
+
+    match bundle.verify() {
+        Ok(()) => CheckResult {
+            id,
+            label,
+            status: CheckStatus::Ok,
+            detail: format!(
+                "bundle {} verified (embed + rerank)",
+                bundle.version
+            ),
+            fix: None,
+        },
+        Err(e) => CheckResult {
+            id,
+            label,
+            status: CheckStatus::Warn,
+            detail: format!("BLAKE3 mismatch: {e} — re-run installer to refresh"),
+            fix: Some(FixAction::RunCommand {
+                command: "curl -fsSL https://thinkingroot.com/install.sh | sh".into(),
+            }),
+        },
     }
 }
 
@@ -1119,6 +1238,166 @@ mod tests {
         };
         let r = install_manifest_consistent(&env);
         assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn models_bundle_present_skipped_when_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = models_bundle_present(&env);
+        assert_eq!(r.status, CheckStatus::Skipped);
+    }
+
+    #[test]
+    fn models_bundle_present_fail_when_manifest_omits_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("install-manifest.json");
+        // Pre-Track-32 manifest shape — `model_bundle` field absent.
+        std::fs::write(
+            &manifest_path,
+            r#"{
+                "schema_version": 1,
+                "binaries": [],
+                "preferred": null,
+                "setup_complete_at": null
+            }"#,
+        )
+        .unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = models_bundle_present(&env);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail.contains("no model bundle"),
+            "expected helpful detail, got: {}",
+            r.detail
+        );
+        assert!(r.fix.is_some(), "must surface a fix command for the user");
+    }
+
+    #[test]
+    fn models_bundle_present_fail_when_files_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let missing = tmp.path().join("does-not-exist.onnx");
+        let content = format!(
+            r#"{{
+                "schema_version": 1,
+                "binaries": [],
+                "preferred": null,
+                "setup_complete_at": null,
+                "model_bundle": {{
+                    "version": "v1",
+                    "embed": {{
+                        "onnx_path": "{m}",
+                        "tokenizer_path": "{m}",
+                        "onnx_blake3": "0000",
+                        "tokenizer_blake3": "0000"
+                    }},
+                    "rerank": {{
+                        "onnx_path": "{m}",
+                        "tokenizer_path": "{m}",
+                        "onnx_blake3": "0000",
+                        "tokenizer_blake3": "0000"
+                    }},
+                    "registered_at": "2026-05-16T00:00:00Z"
+                }}
+            }}"#,
+            m = missing.display()
+        );
+        std::fs::write(&manifest_path, content).unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = models_bundle_present(&env);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail.contains("MISSING") || r.detail.contains("missing"),
+            "expected 'missing' in detail, got: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn models_bundle_present_ok_when_files_match_blake3() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Stage four small "model" files and record their real BLAKE3
+        // anchors in the manifest — verify() must accept them.
+        let mut paths_and_hashes: Vec<(std::path::PathBuf, String)> = Vec::new();
+        for name in &[
+            "embed.onnx",
+            "embed.tokenizer.json",
+            "rerank.onnx",
+            "rerank.tokenizer.json",
+        ] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("fake {name} content")).unwrap();
+            let mut h = blake3::Hasher::new();
+            h.update(format!("fake {name} content").as_bytes());
+            let hex = h.finalize().to_hex().to_string();
+            paths_and_hashes.push((p, hex));
+        }
+        let manifest_path = tmp.path().join("install-manifest.json");
+        let content = format!(
+            r#"{{
+                "schema_version": 1,
+                "binaries": [],
+                "preferred": null,
+                "setup_complete_at": null,
+                "model_bundle": {{
+                    "version": "v1",
+                    "embed": {{
+                        "onnx_path": "{}",
+                        "tokenizer_path": "{}",
+                        "onnx_blake3": "{}",
+                        "tokenizer_blake3": "{}"
+                    }},
+                    "rerank": {{
+                        "onnx_path": "{}",
+                        "tokenizer_path": "{}",
+                        "onnx_blake3": "{}",
+                        "tokenizer_blake3": "{}"
+                    }},
+                    "registered_at": "2026-05-16T00:00:00Z"
+                }}
+            }}"#,
+            paths_and_hashes[0].0.display(),
+            paths_and_hashes[1].0.display(),
+            paths_and_hashes[0].1,
+            paths_and_hashes[1].1,
+            paths_and_hashes[2].0.display(),
+            paths_and_hashes[3].0.display(),
+            paths_and_hashes[2].1,
+            paths_and_hashes[3].1,
+        );
+        std::fs::write(&manifest_path, content).unwrap();
+        let env = DoctorEnv {
+            config_dir: tmp.path().to_path_buf(),
+            install_dir_candidates: vec![],
+            path_entries: vec![],
+        };
+        let r = models_bundle_present(&env);
+        assert_eq!(
+            r.status,
+            CheckStatus::Ok,
+            "expected Ok with matching BLAKE3s, got status={:?} detail={}",
+            r.status,
+            r.detail
+        );
+        assert!(
+            r.detail.contains("v1") && r.detail.contains("verified"),
+            "expected detail to mention version + verified, got: {}",
+            r.detail
+        );
     }
 
     #[tokio::test]

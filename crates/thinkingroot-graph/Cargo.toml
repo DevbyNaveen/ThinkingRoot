@@ -13,11 +13,17 @@ categories.workspace    = true
 rust-version.workspace  = true
 
 [features]
-## Enable neural embedding via fastembed + ONNX Runtime. Disable for faster
-## test builds or environments where the ~300MB ONNX runtime is undesirable.
-## When disabled, VectorStore is a no-op that returns empty search results.
+## Enable neural embedding + cross-encoder reranking via ONNX Runtime.
+## Disable for faster test builds or environments where the ~25 MB ORT
+## runtime is undesirable. When disabled, VectorStore + CrossEncoder are
+## no-ops that return empty search results / identity-ranked scores.
+##
+## Track 32 (2026-05-16) dropped fastembed in favour of `ort` +
+## `tokenizers` direct — fastembed's HF-Hub auto-download was
+## incompatible with the install-time bundle contract (`install.sh`
+## stages all model files; no lazy network at runtime).
 default = ["vector"]
-vector = ["dep:fastembed"]
+vector = ["dep:ort", "dep:tokenizers"]
 
 [dependencies]
 thinkingroot-core = { workspace = true }
@@ -31,7 +37,13 @@ chrono = { workspace = true }
 cozo = { workspace = true }
 blake3 = { workspace = true }
 
-fastembed = { version = "5", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+# ONNX Runtime bindings — bundles the ORT prebuilt binaries so the
+# install one-liner ships a self-contained inference stack. Matches
+# the version fastembed v5.13.1 was pulling transitively so the
+# Cargo.lock churn is minimal.
+ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = ["download-binaries", "tls-rustls", "ndarray", "std"] }
+# Hugging Face tokenizers in Rust — same major as fastembed used.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 tempfile = "3"

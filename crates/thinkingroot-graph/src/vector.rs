@@ -1,28 +1,41 @@
 // ─── Real Implementation ─────────────────────────────────────────────────────
 //
-// Compiled only when the "vector" feature is enabled.  Uses fastembed +
-// ONNX Runtime for local neural embeddings and cosine-similarity search.
+// Compiled only when the "vector" feature is enabled. Uses raw
+// `ort` + `tokenizers` (Track 32, 2026-05-16) — fastembed was dropped
+// because its `with_cache_dir()` still falls back to Hugging Face Hub
+// on cache miss, incompatible with our install-time bundle contract.
+//
+// Model files are staged by `install.sh` / `install.ps1` into the
+// canonical bundle dir (`<dirs::cache_dir()>/thinkingroot/models/`)
+// and loaded via `ort_session::EmbeddingModel`. Loading is still
+// lazy (first call) so workspace open stays instant.
 
 #[cfg(feature = "vector")]
 mod inner {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+    use crate::ort_session::{
+        default_embed_paths, EmbeddingModel as OrtEmbeddingModel, EMBED_MAX_LEN,
+    };
     use thinkingroot_core::{Error, Result};
 
-    /// Vector storage backed by fastembed for local neural embeddings.
-    /// Stores embeddings in-memory with persistence to disk via JSON.
-    /// Supports cosine similarity search for semantic queries.
+    /// AllMiniLM-L6-v2 embedding dimensionality. Pinned here because
+    /// the on-disk `vectors.bin` schema bakes it in — changing it
+    /// invalidates every existing workspace's vector index.
+    const EMBED_DIM: usize = 384;
+
+    /// Vector storage backed by `ort_session::EmbeddingModel`. Stores
+    /// embeddings in-memory with persistence to disk via the compact
+    /// `TRVEC1` binary format. Supports cosine similarity search for
+    /// semantic queries.
     ///
-    /// The ONNX model is loaded **lazily** on first use so that opening a
-    /// workspace (e.g. `root graph`) is instant — ONNX Runtime session
-    /// creation is slow even when the model file is already cached on disk.
+    /// The ONNX model is loaded **lazily** on first use so that opening
+    /// a workspace stays instant — ORT session creation is slow even
+    /// when the model file is already on disk.
     pub struct VectorStore {
-        /// `None` until the first embed/search call; populated on demand.
-        model: Option<TextEmbedding>,
-        /// Stored so the model can be initialised lazily without re-scanning.
-        cache_dir: std::path::PathBuf,
+        /// `None` until first embed/search call; populated on demand.
+        model: Option<OrtEmbeddingModel>,
         /// Map from ID → (embedding vector, metadata string).
         index: HashMap<String, (Vec<f32>, String)>,
         persist_path: std::path::PathBuf,
@@ -31,23 +44,17 @@ mod inner {
     impl VectorStore {
         /// Initialize the vector store.
         ///
-        /// Fast path: only loads the on-disk index. The ONNX embedding model
-        /// is deferred until the first `upsert`, `search`, or `embed_texts`
-        /// call, keeping workspace open time under one second.
+        /// Fast path: only loads the on-disk index. The ONNX embedding
+        /// model is deferred until the first `upsert`, `search`, or
+        /// `embed_texts` call, keeping workspace open time under one
+        /// second.
         ///
-        /// The ONNX model is stored in a **global shared cache** so every
-        /// workspace reuses the same ~30 MB download:
-        ///   macOS:   ~/Library/Caches/thinkingroot/models/
-        ///   Linux:   ~/.cache/thinkingroot/models/
-        ///   Windows: %LOCALAPPDATA%\thinkingroot\models\
-        /// Falls back to `{workspace}/.thinkingroot/models/` if the OS cache
-        /// directory cannot be resolved.
+        /// The ONNX model is read from the canonical bundle dir
+        /// (`<dirs::cache_dir()>/thinkingroot/models/` or
+        /// `$THINKINGROOT_MODELS_DIR`). `install.sh` / `install.ps1`
+        /// stage the files there at install time — no lazy network
+        /// fetch at runtime.
         pub async fn init(path: &Path) -> Result<Self> {
-            let cache_dir = dirs::cache_dir()
-                .map(|d| d.join("thinkingroot").join("models"))
-                .unwrap_or_else(|| path.join("models"));
-            std::fs::create_dir_all(&cache_dir).map_err(|e| Error::io_path(&cache_dir, e))?;
-
             let persist_path = path.join("vectors.bin");
             let index = Self::load_index(&persist_path);
 
@@ -58,34 +65,28 @@ mod inner {
 
             Ok(Self {
                 model: None,
-                cache_dir,
                 index,
                 persist_path,
             })
         }
 
-        /// Ensure the ONNX model is loaded, initialising it on first call.
-        fn ensure_model(&mut self) -> Result<&mut TextEmbedding> {
+        /// Ensure the ONNX model is loaded, initialising it on first
+        /// call. Returns `Error::GraphStorage` with a `root doctor --fix`
+        /// hint when the bundle is missing.
+        fn ensure_model(&mut self) -> Result<&mut OrtEmbeddingModel> {
             if self.model.is_none() {
                 tracing::info!("loading embedding model (first use)…");
-                let model = TextEmbedding::try_new(
-                    InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                        .with_cache_dir(self.cache_dir.clone())
-                        .with_show_download_progress(false),
-                )
-                .map_err(|e| Error::GraphStorage(format!("failed to init embedding model: {e}")))?;
+                let model =
+                    OrtEmbeddingModel::load(&default_embed_paths(), EMBED_DIM, EMBED_MAX_LEN)?;
                 self.model = Some(model);
                 tracing::info!("embedding model loaded");
             }
-            Ok(self.model.as_mut().unwrap())
+            Ok(self.model.as_mut().expect("just-loaded"))
         }
 
         /// Embed and store a text with an ID and metadata string.
         pub fn upsert(&mut self, id: &str, text: &str, metadata: &str) -> Result<()> {
-            let embeddings = self
-                .ensure_model()?
-                .embed(vec![text], None)
-                .map_err(|e| Error::GraphStorage(format!("embedding failed: {e}")))?;
+            let embeddings = self.ensure_model()?.embed(&[text])?;
 
             if let Some(vec) = embeddings.into_iter().next() {
                 self.index
@@ -104,11 +105,7 @@ mod inner {
             }
 
             let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
-
-            let embeddings = self
-                .ensure_model()?
-                .embed(texts, None)
-                .map_err(|e| Error::GraphStorage(format!("batch embedding failed: {e}")))?;
+            let embeddings = self.ensure_model()?.embed(&texts)?;
 
             let mut count = 0;
             for (embedding, (id, _, metadata)) in embeddings.into_iter().zip(items.iter()) {
@@ -144,10 +141,7 @@ mod inner {
                 return Ok(Vec::new());
             }
 
-            let query_embedding = self
-                .ensure_model()?
-                .embed(vec![query], None)
-                .map_err(|e| Error::GraphStorage(format!("query embedding failed: {e}")))?;
+            let query_embedding = self.ensure_model()?.embed(&[query])?;
 
             let query_vec = match query_embedding.into_iter().next() {
                 Some(v) => v,
@@ -292,11 +286,10 @@ mod inner {
         }
 
         /// Embed texts and return raw embedding vectors.
-        /// Used by the grounding system's semantic judge.
+        /// Used by the branch contradiction pass to cache embeddings
+        /// for later `search_by_vector` calls without re-embedding.
         pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-            self.ensure_model()?
-                .embed(texts.to_vec(), None)
-                .map_err(|e| Error::GraphStorage(format!("embedding failed: {e}")))
+            self.ensure_model()?.embed(texts)
         }
 
         /// Project exactly 384-dimensional embeddings (or any dimension) down to 2D
@@ -506,7 +499,7 @@ mod inner {
     use thinkingroot_core::Result;
 
     /// No-op vector store used when the "vector" feature is disabled.
-    /// Allows the codebase to compile without fastembed/ONNX Runtime.
+    /// Allows the codebase to compile without ort/tokenizers / ONNX Runtime.
     pub struct VectorStore;
 
     impl VectorStore {
@@ -619,7 +612,7 @@ mod tests {
 
     #[cfg(feature = "vector")]
     #[tokio::test]
-    #[ignore = "requires fastembed model download (~30 MB)"]
+    #[ignore = "requires AllMiniLM-L6-v2 ONNX bundle staged at default_model_bundle_dir()"]
     async fn remove_by_ids_removes_only_specified() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = VectorStore::init(dir.path()).await.unwrap();

@@ -130,12 +130,15 @@ pub async fn hybrid_retrieve(
     // pure 11-component scoring and pure CE scoring.
     //
     // Skip-conditions (any one trips the bypass):
-    //   - `use_cross_encoder = false` (default)
+    //   - `use_cross_encoder = false` (set by `ScoringProfile::instant()`
+    //     for typeahead; `Default::default()` enables it post-Track-32)
     //   - workspace is structural-only (CE adds no signal over BM25 there)
     //   - `scored.len() < 2` (rerank of a single hit is a no-op)
     //
-    // The model is loaded on first call only; ~280MB Jina-Turbo download
-    // happens lazily, cached under `<dirs::cache_dir>/thinkingroot/models/`.
+    // The model is loaded on first call only; ~300 MB gte-modernbert
+    // ONNX bundle is staged at install time by install.sh / install.ps1
+    // under `<dirs::cache_dir>/thinkingroot/models/rerank.{onnx,tokenizer.json}`.
+    // No HF-Hub fetch at runtime (Track 32, 2026-05-16).
     if req.scoring_profile.use_cross_encoder && scored.len() >= 2 {
         let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
         let pool = &scored[..pool_size];

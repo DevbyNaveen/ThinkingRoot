@@ -354,6 +354,7 @@ pub fn mark_setup_complete() -> Result<(), String> {
                 binaries: Vec::new(),
                 preferred: None,
                 setup_complete_at: None,
+                model_bundle: None,
             }
         }
         Err(e) => return Err(format!("read install manifest: {e}")),

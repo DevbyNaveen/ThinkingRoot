@@ -287,15 +287,22 @@ pub struct ScoringProfile {
     /// Below this candidate count, the planner forces Datalog-only mode
     /// (spec §17 Q3 — small workspaces don't benefit from vector recall).
     pub total_candidate_threshold: usize,
-    /// SOTA Lever 1 — opt-in cross-encoder rerank as the final stage.
-    /// Default `false` because the rerank pass adds ~120-200ms p95 on top-20
-    /// CPU inference (Jina Turbo v1, 137M params), which busts our
-    /// `<25ms p95` instant-retrieval budget. Enable for Playground deep-mode,
-    /// paper synthesis, `/find-gaps` — flows where >100ms latency is
-    /// already acceptable for higher answer accuracy.
+    /// SOTA Lever 1 — cross-encoder rerank as the final stage.
     ///
-    /// Serde-defaults to `false` so legacy `ScoringProfile` JSON round-trips
-    /// stay byte-equal.
+    /// **Default `true` post-Track-32 (2026-05-16)** — the swap from
+    /// Jina Turbo (280 MB, 120-200 ms top-20) to gte-reranker-modernbert-base
+    /// (300 MB, ~150-250 ms top-20, +1.5-2.5% Hit@1 lift on independent
+    /// benchmarks) makes default-on viable: the latency is invisible
+    /// behind LLM-streaming TTFT (500 ms-2 s) for every flow except
+    /// instant typeahead, which uses `ScoringProfile::instant()` to
+    /// explicitly disable.
+    ///
+    /// Serde-defaults to `false` for **back-compat**: pre-Track-32
+    /// `ScoringProfile` JSON round-trips stay byte-equal on the wire
+    /// (a v0.9.x daemon receiving a v0.9.y request payload that omits
+    /// the field gets the old behaviour, not silent upgrade).
+    /// `Default::default()` in-process construction picks up the new
+    /// `true` default.
     #[serde(default)]
     pub use_cross_encoder: bool,
     /// Blend weight applied to the cross-encoder score when fusing with the
@@ -326,8 +333,26 @@ impl Default for ScoringProfile {
             recency_half_life_days: 180.0,
             require_rooted_only: false,
             total_candidate_threshold: 500,
-            use_cross_encoder: false,
+            // Track 32 (2026-05-16) flipped this on by default — see field docstring.
+            use_cross_encoder: true,
             cross_encoder_weight: 0.7,
+        }
+    }
+}
+
+impl ScoringProfile {
+    /// Instant-retrieval profile for typeahead / autocomplete flows
+    /// that need `<25 ms p95`. Disables cross-encoder rerank
+    /// (the only stage that exceeds the budget) but keeps all
+    /// 11 fuse-score components.
+    ///
+    /// Use when the caller cannot afford the rerank pass — UI search
+    /// suggestions, Brain-graph hover hints, low-latency MCP probes.
+    /// Every other flow should take `Default::default()`.
+    pub fn instant() -> Self {
+        Self {
+            use_cross_encoder: false,
+            ..Self::default()
         }
     }
 }

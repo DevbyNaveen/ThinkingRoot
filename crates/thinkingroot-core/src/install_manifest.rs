@@ -64,6 +64,104 @@ pub struct InstallManifest {
     /// `root doctor` checks pass. `None` means the user has not
     /// completed first-run setup.
     pub setup_complete_at: Option<DateTime<Utc>>,
+    /// Track 32 (2026-05-16). Model bundle staged at install time
+    /// by `install.sh` / `install.ps1`. `None` on pre-Track-32
+    /// installs and on `TR_SKIP_MODELS=1` opt-outs — `root doctor`'s
+    /// `models.bundle_present` check surfaces this state so the
+    /// user can `root doctor --fix` to fetch it.
+    ///
+    /// `#[serde(default)]` for back-compat with existing v1 manifests
+    /// in the wild — readers on a daemon that hasn't been upgraded
+    /// to Track 32 silently get `None` here instead of failing
+    /// IncompatibleSchema (a soft addition, not a schema bump).
+    #[serde(default)]
+    pub model_bundle: Option<ModelBundle>,
+}
+
+/// One model file pair (ONNX + tokenizer) with BLAKE3 anchors for
+/// tamper-evidence. Verified at every `root doctor` run and at
+/// daemon boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFile {
+    pub onnx_path: PathBuf,
+    pub tokenizer_path: PathBuf,
+    pub onnx_blake3: String,
+    pub tokenizer_blake3: String,
+}
+
+impl ModelFile {
+    /// Stream-hash both files and check against the recorded
+    /// `*_blake3` digests. Returns `ChecksumMismatch` on the first
+    /// divergence — caller can route this into `Decision::RepairNeeded`
+    /// or surface the doctor `models.bundle_present` failure.
+    pub fn verify(&self) -> Result<(), ManifestError> {
+        verify_file_blake3(&self.onnx_path, &self.onnx_blake3)?;
+        verify_file_blake3(&self.tokenizer_path, &self.tokenizer_blake3)?;
+        Ok(())
+    }
+
+    /// Existence-only check (no BLAKE3). Cheaper than `verify` —
+    /// used by `root doctor`'s presence check before optionally
+    /// running the full hash audit.
+    pub fn files_exist(&self) -> bool {
+        self.onnx_path.exists() && self.tokenizer_path.exists()
+    }
+}
+
+/// Track 32 model bundle. Versioned independently of the engine
+/// release so a 0.9.x → 0.9.y bugfix doesn't force re-downloading
+/// the ~340 MB model files. `version` matches the GitHub release
+/// tag (`models-v1`, `models-v2`, ...) the installer pulled from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelBundle {
+    /// e.g. `"v1"`. The installer stamps this from the tag it
+    /// downloaded; `root doctor` compares it against the daemon's
+    /// expected version (a future minimum-version requirement
+    /// surfaces as a `models.bundle_version` doctor warning).
+    pub version: String,
+    /// Embedding model (AllMiniLM-L6-v2 INT8 ONNX, ~30 MB).
+    pub embed: ModelFile,
+    /// Cross-encoder reranker (gte-reranker-modernbert-base FP16
+    /// ONNX, ~300 MB).
+    pub rerank: ModelFile,
+    /// When the installer registered this bundle.
+    pub registered_at: DateTime<Utc>,
+}
+
+impl ModelBundle {
+    /// Verify every file's BLAKE3 anchor. Order is `embed` then
+    /// `rerank` so failures surface on the smaller download first
+    /// (fast feedback for the common "corrupt download" case).
+    pub fn verify(&self) -> Result<(), ManifestError> {
+        self.embed.verify()?;
+        self.rerank.verify()?;
+        Ok(())
+    }
+
+    /// Existence-only check across both model files. Cheap pre-flight
+    /// before the full `verify`.
+    pub fn files_exist(&self) -> bool {
+        self.embed.files_exist() && self.rerank.files_exist()
+    }
+}
+
+fn verify_file_blake3(
+    path: &std::path::Path,
+    expected_hex: &str,
+) -> Result<(), ManifestError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual == expected_hex {
+        Ok(())
+    } else {
+        Err(ManifestError::ChecksumMismatch {
+            path: path.to_path_buf(),
+            expected: expected_hex.to_string(),
+            actual,
+        })
+    }
 }
 
 /// All errors the manifest can produce. `#[non_exhaustive]` so we
@@ -232,6 +330,7 @@ impl InstallManifest {
                 binaries: Vec::new(),
                 preferred: Some(entry.id),
                 setup_complete_at: None,
+                model_bundle: None,
             },
         };
 
@@ -378,6 +477,7 @@ mod tests {
             }],
             preferred: Some(BinaryId::CliScript),
             setup_complete_at: None,
+            model_bundle: None,
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -426,6 +526,7 @@ mod tests {
             }],
             preferred: Some(BinaryId::CliScript),
             setup_complete_at: None,
+            model_bundle: None,
         };
 
         manifest.save().expect("save succeeds");
@@ -450,6 +551,7 @@ mod tests {
             binaries: vec![],
             preferred: None,
             setup_complete_at: None,
+            model_bundle: None,
         };
         m.save().unwrap();
 

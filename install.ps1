@@ -26,6 +26,9 @@ $ErrorActionPreference = 'Stop'
 $RELEASES_REPO = 'DevbyNaveen/releases'
 $BinaryName = 'root.exe'
 $Asset = 'root-windows-amd64.exe'
+# Track 32 — model bundle tag, versioned separately from engine.
+$ModelsTag = if ($env:MODELS_TAG) { $env:MODELS_TAG } else { 'models-v1' }
+$ModelsVersion = $ModelsTag -replace '^models-', ''
 
 # ── Install paths ────────────────────────────────────────────────────────────
 
@@ -33,6 +36,8 @@ $InstallRoot = Join-Path $env:LOCALAPPDATA 'Programs\ThinkingRoot'
 $InstallBin  = Join-Path $InstallRoot 'bin'
 $InstallApp  = Join-Path $InstallRoot 'app'
 $ConfigDir   = Join-Path $env:APPDATA 'thinkingroot'
+# Mirrors `ort_session::default_model_bundle_dir()` Windows arm.
+$ModelDir    = Join-Path $env:LOCALAPPDATA 'thinkingroot\models'
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -123,14 +128,139 @@ function Write-InstallManifest([string]$binPath, [string]$version, [string]$chec
         $binaries += $desktopEntry
     }
 
+    # Track 32 — `model_bundle` populated by Install-ModelBundle when
+    # it ran successfully earlier in the script. Globals are set on
+    # the script scope so this function can read them after the
+    # download step.
+    $modelBundle = $null
+    if ($script:ModelBundleVersion) {
+        $modelBundle = [pscustomobject]@{
+            version       = $script:ModelBundleVersion
+            embed         = [pscustomobject]@{
+                onnx_path        = $script:ModelBundleEmbedOnnxPath
+                tokenizer_path   = $script:ModelBundleEmbedTokenizerPath
+                onnx_blake3      = $script:ModelBundleEmbedOnnxBlake3
+                tokenizer_blake3 = $script:ModelBundleEmbedTokenizerBlake3
+            }
+            rerank        = [pscustomobject]@{
+                onnx_path        = $script:ModelBundleRerankOnnxPath
+                tokenizer_path   = $script:ModelBundleRerankTokenizerPath
+                onnx_blake3      = $script:ModelBundleRerankOnnxBlake3
+                tokenizer_blake3 = $script:ModelBundleRerankTokenizerBlake3
+            }
+            registered_at = $installedAt
+        }
+    }
+
     $manifest = [pscustomobject]@{
         schema_version     = 1
         binaries           = $binaries
         preferred          = 'cli-script'
         setup_complete_at  = $null
+        model_bundle       = $modelBundle
     }
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
     Say "Registered install manifest at $manifestPath"
+}
+
+function Install-ModelBundle([string]$binPath) {
+    # Track 32 — downloads the four-file model bundle (embed.onnx,
+    # embed.tokenizer.json, rerank.onnx, rerank.tokenizer.json) from
+    # `https://github.com/<RELEASES_REPO>/releases/download/<ModelsTag>/`
+    # and verifies each against the pinned SHA-256 from `SHA256SUMS`.
+    #
+    # On success, sets nine script-scope globals that
+    # Write-InstallManifest reads to populate `model_bundle`.
+    #
+    # Returns $true on success, $false on recoverable failure.
+
+    if (-not (Test-Path $ModelDir)) {
+        New-Item -ItemType Directory -Force -Path $ModelDir | Out-Null
+    }
+
+    $base = if ($env:TR_TEST_MODELS_BASE_URL) {
+        $env:TR_TEST_MODELS_BASE_URL
+    } else {
+        "https://github.com/$RELEASES_REPO/releases/download/$ModelsTag"
+    }
+
+    $sumsPath = Join-Path $ModelDir 'SHA256SUMS'
+    try {
+        Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing -ErrorAction Stop | Out-Null
+    } catch {
+        Warn "model bundle SHA256SUMS not reachable at $base — skipping model download"
+        Warn "vector retrieval + cross-encoder rerank will fail until the user re-runs install.ps1"
+        return $false
+    }
+
+    $sumsLines = Get-Content $sumsPath
+    function Get-ExpectedSha([string]$file) {
+        foreach ($line in $sumsLines) {
+            $parts = $line.Trim() -split '\s+', 2
+            if ($parts.Count -eq 2 -and ($parts[1] -eq $file -or $parts[1] -eq "./$file")) {
+                return $parts[0]
+            }
+        }
+        return $null
+    }
+
+    $files = @('embed.onnx', 'embed.tokenizer.json', 'rerank.onnx', 'rerank.tokenizer.json')
+    foreach ($f in $files) {
+        $dest = Join-Path $ModelDir $f
+        $expected = Get-ExpectedSha $f
+        if (-not $expected) {
+            Warn "no SHA256 entry for $f in SHA256SUMS — refusing to install $f"
+            return $false
+        }
+
+        if (Test-Path $dest) {
+            $cached = Get-Sha256 $dest
+            if ($cached -eq $expected.ToLower()) {
+                SayDim "$f already cached"
+                continue
+            }
+            SayDim "$f cache stale, refreshing"
+            Remove-Item $dest -Force
+        }
+
+        Say "Downloading $f..."
+        try {
+            Invoke-WebRequest -Uri "$base/$f" -OutFile $dest -UseBasicParsing -ErrorAction Stop | Out-Null
+        } catch {
+            Warn "$f download failed: $_"
+            return $false
+        }
+
+        $actual = Get-Sha256 $dest
+        if ($actual -ne $expected.ToLower()) {
+            Remove-Item $dest -Force
+            Fail "SHA256 mismatch for ${f}: expected $expected, got $actual"
+        }
+    }
+
+    # BLAKE3 anchors via `root.exe hash-file`. Empty string on failure
+    # (matches install.sh behaviour) — manifest still records the
+    # bundle but tamper-detection degrades.
+    function Get-Blake3([string]$path) {
+        try {
+            return (& $binPath hash-file $path 2>$null).Trim()
+        } catch {
+            return ''
+        }
+    }
+
+    $script:ModelBundleVersion              = $ModelsVersion
+    $script:ModelBundleEmbedOnnxPath        = (Join-Path $ModelDir 'embed.onnx')
+    $script:ModelBundleEmbedTokenizerPath   = (Join-Path $ModelDir 'embed.tokenizer.json')
+    $script:ModelBundleRerankOnnxPath       = (Join-Path $ModelDir 'rerank.onnx')
+    $script:ModelBundleRerankTokenizerPath  = (Join-Path $ModelDir 'rerank.tokenizer.json')
+    $script:ModelBundleEmbedOnnxBlake3      = Get-Blake3 $script:ModelBundleEmbedOnnxPath
+    $script:ModelBundleEmbedTokenizerBlake3 = Get-Blake3 $script:ModelBundleEmbedTokenizerPath
+    $script:ModelBundleRerankOnnxBlake3     = Get-Blake3 $script:ModelBundleRerankOnnxPath
+    $script:ModelBundleRerankTokenizerBlake3= Get-Blake3 $script:ModelBundleRerankTokenizerPath
+
+    Say "Model bundle $ModelsTag verified."
+    return $true
 }
 
 function Install-DesktopApp([string]$baseUrl, [string]$version) {
@@ -246,6 +376,23 @@ try {
         SayDim "Open a new terminal window to pick up the PATH change."
     } else {
         SayDim "$InstallBin already in PATH"
+    }
+
+    # ── Install ONNX model bundle (Track 32) ─────────────────────
+    # Download embed + rerank ONNX + tokenizer files BEFORE writing
+    # the install manifest so the manifest captures their BLAKE3
+    # anchors. Loud-fail on a tampered download (SHA256 mismatch);
+    # warn-and-continue on a missing SHA256SUMS file (network blip
+    # / model tag not yet published — the CLI is fully functional
+    # sans bundle, retrieval just degrades).
+    if ($env:TR_SKIP_MODELS -eq '1') {
+        SayDim "Skipping model bundle download (TR_SKIP_MODELS=1)"
+        SayDim "→ vector retrieval + cross-encoder rerank will fail until re-installed"
+    } else {
+        $ok = Install-ModelBundle $finalBin
+        if (-not $ok) {
+            SayDim "→ run ``root doctor --fix models.bundle_present`` (or re-run install.ps1) to retry"
+        }
     }
 
     # ── Manifest ─────────────────────────────────────────────────

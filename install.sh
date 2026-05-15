@@ -18,14 +18,24 @@ IFS='
 
 REPO="DevbyNaveen/ThinkingRoot"
 RELEASES_REPO="DevbyNaveen/releases"
+# Model bundle tag — versioned separately from the engine release so a
+# 0.9.x → 0.9.y bugfix doesn't force re-downloading ~340 MB. Bump when
+# embed / rerank ONNX content changes.
+MODELS_TAG="${MODELS_TAG:-models-v1}"
+MODELS_VERSION="${MODELS_TAG#models-}"
 BINARY="root"
 INSTALL_DIR="${INSTALL_DIR:-}"
 # Skip switches — defaults give the "no-headache" install the user
 # expects from a curl-one-liner. Each is opt-in to disable.
 #   TR_SKIP_SERVICE=1   skip login-agent registration (`root service install`)
 #   TR_SKIP_APP=1       skip desktop .app/.AppImage download
+#   TR_SKIP_MODELS=1    skip the ~340 MB embed + rerank ONNX bundle
+#                       (vector retrieval + cross-encoder rerank then
+#                       fail with a `root doctor --fix` hint until the
+#                       user re-runs the installer)
 TR_SKIP_SERVICE="${TR_SKIP_SERVICE:-0}"
 TR_SKIP_APP="${TR_SKIP_APP:-0}"
+TR_SKIP_MODELS="${TR_SKIP_MODELS:-0}"
 # Optional minisign public key for verifying `checksums.txt`.  When
 # unset the installer falls back to TLS-only trust on the checksum
 # file — a CA-level MITM (or a release-pipeline compromise that can
@@ -293,6 +303,35 @@ ${desktop_entry}"
     fi
   fi
 
+  # Track 32 — model_bundle. When `install_model_bundle` succeeded
+  # earlier in main(), it set MODEL_BUNDLE_* globals; we emit them
+  # as a nested JSON block. When it skipped or failed (and no
+  # globals are set), we emit `null` — `root doctor` then surfaces
+  # a `models.bundle_present` fail and the user can re-run install.sh.
+  if [ -n "${MODEL_BUNDLE_VERSION:-}" ]; then
+    model_bundle_block=$(cat <<MBEOF
+{
+    "version": "${MODEL_BUNDLE_VERSION}",
+    "embed": {
+      "onnx_path": "${MODEL_BUNDLE_EMBED_ONNX_PATH}",
+      "tokenizer_path": "${MODEL_BUNDLE_EMBED_TOKENIZER_PATH}",
+      "onnx_blake3": "${MODEL_BUNDLE_EMBED_ONNX_BLAKE3}",
+      "tokenizer_blake3": "${MODEL_BUNDLE_EMBED_TOKENIZER_BLAKE3}"
+    },
+    "rerank": {
+      "onnx_path": "${MODEL_BUNDLE_RERANK_ONNX_PATH}",
+      "tokenizer_path": "${MODEL_BUNDLE_RERANK_TOKENIZER_PATH}",
+      "onnx_blake3": "${MODEL_BUNDLE_RERANK_ONNX_BLAKE3}",
+      "tokenizer_blake3": "${MODEL_BUNDLE_RERANK_TOKENIZER_BLAKE3}"
+    },
+    "registered_at": "${installed_at}"
+  }
+MBEOF
+)
+  else
+    model_bundle_block="null"
+  fi
+
   cat > "$manifest_tmp" <<EOF
 {
   "schema_version": 1,
@@ -300,7 +339,8 @@ ${desktop_entry}"
 ${binaries_block}
   ],
   "preferred": ${preferred},
-  "setup_complete_at": ${setup_complete}
+  "setup_complete_at": ${setup_complete},
+  "model_bundle": ${model_bundle_block}
 }
 EOF
   mv "$manifest_tmp" "$manifest_path" \
@@ -422,6 +462,122 @@ register_login_agent() {
     return 0
   fi
   warn "login-agent registration failed — run \`root service install\` manually if you want auto-start."
+}
+
+# ── Model bundle dir ─────────────────────────────────────────────────────────
+#
+# Canonical on-disk location for the embed + rerank ONNX bundle.
+# Matches `crate::ort_session::default_model_bundle_dir()` in Rust so
+# the engine finds whatever install.sh stages here without further
+# coordination.
+
+model_bundle_dir() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "${HOME}/Library/Caches/thinkingroot/models"
+  else
+    echo "${HOME}/.cache/thinkingroot/models"
+  fi
+}
+
+# ── Install model bundle (Track 32) ──────────────────────────────────────────
+#
+# Downloads the four-file model bundle (embed.onnx, embed.tokenizer.json,
+# rerank.onnx, rerank.tokenizer.json) from
+# `https://github.com/${RELEASES_REPO}/releases/download/${MODELS_TAG}/`
+# and verifies each against the pinned SHA-256 from `SHA256SUMS` at the
+# same URL.
+#
+# On success, sets nine MODEL_BUNDLE_* shell globals that
+# `write_install_manifest` reads to populate the install-manifest's
+# `model_bundle` field:
+#
+#   MODEL_BUNDLE_VERSION
+#   MODEL_BUNDLE_EMBED_ONNX_PATH       MODEL_BUNDLE_EMBED_ONNX_BLAKE3
+#   MODEL_BUNDLE_EMBED_TOKENIZER_PATH  MODEL_BUNDLE_EMBED_TOKENIZER_BLAKE3
+#   MODEL_BUNDLE_RERANK_ONNX_PATH      MODEL_BUNDLE_RERANK_ONNX_BLAKE3
+#   MODEL_BUNDLE_RERANK_TOKENIZER_PATH MODEL_BUNDLE_RERANK_TOKENIZER_BLAKE3
+#
+# Returns 0 on success, 1 on recoverable failure (no SUMS file yet,
+# download error). Callers warn-and-continue on 1 so a transient
+# bundle outage doesn't block the binary install.
+#
+# Idempotent: already-cached files with matching SHA-256 skip the
+# network fetch. Corrupt cached files surface a hard error (refuse
+# to install a tampered bundle).
+
+install_model_bundle() {
+  bin_path="$1"
+
+  bundle_dir="$(model_bundle_dir)"
+  mkdir -p "$bundle_dir" || { warn "Cannot create ${bundle_dir}"; return 1; }
+
+  models_base="https://github.com/${RELEASES_REPO}/releases/download/${MODELS_TAG}"
+  # Test override mirrors the existing BASE_URL convention.
+  models_base="${TR_TEST_MODELS_BASE_URL:-$models_base}"
+
+  sums_path="${bundle_dir}/SHA256SUMS"
+  # Always re-fetch SHA256SUMS — it's tiny (~600 bytes) and tells us
+  # whether the bundle tag has been republished.
+  if ! download_quiet "${models_base}/SHA256SUMS" "$sums_path" 2>/dev/null; then
+    warn "model bundle SHA256SUMS not reachable at ${models_base} — skipping model download"
+    warn "vector retrieval + cross-encoder rerank will fail until the user re-runs install.sh"
+    return 1
+  fi
+
+  for f in embed.onnx embed.tokenizer.json rerank.onnx rerank.tokenizer.json; do
+    dest="${bundle_dir}/${f}"
+    expected="$(awk -v f="$f" '$2 == f || $2 == "./" f { print $1; exit }' "$sums_path")"
+    if [ -z "$expected" ]; then
+      warn "no SHA256 entry for ${f} in SHA256SUMS — refusing to install ${f}"
+      return 1
+    fi
+
+    if [ -f "$dest" ]; then
+      cached_sum="$(sha256 "$dest")"
+      if [ "$cached_sum" = "$expected" ]; then
+        say_dim "${f} already cached"
+        continue
+      fi
+      say_dim "${f} cache stale, refreshing"
+      rm -f "$dest"
+    fi
+
+    say "Downloading ${f}..."
+    download "${models_base}/${f}" "$dest" \
+      || { warn "${f} download failed"; return 1; }
+
+    actual="$(sha256 "$dest")"
+    if [ "$actual" != "$expected" ]; then
+      rm -f "$dest"
+      err "SHA256 mismatch for ${f}: expected ${expected}, got ${actual}"
+    fi
+  done
+
+  # Compute BLAKE3 anchors via the freshly-installed `root hash-file`
+  # so the install-manifest records tamper-evident hashes that
+  # `root doctor models.bundle_present` re-verifies on every run.
+  embed_onnx_b3="$("${bin_path}" hash-file "${bundle_dir}/embed.onnx" 2>/dev/null)"
+  embed_tok_b3="$("${bin_path}" hash-file "${bundle_dir}/embed.tokenizer.json" 2>/dev/null)"
+  rerank_onnx_b3="$("${bin_path}" hash-file "${bundle_dir}/rerank.onnx" 2>/dev/null)"
+  rerank_tok_b3="$("${bin_path}" hash-file "${bundle_dir}/rerank.tokenizer.json" 2>/dev/null)"
+
+  if [ -z "$embed_onnx_b3" ] || [ -z "$rerank_onnx_b3" ]; then
+    warn "BLAKE3 computation failed — model_bundle field will record empty hashes"
+    warn "this disables tamper-detection but the bundle still works"
+  fi
+
+  MODEL_BUNDLE_VERSION="$MODELS_VERSION"
+  MODEL_BUNDLE_EMBED_ONNX_PATH="${bundle_dir}/embed.onnx"
+  MODEL_BUNDLE_EMBED_TOKENIZER_PATH="${bundle_dir}/embed.tokenizer.json"
+  MODEL_BUNDLE_RERANK_ONNX_PATH="${bundle_dir}/rerank.onnx"
+  MODEL_BUNDLE_RERANK_TOKENIZER_PATH="${bundle_dir}/rerank.tokenizer.json"
+  MODEL_BUNDLE_EMBED_ONNX_BLAKE3="$embed_onnx_b3"
+  MODEL_BUNDLE_EMBED_TOKENIZER_BLAKE3="$embed_tok_b3"
+  MODEL_BUNDLE_RERANK_ONNX_BLAKE3="$rerank_onnx_b3"
+  MODEL_BUNDLE_RERANK_TOKENIZER_BLAKE3="$rerank_tok_b3"
+
+  say "Model bundle ${MODELS_TAG} verified."
+  return 0
 }
 
 # ── checksums.txt caching ────────────────────────────────────────────────────
@@ -578,10 +734,24 @@ main() {
     say "Installed: ${INSTALL_DIR}/${BINARY}"
   fi
 
+  # ── Install ONNX model bundle (Track 32) ────────────────────────────────
+  # Downloads embed + rerank ONNX + tokenizer files BEFORE writing the
+  # install manifest so the manifest captures their BLAKE3 anchors.
+  # Loud-fail on a tampered download; warn-and-continue on a missing
+  # SHA256SUMS file (network blip / model tag not yet published — the
+  # CLI is fully functional sans bundle, retrieval just degrades).
+  if [ "$TR_SKIP_MODELS" = "1" ]; then
+    say_dim "Skipping model bundle download (TR_SKIP_MODELS=1)"
+    say_dim "→ vector retrieval + cross-encoder rerank will fail until re-installed"
+  else
+    install_model_bundle "${INSTALL_DIR}/${BINARY}" \
+      || say_dim "→ run \`root doctor --fix models.bundle_present\` (or re-run install.sh) to retry"
+  fi
+
   # ── Register install in coordinating manifest ───────────────────────────────
   # Cache the verified checksums.txt for Slice F recovery; register
-  # the binary in the install manifest so CLI + desktop agree on
-  # which `root` is canonical.  See:
+  # the binary + model bundle in the install manifest so CLI + desktop
+  # + doctor agree on what's canonical.  See:
   #   docs/superpowers/specs/2026-05-11-install-runtime-smoothness-design.md
   cache_checksums_file "$CHECKSUMS_PATH"
   manifest_checksum="$(blake3sum "${INSTALL_DIR}/${BINARY}")"
