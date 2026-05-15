@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { FileText, FlaskConical, MessageSquareText } from "lucide-react";
+import { FileText, FlaskConical, FolderClosed, MessageSquareText } from "lucide-react";
 
 import { useApp } from "@/store/app";
 import { ChatView } from "@/components/chat/ChatView";
 import { DropZone } from "@/components/playground/DropZone";
+import { FileManager } from "@/components/playground/FileManager";
 import { PaperPanel } from "@/components/playground/PaperPanel";
 import { PlaygroundActions } from "@/components/playground/PlaygroundActions";
 import { SourceDetailPanel } from "@/components/playground/SourceDetailPanel";
@@ -11,7 +12,7 @@ import { SourceLibrary } from "@/components/playground/SourceLibrary";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSource } from "@/lib/tauri";
 
-type PlaygroundTab = "paper" | "chat";
+type PlaygroundTab = "paper" | "chat" | "files";
 
 /**
  * Playground surface — the researcher / student-facing workspace
@@ -88,6 +89,12 @@ export function PlaygroundView() {
               label="Paper"
             />
             <TabButton
+              active={tab === "files"}
+              onClick={() => setTab("files")}
+              icon={<FolderClosed className="size-3.5" />}
+              label="Files"
+            />
+            <TabButton
               active={tab === "chat"}
               onClick={() => setTab("chat")}
               icon={<MessageSquareText className="size-3.5" />}
@@ -97,6 +104,8 @@ export function PlaygroundView() {
           <div className="flex flex-1 overflow-hidden">
             {tab === "paper" ? (
               <PaperPanel workspace={workspace} refreshNonce={refreshNonce} />
+            ) : tab === "files" ? (
+              <FileManager workspace={workspace} refreshNonce={refreshNonce} />
             ) : (
               <ChatView />
             )}

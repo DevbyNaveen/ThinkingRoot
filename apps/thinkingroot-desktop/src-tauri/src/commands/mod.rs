@@ -35,6 +35,7 @@ pub mod memory;
 pub mod meta;
 pub mod pack_export;
 pub mod playground;
+pub mod playground_fs;
 pub mod privacy;
 pub mod proposal;
 pub mod recovery;

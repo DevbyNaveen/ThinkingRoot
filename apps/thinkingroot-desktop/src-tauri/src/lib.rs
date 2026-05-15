@@ -281,6 +281,15 @@ pub fn run() {
             commands::playground::playground_handoff_url,
             commands::playground::playground_gaps,
             commands::playground::paper_regenerate,
+            commands::playground_fs::playground_list_directory,
+            commands::playground_fs::playground_create_folder,
+            commands::playground_fs::playground_rename,
+            commands::playground_fs::playground_move,
+            commands::playground_fs::playground_trash,
+            commands::playground_fs::playground_list_trash,
+            commands::playground_fs::playground_restore,
+            commands::playground_fs::playground_empty_trash,
+            commands::playground_fs::playground_preview,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

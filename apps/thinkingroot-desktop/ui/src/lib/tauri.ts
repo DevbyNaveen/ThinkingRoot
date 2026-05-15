@@ -2056,3 +2056,139 @@ export async function paperRegenerate(
 ): Promise<PaperRegenerateOutcome> {
   return invoke<PaperRegenerateOutcome>("paper_regenerate", { workspace });
 }
+
+// ─── Playground file manager — folders, moves, previews, trash ────────
+
+export interface PlaygroundDirEntry {
+  name: string;
+  rel_path: string;
+  is_dir: boolean;
+  size_bytes: number;
+  modified: number;
+  /** "folder" | "image" | "audio" | "video" | "markdown" | "text"
+   *  | "code" | "pdf" | "archive" | "other" */
+  kind: string;
+}
+
+export interface PlaygroundDirListing {
+  workspace: string;
+  rel_path: string;
+  parent_rel_path: string | null;
+  entries: PlaygroundDirEntry[];
+}
+
+export interface PlaygroundMoveOutcome {
+  moved: number;
+  skipped_conflict: number;
+  skipped_invalid: number;
+  moved_rel_paths: string[];
+}
+
+export interface PlaygroundTrashOutcome {
+  trashed: number;
+  skipped: number;
+  trash_rel_paths: string[];
+}
+
+export interface PlaygroundPreview {
+  workspace: string;
+  rel_path: string;
+  /** "text" | "markdown" | "code" | "image" | "binary" */
+  kind: string;
+  mime: string | null;
+  size_bytes: number;
+  /** Set for text/markdown/code (UTF-8, ≤1 MiB). */
+  text: string | null;
+  /** `data:image/...;base64,...` for image (≤5 MiB). */
+  data_url: string | null;
+  absolute_path: string;
+  too_large: boolean;
+}
+
+export async function playgroundListDirectory(
+  workspace: string,
+  relPath: string,
+): Promise<PlaygroundDirListing> {
+  return invoke<PlaygroundDirListing>("playground_list_directory", {
+    workspace,
+    relPath,
+  });
+}
+
+export async function playgroundCreateFolder(
+  workspace: string,
+  parentRelPath: string,
+  name: string,
+): Promise<string> {
+  return invoke<string>("playground_create_folder", {
+    workspace,
+    parentRelPath,
+    name,
+  });
+}
+
+export async function playgroundRename(
+  workspace: string,
+  relPath: string,
+  newName: string,
+): Promise<string> {
+  return invoke<string>("playground_rename", {
+    workspace,
+    relPath,
+    newName,
+  });
+}
+
+export async function playgroundMove(
+  workspace: string,
+  sourceRelPaths: string[],
+  destRelFolder: string,
+): Promise<PlaygroundMoveOutcome> {
+  return invoke<PlaygroundMoveOutcome>("playground_move", {
+    workspace,
+    sourceRelPaths,
+    destRelFolder,
+  });
+}
+
+export async function playgroundTrash(
+  workspace: string,
+  relPaths: string[],
+): Promise<PlaygroundTrashOutcome> {
+  return invoke<PlaygroundTrashOutcome>("playground_trash", {
+    workspace,
+    relPaths,
+  });
+}
+
+export async function playgroundListTrash(
+  workspace: string,
+): Promise<PlaygroundDirEntry[]> {
+  return invoke<PlaygroundDirEntry[]>("playground_list_trash", { workspace });
+}
+
+export async function playgroundRestore(
+  workspace: string,
+  trashRelPaths: string[],
+): Promise<number> {
+  return invoke<number>("playground_restore", {
+    workspace,
+    trashRelPaths,
+  });
+}
+
+export async function playgroundEmptyTrash(
+  workspace: string,
+): Promise<number> {
+  return invoke<number>("playground_empty_trash", { workspace });
+}
+
+export async function playgroundPreview(
+  workspace: string,
+  relPath: string,
+): Promise<PlaygroundPreview> {
+  return invoke<PlaygroundPreview>("playground_preview", {
+    workspace,
+    relPath,
+  });
+}
