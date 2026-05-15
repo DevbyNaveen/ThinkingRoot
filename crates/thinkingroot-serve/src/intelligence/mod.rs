@@ -12,6 +12,7 @@ pub mod engram;
 pub mod hybrid;
 pub mod hybrid_types;
 pub mod identity;
+pub mod observer;
 pub mod planner;
 pub mod react;
 pub mod reminder_bus;

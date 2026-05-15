@@ -50,7 +50,7 @@ include!(concat!(env!("OUT_DIR"), "/grammar_versions.rs"));
 /// `1.2.0` — added audio-family rules: duration / sample-rate /
 /// channels metadata, spectral fingerprint via FFT, decode-fail
 /// honest absence. Pure-Rust via symphonia + rustfft.
-pub const CATALOG_VERSION: &str = "1.4.0";
+pub const CATALOG_VERSION: &str = "1.5.0";
 
 /// One rule in the catalog. The `'static` lifetime everywhere is
 /// load-bearing: descriptors live in a `phf` static map and the
@@ -943,6 +943,57 @@ pub static RULE_CATALOG: phf::Map<&'static str, RuleDescriptor> = phf::phf_map! 
         default_confidence: 0.95,
         default_sensitivity: "Public",
         description: "Sequential temporal edges between git commits touching the same source — each commit's witness gets a TemporalNext edge to the witness for the next commit in chronological order. Powers AEP supersession-chain queries on git-tracked workspaces.",
+    },
+
+    // ── Observer / Reflector — SOTA Lever 3 (catalog 1.5.0) ──
+    //
+    // Mastra's Observational Memory paper (94.87% LongMemEval) gets
+    // its accuracy lift from condensing raw conversation turns into a
+    // **dense observation log** that prepends to chat context as a
+    // stable cacheable prefix. ThinkingRoot reuses the witness
+    // substrate for this:
+    //   - `conversation::observation@v1` — Witness emitted per
+    //     condensed turn-window (~10-20 turns). Stable across
+    //     re-runs because the underlying turn text is byte-anchored.
+    //   - `conversation::reflection@v1` — Reflector output. Emitted
+    //     when ≥ N observations accumulate; restructures by combining
+    //     related items and dropping context that's no longer
+    //     relevant.
+    //
+    // Both rules emit Witnesses with synthetic spans pointing at the
+    // session transcript byte range — the `source.tar.zst` member
+    // stores conversation transcripts alongside file sources after
+    // the next ship. For v1.5.0 the catalog entry is the substrate
+    // contract; the chat-path emitter lands in a follow-up session
+    // because the wire-in to `intelligence::respond` / `react` is a
+    // UX decision that needs broader design alignment.
+    //
+    // Confidence 0.97 — observations are mechanical compressions of
+    // *user-authored* text, not inferences. The 0.02 humility margin
+    // vs. 0.99 reflects the (small) possibility of condensation
+    // dropping a load-bearing detail. Reflections inherit 0.95 because
+    // they introduce one more abstraction layer.
+    "conversation::observation@v1" => RuleDescriptor {
+        name: "conversation::observation@v1",
+        family: "conversation",
+        input_types: &["raw_bytes"],
+        output_type: "conversation::observation",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.97,
+        default_sensitivity: "Internal",
+        description: "Condensed observation per turn-window (~10-20 turns). Mirrors Mastra's Observational Memory dense-log pattern — Witness payload is the structured observation text that prepends to future chat context as a stable cacheable prefix.",
+    },
+    "conversation::reflection@v1" => RuleDescriptor {
+        name: "conversation::reflection@v1",
+        family: "conversation",
+        input_types: &["raw_bytes", "conversation::observation"],
+        output_type: "conversation::reflection",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.95,
+        default_sensitivity: "Internal",
+        description: "Reflector output — restructures accumulated observations by combining related items and dropping context that's no longer relevant. Emitted when the observation log accumulates past a per-session threshold (default 8 observations).",
     },
 };
 
