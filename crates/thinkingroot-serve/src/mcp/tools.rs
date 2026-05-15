@@ -552,6 +552,34 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["workspace", "proposal_id", "closer"]
                 }
             },
+            // ── SOTA Lever 3 — Observer / Reflector tools ─────────────────
+            {
+                "name": "observe_turn",
+                "description": "Record a single chat turn (user_prompt + assistant_reply) into the Observer's per-session buffer. Mechanical, no LLM. When the per-session pending count reaches the condense threshold (default 10), the Observer condenses the window into a staged observation; staged observations later drain to the witness substrate via `flush_observations`. Cheap to call — invoke once per turn-complete event in your chat lifecycle. Returns `{ session_id, turn_number, pending_turns, should_reflect }`. Mirrors Mastra's Observational Memory dense-log pattern (94.87% LongMemEval).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id":      { "type": "string", "description": "Stable session identifier — different sessions stay isolated in the Observer's per-session buffer." },
+                        "turn_number":     { "type": "integer", "description": "Monotonic turn counter within this session. Pin the same numbering scheme across calls so the condensed observation's turn_range is meaningful." },
+                        "user_prompt":     { "type": "string", "description": "What the user said this turn. May be empty if the turn was a tool-only operation, but at least one of user_prompt / assistant_reply must be non-empty." },
+                        "assistant_reply": { "type": "string", "description": "What the assistant said this turn. May be empty if the turn ended without a reply." }
+                    },
+                    "required": ["session_id", "turn_number"]
+                }
+            },
+            {
+                "name": "flush_observations",
+                "description": "Drain staged conversation observations for `session_id` and persist them to the workspace's witness substrate as `conversation::observation@v1` rows (with an optional `conversation::reflection@v1` row when the reflect threshold has been crossed). Call at session-end OR periodically (every N turns / M minutes) to make the buffer durable across process restarts. On insert failure the observations are re-staged so the next flush retries — failed flushes are honest-incomplete, never silent-lossy. Returns `{ session_id, workspace, inserted_witnesses }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":      { "type": "string", "description": "Target workspace. Observations land in this workspace's witness substrate and participate in retrieval there." },
+                        "session_id":     { "type": "string", "description": "Session whose buffer to drain. Other sessions are unaffected." },
+                        "force_condense": { "type": "boolean", "description": "When true, force-condense any pending turn buffer BEFORE flushing — useful at session-end to capture a partial window. Default false.", "default": false }
+                    },
+                    "required": ["workspace", "session_id"]
+                }
+            },
             // ── Rooting tools (Phase 6.5 admission gate) ──────────────────
             {
                 "name": "query_rooted",
@@ -1999,7 +2027,133 @@ pub async fn handle_call(
         "list_proposals" => handle_list_proposals(id, &arguments, engine, ws).await,
         "close_proposal" => handle_close_proposal(id, &arguments, engine, ws).await,
 
+        // ── SOTA Lever 3 — Observer / Reflector tools ─────────────────
+        "observe_turn" => handle_observe_turn(id, &arguments, engine).await,
+        "flush_observations" => handle_flush_observations(id, &arguments, engine, ws).await,
+
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+    }
+}
+
+// ─── SOTA Lever 3 — Observer / Reflector MCP handlers ────────────────
+//
+// Two tools give MCP clients (Claude Code, Cursor, Desktop chat) a
+// clean opt-in surface for the conversation-memory substrate:
+//
+//   - `observe_turn`: record a (user_prompt, assistant_reply) pair.
+//     The Observer buffers turns per-session; condensation fires
+//     automatically at the threshold. Cheap (~µs).
+//
+//   - `flush_observations`: drain staged observations for a session
+//     into the workspace's witness substrate. Call at session-end
+//     OR on a cadence (every N turns / every M minutes). Insert
+//     errors re-stage so failed flushes don't lose memory.
+//
+// Both tools are zero-LLM by design — the condensation is mechanical
+// concatenation of user/assistant prompt pairs. Match Mastra's
+// Observational Memory pattern (94.87% LongMemEval) but on the
+// witness substrate so retrieval (hybrid + AEP) picks observations
+// up alongside file-derived witnesses.
+
+async fn handle_observe_turn(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+) -> JsonRpcResponse {
+    let session_id = match arguments.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "observe_turn: missing required `session_id`".to_string(),
+            );
+        }
+    };
+    let turn_number = match arguments.get("turn_number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "observe_turn: missing required `turn_number` (u64)".to_string(),
+            );
+        }
+    };
+    let user_prompt = arguments
+        .get("user_prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let assistant_reply = arguments
+        .get("assistant_reply")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if user_prompt.is_empty() && assistant_reply.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "observe_turn: at least one of `user_prompt` or `assistant_reply` must be non-empty"
+                .to_string(),
+        );
+    }
+    let observer = engine.observer();
+    observer.record_turn(crate::intelligence::observer::ChatTurn {
+        session_id: session_id.clone(),
+        turn_number,
+        user_prompt,
+        assistant_reply,
+        at: chrono::Utc::now(),
+    });
+    let pending = observer.pending_count(&session_id);
+    mcp_text_result(
+        id,
+        &serde_json::json!({
+            "session_id": session_id,
+            "turn_number": turn_number,
+            "pending_turns": pending,
+            "should_reflect": observer.should_reflect(&session_id),
+        }),
+    )
+}
+
+async fn handle_flush_observations(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let session_id = match arguments.get("session_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "flush_observations: missing required `session_id`".to_string(),
+            );
+        }
+    };
+    // Optional force-condense pass before flushing. Useful at session-
+    // end where you want any partial turn-window to surface as an
+    // observation rather than being lost on a process restart.
+    let force_condense = arguments
+        .get("force_condense")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if force_condense {
+        engine.observer().force_condense(&session_id);
+    }
+    match engine.flush_observations(ws, &session_id).await {
+        Ok(inserted) => mcp_text_result(
+            id,
+            &serde_json::json!({
+                "session_id": session_id,
+                "workspace": ws,
+                "inserted_witnesses": inserted,
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
     }
 }
 
@@ -2849,5 +3003,96 @@ mod resolve_workspace_arg_tests {
     fn missing_arg_and_no_default_falls_back_to_literal_default() {
         let got = resolve_workspace_arg_with(None, None, mounted(&[]));
         assert_eq!(got, "default");
+    }
+}
+
+#[cfg(test)]
+mod observer_tool_listing_tests {
+    use super::handle_list;
+
+    #[tokio::test]
+    async fn observe_turn_tool_is_advertised() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"observe_turn"),
+            "expected observe_turn tool to be advertised; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_observations_tool_is_advertised() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"flush_observations"),
+            "expected flush_observations tool to be advertised; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_turn_requires_session_id_and_turn_number() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let descriptor = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("observe_turn"))
+            .expect("observe_turn tool present");
+        let schema = descriptor.get("inputSchema").expect("schema present");
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array present");
+        let required_names: Vec<&str> = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required_names.contains(&"session_id"));
+        assert!(required_names.contains(&"turn_number"));
+    }
+
+    #[tokio::test]
+    async fn flush_observations_requires_workspace_and_session_id() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let descriptor = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("flush_observations"))
+            .expect("flush_observations tool present");
+        let schema = descriptor.get("inputSchema").expect("schema present");
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array present");
+        let required_names: Vec<&str> = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required_names.contains(&"workspace"));
+        assert!(required_names.contains(&"session_id"));
     }
 }
