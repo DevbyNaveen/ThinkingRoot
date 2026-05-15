@@ -50,7 +50,7 @@ include!(concat!(env!("OUT_DIR"), "/grammar_versions.rs"));
 /// `1.2.0` — added audio-family rules: duration / sample-rate /
 /// channels metadata, spectral fingerprint via FFT, decode-fail
 /// honest absence. Pure-Rust via symphonia + rustfft.
-pub const CATALOG_VERSION: &str = "1.3.0";
+pub const CATALOG_VERSION: &str = "1.4.0";
 
 /// One rule in the catalog. The `'static` lifetime everywhere is
 /// load-bearing: descriptors live in a `phf` static map and the
@@ -882,6 +882,67 @@ pub static RULE_CATALOG: phf::Map<&'static str, RuleDescriptor> = phf::phf_map! 
         default_confidence: 0.99,
         default_sensitivity: "Public",
         description: "Video container not demuxable (WebM/MKV/AVI) or parse failed — honest absence (mirrors audio::skipped@v1)",
+    },
+
+    // ── Typed-edge mechanical extractors (SOTA Lever 2, catalog 1.4.0) ──
+    //
+    // These rules don't emit Witness rows directly. Each Witness they
+    // produce *is* the evidence_witness_id on one or more rows of
+    // `witness_typed_edges`. The rule's `output_type` follows the
+    // typed-edge taxonomy from the substrate (Supersedes / Contradicts
+    // / Related / TemporalNext) — single source of truth in the
+    // graph.rs schema.
+    //
+    // Confidence 0.95 (not 0.99) because the edge relationship is
+    // inferred from a textual pattern. The 0.04 reduction reflects the
+    // honest possibility that "Updated: 2026-05-01" in a markdown
+    // header could be a quote of someone else's release notes rather
+    // than an authorial supersession. Mechanical-pattern extraction is
+    // exact — extraction is never wrong — but the *inferred edge
+    // semantic* is what we're qualifying.
+    "edge::markdown-supersedes@v1" => RuleDescriptor {
+        name: "edge::markdown-supersedes@v1",
+        family: "edge",
+        input_types: &["raw_bytes"],
+        output_type: "edge::Supersedes",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.95,
+        default_sensitivity: "Public",
+        description: "Markdown 'Updated: YYYY-MM-DD' / 'Last modified:' / 'Revised:' patterns under headings. Emits a Supersedes typed edge from the new heading's content witness to the prior version's heading witness in the same source.",
+    },
+    "edge::quantity-contradicts@v1" => RuleDescriptor {
+        name: "edge::quantity-contradicts@v1",
+        family: "edge",
+        input_types: &["raw_bytes", "asserts::quantity"],
+        output_type: "edge::Contradicts",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.95,
+        default_sensitivity: "Public",
+        description: "Two quantity witnesses referring to the same canonical entity/unit but with numerically distinct values flag a Contradicts edge. Uses `(entity, unit)` as the join key; numeric equality tolerates 1e-6 relative epsilon to avoid float-rounding false positives.",
+    },
+    "edge::heading-related@v1" => RuleDescriptor {
+        name: "edge::heading-related@v1",
+        family: "edge",
+        input_types: &["raw_bytes", "documents::heading"],
+        output_type: "edge::Related",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.95,
+        default_sensitivity: "Public",
+        description: "Witnesses that share the same exact `heading_path` parent become Related siblings. Bidirectional in semantics (queried via `list_witness_contradictions`'s symmetric pattern) but stored as a single directed edge from the alphabetically-earlier id to avoid duplication.",
+    },
+    "edge::temporal-next@v1" => RuleDescriptor {
+        name: "edge::temporal-next@v1",
+        family: "edge",
+        input_types: &["raw_bytes", "git::commit@v1"],
+        output_type: "edge::TemporalNext",
+        language: None,
+        grammar_version: None,
+        default_confidence: 0.95,
+        default_sensitivity: "Public",
+        description: "Sequential temporal edges between git commits touching the same source — each commit's witness gets a TemporalNext edge to the witness for the next commit in chronological order. Powers AEP supersession-chain queries on git-tracked workspaces.",
     },
 };
 

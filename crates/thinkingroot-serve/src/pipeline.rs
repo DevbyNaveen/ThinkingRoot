@@ -1172,15 +1172,50 @@ async fn run_pipeline_inner(
                 .graph
                 .insert_witness_input_edges_batch(&assembled.edges)?;
         }
+        // SOTA Lever 2 — derive typed edges (Related/TemporalNext/
+        // Supersedes/Contradicts) from the persisted witness set and
+        // write them into `witness_typed_edges`. Mechanical only; no
+        // LLM. Operates on `assembled.witnesses` (post-dedup, post-
+        // SAFETY-cross-check) so the edges target the same id space
+        // the storage layer just persisted.
+        //
+        // Errors here are `tracing::warn!`-logged (not propagated) to
+        // match the Phase 6.45 contract — typed-edge derivation is
+        // additive substrate, never gating compile. The retrieval
+        // path falls back to non-typed-edge ranking on an empty
+        // `witness_typed_edges` table.
+        let typed_edges =
+            thinkingroot_extract::typed_edges::derive_all_typed_edges(&assembled.witnesses);
+        let typed_edges_emitted = typed_edges.len();
+        let typed_edges_inserted = if !typed_edges.is_empty() {
+            match storage
+                .graph
+                .insert_witness_typed_edges_batch(&typed_edges)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "witness_typed_edges",
+                        error = %e,
+                        "typed-edge insert failed; retrieval will fall back to fuse_score"
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
         persisted_witness_count = assembled.witnesses.len();
         tracing::info!(
             raw = raw_witness_count,
             persisted = persisted_witness_count,
             edges = assembled.edges.len(),
+            typed_edges = typed_edges_inserted,
             deduped = assembled.dedup_count,
             errors = assembled.errors.len(),
             "Witness Mesh: persisted to graph"
         );
+        let _ = typed_edges_emitted; // pinned for future progress-event surface
         emit!(ProgressEvent::WitnessMeshDone {
             persisted: persisted_witness_count,
             deduped: assembled.dedup_count,
