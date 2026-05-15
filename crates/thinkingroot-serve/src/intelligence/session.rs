@@ -58,6 +58,12 @@ pub struct SessionContext {
     pub token_budget: usize,
     /// Number of contribute calls made in this session (used as turn number for turn calendar).
     pub turn_count: u64,
+    /// Number of *chat* turns completed in this session — incremented
+    /// once per agent run that emits a terminal `Done` event. Distinct
+    /// from `turn_count` (which counts `contribute` write calls) so the
+    /// Observer's `ChatTurn.turn_number` is a meaningful ordinal even
+    /// for read-only sessions that never write claims.
+    pub chat_turn_count: u64,
     created_at: Instant,
     last_active: Instant,
 }
@@ -76,9 +82,21 @@ impl SessionContext {
             active_branch: None,
             token_budget: DEFAULT_TOKEN_BUDGET,
             turn_count: 0,
+            chat_turn_count: 0,
             created_at: now,
             last_active: now,
         }
+    }
+
+    /// Allocate the next chat-turn ordinal. Bumps `chat_turn_count`
+    /// and returns the new value, so the first turn is `1`, the
+    /// second is `2`, etc. — matches the human-readable `Turn N`
+    /// scheme the Observer's `condense_window` emits into the
+    /// staged observation text.
+    pub fn next_chat_turn(&mut self) -> u64 {
+        self.last_active = Instant::now();
+        self.chat_turn_count = self.chat_turn_count.saturating_add(1);
+        self.chat_turn_count
     }
 
     /// Mark claim IDs as delivered — they will be filtered from future responses.
@@ -222,6 +240,23 @@ mod tests {
     fn session_not_expired_immediately() {
         let s = SessionContext::new("sess-1", "my-ws");
         assert!(!s.is_expired());
+    }
+
+    #[test]
+    fn next_chat_turn_starts_at_one_and_increments() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        assert_eq!(s.chat_turn_count, 0);
+        assert_eq!(s.next_chat_turn(), 1);
+        assert_eq!(s.next_chat_turn(), 2);
+        assert_eq!(s.chat_turn_count, 2);
+    }
+
+    #[test]
+    fn next_chat_turn_independent_of_turn_count() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        s.turn_count = 7; // simulate prior contribute calls
+        assert_eq!(s.next_chat_turn(), 1, "chat turn ordinal is its own counter");
+        assert_eq!(s.turn_count, 7, "contribute counter is untouched");
     }
 
     #[test]
