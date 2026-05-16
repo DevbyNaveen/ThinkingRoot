@@ -1400,19 +1400,34 @@ async fn async_main() -> anyhow::Result<()> {
         })
     );
 
-    let filter = if cli.verbose {
-        EnvFilter::new("thinkingroot=debug,root=debug")
+    // Filter rule of thumb:
+    //   * Use `info`/`debug` as the BASELINE so custom `target: "rerank"` /
+    //     `"engram"` / `"observer"` / etc. tracing events emitted by our crates
+    //     are visible — the old `thinkingroot=info,root=info` prefix filter
+    //     silently dropped all 13 custom targets (rerank, ort_session,
+    //     observer, paper, readme, reflect, mcp_bridge, fs_watch, witness_typed_edges,
+    //     workspace_state, ttl_cleanup, stream_cleanup, cognition_commit).
+    //   * Mute known-noisy third-party crates explicitly so the baseline
+    //     stays useful without an `RUST_LOG=info,h2=warn,…` incantation.
+    //   * `RUST_LOG` takes priority when set — operator escape hatch.
+    const NOISE_MUTE: &str = "h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,\
+        rustls=warn,tokio_util=warn,tower=warn,want=warn,mio=warn,\
+        cozo=warn,sqlx=warn";
+    let default_directive = if cli.verbose {
+        format!("debug,{NOISE_MUTE}")
     } else if is_mcp_stdio {
         // MCP stdio: only WARN/ERROR to stderr; stdout must stay pure JSON-RPC.
-        EnvFilter::new("thinkingroot=warn,root=warn")
+        "warn".to_string()
     } else if use_progress {
         // TTY + no --verbose: suppress everything below ERROR so progress bars
         // own stderr cleanly. WARN/INFO mixed with indicatif garbles the display.
-        EnvFilter::new("thinkingroot=error,root=error")
+        "error".to_string()
     } else {
-        // Pipe / CI: full INFO for clean log output.
-        EnvFilter::new("thinkingroot=info,root=info")
+        // Pipe / CI / detached daemon: full INFO for clean log output.
+        format!("info,{NOISE_MUTE}")
     };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&default_directive));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -2295,10 +2310,10 @@ async fn run_compile(
     let start = Instant::now();
 
     // M3: `--no-rooting` is plumbed through PipelineOptions instead of
-    // an `unsafe { std::env::set_var(...) }`.  The pipeline reads the
-    // option directly before Phase 6.5; the deprecated env-var
-    // fallback (`TR_ROOTING_DISABLED=1`) is still honoured for
-    // external scripts but no longer set by this CLI.
+    // an `unsafe { std::env::set_var(...) }`. The legacy
+    // `TR_ROOTING_DISABLED=1` env-var fallback is gone — no code reads
+    // it (race hazard with concurrent thread reads). External scripts
+    // must pass `--no-rooting` on the CLI invocation.
     let result = if use_progress {
         progress::run_compile_progress(&path, branch, no_rooting).await?
     } else {

@@ -1941,7 +1941,10 @@ mod tests {
             predicates: vec![],
         };
         let profile = ScoringProfile::default();
-        let s = plan_routing(&parsed, 100, &profile);
+        // Default threshold is 100 post-Track-32 polish; pick a count
+        // well under it so the test stays meaningful if the default
+        // is tuned further down (50 single-file-workspace floor).
+        let s = plan_routing(&parsed, 25, &profile);
         assert_eq!(s, RoutingShape::DatalogOnlyForced);
     }
 
