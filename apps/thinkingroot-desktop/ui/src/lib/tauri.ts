@@ -567,6 +567,10 @@ export type CompileProgress =
   //                   indeterminate; render a spinner with elapsed only.
   //   eta_ms        — Daemon-computed ETA for the current step.
   //                   `null` when total is 0 or done is 0.
+  //   detail        — Short sub-phase caption (e.g.
+  //                   "removing changed sources"). Optional; falls
+  //                   back to step_label when absent. Renders in the
+  //                   indeterminate-spinner caption.
   | {
       phase: "tick";
       step: "reading" | "extracting" | "linking" | "persisting" | "packing";
@@ -576,6 +580,7 @@ export type CompileProgress =
       step_elapsed_ms: number;
       total_elapsed_ms: number;
       eta_ms: number | null;
+      detail?: string | null;
     }
   | { phase: "diff_start" }
   | { phase: "diff_complete"; changed: number; unchanged: number; deleted: number }

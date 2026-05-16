@@ -343,7 +343,17 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           {badge.label}
         </span>
       </div>
-      {!conn.connected && conn.lastSeenMs && (
+      {/* Suppress the "Status disconnected" line while a compile is
+       * actively running. The workspace_status SSE broadcast actor is
+       * re-created by the post-compile engine.mount, which closes the
+       * prior stream cleanly — the client-side fix (Commit 5)
+       * suppresses the flicker, but during a long compile we may
+       * still legitimately observe a brief gap. The compile progress
+       * bar already conveys "engine is busy" honestly, so doubling
+       * up with a scary "disconnected" line is noise. */}
+      {!conn.connected
+        && conn.lastSeenMs
+        && status?.compile.kind !== "running" && (
         <p className="text-[10px] text-muted-foreground/80">
           Status disconnected — last seen{" "}
           {Math.round((Date.now() - conn.lastSeenMs) / 1000)}s ago
@@ -738,11 +748,16 @@ function CompilationProgressIndicator() {
         // the header next to the percent.
         details = `${progress.done} / ${progress.total}`;
       } else {
-        // total === 0 ⇒ indeterminate (e.g. early in extract before
-        // the walker has finished enumerating sources). Render
-        // elapsed-time so the user sees the engine is alive.
+        // total === 0 ⇒ indeterminate. Pre-fix the caption was
+        // hard-coded to "counting sources…" — a lie for every
+        // sub-phase except the literal first second of extract. The
+        // daemon now ships the actual sub-phase label as
+        // `progress.detail` (e.g. "removing changed sources",
+        // "synthesizing paper"); fall back to the step label only
+        // when nothing more specific is available.
         const sec = (progress.step_elapsed_ms / 1000).toFixed(1);
-        details = `${sec}s elapsed · counting sources…`;
+        const sub = progress.detail || progress.step_label.toLowerCase();
+        details = `${sec}s elapsed · ${sub}`;
       }
       break;
     }

@@ -213,6 +213,14 @@ pub enum CompileProgress {
         /// Daemon-computed ETA for the current step (ms). `None` when
         /// total is unknown or done is 0.
         eta_ms: Option<u64>,
+        /// Short sub-phase caption (e.g. "removing changed sources",
+        /// "synthesizing paper"). `None` when the engine has nothing
+        /// more specific to say than the step label. The UI renders
+        /// this in the indeterminate-spinner caption — pre-fix the
+        /// caption was hard-coded to "counting sources…" regardless
+        /// of what the engine was actually doing.
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// Emitted while the compile task is waiting for the bundled
     /// `root` sidecar to finish booting (livez probe + child-process
@@ -1186,6 +1194,7 @@ fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgres
             step_elapsed_ms: tick.step_elapsed_ms,
             total_elapsed_ms: tick.total_elapsed_ms,
             eta_ms: tick.eta_ms,
+            detail: tick.detail,
         }),
         ProgressEvent::DiffStart => Some(CompileProgress::DiffStart),
         ProgressEvent::DiffComplete {
