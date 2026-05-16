@@ -24,10 +24,10 @@ fn phase_names_constant_is_complete() {
     let expected = [
         "diff",
         "extract",
-        "ground",
         "fingerprint",
         "remove_sources",
         "entity_relations",
+        "witness_mesh",
         "link",
         "structural_persist",
         "audit",

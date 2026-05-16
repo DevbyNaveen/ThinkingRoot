@@ -30,6 +30,7 @@
 #![warn(missing_docs)]
 
 pub mod claims;
+pub mod cognition_commit;
 pub mod digest;
 pub mod error;
 pub mod manifest;
@@ -38,11 +39,12 @@ pub mod witness;
 pub mod writer_v3;
 
 pub use claims::ClaimRecord;
+pub use cognition_commit::{CognitionCommitAuthor, CognitionCommitRecord};
 pub use error::Error;
 pub use witness::{WitnessRecord, WitnessRecordInput, WitnessRecordSpan};
 pub use manifest::{
     DERIVED_HASH_KINDS, DerivedHash, FORMAT_VERSION_LATEST, FORMAT_VERSION_V3,
-    FORMAT_VERSION_V31, FORMAT_VERSION_V32, ManifestV3, SourceEntry,
+    FORMAT_VERSION_V31, FORMAT_VERSION_V32, FORMAT_VERSION_V33, ManifestV3, SourceEntry,
 };
 pub use reader_v3::{
     DEFAULT_PACK_SIZE_CAP_BYTES, V3Pack, read_v3_pack, read_v3_pack_with_cap,

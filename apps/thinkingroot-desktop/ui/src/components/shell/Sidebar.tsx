@@ -33,6 +33,7 @@ import {
   Plug,
   ChevronDown,
   KeyRound,
+  LogIn,
   FolderOpen,
   Paintbrush,
   Bell,
@@ -51,6 +52,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
 import {
   authState,
+  cloudLoginStart,
   conversationsCreate,
   conversationsList,
   mcpListConnected,
@@ -541,6 +543,10 @@ function SidebarAuthStrip() {
     setSurface("settings");
     setMenuOpen(false);
   };
+  const signIn = () => {
+    void cloudLoginStart();
+    setMenuOpen(false);
+  };
 
   return (
     <div
@@ -609,14 +615,15 @@ function SidebarAuthStrip() {
               )}
             </div>
           ) : (
-            <div className="space-y-1 px-3 py-2 text-[10px] leading-snug text-muted-foreground">
-              <p className="font-medium text-foreground/90">Sign in</p>
-              <p>
-                Run <code className="rounded bg-muted/80 px-1 font-mono">tr login</code>{" "}
-                in your terminal, then use Settings to verify the Hub
-                connection.
-              </p>
-            </div>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={signIn}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-muted/60"
+            >
+              <LogIn className="size-3.5 shrink-0 text-muted-foreground" />
+              Sign in
+            </button>
           )}
         </div>
       ) : null}

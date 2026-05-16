@@ -2082,6 +2082,223 @@ export async function paperRegenerate(
   return invoke<PaperRegenerateOutcome>("paper_regenerate", { workspace });
 }
 
+// ─── Cognition Commits — chat history IS the commit DAG ──────────────
+
+/** Author of a cognition commit. `kind === "agent"` carries the model
+ *  string and the principal that authorised the call (typically
+ *  "thinkingroot" for the in-app Brain chat). `kind === "user"` only
+ *  carries the user id. */
+export interface CommitAuthor {
+  kind: "user" | "agent";
+  id?: string;
+  model?: string;
+  principal?: string;
+}
+
+/** One cognition commit row as it lands on the wire. The full shape —
+ *  the chat-DAG view renders prompt + reasoning + citation chips
+ *  inline so no follow-up fetch is needed. */
+export interface CognitionCommit {
+  id: string;
+  parent: string | null;
+  branch: string;
+  /** Tolerant projection — the wire emits the typed `CommitAuthor`
+   *  union; we expose it through `unknown` so the React renderer can
+   *  branch on `author.kind` without a strict binding that breaks on
+   *  a future field addition. */
+  author: CommitAuthor | Record<string, unknown>;
+  prompt: string;
+  reasoning: string;
+  /** 64-char lower-hex witness ids this commit produced. Auto-commits
+   *  ship this empty; explicit `commit_cognition` calls populate it. */
+  witnesses_added: string[];
+  /** 64-char lower-hex witness ids cited in `reasoning`. Auto-commits
+   *  populate this from `[[witness:<id>]]` markers, filtered to
+   *  existing witnesses. */
+  citations: string[];
+  /** Gap ids the agent flagged this turn. */
+  gaps_surfaced: string[];
+  /** ISO-8601 wall-clock timestamp. */
+  created_at: string;
+}
+
+/** List cognition commits on a branch newest-first. `branch`
+ *  defaults to `main` server-side when omitted. */
+export async function commitList(options?: {
+  branch?: string;
+  limit?: number;
+}): Promise<CognitionCommit[]> {
+  return invoke<CognitionCommit[]>("commit_list", {
+    branch: options?.branch,
+    limit: options?.limit,
+  });
+}
+
+/** Fetch a single commit by id. Throws when unknown. */
+export async function commitGet(id: string): Promise<CognitionCommit> {
+  return invoke<CognitionCommit>("commit_get", { id });
+}
+
+/** Record a commit. Citations + parent are server-verified — fabricated
+ *  refs surface as a typed error string. */
+export interface CommitRecordArgs {
+  branch: string;
+  parent_id?: string;
+  author_kind: "user" | "agent";
+  author_id: string;
+  author_model?: string;
+  prompt?: string;
+  reasoning?: string;
+  witnesses_added?: string[];
+  citations?: string[];
+  gaps_surfaced?: string[];
+}
+
+export async function commitRecord(
+  args: CommitRecordArgs,
+): Promise<CognitionCommit> {
+  return invoke<CognitionCommit>("commit_record", { args });
+}
+
+// ─── Phase γ.1 — Merge Cognition (deterministic divergence plan) ──────
+
+/** Discriminated union of the five possible divergence outcomes between
+ *  two cognition-commit branches. The `kind` tag is set server-side via
+ *  `#[serde(tag = "kind", rename_all = "snake_case")]` on the Rust
+ *  `CommitDivergence` enum. `diverged` is the only variant that carries
+ *  payload (the LCA); the rest are bare. */
+export type CommitDivergence =
+  | { kind: "identical" }
+  | { kind: "left_ahead" }
+  | { kind: "right_ahead" }
+  | { kind: "diverged"; common_ancestor: string }
+  | { kind: "no_common_history" };
+
+/** Partitioned witness + gap sets across a divergence. Each `_only` /
+ *  `shared` list is hex-sorted-ascending on the wire so the same plan
+ *  serialises byte-stably across runs. */
+export interface WitnessClassification {
+  left_only_citations: string[];
+  right_only_citations: string[];
+  shared_citations: string[];
+  left_only_added: string[];
+  right_only_added: string[];
+  shared_added: string[];
+  left_only_gaps: string[];
+  right_only_gaps: string[];
+  shared_gaps: string[];
+}
+
+/** Full merge plan as the sidecar emits it. The shape matches the
+ *  Rust `thinkingroot_core::types::MergePlan` projection. */
+export interface MergePlan {
+  left_branch: string;
+  right_branch: string;
+  left_head: string | null;
+  right_head: string | null;
+  conflict_kind: CommitDivergence;
+  left_only_commits: string[];
+  right_only_commits: string[];
+  witnesses: WitnessClassification;
+  computed_at: string;
+}
+
+/** Request a deterministic merge plan between two cognition-commit
+ *  branches. The sidecar walks both DAGs, finds the LCA if any, and
+ *  partitions every witness id each side cited or added since the
+ *  LCA. Pure read — no commit is recorded by this call. */
+export async function commitMergePlan(
+  leftBranch: string,
+  rightBranch: string,
+): Promise<MergePlan> {
+  return invoke<MergePlan>("commit_merge_plan", {
+    leftBranch,
+    rightBranch,
+  });
+}
+
+/** Phase γ.2 — what `synthesize_merge` does (kind tag).
+ *  `trivial` / `llm_unavailable` short-circuit without an LLM call;
+ *  `llm_error` carries the upstream error; `synthesized` is the
+ *  success path. */
+export type SynthesisOutcome =
+  | { kind: "trivial" }
+  | { kind: "llm_unavailable" }
+  | { kind: "llm_error"; message?: string }
+  | { kind: "synthesized" };
+
+/** Phase γ.2 — Full synthesis result. */
+export interface MergeSynthesis {
+  outcome: SynthesisOutcome;
+  plan: MergePlan;
+  reasoning: string;
+  verified_citations: string[];
+  dropped_citations: string[];
+  model: string;
+}
+
+/** Request an LLM-driven synthesis of the merge plan between two
+ *  branches. Citation honesty: `verified_citations` is filtered against
+ *  the plan's surfaced witness ids; any fabricated `[[witness:<id>]]`
+ *  the LLM emitted lands in `dropped_citations`. Pure read — no
+ *  commit is recorded by this call. The caller decides whether to
+ *  hand the synthesis to `commit_record` to land it as a real commit. */
+export async function commitSynthesizeMerge(
+  leftBranch: string,
+  rightBranch: string,
+): Promise<MergeSynthesis> {
+  return invoke<MergeSynthesis>("commit_synthesize_merge", {
+    leftBranch,
+    rightBranch,
+  });
+}
+
+// ─── Phase δ.2 + δ.4 — Substrate Bus (background sub-agents) ──────────
+
+/** A single observation report emitted by a sub-agent tick. Mirrors
+ *  the sidecar's `SubAgentReport`. */
+export interface SubAgentReport {
+  agent: string;
+  started_at: string;
+  finished_at: string;
+  summary: string;
+  observations: string[];
+  proposals_opened: string[];
+  error: string | null;
+}
+
+/** Idempotently start the substrate bus for the active workspace.
+ *  Returns the registered agent names so the UI can render the
+ *  available "Run now" affordances. */
+export async function substrateBusStart(): Promise<{
+  workspace: string;
+  running: boolean;
+  agents: string[];
+}> {
+  return invoke("substrate_bus_start");
+}
+
+/** Idempotently shut down the substrate bus for the active workspace. */
+export async function substrateBusStop(): Promise<{
+  workspace: string;
+  running: boolean;
+}> {
+  return invoke("substrate_bus_stop");
+}
+
+/** Snapshot of recent observations across every registered sub-agent.
+ *  Newest-first within each agent slice; empty when the bus is not
+ *  running for this workspace. */
+export async function substrateBusReports(): Promise<SubAgentReport[]> {
+  return invoke<SubAgentReport[]>("substrate_bus_reports");
+}
+
+/** Manually trigger one tick of an agent (skipping its schedule).
+ *  Returns the fresh report so the UI can show the result inline. */
+export async function substrateBusRunNow(agent: string): Promise<SubAgentReport> {
+  return invoke<SubAgentReport>("substrate_bus_run_now", { agent });
+}
+
 // ─── Playground file manager — folders, moves, previews, trash ────────
 
 export interface PlaygroundDirEntry {

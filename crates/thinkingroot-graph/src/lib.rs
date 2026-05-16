@@ -1,4 +1,6 @@
 pub mod aep_queries;
+pub mod cognition_inserts;
+pub mod cognition_merge;
 pub mod graph;
 pub mod hybrid_queries;
 pub mod ort_session;

@@ -8,7 +8,6 @@ import { ToastStack } from "@/components/ui/toast-stack";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
 import { EngineGate } from "@/components/engine/EngineGate";
-import { HeaderChip } from "@/components/cloud/HeaderChip";
 import { onTrFileOpened, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 import { refreshBrainSnapshotCache } from "@/store/brain-cache";
@@ -18,7 +17,6 @@ import { refreshBrainSnapshotCache } from "@/store/brain-cache";
  * column:
  *
  *   +-------------------------------------------------+
- *   |      draggable title bar (macOS overlay)        |
  *   | rail | sidebar |     main pane     | right rail |
  *   |      |         |                   |            |
  *   +------+---------+-------------------+------------+
@@ -35,8 +33,6 @@ export default function App() {
   const activeWorkspace = useApp((s) => s.activeWorkspace);
   const packExportTarget = useApp((s) => s.packExportTarget);
   const setPackExportTarget = useApp((s) => s.setPackExportTarget);
-  const setSurface = useApp((s) => s.setSurface);
-  const setSettingsSection = useApp((s) => s.setSettingsSection);
   const [installTrPath, setInstallTrPath] = useState<string | null>(null);
 
   // Subscribe to compilation progress events from the background sidecar
@@ -100,14 +96,6 @@ export default function App() {
     <EngineGate>
       <TooltipProvider delayDuration={250} skipDelayDuration={120}>
         <div className="flex h-full w-full flex-col bg-background text-foreground">
-          <div className="flex items-center justify-end gap-2 border-b border-border/40 px-3 py-1.5">
-            <HeaderChip
-              onClick={() => {
-                setSurface("settings");
-                setSettingsSection("cloud");
-              }}
-            />
-          </div>
           <div className="flex min-h-0 min-w-0 flex-1">
             <Sidebar />
             <MainPane />

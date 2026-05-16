@@ -1036,6 +1036,35 @@ impl QueryEngine {
             });
         }
 
+        // Phase C.1 (2026-05-17) — Main branch is human-only for
+        // `merge_branch` / `delete_branch` / `rebase_branch`. Agents
+        // never promote work to `main` automatically; the
+        // Stream → Topic → (human merge) → Main lifecycle is the
+        // architectural invariant established by Phases A + B.
+        //
+        // This gate fires even when `branch_ref.owner.is_none()`
+        // (typical fresh workspace), because the existing
+        // owner-less short-circuit would otherwise let any actor
+        // reach `main`. Anonymous + System principals short-
+        // circuited above via the `identity().is_none()` arm —
+        // System retains the ability to perform background
+        // bookkeeping merges; Anonymous can't reach this code path
+        // through any authenticated route in practice. Human /
+        // Connector / MountConsumer continue past this gate to the
+        // normal permission-list check below.
+        if matches!(branch_ref.kind, thinkingroot_core::BranchKind::Main)
+            && matches!(actor, Principal::Agent(_))
+            && matches!(action, "merge_branch" | "delete_branch" | "rebase_branch")
+        {
+            return Err(Error::PermissionDenied {
+                actor: actor.label(),
+                action: format!(
+                    "{action} on Main (agents must route through topic branches — \
+                     merge stream → topic, then a human merges topic → main)"
+                ),
+            });
+        }
+
         if branch_ref
             .owner
             .as_deref()
@@ -1405,6 +1434,228 @@ impl QueryEngine {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
         storage.graph.count_witnesses()
+    }
+
+    // ── Phase β.1 — Cognition Commits ──────────────────────────────
+    //
+    // Three thin delegations onto `GraphStore`. Identical workspace-
+    // scoping pattern as the Witness Mesh methods above; the graph
+    // helpers own citation-verification + parent-existence checks
+    // so the engine layer stays a transport.
+
+    /// Record a cognition commit against a workspace. Verifies every
+    /// cited / added witness id resolves to a real Witness in the
+    /// workspace — fabricated citations are rejected with a typed
+    /// error rather than silently persisted.
+    pub async fn commit_cognition(
+        &self,
+        ws: &str,
+        commit: &thinkingroot_core::types::CognitionCommit,
+    ) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.insert_cognition_commit(commit)
+    }
+
+    /// Fetch a single cognition commit by id. Returns `None` when not
+    /// present — REST handlers map missing to 404.
+    pub async fn get_cognition_commit(
+        &self,
+        ws: &str,
+        id: &thinkingroot_core::types::CommitId,
+    ) -> Result<Option<thinkingroot_core::types::CognitionCommit>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_cognition_commit(id)
+    }
+
+    /// List cognition commits on a branch newest-first. `limit = None`
+    /// returns every commit; pass `Some(N)` for paged UIs.
+    pub async fn list_cognition_commits(
+        &self,
+        ws: &str,
+        branch: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<thinkingroot_core::types::CognitionCommit>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_cognition_commits_on_branch(branch, limit)
+    }
+
+    /// Walk the parent chain from `start_id` up to `max_depth` hops.
+    /// Returns commits in walk order (start first, then parent, etc.).
+    /// Stops early at a root commit or missing parent.
+    pub async fn walk_cognition_ancestors(
+        &self,
+        ws: &str,
+        start_id: &thinkingroot_core::types::CommitId,
+        max_depth: usize,
+    ) -> Result<Vec<thinkingroot_core::types::CognitionCommit>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.walk_commit_ancestors(start_id, max_depth)
+    }
+
+    /// Count cognition commits in the workspace. Cheap.
+    pub async fn count_cognition_commits(&self, ws: &str) -> Result<u64> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.count_cognition_commits()
+    }
+
+    /// Compute a deterministic merge plan between two branches in
+    /// the workspace's cognition-commit DAG. Phase γ.1 of the design
+    /// doc (`docs/2026-05-15-cognition-commits-design.md`).
+    ///
+    /// Pure read — no commits are recorded by this call. The returned
+    /// `MergePlan` classifies the divergence (`Identical` /
+    /// `LeftAhead` / `RightAhead` / `Diverged` / `NoCommonHistory`)
+    /// and surfaces the partitioned witness-id sets each side
+    /// cited or added since the LCA. γ.2 will feed this plan to an
+    /// LLM as the synthesis-prompt context; γ.3 will render it in
+    /// the conflict-resolution UI.
+    pub async fn compute_merge_plan(
+        &self,
+        ws: &str,
+        left_branch: &str,
+        right_branch: &str,
+    ) -> Result<thinkingroot_core::types::MergePlan> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.compute_merge_plan(left_branch, right_branch)
+    }
+
+    /// Phase γ.2 — Merge synthesis (LLM-driven).
+    ///
+    /// Given a deterministic `MergePlan` (γ.1), call the workspace's
+    /// LLM to produce a synthesis: a single piece of reasoning that
+    /// reconciles the two divergent sides, citing witnesses from
+    /// each via `[[witness:<id>]]` markers.
+    ///
+    /// Citation honesty (load-bearing): the response's
+    /// `verified_citations` is *only* the witness ids the LLM cited
+    /// that actually exist in the plan's surfaced witness sets.
+    /// Fabricated ids are dropped and reported via
+    /// `dropped_citations`. The caller (chat agent or React UI)
+    /// decides whether to record the synthesis as a real commit via
+    /// `commit_cognition` — γ.2 never writes the commit itself.
+    ///
+    /// Trivial plans (`Identical` / `LeftAhead` / `RightAhead`)
+    /// short-circuit without calling the LLM — they collapse to a
+    /// "no synthesis needed" outcome.
+    pub async fn synthesize_merge(
+        &self,
+        ws: &str,
+        left_branch: &str,
+        right_branch: &str,
+    ) -> Result<thinkingroot_core::types::MergeSynthesis> {
+        use thinkingroot_core::types::{MergeSynthesis, SynthesisOutcome};
+
+        let plan = self.compute_merge_plan(ws, left_branch, right_branch).await?;
+        if plan.is_trivial() {
+            return Ok(MergeSynthesis {
+                outcome: SynthesisOutcome::Trivial,
+                plan,
+                reasoning: String::new(),
+                verified_citations: Vec::new(),
+                dropped_citations: Vec::new(),
+                model: String::new(),
+            });
+        }
+
+        let llm = match self.workspace_llm(ws) {
+            Some(c) => c,
+            None => {
+                return Ok(MergeSynthesis {
+                    outcome: SynthesisOutcome::LlmUnavailable,
+                    plan,
+                    reasoning: String::new(),
+                    verified_citations: Vec::new(),
+                    dropped_citations: Vec::new(),
+                    model: String::new(),
+                });
+            }
+        };
+
+        // System prompt — pinned and load-bearing. Honesty rules:
+        //   1. Cite only witnesses surfaced in the plan.
+        //   2. Be explicit about disagreement.
+        //   3. Don't invent witnesses or facts.
+        let system = "\
+You are a cognition-merge synthesizer. You receive a deterministic merge plan \
+between two branches of a thinking DAG. Your job: write a single paragraph of \
+reasoning that reconciles the two sides, citing the specific witnesses each \
+side referenced. Strict rules:\n\
+1. Cite witnesses using the marker `[[witness:<64-hex-id>]]`. Never invent ids \
+   — only ids present in the plan are valid.\n\
+2. When the two sides disagree, name the disagreement explicitly. Don't paper \
+   over it.\n\
+3. Don't add facts that aren't in the plan. The plan is the substrate; \
+   anything else is hallucination.\n\
+4. Be brief: 2–4 sentences.";
+        let plan_json = serde_json::to_string_pretty(&plan).unwrap_or_else(|_| {
+            format!(
+                "(plan serialise failed; {} divergent commits)",
+                plan.divergent_commit_count()
+            )
+        });
+        let user_msg = format!(
+            "Merge plan between branches `{}` (left) and `{}` (right):\n\n```json\n{}\n```\n\n\
+             Write the synthesis paragraph now. Remember: cite using \
+             `[[witness:<id>]]` markers; only ids present in the plan are valid.",
+            plan.left_branch, plan.right_branch, plan_json
+        );
+
+        let reply = match llm.chat(system, &user_msg).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(MergeSynthesis {
+                    outcome: SynthesisOutcome::LlmError(format!("{e}")),
+                    plan,
+                    reasoning: String::new(),
+                    verified_citations: Vec::new(),
+                    dropped_citations: Vec::new(),
+                    model: llm.model_name().to_string(),
+                });
+            }
+        };
+
+        let cited = crate::intelligence::citation_markers::extract_witness_citations(&reply);
+        // Honest set: every WitnessId the plan surfaced (left_only ∪
+        // right_only ∪ shared, on citations + witnesses_added). The
+        // LLM is only allowed to cite within this universe.
+        let mut plan_universe: std::collections::HashSet<
+            thinkingroot_core::types::WitnessId,
+        > = std::collections::HashSet::new();
+        for id in plan
+            .witnesses
+            .left_only_citations
+            .iter()
+            .chain(plan.witnesses.right_only_citations.iter())
+            .chain(plan.witnesses.shared_citations.iter())
+            .chain(plan.witnesses.left_only_added.iter())
+            .chain(plan.witnesses.right_only_added.iter())
+            .chain(plan.witnesses.shared_added.iter())
+        {
+            plan_universe.insert(*id);
+        }
+        let mut verified = Vec::new();
+        let mut dropped = Vec::new();
+        for id in cited {
+            if plan_universe.contains(&id) {
+                verified.push(id);
+            } else {
+                dropped.push(id);
+            }
+        }
+        Ok(MergeSynthesis {
+            outcome: SynthesisOutcome::Synthesized,
+            plan,
+            reasoning: reply,
+            verified_citations: verified,
+            dropped_citations: dropped,
+            model: llm.model_name().to_string(),
+        })
     }
 
     /// Witness count grouped by `source_id`. Returned as a Vec so
@@ -4505,6 +4756,194 @@ fn source_kind_from_uri(uri: &str, source_type: &str) -> String {
         "other".to_string()
     } else {
         st.to_ascii_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod permission_gate_tests {
+    //! Phase C.1 (2026-05-17) — pin the agent-blocked-on-main
+    //! contract that `ensure_branch_permission` enforces. These
+    //! tests construct minimal `BranchRef` fixtures and call the
+    //! private gate directly so each rule has an isolated assertion
+    //! that doesn't depend on a full workspace mount.
+    use super::*;
+    use thinkingroot_core::{
+        BranchKind, BranchPermissions, BranchRef, BranchStatus, MergePolicy,
+    };
+
+    fn fresh_branch(name: &str, kind: BranchKind) -> BranchRef {
+        BranchRef {
+            name: name.into(),
+            slug: name.replace(['/', ' '], "-"),
+            parent: "main".into(),
+            created_at: chrono::Utc::now(),
+            status: BranchStatus::Active,
+            description: None,
+            owner: None,
+            permissions: BranchPermissions::default(),
+            kind,
+            merge_policy: MergePolicy::Manual,
+            redaction: None,
+            parent_commit_hash: None,
+            max_age_secs: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn main_branch() -> BranchRef {
+        fresh_branch("main", BranchKind::Main)
+    }
+
+    fn feature_branch() -> BranchRef {
+        fresh_branch("topic/refactor", BranchKind::Feature)
+    }
+
+    #[test]
+    fn agent_cannot_merge_into_main() {
+        let actor = Principal::Agent("claude".into());
+        let main = main_branch();
+        let err = QueryEngine::ensure_branch_permission(&actor, Some(&main), "merge_branch")
+            .expect_err("agent merge into main must be rejected");
+        match err {
+            Error::PermissionDenied { action, .. } => {
+                assert!(
+                    action.contains("Main"),
+                    "PermissionDenied message must mention Main, got: {action}"
+                );
+                assert!(
+                    action.contains("topic"),
+                    "PermissionDenied message must direct user to the topic-branch flow, got: {action}"
+                );
+            }
+            other => panic!("expected PermissionDenied, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_cannot_delete_or_rebase_main() {
+        let actor = Principal::Agent("claude".into());
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "delete_branch").is_err(),
+            "agent delete on main must be rejected — would lose the workspace's primary branch"
+        );
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "rebase_branch").is_err(),
+            "agent rebase on main must be rejected — would rewrite the canonical history"
+        );
+    }
+
+    #[test]
+    fn agent_can_read_main() {
+        // Reading main is always allowed — agents need to retrieve
+        // from the canonical knowledge graph. Only write-class
+        // actions are gated.
+        let actor = Principal::Agent("claude".into());
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "read_branch").is_ok(),
+            "agent read on main must pass — retrieval needs to see canonical knowledge"
+        );
+    }
+
+    #[test]
+    fn agent_can_merge_into_feature_topic_branch() {
+        // The merge stream → topic step uses Principal::System
+        // (maintenance task), but a human-driven agent invocation
+        // of `merge_branch` against a topic Feature branch must
+        // also be allowed — the gate is Main-specific, not a
+        // blanket agent block.
+        let actor = Principal::Agent("claude".into());
+        let topic = feature_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&topic), "merge_branch").is_ok(),
+            "agent merge into a Feature/topic branch must pass — C.1 gate is Main-only"
+        );
+    }
+
+    #[test]
+    fn human_can_merge_into_main() {
+        // The human-only flow is the whole point of the C.1 gate —
+        // explicitly verify a Human principal still reaches main
+        // when no owner is set (default workspace).
+        let actor = Principal::User("alice".into());
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "merge_branch").is_ok(),
+            "human merge into main must pass"
+        );
+    }
+
+    #[test]
+    fn system_can_merge_into_main() {
+        // System principal short-circuits at the identity() == None
+        // arm BEFORE the C.1 gate fires. Keeps background
+        // bookkeeping merges (cross-repo sync, gc, future
+        // automation) able to reach main without explicit
+        // permission lists.
+        let actor = Principal::System;
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "merge_branch").is_ok(),
+            "system merge into main must pass — backed by the identity-None short-circuit"
+        );
+    }
+
+    #[test]
+    fn connector_can_merge_into_main() {
+        // Connectors are first-party integrations (GitHub, Slack,
+        // Notion, Linear, Drive, custom HMAC webhook). They have
+        // an attributable identity and a defensible audit trail,
+        // so the C.1 gate doesn't block them — the existing
+        // permission-list path applies.
+        let actor = Principal::Connector {
+            connector_id: "github".into(),
+            install_id: "acme".into(),
+        };
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "merge_branch").is_ok(),
+            "connector merge into main must pass — C.1 gate is Agent-only"
+        );
+    }
+
+    #[test]
+    fn agent_write_branch_on_main_is_not_blocked_by_c1() {
+        // Intentional scope limit: C.1 ONLY gates merge / delete /
+        // rebase. `write_branch` (the per-claim contribute path)
+        // is allowed because pre-Phase-A workspaces routed agent
+        // contributes directly to main when `auto_session_branch =
+        // false`; hard-blocking write_branch on main here would
+        // surface a regression on those workspaces before they
+        // remount under the new default.
+        let actor = Principal::Agent("claude".into());
+        let main = main_branch();
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&main), "write_branch").is_ok(),
+            "C.1 gate must NOT block write_branch — keeps pre-Phase-A workspaces functional"
+        );
+    }
+
+    #[test]
+    fn tag_immutability_still_applies() {
+        // Regression guard for the T2.5 Tag gate — adding the C.1
+        // arm must not have re-ordered the Tag check away.
+        let actor = Principal::User("alice".into());
+        let tag = fresh_branch(
+            "v1.0.0",
+            BranchKind::Tag {
+                ref_name: "v1.0.0".into(),
+                target: "0123abcd".into(),
+            },
+        );
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&tag), "merge_branch").is_err(),
+            "Tag merge must stay blocked even after C.1 lands"
+        );
+        assert!(
+            QueryEngine::ensure_branch_permission(&actor, Some(&tag), "read_branch").is_ok(),
+            "Tag reads must stay allowed"
+        );
     }
 }
 

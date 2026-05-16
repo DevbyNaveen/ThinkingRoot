@@ -290,6 +290,15 @@ pub fn run() {
             commands::playground_fs::playground_restore,
             commands::playground_fs::playground_empty_trash,
             commands::playground_fs::playground_preview,
+            commands::commits::commit_list,
+            commands::commits::commit_get,
+            commands::commits::commit_record,
+            commands::commits::commit_merge_plan,
+            commands::commits::commit_synthesize_merge,
+            commands::substrate_bus::substrate_bus_start,
+            commands::substrate_bus::substrate_bus_stop,
+            commands::substrate_bus::substrate_bus_reports,
+            commands::substrate_bus::substrate_bus_run_now,
             commands::updater::updater_check_now,
         ])
         .run(tauri::generate_context!())

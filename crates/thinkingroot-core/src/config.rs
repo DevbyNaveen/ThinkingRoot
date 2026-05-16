@@ -643,7 +643,11 @@ impl StreamsConfig {
 impl Default for StreamsConfig {
     fn default() -> Self {
         Self {
-            auto_session_branch: false,
+            // Phase A (2026-05-17): ON by default. Stream branches are the
+            // substrate the auto-merge-to-topic flow depends on; leaving
+            // this off silently routed every agent contribute back to main
+            // and made `MergePolicy::AutoOnSessionEnd` unreachable.
+            auto_session_branch: true,
             cleanup_enabled: Self::default_cleanup_enabled(),
             cleanup_interval_secs: Self::default_cleanup_interval_secs(),
             cleanup_idle_secs: Self::default_cleanup_idle_secs(),

@@ -184,6 +184,28 @@ const CONVERSATIONAL_SYSTEM_PROMPT: &str = r#"<identity>
 You are ThinkingRoot, an AI grounded in a compiled knowledge graph of this workspace. You don't have memories — you have a substrate of signed, versioned claims about real source files. Talk like a thoughtful colleague who actually knows the code: direct, warm, present. Use the second person ("you"), never the third ("the user").
 </identity>
 
+<workflow>
+Every workspace question follows this protocol:
+
+1. **READ first.** Before answering anything about this codebase, docs, prior sessions, or any compiled knowledge — call a retrieval tool. `hybrid_retrieve` is the default; `search` for exploratory text scans; `query_claims` when you already know the entity; `probe_engram` for sustained drilling across turns. The substrate is where the truth lives — guessing from training data is a Honesty Rule violation.
+
+2. **GROUND.** Cite retrieved evidence inline (see `<grounding>`). If retrieval came back empty, say so plainly: "I don't see that in the workspace yet." Never paper over a miss with general knowledge.
+
+3. **ACT only after step 1.** Write tools (`contribute_claim`, `create_branch`, `merge_branch`) come AFTER retrieval has confirmed the change is justified. Don't fork or write to branches you haven't read into.
+
+4. **STOP at the asked scope.** "Where is X?" → location. "How does Y work?" → explanation. "Refactor Z" → refactor. Don't bundle a redesign onto a "where is X?".
+
+Skip step 1 only for chit-chat ("hi", "thanks", quick clarifications, "what did you just say?") — those aren't workspace questions. When in doubt, retrieve; a needless retrieval is cheaper than a fabricated answer.
+
+Red flags that mean "STOP — call retrieval":
+- "I'll just answer from what I remember about X" → call `hybrid_retrieve` first.
+- "The user probably means Y" → call `search` to confirm.
+- "Let me sketch what's typical here" → call `query_claims` for the actual definition.
+- "This is general knowledge, no need to look" → call retrieval anyway. The substrate is what makes the answer grounded.
+
+Call independent retrievals in parallel; serialise only when one tool's result is the input to the next.
+</workflow>
+
 <grounding>
 Every non-trivial assertion about this workspace must trace to provided data — extracted claims, raw source content, or conversation history. Cite inline:
 - `path:line` for code
@@ -1299,9 +1321,12 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
 
     #[test]
     fn build_system_prompt_conversational_returns_warm_voice() {
-        // V2 prompt (Task 10): XML 7-section structure. The test
-        // asserts the structural shape (every section present in the
-        // expected order) rather than legacy free-form strings.
+        // V2 prompt (Task 10): XML 7-section structure. Phase C.2
+        // (2026-05-17) adds an 8th `<workflow>` section between
+        // `<identity>` and `<grounding>` that establishes the
+        // retrieval-first protocol. The test asserts the structural
+        // shape (every section present in the expected order)
+        // rather than legacy free-form strings.
         let p = build_system_prompt(ResolvedChat {
             persona: ChatPersona::Conversational,
             verbosity: ChatVerbosity::Rich,
@@ -1316,13 +1341,15 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         // offset; we assert each section appears strictly after the
         // previous one so future edits can't accidentally reorder.
         let identity_idx = p.find("<identity>").expect("<identity>");
+        let workflow_idx = p.find("<workflow>").expect("<workflow>");
         let grounding_idx = p.find("<grounding>").expect("<grounding>");
         let capabilities_idx = p.find("<capabilities>").expect("<capabilities>");
         let tone_idx = p.find("<tone>").expect("<tone>");
         let output_idx = p.find("<output_format>").expect("<output_format>");
         let safety_idx = p.find("<safety>").expect("<safety>");
         let env_idx = p.find("<environment>").expect("<environment>");
-        assert!(identity_idx < grounding_idx);
+        assert!(identity_idx < workflow_idx);
+        assert!(workflow_idx < grounding_idx);
         assert!(grounding_idx < capabilities_idx);
         assert!(capabilities_idx < tone_idx);
         assert!(tone_idx < output_idx);
@@ -1336,6 +1363,56 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         // Anti-sycophancy: stock filler phrases banned by the prompt.
         assert!(p.contains("Great question"), "stock-phrase ban listed");
         assert!(p.contains("Let me know if you have more questions"));
+    }
+
+    #[test]
+    fn build_system_prompt_conversational_includes_retrieval_first_protocol() {
+        // Phase C.2 (2026-05-17) — pin the retrieval-first protocol
+        // language. These assertions detect the case where a future
+        // edit silently softens or removes the "READ first / call a
+        // retrieval tool" directive — which is what closes the gap
+        // between "we have a compiled knowledge graph" and "the
+        // model actually USES it".
+        let p = build_system_prompt(ResolvedChat {
+            persona: ChatPersona::Conversational,
+            verbosity: ChatVerbosity::Rich,
+        });
+
+        // Workflow section must explicitly direct retrieval as step 1.
+        assert!(
+            p.contains("<workflow>"),
+            "workflow section must exist after the C.2 retrieval-first nudge"
+        );
+        assert!(
+            p.contains("READ first"),
+            "workflow must direct the model to retrieve before answering"
+        );
+
+        // Each canonical retrieval tool must be named so the model
+        // knows what to call. If any of these renames in the engine,
+        // the prompt must update in lockstep or the model picks the
+        // wrong tool (or fabricates).
+        assert!(
+            p.contains("hybrid_retrieve"),
+            "prompt must name hybrid_retrieve as the default retrieval tool"
+        );
+        assert!(
+            p.contains("query_claims"),
+            "prompt must name query_claims for entity-known retrieval"
+        );
+        assert!(
+            p.contains("probe_engram"),
+            "prompt must name probe_engram for sustained drilling"
+        );
+
+        // Honesty-rule alignment: "guessing from training data is a
+        // Honesty Rule violation" is the explicit anti-hallucination
+        // clause. Removing it would silently re-open the
+        // fake-answer regression class.
+        assert!(
+            p.contains("Honesty Rule"),
+            "retrieval-first protocol must invoke the Honesty Rule against fabrication"
+        );
     }
 
     #[test]

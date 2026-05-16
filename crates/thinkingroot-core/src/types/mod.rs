@@ -2,7 +2,9 @@ mod artifact;
 mod branch;
 mod claim;
 pub mod claim_migration;
+pub mod cognition;
 mod contradiction;
+pub mod merge_plan;
 mod diff;
 mod entity;
 mod event;
@@ -22,7 +24,11 @@ pub use claim_migration::{
     CLAIM_SCHEMA_VERSION_META_KEY, CURRENT_CLAIM_SCHEMA_VERSION, ClaimMigration,
     MigrationRegistry, clear_global_registry_for_test, migrate_claim, register_migration,
 };
+pub use cognition::{CognitionCommit, CommitAuthor, CommitId, CommitIdParseError};
 pub use contradiction::*;
+pub use merge_plan::{
+    CommitDivergence, MergePlan, MergeSynthesis, SynthesisOutcome, WitnessClassification,
+};
 pub use diff::*;
 pub use entity::*;
 pub use event::*;

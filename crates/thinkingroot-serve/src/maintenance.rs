@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::branch_cache::BranchEngineCache;
 use crate::intelligence::session::SessionStore;
-use thinkingroot_core::{BranchKind, BranchStatus};
+use thinkingroot_core::{BranchKind, BranchPermissions, BranchStatus, MergePolicy, MergedBy};
 
 /// Spawn the stream-branch cleanup task.
 ///
@@ -128,8 +128,22 @@ pub async fn cleanup_once(
         // "discard, don't merge" but didn't necessarily opt into
         // "delete the data dir." Purge stays an explicit gc_branches
         // call.
+        //
+        // Phase A (2026-05-17) — AutoOnSessionEnd with agent
+        // contributes routes to `auto_merge_to_topic`: a topic
+        // Feature branch is auto-created (or reused if already
+        // present) and the stream is merged into it instead of being
+        // abandoned. Main is intentionally NOT the target — only an
+        // explicit user-initiated merge of topic → main promotes the
+        // work. AutoOnSessionEnd with NO contributes falls through to
+        // the default cleanup_action so empty streams don't leave
+        // spurious topic branches behind.
         let effective_action = if branch.merge_policy.is_ephemeral() {
             "abandon"
+        } else if matches!(branch.merge_policy, MergePolicy::AutoOnSessionEnd)
+            && has_contributes
+        {
+            "auto_merge_to_topic"
         } else if action == "purge" && has_contributes {
             tracing::warn!(
                 branch = %branch.name,
@@ -156,6 +170,87 @@ pub async fn cleanup_once(
         // operation does not race a live DbInstance.
 
         match effective_action {
+            "auto_merge_to_topic" => {
+                let topic_name =
+                    topic_branch_name_for_session(session_id, &branch.created_at);
+                match ensure_topic_branch(workspace_root, &topic_name).await {
+                    Ok(()) => {
+                        // Merge stream → topic. `force=false` keeps the
+                        // health-score gate honest; `propagate_deletions=false`
+                        // because stream-origin deletions are session-local
+                        // intent and shouldn't propagate to a long-lived
+                        // topic.
+                        match thinkingroot_branch::merge_into(
+                            workspace_root,
+                            &branch.name,
+                            &topic_name,
+                            MergedBy::System,
+                            /* force */ false,
+                            /* propagate_deletions */ false,
+                        )
+                        .await
+                        {
+                            Ok(_diff) => {
+                                stats.merged_to_topic += 1;
+
+                                // Phase B.1 (2026-05-17) — propagate the
+                                // stream branch's description (the user's
+                                // first message of the session, written by
+                                // the REST chat handler) onto the topic
+                                // branch as its human-readable title.
+                                // Best-effort: a failure here is logged but
+                                // never rolls back the merge — the data is
+                                // safely on the topic branch even if its
+                                // title stays as the create-time placeholder.
+                                if let Some(desc) = branch.description.as_deref() {
+                                    let desc_trimmed = desc.trim();
+                                    if !desc_trimmed.is_empty() {
+                                        if let Err(e) =
+                                            thinkingroot_branch::set_branch_description(
+                                                workspace_root,
+                                                &topic_name,
+                                                Some(desc_trimmed.to_string()),
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                topic = %topic_name,
+                                                "B.1: failed to propagate stream description to topic (merge stays committed): {e}"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                tracing::info!(
+                                    branch = %branch.name,
+                                    session_id,
+                                    target = %topic_name,
+                                    "stream_cleanup: merged stream → topic (auto)"
+                                );
+                            }
+                            Err(e) => {
+                                // Leave stream Active; next tick retries.
+                                // No data loss — the stream's data dir
+                                // stays on disk until a successful merge
+                                // (or an explicit abandon by the user).
+                                tracing::warn!(
+                                    branch = %branch.name,
+                                    target = %topic_name,
+                                    "stream_cleanup: auto-merge to topic failed \
+                                     (stream stays Active for retry next tick): {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            branch = %branch.name,
+                            topic = %topic_name,
+                            "stream_cleanup: ensure_topic_branch failed \
+                             (stream stays Active for retry next tick): {e}"
+                        );
+                    }
+                }
+            }
             "purge" => match thinkingroot_branch::purge_branch(workspace_root, &branch.name) {
                 Ok(_) => {
                     stats.purged += 1;
@@ -191,6 +286,7 @@ pub async fn cleanup_once(
         branches_scanned = stats.branches_scanned,
         abandoned = stats.abandoned,
         purged = stats.purged,
+        merged_to_topic = stats.merged_to_topic,
         kept = stats.kept,
         "stream cleanup tick complete"
     );
@@ -203,6 +299,13 @@ pub struct CleanupStats {
     pub abandoned: usize,
     pub purged: usize,
     pub kept: usize,
+    /// Phase A (2026-05-17): count of stream branches whose
+    /// `MergePolicy` is `AutoOnSessionEnd` and which carried agent
+    /// contributes — these are merged into an auto-created `topic/*`
+    /// Feature branch (default `MergePolicy::Manual`) instead of
+    /// being abandoned. Main is left untouched; promoting topic →
+    /// main remains an explicit user action.
+    pub merged_to_topic: usize,
 }
 
 /// T2.3 — TTL cleanup pass.
@@ -304,4 +407,80 @@ fn branch_has_agent_contributes(
     Ok(sources
         .iter()
         .any(|(_, uri, _, _)| uri.starts_with("mcp://agent/")))
+}
+
+/// Phase A (2026-05-17) — deterministic topic-branch name for a stream
+/// session's auto-merge target.
+///
+/// Returns `topic/{YYYY-MM-DD}-{session_id_first_8_alphanum}`. Deterministic
+/// so two cleanup ticks on the same session land on the same topic branch
+/// (idempotent ensure + merge). Phase B replaces this with an AI-generated
+/// slug derived from the session's conversation — callers MUST NOT depend
+/// on the date-suffix shape.
+fn topic_branch_name_for_session(
+    session_id: &str,
+    created_at: &chrono::DateTime<chrono::Utc>,
+) -> String {
+    let date = created_at.format("%Y-%m-%d");
+    let short: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    if short.is_empty() {
+        format!("topic/{date}-anon")
+    } else {
+        format!("topic/{date}-{short}")
+    }
+}
+
+/// Phase A (2026-05-17) — idempotent create of a topic Feature branch.
+///
+/// Returns Ok(()) when the branch is present-and-Active after the call,
+/// whether we created it or it already existed. The branch is created
+/// with `BranchKind::Feature` + `MergePolicy::Manual` so it never
+/// auto-promotes to main — only an explicit user-initiated merge can
+/// reach main from a topic branch. Concurrent cleanup ticks racing the
+/// same name are tolerated: `Error::BranchAlreadyExists` is folded into
+/// Ok because the post-state we wanted is already true.
+async fn ensure_topic_branch(
+    workspace_root: &std::path::Path,
+    topic_name: &str,
+) -> thinkingroot_core::Result<()> {
+    // Cheap pre-check: skip the create call when the branch already
+    // exists and is Active. Avoids a noisy "already exists" error in
+    // the typical case (every cleanup tick after the first).
+    let existing = thinkingroot_branch::list_branches(workspace_root)
+        .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("list_branches: {e}")))?;
+    if existing
+        .iter()
+        .any(|b| b.name == topic_name && matches!(b.status, BranchStatus::Active))
+    {
+        return Ok(());
+    }
+
+    match thinkingroot_branch::create_branch_full(
+        workspace_root,
+        topic_name,
+        "main",
+        Some(
+            "auto-created from stream cleanup (Phase A naming; AI titles in Phase B)"
+                .to_string(),
+        ),
+        None, // owner: system
+        BranchPermissions::default(),
+        BranchKind::Feature,
+        MergePolicy::Manual,
+        None, // redaction
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => match &e {
+            // Racing cleanup ticks can both try to create; the
+            // post-state is already what we wanted.
+            thinkingroot_core::Error::BranchAlreadyExists(_) => Ok(()),
+            _ => Err(e),
+        },
+    }
 }

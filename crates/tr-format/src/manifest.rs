@@ -50,10 +50,25 @@ pub const FORMAT_VERSION_V31: &str = "tr/3.1";
 /// `"rule_catalog.toml.blake3"`.
 pub const FORMAT_VERSION_V32: &str = "tr/3.2";
 
+/// v3.3 format identifier — `"tr/3.3"`. The Cognition Commits additive
+/// bump (Phase ζ.1 of the Cognition Commits design,
+/// `docs/2026-05-15-cognition-commits-design.md`). Backward-compatible
+/// with `tr/3`, `tr/3.1`, and `tr/3.2`: the new member is an extra
+/// pack file (`cognition_commits.cbor`) plus an optional manifest
+/// field. v3.3-aware readers gain access to:
+///
+/// - `cognition_commits.cbor` — the CBOR-encoded cognition-commit DAG
+///   produced by the engine's `cognition_commits` table. CBOR
+///   canonical encoding makes the bytes deterministic across runs.
+///
+/// A v3.3 pack manifest's `derived_hashes` allow-list adds one new
+/// `kind` entry: `"cognition_commits.cbor.blake3"`.
+pub const FORMAT_VERSION_V33: &str = "tr/3.3";
+
 /// Latest format version emitted by this crate's writer. Consumers
 /// that want to pin against the most recent published format should
 /// use this alias rather than hard-coding the literal string.
-pub const FORMAT_VERSION_LATEST: &str = FORMAT_VERSION_V32;
+pub const FORMAT_VERSION_LATEST: &str = FORMAT_VERSION_V33;
 
 /// Allow-list of `derived_hashes[].kind` values per spec §3.2 v3.1
 /// and the v3.2 Witness Mesh extension. Anything outside this list
@@ -67,6 +82,8 @@ pub const DERIVED_HASH_KINDS: &[&str] = &[
     // ── tr/3.2 Witness Mesh extension ──
     "witnesses.cbor.blake3",
     "rule_catalog.toml.blake3",
+    // ── tr/3.3 Cognition Commits extension ──
+    "cognition_commits.cbor.blake3",
 ];
 
 /// The v3 manifest. Carried as `manifest.toml` inside `package.tr`.
@@ -233,18 +250,18 @@ impl ManifestV3 {
     /// rejected on `tr/3` so a v3 declaration cannot smuggle in
     /// features that require the bump.
     pub fn validate(&self) -> Result<()> {
-        // `is_v31` covers BOTH `tr/3.1` AND `tr/3.2` — v3.2 is a
-        // strict additive bump of v3.1 (extra files in the tarball,
-        // no new manifest fields), so every v3.1 invariant carries
-        // forward verbatim.
+        // `is_v31` covers v3.1, v3.2, AND v3.3 — each is a strict
+        // additive bump of the prior (extra pack files / optional
+        // manifest fields, no breaking changes), so every v3.1
+        // invariant carries forward verbatim.
         let is_v31 = match self.format_version.as_str() {
             FORMAT_VERSION_V3 => false,
-            FORMAT_VERSION_V31 | FORMAT_VERSION_V32 => true,
+            FORMAT_VERSION_V31 | FORMAT_VERSION_V32 | FORMAT_VERSION_V33 => true,
             other => {
                 return Err(Error::Invalid {
                     what: "manifest.toml",
                     detail: format!(
-                        "format_version must be `{FORMAT_VERSION_V3}`, `{FORMAT_VERSION_V31}`, or `{FORMAT_VERSION_V32}`, got `{other}`"
+                        "format_version must be `{FORMAT_VERSION_V3}`, `{FORMAT_VERSION_V31}`, `{FORMAT_VERSION_V32}`, or `{FORMAT_VERSION_V33}`, got `{other}`"
                     ),
                 });
             }
@@ -959,6 +976,33 @@ mod tests {
                 "`{bad}` must be rejected as path traversal"
             );
         }
+    }
+
+    #[test]
+    fn validate_accepts_v33_format_version() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V33.into();
+        m.validate().expect("v3.3 manifest validates");
+    }
+
+    #[test]
+    fn validate_accepts_cognition_commits_derived_hash_kind_on_v33() {
+        let mut m = sample();
+        m.format_version = FORMAT_VERSION_V33.into();
+        let mut src = good_source_entry("commits.md");
+        src.derived_hashes = vec![DerivedHash {
+            kind: "cognition_commits.cbor.blake3".into(),
+            hash: "blake3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+        }];
+        m.sources = vec![src];
+        m.source_files = Some(1);
+        m.source_bytes = Some(100);
+        m.validate().expect("cognition_commits.cbor.blake3 in allow-list");
+    }
+
+    #[test]
+    fn format_version_latest_points_at_v33() {
+        assert_eq!(FORMAT_VERSION_LATEST, FORMAT_VERSION_V33);
     }
 
     #[test]

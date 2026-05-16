@@ -31,6 +31,7 @@ import {
   Square,
   AlertTriangle,
   Hammer,
+  Inbox,
   Loader2,
   Plus,
   FileText,
@@ -76,6 +77,7 @@ import {
 import { BrainCitationParser, useBrainActivation } from "@/store/brain";
 import type { ChatMessage, EngramActivationEntry, GapEntry } from "@/types";
 import { BranchChip } from "./BranchChip";
+import { TopicBranchesPanel } from "@/components/branches/TopicBranchesPanel";
 import { LiveActivityStrip } from "./LiveActivityStrip";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { EngramTimeline } from "./EngramTimeline";
@@ -737,16 +739,10 @@ export function ChatView() {
 
     return (
       <div className="flex h-full flex-col bg-background">
+        <ChatContextHeader workspace={activeWorkspace} />
         {/* Vertically centered floating composer — Cursor-style */}
         <div className="flex flex-1 flex-col items-center justify-center px-8">
           <div className="flex w-full max-w-3xl flex-col gap-3">
-            {/* Subtle heading above the card */}
-            <div className="mb-1 text-center">
-              <p className="text-[11px] uppercase tracking-widest text-muted-foreground/50">
-                {activeWorkspace}
-              </p>
-            </div>
-
             {/* Floating composer card */}
             <Composer
               workspace={activeWorkspace}
@@ -862,22 +858,7 @@ export function ChatView() {
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <div className="border-b border-border/40 bg-background/80 px-8 py-2.5 backdrop-blur supports-[backdrop-filter]:bg-background/70">
-        <div className="mx-auto flex min-w-0 max-w-3xl items-baseline gap-x-2 font-sans antialiased">
-          <span className="min-w-0 shrink truncate text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-            {activeWorkspace}
-          </span>
-          <span
-            className="shrink-0 translate-y-[0.5px] select-none text-xs font-medium tabular-nums leading-none text-muted-foreground/50"
-            aria-hidden
-          >
-            /
-          </span>
-          <div className="min-w-0 shrink leading-none">
-            <BranchChip workspace={activeWorkspace} />
-          </div>
-        </div>
-      </div>
+      <ChatContextHeader workspace={activeWorkspace} />
       <div className="flex-1 overflow-y-auto px-8 py-6">
         <ul className="mx-auto flex max-w-3xl flex-col gap-6">
           {messages.map((m) => (
@@ -1006,6 +987,56 @@ export function ChatView() {
  * letting the user submit and watch a spinner. Renders nothing on the
  * happy path (configured + has claims).
  */
+/** Workspace + branch label — left-aligned beside the sidebar, no divider.
+ *
+ * Phase B.3 (2026-05-17): adds a small Inbox icon button right of the
+ * BranchChip that opens [`TopicBranchesPanel`] — the surface where
+ * users review and act on auto-created `topic/*` branches before they
+ * promote (manually) to `main`. The trigger lives next to BranchChip
+ * because both affordances are about "which branches matter right
+ * now"; keeping them in the same visual neighbourhood matches the
+ * cognitive flow.
+ */
+function ChatContextHeader({ workspace }: { workspace: string }) {
+  const [topicsOpen, setTopicsOpen] = useState(false);
+  return (
+    <div className="shrink-0 px-4 py-1.5">
+      <div className="flex min-w-0 items-center gap-x-1.5">
+        <span className="min-w-0 shrink truncate text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+          {workspace}
+        </span>
+        <span
+          className="shrink-0 select-none text-[10px] font-medium tabular-nums leading-none text-muted-foreground/45"
+          aria-hidden
+        >
+          /
+        </span>
+        <div className="min-w-0 shrink leading-none">
+          <BranchChip workspace={workspace} compact />
+        </div>
+        <button
+          type="button"
+          onClick={() => setTopicsOpen(true)}
+          className={cn(
+            "ml-0.5 inline-flex shrink-0 items-center gap-0.5 rounded-sm p-0.5 text-muted-foreground transition-colors",
+            "hover:bg-muted/45 hover:text-foreground",
+            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/55 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          )}
+          aria-label="Review pending topic branches"
+          title="Review pending topic branches"
+        >
+          <Inbox className="size-3" aria-hidden />
+        </button>
+      </div>
+      <TopicBranchesPanel
+        workspace={workspace}
+        open={topicsOpen}
+        onOpenChange={setTopicsOpen}
+      />
+    </div>
+  );
+}
+
 /** Compare absolute workspace roots (macOS may differ only by case). */
 function sameWorkspaceRoot(a: string | null, b: string | null): boolean {
   if (!a || !b) return false;

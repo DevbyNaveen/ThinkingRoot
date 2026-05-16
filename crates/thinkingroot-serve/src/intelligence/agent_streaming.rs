@@ -55,6 +55,13 @@ pub struct StreamAgentDeps {
     pub sessions: SessionStore,
     pub pending_approvals: PendingApprovalMap,
     pub trace: Option<SharedTraceLog>,
+    /// Shared per-deployment engram manager — same instance the SSE
+    /// transport hands to `mcp::dispatch`. Required so the McpBridge
+    /// adapter can call `mcp::tools::handle_call` for the bridged
+    /// AEP tools (`materialize_engram`, `probe_engram`,
+    /// `list_engrams`, `expire_engram`) without minting a parallel
+    /// manager that would diverge from the REST/SSE pointer space.
+    pub engram_manager: Arc<crate::intelligence::engram::EngramManager>,
 }
 
 /// Spawn the agent in a tokio task and return the receiver side of the
@@ -96,43 +103,55 @@ pub fn spawn_agent_run(
     let workspace_for_obs = req.workspace.clone();
     let engine_for_obs = deps.engine.clone();
     let sessions_for_obs = deps.sessions.clone();
+    // Phase β.2 — auto-commit needs the model id for the
+    // `CommitAuthor::Agent { model, principal }` projection.
+    let llm_model_for_commit = deps.llm.model_name().to_string();
 
-    let ctx = ToolContext {
-        engine: deps.engine,
-        workspace: req.workspace.clone(),
-        workspace_root: req.workspace_root,
-        session_id: req.session_id.clone(),
-        sessions: deps.sessions,
-        agent_id: req.agent_id,
-        skills: req.skills,
-    };
-    let registry = register_builtin_tools(ctx);
-
-    let llm: Arc<dyn LlmBackend> = deps.llm;
-    let mut agent = Agent::new(llm, registry, router.clone());
-    if let Some(trace) = deps.trace {
-        agent = agent.with_trace_log(trace);
-    }
-
-    // Build the initial conversation: history + the latest user
-    // question as the final turn. The agent appends its own
-    // assistant_tool_calls / tool_results turns as it iterates.
-    let mut messages = req.history;
-    messages.push(ChatMessage::User(req.user_question));
-
-    let agent_req = AgentRequest {
-        system: req.system_prompt,
-        // C5: no refresher wired yet — will be set in Task 5/9
-        // (system-reminder bus). Until then, agent path uses static
-        // identity captured at request entry. Bug C5, plan 2026-05-09.
-        system_refresher: None,
-        history: messages,
-        tool_choice: ToolChoice::Auto,
-    };
-
+    // `register_builtin_tools` is async (it walks the live MCP
+    // catalogue via the bridge), so ctx + registry + agent
+    // construction is deferred into the spawned task below.
+    // `agent_router` is the clone the agent itself takes; the
+    // outer `router` Arc is what we return to the caller for
+    // approval-decision dispatch.
+    let agent_router = router.clone();
     let router_for_pre_emit = router.clone();
     tokio::spawn(async move {
         let _ = router_for_pre_emit; // hold the Arc alive
+
+        let ctx = ToolContext {
+            engine: deps.engine,
+            workspace: req.workspace.clone(),
+            workspace_root: req.workspace_root,
+            session_id: req.session_id.clone(),
+            sessions: deps.sessions,
+            agent_id: req.agent_id,
+            skills: req.skills,
+            engram_manager: deps.engram_manager,
+        };
+        let registry = register_builtin_tools(ctx).await;
+
+        let llm: Arc<dyn LlmBackend> = deps.llm;
+        let mut agent = Agent::new(llm, registry, agent_router);
+        if let Some(trace) = deps.trace {
+            agent = agent.with_trace_log(trace);
+        }
+
+        // Build the initial conversation: history + the latest user
+        // question as the final turn. The agent appends its own
+        // assistant_tool_calls / tool_results turns as it iterates.
+        let mut messages = req.history;
+        messages.push(ChatMessage::User(req.user_question));
+
+        let agent_req = AgentRequest {
+            system: req.system_prompt,
+            // C5: no refresher wired yet — will be set in Task 5/9
+            // (system-reminder bus). Until then, agent path uses
+            // static identity captured at request entry. Bug C5,
+            // plan 2026-05-09.
+            system_refresher: None,
+            history: messages,
+            tool_choice: ToolChoice::Auto,
+        };
 
         // Relay channel between the agent and the caller's `tx`.
         // The agent writes events here; this task forwards them to
@@ -156,6 +175,13 @@ pub fn spawn_agent_run(
         // an error: the chat reply has already streamed to the user
         // and the Observer is a downstream consolidation layer.
         if let Some(reply) = captured_final {
+            // Phase β.2 — clone what the cognition-commit hook needs
+            // BEFORE moving fields into `record_completed_turn`.
+            let engine_for_commit = engine_for_obs.clone();
+            let workspace_for_commit = workspace_for_obs.clone();
+            let user_question_for_commit = user_question_for_obs.clone();
+            let reply_for_commit = reply.clone();
+
             record_completed_turn(
                 engine_for_obs,
                 sessions_for_obs,
@@ -163,6 +189,21 @@ pub fn spawn_agent_run(
                 session_id_for_obs,
                 user_question_for_obs,
                 reply,
+            )
+            .await;
+
+            // Phase β.2 — auto-commit the turn as a CognitionCommit
+            // on `main`. Runs AFTER the observer so the substrate
+            // already has any new witnesses the agent's tool calls
+            // produced; their ids are then verifiable when this
+            // commit's citations resolve. Best-effort: a failure here
+            // doesn't reach the user (the reply has already streamed).
+            record_cognition_commit_for_turn(
+                engine_for_commit,
+                workspace_for_commit,
+                user_question_for_commit,
+                reply_for_commit,
+                llm_model_for_commit,
             )
             .await;
         }
@@ -265,6 +306,123 @@ async fn record_completed_turn(
                     "auto-flush after chat turn failed (non-fatal)"
                 );
             }
+        }
+    }
+}
+
+/// Auto-commit one completed agent turn as a `CognitionCommit` on the
+/// workspace's `main` branch.
+///
+/// The commit threads to the previous `main` commit as parent so the
+/// chat history forms a real DAG. Citations are extracted from the
+/// assistant reply via `citation_markers::extract_witness_citations`
+/// and filtered to those that actually resolve to a real Witness in
+/// the workspace — fabricated markers are silently dropped (with a
+/// debug log) rather than failing the entire commit. The first
+/// branch-genesis commit has `parent = None`.
+///
+/// All failures log at WARN and never propagate: this runs AFTER the
+/// chat reply has been delivered, so a commit error must not reach
+/// the user. The "real revolution" piece (chat history IS the commit
+/// DAG) is honest about being best-effort.
+async fn record_cognition_commit_for_turn(
+    engine: Arc<RwLock<QueryEngine>>,
+    workspace: String,
+    user_prompt: String,
+    assistant_reply: String,
+    llm_model: String,
+) {
+    use thinkingroot_core::types::{CognitionCommit, CommitAuthor};
+
+    const AUTOCOMMIT_BRANCH: &str = "main";
+    const AGENT_PRINCIPAL: &str = "thinkingroot";
+
+    // Extract + verify citations off the read lock first so we hold
+    // it for the minimum window across the commit write.
+    let raw_citations = crate::intelligence::citation_markers::extract_witness_citations(
+        &assistant_reply,
+    );
+    let mut verified_citations: Vec<thinkingroot_core::types::WitnessId> = Vec::new();
+    {
+        let engine_guard = engine.read().await;
+        for id in &raw_citations {
+            match engine_guard.get_witness(&workspace, &id.to_hex()).await {
+                Ok(Some(_)) => verified_citations.push(*id),
+                Ok(None) => tracing::debug!(
+                    target: "cognition_commit",
+                    workspace = %workspace,
+                    witness_id = %id.to_hex(),
+                    "auto-commit: dropping fabricated citation marker"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cognition_commit",
+                        workspace = %workspace,
+                        witness_id = %id.to_hex(),
+                        error = %e,
+                        "auto-commit: get_witness failed for citation"
+                    );
+                }
+            }
+        }
+    }
+
+    // Look up the parent (latest commit on `main`) so the new commit
+    // threads into the DAG. None on a fresh branch is correct — that
+    // commit becomes the genesis.
+    let parent = {
+        let engine_guard = engine.read().await;
+        match engine_guard
+            .list_cognition_commits(&workspace, AUTOCOMMIT_BRANCH, Some(1))
+            .await
+        {
+            Ok(commits) => commits.first().map(|c| c.id),
+            Err(e) => {
+                tracing::warn!(
+                    target: "cognition_commit",
+                    workspace = %workspace,
+                    error = %e,
+                    "auto-commit: list_cognition_commits failed; skipping commit"
+                );
+                return;
+            }
+        }
+    };
+
+    let author = CommitAuthor::Agent {
+        model: llm_model,
+        principal: AGENT_PRINCIPAL.to_string(),
+    };
+    let commit = CognitionCommit::new(
+        parent,
+        AUTOCOMMIT_BRANCH.to_string(),
+        author,
+        user_prompt,
+        assistant_reply,
+        Vec::new(), // witnesses_added — populated by explicit `commit_cognition` calls
+        verified_citations,
+        Vec::new(), // gaps_surfaced — populated by explicit calls
+        chrono::Utc::now(),
+    );
+
+    let engine_guard = engine.read().await;
+    match engine_guard.commit_cognition(&workspace, &commit).await {
+        Ok(()) => {
+            tracing::debug!(
+                target: "cognition_commit",
+                workspace = %workspace,
+                commit_id = %commit.id,
+                citations = commit.citations.len(),
+                "auto-commit recorded agent turn"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "cognition_commit",
+                workspace = %workspace,
+                error = %e,
+                "auto-commit: commit_cognition failed (non-fatal)"
+            );
         }
     }
 }

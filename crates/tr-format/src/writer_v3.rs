@@ -90,6 +90,11 @@ struct CanonicalPack {
     /// verbatim into the outer tar AND chained into `pack_hash`
     /// after `rule_catalog.toml`.
     paper_md: Option<Vec<u8>>,
+    /// `cognition_commits.cbor` body for v3.3 packs. `None` for
+    /// v3 / v3.1 / v3.2 packs. CBOR-canonical encoding of the
+    /// id-sorted commit vec; chained into `pack_hash` after
+    /// `paper.md`.
+    cognition_commits_cbor: Option<Vec<u8>>,
 }
 
 /// Path of the inner source bundle inside the outer `.tr` tar.
@@ -114,6 +119,10 @@ pub const RULE_CATALOG_NAME: &str = "rule_catalog.toml";
 /// present, its bytes are appended to the pack-hash canonical chain
 /// after `rule_catalog.toml`.
 pub const PAPER_NAME: &str = "paper.md";
+/// Path of the Cognition Commits CBOR member inside the outer `.tr`
+/// tar — present only in v3.3 packs. CBOR-canonical encoding of the
+/// id-sorted commit vec.
+pub const COGNITION_COMMITS_NAME: &str = "cognition_commits.cbor";
 
 /// Programmatic builder for a v3 `.tr` pack. Cheaply constructed; build
 /// via [`V3PackBuilder::build`] when ready.
@@ -144,6 +153,10 @@ pub struct V3PackBuilder {
     /// in the outer tar between `rule_catalog.toml` and any
     /// `signature.sig`. Triggers v3.2 wire-format on `build()`.
     paper_md: Option<String>,
+    /// Cognition Commits staged for the `tr/3.3` writer. Empty for
+    /// v3 / v3.1 / v3.2 packs. Sorted by `id` at build time so the
+    /// CBOR emit is byte-deterministic.
+    cognition_commits: Vec<crate::CognitionCommitRecord>,
 }
 
 impl V3PackBuilder {
@@ -158,7 +171,51 @@ impl V3PackBuilder {
             witnesses: Vec::new(),
             rule_catalog_toml: None,
             paper_md: None,
+            cognition_commits: Vec::new(),
         }
+    }
+
+    /// Append a single Cognition Commit record (Phase ζ.1 substrate
+    /// + ζ.2 writer integration). Order doesn't matter — `build()`
+    /// sorts by id ASC before CBOR-encoding so the resulting
+    /// `cognition_commits.cbor` is byte-deterministic. Triggers
+    /// v3.3 wire-format on `build()`.
+    pub fn add_cognition_commit(&mut self, record: crate::CognitionCommitRecord) {
+        self.cognition_commits.push(record);
+    }
+
+    /// Append many Cognition Commits. Same ordering contract as
+    /// [`Self::add_cognition_commit`].
+    pub fn extend_cognition_commits(
+        &mut self,
+        records: impl IntoIterator<Item = crate::CognitionCommitRecord>,
+    ) {
+        self.cognition_commits.extend(records);
+    }
+
+    /// True iff this builder will emit a v3.3 pack (cognition commits
+    /// have been staged). v3.3 is a superset of v3.2; presence of any
+    /// commits flips the format version regardless of whether
+    /// witnesses + catalog or paper are also staged.
+    pub fn is_v33(&self) -> bool {
+        !self.cognition_commits.is_empty()
+    }
+
+    /// Encode the staged cognition commits as canonical CBOR. The
+    /// output is byte-deterministic: commits are sorted by `id`
+    /// ascending before encoding, and `ciborium`'s default writer
+    /// emits canonical CBOR (sorted map keys, shortest int form, no
+    /// indefinite-length items). Same input vec → same bytes across
+    /// processes.
+    pub(crate) fn encode_cognition_commits_cbor(&self) -> Result<Vec<u8>> {
+        let mut sorted = self.cognition_commits.clone();
+        sorted.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut buf: Vec<u8> = Vec::new();
+        ciborium::into_writer(&sorted, &mut buf).map_err(|e| Error::Invalid {
+            what: "cognition_commits.cbor",
+            detail: format!("ciborium encode failed: {e}"),
+        })?;
+        Ok(buf)
     }
 
     /// Append a single Witness Mesh witness record. Order doesn't
@@ -285,6 +342,7 @@ impl V3PackBuilder {
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
             prepared.paper_md.as_deref(),
+            prepared.cognition_commits_cbor.as_deref(),
         )
     }
 
@@ -352,7 +410,22 @@ impl V3PackBuilder {
                 (None, None)
             };
         let paper_md_bytes = self.paper_md.as_ref().map(|s| s.as_bytes().to_vec());
-        if self.is_v32() {
+
+        // ── Cognition Commits v3.3 extension (Phase ζ.2) ──────────
+        // Encode every staged commit as CBOR; the bytes feed into
+        // the canonical bytes recipe so any tampering invalidates
+        // `pack_hash`. Order: appended after `paper.md` so the
+        // recipe is invariant across runs.
+        let cognition_commits_cbor = if !self.cognition_commits.is_empty() {
+            Some(self.encode_cognition_commits_cbor()?)
+        } else {
+            None
+        };
+
+        // Format version: v3.3 wins over v3.2 wins over v3.1/v3.
+        if self.is_v33() {
+            self.manifest.format_version = crate::FORMAT_VERSION_V33.to_string();
+        } else if self.is_v32() {
             // Any v3.2 trigger (witnesses, catalog, OR paper) bumps the
             // format version. The bodies' BLAKE3 are implicitly covered
             // by `pack_hash` via the canonical_bytes recipe extension
@@ -382,7 +455,10 @@ impl V3PackBuilder {
                 + rule_catalog_toml_bytes
                     .as_ref()
                     .map_or(0, |b| b.len() + 1)
-                + paper_md_bytes.as_ref().map_or(0, |b| b.len() + 1),
+                + paper_md_bytes.as_ref().map_or(0, |b| b.len() + 1)
+                + cognition_commits_cbor
+                    .as_ref()
+                    .map_or(0, |b| b.len() + 1),
         );
         canonical_bytes.extend_from_slice(&canonical_manifest);
         canonical_bytes.push(0);
@@ -401,6 +477,12 @@ impl V3PackBuilder {
             canonical_bytes.push(0);
             canonical_bytes.extend_from_slice(p);
         }
+        if let Some(ref cc) = cognition_commits_cbor {
+            // v3.3 chain extension: cognition_commits.cbor lands
+            // last so older readers can stop at the v3.2 prefix.
+            canonical_bytes.push(0);
+            canonical_bytes.extend_from_slice(cc);
+        }
         let pack_hash = format!("blake3:{}", blake3_hex(&canonical_bytes));
         self.manifest.pack_hash = pack_hash.clone();
 
@@ -415,6 +497,7 @@ impl V3PackBuilder {
             witnesses_cbor,
             rule_catalog_toml: rule_catalog_toml_bytes,
             paper_md: paper_md_bytes,
+            cognition_commits_cbor,
         })
     }
 
@@ -462,6 +545,7 @@ impl V3PackBuilder {
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
             prepared.paper_md.as_deref(),
+            prepared.cognition_commits_cbor.as_deref(),
         )
     }
 
@@ -510,6 +594,7 @@ impl V3PackBuilder {
             prepared.witnesses_cbor.as_deref(),
             prepared.rule_catalog_toml.as_deref(),
             prepared.paper_md.as_deref(),
+            prepared.cognition_commits_cbor.as_deref(),
         )
     }
 
@@ -564,6 +649,7 @@ impl V3PackBuilder {
 /// `witnesses.cbor`, `rule_catalog.toml`, and `paper.md` between
 /// `claims.jsonl` and the optional `signature.sig`. Entry order is
 /// fixed for reproducibility.
+#[allow(clippy::too_many_arguments)]
 fn emit_outer_tar(
     manifest_toml: &[u8],
     source_tar_zst: &[u8],
@@ -572,6 +658,7 @@ fn emit_outer_tar(
     witnesses_cbor: Option<&[u8]>,
     rule_catalog_toml: Option<&[u8]>,
     paper_md: Option<&[u8]>,
+    cognition_commits_cbor: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut outer = Vec::with_capacity(
         manifest_toml.len()
@@ -581,6 +668,7 @@ fn emit_outer_tar(
             + witnesses_cbor.map(<[u8]>::len).unwrap_or(0)
             + rule_catalog_toml.map(<[u8]>::len).unwrap_or(0)
             + paper_md.map(<[u8]>::len).unwrap_or(0)
+            + cognition_commits_cbor.map(<[u8]>::len).unwrap_or(0)
             + 4096,
     );
     {
@@ -590,10 +678,10 @@ fn emit_outer_tar(
         // Tar entry order is fixed for reproducibility:
         //   manifest.toml, source.tar.zst, claims.jsonl,
         //   [witnesses.cbor], [rule_catalog.toml], [paper.md],
-        //   [signature.sig].
+        //   [cognition_commits.cbor], [signature.sig].
         // v3 packs stop at claims.jsonl; v3.2 inserts the Witness
-        // Mesh + Living Paper members between claims.jsonl and
-        // signature.sig.
+        // Mesh + Living Paper members; v3.3 adds the cognition
+        // commits member after paper.md and before signature.sig.
         append_file(&mut tar_builder, MANIFEST_NAME, manifest_toml)?;
         append_file(&mut tar_builder, SOURCE_BUNDLE_NAME, source_tar_zst)?;
         append_file(&mut tar_builder, CLAIMS_NAME, claims_jsonl)?;
@@ -605,6 +693,9 @@ fn emit_outer_tar(
         }
         if let Some(p) = paper_md {
             append_file(&mut tar_builder, PAPER_NAME, p)?;
+        }
+        if let Some(cc) = cognition_commits_cbor {
+            append_file(&mut tar_builder, COGNITION_COMMITS_NAME, cc)?;
         }
         if let Some(sig) = signature_sig {
             append_file(&mut tar_builder, SIGNATURE_NAME, sig)?;
@@ -940,5 +1031,145 @@ mod tests {
             }
         }
         panic!("manifest.toml not found in v3.2 pack");
+    }
+
+    // ─── Phase ζ.2 — cognition_commits.cbor pack writer ────────────
+
+    fn sample_commit_record(id_byte: u8) -> crate::CognitionCommitRecord {
+        crate::CognitionCommitRecord::new(
+            format!("{:0>64x}", id_byte),
+            "main",
+            crate::CognitionCommitAuthor::Agent {
+                model: "claude-opus-4-7".to_string(),
+                principal: "thinkingroot".to_string(),
+            },
+            "2026-05-16T00:00:00Z",
+        )
+        .with_prompt("what is x?")
+        .with_reasoning("x is y")
+    }
+
+    #[test]
+    fn is_v33_flips_when_cognition_commit_added() {
+        let mut b = V3PackBuilder::new(fixture_manifest());
+        assert!(!b.is_v33());
+        b.add_cognition_commit(sample_commit_record(0x01));
+        assert!(b.is_v33());
+    }
+
+    #[test]
+    fn v33_build_emits_cognition_commits_tar_entry() {
+        let mut b = V3PackBuilder::new(fixture_manifest());
+        b.add_cognition_commit(sample_commit_record(0x01));
+        b.add_cognition_commit(sample_commit_record(0x02));
+        let bytes = b.build().unwrap();
+
+        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            })
+            .collect();
+        assert!(
+            names.contains(&"cognition_commits.cbor".to_string()),
+            "v3.3 pack must include cognition_commits.cbor; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn v33_pack_format_version_is_v33_in_manifest() {
+        let mut b = V3PackBuilder::new(fixture_manifest());
+        b.add_cognition_commit(sample_commit_record(0xAA));
+        let bytes = b.build().unwrap();
+        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_str() == Some("manifest.toml") {
+                let mut content = String::new();
+                use std::io::Read;
+                entry.read_to_string(&mut content).unwrap();
+                assert!(
+                    content.contains("format_version = \"tr/3.3\""),
+                    "manifest must declare tr/3.3: {content}"
+                );
+                return;
+            }
+        }
+        panic!("manifest.toml not found in v3.3 pack");
+    }
+
+    #[test]
+    fn v33_pack_is_byte_deterministic_across_staging_order() {
+        let pack1 = {
+            let mut b = V3PackBuilder::new(fixture_manifest());
+            b.add_cognition_commit(sample_commit_record(0x11));
+            b.add_cognition_commit(sample_commit_record(0x22));
+            b.build().unwrap()
+        };
+        let pack2 = {
+            let mut b = V3PackBuilder::new(fixture_manifest());
+            b.add_cognition_commit(sample_commit_record(0x22));
+            b.add_cognition_commit(sample_commit_record(0x11));
+            b.build().unwrap()
+        };
+        assert_eq!(
+            pack1, pack2,
+            "v3.3 pack bytes must be staging-order-invariant (sorted at build)"
+        );
+    }
+
+    #[test]
+    fn v33_works_alongside_v32_witnesses_and_paper() {
+        // Combined pack: witnesses + catalog + paper + commits.
+        // v3.3 wins over v3.2 because cognition_commits is present.
+        let mut b = V3PackBuilder::new(fixture_manifest())
+            .with_rule_catalog_toml("catalog_version = \"1.0.0\"\n")
+            .with_paper("---\ntitle: t\n---\nbody\n");
+        b.add_witness(sample_witness_record(0x01));
+        b.add_cognition_commit(sample_commit_record(0x01));
+        let bytes = b.build().unwrap();
+        let mut archive = tar::Archive::new(Cursor::new(bytes.clone()));
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            })
+            .collect();
+        for required in [
+            "manifest.toml",
+            "source.tar.zst",
+            "claims.jsonl",
+            "witnesses.cbor",
+            "rule_catalog.toml",
+            "paper.md",
+            "cognition_commits.cbor",
+        ] {
+            assert!(
+                names.contains(&required.to_string()),
+                "combined pack missing `{required}`; got {names:?}"
+            );
+        }
+        // And the manifest declares v3.3 (the highest version wins).
+        let mut archive2 = tar::Archive::new(Cursor::new(bytes));
+        for entry in archive2.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_str() == Some("manifest.toml") {
+                let mut content = String::new();
+                use std::io::Read;
+                entry.read_to_string(&mut content).unwrap();
+                assert!(content.contains("format_version = \"tr/3.3\""));
+                return;
+            }
+        }
+        panic!("manifest.toml not found");
     }
 }

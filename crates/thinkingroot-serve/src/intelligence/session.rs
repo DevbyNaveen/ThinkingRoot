@@ -64,6 +64,20 @@ pub struct SessionContext {
     /// Observer's `ChatTurn.turn_number` is a meaningful ordinal even
     /// for read-only sessions that never write claims.
     pub chat_turn_count: u64,
+    /// Phase B.1 (2026-05-17): the user's first message in this
+    /// session. Drives topic-branch titling — when
+    /// `maintenance::cleanup_once` auto-merges the stream branch
+    /// into a `topic/*` Feature branch, the first user message is
+    /// propagated onto the topic branch's `description` so the UI
+    /// surfaces a meaningful human-readable title without paying
+    /// for an LLM summarisation pass.
+    ///
+    /// Set exactly once per session via
+    /// [`SessionContext::set_first_user_message_if_unset`]; subsequent
+    /// turns leave it unchanged. Persisted on the active stream
+    /// branch's `description` field at first-message receipt so it
+    /// survives session eviction.
+    pub first_user_message: Option<String>,
     created_at: Instant,
     last_active: Instant,
 }
@@ -83,9 +97,45 @@ impl SessionContext {
             token_budget: DEFAULT_TOKEN_BUDGET,
             turn_count: 0,
             chat_turn_count: 0,
+            first_user_message: None,
             created_at: now,
             last_active: now,
         }
+    }
+
+    /// Phase B.1 (2026-05-17): record the user's first message in
+    /// this session if not already set. Returns `Some(stored_msg)`
+    /// when the call actually set the field (caller should persist
+    /// onto the stream branch description); `None` when a prior turn
+    /// already set it (idempotent no-op).
+    ///
+    /// Trims whitespace and rejects empty input (treats as no-op).
+    /// Caps the stored message at 256 chars to keep `branches.toml`
+    /// bounded — the description is a human-readable title, not a
+    /// full transcript copy.
+    pub fn set_first_user_message_if_unset(&mut self, msg: &str) -> Option<String> {
+        self.last_active = Instant::now();
+        if self.first_user_message.is_some() {
+            return None;
+        }
+        let trimmed = msg.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        const MAX_LEN: usize = 256;
+        let stored: String = if trimmed.chars().count() > MAX_LEN {
+            // Take first MAX_LEN chars (not bytes — avoid splitting a
+            // UTF-8 codepoint) and append an ellipsis marker. Char
+            // boundaries are O(MAX_LEN) which is fine for a one-shot
+            // per session.
+            let mut s: String = trimmed.chars().take(MAX_LEN).collect();
+            s.push('…');
+            s
+        } else {
+            trimmed.to_string()
+        };
+        self.first_user_message = Some(stored.clone());
+        Some(stored)
     }
 
     /// Allocate the next chat-turn ordinal. Bumps `chat_turn_count`
@@ -264,6 +314,95 @@ mod tests {
         let mut s = SessionContext::new("sess-1", "my-ws");
         s.deduct_tokens(DEFAULT_TOKEN_BUDGET + 1000);
         assert_eq!(s.token_budget, 0);
+    }
+
+    #[test]
+    fn set_first_user_message_records_on_first_call() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        assert!(s.first_user_message.is_none());
+        let returned = s.set_first_user_message_if_unset("How does the auth system work?");
+        assert_eq!(returned.as_deref(), Some("How does the auth system work?"));
+        assert_eq!(
+            s.first_user_message.as_deref(),
+            Some("How does the auth system work?")
+        );
+    }
+
+    #[test]
+    fn set_first_user_message_is_idempotent() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        assert!(s
+            .set_first_user_message_if_unset("First message")
+            .is_some());
+        // Subsequent calls must NOT overwrite. Returning None signals
+        // "already set" so the caller doesn't redundantly hit the
+        // branch registry.
+        let returned = s.set_first_user_message_if_unset("Second message");
+        assert!(returned.is_none(), "must not overwrite an existing value");
+        assert_eq!(
+            s.first_user_message.as_deref(),
+            Some("First message"),
+            "stored value must be the first call's input"
+        );
+    }
+
+    #[test]
+    fn set_first_user_message_rejects_empty_and_whitespace() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        assert!(s.set_first_user_message_if_unset("").is_none());
+        assert!(s.first_user_message.is_none(), "empty input is a no-op");
+        assert!(s.set_first_user_message_if_unset("   \t\n  ").is_none());
+        assert!(
+            s.first_user_message.is_none(),
+            "whitespace-only input is a no-op"
+        );
+        // After two rejected attempts, a valid message still takes.
+        let returned = s.set_first_user_message_if_unset("Real question?");
+        assert_eq!(returned.as_deref(), Some("Real question?"));
+    }
+
+    #[test]
+    fn set_first_user_message_truncates_long_input() {
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        // 300-char string of all 'a' — exceeds the 256-char MAX_LEN cap.
+        let long: String = "a".repeat(300);
+        let returned = s
+            .set_first_user_message_if_unset(&long)
+            .expect("non-empty input must store something");
+        // Truncated to 256 chars + the ellipsis marker.
+        assert_eq!(
+            returned.chars().count(),
+            257,
+            "truncated value = MAX_LEN chars + 1 ellipsis char"
+        );
+        assert!(
+            returned.ends_with('…'),
+            "truncation marker must be the trailing ellipsis"
+        );
+    }
+
+    #[test]
+    fn set_first_user_message_handles_utf8_codepoints() {
+        // Regression guard: truncation MUST cut on char boundaries,
+        // not byte boundaries — splitting a multi-byte UTF-8 char
+        // would corrupt branches.toml on disk.
+        let mut s = SessionContext::new("sess-1", "my-ws");
+        // 200 multi-byte chars — well under the 256 char cap, but
+        // would exceed many naive byte-based caps (each char is 2-3
+        // bytes).
+        let msg: String = "你".repeat(200);
+        let returned = s
+            .set_first_user_message_if_unset(&msg)
+            .expect("non-empty input must store something");
+        assert_eq!(
+            returned.chars().count(),
+            200,
+            "200 chars are under the cap, no truncation"
+        );
+        assert!(
+            std::str::from_utf8(returned.as_bytes()).is_ok(),
+            "stored value must be valid UTF-8 — no codepoint split"
+        );
     }
 
     #[test]

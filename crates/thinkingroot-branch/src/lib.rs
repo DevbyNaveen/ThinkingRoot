@@ -238,6 +238,25 @@ pub fn set_branch_redaction(
     registry.set_redaction(name, policy)
 }
 
+/// Phase B.1 (2026-05-17): update the human-readable `description`
+/// on an existing branch and persist. `None` clears the description.
+///
+/// Drives the topic-branch title flow — the first user message of a
+/// chat session is persisted on the stream branch's description, and
+/// `maintenance::cleanup_once` propagates that description onto the
+/// auto-created topic branch at merge time so the UI can surface a
+/// meaningful title without paying for an LLM summarisation pass in
+/// the background cleanup task.
+pub fn set_branch_description(
+    root_path: &Path,
+    name: &str,
+    description: Option<String>,
+) -> Result<BranchRef> {
+    let refs_dir = root_path.join(".thinkingroot-refs");
+    let mut registry = branch::BranchRegistry::load_or_create(&refs_dir)?;
+    registry.set_description(name, description)
+}
+
 /// List all active branches for a workspace.
 pub fn list_branches(root_path: &Path) -> Result<Vec<BranchRef>> {
     let refs_dir = root_path.join(".thinkingroot-refs");

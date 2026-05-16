@@ -1,18 +1,35 @@
 import { useEffect, useState } from "react";
-import { FileText, FlaskConical, FolderClosed, MessageSquareText } from "lucide-react";
+import {
+  Activity,
+  FileText,
+  FlaskConical,
+  FolderClosed,
+  GitCommit,
+  GitMerge,
+  MessageSquareText,
+} from "lucide-react";
 
 import { useApp } from "@/store/app";
 import { ChatView } from "@/components/chat/ChatView";
+import { CommitDAGView } from "@/components/playground/CommitDAGView";
 import { DropZone } from "@/components/playground/DropZone";
 import { FileManager } from "@/components/playground/FileManager";
+import { MergeView } from "@/components/playground/MergeView";
 import { PaperPanel } from "@/components/playground/PaperPanel";
 import { PlaygroundActions } from "@/components/playground/PlaygroundActions";
 import { SourceDetailPanel } from "@/components/playground/SourceDetailPanel";
 import { SourceLibrary } from "@/components/playground/SourceLibrary";
+import { SubstrateBusView } from "@/components/playground/SubstrateBusView";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSource } from "@/lib/tauri";
 
-type PlaygroundTab = "paper" | "chat" | "files";
+type PlaygroundTab =
+  | "paper"
+  | "chat"
+  | "files"
+  | "commits"
+  | "merge"
+  | "bus";
 
 /**
  * Playground surface — the researcher / student-facing workspace
@@ -100,12 +117,39 @@ export function PlaygroundView() {
               icon={<MessageSquareText className="size-3.5" />}
               label="Chat"
             />
+            <TabButton
+              active={tab === "commits"}
+              onClick={() => setTab("commits")}
+              icon={<GitCommit className="size-3.5" />}
+              label="Commits"
+            />
+            <TabButton
+              active={tab === "merge"}
+              onClick={() => setTab("merge")}
+              icon={<GitMerge className="size-3.5" />}
+              label="Merge"
+            />
+            <TabButton
+              active={tab === "bus"}
+              onClick={() => setTab("bus")}
+              icon={<Activity className="size-3.5" />}
+              label="Bus"
+            />
           </div>
           <div className="flex flex-1 overflow-hidden">
             {tab === "paper" ? (
               <PaperPanel workspace={workspace} refreshNonce={refreshNonce} />
             ) : tab === "files" ? (
               <FileManager workspace={workspace} refreshNonce={refreshNonce} />
+            ) : tab === "commits" ? (
+              <CommitDAGView
+                workspace={workspace}
+                refreshNonce={refreshNonce}
+              />
+            ) : tab === "merge" ? (
+              <MergeView workspace={workspace} />
+            ) : tab === "bus" ? (
+              <SubstrateBusView workspace={workspace} />
             ) : (
               <ChatView />
             )}

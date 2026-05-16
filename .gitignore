@@ -80,7 +80,6 @@ apps/thinkingroot-desktop/src-tauri/binaries/*
 .superpowers/
 .research/
 CLAUDE.md
-AGENTS.md
 openclawResearch/
 
 # Internal design docs, specs, planning (business strategy, pricing, roadmap details)
@@ -124,4 +123,3 @@ target/wasm32-unknown-unknown/
 # Benchmarks & Evaluation
 longmemeval-workspace/
 longmemeval-data/
-

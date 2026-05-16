@@ -106,9 +106,82 @@ fn resolve_workspace_arg_with<F: Fn(&str) -> bool>(
     }
 }
 
+/// Phase ε.1 — Long-tail MCP tools.
+///
+/// Tools listed here are TAGGED with `defer_loading: true` in the
+/// `tools/list` response. The tag is an annotation, not a filter:
+/// every tool is still advertised, but Anthropic-style clients (and
+/// the new `tool_search` MCP tool below) treat the annotation as
+/// "load the descriptor on demand, not upfront" — Anthropic's
+/// published context-saving pattern.
+///
+/// Selection criteria:
+///   - **Branch maintenance** (rebase / rollback / gc / abandon /
+///     delete / diff): user runs at most one per session.
+///   - **Engram lifecycle** (materialize / probe / list / expire):
+///     specialised RARP surface, rarely used in standard chat.
+///   - **Reflection** (reflect / reflect_across / rooting_report):
+///     analytical surfaces, not part of a typical answer loop.
+///   - **Proposal lifecycle** (open / list / review / close /
+///     dismiss_gap): the workflow gets pulled in when the user
+///     opens the proposals panel, not on every chat turn.
+///
+/// Tools that DON'T appear here stay loaded by default — `search`,
+/// `query_claims`, `list_witnesses`, `ask`, `compile`, `hybrid_retrieve`,
+/// `list_commits`, `merge_cognition`, `commit_cognition`, etc.
+pub const DEFER_LOADING_TOOLS: &[&str] = &[
+    "rebase_branch",
+    "rollback_merge",
+    "gc_branches",
+    "delete_branch",
+    "diff_branch",
+    "materialize_engram",
+    "probe_engram",
+    "list_engrams",
+    "expire_engram",
+    "reflect",
+    "reflect_across",
+    "rooting_report",
+    "open_proposal",
+    "list_proposals",
+    "review_proposal",
+    "close_proposal",
+    "dismiss_gap",
+    "contribute_bulk",
+    "walk_mesh",
+    "query_rooted",
+];
+
+/// Annotate every tool whose name appears in `DEFER_LOADING_TOOLS`
+/// with `defer_loading: true`. Mutates the array in place. The
+/// annotation is added as a JSON field on each tool descriptor;
+/// MCP clients that don't understand the field ignore it (the JSON
+/// schema for `tools/list` is permissive — additional fields are
+/// allowed).
+fn annotate_defer_loading(tools: &mut serde_json::Value) {
+    let arr = match tools.as_array_mut() {
+        Some(a) => a,
+        None => return,
+    };
+    let deferred: std::collections::HashSet<&str> =
+        DEFER_LOADING_TOOLS.iter().copied().collect();
+    for tool in arr.iter_mut() {
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(name) = name
+            && deferred.contains(name.as_str())
+            && let Some(obj) = tool.as_object_mut()
+        {
+            obj.insert("defer_loading".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+}
+
 #[tracing::instrument(name = "mcp.tools.list", skip_all)]
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
-    let tools = serde_json::json!({
+    let mut tools = serde_json::json!({
         "tools": [
             // ── Classic CRUD tools ────────────────────────────────────────
             {
@@ -151,6 +224,57 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                         "limit":     { "type": "integer", "default": 100, "description": "Max Witnesses to return. Default 100. No upper bound — the substrate fits in memory for v1.0 workspaces." }
                     },
                     "required": ["workspace"]
+                }
+            },
+            {
+                "name": "fs_list",
+                "description": "List the contents of a workspace folder. Returns directory entries (name, rel_path, is_dir, size_bytes, modified, kind) plus the parent rel_path so an agent can walk the tree. Hides the engine-managed `.thinkingroot/` directory from results. Use this before `fs_move` / `fs_rename` so the agent has accurate names to operate on. Distinct from the legacy `list_directory` Playground verb — `fs_list` is the canonical workspace-FS surface.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "rel":       { "type": "string", "description": "Optional sub-folder relative to the workspace root, forward-slash separated (e.g. `inbox` or `inbox/drafts`). Omit / empty for the workspace root." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "fs_create_folder",
+                "description": "Create a new empty directory inside a workspace. The parent must already exist. Refuses collisions (existing path → error). Returns the new rel_path on success.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":  { "type": "string", "description": "Workspace name." },
+                        "parent_rel": { "type": "string", "description": "Parent directory rel_path. Empty string = workspace root." },
+                        "name":       { "type": "string", "description": "New folder name. Must be a single path segment (no `/`, no `..`, not empty)." }
+                    },
+                    "required": ["workspace", "parent_rel", "name"]
+                }
+            },
+            {
+                "name": "fs_rename",
+                "description": "Rename a file or folder in-place (keeps its parent directory). `rel` points to the existing item; `new_name` is the new leaf name. Refuses to rename the workspace root or anything inside `.thinkingroot/`. Refuses collisions. Returns the new rel_path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "rel":       { "type": "string", "description": "Existing item's rel_path." },
+                        "new_name":  { "type": "string", "description": "New leaf name. Single path segment, no separators." }
+                    },
+                    "required": ["workspace", "rel", "new_name"]
+                }
+            },
+            {
+                "name": "fs_move",
+                "description": "Move one or more files/folders into a single destination folder within the same workspace. Skips collisions honestly (counts them as `skipped_conflict` — silent overwrite is the kind of 'helpful' that loses work). Refuses to move a folder into its own descendant. Refuses to touch `.thinkingroot/` state. Returns `{ moved, skipped_conflict, skipped_invalid, moved_rel_paths }` so the agent can report accurately. Use this when the user says 'put folder X inside folder Y'. For per-file rename-on-move pairs, the legacy `organize_files` verb is also available.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string", "description": "Workspace name." },
+                        "sources":     { "type": "array", "items": { "type": "string" }, "description": "Rel_paths to move." },
+                        "dest_folder": { "type": "string", "description": "Destination folder rel_path. Empty string = workspace root." }
+                    },
+                    "required": ["workspace", "sources", "dest_folder"]
                 }
             },
             {
@@ -668,6 +792,161 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": ["pointer", "workspace"]
                 }
             },
+            // ── Phase α — Playground action verbs ────────────────────
+            // Give external agents (Claude Code, Cursor, Codex) the
+            // same write power the in-app Brain chat has, routed
+            // through `intelligence::playground_tools`. Design doc:
+            // docs/2026-05-15-cognition-commits-design.md.
+            {
+                "name": "save_note",
+                "description": "Save a markdown body as a note under <workspace>/notes/<slug>-<date>.md with YAML frontmatter (title, created_at, kind=chat-note). Use this to persist a synthesised reply, a meeting summary, or any AI-authored markdown into the workspace so the next compile picks it up as a source. Refuses to overwrite an existing same-day note — surfaces `created: false` so you can retry with a different title.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name from the mount config." },
+                        "title":     { "type": "string", "description": "Short human-readable title. Becomes the slug + YAML frontmatter title. Non-alphanumeric chars collapse to '-'." },
+                        "body":      { "type": "string", "description": "Markdown body. Citation chips ([[witness:<id>]]) are honoured by the next compile pass." }
+                    },
+                    "required": ["workspace", "title", "body"]
+                }
+            },
+            {
+                "name": "regenerate_paper",
+                "description": "Re-synthesize the Living Paper (`<workspace>/.thinkingroot/paper.md`) against the current Witness Mesh state. Cheap relative to `compile` — no parse/extract/ground passes, just the synthesizer + (when an LLM is configured) the AI-narrative sections. Use after the user adds a few notes or witnesses and wants the paper refreshed without paying the cost of a full compile. Returns `{ path, byte_length, sections }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "ingest_path",
+                "description": "Copy files from an absolute host path into the workspace's `inbox/` directory. When `source_path` is a single file, copies it. When it is a directory, copies every non-hidden top-level regular file (no recursion). Does NOT trigger a compile — call the `compile` tool next when you want the Witness Mesh refreshed. Same-name files are skipped (no overwrite); honest counts surfaced as copied / skipped_duplicate / skipped_unreadable.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string", "description": "Workspace name. The workspace's `inbox/` is the destination." },
+                        "source_path": { "type": "string", "description": "Absolute path on the user's machine (e.g. /Users/alice/Desktop/papers/ or /tmp/notes.md). Relative paths are refused." }
+                    },
+                    "required": ["workspace", "source_path"]
+                }
+            },
+            {
+                "name": "list_directory",
+                "description": "List the immediate children of a workspace-relative directory. Hidden dotfiles are filtered. Folders sort first, then files, alphabetical within each group. Use as a substrate-aware `ls` when you need to know what's under `notes/`, `sources/`, `inbox/` etc. before deciding what to organize / trash / ingest. Read-only. Returns `{ rel_path, parent_rel_path, entries: [{ name, rel_path, is_dir, size_bytes }] }`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "rel_path":  { "type": "string", "description": "Directory to list, workspace-relative. Empty / omitted lists the workspace root. Forward slashes regardless of OS." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "organize_files",
+                "description": "Batch rename/move files within a workspace. Each op `{from, to}` is workspace-relative; both paths are validated to stay inside the workspace root. Atomic `rename(2)` per op — conflicts (target exists, source missing, path escape, would-move-folder-into-itself) are skipped with honest counts. Missing intermediate destination dirs are auto-created. Cross-filesystem moves are not attempted; use `ingest_path` + `trash_files` for that.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "ops": {
+                            "type": "array",
+                            "description": "Move operations. Order is preserved; each op is applied in turn so a later op can target a path a previous op just produced.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from": { "type": "string", "description": "Existing source path, workspace-relative." },
+                                    "to":   { "type": "string", "description": "Destination path, workspace-relative. Missing parent directories are created." }
+                                },
+                                "required": ["from", "to"]
+                            }
+                        }
+                    },
+                    "required": ["workspace", "ops"]
+                }
+            },
+            {
+                "name": "trash_files",
+                "description": "Move files into `<workspace>/.thinkingroot/trash/<unix-ts>-<name>`. Reversible by manually moving back; the next compile won't re-extract trashed items because `.thinkingroot/` is walker-ignored. Refuses to trash anything inside `.thinkingroot/` itself. Use when the user says \"delete that note\" or \"clean up the inbox\" — never let the agent invoke raw filesystem removal.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "rel_paths": {
+                            "type": "array",
+                            "description": "Workspace-relative paths to trash.",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["workspace", "rel_paths"]
+                }
+            },
+            // ── Phase β.1 — Cognition Commits ────────────────────────
+            {
+                "name": "commit_cognition",
+                "description": "Record one cognition event against a workspace branch as a content-addressed commit. The commit id is BLAKE3-derived from (parent, branch, author, prompt, reasoning, witnesses_added, citations, gaps_surfaced) — same inputs always produce the same id. Cited / added witnesses MUST exist in the workspace; fabricated references are rejected. Use this once per agent turn that produced an observable cognitive change: a note saved, a paper regenerated, an argument made, a gap surfaced. The chat history IS the commit DAG.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":       { "type": "string", "description": "Workspace name." },
+                        "branch":          { "type": "string", "description": "Branch this commit belongs to. Joins against branches.toml; create the branch first via `create_branch` if it doesn't exist." },
+                        "parent_id":       { "type": "string", "description": "64-char lower-hex parent commit id. Omit (or pass empty) ONLY for the very first commit on a branch — every subsequent commit must thread back to a parent on the SAME branch." },
+                        "author_kind":     { "type": "string", "enum": ["user", "agent"], "description": "Who emitted this commit." },
+                        "author_id":       { "type": "string", "description": "User id (for kind=user) or agent principal (for kind=agent, e.g. `thinkingroot`)." },
+                        "author_model":    { "type": "string", "description": "Model name for kind=agent (e.g. `claude-opus-4-7`). Empty for kind=user." },
+                        "prompt":          { "type": "string", "description": "User prompt or system-event description that produced this commit. Empty for the genesis commit of a branch." },
+                        "reasoning":       { "type": "string", "description": "AI's reasoning text or structured-event description. Citation chips ([[witness:<id>]]) supported." },
+                        "witnesses_added": { "type": "array", "items": { "type": "string" }, "description": "64-char hex witness ids this commit produced (e.g. comment claims, observation rows). Empty for read-only commits." },
+                        "citations":       { "type": "array", "items": { "type": "string" }, "description": "64-char hex witness ids cited in reasoning. EVERY id must resolve to an existing witness in this workspace." },
+                        "gaps_surfaced":   { "type": "array", "items": { "type": "string" }, "description": "Known-unknown gap_ids (from the `gaps` tool) this commit raised. Empty when the agent didn't flag any." }
+                    },
+                    "required": ["workspace", "branch", "author_kind", "author_id"]
+                }
+            },
+            {
+                "name": "list_commits",
+                "description": "List cognition commits on a branch, newest first. Returns the full CognitionCommit shape (id, parent, branch, author, prompt, reasoning, witnesses_added, citations, gaps_surfaced, created_at). Use this to render the chat-as-commit-DAG view, diff cognitions across time, or walk the parent chain to replay how an argument evolved.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace": { "type": "string", "description": "Workspace name." },
+                        "branch":    { "type": "string", "description": "Branch to list. Defaults to `main` if omitted." },
+                        "limit":     { "type": "integer", "minimum": 1, "description": "Max commits to return. Omit for all." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            // ── Phase γ.2 — Merge Synthesis (LLM-driven) ──────────────
+            {
+                "name": "synthesize_merge",
+                "description": "Generate an LLM-written synthesis of a deterministic merge plan between two cognition-commit branches. Returns the plan PLUS the LLM's reasoning paragraph with citation markers `[[witness:<id>]]`. Citation honesty is enforced: the response's `verified_citations` only contains witness ids the plan actually surfaced; any fabricated ids the LLM produced are reported in `dropped_citations` and excluded. Pure read — does NOT record a commit. Trivial plans (identical / ahead) short-circuit without an LLM call. Use this when the user asks to merge two branches and you want grounded synthesis.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":    { "type": "string", "description": "Workspace name." },
+                        "left_branch":  { "type": "string", "description": "Branch treated as the 'left' side (typically the destination, e.g. `main`)." },
+                        "right_branch": { "type": "string", "description": "Branch treated as the 'right' side (typically the topic / candidate being merged in)." }
+                    },
+                    "required": ["workspace", "left_branch", "right_branch"]
+                }
+            },
+            // ── Phase γ.1 — Merge Cognition ──────────────────────────
+            {
+                "name": "merge_cognition",
+                "description": "Compute a deterministic merge plan between two cognition-commit branches. Returns the divergence classification (identical / left_ahead / right_ahead / diverged / no_common_history), the lowest common ancestor when present, the commit ids unique to each side, and the partitioned witness-id sets each side cited or added since the LCA. This is the substrate γ.1 ship — pure DAG walk + set classification, no LLM. γ.2 will feed this plan to a model to synthesize a merge commit; γ.3 will render it as a conflict-resolution view. Use it now when you want a precise, replayable picture of what differs between two thinking-branches.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":    { "type": "string", "description": "Workspace name." },
+                        "left_branch":  { "type": "string", "description": "Branch name treated as the 'left' side of the merge — convention is the destination branch (e.g. `main`)." },
+                        "right_branch": { "type": "string", "description": "Branch name treated as the 'right' side — convention is the candidate / topic branch being merged in." }
+                    },
+                    "required": ["workspace", "left_branch", "right_branch"]
+                }
+            },
             {
                 "name": "hybrid_retrieve",
                 "description": "Top-tier retrieval over the 33-table substrate: vector recall + Datalog filters + per-row BLAKE3 verification + 11-component score fusion. Returns ranked hits with full provenance (byte spans, source authority, admission tier, trial scores, certificate_hash, derivation lineage) plus typed caveats (stale, contradicted, superseded, test-derived, gap-adjacent, redacted, low-confidence, quarantined, bytes-unavailable). Use when the user wants the BEST evidence for a question and you need verifiable provenance — e.g. before answering a precise factual question, or when grounding a write. Prefer `search` for fuzzy exploration and `query_claims` for filtered list queries. Set `scoring_profile: 'compliance'` for legal/audit (rooted-tier only, doubled penalties).",
@@ -689,10 +968,107 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["workspace", "session_id"]
                 }
+            },
+            // ── Phase ε.1 — Tool Search Tool ──────────────────────────
+            // Anthropic-style pattern: a meta-tool that lets a client
+            // discover deferred tools on demand instead of preloading
+            // every descriptor into context. Matches the "Tool Search
+            // Tool" idiom from the published 85%-context-savings
+            // experiment.
+            {
+                "name": "tool_search",
+                "description": "Search the workspace's MCP tool catalog by name or description substring. Returns full descriptors (including `defer_loading: true` tools) so an AI can pull in a long-tail tool's schema on demand instead of preloading every tool's JSON into context at session start. Use when the user mentions an operation and you suspect there's a specialized tool for it (e.g. 'rebase the branch', 'expire that engram', 'open a proposal').",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query":              { "type": "string", "description": "Substring matched against tool name and description (case-insensitive). Empty string returns every tool — useful as 'show me what's available'." },
+                        "include_non_deferred": { "type": "boolean", "default": true, "description": "When true (default) the result includes always-loaded tools too; when false only `defer_loading: true` tools are returned. Default is permissive so a client can use this as a single search surface." },
+                        "limit":              { "type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Max tool descriptors to return. Default 20 fits the typical 'find me a tool to do X' use case without bloating the response." }
+                    },
+                    "required": []
+                }
             }
         ]
     });
+    if let Some(arr) = tools.get_mut("tools") {
+        annotate_defer_loading(arr);
+    }
     JsonRpcResponse::success(id, tools)
+}
+
+/// Phase ε.1 — `tool_search` handler.
+///
+/// Returns matching tool descriptors. Independent of `handle_list`'s
+/// JSON construction — we re-fetch the full list (cheap; the JSON
+/// is built every call anyway and the array is a few KB) and filter
+/// in-Rust. Filtering on the wire keeps the protocol simple: clients
+/// don't need to maintain a local catalog.
+pub async fn handle_tool_search(
+    id: Option<Value>,
+    arguments: &Value,
+) -> JsonRpcResponse {
+    let query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let include_non_deferred = arguments
+        .get("include_non_deferred")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 100) as usize)
+        .unwrap_or(20);
+
+    // Reuse the canonical list — same source of truth as the
+    // production tools/list endpoint, including the defer_loading
+    // annotation pass.
+    let full = handle_list(None).await;
+    let result = match full.result {
+        Some(v) => v,
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32603,
+                "tool_search: tools/list returned no result".to_string(),
+            );
+        }
+    };
+    let arr = result
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut matches: Vec<Value> = Vec::new();
+    for tool in arr {
+        let is_deferred = tool
+            .get("defer_loading")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !is_deferred && !include_non_deferred {
+            continue;
+        }
+        let name = tool
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let desc = tool
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if query.is_empty() || name.contains(&query) || desc.contains(&query) {
+            matches.push(tool);
+        }
+        if matches.len() >= limit {
+            break;
+        }
+    }
+    mcp_text_result(id, &serde_json::json!({ "tools": matches }))
 }
 
 #[tracing::instrument(
@@ -2031,7 +2407,437 @@ pub async fn handle_call(
         "observe_turn" => handle_observe_turn(id, &arguments, engine).await,
         "flush_observations" => handle_flush_observations(id, &arguments, engine, ws).await,
 
+        // ── Phase α Playground action verbs ───────────────────────────
+        // See docs/2026-05-15-cognition-commits-design.md.
+        // Backing helpers in `intelligence::playground_tools` — same
+        // helpers the in-app ToolRegistry uses, so MCP and native
+        // function-calling produce byte-equivalent results.
+        "save_note" => handle_save_note(id, &arguments, engine, ws).await,
+        "regenerate_paper" => handle_regenerate_paper(id, engine, ws).await,
+        "ingest_path" => handle_ingest_path(id, &arguments, engine, ws).await,
+        "list_directory" => handle_list_directory(id, &arguments, engine, ws).await,
+        "organize_files" => handle_organize_files(id, &arguments, engine, ws).await,
+        "trash_files" => handle_trash_files(id, &arguments, engine, ws).await,
+
+        // ── Phase β.1 Cognition Commits ───────────────────────────────
+        "commit_cognition" => handle_commit_cognition(id, &arguments, engine, ws).await,
+        "list_commits" => handle_list_commits(id, &arguments, engine, ws).await,
+        "merge_cognition" => handle_merge_cognition(id, &arguments, engine, ws).await,
+        "synthesize_merge" => handle_synthesize_merge(id, &arguments, engine, ws).await,
+        // ── Phase ε.1 — Tool Search ───────────────────────────────────
+        // No workspace needed — the `ws` resolved earlier is harmless
+        // because the handler ignores it. Meta-tool that returns
+        // matching tool descriptors so the client can discover
+        // `defer_loading: true` tools on demand without preloading.
+        "tool_search" => handle_tool_search(id, &arguments).await,
+
+        // ── Workspace filesystem operations ──────────────────────────
+        // Same primitives the desktop FileManager uses. Workspace root
+        // is resolved via `engine.workspace_root_path(ws)`; the actual
+        // file ops live in `crate::fs_ops` (workspace-scoped, with
+        // symlink + `..`-escape defences + `.thinkingroot/` refusal).
+        // `fs_*` prefix keeps these distinct from the older Playground
+        // action verbs (`list_directory`, `organize_files`,
+        // `trash_files`).
+        "fs_list" => handle_fs_list(id, &arguments, engine, ws).await,
+        "fs_create_folder" => handle_fs_create_folder(id, &arguments, engine, ws).await,
+        "fs_rename" => handle_fs_rename(id, &arguments, engine, ws).await,
+        "fs_move" => handle_fs_move(id, &arguments, engine, ws).await,
+
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+    }
+}
+
+// ─── Phase α Playground action verb MCP handlers ─────────────────────
+//
+// Three thin handlers — each one validates arguments, delegates to the
+// matching `playground_tools::*_impl` helper, and wraps the outcome in
+// `mcp_text_result`. The helpers are the single source of truth for
+// the side-effecting logic.
+
+async fn handle_save_note(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let title = match arguments.get("title").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "save_note: missing required `title`".to_string(),
+            );
+        }
+    };
+    let body = match arguments.get("body").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "save_note: missing required `body`".to_string(),
+            );
+        }
+    };
+    match crate::intelligence::playground_tools::save_note_impl(engine, ws, title, body).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+async fn handle_regenerate_paper(
+    id: Option<Value>,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    match crate::intelligence::playground_tools::regenerate_paper_impl(engine, ws).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+async fn handle_ingest_path(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let source_path = match arguments.get("source_path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "ingest_path: missing required `source_path`".to_string(),
+            );
+        }
+    };
+    match crate::intelligence::playground_tools::ingest_path_impl(engine, ws, source_path).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+async fn handle_list_directory(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let rel_path = arguments
+        .get("rel_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match crate::intelligence::playground_tools::list_directory_impl(engine, ws, rel_path).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+async fn handle_organize_files(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let ops_raw = match arguments.get("ops").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "organize_files: missing required `ops` (array)".to_string(),
+            );
+        }
+    };
+    let mut ops: Vec<crate::intelligence::playground_tools::OrganizeOp> =
+        Vec::with_capacity(ops_raw.len());
+    for v in ops_raw {
+        match serde_json::from_value::<crate::intelligence::playground_tools::OrganizeOp>(v) {
+            Ok(op) => ops.push(op),
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("organize_files: invalid op shape: {e}"),
+                );
+            }
+        }
+    }
+    match crate::intelligence::playground_tools::organize_files_impl(engine, ws, ops).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+async fn handle_trash_files(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let rel_paths: Vec<String> = match arguments.get("rel_paths").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "trash_files: missing required `rel_paths` (array of strings)".to_string(),
+            );
+        }
+    };
+    if rel_paths.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "trash_files: `rel_paths` must not be empty".to_string(),
+        );
+    }
+    match crate::intelligence::playground_tools::trash_files_impl(engine, ws, rel_paths).await {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => JsonRpcResponse::error(id, -32603, e),
+    }
+}
+
+// ─── Phase β.1 Cognition Commits MCP handlers ─────────────────────
+//
+// `commit_cognition` records one cognition event against a workspace
+// branch. Citations are verified against the live `witnesses` table
+// by `GraphStore::insert_cognition_commit` — fabricated references
+// are surfaced as `-32603` errors with the offending id in the
+// message so the calling agent can recover honestly.
+//
+// `list_commits` returns the branch's commit DAG newest-first. The
+// reply is the full `CognitionCommit` shape — citation chips, gaps,
+// parent pointer — so the client can render a chat-as-commit-DAG
+// view without follow-up round trips.
+
+async fn handle_commit_cognition(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    use thinkingroot_core::types::{CognitionCommit, CommitAuthor, CommitId};
+
+    let branch = match arguments.get("branch").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "commit_cognition: missing required `branch`".to_string(),
+            );
+        }
+    };
+    let prompt = arguments
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reasoning = arguments
+        .get("reasoning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let parent = match arguments.get("parent_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => match CommitId::from_hex(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("commit_cognition: invalid parent_id `{s}`: {e}"),
+                );
+            }
+        },
+        _ => None,
+    };
+
+    let author = match (
+        arguments.get("author_kind").and_then(|v| v.as_str()),
+        arguments.get("author_id").and_then(|v| v.as_str()),
+    ) {
+        (Some("user"), Some(uid)) => CommitAuthor::User {
+            id: uid.to_string(),
+        },
+        (Some("agent"), Some(principal)) => {
+            let model = arguments
+                .get("author_model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            CommitAuthor::Agent {
+                model,
+                principal: principal.to_string(),
+            }
+        }
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "commit_cognition: `author_kind` must be 'user' or 'agent' and `author_id` is required".to_string(),
+            );
+        }
+    };
+
+    let witnesses_added = match crate::intelligence::playground_tools::parse_witness_ids(
+        arguments.get("witnesses_added"),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("commit_cognition: witnesses_added: {e}"),
+            );
+        }
+    };
+    let citations = match crate::intelligence::playground_tools::parse_witness_ids(
+        arguments.get("citations"),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("commit_cognition: citations: {e}"),
+            );
+        }
+    };
+    let gaps_surfaced: Vec<String> = arguments
+        .get("gaps_surfaced")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let commit = CognitionCommit::new(
+        parent,
+        branch,
+        author,
+        prompt,
+        reasoning,
+        witnesses_added,
+        citations,
+        gaps_surfaced,
+        chrono::Utc::now(),
+    );
+
+    match engine.commit_cognition(ws, &commit).await {
+        Ok(()) => mcp_text_result(id, &commit),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("commit_cognition: {e}")),
+    }
+}
+
+async fn handle_list_commits(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let branch = arguments
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("main")
+        .to_string();
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
+    match engine.list_cognition_commits(ws, &branch, limit).await {
+        Ok(commits) => mcp_text_result(id, &commits),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("list_commits: {e}")),
+    }
+}
+
+/// Phase γ.1 — `merge_cognition` MCP tool.
+///
+/// Compute a deterministic merge plan between two cognition-commit
+/// branches. Pure read, no commit recorded. The response shape is
+/// the full `MergePlan` serialized as JSON; agents inspect
+/// `conflict_kind` to decide whether synthesis is needed (γ.2 future
+/// work) or whether the merge is trivially resolvable.
+async fn handle_merge_cognition(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let left_branch = match arguments.get("left_branch").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "merge_cognition: missing required `left_branch`".to_string(),
+            );
+        }
+    };
+    let right_branch = match arguments.get("right_branch").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "merge_cognition: missing required `right_branch`".to_string(),
+            );
+        }
+    };
+
+    match engine
+        .compute_merge_plan(ws, &left_branch, &right_branch)
+        .await
+    {
+        Ok(plan) => mcp_text_result(id, &plan),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("merge_cognition: {e}")),
+    }
+}
+
+/// Phase γ.2 — `synthesize_merge` MCP tool.
+async fn handle_synthesize_merge(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let left_branch = match arguments.get("left_branch").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "synthesize_merge: missing required `left_branch`".to_string(),
+            );
+        }
+    };
+    let right_branch = match arguments.get("right_branch").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "synthesize_merge: missing required `right_branch`".to_string(),
+            );
+        }
+    };
+
+    match engine
+        .synthesize_merge(ws, &left_branch, &right_branch)
+        .await
+    {
+        Ok(synthesis) => mcp_text_result(id, &synthesis),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("synthesize_merge: {e}")),
     }
 }
 
@@ -2818,6 +3624,179 @@ pub fn parse_probe_kind_str(s: &str) -> Option<crate::intelligence::engram::Prob
 }
 
 #[cfg(test)]
+mod defer_loading_tests {
+    use super::{handle_list, handle_tool_search, DEFER_LOADING_TOOLS};
+
+    #[tokio::test]
+    async fn long_tail_tools_carry_defer_loading_flag() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        // Every name in DEFER_LOADING_TOOLS that's actually advertised
+        // must carry `defer_loading: true`. (A name in the constant
+        // that isn't in the catalog is fine — the annotation pass is
+        // forgiving — so we filter to advertised names first.)
+        let by_name: std::collections::HashMap<String, &serde_json::Value> = tools
+            .iter()
+            .filter_map(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| (n.to_string(), t))
+            })
+            .collect();
+        for &deferred in DEFER_LOADING_TOOLS {
+            if let Some(tool) = by_name.get(deferred) {
+                let flag = tool
+                    .get("defer_loading")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                assert!(
+                    flag,
+                    "expected tool `{}` to carry defer_loading: true",
+                    deferred
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn core_tools_do_not_carry_defer_loading_flag() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        // Spot-check: tools the chat loop hits every turn must stay
+        // loaded by default — `search`, `compile`, `list_witnesses`,
+        // `merge_cognition` (the γ flagship).
+        let core_names = ["search", "compile", "list_witnesses", "merge_cognition"];
+        for name in core_names {
+            let tool = tools
+                .iter()
+                .find(|t| {
+                    t.get("name").and_then(|n| n.as_str()) == Some(name)
+                })
+                .unwrap_or_else(|| panic!("core tool `{name}` should be advertised"));
+            let flag = tool
+                .get("defer_loading")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            assert!(
+                !flag,
+                "core tool `{}` should NOT carry defer_loading: true",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_search_returns_matches_by_name_substring() {
+        // Query for "engram" should match every engram-lifecycle tool.
+        let resp = handle_tool_search(
+            None,
+            &serde_json::json!({ "query": "engram", "limit": 50 }),
+        )
+        .await;
+        let payload = resp
+            .result
+            .expect("tool_search responds with result");
+        // mcp_text_result wraps the result in a `content[0].text`
+        // JSON string. Parse the text and walk to the inner tools.
+        let text = payload
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("tool_search mcp text payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).expect("tool_search text parses as JSON");
+        let names: Vec<String> = parsed
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        t.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            names.iter().any(|n| n.contains("engram")),
+            "expected at least one engram tool in results; got {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_filters_to_deferred_only_when_requested() {
+        // Empty query + include_non_deferred=false → only deferred
+        // tools should appear in the result.
+        let resp = handle_tool_search(
+            None,
+            &serde_json::json!({ "include_non_deferred": false, "limit": 100 }),
+        )
+        .await;
+        let payload = resp.result.expect("result");
+        let text = payload
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("tool_search mcp text payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).expect("JSON");
+        let tools = parsed
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+        assert!(!tools.is_empty(), "expected non-empty deferred-only result");
+        for tool in tools {
+            let flag = tool
+                .get("defer_loading")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            assert!(
+                flag,
+                "every tool in deferred-only filter should be deferred: {:?}",
+                tool.get("name")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_search_respects_limit() {
+        let resp = handle_tool_search(
+            None,
+            &serde_json::json!({ "query": "", "limit": 3 }),
+        )
+        .await;
+        let payload = resp.result.expect("result");
+        let text = payload
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("tool_search mcp text payload");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).expect("JSON");
+        let tools = parsed
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+        assert_eq!(tools.len(), 3, "limit=3 should return exactly 3 entries");
+    }
+}
+
+#[cfg(test)]
 mod witness_tool_listing_tests {
     use super::handle_list;
 
@@ -3094,5 +4073,176 @@ mod observer_tool_listing_tests {
             .collect();
         assert!(required_names.contains(&"workspace"));
         assert!(required_names.contains(&"session_id"));
+    }
+
+    #[tokio::test]
+    async fn fs_tools_advertised_in_list() {
+        let resp = handle_list(None).await;
+        let result = resp.result.expect("tools/list responds with result");
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array present");
+        let names: std::collections::HashSet<&str> = tools
+            .iter()
+            .filter_map(|t: &serde_json::Value| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        for required in ["fs_list", "fs_create_folder", "fs_rename", "fs_move"] {
+            assert!(
+                names.contains(required),
+                "fs tool `{required}` missing from tools/list"
+            );
+        }
+    }
+}
+
+// ── Workspace filesystem MCP handlers ─────────────────────────────
+//
+// Thin handlers — each one validates required arguments, resolves the
+// workspace root via `engine.workspace_root_path(ws)`, delegates to
+// `crate::fs_ops`, and wraps the result in `mcp_text_result`. The
+// safety model (`..`-escape refusal, symlink canonicalisation,
+// `.thinkingroot/` protection) lives in `fs_ops`, not here.
+
+fn fs_resolve_root_or_error(
+    id: Option<Value>,
+    engine: &QueryEngine,
+    ws: &str,
+    tool: &str,
+) -> Result<std::path::PathBuf, JsonRpcResponse> {
+    engine.workspace_root_path(ws).ok_or_else(|| {
+        JsonRpcResponse::error(
+            id,
+            -32603,
+            format!("{tool}: workspace `{ws}` is not mounted"),
+        )
+    })
+}
+
+async fn handle_fs_list(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let root = match fs_resolve_root_or_error(id.clone(), engine, ws, "list_directory") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let rel = arguments
+        .get("rel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match crate::fs_ops::list_directory(&root, ws, rel) {
+        Ok(listing) => mcp_text_result(id, &listing),
+        Err(msg) => JsonRpcResponse::error(id, -32603, msg),
+    }
+}
+
+async fn handle_fs_create_folder(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let parent_rel = arguments
+        .get("parent_rel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "create_folder: missing required `name` argument".to_string(),
+            );
+        }
+    };
+    let root = match fs_resolve_root_or_error(id.clone(), engine, ws, "create_folder") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::create_folder(&root, &parent_rel, &name) {
+        Ok(rel_path) => mcp_text_result(id, &serde_json::json!({ "rel_path": rel_path })),
+        Err(msg) => JsonRpcResponse::error(id, -32603, msg),
+    }
+}
+
+async fn handle_fs_rename(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let rel = match arguments.get("rel").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "rename_path: missing required `rel` argument".to_string(),
+            );
+        }
+    };
+    let new_name = match arguments.get("new_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "rename_path: missing required `new_name` argument".to_string(),
+            );
+        }
+    };
+    let root = match fs_resolve_root_or_error(id.clone(), engine, ws, "rename_path") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::rename_path(&root, &rel, &new_name) {
+        Ok(rel_path) => mcp_text_result(id, &serde_json::json!({ "rel_path": rel_path })),
+        Err(msg) => JsonRpcResponse::error(id, -32603, msg),
+    }
+}
+
+async fn handle_fs_move(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let sources: Vec<String> = match arguments.get("sources").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                "move_paths: missing required `sources` array argument".to_string(),
+            );
+        }
+    };
+    if sources.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "move_paths: `sources` must contain at least one rel_path".to_string(),
+        );
+    }
+    let dest_folder = arguments
+        .get("dest_folder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let root = match fs_resolve_root_or_error(id.clone(), engine, ws, "move_paths") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::move_paths(&root, sources, &dest_folder) {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(msg) => JsonRpcResponse::error(id, -32603, msg),
     }
 }

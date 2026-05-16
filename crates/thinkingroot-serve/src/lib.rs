@@ -9,6 +9,7 @@ pub mod backfill;
 pub mod branch_cache;
 pub mod engine;
 pub mod fingerprint;
+pub mod fs_ops;
 pub mod graph;
 pub mod graph_cache;
 pub mod intelligence;

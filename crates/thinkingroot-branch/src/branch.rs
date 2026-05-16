@@ -249,6 +249,37 @@ impl BranchRegistry {
         self.save()
     }
 
+    /// Update the human-readable `description` on an existing active
+    /// branch and persist. `None` clears the description.
+    ///
+    /// Phase B.1 (2026-05-17): drives the topic-branch title flow —
+    /// the first user message of a chat session is persisted on the
+    /// stream branch's description, and `maintenance::cleanup_once`
+    /// propagates that description onto the auto-created topic branch
+    /// at merge time so the UI can surface a meaningful title.
+    ///
+    /// Lock-protected: acquires [`crate::lock::RegistryLock`] and
+    /// reloads the on-disk state before mutating.
+    pub fn set_description(
+        &mut self,
+        name: &str,
+        description: Option<String>,
+    ) -> Result<BranchRef> {
+        let _lock = crate::lock::RegistryLock::acquire(&self.refs_dir)?;
+        self.data = Self::read_registry_file(&self.refs_dir)?;
+
+        let branch = self
+            .data
+            .branches
+            .iter_mut()
+            .find(|b| b.name == name && matches!(b.status, BranchStatus::Active))
+            .ok_or_else(|| Error::BranchNotFound(name.to_string()))?;
+        branch.description = description;
+        let updated = branch.clone();
+        self.save()?;
+        Ok(updated)
+    }
+
     /// Update the redaction policy on an existing active branch and
     /// persist. Returns the updated branch.
     ///

@@ -61,6 +61,16 @@ pub struct AppState {
     /// source of truth; this hub is a fan-out for clients that prefer
     /// live updates over polling `/branches/{branch}/events`.
     pub branch_event_hub: Arc<RwLock<HashMap<String, broadcast::Sender<BranchEvent>>>>,
+    /// Phase δ.2 — per-workspace substrate-bus schedulers. Lazy: an
+    /// entry is inserted the first time the workspace's substrate
+    /// bus is started (via `POST /substrate-bus/start` or the
+    /// equivalent Tauri command). Lookup by workspace name; the
+    /// `Arc<SubAgentScheduler>` is cheap to clone across handlers
+    /// reading the report ring or initiating a `run_now`. Per-
+    /// workspace ownership (not process-global) so a multi-workspace
+    /// daemon doesn't conflate reports across workspaces.
+    pub substrate_bus:
+        Arc<RwLock<HashMap<String, Arc<crate::intelligence::substrate_bus::SubAgentScheduler>>>>,
     /// Task 15 — single broadcast channel that fans every branch
     /// event into one aggregate stream. The desktop's left-rail
     /// branch tree subscribes here once and gets create / merge /
@@ -129,7 +139,69 @@ impl AppState {
             active_merges: Arc::new(RwLock::new(HashMap::new())),
             workspace_watcher: Arc::new(RwLock::new(None)),
             workspace_status: Arc::new(WorkspaceStateRegistry::new()),
+            substrate_bus: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Phase δ.2 — Start the substrate-bus scheduler for a workspace.
+    /// Idempotent: a second call for the same workspace name is a
+    /// no-op (returns the existing scheduler). Returns the scheduler
+    /// so callers can immediately invoke `run_now` on a registered
+    /// agent if the user requests an on-demand observation.
+    pub async fn ensure_substrate_bus(
+        self: &Arc<Self>,
+        workspace: &str,
+    ) -> Arc<crate::intelligence::substrate_bus::SubAgentScheduler> {
+        {
+            let map = self.substrate_bus.read().await;
+            if let Some(existing) = map.get(workspace) {
+                return Arc::clone(existing);
+            }
+        }
+        // Slow path: build a fresh scheduler + start it. Done under
+        // a fresh write guard so a concurrent caller waiting on the
+        // read sees the populated entry.
+        let scheduler = Arc::new(
+            crate::intelligence::substrate_bus::default_scheduler(),
+        );
+        let ctx = crate::intelligence::substrate_bus::SubAgentContext {
+            engine: Arc::clone(&self.engine),
+            workspace: workspace.to_string(),
+        };
+        scheduler.start(ctx);
+        let mut map = self.substrate_bus.write().await;
+        map.entry(workspace.to_string())
+            .or_insert_with(|| Arc::clone(&scheduler));
+        scheduler
+    }
+
+    /// Phase δ.2 — Shut down the substrate-bus scheduler for a
+    /// workspace (e.g. on unmount). Drops every registered sub-agent
+    /// task via the scheduler's shared `CancellationToken`.
+    /// Idempotent: dropping a workspace not registered is a no-op.
+    pub async fn stop_substrate_bus(&self, workspace: &str) {
+        let removed = {
+            let mut map = self.substrate_bus.write().await;
+            map.remove(workspace)
+        };
+        if let Some(s) = removed {
+            s.shutdown();
+        }
+    }
+
+    /// Phase δ.2 — Snapshot of recent substrate-bus reports for a
+    /// workspace. Returns `Vec::new()` when the bus isn't running.
+    /// Honest empty state — the caller (UI) renders "bus not started"
+    /// instead of pretending observations exist.
+    pub async fn substrate_bus_reports(
+        &self,
+        workspace: &str,
+    ) -> Vec<crate::intelligence::substrate_bus::SubAgentReport> {
+        let map = self.substrate_bus.read().await;
+        match map.get(workspace) {
+            Some(s) => s.recent_reports().await,
+            None => Vec::new(),
+        }
     }
 
     /// Slice 3 — install the workspace watcher handle and arm
@@ -364,10 +436,65 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/witnesses/{id}", get(get_witness_handler))
             .route("/ws/{ws}/witnesses/{id}/walk", get(walk_mesh_handler))
+            // Workspace filesystem operations — shared with the
+            // desktop FileManager (which has its own Tauri command
+            // surface that calls the same `fs_ops` module). The MCP
+            // tools `list_directory` / `create_folder` /
+            // `rename_path` / `move_paths` dispatch through the same
+            // primitives, so AI agents can reorganise a workspace
+            // exactly the way a human can.
+            .route("/ws/{ws}/fs/list", get(fs_list_handler))
+            .route("/ws/{ws}/fs/create-folder", post(fs_create_folder_handler))
+            .route("/ws/{ws}/fs/rename", post(fs_rename_handler))
+            .route("/ws/{ws}/fs/move", post(fs_move_handler))
             // Playground v1 — Living Paper + gaps surface. Both
             // delegate to existing QueryEngine methods (see
             // `engine.rs::regenerate_paper` + `list_gaps_branched`).
             .route("/ws/{ws}/paper/regenerate", post(paper_regenerate_handler))
+            // ── Phase β.1 — Cognition Commits ──────────────────────
+            // Three endpoints over the new cognition_commits table.
+            // Same workspace-scoping pattern as the witness endpoints;
+            // each delegates to QueryEngine methods which own the
+            // citation/parent verification (so a 400-level bad-request
+            // is surfaced as a typed engine error before the table is
+            // touched).
+            .route(
+                "/ws/{ws}/commits",
+                get(list_cognition_commits_handler).post(record_cognition_commit_handler),
+            )
+            // Phase γ.1 — merge-plan endpoint. Pure read; computes the
+            // deterministic divergence between two cognition-commit
+            // branches. Lives at `/commits/merge-plan` so the
+            // `/commits/{id}` route below doesn't shadow it (Axum
+            // matches static segments before dynamic placeholders, so
+            // routing order is correct without reorder).
+            .route(
+                "/ws/{ws}/commits/merge-plan",
+                get(merge_plan_handler),
+            )
+            // Phase γ.2 — LLM-driven synthesis on top of a γ.1 plan.
+            .route(
+                "/ws/{ws}/commits/synthesize-merge",
+                post(synthesize_merge_handler),
+            )
+            .route("/ws/{ws}/commits/{id}", get(get_cognition_commit_handler))
+            // Phase δ.2 — Substrate Bus surfaces. Per-workspace.
+            .route(
+                "/ws/{ws}/substrate-bus/start",
+                post(substrate_bus_start_handler),
+            )
+            .route(
+                "/ws/{ws}/substrate-bus/stop",
+                post(substrate_bus_stop_handler),
+            )
+            .route(
+                "/ws/{ws}/substrate-bus/reports",
+                get(substrate_bus_reports_handler),
+            )
+            .route(
+                "/ws/{ws}/substrate-bus/run-now",
+                post(substrate_bus_run_now_handler),
+            )
             .route("/ws/{ws}/gaps", get(gaps_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
@@ -1381,6 +1508,110 @@ async fn witnesses_count_handler(
     }
 }
 
+// ── workspace filesystem ops ─────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct FsListParams {
+    /// Optional sub-folder rel-path. Omit / empty = workspace root.
+    rel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FsCreateFolderBody {
+    parent_rel: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct FsRenameBody {
+    rel: String,
+    new_name: String,
+}
+
+#[derive(Deserialize)]
+struct FsMoveBody {
+    sources: Vec<String>,
+    dest_folder: String,
+}
+
+fn resolve_workspace_root_for_fs(
+    engine: &QueryEngine,
+    ws: &str,
+) -> Result<PathBuf, Response> {
+    engine.workspace_root_path(ws).ok_or_else(|| {
+        err_response(
+            StatusCode::NOT_FOUND,
+            "workspace_not_mounted",
+            &format!("workspace `{ws}` is not mounted"),
+        )
+    })
+}
+
+async fn fs_list_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<FsListParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let root = match resolve_workspace_root_for_fs(&engine, &ws) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let rel = params.rel.unwrap_or_default();
+    match crate::fs_ops::list_directory(&root, &ws, &rel) {
+        Ok(listing) => ok_response(listing).into_response(),
+        Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_list_failed", &msg),
+    }
+}
+
+async fn fs_create_folder_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<FsCreateFolderBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let root = match resolve_workspace_root_for_fs(&engine, &ws) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::create_folder(&root, &body.parent_rel, &body.name) {
+        Ok(rel) => ok_response(serde_json::json!({ "rel_path": rel })).into_response(),
+        Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_create_folder_failed", &msg),
+    }
+}
+
+async fn fs_rename_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<FsRenameBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let root = match resolve_workspace_root_for_fs(&engine, &ws) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::rename_path(&root, &body.rel, &body.new_name) {
+        Ok(rel) => ok_response(serde_json::json!({ "rel_path": rel })).into_response(),
+        Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_rename_failed", &msg),
+    }
+}
+
+async fn fs_move_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<FsMoveBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let root = match resolve_workspace_root_for_fs(&engine, &ws) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::move_paths(&root, body.sources, &body.dest_folder) {
+        Ok(outcome) => ok_response(outcome).into_response(),
+        Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_move_failed", &msg),
+    }
+}
+
 /// `GET /api/v1/ws/{ws}/witnesses/by-source` — witness count per
 /// source row. Used by the Playground SourceLibrary to badge each
 /// source with its witness count. Returns
@@ -1424,6 +1655,358 @@ async fn paper_regenerate_handler(
         .into_response(),
         Err(e) => match_engine_error(e),
     }
+}
+
+/// Query params for `GET /api/v1/ws/{ws}/commits`.
+#[derive(serde::Deserialize)]
+struct CommitListParams {
+    /// Branch to list. Defaults to `main` server-side when omitted so
+    /// the typical chat-UI path (one commit DAG per branch, branch
+    /// often unspecified at first paint) just works.
+    branch: Option<String>,
+    /// Max commits to return. Omit for everything.
+    limit: Option<usize>,
+}
+
+/// Request body for `POST /api/v1/ws/{ws}/commits`. Mirrors the MCP
+/// `commit_cognition` tool's argument shape so external agents can
+/// drive the REST endpoint with identical JSON.
+#[derive(serde::Deserialize)]
+struct RecordCommitRequest {
+    branch: String,
+    parent_id: Option<String>,
+    author_kind: String,
+    author_id: String,
+    #[serde(default)]
+    author_model: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    witnesses_added: Vec<String>,
+    #[serde(default)]
+    citations: Vec<String>,
+    #[serde(default)]
+    gaps_surfaced: Vec<String>,
+}
+
+/// `GET /api/v1/ws/{ws}/commits?branch=&limit=` — list commits on a
+/// branch newest-first. Returns the full `CognitionCommit` shape so
+/// the chat-UI can render the citation chips inline without follow-up
+/// fetches.
+async fn list_cognition_commits_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<CommitListParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let branch = params.branch.as_deref().unwrap_or("main");
+    match engine.list_cognition_commits(&ws, branch, params.limit).await {
+        Ok(commits) => ok_response(commits).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Query params for `GET /api/v1/ws/{ws}/commits/merge-plan`. Both
+/// branch names are required — there's no sensible default-side for
+/// merging.
+#[derive(serde::Deserialize)]
+struct MergePlanParams {
+    left: String,
+    right: String,
+}
+
+/// Phase γ.1 — `GET /api/v1/ws/{ws}/commits/merge-plan?left=&right=`.
+///
+/// Compute a deterministic merge plan between two cognition-commit
+/// branches. Pure read — no commit recorded. Returns the full
+/// `MergePlan` JSON; the React conflict-resolution view (γ.3, not
+/// yet shipped) will be the primary consumer. Today the response
+/// also drives the in-app `merge_cognition` tool's outcome.
+async fn merge_plan_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<MergePlanParams>,
+) -> Response {
+    if params.left.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            ok_response(serde_json::json!({
+                "error": "merge-plan: `left` query param is required",
+            })),
+        )
+            .into_response();
+    }
+    if params.right.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            ok_response(serde_json::json!({
+                "error": "merge-plan: `right` query param is required",
+            })),
+        )
+            .into_response();
+    }
+    let engine = state.engine.read().await;
+    match engine
+        .compute_merge_plan(&ws, &params.left, &params.right)
+        .await
+    {
+        Ok(plan) => ok_response(plan).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Body for `POST /api/v1/ws/{ws}/commits/synthesize-merge`. Mirrors
+/// the MCP `synthesize_merge` tool's argument shape.
+#[derive(serde::Deserialize)]
+struct SynthesizeMergeRequest {
+    left_branch: String,
+    right_branch: String,
+}
+
+/// Phase γ.2 — `POST /api/v1/ws/{ws}/commits/synthesize-merge`.
+async fn synthesize_merge_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    axum::Json(body): axum::Json<SynthesizeMergeRequest>,
+) -> Response {
+    if body.left_branch.is_empty() || body.right_branch.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            ok_response(serde_json::json!({
+                "error": "synthesize_merge: `left_branch` and `right_branch` both required",
+            })),
+        )
+            .into_response();
+    }
+    let engine = state.engine.read().await;
+    match engine
+        .synthesize_merge(&ws, &body.left_branch, &body.right_branch)
+        .await
+    {
+        Ok(synthesis) => ok_response(synthesis).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Phase δ.2 — Substrate Bus REST handlers ─────────────────────────
+
+/// `POST /api/v1/ws/{ws}/substrate-bus/start` — idempotent: starts
+/// the bus for `ws` if not already running, returns the registered
+/// agent names.
+async fn substrate_bus_start_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let scheduler = state.ensure_substrate_bus(&ws).await;
+    let names: Vec<String> = scheduler
+        .agent_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    ok_response(serde_json::json!({
+        "workspace": ws,
+        "running": true,
+        "agents": names,
+    }))
+    .into_response()
+}
+
+/// `POST /api/v1/ws/{ws}/substrate-bus/stop` — idempotent shutdown.
+async fn substrate_bus_stop_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    state.stop_substrate_bus(&ws).await;
+    ok_response(serde_json::json!({ "workspace": ws, "running": false }))
+        .into_response()
+}
+
+/// `GET /api/v1/ws/{ws}/substrate-bus/reports` — snapshot of the
+/// per-agent report ring. Empty when the bus isn't running.
+async fn substrate_bus_reports_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let reports = state.substrate_bus_reports(&ws).await;
+    ok_response(reports).into_response()
+}
+
+/// Body for `POST /api/v1/ws/{ws}/substrate-bus/run-now`.
+#[derive(serde::Deserialize)]
+struct SubstrateBusRunNowRequest {
+    agent: String,
+}
+
+/// `POST /api/v1/ws/{ws}/substrate-bus/run-now` — manually trigger
+/// one tick of an agent (without waiting for its interval). Useful
+/// for the desktop "Run now" affordance.
+async fn substrate_bus_run_now_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    axum::Json(body): axum::Json<SubstrateBusRunNowRequest>,
+) -> Response {
+    let scheduler = state.ensure_substrate_bus(&ws).await;
+    let ctx = crate::intelligence::substrate_bus::SubAgentContext {
+        engine: Arc::clone(&state.engine),
+        workspace: ws.clone(),
+    };
+    match scheduler.run_now(&body.agent, &ctx).await {
+        Some(report) => ok_response(report).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            ok_response(serde_json::json!({
+                "error": format!("unknown agent `{}`", body.agent),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/commits/{id}` — fetch a single commit by id.
+/// Returns 404 when the id is unknown so the chat-UI can render a
+/// "this commit was pruned" empty state honestly.
+async fn get_cognition_commit_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let parsed = match thinkingroot_core::types::CommitId::from_hex(&id) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                ok_response(serde_json::json!({
+                    "error": format!("invalid commit id `{id}`: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let engine = state.engine.read().await;
+    match engine.get_cognition_commit(&ws, &parsed).await {
+        Ok(Some(c)) => ok_response(c).into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            ok_response(serde_json::json!({
+                "error": "commit not found",
+                "commit_id": id,
+            })),
+        )
+            .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/commits` — record one cognition commit.
+/// Citations + parent are verified by `QueryEngine::commit_cognition`
+/// before the row lands; a 400-shaped error surfaces fabricated
+/// citations + dangling parents to the caller.
+async fn record_cognition_commit_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<RecordCommitRequest>,
+) -> Response {
+    use thinkingroot_core::types::{CognitionCommit, CommitAuthor, CommitId};
+
+    if body.branch.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            ok_response(serde_json::json!({
+                "error": "branch must not be empty",
+            })),
+        )
+            .into_response();
+    }
+
+    let parent = match body.parent_id.as_deref() {
+        Some(s) if !s.is_empty() => match CommitId::from_hex(s) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    ok_response(serde_json::json!({
+                        "error": format!("invalid parent_id `{s}`: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        _ => None,
+    };
+
+    let author = match body.author_kind.as_str() {
+        "user" => CommitAuthor::User { id: body.author_id },
+        "agent" => CommitAuthor::Agent {
+            model: body.author_model,
+            principal: body.author_id,
+        },
+        other => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                ok_response(serde_json::json!({
+                    "error": format!("author_kind must be 'user' or 'agent', got `{other}`"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let witnesses_added = match collect_witness_ids(&body.witnesses_added) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                ok_response(serde_json::json!({
+                    "error": format!("witnesses_added: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let citations = match collect_witness_ids(&body.citations) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                ok_response(serde_json::json!({
+                    "error": format!("citations: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let commit = CognitionCommit::new(
+        parent,
+        body.branch,
+        author,
+        body.prompt,
+        body.reasoning,
+        witnesses_added,
+        citations,
+        body.gaps_surfaced,
+        chrono::Utc::now(),
+    );
+
+    let engine = state.engine.read().await;
+    match engine.commit_cognition(&ws, &commit).await {
+        Ok(()) => ok_response(commit).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+fn collect_witness_ids(
+    hex_ids: &[String],
+) -> std::result::Result<Vec<thinkingroot_core::types::WitnessId>, String> {
+    use thinkingroot_core::types::WitnessId;
+    let mut out: Vec<WitnessId> = Vec::with_capacity(hex_ids.len());
+    for s in hex_ids {
+        let id = WitnessId::from_hex(s)
+            .map_err(|e| format!("invalid witness id `{s}`: {e}"))?;
+        out.push(id);
+    }
+    Ok(out)
 }
 
 /// Query parameters for `GET /api/v1/ws/{ws}/gaps`. All optional —
@@ -4486,14 +5069,24 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             .into_response();
     };
 
-    // Skills live at <workspace_root>/.thinkingroot/skills/. Empty
-    // dir or missing dir → empty registry; skill manifest will not
-    // be appended to the system prompt.
+    // Skills live at <workspace_root>/.thinkingroot/skills/. Missing
+    // dir is benign (Ok(empty) at `SkillRegistry::load_from_dir`);
+    // an Err here means the dir IS present but malformed — a parse
+    // or IO failure that silently degrades the agent's skill manifest
+    // to empty. Phase C.3 (2026-05-17) upgraded the log level from
+    // WARN → ERROR with structured fields so the failure surfaces in
+    // the doctor log and the operator can actually find it; the chat
+    // continues so the user still gets an answer.
     let skill_dir = workspace_root.join(".thinkingroot/skills");
     let skills = match SkillRegistry::load_from_dir(&skill_dir) {
         Ok(r) => Arc::new(r),
         Err(e) => {
-            tracing::warn!("agent: skill load failed at {}: {e}", skill_dir.display());
+            tracing::error!(
+                skill_dir = %skill_dir.display(),
+                error = %e,
+                "skill registry failed to load — chat continuing without skills. \
+                 Fix the broken skill file(s) and the next turn will reload them."
+            );
             Arc::new(SkillRegistry::empty())
         }
     };
@@ -4548,6 +5141,53 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             &state.sessions,
         )
         .await;
+    }
+
+    // Phase B.1 (2026-05-17) — record the user's first message of
+    // this session and persist it onto the stream branch's
+    // `description` so `maintenance::cleanup_once` can propagate
+    // that title to the auto-created topic branch at merge time.
+    // Idempotent: only the first turn of each session pays the (one)
+    // registry write. Persistence is best-effort — a registry I/O
+    // failure here MUST NOT block the user's chat turn from running.
+    {
+        let (stored_msg, branch_name) = {
+            let mut sessions_guard = state.sessions.lock().await;
+            let session = sessions_guard
+                .entry(conversation_id.clone())
+                .or_insert_with(|| {
+                    crate::intelligence::session::SessionContext::new(
+                        conversation_id.clone(),
+                        ws.clone(),
+                    )
+                });
+            let stored = session.set_first_user_message_if_unset(&body.question);
+            let branch_name = session.active_branch.clone();
+            (stored, branch_name)
+        };
+        if let (Some(stored), Some(branch_name)) = (stored_msg, branch_name) {
+            // Single TOML write under a registry file lock; measured
+            // in single-digit ms. Cheap enough to inline on the async
+            // runtime for the one-shot-per-session it represents.
+            match thinkingroot_branch::set_branch_description(
+                &workspace_root,
+                &branch_name,
+                Some(stored),
+            ) {
+                Ok(_) => {
+                    tracing::debug!(
+                        branch = %branch_name,
+                        "B.1: persisted first_user_message on stream branch description"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        branch = %branch_name,
+                        "B.1: failed to persist first_user_message on stream branch description (chat continues): {e}"
+                    );
+                }
+            }
+        }
     }
 
     // C2 (Task 5) + Task 9: build the reactive `<system-reminder>` bus
@@ -4617,6 +5257,15 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         format!("{}{}", bus_prefix, body.question)
     };
 
+    // Phase B.2 (2026-05-17): captures threaded into the stream block
+    // for post-Done auto-distill. Taken BEFORE the StreamAgentRequest
+    // is constructed because that construction moves `conversation_id`
+    // and `workspace_root` by value.
+    let workspace_root_for_persist = workspace_root.clone();
+    let conversation_id_for_persist = conversation_id.clone();
+    let user_question_for_persist = body.question.clone();
+    let sessions_for_persist = state.sessions.clone();
+
     let req = StreamAgentRequest {
         workspace: ws.clone(),
         workspace_root,
@@ -4633,6 +5282,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         sessions: state.sessions.clone(),
         pending_approvals: state.pending_approvals.clone(),
         trace: None,
+        engram_manager: state.engram_manager.clone(),
     };
 
     let (mut rx, router) = spawn_agent_run(req, deps);
@@ -4795,6 +5445,63 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                         .event("trust_receipt")
                         .data(payload.to_string())
                 );
+
+                // Phase B.2 (2026-05-17) — auto-distill this turn
+                // onto the session's stream branch graph so the
+                // NEXT turn's `hybrid_retrieve` / `search` can pull
+                // it as context. Runs AFTER trust_receipt is on the
+                // wire so a persistence stall never delays the
+                // user-visible completion signal. Skipped silently
+                // when:
+                //   * there is no active stream branch on the
+                //     session (e.g. `auto_session_branch = false`),
+                //   * both user_question and the agent's final text
+                //     are empty,
+                //   * the chat_turn_count allocator hasn't yet
+                //     incremented (defensive — should never happen
+                //     since `next_chat_turn` runs in the agent loop
+                //     before Done).
+                let final_text_owned =
+                    final_text_for_verify.clone().unwrap_or_default();
+                let (active_branch_opt, turn_n) = {
+                    let store = sessions_for_persist.lock().await;
+                    match store.get(&conversation_id_for_persist) {
+                        Some(s) => (s.active_branch.clone(), s.chat_turn_count),
+                        None => (None, 0),
+                    }
+                };
+                if let Some(active_branch) = active_branch_opt {
+                    if turn_n > 0 {
+                        match crate::intelligence::turn_persistence::persist_chat_turn(
+                            &workspace_root_for_persist,
+                            &active_branch,
+                            &conversation_id_for_persist,
+                            turn_n,
+                            &user_question_for_persist,
+                            &final_text_owned,
+                        )
+                        .await
+                        {
+                            Ok(persisted) => {
+                                tracing::debug!(
+                                    branch = %active_branch,
+                                    session_id = %conversation_id_for_persist,
+                                    turn_number = persisted.turn_number,
+                                    "B.2: persisted chat turn onto stream branch"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    branch = %active_branch,
+                                    session_id = %conversation_id_for_persist,
+                                    turn_number = turn_n,
+                                    "B.2: chat-turn persistence failed (trust_receipt already on wire, chat completes normally): {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 break;
             }
         }

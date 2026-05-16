@@ -25,7 +25,13 @@ use crate::types::{Confidence, Sensitivity, SourceId, WorkspaceId};
 /// is lower-hex (64 characters) — matches what CozoDB stores in the
 /// `witnesses.id` column and what `WitnessRecord.id` carries through
 /// the pack format.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` / `PartialOrd` are derived over the raw 32-byte BLAKE3
+/// payload — which gives the same total order as sorting the
+/// lowercase-hex string form character-by-character. Cognition-commit
+/// merge plans (`thinkingroot-graph::cognition_merge`) rely on the
+/// resulting byte-stable sort to emit deterministic witness-set
+/// outputs across runs / processes / machines.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WitnessId(pub [u8; 32]);
 
 impl WitnessId {

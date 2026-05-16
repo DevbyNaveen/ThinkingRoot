@@ -36,6 +36,7 @@ use thinkingroot_llm::llm::Tool;
 use tokio::sync::RwLock;
 
 use crate::engine::{ClaimFilter, QueryEngine};
+use crate::intelligence::engram::EngramManager;
 use crate::intelligence::session::SessionStore;
 use crate::intelligence::skills::SkillRegistry;
 use crate::intelligence::tools::{ToolHandler, ToolHandlerResult, ToolRegistry};
@@ -65,6 +66,12 @@ pub struct ToolContext {
     /// can load via `use_skill`. Empty means no skills are wired —
     /// `use_skill` returns "no such skill" for any name.
     pub skills: Arc<SkillRegistry>,
+    /// Per-deployment engram manager — shared with the MCP transports
+    /// and REST AEP endpoints so engram pointers minted by the agent
+    /// (`materialize_engram`) resolve via the same TTL cache and
+    /// HMAC pointer-secret. Required by the McpBridge adapter that
+    /// surfaces the full MCP tool catalogue inside the in-app agent.
+    pub engram_manager: Arc<EngramManager>,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1162,8 +1169,8 @@ impl ToolHandler for InvokeExternalAgentTool {
 /// [`crate::intelligence::agent::Agent`] it constructs. Cheap and
 /// idempotent: every call returns a fresh registry with its own
 /// dispatch table.
-pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
-    ToolRegistry::new()
+pub async fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
+    let registry = ToolRegistry::new()
         .register_read(SearchTool::spec(), Arc::new(SearchTool::new(ctx.clone())))
         .register_read(
             ListBranchesTool::spec(),
@@ -1211,8 +1218,116 @@ pub fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
         )
         .register_write(
             InvokeExternalAgentTool::spec(),
-            Arc::new(InvokeExternalAgentTool::new(ctx)),
+            Arc::new(InvokeExternalAgentTool::new(ctx.clone())),
         )
+        // ── Phase α Playground action verbs ───────────────────────
+        // Each routes through PlaygroundToolContext so its handler
+        // can take the engine read-lock for the duration of one call.
+        // See docs/2026-05-15-cognition-commits-design.md.
+        .register_write(
+            crate::intelligence::playground_tools::SaveNoteTool::spec(),
+            Arc::new(crate::intelligence::playground_tools::SaveNoteTool::new(
+                crate::intelligence::playground_tools::PlaygroundToolContext {
+                    engine: ctx.engine.clone(),
+                    workspace: ctx.workspace.clone(),
+                },
+            )),
+        )
+        .register_write(
+            crate::intelligence::playground_tools::RegeneratePaperTool::spec(),
+            Arc::new(
+                crate::intelligence::playground_tools::RegeneratePaperTool::new(
+                    crate::intelligence::playground_tools::PlaygroundToolContext {
+                        engine: ctx.engine.clone(),
+                        workspace: ctx.workspace.clone(),
+                    },
+                ),
+            ),
+        )
+        .register_write(
+            crate::intelligence::playground_tools::IngestPathTool::spec(),
+            Arc::new(crate::intelligence::playground_tools::IngestPathTool::new(
+                crate::intelligence::playground_tools::PlaygroundToolContext {
+                    engine: ctx.engine.clone(),
+                    workspace: ctx.workspace.clone(),
+                },
+            )),
+        )
+        // ── Phase α-tail Playground action verbs ──────────────────
+        .register_read(
+            crate::intelligence::playground_tools::ListDirectoryTool::spec(),
+            Arc::new(
+                crate::intelligence::playground_tools::ListDirectoryTool::new(
+                    crate::intelligence::playground_tools::PlaygroundToolContext {
+                        engine: ctx.engine.clone(),
+                        workspace: ctx.workspace.clone(),
+                    },
+                ),
+            ),
+        )
+        .register_write(
+            crate::intelligence::playground_tools::OrganizeFilesTool::spec(),
+            Arc::new(
+                crate::intelligence::playground_tools::OrganizeFilesTool::new(
+                    crate::intelligence::playground_tools::PlaygroundToolContext {
+                        engine: ctx.engine.clone(),
+                        workspace: ctx.workspace.clone(),
+                    },
+                ),
+            ),
+        )
+        .register_write(
+            crate::intelligence::playground_tools::TrashFilesTool::spec(),
+            Arc::new(crate::intelligence::playground_tools::TrashFilesTool::new(
+                crate::intelligence::playground_tools::PlaygroundToolContext {
+                    engine: ctx.engine.clone(),
+                    workspace: ctx.workspace.clone(),
+                },
+            )),
+        )
+        // ── Phase β.1 — Cognition Commits ─────────────────────────
+        .register_write(
+            crate::intelligence::playground_tools::CommitCognitionTool::spec(),
+            Arc::new(
+                crate::intelligence::playground_tools::CommitCognitionTool::new(
+                    crate::intelligence::playground_tools::PlaygroundToolContext {
+                        engine: ctx.engine.clone(),
+                        workspace: ctx.workspace.clone(),
+                    },
+                ),
+            ),
+        )
+        .register_read(
+            crate::intelligence::playground_tools::ListCommitsTool::spec(),
+            Arc::new(crate::intelligence::playground_tools::ListCommitsTool::new(
+                crate::intelligence::playground_tools::PlaygroundToolContext {
+                    engine: ctx.engine.clone(),
+                    workspace: ctx.workspace.clone(),
+                },
+            )),
+        )
+        // ── Phase γ.1 — Merge Cognition ───────────────────────────
+        .register_read(
+            crate::intelligence::playground_tools::MergeCognitionTool::spec(),
+            Arc::new(
+                crate::intelligence::playground_tools::MergeCognitionTool::new(
+                    crate::intelligence::playground_tools::PlaygroundToolContext {
+                        engine: ctx.engine.clone(),
+                        workspace: ctx.workspace.clone(),
+                    },
+                ),
+            ),
+        );
+
+    // ── McpBridge — surface every safe MCP tool inside the agent ──
+    // One adapter chains all non-skipped tools from `mcp::tools::handle_list`
+    // (AEP, Witness Mesh, hybrid retrieval, branch lifecycle, proposals,
+    // filesystem, …) onto the registry. The bridge is async because it
+    // walks the live MCP catalog at registry-build time; that's why
+    // `register_builtin_tools` itself is async. See
+    // `intelligence/mcp_bridge.rs` for the skip + write classification
+    // rationale.
+    crate::intelligence::mcp_bridge::register_mcp_bridge_tools(registry, &ctx).await
 }
 
 #[cfg(test)]
@@ -1306,6 +1421,9 @@ mod tests {
             sessions: crate::intelligence::session::new_session_store(),
             agent_id: "test-agent".to_string(),
             skills: Arc::new(SkillRegistry::empty()),
+            engram_manager: crate::intelligence::engram::EngramManager::new(
+                crate::intelligence::engram::EngramConfig::default(),
+            ),
         }
     }
 
@@ -1344,37 +1462,52 @@ mod tests {
         assert!(validate_workspace_relative_path("a/../b").is_err());
     }
 
-    #[test]
-    fn register_builtin_tools_produces_thirteen_tools() {
+    #[tokio::test]
+    async fn register_builtin_tools_includes_all_hand_wrapped() {
         let ctx = fixture_ctx();
-        let registry = register_builtin_tools(ctx);
-        let mut names = registry.tool_names();
-        names.sort();
-        assert_eq!(
-            names,
-            vec![
-                "abandon_branch",
-                "contribute_claim",
-                "create_branch",
-                "invoke_external_agent",
-                "list_branches",
-                "list_claims",
-                "merge_branch",
-                "read_file",
-                "read_source",
-                "search",
-                "search_claims",
-                "use_skill",
-                "workspace_info",
-            ]
-        );
+        let registry = register_builtin_tools(ctx).await;
+        // The 22 hand-wrapped builtins must always be present.
+        // Bridge tools (per `mcp_bridge::register_mcp_bridge_tools`)
+        // appear in addition; the separate
+        // `register_builtin_tools_surfaces_mcp_bridge_tools` test
+        // pins their presence.
+        let names = registry.tool_names();
+        for required in [
+            "abandon_branch",
+            "commit_cognition",
+            "contribute_claim",
+            "create_branch",
+            "ingest_path",
+            "invoke_external_agent",
+            "list_branches",
+            "list_claims",
+            "list_commits",
+            "list_directory",
+            "merge_branch",
+            "merge_cognition",
+            "organize_files",
+            "read_file",
+            "read_source",
+            "regenerate_paper",
+            "save_note",
+            "search",
+            "search_claims",
+            "trash_files",
+            "use_skill",
+            "workspace_info",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "hand-wrapped tool '{required}' missing from registry. names: {names:?}",
+            );
+        }
     }
 
-    #[test]
-    fn register_builtin_tools_classifies_writes() {
+    #[tokio::test]
+    async fn register_builtin_tools_classifies_writes() {
         let ctx = fixture_ctx();
-        let registry = register_builtin_tools(ctx);
-        // Reads.
+        let registry = register_builtin_tools(ctx).await;
+        // Reads (hand-wrapped builtins).
         for name in [
             "search",
             "search_claims",
@@ -1384,19 +1517,118 @@ mod tests {
             "use_skill",
             "read_source",
             "read_file",
+            "list_directory",
+            "list_commits",
+            "merge_cognition",
         ] {
             assert!(!registry.is_write(name), "{name} should be a read");
         }
-        // Writes.
+        // Writes (hand-wrapped builtins).
         for name in [
             "create_branch",
             "contribute_claim",
             "merge_branch",
             "abandon_branch",
             "invoke_external_agent",
+            "save_note",
+            "regenerate_paper",
+            "ingest_path",
+            "organize_files",
+            "trash_files",
+            "commit_cognition",
         ] {
             assert!(registry.is_write(name), "{name} should be a write");
         }
+    }
+
+    #[tokio::test]
+    async fn register_builtin_tools_surfaces_mcp_bridge_tools() {
+        let ctx = fixture_ctx();
+        let registry = register_builtin_tools(ctx).await;
+        let names = registry.tool_names();
+
+        // Marquee read tools the bridge MUST surface inside the agent.
+        for must_read in [
+            "ask",
+            "brief",
+            "hybrid_retrieve",
+            "investigate",
+            "list_witnesses",
+            "walk_mesh",
+            "query_claims",
+            "query_rooted",
+            "reflect",
+            "gaps",
+            "rooting_report",
+            "health_check",
+            "materialize_engram",
+            "probe_engram",
+            "list_engrams",
+            "fs_list",
+            "tool_search",
+            "get_relations",
+        ] {
+            assert!(
+                names.iter().any(|n| n == must_read),
+                "MCP bridge tool '{must_read}' missing from registry",
+            );
+            assert!(
+                !registry.is_write(must_read),
+                "MCP bridge tool '{must_read}' should be a read",
+            );
+        }
+
+        // Marquee write tools the bridge MUST surface inside the
+        // agent — gated by ApprovalGate.
+        for must_write in [
+            "checkout_branch",
+            "delete_branch",
+            "rebase_branch",
+            "rollback_merge",
+            "gc_branches",
+            "open_proposal",
+            "close_proposal",
+            "review_proposal",
+            "dismiss_gap",
+            "contribute",
+            "observe_turn",
+            "flush_observations",
+            "synthesize_merge",
+            "fs_create_folder",
+            "fs_rename",
+            "fs_move",
+            "expire_engram",
+        ] {
+            assert!(
+                names.iter().any(|n| n == must_write),
+                "MCP bridge write tool '{must_write}' missing from registry",
+            );
+            assert!(
+                registry.is_write(must_write),
+                "MCP bridge tool '{must_write}' should be a write",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn register_builtin_tools_skips_bridge_skip_list() {
+        let ctx = fixture_ctx();
+        let registry = register_builtin_tools(ctx).await;
+        let names = registry.tool_names();
+
+        // `contribute_bulk` is Connector-only at the API boundary;
+        // bridging it into a chat agent would be dead code (the
+        // call would always reject). `compile` skips the
+        // post-compile remount/engram-invalidation owned by the
+        // desktop's `ChatView.tsx` compile bridge.
+        assert!(
+            !names.iter().any(|n| n == "contribute_bulk"),
+            "contribute_bulk must be skipped from the bridge — Connector-only at the API boundary",
+        );
+        assert!(
+            !names.iter().any(|n| n == "compile"),
+            "compile must be skipped from the bridge — desktop's ChatView.tsx owns the canonical compile path",
+        );
     }
 
     /// Stub adapter factory for invoke_external_agent tests. Each

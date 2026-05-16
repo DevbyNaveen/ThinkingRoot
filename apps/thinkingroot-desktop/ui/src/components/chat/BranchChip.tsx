@@ -36,9 +36,11 @@ import { branchListNeedsRefetchFromEnvelope } from "@/lib/branchEvents";
 
 interface BranchChipProps {
   workspace: string;
+  /** Smaller label for the chat context header. */
+  compact?: boolean;
 }
 
-export function BranchChip({ workspace }: BranchChipProps) {
+export function BranchChip({ workspace, compact = false }: BranchChipProps) {
   const [branches, setBranches] = useState<BranchView[]>([]);
   const [open, setOpen] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
@@ -140,7 +142,14 @@ export function BranchChip({ workspace }: BranchChipProps) {
     // Substrate may not be mounted, or the daemon may not be reachable
     // yet. Show branch label only (no interactive affordance).
     return (
-      <span className="text-xs font-medium text-muted-foreground">main</span>
+      <span
+        className={cn(
+          "font-medium text-muted-foreground",
+          compact ? "text-[10px]" : "text-xs",
+        )}
+      >
+        main
+      </span>
     );
   }
 
@@ -150,7 +159,8 @@ export function BranchChip({ workspace }: BranchChipProps) {
         type="button"
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          "inline-flex max-w-[min(220px,100%)] cursor-pointer items-center gap-1 rounded-sm py-0.5 text-left text-xs font-medium transition-colors",
+          "inline-flex max-w-[min(220px,100%)] cursor-pointer items-center gap-1 rounded-sm py-0.5 text-left font-medium transition-colors",
+          compact ? "text-[10px]" : "text-xs",
           "hover:text-foreground",
           "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/55 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
           open ? "text-foreground" : isMain ? "text-muted-foreground" : "text-foreground/85",
@@ -162,7 +172,8 @@ export function BranchChip({ workspace }: BranchChipProps) {
         <span className="min-w-0 truncate">{activeName}</span>
         <ChevronDown
           className={cn(
-            "h-3 w-3 shrink-0 opacity-70 transition-transform",
+            "shrink-0 opacity-70 transition-transform",
+            compact ? "h-2.5 w-2.5" : "h-3 w-3",
             open && "rotate-180",
           )}
           aria-hidden
