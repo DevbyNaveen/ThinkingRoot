@@ -928,10 +928,10 @@ async fn run_pipeline_inner(
     // ─── Phase 4: Remove changed + deleted sources from graph ──────────
     // T6: collect "resolution-dirty" sources BEFORE the cascade fires.
     // `remove_source_by_id` (called via `remove_source_by_uri`) cascades
-    // `resolution_deps`, so we must query `list_dependent_sources` now —
-    // after the cascade the rows are gone and the dirty set would be empty.
-    // The set is used to log observability data immediately; T11 (watch mode)
-    // will consume it for source-granular re-extraction.
+    // `resolution_deps`, so we must query upstream deps now — after the
+    // cascade the rows are gone and the dirty set would be empty. The
+    // set is used to log observability data immediately; T11 (watch mode)
+    // consumes it for source-granular re-extraction.
     //
     // Bar transitions to `Persisting` here — Phase 4 is substrate GC
     // (cascades across 16 structural tables), conceptually closer to
@@ -939,98 +939,113 @@ async fn run_pipeline_inner(
     // = changed + deleted sources; per-source `advance(1)` happens at
     // each `remove_source_by_uri` call below so the bar moves as work
     // completes instead of glued at 0/N.
+    //
+    // §T13 perf: pre-fix Phase 4 issued ~10N individual Cozo queries
+    // per N changed sources (7 readers × N + `count_structural_rows_for_source`
+    // itself a 16-query nest). On the engine's own repo this dominated
+    // the "stuck at 20%" freeze. The rewrite below collapses every
+    // pre-cascade reader into 5 fixed-cost batched calls; the per-source
+    // `remove_source_by_uri` cascade stays per-source (I-W4 atomic
+    // boundary contract — multi_transaction is the actual atomic
+    // primitive, not script-level union).
     progress_state.set_step(
         thinkingroot_core::CompileStep::Persisting,
         (truly_changed.len() + deleted_sources.len()) as u64,
     );
     progress_state.set_substep("removing changed sources");
-    let mut resolution_dirty_sources: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+
+    // Cache `find_sources_by_uri` once per uri — pre-fix the same query
+    // ran three times per doc (once per top-level reader loop).
+    let mut uri_to_existing_sids: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::with_capacity(truly_changed.len());
     for doc in &truly_changed {
-        let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
-        for (sid, _, _) in &existing_sources {
-            let deps = storage.graph.list_dependent_sources(sid)?;
-            for dep in deps {
-                resolution_dirty_sources.insert(dep);
-            }
-        }
+        let existing = storage.graph.find_sources_by_uri(&doc.uri)?;
+        let sids: Vec<String> = existing.into_iter().map(|(sid, _, _)| sid).collect();
+        uri_to_existing_sids.insert(doc.uri.clone(), sids);
+    }
+
+    // Build the universe of sids that Phase 4 will cascade away — both
+    // the live sids backing truly-changed uris and the orphaned sids of
+    // deleted-on-disk files.
+    let mut all_phase4_sids: Vec<String> = Vec::new();
+    for sids in uri_to_existing_sids.values() {
+        all_phase4_sids.extend(sids.iter().cloned());
     }
     for (sid, _) in &deleted_sources {
-        let deps = storage.graph.list_dependent_sources(sid)?;
-        for dep in deps {
-            resolution_dirty_sources.insert(dep);
-        }
+        all_phase4_sids.push(sid.clone());
     }
+    all_phase4_sids.sort_unstable();
+    all_phase4_sids.dedup();
+
+    // 5 batched reads (≈O(1) round trips regardless of N):
+    let resolution_dirty_sources = storage
+        .graph
+        .list_dependent_sources_for_many(&all_phase4_sids)?;
     tracing::info!(
         resolution_dirty = resolution_dirty_sources.len(),
         "phase 4 resolution-dirty sources (cross-source Phase 7e deps now stale)"
     );
 
-    // Snapshot claim + structural-row counts BEFORE Phase 4 cascades them
-    // away so `IncrementalSummary` can report honest `claims_deleted` and
-    // `structural_rows_cascaded`.  We count per-source id (not per-uri)
-    // to stay consistent with what `remove_source_by_id` actually deletes.
-    let mut phase4_claim_delete_count: usize = 0;
-    let mut phase4_cascade_row_count: usize = 0;
-    for doc in &truly_changed {
-        for (sid, _, _) in storage.graph.find_sources_by_uri(&doc.uri)? {
-            phase4_claim_delete_count += storage.graph.get_claim_ids_for_source(&sid)?.len();
-            phase4_cascade_row_count += storage.graph.count_structural_rows_for_source(&sid)?;
-        }
-    }
-    for (sid, _) in &deleted_sources {
-        phase4_claim_delete_count += storage.graph.get_claim_ids_for_source(sid)?.len();
-        phase4_cascade_row_count += storage.graph.count_structural_rows_for_source(sid)?;
+    // Snapshot claim + structural-row counts BEFORE the cascade fires so
+    // `IncrementalSummary` can report honest `claims_deleted` and
+    // `structural_rows_cascaded`. Per-source attribution flattens into
+    // a total — the original per-source loop summed into the same two
+    // accumulators, so the wire surface is identical.
+    let claim_ids_by_sid = storage
+        .graph
+        .get_claim_ids_for_sources(&all_phase4_sids)?;
+    let phase4_claim_delete_count: usize =
+        claim_ids_by_sid.values().map(|v| v.len()).sum();
+    let cascade_counts_by_sid = storage
+        .graph
+        .count_structural_rows_for_sources(&all_phase4_sids)?;
+    let phase4_cascade_row_count: usize = cascade_counts_by_sid.values().sum();
+
+    // Cross-file staleness: the union of triples touching any sid we're
+    // about to cascade, PLUS triples involving any entity any of these
+    // sids contributed to (a removed source may have linked entity X to
+    // entity Y in another file — the X↔Y edge needs re-aggregation
+    // even though neither X nor Y was directly cascaded). Pre-fix
+    // `get_all_triples_involving_entities` was called per-source-id
+    // with 2N internal queries; the rewrite (Commit 3) makes it a
+    // single inline-relation join.
+    let mut affected_triples = storage
+        .graph
+        .get_source_relation_triples_for_sources(&all_phase4_sids)?;
+    let entity_ids_union: Vec<String> = storage
+        .graph
+        .get_entity_ids_for_sources(&all_phase4_sids)?
+        .into_iter()
+        .collect();
+    if !entity_ids_union.is_empty() {
+        let cross_file_triples = storage
+            .graph
+            .get_all_triples_involving_entities(&entity_ids_union)?;
+        tracing::debug!(
+            "cross-file staleness: {} entity ids, {} cross-file triples added (batched)",
+            entity_ids_union.len(),
+            cross_file_triples.len()
+        );
+        affected_triples.extend(cross_file_triples);
     }
 
-    let mut affected_triples: Vec<(String, String, String)> = Vec::new();
-
+    // Per-source cascade — kept sequential per the I-W4 atomic-rebuild
+    // boundary. The cancel checkpoint inside each iteration honors Stop
+    // within one source-removal cycle even on a large workspace.
     for doc in &truly_changed {
-        // Per-source cancel checkpoint — pre-fix Stop sat unhonored for
-        // the full Phase 4 duration (7-query nest × N sources) because
-        // bail_if_cancelled only fired at phase boundaries.
         bail_if_cancelled!();
-        let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
-        if !existing_sources.is_empty() {
-            for (source_id, _, _) in &existing_sources {
-                affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
-                let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
-                if !entity_ids_from_source.is_empty() {
-                    let cross_file_triples = storage
-                        .graph
-                        .get_all_triples_involving_entities(&entity_ids_from_source)?;
-                    let cross_file_count = cross_file_triples.len();
-                    affected_triples.extend(cross_file_triples);
-                    tracing::debug!(
-                        "cross-file staleness: {} entity ids, {} cross-file triples added for source {}",
-                        entity_ids_from_source.len(),
-                        cross_file_count,
-                        source_id
-                    );
-                }
-            }
+        if uri_to_existing_sids
+            .get(&doc.uri)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+        {
             storage.graph.remove_source_by_uri(&doc.uri)?;
         }
         progress_state.advance(1);
     }
 
-    for (source_id, uri) in &deleted_sources {
+    for (_source_id, uri) in &deleted_sources {
         bail_if_cancelled!();
-        affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
-        let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
-        if !entity_ids_from_source.is_empty() {
-            let cross_file_triples = storage
-                .graph
-                .get_all_triples_involving_entities(&entity_ids_from_source)?;
-            let cross_file_count = cross_file_triples.len();
-            affected_triples.extend(cross_file_triples);
-            tracing::debug!(
-                "cross-file staleness: {} entity ids, {} cross-file triples added for source {}",
-                entity_ids_from_source.len(),
-                cross_file_count,
-                source_id
-            );
-        }
         storage.graph.remove_source_by_uri(uri)?;
         fingerprints.remove(uri);
         progress_state.advance(1);
