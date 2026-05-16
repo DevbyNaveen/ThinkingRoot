@@ -986,6 +986,10 @@ async fn run_pipeline_inner(
     let mut affected_triples: Vec<(String, String, String)> = Vec::new();
 
     for doc in &truly_changed {
+        // Per-source cancel checkpoint — pre-fix Stop sat unhonored for
+        // the full Phase 4 duration (7-query nest × N sources) because
+        // bail_if_cancelled only fired at phase boundaries.
+        bail_if_cancelled!();
         let existing_sources = storage.graph.find_sources_by_uri(&doc.uri)?;
         if !existing_sources.is_empty() {
             for (source_id, _, _) in &existing_sources {
@@ -1011,6 +1015,7 @@ async fn run_pipeline_inner(
     }
 
     for (source_id, uri) in &deleted_sources {
+        bail_if_cancelled!();
         affected_triples.extend(storage.graph.get_source_relation_triples(source_id)?);
         let entity_ids_from_source = storage.graph.get_entity_ids_for_source(source_id)?;
         if !entity_ids_from_source.is_empty() {
@@ -1667,16 +1672,28 @@ async fn run_pipeline_inner(
                 }
             };
 
+        // Cancel checkpoint before any work — if Stop was clicked
+        // during Phase 9 / 10, don't even start the synthesis. For the
+        // LLM path, wrap the await in select so a click DURING the LLM
+        // call bails within ≤500 ms (LLM responses can take 60+ s and
+        // pre-fix would block Stop the entire time).
+        bail_if_cancelled!();
         let result = match &llm_client {
-            Some(client) => thinkingroot_paper::synthesize_and_persist_with_llm(
-                &storage.graph,
-                root_path,
-                &workspace_name,
-                now,
-                client,
-            )
-            .await
-            .map(|_| ()),
+            Some(client) => {
+                let fut = thinkingroot_paper::synthesize_and_persist_with_llm(
+                    &storage.graph,
+                    root_path,
+                    &workspace_name,
+                    now,
+                    client,
+                );
+                tokio::select! {
+                    r = fut => r.map(|_| ()),
+                    _ = cancel.cancelled() => {
+                        return Err(thinkingroot_core::Error::Cancelled);
+                    }
+                }
+            }
             None => thinkingroot_paper::synthesize_and_persist(
                 &storage.graph,
                 root_path,
