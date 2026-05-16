@@ -554,6 +554,26 @@ export type CompileProgress =
   // user clicked Compile and saw no UI activity for up to 60 s; React
   // can now render an explanatory "Waiting for engine…" state.
   | { phase: "booting"; workspace: string }
+  // Sidecar is up; we've POSTed `/compile/stream` and are waiting for
+  // the server-side pipeline ticker to emit its first event.  Bridges
+  // the ~500ms warm / ~2s cold gap between `started` and the first
+  // `tick`. The first Tick overwrites this caption within a second
+  // on typical workloads.
+  | { phase: "connecting"; workspace: string }
+  // First attempt failed; auto-retry scheduled.  Carries the retry
+  // attempt index (1-based — the user's click was attempt 0), the
+  // backoff delay before the retry fires, and the first-attempt error
+  // so the UI can render "Retrying after: <error>" honestly.  React
+  // also uses this as the trigger to reset its monotonic-max bar
+  // tracker so the retry's fresh Reading-5% tick doesn't look like a
+  // backward jump.
+  | {
+      phase: "retrying";
+      workspace: string;
+      attempt: number;
+      after_ms: number;
+      first_error: string;
+    }
   // Unified compile-progress snapshot — emitted every 250 ms by the
   // daemon ticker while a compile is live. **New UI surfaces should
   // render this as the single source of truth**; the per-phase

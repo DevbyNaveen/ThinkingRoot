@@ -232,6 +232,31 @@ pub enum CompileProgress {
     Booting {
         workspace: String,
     },
+    /// Sidecar is up; we've sent `POST /compile/stream` and are
+    /// waiting for the server to reach its first ticker emission
+    /// (~500ms typical, up to ~2s on cold first-mount). Pre-fix the
+    /// bar sat at "Starting compilation · 5%" with no movement during
+    /// this window. The fix paints a brief "Connecting to engine…"
+    /// caption that the first Tick overwrites within a second on a
+    /// warm sidecar.
+    Connecting {
+        workspace: String,
+    },
+    /// First attempt failed; auto-retry is scheduled. Carries the
+    /// retry attempt index (1-based — the user's click was attempt 0),
+    /// the backoff delay before the retry fires, and the first-attempt
+    /// error so the UI can surface "Retrying after: <error>" honestly
+    /// instead of pretending nothing went wrong. Pre-fix the bar sat
+    /// frozen at the last tick percent during the backoff with no UI
+    /// signal that a retry was happening, then snapped back to 5%
+    /// when the retry pipeline emitted its first Reading tick — which
+    /// looked like an unexplained reset.
+    Retrying {
+        workspace: String,
+        attempt: u32,
+        after_ms: u64,
+        first_error: String,
+    },
     DiffStart,
     DiffComplete {
         changed: usize,
@@ -617,6 +642,17 @@ async fn run_desktop_compile_task(
 
     let first_attempt = match sidecar {
         Some((host, port)) => {
+            // Bridge the Started→first-tick gap with a "Connecting"
+            // caption so the bar shows movement during the HTTP POST
+            // + server-side pipeline setup window (~500ms warm, up to
+            // ~2s cold). The first Tick from the server overwrites
+            // this caption within a second on typical workloads.
+            let _ = app.emit(
+                "workspace_compile_progress",
+                CompileProgress::Connecting {
+                    workspace: workspace_label.clone(),
+                },
+            );
             drive_compile_via_sidecar(
                 app.clone(),
                 host,
@@ -697,6 +733,22 @@ async fn run_desktop_compile_task(
                     COMPILE_AUTO_RETRY_LIMIT + 1
                 );
 
+                // Signal the retry to the UI so React can: (a) show
+                // a "Retrying after: <error>" caption instead of
+                // pretending nothing happened, and (b) reset its
+                // monotonic-max bar tracker so the retry's fresh
+                // Reading-5% tick doesn't look like an unexplained
+                // backward jump.
+                let _ = app.emit(
+                    "workspace_compile_progress",
+                    CompileProgress::Retrying {
+                        workspace: workspace_label.clone(),
+                        attempt: 1,
+                        after_ms: backoff.as_millis() as u64,
+                        first_error: first_err.clone(),
+                    },
+                );
+
                 // Cancel-aware sleep — if user clicks Stop during
                 // the backoff, bail immediately with Cancelled.
                 tokio::select! {
@@ -709,6 +761,16 @@ async fn run_desktop_compile_task(
                         let sidecar2 = await_sidecar_handle(&app, &workspace_label, &cancel).await;
                         match sidecar2 {
                             Some((host, port)) => {
+                                // Same Connecting caption as the first
+                                // attempt — the retry's HTTP POST +
+                                // server setup window deserves the
+                                // same honest signal.
+                                let _ = app.emit(
+                                    "workspace_compile_progress",
+                                    CompileProgress::Connecting {
+                                        workspace: workspace_label.clone(),
+                                    },
+                                );
                                 let retry_outcome = drive_compile_via_sidecar(
                                     app.clone(),
                                     host,
