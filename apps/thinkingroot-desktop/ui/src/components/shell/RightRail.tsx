@@ -613,10 +613,6 @@ function SubstrateCompileMeter({
 function CompilationProgressIndicator() {
   const progress = useApp((s) => s.compileProgress);
   const [stopping, setStopping] = useState(false);
-  /** Same done/total for a long time while extracting — usually one slow LLM batch, not a frozen UI. */
-  const [extractionStalled, setExtractionStalled] = useState(false);
-  const extractionSigRef = useRef<string>("");
-  const extractionChangeAtRef = useRef<number>(0);
   /**
    * Per-group phase start clock for ETA computation. Reset whenever
    * `compilePhaseGroup(progress.phase)` changes — every new umbrella
@@ -627,26 +623,35 @@ function CompilationProgressIndicator() {
   const phaseStartedAtRef = useRef<number>(0);
   /** Kept-alive ETA string for the currently-running phase. */
   const [eta, setEta] = useState<string>("");
+  /**
+   * Monotonic-max percent guard. The compile pipeline's user-visible
+   * step labels (`Reading`/`Extracting`/`Linking`/`Persisting`) don't
+   * map monotonically onto pipeline-internal phase order — Phase 4
+   * source-removal lives under `Persisting` (82-95% band) but happens
+   * BEFORE Phase 5 entity-relations (under `Linking`, 62-82% band).
+   * Without clamping, the bar would swing backward 33% twice per
+   * incremental compile. The substep caption (`progress.detail`)
+   * gives the user accurate "what's happening now" feedback; the bar
+   * just shows monotonic "fraction of work done."
+   *
+   * Reset on a new compile (`started`) or on an auto-retry boundary
+   * (`retrying`) — the retry's fresh Reading-5% tick is a genuine
+   * progress reset, not a backward jump.
+   */
+  const maxPercentRef = useRef<number>(0);
 
+  // Reset the monotonic-max bar tracker on compile start + retry
+  // boundary. Done/Failed/Cancelled don't reset — the terminal-state
+  // percent (100%) is always >= max so clamping is a no-op.
   useEffect(() => {
-    if (!progress || progress.phase !== "extraction_progress") {
-      setExtractionStalled(false);
+    if (!progress) {
+      maxPercentRef.current = 0;
       return;
     }
-    const sig = `${progress.done}/${progress.total}`;
-    const now = Date.now();
-    if (sig !== extractionSigRef.current) {
-      extractionSigRef.current = sig;
-      extractionChangeAtRef.current = now;
-      setExtractionStalled(false);
+    if (progress.phase === "started" || progress.phase === "retrying") {
+      maxPercentRef.current = 0;
     }
-    const tick = window.setInterval(() => {
-      if (Date.now() - extractionChangeAtRef.current > 75_000) {
-        setExtractionStalled(true);
-      }
-    }, 4000);
-    return () => window.clearInterval(tick);
-  }, [progress]);
+  }, [progress?.phase]);
 
   // Track per-phase start time; recompute ETA whenever a counted-progress
   // event arrives. Done/failed/cancelled clear the ETA so a stale value
@@ -763,6 +768,23 @@ function CompilationProgressIndicator() {
     }
     case "booting":
       title = "Waiting for engine"; details = `Workspace: ${progress.workspace}`; percent = 2; break;
+    case "connecting":
+      // Bridges the Started→first-tick window so the bar shows
+      // movement during the HTTP POST + server-side pipeline setup.
+      // Monotonic-max keeps this from reading as a backward jump
+      // when Started already painted 5%.
+      title = "Connecting to engine";
+      details = "Waiting for first progress event…";
+      percent = 4;
+      break;
+    case "retrying":
+      // Auto-retry boundary — the monotonic-max effect above has
+      // already reset the tracker on this phase. The bar resets to 3%
+      // and climbs again as the retry's pipeline emits tick events.
+      title = `Retrying compile (attempt ${progress.attempt + 1}/2)`;
+      details = `After ${(progress.after_ms / 1000).toFixed(1)}s — ${progress.first_error}`;
+      percent = 3;
+      break;
     case "diff_start":
       title = "Diffing workspace state"; details = "Comparing changed and unchanged sources"; percent = 8; break;
     case "diff_complete":
@@ -831,7 +853,22 @@ function CompilationProgressIndicator() {
       percent = 100; isError = true; break;
   }
 
-  const filledCount = substrateFilledSegments(percent);
+  // Monotonic-max clamp: during in-flight phases, the bar never goes
+  // below its high-water mark. Terminal states (done/failed/cancelled)
+  // use 100% directly. The displayed percent drives both `filledCount`
+  // and the ARIA `aria-valuenow` so screen readers and sighted users
+  // see the same number. Mutating the ref in render is safe here
+  // because we read it BEFORE the write and the displayed value is a
+  // pure function of (ref-before, current-percent).
+  const inFlight = !isDone && !isError && !isCancelled;
+  const displayPercent = inFlight
+    ? Math.max(maxPercentRef.current, percent)
+    : percent;
+  if (inFlight && displayPercent > maxPercentRef.current) {
+    maxPercentRef.current = displayPercent;
+  }
+
+  const filledCount = substrateFilledSegments(displayPercent);
   const activeTickBand = substrateActiveTickBand(progress);
   const indeterminateTick =
     progress.phase === "tick" &&
@@ -839,7 +876,7 @@ function CompilationProgressIndicator() {
     !isDone &&
     !isError &&
     !isCancelled;
-  const meterAriaText = `${title}. ${details || `${Math.round(percent)}%`}`;
+  const meterAriaText = `${title}. ${details || `${Math.round(displayPercent)}%`}`;
 
   return (
     <section
@@ -874,12 +911,12 @@ function CompilationProgressIndicator() {
                 <span className="whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
                   {eta ? (
                     <>
-                      <span className="text-foreground">{Math.round(percent)}%</span>
+                      <span className="text-foreground">{Math.round(displayPercent)}%</span>
                       <span> · </span>
                       <span className="text-primary">ETA {eta}</span>
                     </>
                   ) : (
-                    <span className="text-foreground">{Math.round(percent)}%</span>
+                    <span className="text-foreground">{Math.round(displayPercent)}%</span>
                   )}
                 </span>
                 <Button
@@ -905,7 +942,7 @@ function CompilationProgressIndicator() {
 
       <SubstrateCompileMeter
         filledCount={filledCount}
-        progressPercent={percent}
+        progressPercent={displayPercent}
         isDone={isDone}
         isError={isError}
         isCancelled={isCancelled}
@@ -945,17 +982,12 @@ function CompilationProgressIndicator() {
       >
         {details}
       </p>
-      {progress.phase === "extraction_progress" &&
-        extractionStalled &&
-        !isDone &&
-        !isError &&
-        !isCancelled && (
-          <p className="text-[10px] leading-snug text-amber-700 dark:text-amber-300/95">
-            Over 75s on this count — likely a slow or stuck LLM call. Stop
-            (■) aborts the run; check Settings → Credentials and provider
-            limits.
-          </p>
-        )}
+      {progress.phase === "retrying" && (
+        <p className="text-[10px] leading-snug text-amber-700 dark:text-amber-300/95">
+          First attempt failed — retrying once before giving up. Click Stop
+          (■) to bail out now, or wait for the retry to complete.
+        </p>
+      )}
       {progress.phase === "done" &&
         progress.failed_batches !== undefined &&
         progress.failed_batches > 0 && (

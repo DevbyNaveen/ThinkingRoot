@@ -160,6 +160,10 @@ function compileLabel(p: CompileProgress | null): { busy: boolean; text: string 
     }
     case "booting":
       return { busy: true, text: "compile · engine…" };
+    case "connecting":
+      return { busy: true, text: "compile · connecting…" };
+    case "retrying":
+      return { busy: true, text: `compile · retry ${p.attempt + 1}/2` };
     case "started":
       return { busy: true, text: "compile · starting" };
     default:
