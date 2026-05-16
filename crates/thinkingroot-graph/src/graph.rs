@@ -467,6 +467,30 @@ impl GraphStore {
                 confidence: Float default 0.9,
                 created_at: Float default 0.0
             }",
+            // ─── Cognition Commits (Phase β.1, 2026-05-16).
+            //     Each row is a content-addressed cognition event —
+            //     `id = BLAKE3(domain || parent || branch || author ||
+            //     prompt || reasoning || sorted(witnesses_added) ||
+            //     sorted(citations) || sorted(gaps_surfaced))`. See
+            //     `crates/thinkingroot-core/src/types/cognition.rs` for
+            //     the identity derivation. Citations + witnesses_added
+            //     are stored JSON-encoded; the in-app projection types
+            //     decode them at read time.
+            ":create cognition_commits {
+                id: String
+                =>
+                parent_id: String default '',
+                branch: String,
+                author_kind: String,
+                author_id: String,
+                author_model: String default '',
+                prompt: String default '',
+                reasoning: String default '',
+                witnesses_added_json: String default '[]',
+                citations_json: String default '[]',
+                gaps_surfaced_json: String default '[]',
+                created_at: Float default 0.0
+            }",
             ":create entities {
                 id: String
                 =>
@@ -996,6 +1020,12 @@ impl GraphStore {
             "::index create witness_typed_edges:by_from { from_witness_id }",
             "::index create witness_typed_edges:by_to { to_witness_id }",
             "::index create witness_typed_edges:by_type { edge_type }",
+            // Cognition Commits — branch-scoped listing + parent-walk
+            // are the two hot read paths; author lookup is a cold but
+            // load-bearing audit query.
+            "::index create cognition_commits:by_branch { branch }",
+            "::index create cognition_commits:by_parent { parent_id }",
+            "::index create cognition_commits:by_author { author_kind, author_id }",
             "::index create events:by_subject { subject_entity_id }",
             "::index create events:by_timestamp { timestamp }",
             "::index create turns:by_session { session_id }",
@@ -7490,6 +7520,115 @@ mod tests {
                 .len(),
             1,
             "the unrelated source's entity event must still be findable"
+        );
+    }
+
+    /// Regression: the hybrid pipeline's `fetch_events` (see
+    /// `crates/thinkingroot-serve/src/intelligence/hybrid.rs`) used
+    /// the bind-rename pattern `*events{subject_entity_id: entity_id,
+    /// ...}` together with a head reference to `subject_entity_id`.
+    /// Cozo's stratified evaluator rejects this with
+    /// `Symbol 'subject_entity_id' in rule head is unbound` because
+    /// the local variable bound by the rename (`entity_id`) is
+    /// distinct from the head's column-named reference. Every
+    /// `/api/v1/ws/{ws}/search/hybrid` call that produced ≥1 vector
+    /// candidate failed with an `INTERNAL` error.
+    ///
+    /// This test pins the corrected idiom — bind the column under its
+    /// own name and constrain it via a separate predicate — by
+    /// running the exact Datalog string against a real Cozo instance
+    /// with sample events + claim_entity_edges rows.
+    #[test]
+    fn hybrid_fetch_events_query_parses_and_joins() {
+        use cozo::ScriptMutability;
+        use thinkingroot_core::types::ExtractedEvent;
+        let mut store = mem_store();
+
+        // Seed: one source, two entities, two events (alice
+        // subject-side, paris object-side), and a claim_entity_edges
+        // row linking claim "c-alice" to entity "alice-ulid". The
+        // hybrid query joins events to claims via this edge table.
+        let source = thinkingroot_core::Source::new(
+            "test://hybrid-events.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("hash-hybrid".into()));
+        let source_id = source.id.to_string();
+        store.insert_source(&source).unwrap();
+        store
+            .insert_events(&[
+                ExtractedEvent {
+                    id: "ev-subject".into(),
+                    subject_entity_id: "alice-ulid".into(),
+                    verb: "visited".into(),
+                    object_entity_id: "paris-ulid".into(),
+                    timestamp: 1_700_000_000.0,
+                    normalized_date: "2023-11-14".into(),
+                    source_id: source_id.clone(),
+                    confidence: 0.9,
+                },
+                ExtractedEvent {
+                    id: "ev-object".into(),
+                    subject_entity_id: "bob-ulid".into(),
+                    verb: "founded".into(),
+                    object_entity_id: "alice-ulid".into(),
+                    timestamp: 1_700_001_000.0,
+                    normalized_date: "2023-11-14".into(),
+                    source_id,
+                    confidence: 0.8,
+                },
+            ])
+            .unwrap();
+
+        // Insert a claim_entity_edges row directly (no public helper
+        // exists — this mirrors what `link::link_claim_entities`
+        // writes during Phase 7 of compile).
+        store
+            .db
+            .run_script(
+                "?[claim_id, entity_id] <- [['c-alice', 'alice-ulid']]
+                 :put claim_entity_edges { claim_id, entity_id }",
+                Default::default(),
+                ScriptMutability::Mutable,
+            )
+            .expect("claim_entity_edges seed");
+
+        // Run the EXACT Datalog string from `fetch_events`. If the
+        // bind-rename regression returns, this assert fires.
+        let mut params = std::collections::BTreeMap::new();
+        let cset = cozo::DataValue::List(vec![cozo::DataValue::Str("c-alice".into())]);
+        params.insert("cset".into(), cset);
+        params.insert("ws".into(), cozo::DataValue::from(0.0_f64));
+        params.insert("we".into(), cozo::DataValue::from(f64::MAX));
+
+        let rows = store
+            .db
+            .run_script(
+                r#"?[claim_id, subject_entity_id, verb, object_entity_id, timestamp, normalized_date] :=
+                    claim_id in $cset,
+                    *claim_entity_edges{claim_id, entity_id},
+                    *events{subject_entity_id, verb, object_entity_id, timestamp, normalized_date},
+                    subject_entity_id = entity_id,
+                    timestamp >= $ws,
+                    timestamp <= $we
+                ?[claim_id, subject_entity_id, verb, object_entity_id, timestamp, normalized_date] :=
+                    claim_id in $cset,
+                    *claim_entity_edges{claim_id, entity_id},
+                    *events{subject_entity_id, verb, object_entity_id, timestamp, normalized_date},
+                    object_entity_id = entity_id,
+                    timestamp >= $ws,
+                    timestamp <= $we"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .expect("hybrid fetch_events query must parse and execute against real Cozo");
+
+        // The seed has alice as both subject (ev-subject) and object
+        // (ev-object). Both rules must fire — one each, two rows total.
+        assert_eq!(
+            rows.rows.len(),
+            2,
+            "subject-side + object-side rules must each fire once"
         );
     }
 

@@ -1498,18 +1498,26 @@ fn fetch_events(
     params.insert("we".into(), DataValue::from(end));
     // Events are entity-keyed, not claim-keyed. Attach per claim through
     // its claim_entity_edges.
+    // Cozo idiom: bind every column referenced in the head via the body's
+    // relation pattern, then constrain via predicate. Renaming a column at
+    // bind time (`{col: localvar}`) makes the column unbound in the head —
+    // Cozo's stratified evaluator rejects this with `Symbol '<col>' in rule
+    // head is unbound`. See `.claude/rules/witness-mesh.md` Datalog query
+    // idiom and `.claude/rules/hybrid-retrieval.md`.
     let rows = run_hybrid(
         graph,
         r#"?[claim_id, subject_entity_id, verb, object_entity_id, timestamp, normalized_date] :=
             claim_id in $cset,
             *claim_entity_edges{claim_id, entity_id},
-            *events{subject_entity_id: entity_id, verb, object_entity_id, timestamp, normalized_date},
+            *events{subject_entity_id, verb, object_entity_id, timestamp, normalized_date},
+            subject_entity_id = entity_id,
             timestamp >= $ws,
             timestamp <= $we
         ?[claim_id, subject_entity_id, verb, object_entity_id, timestamp, normalized_date] :=
             claim_id in $cset,
             *claim_entity_edges{claim_id, entity_id},
-            *events{subject_entity_id, verb, object_entity_id: entity_id, timestamp, normalized_date},
+            *events{subject_entity_id, verb, object_entity_id, timestamp, normalized_date},
+            object_entity_id = entity_id,
             timestamp >= $ws,
             timestamp <= $we"#,
         params,
