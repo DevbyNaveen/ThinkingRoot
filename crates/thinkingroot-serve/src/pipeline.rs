@@ -208,6 +208,13 @@ pub(crate) struct CompileProgressState {
     /// Milliseconds since `pipeline_start` when the current step began.
     /// Stored as a u64 atomic so we never need a mutex.
     step_started_ms: std::sync::atomic::AtomicU64,
+    /// Short sub-phase label surfaced as `CompileTick.detail` so the UI
+    /// can render an honest indeterminate-spinner caption. Set 10–15
+    /// times per compile at sub-phase boundaries (a `&'static str` from
+    /// a fixed catalog — no allocation, no payload contention). The
+    /// ticker reads this every 250 ms; the read is the only place a
+    /// lock is held, and only for the duration of a 1-pointer copy.
+    substep: std::sync::Mutex<&'static str>,
 }
 
 impl CompileProgressState {
@@ -220,6 +227,7 @@ impl CompileProgressState {
             total: std::sync::atomic::AtomicU64::new(0),
             pipeline_start: std::time::Instant::now(),
             step_started_ms: std::sync::atomic::AtomicU64::new(0),
+            substep: std::sync::Mutex::new(""),
         }
     }
 
@@ -245,6 +253,19 @@ impl CompileProgressState {
 
     pub(crate) fn set_total(&self, n: u64) {
         self.total.store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Replace the sub-phase label surfaced as `CompileTick.detail`.
+    /// Callers pass `&'static str` from the in-file catalog (e.g.
+    /// `"removing changed sources"`, `"persisting witnesses"`); the
+    /// ticker snapshot copies the pointer under a brief Mutex.  Poison
+    /// is impossible (no panic between lock + write), so a `.lock()`
+    /// failure is intentionally swallowed — substep is observability,
+    /// not correctness.
+    pub(crate) fn set_substep(&self, label: &'static str) {
+        if let Ok(mut guard) = self.substep.lock() {
+            *guard = label;
+        }
     }
 
     fn step_from_index(idx: u8) -> thinkingroot_core::CompileStep {
@@ -276,6 +297,16 @@ impl CompileProgressState {
         } else {
             None
         };
+        // Substep is a 1-pointer copy; an empty literal maps to `None`
+        // so the UI's fallback caption logic only fires when the engine
+        // genuinely has nothing more specific to say.
+        let detail = self
+            .substep
+            .lock()
+            .ok()
+            .map(|g| *g)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         thinkingroot_core::CompileTick {
             step,
             done,
@@ -283,7 +314,7 @@ impl CompileProgressState {
             step_elapsed_ms,
             total_elapsed_ms,
             eta_ms,
-            detail: None,
+            detail,
         }
     }
 }
@@ -392,12 +423,16 @@ pub struct PipelineOptions {
     /// `ProgressEvent::PipelineFailed`.  Partial state already
     /// persisted by Phase 4 (changed-source removal) is preserved.
     pub cancel: CancellationToken,
-    /// Skip Phase 6.5 (Rooting admission gate).  All admitted claims
-    /// stay in the `attested` tier — same as pre-Rooting behaviour.
-    /// Pre-fix this was driven by an env var
-    /// (`TR_ROOTING_DISABLED=1`) that the CLI set via
-    /// `unsafe { std::env::set_var(...) }`; this field replaces that
-    /// hazard with explicit plumbing.
+    /// Pre-Witness-Mesh: skipped Phase 6.5 (Rooting admission gate).
+    /// Post-cutover (2026-05-11): Phase 6.5 is deleted, so this flag
+    /// is a no-op kept for wire-compat — both `true` and `false`
+    /// produce identical behaviour. Retained because the CLI's
+    /// `--no-rooting` flag, the desktop's compile-stream request body,
+    /// and SSE consumers built against pre-cutover daemons all plumb
+    /// through this struct field. The historical env-var shortcut
+    /// `TR_ROOTING_DISABLED=1` (which sat behind `unsafe { std::env::set_var(...) }`)
+    /// is gone — see the "Phase 6.5: Rooting — DELETED" block below
+    /// for the cutover rationale.
     pub no_rooting: bool,
     /// For tests + local iteration: skip the Phase 9 byte-coverage +
     /// structural-orphan audit so a fixture that doesn't satisfy 100%
@@ -517,6 +552,7 @@ async fn run_pipeline_inner(
     let progress_state = std::sync::Arc::new(CompileProgressState::new());
     let _ticker_guard = progress.as_ref().map(|tx| {
         progress_state.set_step(thinkingroot_core::CompileStep::Reading, 0);
+        progress_state.set_substep("starting compile");
         let ticker_cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_compile_ticker(
             progress_state.clone(),
@@ -536,17 +572,18 @@ async fn run_pipeline_inner(
     // ParseStart fires *here*, after config/data-dir setup but immediately
     // before the actual parse, so the displayed "Parsing" elapsed reflects
     // only the cost of `parse_directory` itself.
+    progress_state.set_substep("reading files");
     emit!(ProgressEvent::ParseStart);
     bail_if_cancelled!();
     let documents = thinkingroot_parse::parse_directory(root_path, &config.parsers)?;
     let files_parsed = documents.len();
     // Reading is done — stamp the total so the bar shows N/N for a
-    // moment before transitioning. Then move to Extracting (covers
-    // Phase 2 extract + Phase 3 fingerprint + Phase 4 source-removal,
-    // which are all "input-deriving" work from the user's perspective).
+    // moment. We stay on `Reading` through migration (opens graph) and
+    // Phase 1 (diffs filesystem against graph); the transition to
+    // `Extracting` happens at the actual Phase 2 entry below. This keeps
+    // each user-visible step label honest to the work currently running.
     progress_state.set_total(files_parsed as u64);
     progress_state.set_done(files_parsed as u64);
-    progress_state.set_step(thinkingroot_core::CompileStep::Extracting, 0);
     emit!(ProgressEvent::ParseComplete {
         files: files_parsed
     });
@@ -555,6 +592,7 @@ async fn run_pipeline_inner(
     // ─── Diff phase: compare against the stored graph ──────────────────
     // Storage open + fingerprint load + content-hash scan + deletion detect
     // + graph-primed context load all live under one user-visible bar.
+    progress_state.set_substep("opening graph");
     emit!(ProgressEvent::DiffStart);
     let mut storage = StorageEngine::init(&data_dir).await?;
     let mut fingerprints = crate::fingerprint::FingerprintStore::load(&data_dir);
@@ -575,6 +613,10 @@ async fn run_pipeline_inner(
         .get_workspace_meta("compile_schema_version")?
         .unwrap_or_default();
     if current_version != "3" {
+        // Migration runs while the bar is still on `Reading`. Substep
+        // surfaces the actual work so a 1-GB substrate's multi-minute
+        // backfill is honest, not a silent "0.0s elapsed" spinner.
+        progress_state.set_substep("migrating schema");
         if current_version != "2" {
             tracing::info!(
                 current_version = %current_version,
@@ -592,6 +634,7 @@ async fn run_pipeline_inner(
         crate::backfill::backfill_water_flow_v3_at_path(&data_dir)?;
         // Re-open with the v3 schema in place.
         storage = StorageEngine::init(&data_dir).await?;
+        progress_state.set_substep("opening graph");
     }
 
     // ─── Phase 1: Identify potentially-changed documents ───────────────
@@ -603,6 +646,7 @@ async fn run_pipeline_inner(
     // which dominated Phase 1 latency on workspaces with many files — e.g.
     // 100 queries × ~20ms each = ~2s even when 99 files were unchanged.
     // The batched path pays one round-trip regardless of workspace size.
+    progress_state.set_substep("diffing workspace");
     let stored_hashes: HashSet<String> = {
         let pairs = storage.graph.get_sources_with_hashes()?;
         pairs
@@ -709,6 +753,17 @@ async fn run_pipeline_inner(
     // get_known_entities` / `get_known_relations` remain available
     // for any future chat-time consumer that needs them.
 
+    // Bar transitions to `Extracting` here — the actual Phase 2 work.
+    // Pre-fix the transition happened back at parse-end (line 553) and
+    // the entire diff + migration ran under a mislabeled "Extracting"
+    // bar. Total = potentially-changed source count; per-source advance
+    // is implicit (structural extraction is microseconds per chunk so
+    // the bar fills near-instantly once the rule pass begins).
+    progress_state.set_step(
+        thinkingroot_core::CompileStep::Extracting,
+        potentially_changed.len() as u64,
+    );
+    progress_state.set_substep("extracting structure");
     if potentially_changed.is_empty() {
         // Only deletions — no extraction needed.
         cache_hits = 0;
@@ -829,6 +884,10 @@ async fn run_pipeline_inner(
     // When `no_incremental` is set, all potentially-changed docs proceed
     // regardless of fingerprint equality (fingerprint store is still updated
     // so the next incremental run can resume normally).
+    //
+    // Stays on `Extracting` step — fingerprint depends on the extracted
+    // claims so it's conceptually "post-process the extract output."
+    progress_state.set_substep("fingerprinting");
     let mut truly_changed: Vec<_> = Vec::new();
     let mut fingerprint_cutoffs = 0usize;
 
@@ -873,6 +932,18 @@ async fn run_pipeline_inner(
     // after the cascade the rows are gone and the dirty set would be empty.
     // The set is used to log observability data immediately; T11 (watch mode)
     // will consume it for source-granular re-extraction.
+    //
+    // Bar transitions to `Persisting` here — Phase 4 is substrate GC
+    // (cascades across 16 structural tables), conceptually closer to
+    // "preparing the substrate for new writes" than to extraction.  Total
+    // = changed + deleted sources; per-source `advance(1)` happens at
+    // each `remove_source_by_uri` call below so the bar moves as work
+    // completes instead of glued at 0/N.
+    progress_state.set_step(
+        thinkingroot_core::CompileStep::Persisting,
+        (truly_changed.len() + deleted_sources.len()) as u64,
+    );
+    progress_state.set_substep("removing changed sources");
     let mut resolution_dirty_sources: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for doc in &truly_changed {
@@ -936,6 +1007,7 @@ async fn run_pipeline_inner(
             }
             storage.graph.remove_source_by_uri(&doc.uri)?;
         }
+        progress_state.advance(1);
     }
 
     for (source_id, uri) in &deleted_sources {
@@ -956,6 +1028,7 @@ async fn run_pipeline_inner(
         }
         storage.graph.remove_source_by_uri(uri)?;
         fingerprints.remove(uri);
+        progress_state.advance(1);
     }
     mark_phase!("remove_sources");
 
@@ -965,6 +1038,7 @@ async fn run_pipeline_inner(
     // Phase 7. We don't know an honest total here (Cozo-side update),
     // so the ticker shows a spinner with elapsed time only.
     progress_state.set_step(thinkingroot_core::CompileStep::Linking, 0);
+    progress_state.set_substep("updating relations");
     if !affected_triples.is_empty() {
         affected_triples.sort_unstable();
         affected_triples.dedup();
@@ -1058,6 +1132,7 @@ async fn run_pipeline_inner(
         thinkingroot_core::CompileStep::Persisting,
         truly_changed.len() as u64,
     );
+    progress_state.set_substep("inserting sources");
     let byte_store = thinkingroot_graph::FileSystemSourceStore::new(&data_dir)
         .map_err(|e| thinkingroot_core::Error::Config(format!("rooting byte store: {e}")))?;
     for doc in &truly_changed {
@@ -1153,6 +1228,7 @@ async fn run_pipeline_inner(
     let mut persisted_witness_count: usize = 0;
     if !filtered_extraction.witnesses.is_empty() {
         let raw_witness_count = filtered_extraction.witnesses.len();
+        progress_state.set_substep("persisting witnesses");
         emit!(ProgressEvent::WitnessMeshStart { raw: raw_witness_count });
         let assembled = thinkingroot_extract::assemble_witness_mesh(
             std::mem::take(&mut filtered_extraction.witnesses),
@@ -1254,6 +1330,7 @@ async fn run_pipeline_inner(
     // satisfied here: sources inserted (Phase 6), bytes available in
     // byte_store, admission_tier stamped (Phase 6.5 / no-op when rooting
     // disabled), linker not yet run.
+    progress_state.set_substep("persisting structural rows");
     let phase_6_7_doc_refs: Vec<&thinkingroot_core::ir::DocumentIR> =
         truly_changed.iter().copied().collect();
     let phase_6_7_stats = crate::structural_persist::phase_6_7_structural_persist(
@@ -1279,6 +1356,7 @@ async fn run_pipeline_inner(
     // `progress_state` so the bar shows real entity-merge progress.
     let entities_total = filtered_extraction.entities.len() as u64;
     progress_state.set_step(thinkingroot_core::CompileStep::Linking, entities_total);
+    progress_state.set_substep("linking entities");
 
     // Phase 5 Witness Mesh cutover (2026-05-14): `claims_count` is
     // the pipeline's "this compile produced N substrate rows" signal
@@ -1346,6 +1424,7 @@ async fn run_pipeline_inner(
     //
     // Non-fatal: event calendar failure must never abort the pipeline.
     {
+        progress_state.set_substep("extracting events");
         // Audit invariant: no `unwrap_or_default()` on engine-error
         // returns.  A real CozoDB failure here previously masqueraded
         // as "no entities yet" and silently skipped event-calendar
@@ -1405,6 +1484,7 @@ async fn run_pipeline_inner(
     }
 
     // ─── Phase 8: Incremental entity relation update for new sources ───
+    progress_state.set_substep("updating relations");
     let mut new_triples: Vec<(String, String, String)> = Vec::new();
     for doc in &truly_changed {
         new_triples.extend(
@@ -1460,6 +1540,7 @@ async fn run_pipeline_inner(
     // writing, but from the user's bar this is "verifying what we just
     // persisted." No known total → spinner with elapsed-only.
     progress_state.set_step(thinkingroot_core::CompileStep::Persisting, 0);
+    progress_state.set_substep("auditing byte coverage");
     let phase_9_skip = skip_byte_audit
         || std::env::var("TR_SKIP_BYTE_AUDIT")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1535,6 +1616,7 @@ async fn run_pipeline_inner(
     // differ in counts and the user-facing root README is workspace-
     // level state.
     if matches!(branch, None | Some("main")) {
+        progress_state.set_substep("synthesizing readme");
         if let Err(e) = synthesise_and_persist_readme(root_path, &storage).await {
             // Non-fatal: a failure here means the README is stale, not
             // that the compile produced bad data. Surface as warn (no
@@ -1561,6 +1643,7 @@ async fn run_pipeline_inner(
     // provider we fall back to the v1 deterministic-only path so a
     // misconfigured workspace still yields a (skeleton-only) paper.
     if matches!(branch, None | Some("main")) {
+        progress_state.set_substep("synthesizing paper");
         let workspace_name: String = root_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -1913,5 +1996,58 @@ mod tests {
         assert_eq!(result.files_parsed, 0);
         assert_eq!(result.claims_count, 0);
         assert!(!result.cache_dirty, "empty compile must not dirty cache");
+    }
+
+    /// `set_substep` must propagate into the next ticker snapshot's
+    /// `detail` field. The UI's indeterminate-fallback caption keys off
+    /// this field; if a future refactor drops the wiring, the bar
+    /// silently regresses to the "counting sources…" lie.
+    #[test]
+    fn substep_round_trips_through_snapshot() {
+        let state = CompileProgressState::new();
+        let snap0 = state.snapshot();
+        assert!(
+            snap0.detail.is_none(),
+            "fresh state must have no substep detail"
+        );
+
+        state.set_substep("removing changed sources");
+        let snap1 = state.snapshot();
+        assert_eq!(
+            snap1.detail.as_deref(),
+            Some("removing changed sources"),
+            "set_substep must surface as snapshot.detail"
+        );
+
+        // Empty literal clears the detail back to None — used by the
+        // ticker spawn block before any sub-phase has set a label.
+        state.set_substep("");
+        let snap2 = state.snapshot();
+        assert!(
+            snap2.detail.is_none(),
+            "empty substep must surface as None, not Some(\"\")"
+        );
+    }
+
+    /// Substep persists across `set_step` transitions; resetting the
+    /// step (done→0, total→N) intentionally does NOT clear the substep
+    /// because the next sub-phase always overwrites it explicitly. This
+    /// pins the contract so a `set_step` re-entry mid-phase doesn't
+    /// flash an empty caption.
+    #[test]
+    fn substep_persists_across_step_transitions() {
+        let state = CompileProgressState::new();
+        state.set_substep("linking entities");
+        state.set_step(thinkingroot_core::CompileStep::Persisting, 42);
+
+        let snap = state.snapshot();
+        assert_eq!(snap.step, thinkingroot_core::CompileStep::Persisting);
+        assert_eq!(snap.total, 42);
+        assert_eq!(snap.done, 0, "set_step must reset done to 0");
+        assert_eq!(
+            snap.detail.as_deref(),
+            Some("linking entities"),
+            "substep survives a set_step call by design"
+        );
     }
 }
