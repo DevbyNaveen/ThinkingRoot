@@ -1046,6 +1046,212 @@ impl GraphStore {
 
         Ok(orphans)
     }
+
+    // ─── Batched Phase 4 readers (water-flow perf §T13) ────────────────
+    //
+    // The five methods below collapse Phase 4's per-source query nest
+    // (~10N queries on N changed sources) into ~5 queries total by
+    // pinning the candidate id set to a single inline relation and
+    // joining once. The pattern is the canonical Cozo batching idiom
+    // already shipped in `GraphStore::fetch_source_uris` (graph.rs:1675).
+    //
+    // Each method preserves the per-source method's semantics exactly
+    // — same input universe, same output shape (modulo the
+    // single-vs-many wrapper). The pipeline switch in Phase 4 is a
+    // mechanical rewrite, never a behaviour change.
+
+    /// Batched form of [`Self::list_dependent_sources`]. Returns the
+    /// union of dependent sources across `target_ids`, deduplicated.
+    /// Used by Phase 4 to compute `resolution_dirty_sources` in one
+    /// round trip instead of `target_ids.len()` round trips.
+    pub fn list_dependent_sources_for_many(
+        &self,
+        target_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if target_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<DataValue> = target_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        let result = self
+            .query(
+                "candidate[to] <- $ids
+                 ?[from_source_id] := candidate[to], \
+                   *resolution_deps{from_source_id, to_source_id: to}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_dependent_sources_for_many: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|r: &Vec<DataValue>| r.first().map(dv_to_string))
+            .collect())
+    }
+
+    /// Batched form of [`Self::count_structural_rows_for_source`].
+    /// Returns per-source totals (id → row count across all 16
+    /// structural tables). Used by Phase 4 to snapshot
+    /// `structural_rows_cascaded` for `IncrementalSummary` without
+    /// 16×N individual queries.
+    pub fn count_structural_rows_for_sources(
+        &self,
+        sids: &[String],
+    ) -> Result<HashMap<String, usize>> {
+        use thinkingroot_core::structural_registry::STRUCTURAL_TABLES;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        if sids.is_empty() {
+            return Ok(counts);
+        }
+        let rows: Vec<DataValue> = sids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        for spec in STRUCTURAL_TABLES {
+            let mut params = BTreeMap::new();
+            params.insert("ids".into(), DataValue::List(rows.clone()));
+            let script = format!(
+                "candidate[sid] <- $ids
+                 ?[sid, count(x)] := candidate[sid], \
+                   *{name}{{{sid_col}: sid, {pk}: x}}",
+                name = spec.name,
+                sid_col = spec.source_id_column,
+                pk = structural_count_pk(spec.name),
+            );
+            let result = self
+                .query(&script, params)
+                .map_err(|e| Error::GraphStorage(format!(
+                    "count_structural_rows_for_sources({}): {e}", spec.name
+                )))?;
+            for r in &result.rows {
+                if r.len() >= 2 {
+                    let sid = dv_to_string(&r[0]);
+                    let n = dv_to_u64(&r[1]) as usize;
+                    *counts.entry(sid).or_insert(0) += n;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Batched form of [`Self::get_claim_ids_for_source`]. Returns
+    /// per-source claim id lists (id → vec of claim ids). Used by
+    /// Phase 4 to compute `phase4_claim_delete_count` in one query.
+    pub fn get_claim_ids_for_sources(
+        &self,
+        sids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        if sids.is_empty() {
+            return Ok(out);
+        }
+        let rows: Vec<DataValue> = sids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        let result = self
+            .query(
+                "candidate[sid] <- $ids
+                 ?[sid, cid] := candidate[sid], *claims{id: cid, source_id: sid}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_claim_ids_for_sources: {e}")))?;
+        for r in &result.rows {
+            if r.len() >= 2 {
+                let sid = dv_to_string(&r[0]);
+                let cid = dv_to_string(&r[1]);
+                out.entry(sid).or_default().push(cid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched form of [`Self::get_source_relation_triples`]. Returns
+    /// the union of triples across all `sids`, deduplicated. Phase 4
+    /// extends `affected_triples` with the union anyway — dedup
+    /// downstream is a no-op when we dedup here.
+    pub fn get_source_relation_triples_for_sources(
+        &self,
+        sids: &[String],
+    ) -> Result<Vec<(String, String, String)>> {
+        if sids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<DataValue> = sids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        let result = self
+            .query(
+                "candidate[sid] <- $ids
+                 ?[from_id, to_id, relation_type] := candidate[sid], \
+                   *source_entity_relations{source_id: sid, from_id, to_id, relation_type}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!(
+                "get_source_relation_triples_for_sources: {e}"
+            )))?;
+        let mut out: Vec<(String, String, String)> = result
+            .rows
+            .iter()
+            .filter(|r| r.len() >= 3)
+            .map(|r| (dv_to_string(&r[0]), dv_to_string(&r[1]), dv_to_string(&r[2])))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Batched form of [`Self::get_entity_ids_for_source`]. Returns
+    /// the UNION of entity ids across all `sids`, deduplicated. Phase 4
+    /// only needs the union — it feeds the result into
+    /// `get_all_triples_involving_entities`, which itself is the union
+    /// of cross-file triples touching any of these entities. Per-source
+    /// attribution is lost in the original code path too (the dedup
+    /// at the end of Phase 4 collapses it).
+    pub fn get_entity_ids_for_sources(
+        &self,
+        sids: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        if sids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<DataValue> = sids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        // Three disjunctive rules mirror `get_entity_ids_for_source`:
+        // (a) entities via claim_source_edges + claim_entity_edges,
+        // (b) entities appearing as from_id in source_entity_relations,
+        // (c) entities appearing as to_id in source_entity_relations.
+        let result = self
+            .query(
+                "candidate[sid] <- $ids
+                 ?[entity_id] := candidate[sid], \
+                   *claim_source_edges{claim_id, source_id: sid}, \
+                   *claim_entity_edges{claim_id, entity_id}
+                 ?[entity_id] := candidate[sid], \
+                   *source_entity_relations{source_id: sid, from_id: entity_id}
+                 ?[entity_id] := candidate[sid], \
+                   *source_entity_relations{source_id: sid, to_id: entity_id}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_entity_ids_for_sources: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|r| r.first().map(dv_to_string))
+            .collect())
+    }
 }
 
 /// The auto-generated Phase 9 coverage union — one disjunct per of the
@@ -1176,5 +1382,130 @@ mod tests {
             .query_read("?[source_id, dotted_path, value] := *config_tree{source_id, dotted_path, value}")
             .unwrap();
         assert_eq!(probe.rows.len(), 1);
+    }
+
+    // ─── Batched Phase 4 reader tests (Commit 3 / §T13) ────────────────
+
+    #[test]
+    fn batched_phase4_methods_handle_empty_input() {
+        let store = make_store();
+        // Every batched reader must short-circuit on empty input — Phase 4
+        // calls them with `truly_changed` which is empty when only
+        // deletions are pending (and would otherwise issue a malformed
+        // Cozo query against an empty inline relation).
+        let empty: Vec<String> = Vec::new();
+        assert!(store.list_dependent_sources_for_many(&empty).unwrap().is_empty());
+        assert!(store.count_structural_rows_for_sources(&empty).unwrap().is_empty());
+        assert!(store.get_claim_ids_for_sources(&empty).unwrap().is_empty());
+        assert!(store.get_source_relation_triples_for_sources(&empty).unwrap().is_empty());
+        assert!(store.get_entity_ids_for_sources(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_structural_rows_for_sources_aggregates_per_source_across_tables() {
+        let store = make_store();
+        // src-1: 2 function_calls + 1 heading = 3 rows.
+        // src-2: 1 function_call only = 1 row.
+        store
+            .insert_function_calls_batch(&[
+                FunctionCall {
+                    id: "fc-a".into(),
+                    caller_claim_id: "c1".into(),
+                    callee_name: "foo".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-1".into(),
+                    byte_start: 0,
+                    byte_end: 10,
+                    content_blake3: "b1".into(),
+                },
+                FunctionCall {
+                    id: "fc-b".into(),
+                    caller_claim_id: "c1".into(),
+                    callee_name: "bar".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-1".into(),
+                    byte_start: 20,
+                    byte_end: 30,
+                    content_blake3: "b2".into(),
+                },
+                FunctionCall {
+                    id: "fc-c".into(),
+                    caller_claim_id: "c2".into(),
+                    callee_name: "baz".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-2".into(),
+                    byte_start: 0,
+                    byte_end: 10,
+                    content_blake3: "b3".into(),
+                },
+            ])
+            .unwrap();
+        store
+            .insert_headings_batch(&[HeadingRow {
+                id: "h1".into(),
+                source_id: "src-1".into(),
+                level: 2,
+                text: "API".into(),
+                parent_heading_id: String::new(),
+                byte_start: 40,
+                byte_end: 50,
+                content_blake3: "b4".into(),
+            }])
+            .unwrap();
+
+        let counts = store
+            .count_structural_rows_for_sources(&[
+                "src-1".to_string(),
+                "src-2".to_string(),
+                "src-missing".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(counts.get("src-1").copied(), Some(3), "2 function_calls + 1 heading");
+        assert_eq!(counts.get("src-2").copied(), Some(1), "1 function_call");
+        assert_eq!(
+            counts.get("src-missing"),
+            None,
+            "absent ids must not appear in the result map"
+        );
+
+        // Batched result must equal the sum of per-source calls — the
+        // pre-fix per-source method is the ground truth.
+        let single_1 = store.count_structural_rows_for_source("src-1").unwrap();
+        let single_2 = store.count_structural_rows_for_source("src-2").unwrap();
+        assert_eq!(counts.get("src-1").copied().unwrap_or(0), single_1);
+        assert_eq!(counts.get("src-2").copied().unwrap_or(0), single_2);
+    }
+
+    #[test]
+    fn list_dependent_sources_for_many_unions_targets() {
+        let store = make_store();
+        // src-A depends on src-1, src-B depends on src-2, src-C depends
+        // on src-1 (so src-1 has two upstream dependents).
+        store.record_resolution_dep("src-A", "src-1", "function_call", "edge-1").unwrap();
+        store.record_resolution_dep("src-B", "src-2", "function_call", "edge-2").unwrap();
+        store.record_resolution_dep("src-C", "src-1", "code_link", "edge-3").unwrap();
+
+        // Querying src-1 + src-2 together should return {src-A, src-B,
+        // src-C} — the union of dependents. Dedup is implicit (src-1
+        // has two upstream rows but src-A only appears once).
+        let deps = store
+            .list_dependent_sources_for_many(&[
+                "src-1".to_string(),
+                "src-2".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(deps.len(), 3, "expected union of 3 distinct dependents");
+        assert!(deps.contains("src-A"));
+        assert!(deps.contains("src-B"));
+        assert!(deps.contains("src-C"));
+
+        // Batched result must equal the union of per-source calls.
+        let mut single_union: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in ["src-1", "src-2"] {
+            for dep in store.list_dependent_sources(t).unwrap() {
+                single_union.insert(dep);
+            }
+        }
+        assert_eq!(deps, single_union, "batched must equal per-target union");
     }
 }

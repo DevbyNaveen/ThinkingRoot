@@ -2429,38 +2429,39 @@ impl GraphStore {
         if entity_ids.is_empty() {
             return Ok(Vec::new());
         }
-
+        // Water-flow §T13 perf: collapse the 2N per-entity query nest
+        // into one inline-relation join (the `candidate[id] <- $ids`
+        // pattern from `fetch_source_uris`). On a 50-entity input the
+        // pre-fix shape issued 100 individual Cozo queries with
+        // round-trip overhead per call; the rewrite issues one.
+        let rows: Vec<DataValue> = entity_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        // Note: head vars must differ from the bound column names AND
+        // be bound in the body — Cozo's stratified evaluator forbids
+        // reusing `from_id` as both a head symbol and a `{from_id:
+        // eid}` constraint target. See `.claude/rules/witness-mesh.md`
+        // — the same trap broke `fetch_events` in commit b4640a8.
+        let result = self
+            .db
+            .run_script(
+                "candidate[eid] <- $ids
+                 ?[fid, tid, rt] := candidate[eid], \
+                   *entity_relations{from_id: eid, to_id: tid, relation_type: rt}, \
+                   fid = eid
+                 ?[fid, tid, rt] := candidate[eid], \
+                   *entity_relations{from_id: fid, to_id: eid, relation_type: rt}, \
+                   tid = eid",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
         let mut seen = std::collections::HashSet::new();
-
-        for eid in entity_ids {
-            let mut params = BTreeMap::new();
-            params.insert("eid".into(), DataValue::Str(eid.clone().into()));
-
-            // Triples where this entity is the source (from_id == eid).
-            let from_result = self
-                .db
-                .run_script(
-                    "?[f, t, rel_type] := \
-                     *entity_relations{from_id: $eid, to_id: t, relation_type: rel_type}, \
-                     f = $eid",
-                    params.clone(),
-                    ScriptMutability::Immutable,
-                )
-                .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
-
-            // Triples where this entity is the target (to_id == eid).
-            let to_result = self
-                .db
-                .run_script(
-                    "?[f, t, rel_type] := \
-                     *entity_relations{from_id: f, to_id: $eid, relation_type: rel_type}, \
-                     t = $eid",
-                    params,
-                    ScriptMutability::Immutable,
-                )
-                .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
-
-            for row in from_result.rows.iter().chain(to_result.rows.iter()) {
+        for row in &result.rows {
+            if row.len() >= 3 {
                 seen.insert((
                     dv_to_string(&row[0]),
                     dv_to_string(&row[1]),
@@ -2468,7 +2469,6 @@ impl GraphStore {
                 ));
             }
         }
-
         Ok(seen.into_iter().collect())
     }
 
