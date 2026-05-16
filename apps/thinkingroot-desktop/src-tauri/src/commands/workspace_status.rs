@@ -212,19 +212,33 @@ async fn run_subscriber(
     cache: Arc<tokio::sync::RwLock<std::collections::HashMap<String, WorkspaceStatus>>>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
+    // A clean SSE EOF (server-side broadcast actor recreated on
+    // workspace re-mount during compile, etc.) is followed by an
+    // immediate reconnect attempt. Pre-fix we flashed
+    // connection=false on every EOF — the user saw "Status
+    // disconnected — last seen 0s ago" during every compile because
+    // the post-compile `engine.mount` re-creates the broadcast
+    // sender. The fix: defer the disconnect emit until a reconnect
+    // actually fails, so the UI never sees a sub-second flicker.
+    let mut pending_disconnect: Option<String> = None;
     loop {
         if cancel.is_cancelled() {
             break;
         }
         match attach(&app, &workspace, &cancel, &cache).await {
             Ok(()) => {
-                // Stream closed cleanly (rare — usually a server
-                // shutdown). Reset backoff and retry.
-                emit_connection(&app, &workspace, false, Some("stream ended".into()));
+                // Stream closed cleanly — try to reconnect immediately
+                // before surfacing disconnect to the UI. Reset backoff
+                // so the retry feels instantaneous.
+                pending_disconnect = Some("stream ended".into());
                 backoff = INITIAL_BACKOFF;
             }
             Err(e) => {
-                emit_connection(&app, &workspace, false, Some(e.clone()));
+                // Real failure — emit disconnect now (carries either
+                // the deferred clean-EOF reason or the actual error
+                // depending on which path we came from).
+                let reason = pending_disconnect.take().unwrap_or_else(|| e.clone());
+                emit_connection(&app, &workspace, false, Some(reason));
                 tracing::debug!(
                     target: "workspace_status",
                     workspace = %workspace,
@@ -241,6 +255,12 @@ async fn run_subscriber(
             _ = tokio::time::sleep(backoff) => {}
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+    // If we exit the loop with a deferred disconnect still pending
+    // (clean EOF then cancel), surface it so the UI doesn't sit
+    // believing it's still connected.
+    if let Some(reason) = pending_disconnect {
+        emit_connection(&app, &workspace, false, Some(reason));
     }
     tracing::debug!(target: "workspace_status", workspace = %workspace, "subscriber stopped");
 }
