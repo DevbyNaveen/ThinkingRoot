@@ -1127,6 +1127,15 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     });
     if let Some(arr) = tools.get_mut("tools") {
         annotate_defer_loading(arr);
+        // Phase E.6 (2026-05-17) — append any tools registered via the
+        // `mcp::tool_trait` registry. The hardcoded 64 above stay as-is
+        // for the incremental migration policy; future tools land via
+        // `tool_trait::register_tool`.
+        if let Some(arr_mut) = arr.as_array_mut() {
+            for schema in crate::mcp::tool_trait::list_schemas() {
+                arr_mut.push(schema);
+            }
+        }
     }
     JsonRpcResponse::success(id, tools)
 }
@@ -2591,7 +2600,37 @@ pub async fn handle_call(
         "open_in_default" => handle_open_in_default(id, &arguments).await,
         "trash"           => handle_trash(id, &arguments).await,
 
-        other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+        // ── Phase E.6 (2026-05-17) — trait-registry fall-through ────
+        // After every built-in `match` arm misses, consult the
+        // `mcp::tool_trait` registry. Tools added from Phase E
+        // onwards (export_memory_tree, import_memory_tree, external
+        // MCP bridge tools, etc.) land here without churning the
+        // hardcoded arms. The built-in arms run first, so a
+        // registered tool can never shadow a built-in.
+        other => match crate::mcp::tool_trait::lookup(other) {
+            Some(handler) => {
+                let ctx = crate::mcp::tool_trait::McpToolContext {
+                    engine,
+                    workspace: ws,
+                    session_id,
+                    sessions,
+                    engram_manager,
+                };
+                match handler.handle(arguments, &ctx).await {
+                    Ok(value) => mcp_text_result(id, &value),
+                    Err(crate::mcp::tool_trait::McpToolError::InvalidArgs(m)) => {
+                        JsonRpcResponse::error(id, -32602, format!("{other}: {m}"))
+                    }
+                    Err(crate::mcp::tool_trait::McpToolError::Backend(e)) => {
+                        JsonRpcResponse::error(id, -32603, format!("{other}: {e}"))
+                    }
+                    Err(crate::mcp::tool_trait::McpToolError::Refused(r)) => {
+                        JsonRpcResponse::error(id, -32603, format!("{other}: refused: {r}"))
+                    }
+                }
+            }
+            None => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
+        },
     }
 }
 

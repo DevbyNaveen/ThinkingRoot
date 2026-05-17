@@ -221,16 +221,42 @@ impl std::fmt::Debug for AgentRequest {
 /// Configuration knobs for the agent. Defaults match the safe
 /// production setpoint: 8 iterations max, AutoApprove disabled
 /// (caller MUST supply a gate), no parallel dispatch.
+///
+/// Phase E.7 (2026-05-17): adds same-tool-same-args loop detection on
+/// top of the existing hard `max_iterations` cap. When the model
+/// proposes the same `(tool_name, canonical_args_hash)` ≥ `threshold`
+/// times within the trailing `window`-call buffer, the loop halts
+/// with a forced-summary turn — saves the user's tokens vs. burning
+/// through `max_iterations` on a stuck model. ON by default; tunable.
 pub struct AgentConfig {
     /// Maximum LLM round-trips per `run`. Hitting the ceiling causes
     /// the loop to terminate with whatever text has accumulated and
     /// emit an `Error` event noting the cause.
     pub max_iterations: usize,
+    /// Enable same-tool-same-args loop detection. Default `true`.
+    /// Power users (CLI flows that intentionally retry, evaluator
+    /// scripts) can disable this. When disabled only `max_iterations`
+    /// guards against runaway loops.
+    pub loop_detection: bool,
+    /// Size of the trailing ring buffer (in tool-call entries) over
+    /// which repetition is counted. Default 10.
+    pub loop_detection_window: usize,
+    /// Number of identical `(tool_name, canonical_args_hash)` entries
+    /// in the window that triggers the halt. Default 3 — two repeats
+    /// of the same call are common in legitimate multi-step flows
+    /// (a planner retry after a tool-error, or fetching adjacent
+    /// rows); three is solid evidence of a stuck model.
+    pub loop_detection_threshold: usize,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_iterations: 8 }
+        Self {
+            max_iterations: 8,
+            loop_detection: true,
+            loop_detection_window: 10,
+            loop_detection_threshold: 3,
+        }
     }
 }
 
@@ -248,6 +274,9 @@ pub struct Agent {
     /// shouldn't kill a live conversation.
     trace_log: Option<SharedTraceLog>,
     max_iterations: usize,
+    loop_detection: bool,
+    loop_detection_window: usize,
+    loop_detection_threshold: usize,
 }
 
 impl Agent {
@@ -271,6 +300,9 @@ impl Agent {
             approval,
             trace_log: None,
             max_iterations: config.max_iterations,
+            loop_detection: config.loop_detection,
+            loop_detection_window: config.loop_detection_window.max(1),
+            loop_detection_threshold: config.loop_detection_threshold.max(2),
         }
     }
 
@@ -329,6 +361,13 @@ impl Agent {
         // calls always use `Auto` because forcing a tool on a
         // post-results turn would loop forever.
         let mut tool_choice = req.tool_choice.clone();
+
+        // Phase E.7 (2026-05-17) — same-tool-same-args ring buffer.
+        // Each entry is `(tool_name, canonical_args_hash)`. New
+        // proposed calls are checked against the buffer BEFORE
+        // dispatch so a confirmed loop saves both tool execution
+        // and the next LLM round-trip. Cap: `loop_detection_window`.
+        let mut tool_call_ring: Vec<(String, [u8; 32])> = Vec::new();
 
         while iterations < self.max_iterations {
             iterations += 1;
@@ -412,6 +451,70 @@ impl Agent {
                         )
                         .await;
                     }
+
+                    // E.7 loop detection — check BEFORE dispatch so a
+                    // confirmed loop saves the tool execution AND the
+                    // next LLM round-trip. We treat any single call in
+                    // the proposed batch matching the threshold as
+                    // sufficient to halt: parallel-batches of the same
+                    // (name, args) are unambiguously a loop, and even
+                    // a single repeat-call is enough when the prior
+                    // (threshold-1) hits are already in the buffer.
+                    if self.loop_detection {
+                        let triggering = calls.iter().find_map(|c| {
+                            let h = canonical_args_hash(&c.input);
+                            let prior = tool_call_ring
+                                .iter()
+                                .filter(|(n, hh)| n == &c.name && hh == &h)
+                                .count();
+                            if prior + 1 >= self.loop_detection_threshold {
+                                Some((c.name.clone(), prior + 1))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((name, count)) = triggering {
+                            self.emit(
+                                sink,
+                                AgentEvent::Error {
+                                    message: format!(
+                                        "loop detected: tool `{name}` called {count} times \
+                                         with identical args within last {} calls. \
+                                         Halting before dispatch to save tokens.",
+                                        self.loop_detection_window
+                                    ),
+                                },
+                            )
+                            .await;
+                            if !accumulated_text.is_empty() {
+                                accumulated_text.push_str("\n\n");
+                            }
+                            accumulated_text.push_str(&format!(
+                                "[Halted: agent was calling `{name}` repeatedly with the \
+                                 same arguments — likely stuck. Partial progress preserved \
+                                 above.]"
+                            ));
+                            self.emit(
+                                sink,
+                                AgentEvent::Done {
+                                    final_text: accumulated_text,
+                                    iterations,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                        // Record this batch into the ring buffer.
+                        for c in &calls {
+                            tool_call_ring.push((c.name.clone(), canonical_args_hash(&c.input)));
+                        }
+                        // Trim to window — keep the most recent.
+                        let len = tool_call_ring.len();
+                        if len > self.loop_detection_window {
+                            tool_call_ring.drain(0..(len - self.loop_detection_window));
+                        }
+                    }
+
                     // Append the assistant's tool_use turn so the
                     // next call sees the conversation in shape.
                     history.push(ChatMessage::AssistantToolCalls(calls.clone()));
@@ -551,6 +654,68 @@ impl Agent {
             });
         }
         results
+    }
+}
+
+/// E.7 loop detection — hash a tool's `input` Value to a canonical
+/// 32-byte BLAKE3 digest that is order-independent over object keys.
+///
+/// `serde_json::Map` preserves insertion order by default; two
+/// identical conceptual JSON objects can serialise to different
+/// byte strings if they were constructed from differently-ordered
+/// sources. We can't use raw `to_vec` for the loop-detection key.
+///
+/// Strategy: domain-tag each variant (1 byte), length-prefix
+/// variable-size payloads, sort object keys lexicographically
+/// before hashing.
+fn canonical_args_hash(v: &serde_json::Value) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    canonical_args_feed(&mut h, v);
+    *h.finalize().as_bytes()
+}
+
+fn canonical_args_feed(h: &mut blake3::Hasher, v: &serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Null => {
+            h.update(&[0u8]);
+        }
+        Value::Bool(b) => {
+            h.update(&[1u8, if *b { 1 } else { 0 }]);
+        }
+        Value::Number(n) => {
+            h.update(&[2u8]);
+            // Use the canonical decimal representation rather than
+            // f64::to_le_bytes — JSON numbers may be ints OR floats
+            // and round-trip stability of the textual form is what
+            // matters for "same args" identity.
+            let s = n.to_string();
+            h.update(&(s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+        Value::String(s) => {
+            h.update(&[3u8]);
+            h.update(&(s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+        }
+        Value::Array(items) => {
+            h.update(&[4u8]);
+            h.update(&(items.len() as u64).to_le_bytes());
+            for it in items {
+                canonical_args_feed(h, it);
+            }
+        }
+        Value::Object(map) => {
+            h.update(&[5u8]);
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            h.update(&(keys.len() as u64).to_le_bytes());
+            for k in keys {
+                h.update(&(k.len() as u64).to_le_bytes());
+                h.update(k.as_bytes());
+                canonical_args_feed(h, &map[k]);
+            }
+        }
     }
 }
 
@@ -1079,7 +1244,16 @@ mod tests {
             llm,
             registry,
             Arc::new(AutoApprove),
-            AgentConfig { max_iterations: 3 },
+            AgentConfig {
+                max_iterations: 3,
+                // This test specifically exercises the iteration-ceiling
+                // path with identical-args repeats; with E.7's default
+                // detector ON, the halt would fire before the ceiling.
+                // Disable the detector here to keep this assertion
+                // pointed at the ceiling code path.
+                loop_detection: false,
+                ..AgentConfig::default()
+            },
         );
         let req = AgentRequest {
             system: "sys".to_string(),
@@ -1611,5 +1785,289 @@ mod tests {
             "without a refresher, every iteration must see the same \
              AgentRequest.system string byte-identical"
         );
+    }
+
+    // ─── Phase E.7 loop-detection tests ────────────────────────────────
+
+    fn agent_with_loop_detection(
+        llm: Arc<dyn LlmBackend>,
+        registry: ToolRegistry,
+        threshold: usize,
+        window: usize,
+    ) -> Agent {
+        Agent::with_config(
+            llm,
+            registry,
+            Arc::new(AutoApprove),
+            AgentConfig {
+                max_iterations: 16,
+                loop_detection: true,
+                loop_detection_window: window,
+                loop_detection_threshold: threshold,
+            },
+        )
+    }
+
+    fn search_call(id: &str, q: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "search".to_string(),
+            input: json!({ "query": q }),
+        }
+    }
+
+    fn tool_calls(calls: Vec<ToolCall>) -> ToolUseResponse {
+        ToolUseResponse::ToolCalls {
+            calls,
+            text_preamble: String::new(),
+            limits: empty_limits(),
+        }
+    }
+
+    #[test]
+    fn canonical_args_hash_is_key_order_independent() {
+        let a = json!({ "alpha": 1, "beta": "x", "gamma": [1, 2, 3] });
+        let b = json!({ "gamma": [1, 2, 3], "beta": "x", "alpha": 1 });
+        let c = json!({ "alpha": 1, "beta": "x", "gamma": [1, 2, 4] }); // different
+        let ha = canonical_args_hash(&a);
+        let hb = canonical_args_hash(&b);
+        let hc = canonical_args_hash(&c);
+        assert_eq!(ha, hb, "object key order must not affect canonical hash");
+        assert_ne!(ha, hc, "different array element must change hash");
+    }
+
+    #[test]
+    fn canonical_args_hash_distinguishes_null_zero_false() {
+        // Different JSON types that all serialise to short tokens must
+        // remain distinguishable — otherwise loop detection would
+        // false-trigger on incidental coincidences.
+        let n = canonical_args_hash(&json!(null));
+        let z = canonical_args_hash(&json!(0));
+        let f = canonical_args_hash(&json!(false));
+        let empty_str = canonical_args_hash(&json!(""));
+        let empty_obj = canonical_args_hash(&json!({}));
+        let empty_arr = canonical_args_hash(&json!([]));
+        let all = [n, z, f, empty_str, empty_obj, empty_arr];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "domain tags must distinguish empty/null/zero values (i={i}, j={j})");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detection_halts_at_threshold_with_identical_args() {
+        // 3× same call → at the 3rd proposal the loop must halt
+        // BEFORE the third dispatch (so dispatch ran twice, not three).
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_calls(vec![search_call("a1", "foo")]),
+            tool_calls(vec![search_call("a2", "foo")]),
+            tool_calls(vec![search_call("a3", "foo")]),
+            // safety net — if loop-detect doesn't fire, this run
+            // would eventually exhaust the script and Error out.
+            ToolUseResponse::Text {
+                text: "should not reach".into(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "ok".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+
+        let agent = agent_with_loop_detection(llm, registry, 3, 10);
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+
+        // The 3rd `search` proposal triggered the halt — so only
+        // 2 dispatches reached the handler.
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "dispatch must be skipped at the threshold-hitting call"
+        );
+
+        // Wire: must emit both an Error explaining the halt AND a
+        // Done with the preserved partial text. Caller-side parsers
+        // (HTTP SSE, Tauri ChatView) treat Done as the terminator.
+        let err = run.first_error().expect("expected loop-detected error");
+        assert!(
+            err.contains("loop detected") && err.contains("search"),
+            "error message should name the looping tool: {err}"
+        );
+        let done = run.final_text().expect("expected Done event");
+        assert!(
+            done.contains("Halted") && done.contains("search"),
+            "final text should explain the halt: {done}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_detection_does_not_fire_on_different_args() {
+        // 3 calls to the same tool but with different args must not
+        // trigger the halt — only `(name, args_hash)` repetition counts.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_calls(vec![search_call("a1", "foo")]),
+            tool_calls(vec![search_call("a2", "bar")]),
+            tool_calls(vec![search_call("a3", "baz")]),
+            ToolUseResponse::Text {
+                text: "final summary".into(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "ok".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+
+        let agent = agent_with_loop_detection(llm, registry, 3, 10);
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+
+        assert_eq!(captured.lock().unwrap().len(), 3);
+        assert_eq!(run.final_text().as_deref(), Some("final summary"));
+        assert!(run.first_error().is_none(), "no loop should be reported");
+    }
+
+    #[tokio::test]
+    async fn loop_detection_window_evicts_old_entries() {
+        // With window=3 and threshold=3, an interleaved pattern A,B,A,B,A
+        // never has 3× `A` in the *last 3* slots — should not halt.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_calls(vec![search_call("1", "A")]),
+            tool_calls(vec![search_call("2", "B")]),
+            tool_calls(vec![search_call("3", "A")]),
+            tool_calls(vec![search_call("4", "B")]),
+            tool_calls(vec![search_call("5", "A")]),
+            ToolUseResponse::Text {
+                text: "ok".into(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "x".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+
+        let agent = agent_with_loop_detection(llm, registry, 3, 3);
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+        // 5 dispatches with no halt — window evicted older `A`s.
+        assert_eq!(captured.lock().unwrap().len(), 5);
+        assert!(run.first_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_detection_can_be_disabled_via_config() {
+        // With detection OFF, max_iterations is the only guard.
+        // 4× same-args call must dispatch 4 times.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_calls(vec![search_call("1", "x")]),
+            tool_calls(vec![search_call("2", "x")]),
+            tool_calls(vec![search_call("3", "x")]),
+            tool_calls(vec![search_call("4", "x")]),
+            ToolUseResponse::Text {
+                text: "ok".into(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "y".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+
+        let agent = Agent::with_config(
+            llm,
+            registry,
+            Arc::new(AutoApprove),
+            AgentConfig {
+                max_iterations: 8,
+                loop_detection: false,
+                loop_detection_window: 10,
+                loop_detection_threshold: 3,
+            },
+        );
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let run = run_to_completion(&agent, req).await;
+        assert_eq!(captured.lock().unwrap().len(), 4);
+        assert!(run.first_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_detection_min_threshold_clamps_at_two() {
+        // Threshold=0 or 1 would mean "halt on first call ever" — a
+        // footgun. with_config clamps to a minimum of 2.
+        let llm = Arc::new(ScriptedLlm::new(vec![tool_calls(vec![search_call(
+            "1", "x",
+        )])]));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "y".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+
+        let agent = Agent::with_config(
+            llm,
+            registry,
+            Arc::new(AutoApprove),
+            AgentConfig {
+                max_iterations: 4,
+                loop_detection: true,
+                loop_detection_window: 10,
+                loop_detection_threshold: 0, // clamped to 2
+            },
+        );
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+        let _ = run_to_completion(&agent, req).await;
+        // First call should still execute (count 0+1=1 < 2).
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }

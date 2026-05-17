@@ -16,16 +16,60 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio::task::JoinHandle;
 
 use crate::branch_cache::BranchEngineCache;
 use crate::intelligence::session::SessionStore;
+use crate::scheduler::{PeriodicTask, spawn_periodic_task};
 use thinkingroot_core::{BranchKind, BranchPermissions, BranchStatus, MergePolicy, MergedBy};
+
+/// Phase E.2 (2026-05-17) — `PeriodicTask` impl for stream-branch
+/// cleanup. Encapsulates the data the worker loop needs so the
+/// worker body itself can stay generic in `scheduler::spawn_periodic_task`.
+///
+/// The shape mirrors the legacy `spawn_stream_cleanup` closure
+/// captures byte-for-byte — moving the loop into a trait impl is a
+/// pure refactor.
+struct StreamCleanupTask {
+    sessions: SessionStore,
+    workspace_root: PathBuf,
+    idle_secs: u64,
+    action: String,
+    branch_engines: Option<Arc<BranchEngineCache>>,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for StreamCleanupTask {
+    fn name(&self) -> &'static str {
+        "stream_cleanup"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        cleanup_once(
+            &self.sessions,
+            &self.workspace_root,
+            self.idle_secs,
+            &self.action,
+            self.branch_engines.as_deref(),
+        )
+        .await
+        .map(|_stats| ())
+    }
+}
 
 /// Spawn the stream-branch cleanup task.
 ///
 /// Returns a `JoinHandle` the caller must keep alive (and may abort at
 /// shutdown). If `cleanup_enabled = false`, this returns a no-op handle.
+///
+/// Phase E.2 (2026-05-17) — internally builds a `StreamCleanupTask`
+/// and spawns it via `scheduler::spawn_periodic_task`. The signature
+/// is unchanged for byte-equivalent CLI behaviour at
+/// `thinkingroot-cli/src/serve.rs:{377,667}`.
 pub fn spawn_stream_cleanup(
     sessions: SessionStore,
     workspace_root: PathBuf,
@@ -36,32 +80,15 @@ pub fn spawn_stream_cleanup(
         return tokio::spawn(async {});
     }
 
-    let interval = Duration::from_secs(cfg.cleanup_interval_secs.max(1));
-    let idle_secs = cfg.cleanup_idle_secs;
-    let action = cfg.cleanup_action.clone();
-
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // Skip the immediate first tick so we don't scan at t=0 before any
-        // sessions exist; interval::tick() fires once immediately by default.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-
-        loop {
-            ticker.tick().await;
-            if let Err(e) = cleanup_once(
-                &sessions,
-                &workspace_root,
-                idle_secs,
-                &action,
-                branch_engines.as_deref(),
-            )
-            .await
-            {
-                tracing::warn!("stream cleanup tick failed (non-fatal): {e}");
-            }
-        }
-    })
+    let task: Arc<dyn PeriodicTask> = Arc::new(StreamCleanupTask {
+        sessions,
+        workspace_root,
+        idle_secs: cfg.cleanup_idle_secs,
+        action: cfg.cleanup_action,
+        branch_engines,
+        interval: Duration::from_secs(cfg.cleanup_interval_secs.max(1)),
+    });
+    spawn_periodic_task(task)
 }
 
 /// Single cleanup pass. Exposed for tests.

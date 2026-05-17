@@ -257,7 +257,14 @@ pub async fn register_mcp_bridge_tools(
             continue;
         }
         let handler = Arc::new(McpBridgeTool::new(spec.name.clone(), ctx.clone()));
-        if BRIDGE_WRITE_NAMES.contains(&spec.name.as_str()) {
+        // E.6 (2026-05-17): the const BRIDGE_WRITE_NAMES covers the 64
+        // hardcoded built-ins; the trait-registry path covers any tool
+        // registered post-startup via `tool_trait::register_tool`. A
+        // tool that declares `is_write() = true` auto-routes through
+        // the write-class gate without manual addition to the const.
+        let is_write = BRIDGE_WRITE_NAMES.contains(&spec.name.as_str())
+            || crate::mcp::tool_trait::is_registered_write(&spec.name);
+        if is_write {
             registry = registry.register_write(spec, handler);
         } else {
             registry = registry.register_read(spec, handler);

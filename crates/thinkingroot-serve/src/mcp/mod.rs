@@ -1,6 +1,7 @@
 pub mod resources;
 pub mod sse;
 pub mod stdio;
+pub mod tool_trait;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};

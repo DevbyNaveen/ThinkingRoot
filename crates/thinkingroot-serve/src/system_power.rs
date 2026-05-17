@@ -96,6 +96,17 @@ pub struct ShellOutcome {
     pub truncated_stdout: bool,
     pub truncated_stderr: bool,
     pub sandbox_backend: String,
+    /// Phase E.1 (2026-05-17) — TokenJuice compaction diagnostic.
+    /// Versioned rule id (e.g. `"git.status@v1"`, `"cargo.test@v1"`)
+    /// or `"passthrough@v1"` when no rule fired. Surfaces in the
+    /// JSON response so the LLM + the user can both see whether
+    /// output was compacted and by which rule.
+    pub compaction_rule: String,
+    /// Total bytes of raw `(stdout + stderr)` before compaction.
+    pub original_bytes: usize,
+    /// Total bytes of `(stdout + stderr)` after compaction. Equal to
+    /// `original_bytes` when compaction was skipped.
+    pub compacted_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -550,17 +561,32 @@ pub async fn shell_exec(
         SandboxBackend::LinuxBubblewrap => "linux_bubblewrap",
         SandboxBackend::LinuxDegraded => "linux_degraded",
     };
+    // Phase E.1 (2026-05-17) — TokenJuice compaction. Runs after the
+    // sandbox spawn so the raw exit_code is available for
+    // `preserve_on_failure` rules; the compacted strings are what
+    // the LLM sees in `ShellOutcome.{stdout,stderr}` — the raw
+    // bytes are never surfaced beyond this point.
+    let compaction = crate::tokenjuice::compact_shell_output(
+        command,
+        args,
+        &output.stdout,
+        &output.stderr,
+        output.exit_code,
+    );
     Ok(ShellOutcome {
         command: command.to_string(),
         args: args.to_vec(),
         exit_code: output.exit_code,
         signal: output.signal,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: compaction.stdout,
+        stderr: compaction.stderr,
         duration_ms: output.duration_ms,
         truncated_stdout: output.truncated_stdout,
         truncated_stderr: output.truncated_stderr,
         sandbox_backend: backend.to_string(),
+        compaction_rule: compaction.rule_id,
+        original_bytes: compaction.original_bytes,
+        compacted_bytes: compaction.compacted_bytes,
     })
 }
 
