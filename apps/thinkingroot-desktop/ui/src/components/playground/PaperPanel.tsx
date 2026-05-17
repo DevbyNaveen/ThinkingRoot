@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import { FileText, RefreshCw, RotateCcw } from "lucide-react";
 
 import {
@@ -168,6 +169,7 @@ export function PaperPanel({
       <div className="prose prose-sm dark:prose-invert max-w-none flex-1 overflow-auto px-6 py-4">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          rehypePlugins={[rehypeSanitize]}
           components={{
             p: ({ children }) => <p>{transformCitations(children)}</p>,
             li: ({ children }) => <li>{transformCitations(children)}</li>,

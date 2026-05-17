@@ -28,12 +28,23 @@ pub(super) fn classify<'a>(
     let mut best: Option<(&Rule, i32)> = None;
     for rule in ALL_RULES.iter().copied() {
         let mut score: i32 = 0;
-        // argv0 match
-        if let Some(want) = rule.argv0 {
-            if want.eq_ignore_ascii_case(command) {
+        // argv0 match — either the single exact-match slot or any
+        // entry in `argv0_any_of` (used by package-manager-family
+        // rules where npm/pnpm/yarn share one ruleset).
+        let argv0_constrained = rule.argv0.is_some() || !rule.argv0_any_of.is_empty();
+        if argv0_constrained {
+            let exact_hit = rule
+                .argv0
+                .map(|want| want.eq_ignore_ascii_case(command))
+                .unwrap_or(false);
+            let alt_hit = rule
+                .argv0_any_of
+                .iter()
+                .any(|want| want.eq_ignore_ascii_case(command));
+            if exact_hit || alt_hit {
                 score += 100;
             } else {
-                // A rule that pins argv0 but doesn't match it is
+                // A rule that constrains argv0 but doesn't match is
                 // disqualified outright — score stays 0.
                 continue;
             }

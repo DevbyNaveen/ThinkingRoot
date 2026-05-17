@@ -46,8 +46,13 @@ pub enum Transform {
 pub struct Rule {
     /// Versioned id: `<family>.<name>@v<N>`, e.g. `"git.status@v1"`.
     pub id: &'static str,
-    /// Match the argv[0] exactly. `None` matches any command.
+    /// Match the argv[0] exactly. `None` defers to `argv0_any_of`.
     pub argv0: Option<&'static str>,
+    /// Alternative argv[0] candidates (case-insensitive). Match if
+    /// the command equals any entry. Used by package-manager-family
+    /// rules (npm/pnpm/yarn share the install rule). Empty slice +
+    /// `argv0: None` means "match any command" (generic rules).
+    pub argv0_any_of: &'static [&'static str],
     /// Match when ALL listed tokens appear somewhere in args.
     /// Empty slice matches any args.
     pub argv_includes: &'static [&'static str],
@@ -65,6 +70,7 @@ pub struct Rule {
 const RULE_GIT_STATUS: Rule = Rule {
     id: "git.status@v1",
     argv0: Some("git"),
+    argv0_any_of: &[],
     argv_includes: &["status"],
     priority: 100,
     transforms: &[
@@ -83,6 +89,7 @@ const RULE_GIT_STATUS: Rule = Rule {
 const RULE_GIT_DIFF: Rule = Rule {
     id: "git.diff@v1",
     argv0: Some("git"),
+    argv0_any_of: &[],
     // `git diff`, `git show`, `git log -p` all dump big diffs.
     // Matching on just `diff` would mis-match `git log --no-diff`;
     // we match the explicit subcommand only.
@@ -102,6 +109,7 @@ const RULE_GIT_DIFF: Rule = Rule {
 const RULE_GIT_LOG: Rule = Rule {
     id: "git.log@v1",
     argv0: Some("git"),
+    argv0_any_of: &[],
     argv_includes: &["log"],
     priority: 100,
     transforms: &[
@@ -117,10 +125,16 @@ const RULE_GIT_LOG: Rule = Rule {
 
 const RULE_NPM_INSTALL: Rule = Rule {
     id: "npm.install@v1",
-    // Match npm / pnpm / yarn by leaving argv0 None and relying on
-    // command-pattern detection via `argv_includes`. Then enforce
-    // via priority that this wins over generic fallbacks.
+    // Match npm / pnpm / yarn / bun via `argv0_any_of`. Pre-fix this
+    // rule had `argv0: None + argv_includes: &["install"]`, which
+    // also matched `cargo install`, `pip install`, `apt install`,
+    // `brew install`, etc. — applying npm's spinner-strip transform
+    // to cargo install's pretty-printed output truncated useful
+    // diagnostic context. The OR-set keeps the family of package
+    // managers that share npm's output pattern while disqualifying
+    // unrelated `install` subcommands.
     argv0: None,
+    argv0_any_of: &["npm", "pnpm", "yarn", "bun"],
     argv_includes: &["install"],
     priority: 80,
     transforms: &[
@@ -160,6 +174,7 @@ const RULE_NPM_INSTALL: Rule = Rule {
 const RULE_CARGO_TEST: Rule = Rule {
     id: "cargo.test@v1",
     argv0: Some("cargo"),
+    argv0_any_of: &[],
     argv_includes: &["test"],
     priority: 100,
     transforms: &[
@@ -193,6 +208,7 @@ const RULE_CARGO_TEST: Rule = Rule {
 const RULE_CARGO_BUILD: Rule = Rule {
     id: "cargo.build@v1",
     argv0: Some("cargo"),
+    argv0_any_of: &[],
     argv_includes: &["build"],
     priority: 100,
     transforms: &[
@@ -211,6 +227,7 @@ const RULE_CARGO_BUILD: Rule = Rule {
 const RULE_DOCKER_PS: Rule = Rule {
     id: "docker.ps@v1",
     argv0: Some("docker"),
+    argv0_any_of: &[],
     argv_includes: &["ps"],
     priority: 100,
     transforms: &[
@@ -227,6 +244,7 @@ const RULE_DOCKER_PS: Rule = Rule {
 const RULE_DOCKER_LOGS: Rule = Rule {
     id: "docker.logs@v1",
     argv0: Some("docker"),
+    argv0_any_of: &[],
     argv_includes: &["logs"],
     priority: 100,
     transforms: &[
@@ -243,6 +261,7 @@ const RULE_DOCKER_LOGS: Rule = Rule {
 const RULE_GENERIC_ANSI: Rule = Rule {
     id: "generic.ansi@v1",
     argv0: None,
+    argv0_any_of: &[],
     argv_includes: &[],
     priority: 10,
     transforms: &[Transform::StripAnsi],
@@ -252,6 +271,7 @@ const RULE_GENERIC_ANSI: Rule = Rule {
 const RULE_GENERIC_FALLBACK: Rule = Rule {
     id: "generic.fallback@v1",
     argv0: None,
+    argv0_any_of: &[],
     argv_includes: &[],
     priority: 1,
     transforms: &[

@@ -343,8 +343,19 @@ pub async fn terminal_open(
             // leaving a zombie. `wait()` is idempotent on portable-pty:
             // if it was already killed via `terminal_close`, this
             // returns the prior status.
+            //
+            // Poison-safe lock: if the original lock holder panicked
+            // (e.g. PTY backend bug during start), we recover the
+            // inner Option<Child> via `into_inner()` rather than
+            // crashing the Tauri reaper thread. `unwrap()` on a
+            // poisoned PoisonError would propagate the panic and
+            // take down the desktop process — terminal cleanup is
+            // best-effort observability, not a correctness gate.
             let exit = {
-                let mut guard = session_for_thread.child.lock().unwrap();
+                let mut guard = match session_for_thread.child.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 guard.as_mut().and_then(|c| c.wait().ok())
             };
             let payload = match exit {

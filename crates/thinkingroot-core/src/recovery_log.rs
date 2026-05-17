@@ -264,13 +264,21 @@ pub fn append(event: &RecoveryEvent) -> Result<(), LogError> {
     let mut bytes = line.into_bytes();
     bytes.push(b'\n');
 
+    // POSIX guarantees `write(2)` on `O_APPEND` is atomic at the line
+    // level when the line is < PIPE_BUF (typically 4096 bytes). A
+    // single `write_all` therefore lands as one contiguous record
+    // even under concurrent appenders — no flock needed. We
+    // intentionally skip `sync_all()` (fsync): the recovery log is
+    // observability infrastructure, not a correctness gate. The
+    // doctor surface re-builds from `restart_state.json` on next
+    // boot if the log is truncated by a crash. fsync adds 1-15 ms
+    // of latency per append, which compounds on noisy debug paths.
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
 
     #[cfg(unix)]
     {

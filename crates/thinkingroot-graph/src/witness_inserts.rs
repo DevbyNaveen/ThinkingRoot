@@ -797,11 +797,29 @@ fn parse_witness_row(row: &[DataValue]) -> Result<Witness> {
     let symbol = if symbol_str.is_empty() { None } else { Some(symbol_str) };
 
     // byte_start / byte_end (row[11], row[12]) are denormalised from
-    // spans[0] — we trust the spans_json round-trip for the in-memory
-    // representation and only read byte_start/byte_end here for the
-    // schema-level assertion check.
-    let _denorm_start = dv_u64(&row[11]);
-    let _denorm_end = dv_u64(&row[12]);
+    // spans[0]. Assert agreement before returning so a torn write or
+    // a migration bug surfaces as a typed error rather than silently
+    // producing a row whose in-memory shape disagrees with the
+    // indexed columns that Datalog queries join on. Empty `spans` is
+    // already rejected by `WitnessMesh::assemble` upstream; this is
+    // defence-in-depth for the persistence boundary.
+    let denorm_start = dv_u64(&row[11]);
+    let denorm_end = dv_u64(&row[12]);
+    if let Some(primary) = spans.first() {
+        if primary.start != denorm_start || primary.end != denorm_end {
+            return Err(Error::GraphStorage(format!(
+                "witness {id_hex}: denormalised byte range \
+                 ({denorm_start}..{denorm_end}) disagrees with spans[0] \
+                 ({}..{}); row corrupt or stale",
+                primary.start, primary.end
+            )));
+        }
+    } else {
+        return Err(Error::GraphStorage(format!(
+            "witness {id_hex}: spans_json decoded to empty array; \
+             every Witness must carry at least one span"
+        )));
+    }
 
     let created_at_unix = dv_f64(&row[13]);
     let valid_from_unix = dv_f64(&row[14]);

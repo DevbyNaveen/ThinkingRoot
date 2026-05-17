@@ -180,6 +180,16 @@ impl RestartState {
 
     /// Load from disk.  Corrupt file → fresh state (best-effort).
     /// Missing file → fresh state.
+    ///
+    /// After deserialising, the in-memory `schema_version` is forced
+    /// to the current `SCHEMA_VERSION` constant. Pre-fix, a v1 file
+    /// loaded into a v2-aware binary kept the on-disk `1` value, and
+    /// the next `save()` wrote it back unchanged — so the file was
+    /// laid out with v2 fields populated by `#[serde(default)]` but
+    /// the header still claimed `schema_version: 1`. A future reader
+    /// would mis-identify the version. Bumping on load is the right
+    /// place because by the time `save()` writes back, the in-memory
+    /// shape IS v2.
     pub fn load() -> Result<Self, RestartStateError> {
         let path = path()?;
         let bytes = match std::fs::read(&path) {
@@ -190,8 +200,11 @@ impl RestartState {
         if bytes.is_empty() {
             return Ok(Self::new());
         }
-        match serde_json::from_slice(&bytes) {
-            Ok(state) => Ok(state),
+        match serde_json::from_slice::<Self>(&bytes) {
+            Ok(mut state) => {
+                state.schema_version = SCHEMA_VERSION;
+                Ok(state)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "restart-state corrupt; resetting");
                 Ok(Self::new())

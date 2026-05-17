@@ -374,14 +374,36 @@ pub async fn import_verify(input_dir: &Path) -> Result<ImportReport, McpToolErro
                     // when the export carries the byte range AND
                     // the source's content_blake3. Reconstruct a
                     // single-span Witness from those + re-derive.
-                    let file_blake3 = node
-                        .content_blake3
-                        .clone()
-                        .unwrap_or_default();
+                    //
+                    // Missing required fields are surfaced as a
+                    // distinct "missing field" failure rather than
+                    // silently re-deriving with an empty hash —
+                    // re-deriving from `("", 0, 0)` would produce a
+                    // bogus hash that has zero chance of matching
+                    // any legitimate id, masking the real "frontmatter
+                    // incomplete" cause behind a generic mismatch.
+                    let Some(file_blake3) = node.content_blake3.as_ref().filter(|s| !s.is_empty()) else {
+                        report.failures.push(ImportFailure {
+                            path: path.display().to_string(),
+                            reason: format!(
+                                "witness {id_str}: frontmatter missing `content_blake3` — cannot re-derive id"
+                            ),
+                        });
+                        continue;
+                    };
+                    let (Some(start), Some(end)) = (node.byte_start, node.byte_end) else {
+                        report.failures.push(ImportFailure {
+                            path: path.display().to_string(),
+                            reason: format!(
+                                "witness {id_str}: frontmatter missing `byte_start` / `byte_end` — cannot re-derive id"
+                            ),
+                        });
+                        continue;
+                    };
                     let span = WitnessSpan {
-                        file_blake3,
-                        start: node.byte_start.unwrap_or(0),
-                        end: node.byte_end.unwrap_or(0),
+                        file_blake3: file_blake3.clone(),
+                        start,
+                        end,
                     };
                     let derived = WitnessId::derive(rule, std::slice::from_ref(&span));
                     if derived.to_hex() == *id_str {

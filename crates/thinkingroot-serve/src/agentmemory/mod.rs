@@ -41,6 +41,8 @@ pub mod types;
 
 use std::sync::Arc;
 
+use chrono::TimeZone;
+
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -89,7 +91,11 @@ pub(crate) fn agentmemory_auth_check(headers: &HeaderMap) -> Result<(), (StatusC
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if let Some(token) = auth.strip_prefix("Bearer ") {
-        if token == secret {
+        // Constant-time comparison — a plain `==` would short-circuit
+        // on the first mismatching byte and leak the expected secret
+        // one character per probe.
+        use subtle::ConstantTimeEq;
+        if bool::from(token.as_bytes().ct_eq(secret.as_bytes())) {
             return Ok(());
         }
     }
@@ -127,16 +133,19 @@ async fn projects_handler(
                 .into_response();
         }
     };
-    let now = chrono::Utc::now().to_rfc3339();
+    // Per-workspace `last_updated` is not yet tracked in the engine's
+    // WorkspaceInfo. Per honesty rule #1 ("no fake data, ever") we
+    // return an empty string rather than `Utc::now()` — the latter
+    // would change on every poll and break any consumer that
+    // dedupes / sorts by recency. Empty string is a clear "not
+    // available" sentinel rather than a fabricated value. Consumers
+    // can derive a recency proxy from `/memories?latest=true`.
     let projects = workspaces
         .into_iter()
         .map(|ws| ProjectInfo {
             name: ws.name,
             count: ws.claim_count,
-            // We don't yet track per-workspace last_updated; v1
-            // returns the current time so consumers have a valid
-            // RFC3339 string (NOT an empty-or-fake sentinel).
-            last_updated: now.clone(),
+            last_updated: String::new(),
         })
         .collect();
     Json(ProjectsResponse { projects }).into_response()
@@ -296,16 +305,33 @@ async fn smart_search_handler(
     };
     // Map each RetrievalHit → MemoryHit. We don't have a typed
     // ClaimInfo round-trip; assemble from the hit fields directly.
+    //
+    // Timestamps: honesty rule #1 forbids fabricating values. The
+    // RetrievalHit carries `valid_window.0` (Unix epoch seconds —
+    // see `claim_temporal.valid_from`), which is the closest typed
+    // proxy for the claim's creation moment. When that is absent
+    // we return an empty string rather than `Utc::now()`, which
+    // (pre-fix) collapsed every distinct claim's `createdAt` to
+    // the search-call timestamp and broke client-side dedupe.
     let results: Vec<MemoryHit> = response
         .hits
         .into_iter()
         .map(|hit| {
-            let now = chrono::Utc::now().to_rfc3339();
             let split = hit.statement.split_once("\n\n");
             let (title, content) = match split {
                 Some((t, c)) => (t.to_string(), c.to_string()),
                 None => (hit.statement.clone(), String::new()),
             };
+            let ts_from_window = hit
+                .valid_window
+                .0
+                .and_then(|secs| {
+                    chrono::Utc
+                        .timestamp_opt(secs as i64, 0)
+                        .single()
+                })
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
             MemoryHit {
                 id: hit.claim_id,
                 project: project.clone(),
@@ -314,8 +340,8 @@ async fn smart_search_handler(
                 kind: hit.claim_type,
                 concepts: Vec::new(),
                 session_ids: Vec::new(),
-                updated_at: now.clone(),
-                created_at: now,
+                updated_at: ts_from_window.clone(),
+                created_at: ts_from_window,
                 score: hit.fused_score as f64,
             }
         })
@@ -331,34 +357,50 @@ async fn forget_handler(
     if let Err((code, msg)) = agentmemory_auth_check(&headers) {
         return (code, msg).into_response();
     }
-    let engine_guard = state.engine.read().await;
-    // Look across every mounted workspace until we find a claim
-    // whose id matches; remove its source. Honest: the protocol
-    // gives us only an opaque id (no project hint), so a workspace
-    // scan is the load-bearing path.
-    let workspaces = match engine_guard.list_workspaces().await {
-        Ok(w) => w,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("list_workspaces: {e}"),
-            )
-                .into_response();
+    // Each engine access is scoped tightly — pre-fix this handler
+    // held a single read guard across `list_workspaces` + an N-step
+    // `list_claims` scan + the final `forget_source` mutation. Every
+    // `.await` inside that span yielded to the runtime while still
+    // holding the read lock, so a concurrent mount/unmount (which
+    // takes `engine.write()`) would queue behind a 30s claim scan.
+    // Acquiring + dropping per phase keeps the contention window to
+    // the actual call duration.
+    //
+    // The protocol gives us only an opaque memory id with no project
+    // hint, so a per-workspace scan is the load-bearing search path.
+    // `forget_source` itself takes `&self` and acquires the per-
+    // workspace storage `Mutex` internally — a brief read guard is
+    // the right outer access level.
+    let workspaces = {
+        let engine_guard = state.engine.read().await;
+        match engine_guard.list_workspaces().await {
+            Ok(w) => w,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("list_workspaces: {e}"),
+                )
+                    .into_response();
+            }
         }
     };
     for ws in &workspaces {
-        let claims = match engine_guard
-            .list_claims(&ws.name, ClaimFilter::default())
-            .await
-        {
-            Ok(c) => c,
-            Err(_) => continue,
+        let found_uri: Option<String> = {
+            let engine_guard = state.engine.read().await;
+            match engine_guard
+                .list_claims(&ws.name, ClaimFilter::default())
+                .await
+            {
+                Ok(claims) => claims
+                    .iter()
+                    .find(|c| c.id == req.id)
+                    .map(|c| c.source_uri.clone()),
+                Err(_) => continue,
+            }
         };
-        if let Some(found) = claims.iter().find(|c| c.id == req.id) {
-            let source_uri = found.source_uri.clone();
-            drop(engine_guard);
-            let engine_write = state.engine.read().await;
-            return match engine_write.forget_source(&ws.name, &source_uri).await {
+        if let Some(source_uri) = found_uri {
+            let engine_guard = state.engine.read().await;
+            return match engine_guard.forget_source(&ws.name, &source_uri).await {
                 Ok(n) => Json(ForgetResponse { forgotten: n > 0 }).into_response(),
                 Err(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,

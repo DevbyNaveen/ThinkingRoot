@@ -6,14 +6,24 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 
-/// Fixed session ID for the stdio transport (single-client protocol).
-const STDIO_SESSION_ID: &str = "stdio";
-
 pub async fn run(
     engine: Arc<RwLock<QueryEngine>>,
     default_workspace: Option<String>,
     sessions: SessionStore,
 ) {
+    // Per-process unique session id. Pre-fix this was the literal
+    // string `"stdio"`, so two concurrent stdio transports (e.g.
+    // Claude Code + Cursor in two terminal panes attached to the
+    // same daemon) collided on every session-scoped piece of state:
+    // EngramManager pointer tables, `checkout_branch` active
+    // branch, `turn_provenance` window, observer buffer. The
+    // session id includes the process id so logs remain readable
+    // even when a UUID rolls.
+    let stdio_session_id = format!(
+        "stdio-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
     // Stdio transport gets its own EngramManager — single client, lives
     // for the duration of the process. SSE transport uses the AppState's
     // shared manager.
@@ -63,7 +73,7 @@ pub async fn run(
             &request,
             &engine_guard,
             default_workspace.as_deref(),
-            STDIO_SESSION_ID,
+            &stdio_session_id,
             &sessions,
             &engram_manager,
         )

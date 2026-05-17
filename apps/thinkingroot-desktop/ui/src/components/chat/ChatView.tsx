@@ -47,6 +47,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 
@@ -1374,6 +1375,7 @@ function MessageBubble({
         <div className="w-full max-w-3xl text-[15px] leading-7 text-foreground">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeSanitize]}
             components={{
               code({ node, inline, className, children, ...props }: any) {
                 const match = /language-(\w+)/.exec(className || "");

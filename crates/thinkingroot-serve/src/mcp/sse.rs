@@ -77,6 +77,33 @@ async fn handle_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let endpoint_url = format!("/mcp?sessionId={session_id}");
     let _ = tx.send(SseMsg::Endpoint(endpoint_url));
 
+    // Session reaper. When the SSE stream's receiver is dropped (the
+    // client disconnected, network flapped, browser refreshed before
+    // sending any POST), the existing send-failure cleanup at
+    // `handle_post` only fires if a POST arrives. Without this
+    // watchdog, a session that never receives a POST leaks the
+    // `UnboundedSender` slot in `mcp_sessions` forever.
+    //
+    // `UnboundedSender::closed()` resolves the moment the receiver
+    // half is dropped. The clone we hold here doesn't prevent the
+    // stream's `rx` from dropping when the stream ends — clones are
+    // independent senders and `rx.recv()` returns None only when all
+    // senders go away. The reaper holds one of those clones to await
+    // the close signal, then removes the entry.
+    {
+        let session_id = session_id.clone();
+        let sessions = state.mcp_sessions.clone();
+        let tx_watch = tx.clone();
+        tokio::spawn(async move {
+            tx_watch.closed().await;
+            sessions.lock().await.remove(&session_id);
+            tracing::debug!(
+                target: "mcp_sse",
+                "session reaper: removed entry after receiver drop"
+            );
+        });
+    }
+
     let stream = UnboundedReceiverStream::new(rx).map(|msg| {
         let event = match msg {
             SseMsg::Endpoint(url) => Event::default().event("endpoint").data(url),
@@ -274,30 +301,30 @@ async fn handle_post(
         }
     };
 
-    // Route the response to the session's SSE stream.
-    let sessions = state.mcp_sessions.lock().await;
+    // Route the response to the session's SSE stream. The lock guard
+    // is held across the entire send-and-cleanup path so that a
+    // reconnect carrying the same `session_id` cannot slot itself
+    // into the map between our `is_err()` check and the `.remove()`,
+    // which would otherwise evict the new (live) session instead of
+    // the dead one. Worst case the lock is held for a single
+    // synchronous `tx.send` — non-blocking on `UnboundedSender`.
+    let mut sessions = state.mcp_sessions.lock().await;
     match sessions.get(&session_id) {
         Some(tx) => {
             let send_result = tx.send(SseMsg::Message(json_str));
-            drop(sessions);
-
             if send_result.is_err() {
                 // The SSE stream closed between registration and this POST.
-                // Clean up the dead session entry.
+                // Clean up the dead session entry under the same guard.
                 tracing::warn!("MCP session {session_id}: SSE stream closed, removing session");
-                state.mcp_sessions.lock().await.remove(&session_id);
+                sessions.remove(&session_id);
                 return StatusCode::GONE.into_response();
             }
-
             StatusCode::ACCEPTED.into_response()
         }
-        None => {
-            drop(sessions);
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("session '{session_id}' not found")})),
-            )
-                .into_response()
-        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("session '{session_id}' not found")})),
+        )
+            .into_response(),
     }
 }

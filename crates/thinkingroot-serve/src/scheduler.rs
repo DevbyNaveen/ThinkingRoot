@@ -102,18 +102,20 @@ impl Scheduler {
         })
     }
 
-    /// Register one periodic task. Safe to call before or after
-    /// `start`; tasks registered after start are NOT picked up
-    /// automatically — call `start` again (it's idempotent but a
-    /// no-op for already-started tasks) to spawn newly registered
-    /// workers. For the v1.0 ship every registration happens at
-    /// process setup so the re-start path is unused in production.
+    /// Register one periodic task.
+    ///
+    /// **Order requirement:** call every `register` BEFORE `start`.
+    /// `start` is one-shot (gated by `OnceLock`), so tasks registered
+    /// after the first `start` are silently never spawned — calling
+    /// `start` again is a no-op. Use [`start_one`] to spawn a single
+    /// late-registered task on top of an already-running scheduler.
     pub async fn register(&self, task: Arc<dyn PeriodicTask>) {
         self.tasks.lock().await.push(task);
     }
 
-    /// Idempotent start. First call spawns one tokio worker per
-    /// currently-registered task. Subsequent calls are no-ops.
+    /// One-shot start. First call spawns one tokio worker per
+    /// currently-registered task. Subsequent calls are no-ops —
+    /// `start_one` is the entry point for late additions.
     pub async fn start(self: &Arc<Self>) {
         if self.started.set(()).is_err() {
             return;
@@ -123,6 +125,17 @@ impl Scheduler {
         for task in tasks_snapshot {
             handles.push(spawn_periodic_task(task));
         }
+    }
+
+    /// Spawn a single task on a scheduler that has already been
+    /// started. Use when a feature wants to add a periodic worker
+    /// dynamically (e.g. after a workspace mounts). The task is also
+    /// appended to `tasks` so it survives a hypothetical future
+    /// restart hook. Idempotency vs. `start` is by construction:
+    /// this method does NOT consult `started` at all.
+    pub async fn start_one(self: &Arc<Self>, task: Arc<dyn PeriodicTask>) {
+        self.tasks.lock().await.push(task.clone());
+        self.handles.lock().await.push(spawn_periodic_task(task));
     }
 
     /// Record a forced run of `task_name` — used by event-driven

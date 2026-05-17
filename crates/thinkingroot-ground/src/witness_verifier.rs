@@ -85,7 +85,8 @@ pub fn verify_witness_anchor(
     source_bytes: &[u8],
     expected_content_blake3: &str,
 ) -> Result<AnchorVerdict, WitnessAnchorError> {
-    if byte_end <= byte_start {
+    // `start > end` is genuinely inverted — refuse loudly.
+    if byte_end < byte_start {
         return Err(WitnessAnchorError::InvertedSpan {
             start: byte_start,
             end: byte_end,
@@ -104,6 +105,13 @@ pub fn verify_witness_anchor(
         ));
     }
 
+    // Point-location spans (`start == end`) are legitimate per the
+    // `WitnessSpan` docs: rules like `lsp::diagnostic@v1` emit a
+    // Witness at a cursor position carrying no byte range. The
+    // expected hash for an empty span is the BLAKE3 of zero bytes;
+    // we let the regular hash path handle it so caller code paths
+    // (probe verification, pack open verification) don't need a
+    // special-case branch.
     let slice = &source_bytes[byte_start as usize..byte_end as usize];
     let actual = blake3::hash(slice).to_hex().to_string();
 
@@ -179,12 +187,24 @@ mod tests {
     }
 
     #[test]
-    fn equal_start_and_end_returns_inverted_error() {
-        // Zero-length spans are rejected — every Witness's anchor
-        // points at at-least-one byte.
+    fn equal_start_and_end_is_point_location() {
+        // Point-location spans (start == end) are legitimate per
+        // the `WitnessSpan` docs — rules like `lsp::diagnostic@v1`
+        // emit a Witness at a cursor position with no byte range.
+        // The expected hash for the empty slice is BLAKE3 of zero
+        // bytes; the verifier hashes the slice unconditionally.
         let source = b"abc";
-        let err = verify_witness_anchor(1, 1, source, &"0".repeat(64)).unwrap_err();
-        assert!(matches!(err, WitnessAnchorError::InvertedSpan { .. }));
+        let empty_hash = blake3::hash(&[]).to_hex().to_string();
+        let verdict = verify_witness_anchor(1, 1, source, &empty_hash).unwrap();
+        assert!(matches!(verdict, AnchorVerdict::Verified));
+    }
+
+    #[test]
+    fn point_location_mismatch_surfaces_normally() {
+        let source = b"abc";
+        let bogus = "0".repeat(64);
+        let verdict = verify_witness_anchor(1, 1, source, &bogus).unwrap();
+        assert!(matches!(verdict, AnchorVerdict::Mismatch { .. }));
     }
 
     #[test]

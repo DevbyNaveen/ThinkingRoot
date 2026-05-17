@@ -122,6 +122,13 @@ export function EngineGate({ children }: EngineGateProps) {
   // Hold the latest cancellation flag in a ref so the event listener
   // (which captures it at mount time) can read the live value.
   const cancelledRef = useRef(false);
+  // Guards `markSetupComplete` against the React Strict-Mode double-
+  // fire + repeated `engineStatus === "healthy"` re-renders. The
+  // backend now serialises concurrent writes under the install-
+  // manifest sentinel lock, so a duplicate call no longer races —
+  // but firing the same Tauri command 2-3× per session is still
+  // wasteful and pollutes logs.
+  const setupStampInFlightRef = useRef(false);
 
   // Pull-style refresh used by both the initial probe and event-driven
   // re-checks. Always re-reads from the CLI so the panel never shows
@@ -300,13 +307,22 @@ export function EngineGate({ children }: EngineGateProps) {
   // never surfaces again. Future failures fall through to the
   // standard panel.
   useEffect(() => {
-    if (engineStatus === "healthy" && setupCompleteAt === null) {
+    if (
+      engineStatus === "healthy" &&
+      setupCompleteAt === null &&
+      !setupStampInFlightRef.current
+    ) {
+      setupStampInFlightRef.current = true;
       const now = new Date().toISOString();
       markSetupComplete()
         .then(() => {
           if (!cancelledRef.current) setSetupCompleteAt(now);
         })
         .catch((err) => {
+          // Leave the ref true on failure too — retrying on every
+          // re-render would spin the Tauri command. The user can
+          // restart the app to retry, or hit "Skip" in the wizard
+          // panel which calls the same command via `handleSkipWizard`.
           console.error("mark_setup_complete failed:", err);
         });
     }

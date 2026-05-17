@@ -4609,6 +4609,108 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Cascade the Witness Mesh substrate (`witnesses`,
+    /// `witness_input_edges`, `witness_typed_edges`) for a single
+    /// source. Order is: (1) collect Witness ids about to be removed,
+    /// (2) prune both edge tables where any endpoint is in that set,
+    /// (3) remove the Witness rows themselves. Edges-before-rows
+    /// matters because I-W9 (DAG consistency) is an audit invariant:
+    /// a transient state where an edge references a Witness whose
+    /// row has been removed would fail any in-flight audit running
+    /// against the same DB. Cozo `multi_transaction` is not in play
+    /// here (the parent `remove_source_by_id` is not transactional
+    /// across all its child cascades) so the within-cascade order
+    /// is the only consistency lever we have.
+    fn cascade_witnesses_for_source(&self, source_id: &str) -> Result<()> {
+        // 1. Collect Witness ids for this source.
+        let mut params = BTreeMap::new();
+        params.insert("sid".into(), DataValue::Str(source_id.into()));
+        let ids_result = self
+            .db
+            .run_script(
+                "?[id] := *witnesses{id, source_id}, source_id = $sid",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!(
+                    "collect witness ids for cascade ({source_id}): {e}"
+                ))
+            })?;
+
+        let witness_ids: Vec<String> = ids_result
+            .rows
+            .iter()
+            .filter_map(|r| {
+                r.first().and_then(|dv| match dv {
+                    DataValue::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        if witness_ids.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Prune edges where this Witness appears on either side.
+        //    Per-id loops are necessary because Cozo's `:rm` requires
+        //    head columns matched against the rule body; we cannot
+        //    bind a Set parameter to an `IN` predicate without
+        //    materialising each id as a query.
+        for wid in &witness_ids {
+            let mut params = BTreeMap::new();
+            params.insert("wid".into(), DataValue::Str(wid.as_str().into()));
+            self.db
+                .run_script(
+                    r#"?[parent_witness_id, child_witness_id]
+                        := *witness_input_edges{parent_witness_id, child_witness_id},
+                           (parent_witness_id = $wid or child_witness_id = $wid)
+                       :rm witness_input_edges {parent_witness_id, child_witness_id}"#,
+                    params,
+                    ScriptMutability::Mutable,
+                )
+                .map_err(|e| {
+                    Error::GraphStorage(format!(
+                        "cascade witness_input_edges for witness {wid}: {e}"
+                    ))
+                })?;
+
+            let mut params = BTreeMap::new();
+            params.insert("wid".into(), DataValue::Str(wid.as_str().into()));
+            self.db
+                .run_script(
+                    r#"?[from_witness_id, to_witness_id, edge_type]
+                        := *witness_typed_edges{from_witness_id, to_witness_id, edge_type},
+                           (from_witness_id = $wid or to_witness_id = $wid)
+                       :rm witness_typed_edges {from_witness_id, to_witness_id, edge_type}"#,
+                    params,
+                    ScriptMutability::Mutable,
+                )
+                .map_err(|e| {
+                    Error::GraphStorage(format!(
+                        "cascade witness_typed_edges for witness {wid}: {e}"
+                    ))
+                })?;
+        }
+
+        // 3. Remove the Witness rows themselves.
+        let mut params = BTreeMap::new();
+        params.insert("sid".into(), DataValue::Str(source_id.into()));
+        self.db
+            .run_script(
+                r#"?[id] := *witnesses{id, source_id}, source_id = $sid
+                   :rm witnesses {id}"#,
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("cascade witnesses for {source_id}: {e}"))
+            })?;
+
+        Ok(())
+    }
+
     fn remove_source_by_id(&self, source_id: &str) -> Result<()> {
         let claim_ids = self.get_claim_ids_for_source(source_id)?;
         self.remove_source_relations(source_id)?;
@@ -4655,6 +4757,18 @@ impl GraphStore {
         // source delete, leaving AEP/Hybrid clusters joining through dead
         // claim_ids.
         self.cascade_structural_tables_for_source(source_id)?;
+
+        // Cascade the Witness Mesh substrate. `witnesses` carries a
+        // direct `source_id` column; `witness_input_edges` and
+        // `witness_typed_edges` reference Witness ids on both sides,
+        // so any edge touching a deleted Witness must also go. Pre-
+        // fix this cascade did not exist — every incremental compile
+        // that deleted a file leaked Witness rows forever (orphan
+        // canary in `count_orphaned_claims` would fire but the
+        // cleanup path was absent). I-W1 cascade completeness
+        // requires every byte-anchored substrate row to vanish with
+        // its source.
+        self.cascade_witnesses_for_source(source_id)?;
 
         // Cascade resolution_deps in both directions (T5).  When a source is
         // removed, every cross-source resolution it participated in becomes

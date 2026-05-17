@@ -159,7 +159,22 @@ function Write-InstallManifest([string]$binPath, [string]$version, [string]$chec
         setup_complete_at  = $null
         model_bundle       = $modelBundle
     }
-    $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
+    # Atomic write via .tr-installing staging + Move-Item. Pre-fix
+    # `Set-Content` wrote in-place; a SIGINT (Ctrl-C on the PowerShell
+    # pipeline) mid-write left a torn JSON file that `InstallManifest::load()`
+    # would treat as `None` (corrupt-but-absent), losing the manifest
+    # entirely on the next launch. Matches install.sh's tmp+mv pattern
+    # required by .claude/rules/universal-install.md.
+    $manifestTmp = "${manifestPath}.tr-installing"
+    try {
+        $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestTmp -Encoding UTF8
+        Move-Item -Force -Path $manifestTmp -Destination $manifestPath
+    } catch {
+        # Clean up the staging file if the move failed so the next
+        # install doesn't trip on a stale tempfile.
+        if (Test-Path $manifestTmp) { Remove-Item -Force -ErrorAction SilentlyContinue $manifestTmp }
+        throw
+    }
     Say "Registered install manifest at $manifestPath"
 }
 

@@ -318,14 +318,25 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
     // before storing the handle.  `cmd.spawn()` only forks the OS
     // process — the engine still needs to load the workspace registry,
     // mount each workspace's CozoDB + vector index, and bind the TCP
-    // listener.  That can take several seconds on a warm machine and
-    // longer on first-compile cold starts.
+    // listener.
     //
-    // CRITICAL FIX: We pass `&mut child` so we can call `try_wait()`
-    // during polling.  If the child exits (crash, mount failure, etc.),
-    // we detect it immediately instead of burning the full 120s timeout.
+    // 10s ceiling matches `compile-resilience.md`'s SIDECAR_BOOT_MAX_ATTEMPTS
+    // (20 attempts × 500ms). The historical 120s ceiling was justified by
+    // first-run NLI ONNX + fastembed downloads — both dependencies are
+    // gone (NLI was deleted in commit c16b9aa; fastembed loads lazily
+    // in-process now). A healthy sidecar boots in 2-4s on M-series; 10s
+    // is 4-5× headroom while still feeling instant.
+    //
+    // Pre-fix: the compile path's 10s boot wait (await_sidecar_handle)
+    // would time out and return a false-negative "sidecar not ready"
+    // while spawn_attached was still holding the slot Mutex for up to
+    // 110 more seconds, freezing the UI on a wedged-but-not-dead boot.
+    //
+    // `&mut child` is passed so we can `try_wait()` during polling;
+    // if the child exits (crash, mount failure, etc.), we detect it
+    // immediately instead of burning the full timeout.
     let livez_url = format!("http://{}:{}/livez", HOST, port);
-    let ready = wait_for_sidecar_ready(&livez_url, &mut child, 120).await;
+    let ready = wait_for_sidecar_ready(&livez_url, &mut child, 10).await;
 
     if !ready {
         // Child died or never became ready.  Check if it exited.
@@ -341,7 +352,7 @@ async fn spawn_attached<R: Runtime>(app: &AppHandle<R>, binary: &Path, port: u16
                 // Still running but never responded to /livez.
                 tracing::error!(
                     "sidecar process is running but never became ready (no /livez response \
-                     after 120s). Killing it and falling back to in-process compile."
+                     after 10s). Killing it and falling back to in-process compile."
                 );
                 let _ = child.kill().await;
             }

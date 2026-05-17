@@ -262,7 +262,17 @@ pub async fn register_mcp_bridge_tools(
         // registered post-startup via `tool_trait::register_tool`. A
         // tool that declares `is_write() = true` auto-routes through
         // the write-class gate without manual addition to the const.
-        let is_write = BRIDGE_WRITE_NAMES.contains(&spec.name.as_str())
+        //
+        // Fail-safe: any tool whose name contains `::` came from the
+        // external MCP registry (`<server>::<tool>` prefixing scheme)
+        // and is treated as write-class. External servers can expose
+        // arbitrary side effects (filesystem, network, third-party
+        // APIs); honouring their `is_write` claim would let any user-
+        // configured MCP server bypass the agent's ApprovalGate. The
+        // DEFAULT_DENY discipline applies: external → write → gated.
+        let is_external_mcp = spec.name.contains("::");
+        let is_write = is_external_mcp
+            || BRIDGE_WRITE_NAMES.contains(&spec.name.as_str())
             || crate::mcp::tool_trait::is_registered_write(&spec.name);
         if is_write {
             registry = registry.register_write(spec, handler);

@@ -1162,19 +1162,47 @@ async fn run_pipeline_inner(
         storage.graph.insert_source(&source)?;
         progress_state.advance(1);
 
-        // Reconstruct the text used during extraction (chunks joined by \n).
-        // This matches what the Grounder saw, so provenance probe results line
-        // up with Phase 2b's tribunal when re-rooted later.
-        let text: String = doc
-            .chunks
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Persist the ORIGINAL source bytes to the durable byte store.
+        // The current consumer is `witness_verifier::verify_witness_anchor`
+        // which re-hashes the byte slice referenced by each Witness's
+        // `spans[0]` and compares against `content_blake3`. A chunk-
+        // join reconstruction (the pre-fix shape) differs from the
+        // original on any file with non-`\n`-newlines, BOMs, or
+        // inter-chunk whitespace — making every Witness on those
+        // sources fail anchor verification at probe time. Reading
+        // from `doc.uri` matches what the parser saw a few phases
+        // earlier; if the file was modified between parse and now
+        // the next compile's Phase 1 fingerprint diff will catch it.
+        //
+        // Sources whose URI doesn't round-trip to a readable file
+        // (e.g. synthetic doc URIs for hand-contributed Documents,
+        // git-history rows, virtual MCP feeds) are skipped honestly
+        // with a tracing warning — the witness verifier degrades to
+        // "in-place re-check" for those rows, but the alternative
+        // (writing the chunk-join into the byte store) would
+        // silently break verification rather than admit absence.
         use thinkingroot_graph::SourceByteStore;
-        byte_store
-            .put(doc.source_id, &doc.content_hash, text.as_bytes())
-            .map_err(|e| thinkingroot_core::Error::Config(format!("rooting put: {e}")))?;
+        let source_path = std::path::Path::new(&doc.uri);
+        match std::fs::read(source_path) {
+            Ok(bytes) => {
+                byte_store
+                    .put(doc.source_id, &doc.content_hash, &bytes)
+                    .map_err(|e| {
+                        thinkingroot_core::Error::Config(format!("byte store put: {e}"))
+                    })?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "pipeline",
+                    source_id = %doc.source_id,
+                    uri = %doc.uri,
+                    error = %e,
+                    "byte store: source URI does not resolve to a readable file; \
+                     witness anchor verification will degrade to in-place re-check \
+                     for rows on this source"
+                );
+            }
+        }
     }
 
     // Filter extraction to only truly-changed sources.

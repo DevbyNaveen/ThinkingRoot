@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -52,6 +52,13 @@ pub struct StdioTransport {
     /// Hold a child handle so `Drop` can kill the subprocess.
     child: Mutex<Option<Child>>,
     timeout: Duration,
+    /// Set to `true` when the background reader observes EOF or a
+    /// read error. Subsequent `rpc()` calls bail immediately rather
+    /// than queueing a request that would never be answered + then
+    /// blocking on a write to a closed stdin + then sleeping the
+    /// full per-request timeout. `Arc<AtomicBool>` so the reader
+    /// task and the transport share one instance.
+    dead: Arc<AtomicBool>,
 }
 
 impl StdioTransport {
@@ -63,6 +70,22 @@ impl StdioTransport {
         args: &[String],
         env: HashMap<String, String>,
         cwd: Option<PathBuf>,
+    ) -> Result<Arc<Self>, McpClientError> {
+        Self::spawn_with_timeout(program, args, env, cwd, DEFAULT_RPC_TIMEOUT).await
+    }
+
+    /// Same as `spawn` but with a caller-supplied per-RPC timeout.
+    /// Used by `external_registry::start_client` to honour the
+    /// per-server `timeout_secs` field from `mcp-servers.toml`. Pre-
+    /// fix the legacy `with_timeout` builder discarded its argument
+    /// silently, so every stdio server inherited the 30s default
+    /// regardless of operator config.
+    pub async fn spawn_with_timeout(
+        program: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        cwd: Option<PathBuf>,
+        timeout: Duration,
     ) -> Result<Arc<Self>, McpClientError> {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -101,12 +124,14 @@ impl StdioTransport {
 
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, McpClientError>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let dead = Arc::new(AtomicBool::new(false));
 
         // Background reader: parse one JSON-RPC envelope per line.
         // On unparseable lines, log at WARN and continue — some
         // MCP servers emit informational stderr/stdout lines that
         // aren't JSON-RPC; we treat them as noise.
         let pending_for_reader = pending.clone();
+        let dead_for_reader = dead.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             loop {
@@ -124,9 +149,12 @@ impl StdioTransport {
                     }
                     Ok(Some(_)) => continue,
                     Ok(None) => {
-                        // EOF — child closed stdout. Fail every
-                        // pending request loudly so callers don't
-                        // hang.
+                        // EOF — child closed stdout. Mark the
+                        // transport dead BEFORE draining so any
+                        // racing `rpc()` call observes the flag and
+                        // bails immediately instead of inserting a
+                        // doomed request.
+                        dead_for_reader.store(true, Ordering::SeqCst);
                         let mut p = pending_for_reader.lock().await;
                         for (_, tx) in p.drain() {
                             let _ = tx.send(Err(McpClientError::TransportFailed(
@@ -136,6 +164,7 @@ impl StdioTransport {
                         break;
                     }
                     Err(e) => {
+                        dead_for_reader.store(true, Ordering::SeqCst);
                         let mut p = pending_for_reader.lock().await;
                         for (_, tx) in p.drain() {
                             let _ = tx.send(Err(McpClientError::TransportFailed(format!(
@@ -153,19 +182,9 @@ impl StdioTransport {
             stdin: Mutex::new(stdin),
             pending,
             child: Mutex::new(Some(child)),
-            timeout: DEFAULT_RPC_TIMEOUT,
+            timeout,
+            dead,
         }))
-    }
-
-    /// Override the per-RPC timeout.
-    pub fn with_timeout(self: Arc<Self>, timeout: Duration) -> Arc<Self> {
-        // Honest scope: we can't mutate fields on an Arc'd struct.
-        // The construction-time pattern is StdioTransport { ..,
-        // timeout: configured }. Use `spawn_with_timeout` if you
-        // need a custom timeout — adding here would require
-        // interior mutability we don't currently need.
-        let _ = timeout;
-        self
     }
 }
 
@@ -204,6 +223,15 @@ async fn dispatch_envelope(
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, McpClientError> {
+        // Fast-fail when the reader has already observed EOF/error —
+        // queueing a request that no one will answer wastes the full
+        // per-RPC timeout and pollutes `pending` with a stale entry
+        // until either Drop or a late race-window response.
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(McpClientError::TransportFailed(
+                "stdio child is no longer responding (EOF / read error observed)".into(),
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let envelope = serde_json::json!({
             "jsonrpc": "2.0",

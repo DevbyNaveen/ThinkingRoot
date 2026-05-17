@@ -257,14 +257,20 @@ pub async fn file_write(
         parent_dirs_created = true;
     }
 
-    // Atomic write via tempfile + rename. Use a per-PID temp suffix
-    // so two concurrent writers can't clobber each other's tmp file.
+    // Atomic write via tempfile + rename. The suffix mixes the PID
+    // (for cross-process distinctness) with a per-call random u64
+    // (for in-process distinctness — two async writers in the same
+    // tokio task can otherwise collide on the PID-only suffix, the
+    // second write clobbers the first's tmp file before its rename
+    // fires, and the disk ends up with whichever happened to land
+    // last). Hex-encoded keeps the suffix short and printable.
     let tmp = path.with_file_name(format!(
-        "{}.tmp-{}",
+        "{}.tmp-{}-{:016x}",
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        std::process::id()
+        std::process::id(),
+        rand::random::<u64>(),
     ));
     tokio::fs::write(&tmp, content)
         .await

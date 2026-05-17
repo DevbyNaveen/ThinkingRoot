@@ -782,14 +782,64 @@ async fn run_desktop_compile_task(
                                     cancel.clone(),
                                 )
                                 .await;
-                                if let Ok(ref _result) = retry_outcome {
-                                    let _ = recovery_log::append(
-                                        &RecoveryEvent::compile_recovered(&url_alias, 1),
-                                    );
-                                    tracing::info!(
-                                        workspace = %url_alias,
-                                        "compile auto-retry succeeded"
-                                    );
+                                match &retry_outcome {
+                                    Ok(_) => {
+                                        let _ = recovery_log::append(
+                                            &RecoveryEvent::compile_recovered(&url_alias, 1),
+                                        );
+                                        tracing::info!(
+                                            workspace = %url_alias,
+                                            "compile auto-retry succeeded"
+                                        );
+                                    }
+                                    Err(CompileDriveError::Failed(retry_err)) => {
+                                        // Audit invariant from
+                                        // compile-resilience.md: all 4 retry
+                                        // events are required to construct the
+                                        // doctor's "recent compile health"
+                                        // panel. Pre-fix the second failure
+                                        // was emitted only as a UI event, not
+                                        // into recovery.log, so the panel
+                                        // showed an unexplained "1 failed +
+                                        // retry scheduled" with no terminal
+                                        // outcome for a permanently-failed
+                                        // compile. Record the second
+                                        // `compile_failed` so the doctor can
+                                        // distinguish "retry succeeded" from
+                                        // "retry also failed".
+                                        let _ = recovery_log::append(
+                                            &RecoveryEvent::compile_failed(
+                                                &url_alias,
+                                                retry_err,
+                                                1,
+                                            ),
+                                        );
+                                        // Re-evaluate the breaker for THIS
+                                        // (second) failure — if it now trips,
+                                        // emit the breaker event so the panel
+                                        // shows the cool-down.
+                                        let mut rs = RestartState::load().unwrap_or_default();
+                                        rs.prune_compile_attempts();
+                                        rs.record_compile_failure(&url_alias, retry_err);
+                                        if rs.compile_should_trip(&url_alias) {
+                                            let until = rs.trip_compile_breaker();
+                                            let count =
+                                                rs.recent_compile_failure_count(&url_alias);
+                                            let _ = recovery_log::append(
+                                                &RecoveryEvent::compile_breaker_tripped(
+                                                    &url_alias,
+                                                    count as u32,
+                                                    until,
+                                                ),
+                                            );
+                                        }
+                                        let _ = rs.save();
+                                    }
+                                    Err(CompileDriveError::Cancelled) => {
+                                        // User stopped during retry — already
+                                        // handled by the outer match arm,
+                                        // nothing extra to log.
+                                    }
                                 }
                                 retry_outcome
                             }

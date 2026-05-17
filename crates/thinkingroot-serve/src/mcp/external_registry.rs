@@ -111,6 +111,8 @@ pub enum RegistryError {
     ConfigParse(String),
     #[error("unresolved env reference: {0}")]
     UnresolvedEnv(String),
+    #[error("malformed env reference: {0}")]
+    MalformedEnv(String),
     #[error("transport startup for `{0}`: {1}")]
     TransportStartup(String, McpClientError),
 }
@@ -273,9 +275,22 @@ async fn spawn_one(entry: &ServerEntry) -> Result<Arc<McpClient>, RegistryError>
                 .ok_or_else(|| RegistryError::ConfigParse("stdio server missing `command`".into()))?;
             let env = resolve_env_map(&entry.env)?;
             let cwd = entry.cwd.clone().map(PathBuf::from);
-            let transport = StdioTransport::spawn(&command, &entry.args, env, cwd)
-                .await
-                .map_err(|e| RegistryError::TransportStartup(entry.name.clone(), e))?;
+            // Honour the per-server `timeout_secs` from
+            // `mcp-servers.toml`. `None` keeps the default 30s.
+            let transport = match entry.timeout_secs {
+                Some(secs) => {
+                    StdioTransport::spawn_with_timeout(
+                        &command,
+                        &entry.args,
+                        env,
+                        cwd,
+                        Duration::from_secs(secs),
+                    )
+                    .await
+                }
+                None => StdioTransport::spawn(&command, &entry.args, env, cwd).await,
+            }
+            .map_err(|e| RegistryError::TransportStartup(entry.name.clone(), e))?;
             McpClient::new(transport)
         }
         TransportKind::Http => {
@@ -305,17 +320,135 @@ async fn spawn_one(entry: &ServerEntry) -> Result<Arc<McpClient>, RegistryError>
     Ok(Arc::new(client))
 }
 
-/// Resolve `${VAR}` references in `value`. A literal not matching
-/// the `${...}` pattern is returned verbatim. Unresolved refs
-/// produce `Err(UnresolvedEnv)` — never silent fallthrough.
+/// Resolve `${VAR}` references inside `value`. Both whole-string
+/// (`${TOKEN}`) and substring (`Bearer ${TOKEN}`, `prefix-${X}-suffix`)
+/// patterns are supported. A literal containing no `${...}` is
+/// returned verbatim. Unresolved refs produce `Err(UnresolvedEnv)` —
+/// never a silent pass-through that would let `${MY_TOKEN}` ship
+/// as the literal token string to the remote MCP server.
+///
+/// Variable names follow shell convention: `[A-Za-z_][A-Za-z0-9_]*`.
+/// A malformed reference (unterminated `${`, empty name, or invalid
+/// chars in the name) is returned as `MalformedEnv` rather than
+/// being passed through, so operators get a loud error rather than a
+/// silent miss.
 fn resolve_env_ref(value: &str) -> Result<String, RegistryError> {
-    let trimmed = value.trim();
-    if trimmed.starts_with("${") && trimmed.ends_with('}') {
-        let name = &trimmed[2..trimmed.len() - 1];
-        return std::env::var(name)
-            .map_err(|_| RegistryError::UnresolvedEnv(name.to_string()));
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for "${" — anything else is copied byte-for-byte.
+        if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
+            // Find the closing `}`.
+            let name_start = i + 2;
+            let Some(close_rel) = bytes[name_start..].iter().position(|&b| b == b'}') else {
+                return Err(RegistryError::MalformedEnv(format!(
+                    "unterminated ${{...}} reference starting at byte {i} in `{value}`"
+                )));
+            };
+            let name_end = name_start + close_rel;
+            let name = &value[name_start..name_end];
+            if name.is_empty() {
+                return Err(RegistryError::MalformedEnv(format!(
+                    "empty ${{}} reference at byte {i} in `{value}`"
+                )));
+            }
+            // Validate shell identifier rules — refuse mistakes
+            // early instead of forwarding garbage to `std::env::var`
+            // (which would surface as an opaque NotPresent).
+            let valid = name.chars().enumerate().all(|(idx, c)| {
+                if idx == 0 {
+                    c.is_ascii_alphabetic() || c == '_'
+                } else {
+                    c.is_ascii_alphanumeric() || c == '_'
+                }
+            });
+            if !valid {
+                return Err(RegistryError::MalformedEnv(format!(
+                    "invalid env var name `${{{name}}}` in `{value}` — must match [A-Za-z_][A-Za-z0-9_]*"
+                )));
+            }
+            let resolved = std::env::var(name)
+                .map_err(|_| RegistryError::UnresolvedEnv(name.to_string()))?;
+            out.push_str(&resolved);
+            i = name_end + 1;
+        } else {
+            // Push one UTF-8 char at a time — `bytes[i]` could be a
+            // multi-byte lead, so step by char_len.
+            let rest = &value[i..];
+            let ch = rest.chars().next().expect("non-empty rest");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
-    Ok(value.to_string())
+    Ok(out)
+}
+
+#[cfg(test)]
+mod env_ref_tests {
+    use super::{RegistryError, resolve_env_ref};
+
+    fn set(name: &str, val: &str) {
+        // SAFETY: tests run in a single-threaded test harness; even
+        // multi-threaded test runners only collide on the same key
+        // when two tests share a variable, which is the case here
+        // but isolated to this module's serial #[test] order.
+        unsafe { std::env::set_var(name, val) };
+    }
+
+    fn unset(name: &str) {
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn whole_string_substitution() {
+        set("TR_TEST_TOK_A", "sk-abc123");
+        assert_eq!(resolve_env_ref("${TR_TEST_TOK_A}").unwrap(), "sk-abc123");
+        unset("TR_TEST_TOK_A");
+    }
+
+    #[test]
+    fn substring_substitution() {
+        set("TR_TEST_TOK_B", "xyz");
+        assert_eq!(
+            resolve_env_ref("Bearer ${TR_TEST_TOK_B}").unwrap(),
+            "Bearer xyz"
+        );
+        assert_eq!(
+            resolve_env_ref("prefix-${TR_TEST_TOK_B}-suffix").unwrap(),
+            "prefix-xyz-suffix"
+        );
+        unset("TR_TEST_TOK_B");
+    }
+
+    #[test]
+    fn unresolved_substring_errors() {
+        unset("TR_TEST_UNSET_XYZ");
+        let err = resolve_env_ref("Bearer ${TR_TEST_UNSET_XYZ}").unwrap_err();
+        assert!(matches!(err, RegistryError::UnresolvedEnv(_)));
+    }
+
+    #[test]
+    fn malformed_refs_are_loud() {
+        assert!(matches!(
+            resolve_env_ref("Bearer ${UNCLOSED").unwrap_err(),
+            RegistryError::MalformedEnv(_)
+        ));
+        assert!(matches!(
+            resolve_env_ref("Bearer ${}").unwrap_err(),
+            RegistryError::MalformedEnv(_)
+        ));
+        assert!(matches!(
+            resolve_env_ref("Bearer ${invalid-name}").unwrap_err(),
+            RegistryError::MalformedEnv(_)
+        ));
+    }
+
+    #[test]
+    fn literal_pass_through() {
+        assert_eq!(resolve_env_ref("plain-string").unwrap(), "plain-string");
+        assert_eq!(resolve_env_ref("").unwrap(), "");
+    }
 }
 
 fn resolve_env_map(input: &HashMap<String, String>) -> Result<HashMap<String, String>, RegistryError> {

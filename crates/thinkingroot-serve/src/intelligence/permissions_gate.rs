@@ -90,10 +90,43 @@ impl PermissionsGate {
             }
         };
         match tool_name {
-            "file_read" | "file_edit" | "open_in_default" => input
+            "file_read" | "file_edit" => input
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(|s| vec![path_subject(s, false)])
+                .unwrap_or_default(),
+
+            // `open_in_default` accepts EITHER a filesystem path OR a
+            // URL under the same `path_or_url` field (see tool schema
+            // in `mcp/tools.rs::open_in_default`). The earlier shared
+            // arm above read `input.get("path")`, which the schema
+            // never populates — every call yielded an empty subject
+            // vec, silently bypassing DEFAULT_DENY for file targets.
+            //
+            // Path targets route through `Subject::Path` so the
+            // canonical-check fires (~/.ssh refused without prompt).
+            // URL targets (`http://`, `https://`, `mailto:`, `ftp://`)
+            // route through `Subject::Command` so the existing
+            // command-policy machinery decides — that's the closest
+            // existing primitive without introducing a new variant.
+            "open_in_default" => input
+                .get("path_or_url")
+                .and_then(|v| v.as_str())
+                .map(|raw| {
+                    let trimmed = raw.trim();
+                    let lower = trimmed.to_ascii_lowercase();
+                    if lower.starts_with("http://")
+                        || lower.starts_with("https://")
+                        || lower.starts_with("ftp://")
+                        || lower.starts_with("mailto:")
+                    {
+                        vec![Subject::Command(trimmed.to_string())]
+                    } else if let Some(stripped) = trimmed.strip_prefix("file://") {
+                        vec![path_subject(stripped, false)]
+                    } else {
+                        vec![path_subject(trimmed, false)]
+                    }
+                })
                 .unwrap_or_default(),
 
             "file_write" => input

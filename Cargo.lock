@@ -6977,6 +6977,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "subtle",
  "tempfile",
  "thinkingroot-branch",
  "thinkingroot-compile",

@@ -210,12 +210,20 @@ impl InstallManifest {
             .expect("manifest path always has a parent");
         std::fs::create_dir_all(parent)?;
 
-        // Advisory write lock (sibling sentinel).
+        // Advisory write lock (sibling sentinel). The sentinel MUST
+        // NOT be truncated on open. POSIX `flock` is per-open-file-
+        // description: a second opener that calls `open()` with
+        // `truncate(true)` gets a fresh fd that is NOT blocked by an
+        // existing lock on the prior fd, defeating mutual exclusion
+        // completely. `truncate(false)` keeps every opener pointing
+        // at the same inode so `lock_exclusive` actually serialises.
+        // Matches the cortex.lock write-sentinel discipline in
+        // `crates/thinkingroot-core/src/cortex.rs::write_lock_inner`.
         let sentinel_path = parent.join("install-manifest.json.write");
         let sentinel = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .open(&sentinel_path)?;
         fs2::FileExt::lock_exclusive(&sentinel)?;
 
@@ -319,7 +327,7 @@ impl InstallManifest {
         let sentinel = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .open(&sentinel_path)?;
         fs2::FileExt::lock_exclusive(&sentinel)?;
 
@@ -352,6 +360,70 @@ impl InstallManifest {
         }
         tmp.persist(&path)
             .map_err(|e| ManifestError::Io(e.error))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+
+        let _ = fs2::FileExt::unlock(&sentinel);
+        Ok(())
+    }
+
+    /// Stamp `setup_complete_at = now()` atomically under the sentinel
+    /// lock. Used by the desktop's `mark_setup_complete` Tauri command
+    /// when the EngineGate flips to healthy for the first time.
+    ///
+    /// The desktop layer used to do `load() → mutate → save()` from
+    /// inside a Tauri command, leaving a window where two concurrent
+    /// callers (`register_or_update` from the install bridge, an
+    /// EngineGate React-Strict-Mode double-fire) could read the same
+    /// manifest, each mutate locally, and write back — clobbering
+    /// each other. Holding the sentinel lock across the whole
+    /// load-modify-save closes the window.
+    pub fn mark_setup_complete() -> Result<(), ManifestError> {
+        let path = Self::path()?;
+        let parent = path
+            .parent()
+            .expect("manifest path always has a parent");
+        std::fs::create_dir_all(parent)?;
+
+        let sentinel_path = parent.join("install-manifest.json.write");
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&sentinel_path)?;
+        fs2::FileExt::lock_exclusive(&sentinel)?;
+
+        let mut manifest = match Self::load_unlocked(&path)? {
+            Some(m) => m,
+            None => Self {
+                schema_version: SCHEMA_VERSION,
+                binaries: Vec::new(),
+                preferred: None,
+                setup_complete_at: None,
+                model_bundle: None,
+            },
+        };
+        manifest.setup_complete_at = Some(chrono::Utc::now());
+
+        // Inline atomic write under the held sentinel (mirrors the
+        // pattern in `register_or_update` — do NOT delegate to
+        // `save()` here, which would re-acquire this same lock and
+        // block forever).
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        let json = serde_json::to_string_pretty(&manifest)?;
+        {
+            use std::io::Write;
+            let mut handle = tmp.as_file().try_clone()?;
+            handle.write_all(json.as_bytes())?;
+            handle.sync_all()?;
+        }
+        tmp.persist(&path).map_err(|e| ManifestError::Io(e.error))?;
 
         #[cfg(unix)]
         {

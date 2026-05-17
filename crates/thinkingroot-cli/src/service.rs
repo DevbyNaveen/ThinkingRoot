@@ -355,7 +355,7 @@ fn install_linux(binary: &str, log_path: &std::path::Path) -> Result<ServiceOutc
     // daemon-reload picks up the new unit; enable --now starts it AND
     // wires it for login auto-start in one call.
     run_or_err("systemctl", &["--user", "daemon-reload"])?;
-    run_or_err(
+    let enable_result = run_or_err(
         "systemctl",
         &[
             "--user",
@@ -363,7 +363,29 @@ fn install_linux(binary: &str, log_path: &std::path::Path) -> Result<ServiceOutc
             "--now",
             &format!("{SERVICE_SHORTNAME}.service"),
         ],
-    )?;
+    );
+
+    // Headless Linux servers don't run `systemd --user` for users
+    // who never logged in interactively; `enable --now` exits 1 in
+    // that case with a message about a missing user manager. Detect
+    // the most reliable signal — `XDG_RUNTIME_DIR` unset means no
+    // user manager has been booted for this UID — and surface a
+    // hint about `loginctl enable-linger`, which keeps the user
+    // manager alive across logout and is the conventional fix on
+    // servers.
+    if let Err(e) = &enable_result {
+        let headless = std::env::var_os("XDG_RUNTIME_DIR").is_none();
+        if headless {
+            eprintln!(
+                "\nHint: on headless / server systems, the systemd --user manager isn't \
+                 running by default. Run\n\
+                 \n    sudo loginctl enable-linger $USER\n\n\
+                 then re-run `root service install`. (Detected via missing XDG_RUNTIME_DIR.)\n\
+                 Underlying error: {e}"
+            );
+        }
+    }
+    enable_result?;
 
     Ok(ServiceOutcome {
         artifact_path: Some(service_path),
@@ -421,9 +443,23 @@ fn install_windows(
 ) -> Result<ServiceOutcome, ServiceError> {
     let _ = log_path; // schtasks writes nothing; the daemon owns its own log.
 
-    // Build the task command line. /tr accepts a quoted command;
-    // schtasks accepts double-quote escaping via backslash-quote.
-    let tr = format!("\\\"{binary}\\\" serve");
+    // Build the task command line. `schtasks /TR` accepts a single
+    // string that is forwarded verbatim to the task. When the binary
+    // path contains spaces (the common case on Windows:
+    // `C:\Users\John Doe\AppData\...`) the path must be quoted so
+    // Task Scheduler reads it as one argument.
+    //
+    // The pre-fix shape `"\\\"{binary}\\\" serve"` baked
+    // backslash-escaped quotes into the value, which only works when
+    // the value is then passed through cmd.exe's parsing layer. Our
+    // `run_or_err` uses `std::process::Command::args()`, which
+    // forwards each arg as a NUL-terminated wide string directly to
+    // CreateProcessW — no cmd.exe involvement. The doubled escapes
+    // ended up in the task's command literally, and Task Scheduler
+    // refused to launch the resulting `\"C:\path\\\" serve` payload.
+    // The fix: plain double-quotes (one layer of escaping) so
+    // CreateProcessW hands schtasks exactly `"C:\path" serve`.
+    let tr = format!("\"{binary}\" serve");
 
     run_or_err(
         "schtasks",

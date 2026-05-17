@@ -89,6 +89,10 @@ dirs = { workspace = true }
 # feature set (json + rustls-tls) is what the existing dev-dep was
 # already pinned to.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Constant-time comparison for bearer/API-key auth checks. Tiny
+# (~6 KB), pure Rust, no_std. Closes the timing-side-channel class
+# that `==` allows when comparing user-supplied secrets.
+subtle = "2.6"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

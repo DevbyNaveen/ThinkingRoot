@@ -3,6 +3,7 @@ import { GitCommit, RefreshCw, User2, Bot, ChevronRight, ChevronDown } from "luc
 
 import { cn } from "@/lib/utils";
 import {
+  branchList,
   commitList,
   type CognitionCommit,
   type CommitAuthor,
@@ -43,6 +44,7 @@ export function CommitDAGView({ workspace, refreshNonce }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [activeBranch, setActiveBranch] = useState<string>("main");
 
   const load = useCallback(async () => {
     if (!workspace) {
@@ -53,7 +55,28 @@ export function CommitDAGView({ workspace, refreshNonce }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const rows = await commitList({ branch: "main", limit: 200 });
+      // Resolve the workspace's HEAD branch first so the DAG mirrors
+      // what the chat surface shows. Pre-fix this view hard-coded
+      // "main" and silently displayed an empty (or stale) DAG for
+      // anyone working on a topic/stream branch.
+      let resolvedBranch = "main";
+      try {
+        const branches = await branchList(workspace);
+        const current = branches.find((b) => b.current);
+        if (current) {
+          resolvedBranch = current.name;
+        }
+      } catch (branchErr) {
+        // Branch listing is best-effort — falling back to "main"
+        // preserves the historical default, and we surface the
+        // failure as a console warning so it's not silent.
+        console.warn(
+          "CommitDAGView: branch resolution failed, falling back to 'main':",
+          branchErr,
+        );
+      }
+      setActiveBranch(resolvedBranch);
+      const rows = await commitList({ branch: resolvedBranch, limit: 200 });
       setCommits(rows);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -88,7 +111,7 @@ export function CommitDAGView({ workspace, refreshNonce }: Props) {
           <span className="text-xs text-muted-foreground">
             {commits.length === 0
               ? "chat history as a content-addressed DAG"
-              : `${commits.length} commit${commits.length === 1 ? "" : "s"} on main`}
+              : `${commits.length} commit${commits.length === 1 ? "" : "s"} on ${activeBranch}`}
           </span>
         </div>
         <button

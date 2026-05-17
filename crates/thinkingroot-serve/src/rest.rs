@@ -12,7 +12,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::HeaderValue;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::engine::{ClaimFilter, QueryEngine};
 use crate::workspace_state::{Msg as WorkspaceStatusMsg, WorkspaceStateRegistry};
@@ -398,8 +399,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bool) -> Router {
+    // CORS is locked to loopback origins. The daemon's threat model
+    // assumes loopback binding; if the user explicitly binds to a
+    // non-loopback interface they accept that local-only browser
+    // SDKs (desktop, CLI tools, local dev pages) keep working while
+    // arbitrary third-party origins cannot read API responses via a
+    // browser. `Any` would let any page on the web exfiltrate
+    // workspace data through a visiting user's session.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+            origin
+                .to_str()
+                .map(is_loopback_origin)
+                .unwrap_or(false)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -686,30 +699,94 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
         router = router.nest("/mcp", mcp_routes);
     }
 
-    // Apply CORS + auth middleware to the routes registered above.
-    // The agentmemory router is composed BELOW the layer because it
-    // uses its own bearer-token scheme (env-gated) — it doesn't
-    // share the daemon's `X-API-Key` middleware. See
-    // `crate::agentmemory::agentmemory_auth_check`.
-    // Ops endpoints (/metrics, /readyz, /livez) are added AFTER .layer()
-    // so monitoring scrapers don't need the API key. Axum only applies a
-    // layer to routes already registered when `.layer()` was called.
-    let routed = router.layer(cors).layer(middleware::from_fn_with_state(
+    // Apply the daemon's X-API-Key auth ONLY to routes registered up
+    // to this point. `tower::Layer::layer` is order-sensitive: routes
+    // added afterwards are not wrapped. The remaining surfaces
+    // (`/agentmemory/*` which has its own bearer scheme, the public
+    // ops endpoints, and the discovery endpoints) merge in AFTER the
+    // auth wrap but BEFORE the CORS wrap so all routes share CORS
+    // semantics.
+    let auth_routed = router.layer(middleware::from_fn_with_state(
         state.clone(),
         auth_middleware,
     ));
 
-    routed
+    // Public + self-authenticated routes. `/livez`, `/readyz`,
+    // `/metrics`, `/api/v1/version`, `/.well-known/mcp` are
+    // unauthenticated discovery / monitoring surfaces. `/agentmemory`
+    // carries its own env-gated bearer scheme — see
+    // `crate::agentmemory::agentmemory_auth_check`.
+    let public_or_self_auth = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/readyz", get(readyz_handler))
         .route("/livez", get(livez_handler))
         .route("/api/v1/version", get(version_handler))
         .route("/.well-known/mcp", get(well_known_mcp_handler))
-        // Phase E.4 (2026-05-17) — agentmemory-compatible REST
-        // protocol exposed under `/agentmemory/*`. Mounted BELOW
-        // the auth layer because it has its own bearer scheme.
-        .nest("/agentmemory", crate::agentmemory::router(state.clone()))
+        .nest("/agentmemory", crate::agentmemory::router(state.clone()));
+
+    // CORS is applied as the OUTERMOST layer so every route
+    // (auth-gated, self-authenticated, or fully public) honours the
+    // loopback-only origin policy. Pre-fix `/agentmemory/*` was
+    // nested after `.layer(cors)` and got no CORS headers at all,
+    // breaking legitimate browser SDK calls.
+    auth_routed
+        .merge(public_or_self_auth)
+        .layer(cors)
         .with_state(state)
+}
+
+/// Is this `Origin` header value a loopback URL? Used by the CORS
+/// `AllowOrigin::predicate` so only same-machine browser surfaces
+/// (Tauri webview at `tauri://localhost`, dev tools at
+/// `http://localhost:*`, CLI fetches from `http://127.0.0.1:*`)
+/// receive `Access-Control-Allow-Origin` headers. Any other origin
+/// (an attacker-controlled page on the public web) gets no CORS
+/// response and the browser refuses the read.
+fn is_loopback_origin(origin: &str) -> bool {
+    let after_scheme = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .or_else(|| origin.strip_prefix("tauri://"));
+    let Some(authority) = after_scheme else {
+        return false;
+    };
+    // Strip optional port. `[::1]:8080` keeps the bracketed v6
+    // literal as the host.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // IPv6 literal — find closing bracket.
+        match stripped.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        authority.split_once(':').map(|(h, _)| h).unwrap_or(authority)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+#[cfg(test)]
+mod cors_origin_tests {
+    use super::is_loopback_origin;
+
+    #[test]
+    fn loopback_origins_are_allowed() {
+        assert!(is_loopback_origin("http://localhost"));
+        assert!(is_loopback_origin("http://localhost:31760"));
+        assert!(is_loopback_origin("http://127.0.0.1:8080"));
+        assert!(is_loopback_origin("http://[::1]:31760"));
+        assert!(is_loopback_origin("https://localhost:443"));
+        assert!(is_loopback_origin("tauri://localhost"));
+    }
+
+    #[test]
+    fn non_loopback_origins_are_refused() {
+        assert!(!is_loopback_origin("http://evil.example.com"));
+        assert!(!is_loopback_origin("http://192.168.1.42"));
+        assert!(!is_loopback_origin("https://anthropic.com"));
+        assert!(!is_loopback_origin("file:///etc/passwd"));
+        assert!(!is_loopback_origin(""));
+        assert!(!is_loopback_origin("[malformed"));
+    }
 }
 
 // ─── Ops endpoints (unauthenticated) ─────────────────────────
@@ -828,15 +905,23 @@ async fn auth_middleware(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
-        match provided {
-            Some(key) if key == expected_key => {}
-            _ => {
-                return err_response(
-                    StatusCode::UNAUTHORIZED,
-                    "UNAUTHORIZED",
-                    "Invalid or missing API key",
-                );
+        // Constant-time bearer comparison. A naive `==` short-circuits
+        // on the first mismatching byte, leaking the expected secret
+        // one character at a time over the network. `ConstantTimeEq`
+        // compares the full length unconditionally.
+        let authorized = match provided {
+            Some(key) => {
+                use subtle::ConstantTimeEq;
+                key.as_bytes().ct_eq(expected_key.as_bytes()).into()
             }
+            None => false,
+        };
+        if !authorized {
+            return err_response(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "Invalid or missing API key",
+            );
         }
     }
     next.run(request).await

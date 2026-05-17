@@ -565,13 +565,28 @@ pub fn backfill_witness_mesh(store: &GraphStore, dry_run: bool) -> Result<Witnes
     // grounding_score, grounding_method, extraction_tier, event_date,
     // admission_tier, derivation_parents, predicate_json, last_rooted_at,
     // source_path (recoverable from source_id).
+    //
+    // Joins `sources.content_hash` so each row also carries the
+    // FILE-identity BLAKE3 (full-source hash), not just the claim's
+    // BYTE-RANGE BLAKE3. The two are different by definition and
+    // both are load-bearing: `WitnessSpan.file_blake3` is the
+    // pointer into `source.tar.zst`; `Witness.content_blake3` is the
+    // hash of the bytes addressed by `spans[0]`. Conflating them
+    // (the pre-fix shape) baked a corrupted file pointer into every
+    // migrated Witness's id — `WitnessId::derive` length-prefixes
+    // `file_blake3` so the id is permanently wrong for any row
+    // emitted with the wrong field. Rows whose source has no
+    // `content_hash` (legacy gap) are counted as
+    // `claims_missing_anchor` rather than being inserted with a
+    // bogus file pointer.
     let projection = store
         .raw_db()
         .run_script(
             "?[id, source_id, workspace_id, byte_start, byte_end, content_blake3, \
-              symbol, sensitivity, confidence, created_at] := \
+              symbol, sensitivity, confidence, created_at, file_blake3] := \
               *claims{id, source_id, workspace_id, byte_start, byte_end, content_blake3, \
-              symbol, sensitivity, confidence, created_at}",
+              symbol, sensitivity, confidence, created_at}, \
+              *sources{id: source_id, content_hash: file_blake3}",
             Default::default(),
             cozo::ScriptMutability::Immutable,
         )
@@ -597,12 +612,17 @@ pub fn backfill_witness_mesh(store: &GraphStore, dry_run: bool) -> Result<Witnes
         let sensitivity_str = string_from_dv(&row[7]);
         let confidence_raw = f64_from_dv(&row[8]);
         let created_at_unix = f64_from_dv(&row[9]);
+        let file_blake3 = string_from_dv(&row[10]);
 
         // CCC I-2 / I-4 — a claim without (source_id, byte_start,
         // byte_end, content_blake3) cannot be ingested as a Witness
-        // honestly. Skip and surface the count.
+        // honestly. `file_blake3` is also load-bearing: the Witness
+        // id derivation length-prefixes it, so a missing or empty
+        // file hash produces a permanently-wrong id. Skip honestly
+        // and surface the count.
         if source_id_str.is_empty()
             || content_blake3.is_empty()
+            || file_blake3.is_empty()
             || byte_end <= byte_start
         {
             report.claims_missing_anchor += 1;
@@ -638,7 +658,7 @@ pub fn backfill_witness_mesh(store: &GraphStore, dry_run: bool) -> Result<Witnes
         let confidence = Confidence::new(0.50);
 
         let span = WitnessSpan {
-            file_blake3: content_blake3.clone(),
+            file_blake3: file_blake3.clone(),
             start: byte_start,
             end: byte_end,
         };
@@ -651,7 +671,7 @@ pub fn backfill_witness_mesh(store: &GraphStore, dry_run: bool) -> Result<Witnes
             "legacy::claim@v1",
             "legacy::claim",
             vec![WitnessInput::ByteRef {
-                file_blake3: content_blake3.clone(),
+                file_blake3: file_blake3.clone(),
                 start: byte_start,
                 end: byte_end,
             }],
@@ -821,12 +841,20 @@ mod tests {
         let source = SourceId::new();
 
         // Insert a source row so the foreign-key intent is honoured
-        // even though the migration doesn't enforce it.
-        let mut src = thinkingroot_core::types::Source::new(
+        // even though the migration doesn't enforce it. The
+        // backfill joins `sources.content_hash` to populate the
+        // Witness's `WitnessSpan.file_blake3`; a source row without
+        // a content_hash is honestly counted as `claims_missing_anchor`
+        // (it carries no identity for the byte store) so the test
+        // fixture sets a representative file-content hash here.
+        let src = thinkingroot_core::types::Source::new(
             "test://fixture.rs".to_string(),
             thinkingroot_core::types::SourceType::File,
-        );
-        src.id = source;
+        )
+        .with_id(source)
+        .with_hash(thinkingroot_core::types::ContentHash::from_bytes(
+            b"abcdefghijklmnopqrst",
+        ));
         store.insert_source(&src).unwrap();
 
         let mut claim_a = Claim::new("ignored statement", ClaimType::Fact, source, workspace)
