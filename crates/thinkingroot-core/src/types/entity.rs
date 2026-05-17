@@ -85,6 +85,63 @@ pub enum EntityType {
     Organization,
 }
 
+impl EntityType {
+    /// Canonical wire form — matches `#[serde(rename_all = "snake_case")]`.
+    /// Use this whenever you build a `String` payload from an `EntityType`
+    /// (REST, MCP, SDK projections) so the wire matches the typed contract.
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::System => "system",
+            Self::Service => "service",
+            Self::Concept => "concept",
+            Self::Team => "team",
+            Self::Api => "api",
+            Self::Database => "database",
+            Self::Library => "library",
+            Self::File => "file",
+            Self::Module => "module",
+            Self::Function => "function",
+            Self::Config => "config",
+            Self::Organization => "organization",
+        }
+    }
+
+    /// Bidirectional parser: accepts both the wire snake_case
+    /// (`"function"`) and the legacy Debug-derived TitleCase storage
+    /// form (`"Function"`) the graph layer historically wrote via
+    /// `format!("{:?}")`. Returns `None` for unknown strings so the
+    /// caller can decide between a default and surfacing the raw value.
+    pub fn from_any(s: &str) -> Option<Self> {
+        match s {
+            "person" | "Person" => Some(Self::Person),
+            "system" | "System" => Some(Self::System),
+            "service" | "Service" => Some(Self::Service),
+            "concept" | "Concept" => Some(Self::Concept),
+            "team" | "Team" => Some(Self::Team),
+            "api" | "Api" => Some(Self::Api),
+            "database" | "Database" => Some(Self::Database),
+            "library" | "Library" => Some(Self::Library),
+            "file" | "File" => Some(Self::File),
+            "module" | "Module" => Some(Self::Module),
+            "function" | "Function" => Some(Self::Function),
+            "config" | "Config" => Some(Self::Config),
+            "organization" | "Organization" => Some(Self::Organization),
+            _ => None,
+        }
+    }
+
+    /// Normalizes an arbitrary stored entity-type string to the
+    /// canonical wire snake_case. Falls back to a lowercase copy
+    /// when the string isn't a recognised variant — keeps the
+    /// existing UI tolerance for unknown extractor outputs.
+    pub fn normalize_storage(stored: &str) -> String {
+        Self::from_any(stored)
+            .map(|e| e.wire_str().to_string())
+            .unwrap_or_else(|| stored.to_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +172,51 @@ mod tests {
     fn canonical_name_not_aliased() {
         let entity = Entity::new("Test", EntityType::Concept).with_alias("Test");
         assert!(entity.aliases.is_empty());
+    }
+
+    #[test]
+    fn wire_str_matches_serde_snake_case() {
+        // Single-word variants
+        assert_eq!(EntityType::Person.wire_str(), "person");
+        assert_eq!(EntityType::Function.wire_str(), "function");
+        assert_eq!(EntityType::Api.wire_str(), "api");
+        // Round-trip with serde — guards against future variant
+        // additions that forget to update the wire_str arm.
+        for variant in [
+            EntityType::Person,
+            EntityType::System,
+            EntityType::Service,
+            EntityType::Concept,
+            EntityType::Team,
+            EntityType::Api,
+            EntityType::Database,
+            EntityType::Library,
+            EntityType::File,
+            EntityType::Module,
+            EntityType::Function,
+            EntityType::Config,
+            EntityType::Organization,
+        ] {
+            let serde_form = serde_json::to_value(variant).unwrap();
+            assert_eq!(serde_form.as_str().unwrap(), variant.wire_str());
+        }
+    }
+
+    #[test]
+    fn from_any_accepts_both_storage_forms() {
+        assert_eq!(EntityType::from_any("Function"), Some(EntityType::Function));
+        assert_eq!(EntityType::from_any("function"), Some(EntityType::Function));
+        assert_eq!(EntityType::from_any("File"), Some(EntityType::File));
+        assert_eq!(EntityType::from_any("file"), Some(EntityType::File));
+        assert_eq!(EntityType::from_any("WeirdType"), None);
+    }
+
+    #[test]
+    fn normalize_storage_returns_wire_form_or_lowercase() {
+        assert_eq!(EntityType::normalize_storage("Function"), "function");
+        assert_eq!(EntityType::normalize_storage("function"), "function");
+        assert_eq!(EntityType::normalize_storage("Organization"), "organization");
+        // Unknown values stay lowercase (best-effort tolerance).
+        assert_eq!(EntityType::normalize_storage("Something"), "something");
     }
 }

@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use thinkingroot_llm::llm::{ChatMessage, LlmClient, ToolChoice};
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::engine::QueryEngine;
 use crate::intelligence::agent::{Agent, AgentEvent, AgentRequest, LlmBackend};
@@ -75,11 +76,12 @@ pub struct StreamAgentDeps {
 }
 
 /// Spawn the agent in a tokio task and return the receiver side of the
-/// event stream. The router is exposed so the REST handler can call
-/// `set_pending_id` immediately before the agent dispatches a write
-/// tool — the handler watches the event stream for `ToolCallProposed`
-/// events with `is_write: true` and registers the matching pending
-/// approval.
+/// event stream. The router is returned so the REST handler can hold
+/// it for the lifetime of the stream (the agent owns its own Arc via
+/// the PermissionsGate wrap). Pre-2026-05-17 the handler called
+/// `router.set_pending_id` on every write proposal; the trait now
+/// takes `tool_use_id` directly so the registration happens inside
+/// `ApprovalGate::check` itself — no scheduler race window.
 ///
 /// Channel buffer is intentionally small (`16`): the agent emits at
 /// most one event per LLM round-trip + tool dispatch, and a slow SSE
@@ -98,6 +100,7 @@ pub struct StreamAgentDeps {
 pub fn spawn_agent_run(
     req: StreamAgentRequest,
     deps: StreamAgentDeps,
+    cancel: CancellationToken,
 ) -> (mpsc::Receiver<AgentEvent>, Arc<ToolApprovalRouter>) {
     let (tx, rx) = mpsc::channel::<AgentEvent>(16);
 
@@ -133,14 +136,16 @@ pub fn spawn_agent_run(
     // `agent_router` is the clone the agent itself takes; the
     // outer `router` Arc is what we return to the caller for
     // approval-decision dispatch.
-    // The agent receives the PermissionsGate-wrapped gate; the
-    // raw router stays exposed to the caller so the streaming
-    // handler can still call `set_pending_id` before every write
-    // dispatch (the Ask-delegation path needs that).
+    // The agent receives the PermissionsGate-wrapped gate; the raw
+    // router stays exposed to the caller so the streaming handler can
+    // hold the Arc for the lifetime of the SSE stream (the agent path
+    // no longer needs the caller to pre-register the pending id — the
+    // router does that inside `check` from the agent-supplied
+    // `tool_use_id`).
     let agent_gate = permissions_gate.clone();
-    let router_for_pre_emit = router.clone();
+    let router_for_agent_lifetime = router.clone();
     tokio::spawn(async move {
-        let _ = router_for_pre_emit; // hold the Arc alive
+        let _ = router_for_agent_lifetime; // hold the Arc alive
 
         let ctx = ToolContext {
             engine: deps.engine,
@@ -188,8 +193,18 @@ pub fn spawn_agent_run(
         // own `mpsc::Sender<AgentEvent>`. The relay is the seam where
         // session-aware concerns (Observer, future telemetry) land.
         let (relay_tx, mut relay_rx) = mpsc::channel::<AgentEvent>(16);
+        // Cancel-aware streaming: the SSE handler's DropGuard fires
+        // `cancel` when the client disconnects (Stop button, network
+        // drop, modal close). The agent observes the same token via
+        // `run_streaming_cancellable` and aborts at the next safe
+        // checkpoint — between LLM calls, or between tool dispatches
+        // in a batch, or mid-tool for tools whose handlers are
+        // cancel-safe on drop.
+        let agent_cancel = cancel.clone();
         let agent_handle = tokio::spawn(async move {
-            agent.run_streaming(agent_req, relay_tx).await;
+            agent
+                .run_streaming_cancellable(agent_req, relay_tx, agent_cancel)
+                .await;
         });
 
         let captured_final = relay_events(&mut relay_rx, &tx).await;
@@ -486,6 +501,9 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
             name,
             content,
             is_error,
+            llm_truncated,
+            llm_content_bytes,
+            original_content_bytes,
         } => (
             "tool_call_finished",
             json!({
@@ -493,6 +511,9 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
                 "name": name,
                 "content": content,
                 "is_error": is_error,
+                "llm_truncated": llm_truncated,
+                "llm_content_bytes": llm_content_bytes,
+                "original_content_bytes": original_content_bytes,
             }),
         ),
         AgentEvent::Done {
@@ -693,9 +714,15 @@ mod tests {
             name: "search".into(),
             content: "ok".into(),
             is_error: false,
+            llm_truncated: false,
+            llm_content_bytes: 2,
+            original_content_bytes: 2,
         });
         assert_eq!(kind2, "tool_call_finished");
         assert_eq!(payload2["content"], "ok");
+        assert_eq!(payload2["llm_truncated"], false);
+        assert_eq!(payload2["llm_content_bytes"], 2);
+        assert_eq!(payload2["original_content_bytes"], 2);
         assert_eq!(payload2["is_error"], false);
     }
 }

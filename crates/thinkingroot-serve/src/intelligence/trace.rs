@@ -325,6 +325,9 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
             name,
             content,
             is_error,
+            llm_truncated,
+            llm_content_bytes,
+            original_content_bytes,
         } => (
             kind::AGENT_TOOL_FINISHED,
             json!({
@@ -332,6 +335,9 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
                 "name": name,
                 "content": content,
                 "is_error": is_error,
+                "llm_truncated": llm_truncated,
+                "llm_content_bytes": llm_content_bytes,
+                "original_content_bytes": original_content_bytes,
             }),
         ),
         AgentEvent::Done {
@@ -748,6 +754,9 @@ mod tests {
                     name: "x".into(),
                     content: "ok".into(),
                     is_error: false,
+                    llm_truncated: false,
+                    llm_content_bytes: 2,
+                    original_content_bytes: 2,
                 },
                 kind::AGENT_TOOL_FINISHED,
             ),

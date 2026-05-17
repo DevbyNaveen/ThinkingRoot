@@ -837,8 +837,16 @@ export type ChatEvent =
       turn_id: string;
       id: string;
       name: string;
+      /** Full (untruncated) tool result — render this in the UI. */
       content: string;
       is_error: boolean;
+      /** True iff the LLM's history copy was truncated to fit the per-call
+       *  token budget; the LLM saw `llm_content_bytes` of the
+       *  `original_content_bytes` the UI is showing. Surface honestly in
+       *  the tool card so users know the model has a smaller view. */
+      llm_truncated: boolean;
+      llm_content_bytes: number;
+      original_content_bytes: number;
     }
   | {
       type: "tool_call_rejected";

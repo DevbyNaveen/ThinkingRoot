@@ -2203,7 +2203,11 @@ async fn get_all_relations(State(state): State<Arc<AppState>>, Path(ws): Path<St
                     serde_json::json!({
                         "from": from,
                         "to": to,
-                        "relation_type": rtype,
+                        // Normalize the legacy TitleCase storage form
+                        // (`format!("{:?}")` at graph.rs) to the wire
+                        // snake_case `RelationType` declares via serde.
+                        "relation_type":
+                            thinkingroot_core::types::RelationType::normalize_storage(&rtype),
                         "strength": strength,
                     })
                 })
@@ -5395,7 +5399,17 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         permission_store: state.permission_store.clone(),
     };
 
-    let (mut rx, router) = spawn_agent_run(req, deps);
+    // Cancellation = client disconnect, end-to-end (same contract
+    // `compile_stream` enforces at rest.rs:2911). The token is owned
+    // by the SSE response body's `async_stream::stream!` block below
+    // via `drop_guard`; when the body is dropped (Stop button, modal
+    // close, network drop) the guard fires the token and the agent
+    // task observes it at its next safe checkpoint. Pre-2026-05-17
+    // the agent had no cancellation observation; tokens kept burning
+    // until natural completion.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let drop_guard = cancel.clone().drop_guard();
+    let (mut rx, router) = spawn_agent_run(req, deps, cancel);
 
     // The streaming task watches the event channel. For every
     // `tool_call_proposed` with `is_write: true`, it (1) tells the
@@ -5423,6 +5437,13 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             DEFAULT_AUTO_CITE_THRESHOLD, VerifyInput, VerifyKind, verify,
         };
 
+        // Move the DropGuard inside the stream block. When the SSE
+        // response body is dropped (Stop button, client disconnect,
+        // modal close) this guard fires the matching cancellation
+        // token and the spawned agent task observes it at its next
+        // safe checkpoint.
+        let _agent_drop_guard = drop_guard;
+
         // Surface a cheap meta event up front so UIs that show a
         // "category" header have something to render before tokens
         // start flowing. claims_used is unknown from the agent
@@ -5439,14 +5460,22 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         let mut last_was_rejection = false;
         let mut final_text_for_verify: Option<String> = None;
 
+        // `router` is kept alive for the lifetime of the stream (the
+        // agent task holds its own Arc via the PermissionsGate wrap);
+        // SSE no longer needs to call `set_pending_id` because the
+        // agent supplies `tool_use_id` directly to
+        // `ApprovalGate::check`. The router registers its pending
+        // oneshot under that id, the `/ask/approval/{id}` POST
+        // resolves it — no race between the SSE relay and the agent
+        // dispatch task.
+        let _router_anchor = router;
         while let Some(event) = rx.recv().await {
-            // Side effect: write proposals need a pending-id
-            // registration BEFORE the agent's gate.check fires.
-            // The agent emits ToolCallProposed before calling the
-            // gate, so we have a small window to set this up.
+            // Surface the approval prompt to the UI for every write
+            // proposal. The agent has already (or will momentarily)
+            // call `ApprovalGate::check` with the same id, which
+            // registers the matching oneshot in `pending_approvals`.
             if let AgentEvent::ToolCallProposed { id, is_write, name, input } = &event {
                 if *is_write {
-                    router.set_pending_id(id.clone()).await;
                     // Phase D Wave 1 — when this is a Phase D
                     // system-power tool, attach a `permission_context`
                     // so the UI can render a permission-aware prompt
@@ -5489,12 +5518,16 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                 AgentEvent::ToolCallFinished { name, content, is_error, .. } => {
                     capture.observe_tool_finished(name, content, *is_error);
                     last_was_rejection = false;
-                    if !*is_error
-                        && (name == "materialize_engram" || name == "probe_engram")
-                    {
+                    // 2026-05-17 — shape-driven side-event detection.
+                    // Pre-fix the dispatch keyed on the literal tool
+                    // name; new aggregate/wrapper tools that produce
+                    // the same wire shape were silently invisible to
+                    // the EngramTimeline + GapCards. The parsers now
+                    // self-identify by JSON shape and return None when
+                    // the shape doesn't match — drop in only the ones
+                    // that pass.
+                    if !*is_error {
                         engram_activation = parse_engram_activation(name, content);
-                    }
-                    if !*is_error && name == "gaps" {
                         gap_surfacing = parse_gaps_surfacing(content);
                     }
                 }
@@ -6218,56 +6251,60 @@ async fn resolve_workspace_path(state: &AppState, name: &str) -> Option<PathBuf>
 // from `summary.source_count` if present, else `summary.sources.len()`,
 // else 0 (the wire shape is owned by `intelligence/engram.rs::EngramSummary`
 // and may evolve). The UI treats 0 as "unknown" rather than "empty".
+// Shape-driven, NOT name-driven (2026-05-17). Pre-fix this matched on
+// the literal `name == "materialize_engram"` / `name == "probe_engram"`
+// strings — any future tool that wrapped or aliased those (e.g. a
+// composite `search_engrams` that internally materialises + ranks)
+// would silently fail to surface the EngramTimeline event. The shape
+// discriminator is specific: probe results have a `pointer` string +
+// `answers` array; materialise results have a `pointer` string + a
+// `summary` object. Two shapes, two events, no name dependency. The
+// `tool` field in the emitted payload still carries `name` as a
+// diagnostic so downstream consumers can observe which tool
+// produced the activation.
 fn parse_engram_activation(name: &str, content: &str) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
+    let pointer = parsed.get("pointer").and_then(|v| v.as_str())?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    match name {
-        "materialize_engram" => {
-            let pointer = parsed.get("pointer")?.as_str()?.to_string();
-            let summary = parsed.get("summary").cloned().unwrap_or(serde_json::Value::Null);
-            let source_count = summary
-                .get("source_count")
-                .and_then(|v| v.as_u64())
-                .or_else(|| {
-                    summary
-                        .get("sources")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len() as u64)
-                })
-                .unwrap_or(0);
-            Some(serde_json::json!({
-                "tool": "materialize_engram",
-                "pointer": pointer,
-                "summary": summary,
-                "source_count": source_count,
-                "ts_ms": now_ms,
-            }))
-        }
-        "probe_engram" => {
-            let pointer = parsed
-                .get("pointer")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let answer_count = parsed
-                .get("answers")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len() as u64)
-                .unwrap_or_else(|| {
-                    parsed
-                        .get("answer_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0)
-                });
-            Some(serde_json::json!({
-                "tool": "probe_engram",
-                "pointer": pointer,
-                "answer_count": answer_count,
-                "ts_ms": now_ms,
-            }))
-        }
-        _ => None,
+
+    // Probe shape: `pointer + answers (array)`. Check this BEFORE the
+    // materialise shape so a result that somehow carries both (e.g.
+    // a future composite tool) classifies as the more informative
+    // probe shape.
+    if let Some(answers) = parsed.get("answers").and_then(|v| v.as_array()) {
+        return Some(serde_json::json!({
+            "tool": name,
+            "pointer": pointer.to_string(),
+            "answer_count": answers.len() as u64,
+            "ts_ms": now_ms,
+        }));
     }
+
+    // Materialise shape: `pointer + summary (object)`. `summary` may
+    // be an empty object on cold pointers; that still counts as the
+    // materialise shape — the UI renders an honest "0 sources" cell
+    // rather than swallowing the event.
+    if let Some(summary) = parsed.get("summary").and_then(|v| v.as_object()) {
+        let source_count = summary
+            .get("source_count")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                summary
+                    .get("sources")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() as u64)
+            })
+            .unwrap_or(0);
+        return Some(serde_json::json!({
+            "tool": name,
+            "pointer": pointer.to_string(),
+            "summary": serde_json::Value::Object(summary.clone()),
+            "source_count": source_count,
+            "ts_ms": now_ms,
+        }));
+    }
+
+    None
 }
 
 // ─── Gap-surfacing SSE shim ──────────────────────────────────────────
@@ -6293,11 +6330,89 @@ fn parse_gaps_surfacing(content: &str) -> Option<serde_json::Value> {
     if gaps_arr.is_empty() {
         return None;
     }
+    // Shape discriminator: every gap row is an object carrying at
+    // least `entity_name` AND `expected_claim_type` (the gap MCP
+    // tool's stable wire shape per `mcp/tools.rs::list_gaps`). Pre-
+    // 2026-05-17 the literal `name == "gaps"` filter was enough; the
+    // shape-driven dispatch this commit moves to needs a tighter
+    // discriminator so a coincidental `{gaps: [...]}` shape on an
+    // unrelated tool doesn't trip a false GapCards render.
+    let first = gaps_arr.first().and_then(|v| v.as_object())?;
+    if !first.contains_key("entity_name") || !first.contains_key("expected_claim_type") {
+        return None;
+    }
     let now_ms = chrono::Utc::now().timestamp_millis();
     Some(serde_json::json!({
         "gaps": gaps_arr,
         "ts_ms": now_ms,
     }))
+}
+
+#[cfg(test)]
+mod sse_side_event_tests {
+    use super::{parse_engram_activation, parse_gaps_surfacing};
+
+    #[test]
+    fn parse_engram_activation_recognises_probe_shape_independent_of_name() {
+        // Probe shape: pointer + answers (array). The name argument
+        // is purely diagnostic; passing a wrapper-tool name still
+        // produces the event so future aliases inherit the
+        // EngramTimeline integration for free.
+        let body = r#"{"pointer":"0x7F9A","answers":[{"id":"c1"},{"id":"c2"}]}"#;
+        let out = parse_engram_activation("future_search_engrams", body)
+            .expect("probe shape must trigger event regardless of tool name");
+        assert_eq!(out["pointer"], "0x7F9A");
+        assert_eq!(out["answer_count"], 2);
+        assert_eq!(out["tool"], "future_search_engrams");
+    }
+
+    #[test]
+    fn parse_engram_activation_recognises_materialize_shape() {
+        let body = r#"{"pointer":"0x7F9A","summary":{"source_count":3}}"#;
+        let out = parse_engram_activation("materialize_engram", body)
+            .expect("materialise shape must trigger event");
+        assert_eq!(out["pointer"], "0x7F9A");
+        assert_eq!(out["source_count"], 3);
+    }
+
+    #[test]
+    fn parse_engram_activation_drops_unrelated_shapes() {
+        // A tool result that happens to be valid JSON but doesn't
+        // carry the probe or materialise discriminator must NOT
+        // surface a spurious engram_activated event.
+        let unrelated = r#"{"matches":["a","b"]}"#;
+        assert!(parse_engram_activation("grep", unrelated).is_none());
+
+        // Non-JSON text is also rejected cleanly.
+        assert!(parse_engram_activation("anything", "raw text result").is_none());
+
+        // `pointer` alone (no answers, no summary) is ambiguous —
+        // not enough signal to classify, so we refuse to emit.
+        let ambiguous = r#"{"pointer":"0xDEAD"}"#;
+        assert!(parse_engram_activation("anything", ambiguous).is_none());
+    }
+
+    #[test]
+    fn parse_gaps_surfacing_requires_typed_gap_rows() {
+        // Real gaps tool shape — first row has the discriminator
+        // fields.
+        let body = r#"{"gaps":[{"entity_name":"foo","entity_type":"Function","expected_claim_type":"DocComment","confidence":0.8,"sample_size":3,"reason":"missing"}]}"#;
+        let out = parse_gaps_surfacing(body).expect("typed gap rows must surface");
+        assert_eq!(out["gaps"].as_array().unwrap().len(), 1);
+
+        // Coincidental `gaps: [{...}]` from an unrelated tool with
+        // a different row shape must NOT trip the side-event.
+        let coincidence = r#"{"gaps":[{"key":"x","value":1}]}"#;
+        assert!(
+            parse_gaps_surfacing(coincidence).is_none(),
+            "non-gap shape must not produce a gaps_surfaced event"
+        );
+
+        // Empty array is also dropped (gap tool conventionally
+        // returns absence as no event, not a noisy "0 gaps" toast).
+        let empty = r#"{"gaps":[]}"#;
+        assert!(parse_gaps_surfacing(empty).is_none());
+    }
 }
 
 // ─── Error Mapping ───────────────────────────────────────────

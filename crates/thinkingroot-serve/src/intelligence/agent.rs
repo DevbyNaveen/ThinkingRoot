@@ -37,10 +37,13 @@ use thinkingroot_llm::llm::{
     ChatMessage, LlmClient, Tool, ToolCall, ToolChoice, ToolResult, ToolUseResponse,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::intelligence::approval::{ApprovalDecision, ApprovalGate};
 use crate::intelligence::synthesizer::{ChatRole, ChatTurn};
-use crate::intelligence::token_budget::{DEFAULT_TOOL_RESULT_TOKEN_BUDGET, truncate_tool_result};
+use crate::intelligence::token_budget::{
+    DEFAULT_TOOL_RESULT_TOKEN_BUDGET, truncate_tool_result_with_stats,
+};
 use crate::intelligence::tools::ToolRegistry;
 use crate::intelligence::trace::{SharedTraceLog, event_to_trace};
 
@@ -136,13 +139,30 @@ pub enum AgentEvent {
     ToolCallExecuting { id: String, name: String },
     /// Tool execution finished. `is_error` mirrors the
     /// [`ToolHandlerResult`] flag — UI can colour the card
-    /// accordingly. `content` is the same string fed back to the
-    /// LLM.
+    /// accordingly. `content` is the FULL (untruncated) tool result —
+    /// what the UI should render. The LLM, however, may have seen a
+    /// truncated head+tail when the result exceeded the per-call
+    /// token budget. `llm_truncated` + `llm_content_bytes` +
+    /// `original_content_bytes` surface that asymmetry honestly so
+    /// the UI can render a "model only saw X of Y bytes" indicator
+    /// instead of letting the user assume the model has full context.
     ToolCallFinished {
         id: String,
         name: String,
         content: String,
         is_error: bool,
+        /// True iff the LLM-facing history copy was truncated to fit
+        /// the per-result token budget.
+        llm_truncated: bool,
+        /// Byte length of the string the LLM actually saw in
+        /// history. Equal to `content.len()` when `llm_truncated`
+        /// is false; smaller when true.
+        llm_content_bytes: usize,
+        /// Byte length of the full `content` field — what the UI
+        /// renders. Always equals `content.len()`; carried on the
+        /// wire as a discoverability hint so clients don't have to
+        /// recompute it.
+        original_content_bytes: usize,
     },
     /// Loop terminated cleanly with the model's final text answer.
     /// `iterations` is the number of LLM round-trips taken (always
@@ -330,10 +350,11 @@ impl Agent {
 
     /// Run the loop, pushing every event into the supplied `Vec`.
     /// Equivalent to `run_collected` but lets the caller pre-allocate
-    /// or post-process the buffer.
+    /// or post-process the buffer. Non-streaming: cancellation is not
+    /// surfaced (a never-fired token is passed through).
     pub async fn run_into(&self, req: AgentRequest, out: &mut Vec<AgentEvent>) {
         let mut sink = EventSink::Buf(out);
-        self.drive(req, &mut sink).await;
+        self.drive(req, &mut sink, CancellationToken::new()).await;
     }
 
     /// Run the loop, sending every event into the mpsc channel as
@@ -344,15 +365,57 @@ impl Agent {
     /// Returns once the agent terminates. The caller is responsible
     /// for closing the channel (drop the `Sender`) when the
     /// conversation ends.
+    ///
+    /// Cancellation: this entrypoint constructs a never-fired
+    /// [`CancellationToken`] — use [`run_streaming_cancellable`] to
+    /// thread a token from the SSE handler's [`DropGuard`] so a
+    /// client disconnect (Stop button, network drop) aborts the
+    /// in-flight LLM call and the inter-tool checkpoints.
+    ///
+    /// [`run_streaming_cancellable`]: Agent::run_streaming_cancellable
     pub async fn run_streaming(&self, req: AgentRequest, tx: mpsc::Sender<AgentEvent>) {
+        self.run_streaming_cancellable(req, tx, CancellationToken::new())
+            .await;
+    }
+
+    /// Streaming variant that also observes a [`CancellationToken`].
+    /// When the token fires (client disconnects, Stop click), the
+    /// loop:
+    ///
+    ///   * Aborts any in-flight `chat_with_tools` call via
+    ///     `tokio::select!` against `cancel.cancelled()`.
+    ///   * Skips any subsequent LLM iteration.
+    ///   * Skips any subsequent tool dispatch inside a batch.
+    ///   * Emits `Error { message: "agent cancelled by client" }`
+    ///     followed by `Done { final_text, iterations }` so the
+    ///     SSE consumer's terminator (`matches!(_, Done { .. })`)
+    ///     still fires and the post-run trust receipt + observer
+    ///     hooks run on the partial text the model already streamed.
+    pub async fn run_streaming_cancellable(
+        &self,
+        req: AgentRequest,
+        tx: mpsc::Sender<AgentEvent>,
+        cancel: CancellationToken,
+    ) {
         let mut sink = EventSink::Channel(&tx);
-        self.drive(req, &mut sink).await;
+        self.drive(req, &mut sink, cancel).await;
     }
 
     /// The actual loop. Shared between `run_into` and `run_streaming`
     /// via the `EventSink` abstraction; a single source of truth so
     /// the two transports can never diverge in observable behaviour.
-    async fn drive(&self, req: AgentRequest, sink: &mut EventSink<'_>) {
+    ///
+    /// The non-streaming entry points pass a never-fired
+    /// [`CancellationToken`]; the streaming entry point threads the
+    /// SSE handler's token so a client disconnect aborts within a
+    /// bounded window (at the next LLM-call boundary or tool-dispatch
+    /// boundary).
+    async fn drive(
+        &self,
+        req: AgentRequest,
+        sink: &mut EventSink<'_>,
+        cancel: CancellationToken,
+    ) {
         let tools = self.registry.specs();
         let mut history = req.history;
         let mut iterations: usize = 0;
@@ -370,6 +433,16 @@ impl Agent {
         let mut tool_call_ring: Vec<(String, [u8; 32])> = Vec::new();
 
         while iterations < self.max_iterations {
+            // Pre-iteration cancellation gate. Fast-path when the SSE
+            // client disconnected between iterations — skip the next
+            // LLM call entirely. Without this an agent that just
+            // finished a tool dispatch would still pay for one more
+            // round-trip before noticing the disconnect.
+            if cancel.is_cancelled() {
+                self.emit_cancelled(sink, accumulated_text, iterations).await;
+                return;
+            }
+
             iterations += 1;
 
             // C5: refresh system prompt at the top of each iteration
@@ -382,21 +455,28 @@ impl Agent {
                 None => req.system.clone(),
             };
 
-            let response = match self
-                .llm
-                .chat_with_tools(&current_system, &history, &tools, &tool_choice)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    self.emit(
-                        sink,
-                        AgentEvent::Error {
-                            message: format!("LLM call failed on iteration {iterations}: {e}"),
-                        },
-                    )
-                    .await;
+            // Race the LLM round-trip against the cancellation token.
+            // `chat_with_tools` may take 30s+ on a long completion; a
+            // user-initiated Stop has to interrupt it within one
+            // poll, not on natural completion.
+            let response = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.emit_cancelled(sink, accumulated_text, iterations).await;
                     return;
+                }
+                r = self.llm.chat_with_tools(&current_system, &history, &tools, &tool_choice) => match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.emit(
+                            sink,
+                            AgentEvent::Error {
+                                message: format!("LLM call failed on iteration {iterations}: {e}"),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                 }
             };
 
@@ -518,7 +598,13 @@ impl Agent {
                     // Append the assistant's tool_use turn so the
                     // next call sees the conversation in shape.
                     history.push(ChatMessage::AssistantToolCalls(calls.clone()));
-                    let results = self.dispatch_calls(&calls, sink).await;
+                    let results = self.dispatch_calls(&calls, sink, &cancel).await;
+                    // If cancellation tripped mid-batch, the per-call
+                    // synth result already accounts for it and the
+                    // outer loop's pre-iteration gate will halt before
+                    // the next LLM call. Either way the history stays
+                    // shape-correct (every assistant_tool_calls is
+                    // followed by a matching tool_results vec).
                     history.push(ChatMessage::ToolResults(results));
                     // Subsequent iterations always use Auto: forcing
                     // tools again would create an infinite loop.
@@ -536,6 +622,36 @@ impl Agent {
                     self.max_iterations,
                     accumulated_text.len()
                 ),
+            },
+        )
+        .await;
+        self.emit(
+            sink,
+            AgentEvent::Done {
+                final_text: accumulated_text,
+                iterations,
+            },
+        )
+        .await;
+    }
+
+    /// Emit the cancellation-terminator pair: one `Error` event with
+    /// a stable, recognisable message, then `Done` so the SSE
+    /// consumer's terminator (`matches!(_, Done { .. })`) fires and
+    /// the post-Done trust-receipt + observer hooks run on whatever
+    /// partial text already streamed. Pre-2026-05-17 a Stop click had
+    /// no observation point inside the agent loop; tokens kept
+    /// burning until natural completion.
+    async fn emit_cancelled(
+        &self,
+        sink: &mut EventSink<'_>,
+        accumulated_text: String,
+        iterations: usize,
+    ) {
+        self.emit(
+            sink,
+            AgentEvent::Error {
+                message: "agent cancelled by client".to_string(),
             },
         )
         .await;
@@ -581,9 +697,26 @@ impl Agent {
         &self,
         calls: &[ToolCall],
         sink: &mut EventSink<'_>,
+        cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
         let mut results: Vec<ToolResult> = Vec::with_capacity(calls.len());
+        // Cancellation between calls in a batch: a long shell_exec at
+        // call[0] followed by a remember-call at call[1] should not
+        // run call[1] if the client disconnected during call[0]. The
+        // synthetic "cancelled" result is fed back to the LLM so
+        // `history` stays balanced (every assistant_tool_calls turn
+        // has a matching tool_results turn with one entry per call).
+        let mut cancelled = false;
         for call in calls {
+            if cancelled || cancel.is_cancelled() {
+                cancelled = true;
+                results.push(ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: "agent cancelled by client; tool dispatch skipped".to_string(),
+                    is_error: true,
+                });
+                continue;
+            }
             let is_write = self.registry.is_write(&call.name);
             self.emit(
                 sink,
@@ -597,7 +730,29 @@ impl Agent {
             .await;
 
             if is_write {
-                let decision = self.approval.check(&call.name, &call.input).await;
+                // `call.id` is the LLM-supplied tool_use_id. Threading
+                // it through the gate signature (rather than relying on
+                // shared mutable state on the router) eliminates the
+                // race that pre-2026-05-17 could surface a spurious
+                // "internal: called without a tool_use_id" rejection
+                // when the SSE relay registered the id later than the
+                // agent's dispatch task ran.
+                //
+                // Race the gate against cancellation: a write-tool
+                // approval prompt can sit pending for up to 5 minutes
+                // (the router's APPROVAL_TIMEOUT); a user-initiated
+                // Stop during that window aborts the wait without
+                // burning the timeout budget.
+                let decision = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        ApprovalDecision::Rejected {
+                            reason: "agent cancelled by client".to_string(),
+                        }
+                    }
+                    d = self.approval.check(&call.id, &call.name, &call.input) => d,
+                };
                 if let ApprovalDecision::Rejected { reason } = decision {
                     self.emit(
                         sink,
@@ -628,15 +783,46 @@ impl Agent {
                 },
             )
             .await;
-            let res = self.registry.dispatch(&call.name, call.input.clone()).await;
+            // Race the tool dispatch against cancellation. Tools that
+            // are themselves cancel-aware (e.g. `compile`, which
+            // threads a CancellationToken into the pipeline) will
+            // observe the same token via the engine; tools that are
+            // not (a long `shell_exec`, a slow `file_read` over NFS)
+            // get force-dropped here and we synthesise an error
+            // result so the conversation history stays well-formed.
+            //
+            // The dropped future is responsible for its own cleanup
+            // (the registry's ToolHandler trait already requires
+            // panic-safety; drop guards inside individual handlers
+            // do the rest — for example shell_exec's spawned Child
+            // is owned by the sandbox future and killed on drop).
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    crate::intelligence::tools::ToolHandlerResult::error(
+                        "agent cancelled by client; tool dispatch aborted",
+                    )
+                }
+                r = self.registry.dispatch(&call.name, call.input.clone()) => r,
+            };
             // C6: bound the per-result content so a single oversized
             // tool output (large file read, 50-hit search) cannot
             // starve subsequent iterations of context. The full
             // result is still emitted to the UI/trace via
             // ToolCallFinished — only the LLM-facing history copy is
             // truncated. (plan 2026-05-09)
-            let bounded_content =
-                truncate_tool_result(res.content.clone(), DEFAULT_TOOL_RESULT_TOKEN_BUDGET);
+            //
+            // 2026-05-17 — surface the truncation honestly on the
+            // wire. Pre-fix the UI showed `content` (full) while the
+            // LLM saw a much smaller string with no signal that the
+            // model couldn't see what the user could. Now the
+            // ToolCallFinished event carries `llm_truncated` +
+            // byte counts so the UI can render the asymmetry.
+            let truncation = truncate_tool_result_with_stats(
+                res.content.clone(),
+                DEFAULT_TOOL_RESULT_TOKEN_BUDGET,
+            );
             self.emit(
                 sink,
                 AgentEvent::ToolCallFinished {
@@ -644,12 +830,15 @@ impl Agent {
                     name: call.name.clone(),
                     content: res.content,
                     is_error: res.is_error,
+                    llm_truncated: truncation.truncated,
+                    llm_content_bytes: truncation.llm_bytes,
+                    original_content_bytes: truncation.original_bytes,
                 },
             )
             .await;
             results.push(ToolResult {
                 tool_use_id: call.id.clone(),
-                content: bounded_content,
+                content: truncation.bounded,
                 is_error: res.is_error,
             });
         }
@@ -1098,7 +1287,12 @@ mod tests {
         }
         #[async_trait]
         impl ApprovalGate for RecordingGate {
-            async fn check(&self, tool_name: &str, _input: &serde_json::Value) -> ApprovalDecision {
+            async fn check(
+                &self,
+                _tool_use_id: &str,
+                tool_name: &str,
+                _input: &serde_json::Value,
+            ) -> ApprovalDecision {
                 self.checks.lock().unwrap().push(tool_name.to_string());
                 ApprovalDecision::Approved
             }
@@ -2031,6 +2225,276 @@ mod tests {
         let run = run_to_completion(&agent, req).await;
         assert_eq!(captured.lock().unwrap().len(), 4);
         assert!(run.first_error().is_none());
+    }
+
+    /// LLM stub that blocks on a oneshot until released — lets a
+    /// cancellation test prove the agent aborts a real in-flight
+    /// chat_with_tools call rather than waiting for it to complete.
+    struct BlockingLlm {
+        gate: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl BlockingLlm {
+        fn new(rx: tokio::sync::oneshot::Receiver<()>) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    gate: tokio::sync::Mutex::new(Some(rx)),
+                    call_count: counter.clone(),
+                },
+                counter,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LlmBackend for BlockingLlm {
+        async fn chat_with_tools(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[Tool],
+            _tool_choice: &ToolChoice,
+        ) -> Result<ToolUseResponse> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // First call: block on the gate until the test releases
+            // it (or the surrounding select! aborts us via drop).
+            let gate = {
+                let mut g = self.gate.lock().await;
+                g.take()
+            };
+            if let Some(rx) = gate {
+                // Yield to the test until released — this future is
+                // exactly what `select!` should drop when cancel
+                // fires. The Receiver `Drop` is silent (just frees
+                // the channel slot) — no side effect to assert.
+                let _ = rx.await;
+            }
+            // If we ever reach here, the cancellation contract was
+            // violated. Return a terminal text so the agent exits
+            // cleanly and the test's failing assert produces a
+            // useful message.
+            Ok(ToolUseResponse::Text {
+                text: "should not be observed".to_string(),
+                truncated: false,
+                limits: HeaderRateLimits::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_in_flight_llm_call_and_emits_done() {
+        // Wire an agent against a blocking LLM, fire cancel from a
+        // separate task, assert the agent emits Error("agent
+        // cancelled") + Done with NO real LLM completion. Proves
+        // the SSE-DropGuard-to-agent contract.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let (llm, call_count) = BlockingLlm::new(gate_rx);
+        let llm: Arc<dyn LlmBackend> = Arc::new(llm);
+        let agent = Agent::new(llm, ToolRegistry::new(), Arc::new(AutoApprove));
+
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("hi")],
+            tool_choice: ToolChoice::Auto,
+        };
+
+        let agent_handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                agent.run_streaming_cancellable(req, tx, cancel).await;
+            })
+        };
+
+        // Give the agent a moment to enter chat_with_tools, then
+        // cancel. The select! inside `drive` must drop the LLM
+        // future before it can complete.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        cancel.cancel();
+
+        agent_handle.await.expect("agent task should finish");
+
+        // The blocking LLM future must NEVER have completed — its
+        // gate sender is still held by the test.
+        drop(gate_tx);
+
+        // Expected sequence: Error("agent cancelled by client") +
+        // Done. Iterations counts the iteration the cancel
+        // interrupted (1, because the agent did enter the iteration
+        // before cancel observation).
+        let mut events: Vec<AgentEvent> = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "LLM was invoked exactly once before cancel observation"
+        );
+        let saw_cancel_error = events.iter().any(|e| {
+            matches!(e, AgentEvent::Error { message } if message == "agent cancelled by client")
+        });
+        let saw_done = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { .. }));
+        assert!(
+            saw_cancel_error,
+            "must emit the stable cancel-error marker, got events: {events:?}"
+        );
+        assert!(
+            saw_done,
+            "must emit terminal Done so SSE consumer's terminator fires"
+        );
+    }
+
+    /// Two-call LLM stub: call 1 returns a scripted tool-use, call 2+
+    /// blocks on a gate. Lets the cancellation test deterministically
+    /// race a Stop click against the second LLM round-trip — without
+    /// a yield inside the stub's first call the ScriptedLlm runs the
+    /// whole iteration synchronously and there's no scheduler window
+    /// for the test task to fire cancel.
+    struct TwoCallBlockingLlm {
+        scripted_first: Mutex<Option<ToolUseResponse>>,
+        gate: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TwoCallBlockingLlm {
+        fn new(
+            first: ToolUseResponse,
+            second_gate: tokio::sync::oneshot::Receiver<()>,
+        ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    scripted_first: Mutex::new(Some(first)),
+                    gate: tokio::sync::Mutex::new(Some(second_gate)),
+                    call_count: counter.clone(),
+                },
+                counter,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LlmBackend for TwoCallBlockingLlm {
+        async fn chat_with_tools(
+            &self,
+            _system: &str,
+            _messages: &[ChatMessage],
+            _tools: &[Tool],
+            _tool_choice: &ToolChoice,
+        ) -> Result<ToolUseResponse> {
+            let n = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                let r = self.scripted_first.lock().unwrap().take().expect("first call");
+                return Ok(r);
+            }
+            // Subsequent calls: block until released or dropped.
+            let gate = {
+                let mut g = self.gate.lock().await;
+                g.take()
+            };
+            if let Some(rx) = gate {
+                let _ = rx.await;
+            }
+            // Should be unreachable in the cancellation test — the
+            // select! drops this future before the gate releases.
+            Ok(ToolUseResponse::Text {
+                text: "unreached".to_string(),
+                truncated: false,
+                limits: HeaderRateLimits::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_tool_dispatch_aborts_next_llm_call() {
+        // Fire one tool dispatch on iteration 1, then cancel.
+        // Asserts the second LLM call enters select! and gets
+        // dropped — no run-to-completion on iteration 2.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let first_response = tool_calls(vec![search_call("1", "x")]);
+        let (llm, call_count) = TwoCallBlockingLlm::new(first_response, gate_rx);
+        let llm: Arc<dyn LlmBackend> = Arc::new(llm);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(CapturingHandler {
+            name: "search",
+            captured: captured.clone(),
+            reply: "ok".to_string(),
+            is_error: false,
+        });
+        let registry = ToolRegistry::new().register_read(fixture_tool("search"), handler);
+        let agent = Agent::new(llm, registry, Arc::new(AutoApprove));
+
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+
+        let req = AgentRequest {
+            system: "sys".into(),
+            system_refresher: None,
+            history: vec![ChatMessage::user("look")],
+            tool_choice: ToolChoice::Auto,
+        };
+
+        let cancel_for_relay = cancel.clone();
+        let relay = tokio::spawn(async move {
+            // Drain events, fire cancel when the tool finishes so
+            // the second LLM call is already pending inside select!
+            // by the time cancel propagates.
+            let mut events = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                let is_tool_finished = matches!(&ev, AgentEvent::ToolCallFinished { .. });
+                events.push(ev);
+                if is_tool_finished {
+                    // Small yield so the agent has time to reach
+                    // the iteration boundary + enter the LLM
+                    // select! — without this the cancel could fire
+                    // *during* the dispatch's post-emit await chain
+                    // which is also a valid (but different) cancel
+                    // observation point. We're specifically
+                    // exercising the iteration-boundary path here.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    cancel_for_relay.cancel();
+                }
+            }
+            events
+        });
+
+        agent.run_streaming_cancellable(req, tx, cancel).await;
+        let events = relay.await.unwrap();
+        drop(gate_tx);
+
+        // Tool was dispatched exactly once.
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "tool ran once on iteration 1"
+        );
+        // LLM was invoked exactly twice — once on iteration 1
+        // returning the tool_call, once on iteration 2 which was
+        // then aborted via select!.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "second LLM call entered the select! before cancel observation"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error { message } if message == "agent cancelled by client"
+            )),
+            "stable cancel-error message must appear, got: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { .. })));
     }
 
     #[tokio::test]

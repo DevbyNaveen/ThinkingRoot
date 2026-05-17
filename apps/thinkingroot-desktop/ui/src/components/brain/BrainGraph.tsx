@@ -103,15 +103,59 @@ interface InternalLink {
 
 // ───────────────────────── Helpers ────────────────────────────────────
 
+// Production palette covering every value `node.entity_type` can take.
+// Two source vocabularies feed this string:
+//   1. `ClaimType` (worker-resolved; entityResolver.worker.ts) — serde
+//      snake_case from `crates/thinkingroot-core/src/types/claim.rs`.
+//   2. `EntityType` (backend fallback) — serde snake_case from
+//      `crates/thinkingroot-core/src/types/entity.rs`.
+// Plus two synthetic strings: `"rooted"` (worker override when any
+// matching claim is tier=rooted) and `"inferred"` (BrainGraph.tsx
+// fallback for entities mentioned in relations but absent from the
+// entity list). Lightness pinned 55–72% for legibility on the dark
+// canvas; hue separation ≥ 25° between same-vocabulary neighbours.
+const SEMANTIC_PALETTE: Readonly<Record<string, string>> = {
+  // ── ClaimType (snake_case wire) ──
+  fact: "hsl(215, 55%, 65%)",
+  decision: "hsl(45, 75%, 60%)",
+  opinion: "hsl(15, 60%, 68%)",
+  plan: "hsl(135, 50%, 58%)",
+  requirement: "hsl(340, 70%, 65%)",
+  metric: "hsl(180, 70%, 55%)",
+  definition: "hsl(280, 70%, 65%)",
+  dependency: "hsl(305, 55%, 62%)",
+  api_signature: "hsl(200, 80%, 65%)",
+  // Legacy compact spelling — kept as a no-cost alias in case any
+  // upstream path emits `apisignature` without the underscore.
+  apisignature: "hsl(200, 80%, 65%)",
+  architecture: "hsl(30, 80%, 65%)",
+  preference: "hsl(60, 55%, 60%)",
+  // ── EntityType (snake_case wire) ──
+  person: "hsl(0, 65%, 68%)",
+  system: "hsl(250, 50%, 65%)",
+  service: "hsl(160, 55%, 55%)",
+  concept: "hsl(265, 55%, 72%)",
+  team: "hsl(325, 50%, 68%)",
+  api: "hsl(195, 70%, 60%)",
+  database: "hsl(85, 50%, 55%)",
+  library: "hsl(290, 55%, 68%)",
+  file: "hsl(45, 70%, 62%)",
+  module: "hsl(225, 60%, 65%)",
+  function: "hsl(170, 60%, 55%)",
+  config: "hsl(220, 22%, 60%)",
+  organization: "hsl(20, 55%, 62%)",
+  // ── Synthetic ──
+  rooted: "hsl(150, 70%, 60%)",
+  inferred: "rgba(140, 140, 140, 0.4)",
+};
+
+// Dim slate — deliberately not pale (`rgba(200,200,200,0.8)` reads as
+// white on the dark canvas). Used only when an unknown type arrives;
+// the palette above is meant to cover every real wire value.
+const SEMANTIC_DEFAULT = "hsl(220, 15%, 58%)";
+
 function getSemanticColor(type: string): string {
-  const t = type.toLowerCase();
-  if (t === "definition") return "hsl(280, 70%, 65%)";
-  if (t === "apisignature") return "hsl(200, 80%, 65%)";
-  if (t === "architecture") return "hsl(30, 80%, 65%)";
-  if (t === "rooted") return "hsl(150, 70%, 60%)";
-  if (t === "requirement") return "hsl(340, 70%, 65%)";
-  if (t === "inferred") return "rgba(140, 140, 140, 0.4)";
-  return "rgba(200, 200, 200, 0.8)";
+  return SEMANTIC_PALETTE[type.toLowerCase()] ?? SEMANTIC_DEFAULT;
 }
 
 function activationHue(kind: ActivationKind): { r: number; g: number; b: number } {

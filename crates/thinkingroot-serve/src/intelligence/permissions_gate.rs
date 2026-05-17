@@ -218,13 +218,18 @@ impl PermissionsGate {
 
 #[async_trait]
 impl ApprovalGate for PermissionsGate {
-    async fn check(&self, tool_name: &str, input: &serde_json::Value) -> ApprovalDecision {
+    async fn check(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> ApprovalDecision {
         let subjects = Self::extract_subjects(tool_name, input);
         if subjects.is_empty() {
             // No subjects: this tool isn't a path/command-typed one;
             // fall through to the inner gate so the standard
             // write-tool approval flow still runs.
-            return self.inner.check(tool_name, input).await;
+            return self.inner.check(tool_use_id, tool_name, input).await;
         }
 
         let store = self.store.read().await;
@@ -270,8 +275,10 @@ impl ApprovalGate for PermissionsGate {
         if any_ask {
             // Delegate to inner gate (UI prompt via the existing SSE
             // `approval_requested` flow). The inner gate sees the
-            // tool_name + input as-is.
-            self.inner.check(tool_name, input).await
+            // tool_use_id + tool_name + input as-is so the HTTP-bridge
+            // router can register its pending oneshot under the agent's
+            // call id.
+            self.inner.check(tool_use_id, tool_name, input).await
         } else {
             // Every subject evaluated to Allow.
             ApprovalDecision::Approved
@@ -308,7 +315,7 @@ mod tests {
         // clipboard_read has no subjects → must delegate to inner.
         // Inner is AutoApprove → check returns Approved.
         let gate = PermissionsGate::new(empty_store(), Arc::new(AutoApprove));
-        let d = gate.check("clipboard_read", &json!({})).await;
+        let d = gate.check("id-1", "clipboard_read", &json!({})).await;
         assert!(d.is_approved());
     }
 
@@ -316,7 +323,7 @@ mod tests {
     async fn no_subjects_delegates_rejection_too() {
         // Same path but inner is DenyAll → gate must surface the rejection.
         let gate = PermissionsGate::new(empty_store(), Arc::new(DenyAll));
-        let d = gate.check("clipboard_read", &json!({})).await;
+        let d = gate.check("id-1", "clipboard_read", &json!({})).await;
         assert!(!d.is_approved());
     }
 
@@ -337,7 +344,7 @@ mod tests {
         let store = store_with_rule(&pattern, Decision::Allow, RuleKind::Path);
         let gate = PermissionsGate::new(store, Arc::new(DenyAll));
         let d = gate
-            .check("file_read", &json!({ "path": f.display().to_string() }))
+            .check("id-1", "file_read", &json!({ "path": f.display().to_string() }))
             .await;
         assert!(d.is_approved(), "explicit allow must skip inner gate");
     }
@@ -355,7 +362,7 @@ mod tests {
 
         let gate = PermissionsGate::new(empty_store(), Arc::new(AutoApprove));
         let d = gate
-            .check("file_read", &json!({ "path": key.display().to_string() }))
+            .check("id-1", "file_read", &json!({ "path": key.display().to_string() }))
             .await;
         // Cleanup before assertion.
         std::fs::remove_file(&key).ok();
@@ -378,6 +385,7 @@ mod tests {
         let gate = PermissionsGate::new(empty_store(), Arc::new(AutoApprove));
         let d = gate
             .check(
+                "id-1",
                 "file_read",
                 &json!({ "path": "/this/path/definitely/does/not/exist/anywhere" }),
             )
@@ -404,6 +412,7 @@ mod tests {
         let gate = PermissionsGate::new(store, Arc::new(DenyAll));
         let d = gate
             .check(
+                "id-1",
                 "file_write",
                 &json!({ "path": new_file.display().to_string(), "content": "hi" }),
             )
@@ -434,13 +443,13 @@ mod tests {
         // Allow rule on `git status` → policy short-circuits to Approved.
         let gate = PermissionsGate::new(store.clone(), Arc::new(DenyAll));
         let d = gate
-            .check("shell_exec", &json!({ "command": "git status" }))
+            .check("id-1", "shell_exec", &json!({ "command": "git status" }))
             .await;
         assert!(d.is_approved(), "Allow command rule must skip inner");
 
         // Different command → falls through to Ask → DenyAll inner → Rejected.
         let d2 = gate
-            .check("shell_exec", &json!({ "command": "rm -rf /" }))
+            .check("id-2", "shell_exec", &json!({ "command": "rm -rf /" }))
             .await;
         assert!(!d2.is_approved(), "Ask must delegate to inner DenyAll");
     }
@@ -460,7 +469,7 @@ mod tests {
         // Inner is AutoApprove — Deny rule MUST win.
         let gate = PermissionsGate::new(store, Arc::new(AutoApprove));
         let d = gate
-            .check("shell_exec", &json!({ "command": "rm -rf /" }))
+            .check("id-1", "shell_exec", &json!({ "command": "rm -rf /" }))
             .await;
         match d {
             ApprovalDecision::Rejected { reason } => {
@@ -484,6 +493,7 @@ mod tests {
         let gate = PermissionsGate::new(store, Arc::new(DenyAll));
         let d = gate
             .check(
+                "id-1",
                 "trash",
                 &json!({
                     "paths": [

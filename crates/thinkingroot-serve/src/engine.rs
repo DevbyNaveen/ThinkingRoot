@@ -1280,7 +1280,13 @@ impl QueryEngine {
                 result.push(EntityInfo {
                     id: e.id.clone(),
                     name: e.canonical_name.clone(),
-                    entity_type: e.entity_type.clone(),
+                    // Normalize TitleCase storage to the snake_case wire
+                    // form `EntityType` advertises via serde — the graph
+                    // layer historically wrote `format!("{:?}")` which
+                    // bypassed the rename_all contract.
+                    entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                        &e.entity_type,
+                    ),
                     claim_count: cache.entity_claim_count(&e.id),
                 });
             }
@@ -1310,7 +1316,9 @@ impl QueryEngine {
             .into_iter()
             .map(|r| RelationInfo {
                 target: r.to_name.clone(),
-                relation_type: r.relation_type.clone(),
+                relation_type: thinkingroot_core::types::RelationType::normalize_storage(
+                    &r.relation_type,
+                ),
                 strength: r.strength,
             })
             .collect();
@@ -1318,7 +1326,9 @@ impl QueryEngine {
         Ok(EntityDetail {
             id: entity.id.clone(),
             name: entity.canonical_name.clone(),
-            entity_type: entity.entity_type.clone(),
+            entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                &entity.entity_type,
+            ),
             aliases: entity.aliases.clone(),
             claims,
             relations,
@@ -1709,7 +1719,9 @@ side referenced. Strict rules:\n\
             .into_iter()
             .map(|r| RelationInfo {
                 target: r.to_name.clone(),
-                relation_type: r.relation_type.clone(),
+                relation_type: thinkingroot_core::types::RelationType::normalize_storage(
+                    &r.relation_type,
+                ),
                 strength: r.strength,
             })
             .collect())
@@ -1767,7 +1779,9 @@ side referenced. Strict rules:\n\
                 nodes.push(GalaxyNode {
                     id: e.id.to_string(),
                     name: e.canonical_name.clone(),
-                    entity_type: e.entity_type.clone(),
+                    entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                        &e.entity_type,
+                    ),
                     claim_count,
                     x,
                     y,
@@ -1787,7 +1801,9 @@ side referenced. Strict rules:\n\
                 links.push(GalaxyLink {
                     source: src.id.clone(),
                     target: tgt.id.clone(),
-                    relation_type: r.relation_type.clone(),
+                    relation_type: thinkingroot_core::types::RelationType::normalize_storage(
+                        &r.relation_type,
+                    ),
                 });
             }
         }
@@ -2237,7 +2253,9 @@ side referenced. Strict rules:\n\
                     ClaimInfo {
                         id,
                         statement,
-                        claim_type,
+                        claim_type: thinkingroot_core::types::ClaimType::normalize_storage(
+                            &claim_type,
+                        ),
                         confidence,
                         source_uri,
                         event_date,
@@ -2344,7 +2362,9 @@ side referenced. Strict rules:\n\
                     entity_hits.push(EntitySearchHit {
                         id: e.id.clone(),
                         name: e.canonical_name.clone(),
-                        entity_type: e.entity_type.clone(),
+                        entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                            &e.entity_type,
+                        ),
                         claim_count: cache.entity_claim_count(&e.id),
                         relevance: *score,
                     });
@@ -2473,7 +2493,9 @@ side referenced. Strict rules:\n\
                     entity_hits.push(EntitySearchHit {
                         id: e.id.clone(),
                         name: e.canonical_name.clone(),
-                        entity_type: e.entity_type.clone(),
+                        entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                            &e.entity_type,
+                        ),
                         claim_count: cache.entity_claim_count(&e.id),
                         relevance: *score,
                     });
@@ -2704,7 +2726,9 @@ side referenced. Strict rules:\n\
                         entity_hits.push(EntitySearchHit {
                             id: e.id.clone(),
                             name: e.canonical_name.clone(),
-                            entity_type: e.entity_type.clone(),
+                            entity_type: thinkingroot_core::types::EntityType::normalize_storage(
+                                &e.entity_type,
+                            ),
                             claim_count: cache.entity_claim_count(&e.id),
                             relevance: *score,
                         });
@@ -2714,7 +2738,8 @@ side referenced. Strict rules:\n\
                             entity_hits.push(EntitySearchHit {
                                 id: bare_id.to_string(),
                                 name,
-                                entity_type: etype,
+                                entity_type:
+                                    thinkingroot_core::types::EntityType::normalize_storage(&etype),
                                 claim_count: 0,
                                 relevance: *score,
                             });
@@ -2955,7 +2980,7 @@ side referenced. Strict rules:\n\
                 |(id, statement, claim_type, confidence, source_uri, event_date)| ClaimInfo {
                     id,
                     statement,
-                    claim_type,
+                    claim_type: thinkingroot_core::types::ClaimType::normalize_storage(&claim_type),
                     confidence,
                     source_uri,
                     event_date: if event_date > 0.0 {
@@ -4216,7 +4241,9 @@ Rules: \
                     crate::engine::ClaimInfo {
                         id,
                         statement,
-                        claim_type,
+                        claim_type: thinkingroot_core::types::ClaimType::normalize_storage(
+                            &claim_type,
+                        ),
                         confidence,
                         source_uri,
                         event_date: if event_date > 0.0 {
@@ -5043,7 +5070,11 @@ fn cached_claim_to_info(c: &CachedClaim) -> ClaimInfo {
     ClaimInfo {
         id: c.id.clone(),
         statement: c.statement.clone(),
-        claim_type: c.claim_type.clone(),
+        // Normalize TitleCase storage (legacy `format!("{:?}")`) to the
+        // canonical snake_case the `ClaimType` serde contract advertises.
+        // Witness-mesh rule names (e.g. `"documents::heading"`) pass
+        // through unchanged because they aren't ClaimType variants.
+        claim_type: thinkingroot_core::types::ClaimType::normalize_storage(&c.claim_type),
         confidence: c.confidence,
         source_uri: c.source_uri.clone(),
         event_date: c.event_date,

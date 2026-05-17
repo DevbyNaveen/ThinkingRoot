@@ -192,6 +192,61 @@ pub enum ClaimType {
     Preference,
 }
 
+impl ClaimType {
+    /// Canonical wire form — matches `#[serde(rename_all = "snake_case")]`.
+    /// Use this whenever you build a `String` payload from a `ClaimType`
+    /// so the wire matches the typed contract instead of the legacy
+    /// Debug-derived TitleCase the graph layer historically wrote.
+    pub fn wire_str(&self) -> &'static str {
+        match self {
+            Self::Fact => "fact",
+            Self::Decision => "decision",
+            Self::Opinion => "opinion",
+            Self::Plan => "plan",
+            Self::Requirement => "requirement",
+            Self::Metric => "metric",
+            Self::Definition => "definition",
+            Self::Dependency => "dependency",
+            Self::ApiSignature => "api_signature",
+            Self::Architecture => "architecture",
+            Self::Preference => "preference",
+        }
+    }
+
+    /// Bidirectional parser: accepts wire snake_case (`"api_signature"`),
+    /// the legacy Debug-derived storage form (`"ApiSignature"`), and
+    /// also the historical compact spelling (`"apisignature"`) the UI
+    /// palette kept as a no-cost alias. Returns `None` for unknown
+    /// strings.
+    pub fn from_any(s: &str) -> Option<Self> {
+        match s {
+            "fact" | "Fact" => Some(Self::Fact),
+            "decision" | "Decision" => Some(Self::Decision),
+            "opinion" | "Opinion" => Some(Self::Opinion),
+            "plan" | "Plan" => Some(Self::Plan),
+            "requirement" | "Requirement" => Some(Self::Requirement),
+            "metric" | "Metric" => Some(Self::Metric),
+            "definition" | "Definition" => Some(Self::Definition),
+            "dependency" | "Dependency" => Some(Self::Dependency),
+            "api_signature" | "ApiSignature" | "apisignature" => Some(Self::ApiSignature),
+            "architecture" | "Architecture" => Some(Self::Architecture),
+            "preference" | "Preference" => Some(Self::Preference),
+            _ => None,
+        }
+    }
+
+    /// Normalizes an arbitrary stored claim-type string to the
+    /// canonical wire snake_case. Falls back to the raw input string
+    /// when the value isn't a recognised variant — preserves
+    /// witness-mesh-style rule names (`"documents::heading"`) which
+    /// aren't ClaimType values at all.
+    pub fn normalize_storage(stored: &str) -> String {
+        Self::from_any(stored)
+            .map(|c| c.wire_str().to_string())
+            .unwrap_or_else(|| stored.to_string())
+    }
+}
+
 /// Confidence score clamped to [0.0, 1.0].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Confidence(OrderedFloat<f64>);
@@ -513,5 +568,62 @@ mod tests {
         assert!(round.derivation.is_none());
         assert!(round.predicate.is_none());
         assert!(round.last_rooted_at.is_none());
+    }
+
+    #[test]
+    fn claim_type_wire_str_matches_serde_snake_case() {
+        assert_eq!(ClaimType::Fact.wire_str(), "fact");
+        // The compound variant is the load-bearing case: Debug emits
+        // "ApiSignature" but serde emits "api_signature".
+        assert_eq!(ClaimType::ApiSignature.wire_str(), "api_signature");
+        for variant in [
+            ClaimType::Fact,
+            ClaimType::Decision,
+            ClaimType::Opinion,
+            ClaimType::Plan,
+            ClaimType::Requirement,
+            ClaimType::Metric,
+            ClaimType::Definition,
+            ClaimType::Dependency,
+            ClaimType::ApiSignature,
+            ClaimType::Architecture,
+            ClaimType::Preference,
+        ] {
+            let serde_form = serde_json::to_value(variant).unwrap();
+            assert_eq!(serde_form.as_str().unwrap(), variant.wire_str());
+        }
+    }
+
+    #[test]
+    fn claim_type_from_any_accepts_three_storage_forms() {
+        assert_eq!(
+            ClaimType::from_any("api_signature"),
+            Some(ClaimType::ApiSignature)
+        );
+        assert_eq!(
+            ClaimType::from_any("ApiSignature"),
+            Some(ClaimType::ApiSignature)
+        );
+        // Historical compact spelling the UI palette aliased.
+        assert_eq!(
+            ClaimType::from_any("apisignature"),
+            Some(ClaimType::ApiSignature)
+        );
+        assert_eq!(ClaimType::from_any("documents::heading"), None);
+    }
+
+    #[test]
+    fn claim_type_normalize_storage_preserves_witness_mesh_names() {
+        // Witness-mesh rule-prefixed names are NOT ClaimType variants —
+        // they pass through unchanged, never lowercased.
+        assert_eq!(
+            ClaimType::normalize_storage("documents::heading"),
+            "documents::heading"
+        );
+        assert_eq!(
+            ClaimType::normalize_storage("ApiSignature"),
+            "api_signature"
+        );
+        assert_eq!(ClaimType::normalize_storage("fact"), "fact");
     }
 }

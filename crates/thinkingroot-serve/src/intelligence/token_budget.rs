@@ -47,6 +47,31 @@ pub fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
 }
 
+/// Outcome of a single `truncate_tool_result_with_stats` call.
+/// Carries the bounded content the LLM will see PLUS the original
+/// byte count so the agent loop can surface visibility to the UI:
+/// the wire's `ToolCallFinished` event reports `content` (full,
+/// untruncated, for the UI rendering pipeline) alongside
+/// `llm_truncated` + `llm_content_bytes` (what the model actually
+/// saw). Pre-2026-05-17 this was opaque — the UI rendered the full
+/// result but the LLM had a much smaller view, and there was no
+/// honest signal to the user that the model couldn't see what they
+/// could.
+#[derive(Debug, Clone)]
+pub struct TruncationOutcome {
+    /// The (possibly-truncated) string fed into the LLM's history.
+    pub bounded: String,
+    /// True iff the input exceeded the budget and was reshaped.
+    pub truncated: bool,
+    /// Byte length of `bounded`. Cheap proxy for "what the LLM saw"
+    /// — surfaced to the UI so a user can see the model only had,
+    /// say, 8 KB of a 10 MB tool result.
+    pub llm_bytes: usize,
+    /// Byte length of the original input. Reported alongside
+    /// `llm_bytes` so the UI can compute the ratio.
+    pub original_bytes: usize,
+}
+
 /// Truncate `content` so its estimated token count ≤ `budget`. When
 /// the input already fits, returns it unchanged (no allocation). When
 /// over budget, returns head + truncation marker + tail, with head and
@@ -57,14 +82,41 @@ pub fn estimate_tokens(s: &str) -> usize {
 /// `budget = 0` is a valid "drop entirely" request: returns just the
 /// marker. Callers that don't want truncation should pass
 /// [`usize::MAX`] (or skip the call).
+///
+/// String-returning convenience wrapper around
+/// [`truncate_tool_result_with_stats`]; callers that need to know
+/// whether truncation happened (the agent loop, the SSE emitter)
+/// should call the `_with_stats` variant directly.
 pub fn truncate_tool_result(content: String, budget: usize) -> String {
+    truncate_tool_result_with_stats(content, budget).bounded
+}
+
+/// Truncate-and-report variant. See [`truncate_tool_result`] for the
+/// truncation contract; this variant additionally returns whether
+/// truncation occurred plus the byte counts the UI needs to render
+/// honest "model saw X / Y bytes" indicators.
+pub fn truncate_tool_result_with_stats(content: String, budget: usize) -> TruncationOutcome {
+    let original_bytes = content.len();
     let estimated = estimate_tokens(&content);
     if estimated <= budget {
-        return content;
+        let llm_bytes = content.len();
+        return TruncationOutcome {
+            bounded: content,
+            truncated: false,
+            llm_bytes,
+            original_bytes,
+        };
     }
 
     if budget == 0 {
-        return TRUNCATION_MARKER.trim().to_string();
+        let bounded = TRUNCATION_MARKER.trim().to_string();
+        let llm_bytes = bounded.len();
+        return TruncationOutcome {
+            bounded,
+            truncated: true,
+            llm_bytes,
+            original_bytes,
+        };
     }
 
     // Head + tail allocation: each gets ~30% of the budget. We leave
@@ -81,13 +133,20 @@ pub fn truncate_tool_result(content: String, budget: usize) -> String {
 
     // Don't bother emitting both head and tail when they overlap —
     // the input is short enough that the marker alone is fine.
-    if tail_start <= head_end {
-        return format!("{}{TRUNCATION_MARKER}", &content[..head_end]);
+    let bounded = if tail_start <= head_end {
+        format!("{}{TRUNCATION_MARKER}", &content[..head_end])
+    } else {
+        let head = &content[..head_end];
+        let tail = &content[tail_start..];
+        format!("{head}{TRUNCATION_MARKER}{tail}")
+    };
+    let llm_bytes = bounded.len();
+    TruncationOutcome {
+        bounded,
+        truncated: true,
+        llm_bytes,
+        original_bytes,
     }
-
-    let head = &content[..head_end];
-    let tail = &content[tail_start..];
-    format!("{head}{TRUNCATION_MARKER}{tail}")
 }
 
 /// Round `idx` down to the nearest UTF-8 char boundary, never past 0.
@@ -173,6 +232,45 @@ mod tests {
         assert!(out.is_char_boundary(0));
         assert!(out.is_char_boundary(out.len()));
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn stats_under_budget_reports_no_truncation_with_matching_bytes() {
+        let content = "small result".to_string();
+        let original_len = content.len();
+        let out = truncate_tool_result_with_stats(content.clone(), 1024);
+        assert_eq!(out.bounded, content);
+        assert!(!out.truncated);
+        assert_eq!(out.original_bytes, original_len);
+        assert_eq!(out.llm_bytes, original_len);
+    }
+
+    #[test]
+    fn stats_over_budget_flags_truncation_with_shorter_llm_view() {
+        let content = "x".repeat(20_000);
+        let original_len = content.len();
+        let out = truncate_tool_result_with_stats(content, 1_024);
+        assert!(out.truncated, "must flag truncation");
+        assert_eq!(out.original_bytes, original_len);
+        assert!(
+            out.llm_bytes < out.original_bytes,
+            "LLM byte count {} must be smaller than original {}",
+            out.llm_bytes,
+            out.original_bytes
+        );
+        // Head+tail+marker shape stays much smaller than input.
+        assert!(out.llm_bytes < 20_000);
+    }
+
+    #[test]
+    fn stats_zero_budget_returns_marker_only_with_truncated_flag() {
+        let content = "anything at all".to_string();
+        let original_len = content.len();
+        let out = truncate_tool_result_with_stats(content, 0);
+        assert!(out.truncated);
+        assert_eq!(out.original_bytes, original_len);
+        assert_eq!(out.llm_bytes, out.bounded.len());
+        assert!(!out.bounded.contains("anything"));
     }
 
     #[test]

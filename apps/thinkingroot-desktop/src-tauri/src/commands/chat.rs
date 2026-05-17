@@ -128,12 +128,27 @@ pub enum ChatEvent {
     },
     /// Tool dispatch finished. `is_error` mirrors the registry
     /// flag so the UI can colour the card.
+    ///
+    /// `content` is the FULL (untruncated) tool result — what the
+    /// UI renders. The LLM may have seen a shorter head+tail when
+    /// the result exceeded the per-call token budget; the
+    /// `llm_truncated` + byte counts surface that asymmetry so the
+    /// UI can render an honest "model only saw X of Y bytes"
+    /// indicator. All three fields are optional on the wire (default
+    /// `false` / `0`) so a pre-2026-05-17 backend missing them
+    /// still deserialises cleanly.
     ToolCallFinished {
         turn_id: String,
         id: String,
         name: String,
         content: String,
         is_error: bool,
+        #[serde(default)]
+        llm_truncated: bool,
+        #[serde(default)]
+        llm_content_bytes: usize,
+        #[serde(default)]
+        original_content_bytes: usize,
     },
     /// Approval declined or auto-rejected. The agent gets the
     /// rejection back as a tool error and may continue with a
@@ -495,6 +510,23 @@ async fn consume_ask_stream(
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        // Optional truncation telemetry (2026-05-17).
+                        // Older backends won't carry these fields;
+                        // unwrap_or(default) keeps the desktop
+                        // compatible without a wire-format break.
+                        let llm_truncated = json
+                            .get("llm_truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let llm_content_bytes = json
+                            .get("llm_content_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let original_content_bytes = json
+                            .get("original_content_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or_else(|| content.len() as u64)
+                            as usize;
                         let _ = app.emit(
                             "chat-event",
                             ChatEvent::ToolCallFinished {
@@ -503,6 +535,9 @@ async fn consume_ask_stream(
                                 name,
                                 content,
                                 is_error,
+                                llm_truncated,
+                                llm_content_bytes,
+                                original_content_bytes,
                             },
                         );
                     }

@@ -50,9 +50,16 @@ export interface EntityResolverResponse {
   elapsedMs: number;
 }
 
+// Wire spelling matches `ClaimType` serde snake_case from
+// `crates/thinkingroot-core/src/types/claim.rs` (verified against
+// engine.rs:5031 and extractor.rs:636). The pre-fix `"apisignature"`
+// (no underscore) never matched the backend's `"api_signature"` —
+// every ApiSignature claim silently fell to MAX_SAFE_INTEGER rank
+// and lost every tie-break. Ranking order = bias for which claim
+// type wins when an entity is mentioned by multiple claims.
 const TYPE_PRIORITY: ReadonlyArray<string> = [
   "definition",
-  "apisignature",
+  "api_signature",
   "architecture",
   "requirement",
   "fact",

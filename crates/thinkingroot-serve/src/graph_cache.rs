@@ -203,8 +203,16 @@ impl KnowledgeGraph {
         let mut claims_by_type: HashMap<String, Vec<String>> = HashMap::new();
 
         for (id, statement, claim_type, confidence, source_uri, event_date_raw) in raw.claims {
+            // Key by the canonical wire form so callers passing
+            // serde snake_case (`"fact"`, `"api_signature"`) match
+            // claims whose CozoDB row carries the legacy Debug-derived
+            // TitleCase storage form (`"Fact"`, `"ApiSignature"`).
+            // Witness-mesh rule names (`"documents::heading"`) are not
+            // ClaimType variants and pass through unchanged.
+            let type_key =
+                thinkingroot_core::types::ClaimType::normalize_storage(&claim_type);
             claims_by_type
-                .entry(claim_type.clone())
+                .entry(type_key)
                 .or_default()
                 .push(id.clone());
             // 0.0 is the default sentinel stored in CozoDB — treat it as "no date".
@@ -363,9 +371,16 @@ impl KnowledgeGraph {
     }
 
     /// All claims of a given type — O(k).
+    ///
+    /// The index is keyed by the canonical wire form (serde snake_case);
+    /// the lookup normalises the caller-supplied string the same way
+    /// so wire-form callers (`"fact"`), legacy storage-form callers
+    /// (`"Fact"`), and witness-mesh rule callers (`"documents::heading"`)
+    /// all resolve correctly.
     pub fn claims_of_type(&self, claim_type: &str) -> Vec<&CachedClaim> {
+        let normalised = thinkingroot_core::types::ClaimType::normalize_storage(claim_type);
         self.claims_by_type
-            .get(claim_type)
+            .get(&normalised)
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| self.claims_by_id.get(id))
