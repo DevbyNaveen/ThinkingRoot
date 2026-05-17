@@ -20,6 +20,7 @@ mod cortex_remote;
 mod doctor;
 mod engram_cmd;
 mod eval_cmd;
+mod mcp_cmd;
 mod mcp_config;
 mod mount_cmd;
 mod pack_cmd;
@@ -920,6 +921,42 @@ enum Commands {
     Engram {
         #[command(subcommand)]
         action: EngramAction,
+    },
+
+    /// Phase E.5 (2026-05-17) — manage external MCP servers bridged
+    /// into ThinkingRoot's `tools/list`. Per-workspace config lives
+    /// at `<workspace>/.thinkingroot/mcp-servers.toml`.
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Register an external MCP server (stdio transport).
+    /// Example: `root mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /Users/me/Documents`
+    Add {
+        /// Server name (used as the `<server>::<tool>` prefix).
+        name: String,
+        /// Workspace root path (defaults to current dir).
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Subprocess command + args; everything after `--` is the
+        /// command to invoke.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command_and_args: Vec<String>,
+    },
+    /// List external MCP servers registered for a workspace.
+    List {
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+    /// Remove an external MCP server.
+    Remove {
+        name: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
     },
 }
 
@@ -2264,6 +2301,25 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
         }
+        // Phase E.5 (2026-05-17) — external MCP server management.
+        // Purely config-file manipulation: writes to
+        // `<workspace>/.thinkingroot/mcp-servers.toml`. The daemon
+        // picks up the new entries on next workspace mount.
+        Some(Commands::Mcp { action }) => match action {
+            McpAction::Add {
+                name,
+                workspace,
+                command_and_args,
+            } => {
+                mcp_cmd::add(&name, &workspace, &command_and_args)?;
+            }
+            McpAction::List { workspace } => {
+                mcp_cmd::list(&workspace)?;
+            }
+            McpAction::Remove { name, workspace } => {
+                mcp_cmd::remove(&name, &workspace)?;
+            }
+        },
         None => {
             // `root ./path` shorthand — same as `root compile ./path`.
             let path = cli.path.unwrap_or_else(|| PathBuf::from("."));

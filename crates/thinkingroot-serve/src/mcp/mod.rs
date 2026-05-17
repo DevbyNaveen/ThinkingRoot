@@ -1,6 +1,10 @@
+pub mod client;
+pub mod external_registry;
+pub mod http_transport;
 pub mod resources;
 pub mod sse;
 pub mod stdio;
+pub mod stdio_transport;
 pub mod tool_trait;
 pub mod tools;
 

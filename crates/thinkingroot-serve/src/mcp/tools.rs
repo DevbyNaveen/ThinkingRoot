@@ -1135,6 +1135,22 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             for schema in crate::mcp::tool_trait::list_schemas() {
                 arr_mut.push(schema);
             }
+            // Phase E.5 (2026-05-17) — append external MCP tools
+            // from the bridged registry under
+            // `<server_name>::<tool_name>` namespace. Tolerates a
+            // slow external server: list_all_tools internally
+            // logs + skips servers that fail. Production startup
+            // installs the global via
+            // `external_registry::load_global_from_workspace_config`
+            // at workspace mount.
+            let external = crate::mcp::external_registry::global().await;
+            for (prefixed_name, tool) in external.list_all_tools().await {
+                arr_mut.push(serde_json::json!({
+                    "name": prefixed_name,
+                    "description": format!("[external] {}", tool.description),
+                    "inputSchema": tool.input_schema,
+                }));
+            }
         }
     }
     JsonRpcResponse::success(id, tools)
@@ -2600,6 +2616,34 @@ pub async fn handle_call(
         "open_in_default" => handle_open_in_default(id, &arguments).await,
         "trash"           => handle_trash(id, &arguments).await,
 
+        // ── Phase E.5 (2026-05-17) — external MCP fall-through ─────
+        // Names containing `::` are routed to the external MCP
+        // registry. Split on `::`, look up the server, strip the
+        // prefix, dispatch via `McpClient::call_tool`. Wrap the
+        // result in the MCP `text` content block shape so agents
+        // see external tool results identically to built-ins.
+        other if other.contains("::") => {
+            let registry = crate::mcp::external_registry::global().await;
+            match registry.dispatch(other, arguments.clone()).await {
+                Some(Ok(result)) => {
+                    let text = serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| String::from("(serialization failure)"));
+                    JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "content": [{"type": "text", "text": text}],
+                            "isError": result.is_error
+                        }),
+                    )
+                }
+                Some(Err(e)) => JsonRpcResponse::error(id, -32603, format!("external MCP {other}: {e}")),
+                None => JsonRpcResponse::error(
+                    id,
+                    -32601,
+                    format!("external MCP server not registered for: {other}"),
+                ),
+            }
+        }
         // ── Phase E.6 (2026-05-17) — trait-registry fall-through ────
         // After every built-in `match` arm misses, consult the
         // `mcp::tool_trait` registry. Tools added from Phase E

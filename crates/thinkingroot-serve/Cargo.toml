@@ -41,6 +41,8 @@ blake3 = { workspace = true }
 cozo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -82,9 +84,13 @@ globset = { workspace = true }
 # `<config_dir>/thinkingroot/`. Same crate the rest of the workspace
 # already uses for cortex.lock / credentials.toml.
 dirs = { workspace = true }
+# E.5 (2026-05-17) — external MCP HTTP transport. `reqwest` was a
+# dev-dep only until E.5 added a production HTTP MCP client; the
+# feature set (json + rustls-tls) is what the existing dev-dep was
+# already pinned to.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }
 cozo = { workspace = true }
 thinkingroot-parse = { workspace = true }

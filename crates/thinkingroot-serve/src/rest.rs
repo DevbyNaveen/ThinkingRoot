@@ -134,6 +134,10 @@ impl AppState {
         api_key: Option<String>,
         workspace_root: Option<PathBuf>,
     ) -> Arc<Self> {
+        // Phase E.3 (2026-05-17) — register memory_tree MCP tools
+        // (export_memory_tree, import_memory_tree). Idempotent —
+        // duplicate entries collapse in the tool_trait registry.
+        crate::memory_tree::register_memory_tree_tools();
         Arc::new(Self {
             engine: Arc::new(RwLock::new(engine)),
             api_key,
@@ -683,6 +687,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
     }
 
     // Apply CORS + auth middleware to the routes registered above.
+    // The agentmemory router is composed BELOW the layer because it
+    // uses its own bearer-token scheme (env-gated) — it doesn't
+    // share the daemon's `X-API-Key` middleware. See
+    // `crate::agentmemory::agentmemory_auth_check`.
     // Ops endpoints (/metrics, /readyz, /livez) are added AFTER .layer()
     // so monitoring scrapers don't need the API key. Axum only applies a
     // layer to routes already registered when `.layer()` was called.
@@ -697,6 +705,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
         .route("/livez", get(livez_handler))
         .route("/api/v1/version", get(version_handler))
         .route("/.well-known/mcp", get(well_known_mcp_handler))
+        // Phase E.4 (2026-05-17) — agentmemory-compatible REST
+        // protocol exposed under `/agentmemory/*`. Mounted BELOW
+        // the auth layer because it has its own bearer scheme.
+        .nest("/agentmemory", crate::agentmemory::router(state.clone()))
         .with_state(state)
 }
 
