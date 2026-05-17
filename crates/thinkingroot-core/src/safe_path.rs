@@ -225,6 +225,111 @@ pub fn atomic_write(
     Ok(())
 }
 
+/// Typed error variants for [`canonicalize_for_policy`].
+///
+/// Distinct from [`Error::SecurityViolation`] because the caller
+/// (typically [`PermissionsGate`] in thinkingroot-serve) needs to
+/// decide between "deny silently" (NotFound — never tell the LLM
+/// the file existed) and "deny loudly" (CrossVolume / Io — the
+/// user should know their path traversed a volume boundary).
+#[derive(Debug, thiserror::Error)]
+pub enum PathPolicyError {
+    /// The path does not exist OR is a dangling symlink. We don't
+    /// distinguish — both mean "no canonical realpath to evaluate"
+    /// and both are treated as deny by the permission gate.
+    #[error("path does not exist or is a dangling symlink: {path}")]
+    NotFound { path: String },
+
+    /// The path's canonical realpath lives on a different
+    /// filesystem device than its declared parent. This catches
+    /// reparse-point / bind-mount attacks where a symlink leads to
+    /// an unexpected volume. Refused by default.
+    #[error("path crosses filesystem boundary (possible reparse-point attack): {path}")]
+    CrossVolume { path: String },
+
+    /// IO error during canonicalization (permission denied,
+    /// network filesystem timeout, etc.). Treated as deny by the
+    /// permission gate — when we cannot establish the realpath,
+    /// we refuse rather than risk evaluating a partially-resolved
+    /// path against an allowlist.
+    #[error("path canonicalization failed for `{path}`: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Phase D Wave 1 (2026-05-17) — resolve a path to its canonical
+/// realpath, suitable for evaluation against permission rules.
+///
+/// The single load-bearing security invariant of the permission
+/// system: paths inside tool inputs MUST be resolved through this
+/// function BEFORE being matched against allow/deny patterns.
+/// Without it, an LLM-suggested path like `./notes/id_rsa` (where
+/// `./notes` is a symlink to `~/.ssh`) bypasses the literal
+/// `~/.ssh/**` deny rule because the literal path string never
+/// matches.
+///
+/// The function:
+///
+/// 1. Calls `fs::canonicalize` — follows all symlinks, returns
+///    the realpath. Dangling symlinks return `Err(NotFound)`.
+/// 2. On Unix, compares `Metadata::dev()` of the canonical path's
+///    parent against the input path's parent (via `symlink_metadata`
+///    which does NOT follow symlinks). When they differ, the path
+///    traversed a volume boundary via a symlink/mount/reparse —
+///    refused as a potential reparse attack.
+/// 3. Returns the canonical [`PathBuf`].
+///
+/// Callers always pass an absolute path or a path that
+/// canonicalizes via the current working directory — never a
+/// relative tar-entry-style path. The relative-vs-absolute
+/// distinction is the caller's responsibility ([`safe_join_under`]
+/// is the correct helper for tar entries).
+pub fn canonicalize_for_policy(path: &Path) -> std::result::Result<PathBuf, PathPolicyError> {
+    let display = path.display().to_string();
+
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        // canonicalize() returns ErrorKind::NotFound for both
+        // "path doesn't exist" and "dangling symlink at some
+        // ancestor". Both are deny-cases; we use a single variant.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            PathPolicyError::NotFound { path: display.clone() }
+        } else {
+            PathPolicyError::Io {
+                path: display.clone(),
+                source: e,
+            }
+        }
+    })?;
+
+    // Cross-volume check (Unix only).  On Windows, reparse points
+    // use a different mechanism (DeviceIoControl with
+    // FSCTL_GET_REPARSE_POINT) that this v1 doesn't enforce — a
+    // future tightening can add it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // The reasoning here: the symlink_metadata of the input
+        // path tells us the device of the path-as-typed.  The
+        // canonical path's metadata tells us the device of the
+        // resolved target.  When they differ, a symlink (or bind
+        // mount) crossed a volume boundary — usually fine for
+        // user-mounted volumes, but suspicious enough that the
+        // permission gate should refuse rather than evaluate
+        // against potentially-mismatched allowlist patterns.
+        if let (Ok(input_meta), Ok(canonical_meta)) =
+            (std::fs::symlink_metadata(path), std::fs::metadata(&canonical))
+            && input_meta.dev() != canonical_meta.dev()
+        {
+            return Err(PathPolicyError::CrossVolume { path: display });
+        }
+    }
+
+    Ok(canonical)
+}
+
 /// Returns `true` iff `host` is a literal loopback host: `127.0.0.0/8`,
 /// `localhost`, or `::1`. Uses real IP-address parsing rather than
 /// string-prefix matching, so `127.evil.com` is correctly classified
@@ -411,6 +516,77 @@ mod tests {
             .collect();
         entries.sort();
         assert_eq!(entries, vec!["a.toml".to_string()]);
+    }
+
+    #[test]
+    fn canonicalize_for_policy_resolves_symlink_to_realpath() {
+        // The load-bearing test for Phase D Wave 1.  Build a
+        // symlink `notes -> secrets` and ask for the canonical form
+        // of `notes/inside.txt` — must return `<root>/secrets/inside.txt`
+        // not `<root>/notes/inside.txt`.
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = tmp.path().join("secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        let inside = secrets.join("inside.txt");
+        fs::write(&inside, b"x").unwrap();
+        let notes_link = tmp.path().join("notes");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&secrets, &notes_link).unwrap();
+            let via_symlink = notes_link.join("inside.txt");
+            let canonical = canonicalize_for_policy(&via_symlink).unwrap();
+            // The canonical form must point through `secrets`, not
+            // `notes`. The realpath of the tmpdir itself may resolve
+            // to a different prefix on macOS (`/var` → `/private/var`),
+            // so we compare the suffix.
+            assert!(
+                canonical.ends_with("secrets/inside.txt"),
+                "expected canonical to resolve symlink: got {}",
+                canonical.display()
+            );
+            assert!(
+                !canonical.to_string_lossy().contains("/notes/"),
+                "canonical must NOT contain the symlink-cover name `notes`: {}",
+                canonical.display()
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows symlink creation requires elevated privileges;
+            // the literal-path canonicalization (no symlinks
+            // involved) is exercised by the non-existent test below.
+            let _ = (secrets, notes_link);
+        }
+    }
+
+    #[test]
+    fn canonicalize_for_policy_dangling_symlink_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dangling = tmp.path().join("dangling");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(tmp.path().join("does-not-exist"), &dangling).unwrap();
+            let err = canonicalize_for_policy(&dangling).unwrap_err();
+            assert!(
+                matches!(err, PathPolicyError::NotFound { .. }),
+                "expected NotFound for dangling symlink, got {err:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dangling;
+        }
+    }
+
+    #[test]
+    fn canonicalize_for_policy_nonexistent_path_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nope = tmp.path().join("does-not-exist");
+        let err = canonicalize_for_policy(&nope).unwrap_err();
+        assert!(matches!(err, PathPolicyError::NotFound { .. }));
     }
 
     #[test]

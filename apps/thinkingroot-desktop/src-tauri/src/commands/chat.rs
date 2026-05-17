@@ -102,11 +102,23 @@ pub enum ChatEvent {
     /// Approval is needed for this write tool call. The UI is
     /// expected to surface Approve/Reject buttons that call the
     /// `chat_approve` Tauri command with the same `id`.
+    ///
+    /// Phase D Wave 1 (2026-05-17) — when the agent invokes a
+    /// system-power tool (file_read / file_write / shell_exec /
+    /// etc.), the backend additionally populates
+    /// `permission_context` so the UI can render a permission-
+    /// aware prompt with "Allow always for pattern X" / "Deny
+    /// always for pattern X" buttons. When
+    /// `permission_context.default_deny_matched == true`, the UI
+    /// MUST hide the Allow buttons — the path is hardcoded-blocked
+    /// by `DEFAULT_DENY` and no user click can override it.
     ApprovalRequested {
         turn_id: String,
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_context: Option<serde_json::Value>,
     },
     /// Tool dispatch started (after approval, if write).
     ToolCallExecuting {
@@ -423,6 +435,11 @@ async fn consume_ask_stream(
                             .get("input")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
+                        // Phase D Wave 1 — optional permission_context
+                        // for system-power tools. Pre-Phase-D daemons
+                        // omit this field and the UI falls back to the
+                        // standard write-tool approval prompt.
+                        let permission_context = json.get("permission_context").cloned();
                         let _ = app.emit(
                             "chat-event",
                             ChatEvent::ApprovalRequested {
@@ -430,6 +447,7 @@ async fn consume_ask_stream(
                                 id,
                                 name,
                                 input,
+                                permission_context,
                             },
                         );
                     }
@@ -738,6 +756,21 @@ pub struct ChatApproveArgs {
     /// `tool_call_rejected` event when approve is false.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Phase D Wave 1 (2026-05-17) — when present, the user clicked
+    /// "Allow always" / "Deny always" and the rule is persisted to
+    /// `permissions.toml` before the agent unblocks.
+    #[serde(default)]
+    pub persist_rule: Option<PersistRuleArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PersistRuleArgs {
+    /// `"path"` or `"command"`.
+    pub kind: String,
+    /// Glob pattern (paths) or command pattern.
+    pub pattern: String,
+    /// `"allow"` or `"deny"`.
+    pub decision: String,
 }
 
 /// POST the user's decision back to the engine's
@@ -756,10 +789,17 @@ pub async fn chat_approve(app: AppHandle, args: ChatApproveArgs) -> Result<(), S
         "http://{}:{}/api/v1/ws/{}/ask/approval/{}",
         sidecar.host, sidecar.port, args.workspace, args.tool_use_id
     );
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "decision": if args.approve { "approve" } else { "reject" },
         "reason": args.reason,
     });
+    if let Some(rule) = args.persist_rule {
+        body["persist_rule"] = serde_json::json!({
+            "kind": rule.kind,
+            "pattern": rule.pattern,
+            "decision": rule.decision,
+        });
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

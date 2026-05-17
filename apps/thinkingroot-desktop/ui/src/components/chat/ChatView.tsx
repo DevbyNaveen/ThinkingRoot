@@ -78,6 +78,7 @@ import { BrainCitationParser, useBrainActivation } from "@/store/brain";
 import type { ChatMessage, EngramActivationEntry, GapEntry } from "@/types";
 import { BranchChip } from "./BranchChip";
 import { TopicBranchesPanel } from "@/components/branches/TopicBranchesPanel";
+import { PermissionPromptDialog } from "@/components/permissions/PermissionPromptDialog";
 import { LiveActivityStrip } from "./LiveActivityStrip";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { EngramTimeline } from "./EngramTimeline";
@@ -167,6 +168,17 @@ export function ChatView() {
 
   const key = activeWorkspace && activeConv ? `${activeWorkspace}::${activeConv}` : null;
   const messages = key ? (messagesByKey[key] ?? []) : [];
+
+  // Phase D Wave 1 (2026-05-17) — pending permission prompt for the
+  // 10 system-power tools. Set when an `approval_requested` event
+  // arrives with `permission_context`; cleared when the user clicks
+  // a button on PermissionPromptDialog or dismisses with ESC.
+  const [permissionPrompt, setPermissionPrompt] = useState<{
+    toolUseId: string;
+    toolName: string;
+    toolInput: unknown;
+    permissionContext: import("@/lib/tauri").PermissionContext;
+  } | null>(null);
 
   // Pre-flight LLM health for the active workspace. We fetch on switch so
   // a banner appears *before* the user types — no more 120 s "Generating…"
@@ -416,6 +428,18 @@ export function ChatView() {
           isWrite: true,
           status: "awaiting_approval",
         });
+        // Phase D Wave 1 — when the backend attached a
+        // permission_context, route to the permission-aware modal
+        // instead of the standard claim-card approval flow. Falls
+        // through to the existing approval UX for events without it.
+        if (ev.permission_context) {
+          setPermissionPrompt({
+            toolUseId: ev.id,
+            toolName: ev.name,
+            toolInput: ev.input,
+            permissionContext: ev.permission_context,
+          });
+        }
         return;
       }
       if (ev.type === "tool_call_executing") {
@@ -976,6 +1000,16 @@ export function ChatView() {
           });
         }}
       />
+      {permissionPrompt && activeWorkspace && (
+        <PermissionPromptDialog
+          workspace={activeWorkspace}
+          toolUseId={permissionPrompt.toolUseId}
+          toolName={permissionPrompt.toolName}
+          toolInput={permissionPrompt.toolInput}
+          permissionContext={permissionPrompt.permissionContext}
+          onResolved={() => setPermissionPrompt(null)}
+        />
+      )}
     </div>
   );
 }

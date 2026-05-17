@@ -24,6 +24,11 @@ pub fn run_all_sync(env: &DoctorEnv) -> Vec<CheckResult> {
         workspace_active_exists(env),
         install_manifest_consistent(env),
         models_bundle_present(env),
+        // Phase D Wave 1 — sandbox capability probes. Each fires only
+        // on its target OS; off-target platforms return `Skipped`.
+        sandbox_macos_available(),
+        sandbox_linux_bwrap_available(),
+        sandbox_linux_userns_works(),
     ]
 }
 
@@ -939,6 +944,217 @@ fn platform_fix_for_unrunnable(binary: &std::path::Path) -> FixAction {
     }
 }
 
+// ─── Phase D Wave 1 — Sandbox capability probes ────────────────────
+//
+// Three checks that surface the host's `shell_exec` sandbox readiness
+// in `root doctor` output and (via JSON mode) in the desktop's
+// EngineGate. Each fires only on its target OS; off-target platforms
+// return `Skipped`.
+//
+// The checks don't depend on `DoctorEnv` because they probe real OS
+// state (binary on PATH, kernel capability). Mock-driven tests for
+// these are in `tests/doctor_canned_envs.rs` via env-var injection
+// of `TR_DOCTOR_SIM_*` overrides.
+
+/// macOS: `/usr/bin/sandbox-exec` exists and accepts a trivial
+/// policy. On other OSes returns `Skipped`.
+pub fn sandbox_macos_available() -> CheckResult {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return CheckResult {
+            id: CheckId::from_static("sandbox.macos.available"),
+            label: "macOS Seatbelt sandbox".into(),
+            status: CheckStatus::Skipped,
+            detail: "not macOS".into(),
+            fix: None,
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Honor the canned-env injection so test harnesses can
+        // simulate "sandbox-exec missing" without touching real /usr/bin.
+        if let Ok(sim) = std::env::var("TR_DOCTOR_SIM_SANDBOX_MACOS")
+            && sim == "missing"
+        {
+            return CheckResult {
+                id: CheckId::from_static("sandbox.macos.available"),
+                label: "macOS Seatbelt sandbox".into(),
+                status: CheckStatus::Fail,
+                detail: "/usr/bin/sandbox-exec not found (simulated)".into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "macOS Seatbelt is a built-in component; reinstall the OS toolchain or restore /usr/bin from a backup"
+                        .into(),
+                }),
+            };
+        }
+
+        let bin = std::path::Path::new("/usr/bin/sandbox-exec");
+        if !bin.exists() {
+            return CheckResult {
+                id: CheckId::from_static("sandbox.macos.available"),
+                label: "macOS Seatbelt sandbox".into(),
+                status: CheckStatus::Fail,
+                detail: "/usr/bin/sandbox-exec missing — shell_exec will refuse all calls"
+                    .into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "macOS Seatbelt is a built-in component; reinstall the OS toolchain or restore /usr/bin from a backup"
+                        .into(),
+                }),
+            };
+        }
+        // Probe with a trivial deny-network policy that should succeed.
+        let probe = std::process::Command::new(bin)
+            .arg("-p")
+            .arg("(version 1)(allow default)")
+            .arg("/bin/true")
+            .status();
+        match probe {
+            Ok(s) if s.success() => CheckResult {
+                id: CheckId::from_static("sandbox.macos.available"),
+                label: "macOS Seatbelt sandbox".into(),
+                status: CheckStatus::Ok,
+                detail: "/usr/bin/sandbox-exec functional (trivial policy ran)".into(),
+                fix: None,
+            },
+            Ok(s) => CheckResult {
+                id: CheckId::from_static("sandbox.macos.available"),
+                label: "macOS Seatbelt sandbox".into(),
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "/usr/bin/sandbox-exec returned non-zero ({}) for a trivial policy probe — Seatbelt may be disabled by an MDM profile",
+                    s.code().unwrap_or(-1)
+                ),
+                fix: None,
+            },
+            Err(e) => CheckResult {
+                id: CheckId::from_static("sandbox.macos.available"),
+                label: "macOS Seatbelt sandbox".into(),
+                status: CheckStatus::Fail,
+                detail: format!("sandbox-exec spawn failed: {e}"),
+                fix: None,
+            },
+        }
+    }
+}
+
+/// Linux: `bwrap` (bubblewrap) is installed and on PATH. Returns
+/// `Warn` not `Fail` when missing — the Linux sandbox has a
+/// degraded fallback (`prctl(PR_SET_NO_NEW_PRIVS)` + `setrlimit`)
+/// so `shell_exec` still works, just with weaker isolation.
+pub fn sandbox_linux_bwrap_available() -> CheckResult {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return CheckResult {
+            id: CheckId::from_static("sandbox.linux.bwrap_available"),
+            label: "Linux bubblewrap (bwrap)".into(),
+            status: CheckStatus::Skipped,
+            detail: "not Linux".into(),
+            fix: None,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(sim) = std::env::var("TR_DOCTOR_SIM_BWRAP")
+            && sim == "missing"
+        {
+            return CheckResult {
+                id: CheckId::from_static("sandbox.linux.bwrap_available"),
+                label: "Linux bubblewrap (bwrap)".into(),
+                status: CheckStatus::Warn,
+                detail: "bwrap not found (simulated). shell_exec will use degraded sandbox."
+                    .into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "apt install bubblewrap   # Debian/Ubuntu\ndnf install bubblewrap  # Fedora/RHEL\npacman -S bubblewrap   # Arch"
+                        .into(),
+                }),
+            };
+        }
+        let probe = std::process::Command::new("bwrap")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match probe {
+            Ok(s) if s.success() => CheckResult {
+                id: CheckId::from_static("sandbox.linux.bwrap_available"),
+                label: "Linux bubblewrap (bwrap)".into(),
+                status: CheckStatus::Ok,
+                detail: "bwrap on PATH; shell_exec will run under full sandbox".into(),
+                fix: None,
+            },
+            _ => CheckResult {
+                id: CheckId::from_static("sandbox.linux.bwrap_available"),
+                label: "Linux bubblewrap (bwrap)".into(),
+                status: CheckStatus::Warn,
+                detail: "bwrap not found. shell_exec will use degraded sandbox (setrlimit + PR_SET_NO_NEW_PRIVS); install bubblewrap for full isolation."
+                    .into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "apt install bubblewrap   # Debian/Ubuntu\ndnf install bubblewrap  # Fedora/RHEL\npacman -S bubblewrap   # Arch"
+                        .into(),
+                }),
+            },
+        }
+    }
+}
+
+/// Linux: unprivileged user namespaces work. Required by `bwrap`
+/// for non-setuid operation. RHEL 8 / hardened Debian configs may
+/// disable this via `kernel.unprivileged_userns_clone=0`.
+pub fn sandbox_linux_userns_works() -> CheckResult {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return CheckResult {
+            id: CheckId::from_static("sandbox.linux.userns_works"),
+            label: "Linux unprivileged userns".into(),
+            status: CheckStatus::Skipped,
+            detail: "not Linux".into(),
+            fix: None,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(sim) = std::env::var("TR_DOCTOR_SIM_USERNS")
+            && sim == "broken"
+        {
+            return CheckResult {
+                id: CheckId::from_static("sandbox.linux.userns_works"),
+                label: "Linux unprivileged userns".into(),
+                status: CheckStatus::Warn,
+                detail: "unprivileged user namespaces disabled (simulated)".into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "sudo sysctl -w kernel.unprivileged_userns_clone=1   # Debian/Ubuntu hardened kernels\n# Or permanently: echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/00-thinkingroot.conf"
+                        .into(),
+                }),
+            };
+        }
+        let probe = std::process::Command::new("unshare")
+            .args(["--user", "--pid", "echo", "ok"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match probe {
+            Ok(s) if s.success() => CheckResult {
+                id: CheckId::from_static("sandbox.linux.userns_works"),
+                label: "Linux unprivileged userns".into(),
+                status: CheckStatus::Ok,
+                detail: "unshare --user --pid succeeded; bwrap can run unprivileged".into(),
+                fix: None,
+            },
+            _ => CheckResult {
+                id: CheckId::from_static("sandbox.linux.userns_works"),
+                label: "Linux unprivileged userns".into(),
+                status: CheckStatus::Warn,
+                detail: "unprivileged user namespaces disabled (sysctl kernel.unprivileged_userns_clone=0?). shell_exec falls back to degraded sandbox."
+                    .into(),
+                fix: Some(FixAction::ShellHint {
+                    command: "sudo sysctl -w kernel.unprivileged_userns_clone=1\n# Permanent: echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/00-thinkingroot.conf"
+                        .into(),
+                }),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1189,99 @@ mod tests {
         let r = binary_cli_installed(&env);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(matches!(r.fix, Some(FixAction::ShellHint { .. })));
+    }
+
+    #[test]
+    fn sandbox_checks_return_stable_ids_on_every_platform() {
+        // Phase D Wave 1 — the three sandbox check IDs are commit-
+        // locked (the desktop EngineGate hard-codes them).  Verify
+        // each function returns the right id regardless of OS;
+        // off-target platforms produce Skipped, target platform
+        // produces Ok/Warn/Fail.
+        let macos = sandbox_macos_available();
+        assert_eq!(macos.id, CheckId::from_static("sandbox.macos.available"));
+
+        let bwrap = sandbox_linux_bwrap_available();
+        assert_eq!(
+            bwrap.id,
+            CheckId::from_static("sandbox.linux.bwrap_available")
+        );
+
+        let userns = sandbox_linux_userns_works();
+        assert_eq!(
+            userns.id,
+            CheckId::from_static("sandbox.linux.userns_works")
+        );
+
+        // On macOS, the macos check must NOT be Skipped (we're on
+        // target); the linux checks MUST be Skipped (off-target).
+        #[cfg(target_os = "macos")]
+        {
+            assert_ne!(macos.status, CheckStatus::Skipped);
+            assert_eq!(bwrap.status, CheckStatus::Skipped);
+            assert_eq!(userns.status, CheckStatus::Skipped);
+        }
+        // On Linux, the inverse.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(macos.status, CheckStatus::Skipped);
+            assert_ne!(bwrap.status, CheckStatus::Skipped);
+            assert_ne!(userns.status, CheckStatus::Skipped);
+        }
+        // On Windows / other: all three Skipped.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            assert_eq!(macos.status, CheckStatus::Skipped);
+            assert_eq!(bwrap.status, CheckStatus::Skipped);
+            assert_eq!(userns.status, CheckStatus::Skipped);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_macos_simulated_missing_reports_fail() {
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let prev = std::env::var_os("TR_DOCTOR_SIM_SANDBOX_MACOS");
+        // SAFETY: ENV_GUARD held.
+        unsafe { std::env::set_var("TR_DOCTOR_SIM_SANDBOX_MACOS", "missing"); }
+        let r = sandbox_macos_available();
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(matches!(r.fix, Some(FixAction::ShellHint { .. })));
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TR_DOCTOR_SIM_SANDBOX_MACOS", v),
+                None => std::env::remove_var("TR_DOCTOR_SIM_SANDBOX_MACOS"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_linux_simulated_bwrap_missing_reports_warn_not_fail() {
+        // Critical UX guarantee: missing bwrap is WARN not FAIL —
+        // the degraded fallback (PR_SET_NO_NEW_PRIVS + setrlimit)
+        // still works, so shell_exec is operational with reduced
+        // isolation.  Fail would mislead the user into thinking
+        // shell_exec is broken.
+        let _guard = thinkingroot_core::test_util::ENV_GUARD.lock().expect("env guard");
+        let prev = std::env::var_os("TR_DOCTOR_SIM_BWRAP");
+        // SAFETY: ENV_GUARD held.
+        unsafe { std::env::set_var("TR_DOCTOR_SIM_BWRAP", "missing"); }
+        let r = sandbox_linux_bwrap_available();
+        assert_eq!(r.status, CheckStatus::Warn);
+        let hint_contains_apt = match &r.fix {
+            Some(FixAction::ShellHint { command }) => command.contains("apt install bubblewrap"),
+            _ => false,
+        };
+        assert!(hint_contains_apt, "fix must include the per-distro install line");
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TR_DOCTOR_SIM_BWRAP", v),
+                None => std::env::remove_var("TR_DOCTOR_SIM_BWRAP"),
+            }
+        }
     }
 
     #[test]

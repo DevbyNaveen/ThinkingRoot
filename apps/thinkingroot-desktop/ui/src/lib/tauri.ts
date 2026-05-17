@@ -812,6 +812,19 @@ export type ChatEvent =
       id: string;
       name: string;
       input: unknown;
+      /**
+       * Phase D Wave 1 (2026-05-17) — populated for the 10
+       * system-power tools (file_read / file_write / file_edit /
+       * glob / grep / shell_exec / clipboard_* / open_in_default /
+       * trash). When present, the UI renders a permission-aware
+       * prompt with "Allow always for pattern X" / "Deny always
+       * for pattern X" buttons. When
+       * `permission_context.default_deny_matched === true`, the UI
+       * MUST hide the Allow buttons — the path is protected by
+       * ThinkingRoot's hardcoded security policy and no user
+       * click can override it.
+       */
+      permission_context?: PermissionContext;
     }
   | {
       type: "tool_call_executing";
@@ -911,14 +924,54 @@ export function onChatEvent(handler: (e: ChatEvent) => void): Promise<UnlistenFn
   return listen<ChatEvent>("chat-event", (ev) => handler(ev.payload));
 }
 
+/**
+ * Phase D Wave 1 permission rule the UI persists when the user
+ * clicks "Allow always" or "Deny always". Sent inside the
+ * `chat_approve` call so the rule is saved BEFORE the agent
+ * unblocks.
+ */
+export interface PersistRule {
+  kind: "path" | "command";
+  /** Glob pattern (path) or shell-command pattern. */
+  pattern: string;
+  decision: "allow" | "deny";
+}
+
+/**
+ * Phase D Wave 1 permission context attached to
+ * `approval_requested` events for the 10 system-power tools.
+ */
+export interface PermissionContext {
+  /** Which Phase D tool the agent is invoking. */
+  tool: string;
+  /** Canonical realpath the gate evaluated against rules, when
+   *  the input contained a path (file_read/file_write/glob/etc.). */
+  canonical_path?: string;
+  /** Raw path when canonicalisation failed (e.g. file_write to a
+   *  not-yet-existing file). */
+  raw_path?: string;
+  /** Shell command when the tool is shell_exec. */
+  command?: string;
+  /** Pattern the UI can offer as "Allow always for X". */
+  suggested_pattern?: string;
+  /** When true, the path matched DEFAULT_DENY; UI hides Allow buttons. */
+  default_deny_matched?: boolean;
+}
+
 /** Approve or reject a pending agent write tool call. Resolves the
  *  matching pending oneshot in the engine's `pending_approvals` map
- *  and unblocks the agent's `ToolApprovalRouter::check`. */
+ *  and unblocks the agent's `ToolApprovalRouter::check`.
+ *
+ *  Phase D Wave 1 — pass `persistRule` to save an
+ *  "always" decision to `permissions.toml` BEFORE the agent
+ *  unblocks. The backend rejects rules that conflict with
+ *  DEFAULT_DENY (e.g. trying to persist `allow ~/.ssh/foo`). */
 export async function chatApprove(args: {
   workspace: string;
   toolUseId: string;
   approve: boolean;
   reason?: string;
+  persistRule?: PersistRule;
 }): Promise<void> {
   return invoke<void>("chat_approve", {
     args: {
@@ -926,6 +979,7 @@ export async function chatApprove(args: {
       tool_use_id: args.toolUseId,
       approve: args.approve,
       reason: args.reason ?? null,
+      persist_rule: args.persistRule ?? null,
     },
   });
 }

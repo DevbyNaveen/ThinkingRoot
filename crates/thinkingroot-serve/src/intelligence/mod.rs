@@ -15,6 +15,7 @@ pub mod hybrid_types;
 pub mod identity;
 pub mod mcp_bridge;
 pub mod observer;
+pub mod permissions_gate;
 pub mod planner;
 pub mod playground_tools;
 pub mod react;

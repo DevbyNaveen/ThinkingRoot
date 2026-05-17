@@ -35,6 +35,9 @@ tempfile = { workspace = true }
 # T2.6 per-branch redaction policy compiles patterns at apply time
 # (regex::Regex isn't Serialize, so the policy stores raw strings).
 regex = { workspace = true }
+# Phase D Wave 1 permission rules (`permissions.rs`) match user-
+# authored glob patterns against canonicalised paths.
+globset = { workspace = true }
 
 [features]
 ## Expose `thinkingroot_core::test_util::ENV_GUARD` to dependent

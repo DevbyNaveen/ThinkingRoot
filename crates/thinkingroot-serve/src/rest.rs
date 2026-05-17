@@ -108,6 +108,17 @@ pub struct AppState {
     /// `workspace_compile_state`, right-rail substrate poll) all collapse
     /// to a single subscriber on this registry.
     pub workspace_status: Arc<WorkspaceStateRegistry>,
+    /// Phase D Wave 1 (2026-05-17) — identity-level permission rules
+    /// for the system-power tools. Loaded from
+    /// `<config_dir>/thinkingroot/permissions.toml` at startup (or
+    /// empty store on first run); shared with the
+    /// [`crate::intelligence::permissions_gate::PermissionsGate`]
+    /// that wraps the `ToolApprovalRouter` for every agent
+    /// invocation. The approval handler at
+    /// `POST /api/v1/ws/{ws}/ask/approval/{tool_use_id}` mutates
+    /// this when the user clicks "Allow always" / "Deny always" in
+    /// the desktop permission prompt.
+    pub permission_store: Arc<RwLock<thinkingroot_core::permissions::PermissionStore>>,
 }
 
 impl AppState {
@@ -140,6 +151,7 @@ impl AppState {
             workspace_watcher: Arc::new(RwLock::new(None)),
             workspace_status: Arc::new(WorkspaceStateRegistry::new()),
             substrate_bus: Arc::new(RwLock::new(HashMap::new())),
+            permission_store: Arc::new(RwLock::new(load_permission_store_or_empty())),
         })
     }
 
@@ -5283,6 +5295,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         pending_approvals: state.pending_approvals.clone(),
         trace: None,
         engram_manager: state.engram_manager.clone(),
+        permission_store: state.permission_store.clone(),
     };
 
     let (mut rx, router) = spawn_agent_run(req, deps);
@@ -5337,11 +5350,22 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             if let AgentEvent::ToolCallProposed { id, is_write, name, input } = &event {
                 if *is_write {
                     router.set_pending_id(id.clone()).await;
-                    let payload = serde_json::json!({
+                    // Phase D Wave 1 — when this is a Phase D
+                    // system-power tool, attach a `permission_context`
+                    // so the UI can render a permission-aware prompt
+                    // (Allow once / Allow always for pattern X /
+                    // Deny once / Deny always; deny-only when the
+                    // canonical path matches DEFAULT_DENY).
+                    let permission_context =
+                        build_permission_context_for_tool(name, input);
+                    let mut payload = serde_json::json!({
                         "id": id,
                         "name": name,
                         "input": input,
                     });
+                    if let Some(ctx) = permission_context {
+                        payload["permission_context"] = ctx;
+                    }
                     yield Ok(
                         Event::default()
                             .event("approval_requested")
@@ -5536,6 +5560,25 @@ struct ApprovalRequestBody {
     /// `tool_call_rejected` event when the decision is "reject".
     #[serde(default)]
     reason: Option<String>,
+    /// Phase D Wave 1 (2026-05-17) — when present, the user clicked
+    /// "Allow always" or "Deny always" in the permission prompt, and
+    /// this rule is persisted to `permissions.toml` BEFORE the
+    /// oneshot is resolved. If insert fails (e.g. the rule pattern
+    /// overlaps with `DEFAULT_DENY`), the approval is still resolved
+    /// (so the agent doesn't hang) but with a Rejected decision and
+    /// the `ProtectedPath` error as the reason.
+    #[serde(default)]
+    persist_rule: Option<PersistRuleBody>,
+}
+
+#[derive(Deserialize)]
+struct PersistRuleBody {
+    /// `"path"` or `"command"`.
+    kind: String,
+    /// Glob pattern (path rules) or shell-command pattern.
+    pattern: String,
+    /// `"allow"` or `"deny"`.
+    decision: String,
 }
 
 async fn ask_approval_handler(
@@ -5544,12 +5587,78 @@ async fn ask_approval_handler(
     Json(body): Json<ApprovalRequestBody>,
 ) -> Response {
     use crate::intelligence::approval::{ApprovalDecision, ToolApprovalRouter};
+    use thinkingroot_core::permissions::{Decision as PermDecision, Rule, RuleKind};
 
-    let decision = match body.decision.as_str() {
-        "approve" | "approved" => ApprovalDecision::Approved,
-        _ => ApprovalDecision::Rejected {
-            reason: body.reason.unwrap_or_else(|| "user declined".to_string()),
-        },
+    // Phase D Wave 1 — persist the rule BEFORE resolving the
+    // oneshot, so the next turn's PermissionsGate sees the new rule
+    // immediately. Failures here (e.g. DEFAULT_DENY conflict) coerce
+    // the decision to Rejected with the protect-path error as the
+    // reason — we never silently drop a rule write but we also never
+    // hang the agent waiting on a decision we couldn't persist.
+    let mut decision_override_reason: Option<String> = None;
+    if let Some(rule_body) = &body.persist_rule {
+        let kind = match rule_body.kind.as_str() {
+            "path" => RuleKind::Path,
+            "command" => RuleKind::Command,
+            other => {
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_RULE_KIND",
+                    &format!("persist_rule.kind must be `path` or `command`, got `{other}`"),
+                );
+            }
+        };
+        let perm_decision = match rule_body.decision.as_str() {
+            "allow" => PermDecision::Allow,
+            "deny" => PermDecision::Deny,
+            other => {
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_RULE_DECISION",
+                    &format!("persist_rule.decision must be `allow` or `deny`, got `{other}`"),
+                );
+            }
+        };
+        let new_rule = Rule {
+            kind,
+            pattern: rule_body.pattern.clone(),
+            decision: perm_decision,
+            created_at: chrono::Utc::now(),
+            created_by: "user-decision".to_string(),
+        };
+        let mut store = state.permission_store.write().await;
+        match store.insert_rule(new_rule) {
+            Ok(_) => {
+                // Persist to disk (best-effort; failure logged but
+                // doesn't block the in-memory decision).
+                if let Some(path) = permissions_toml_path() {
+                    if let Err(e) = store.save(&path) {
+                        tracing::warn!(
+                            "permissions.toml write failed; rule held in memory only: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // DEFAULT_DENY conflict or invalid pattern → coerce
+                // decision to Rejected so the agent doesn't think
+                // the user enabled access that's hardcoded-blocked.
+                decision_override_reason = Some(format!(
+                    "permission policy refused rule persistence: {e}"
+                ));
+            }
+        }
+    }
+
+    let decision = if let Some(reason) = decision_override_reason {
+        ApprovalDecision::Rejected { reason }
+    } else {
+        match body.decision.as_str() {
+            "approve" | "approved" => ApprovalDecision::Approved,
+            _ => ApprovalDecision::Rejected {
+                reason: body.reason.unwrap_or_else(|| "user declined".to_string()),
+            },
+        }
     };
 
     let resolved =
@@ -5563,6 +5672,191 @@ async fn ask_approval_handler(
             "NO_PENDING_APPROVAL",
             &format!("no pending approval for tool_use_id '{tool_use_id}'"),
         )
+    }
+}
+
+/// Phase D Wave 1 — build a `permission_context` JSON object for
+/// an approval_requested event, based on the tool name + input.
+///
+/// Returns `None` when the tool isn't a Phase D system-power tool
+/// (so the UI renders the standard approval prompt). Returns
+/// `Some(json)` for the 10 system-power tools, with a structure
+/// the UI consumes to render the permission-aware prompt:
+///
+/// ```json
+/// {
+///   "tool": "file_read",
+///   "canonical_path": "/Users/me/.ssh/id_rsa",   // present for path-typed tools
+///   "command": "git status",                      // present for shell_exec
+///   "suggested_pattern": "~/.ssh/**",             // pattern the user could persist
+///   "default_deny_matched": true                  // when true, UI hides Allow buttons
+/// }
+/// ```
+fn build_permission_context_for_tool(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    use thinkingroot_core::permissions::PermissionStore;
+    use thinkingroot_core::safe_path::canonicalize_for_policy;
+
+    let is_phase_d = matches!(
+        tool_name,
+        "file_read"
+            | "file_write"
+            | "file_edit"
+            | "glob"
+            | "grep"
+            | "shell_exec"
+            | "clipboard_read"
+            | "clipboard_write"
+            | "open_in_default"
+            | "trash"
+    );
+    if !is_phase_d {
+        return None;
+    }
+
+    let mut ctx = serde_json::json!({
+        "tool": tool_name,
+    });
+
+    // Extract the primary path (or command for shell_exec).
+    let primary_path: Option<String> = match tool_name {
+        "file_read" | "file_edit" | "open_in_default" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "file_write" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "glob" | "grep" => input
+            .get("base")
+            .or_else(|| input.get("path"))
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        "shell_exec" => input.get("cwd").and_then(|v| v.as_str()).map(String::from),
+        "trash" => input
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        _ => None,
+    };
+
+    // Surface the shell command separately so the UI can show it.
+    if tool_name == "shell_exec" {
+        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+            ctx["command"] = serde_json::Value::String(cmd.to_string());
+        }
+    }
+
+    if let Some(raw_path) = primary_path {
+        let canonical = canonicalize_for_policy(std::path::Path::new(&raw_path));
+        match canonical {
+            Ok(c) => {
+                ctx["canonical_path"] = serde_json::Value::String(c.display().to_string());
+                // Check DEFAULT_DENY by evaluating against an empty store.
+                let empty = PermissionStore::empty();
+                let decision = empty.evaluate_path(&c);
+                if matches!(
+                    decision,
+                    thinkingroot_core::permissions::Decision::Deny
+                ) {
+                    ctx["default_deny_matched"] =
+                        serde_json::Value::Bool(true);
+                }
+                ctx["suggested_pattern"] =
+                    serde_json::Value::String(suggested_pattern_for_canonical_path(&c));
+            }
+            Err(_e) => {
+                // Path doesn't exist yet (file_write to new path)
+                // or canonicalize failed. Still surface the raw
+                // path so the UI can render context.
+                ctx["raw_path"] = serde_json::Value::String(raw_path.clone());
+                ctx["suggested_pattern"] = serde_json::Value::String(
+                    suggested_pattern_for_raw_path(&raw_path),
+                );
+            }
+        }
+    }
+
+    Some(ctx)
+}
+
+/// Produce a glob pattern the UI can offer as "Allow always for X".
+/// Maps `/Users/me/Code/myproj/foo.rs` → `~/Code/**` when the path
+/// is inside the user's home. For paths outside `~`, returns the
+/// parent directory with `/**` appended so the rule covers the
+/// directory (not the specific file).
+fn suggested_pattern_for_canonical_path(canonical: &std::path::Path) -> String {
+    let canonical_str = canonical.to_string_lossy();
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if let Some(rest) = canonical_str.strip_prefix(home_str.as_ref())
+            && let Some(rest) = rest.strip_prefix('/')
+        {
+            // Take the first segment under home for the pattern.
+            let first = rest.split('/').next().unwrap_or(rest);
+            if !first.is_empty() {
+                return format!("~/{first}/**");
+            }
+        }
+    }
+    // Outside home — pattern over the parent dir.
+    canonical
+        .parent()
+        .map(|p| format!("{}/**", p.display()))
+        .unwrap_or_else(|| canonical_str.into_owned())
+}
+
+/// Best-effort suggestion when the path can't be canonicalized
+/// (typically file_write to a new file). Mirrors the canonical
+/// version but operates on the literal string.
+fn suggested_pattern_for_raw_path(raw: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(home_str.as_ref())
+            && let Some(rest) = rest.strip_prefix('/')
+        {
+            let first = rest.split('/').next().unwrap_or(rest);
+            if !first.is_empty() {
+                return format!("~/{first}/**");
+            }
+        }
+    }
+    std::path::Path::new(raw)
+        .parent()
+        .map(|p| format!("{}/**", p.display()))
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// Phase D Wave 1 — canonical on-disk location of the permission
+/// store: `<dirs::config_dir()>/thinkingroot/permissions.toml`.
+/// Same parent dir as `cortex.lock` and `credentials.toml`. Returns
+/// `None` only when `dirs::config_dir()` fails (extremely rare —
+/// no home directory on a non-XDG system).
+pub fn permissions_toml_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|c| c.join("thinkingroot").join("permissions.toml"))
+}
+
+/// Load the permission store from disk at startup. Falls through to
+/// an empty store on any error (first-run, corruption, schema
+/// mismatch is logged) — chat continues, only the rules layer is
+/// empty until the user re-creates them via the UI prompts.
+pub fn load_permission_store_or_empty() -> thinkingroot_core::permissions::PermissionStore {
+    let Some(path) = permissions_toml_path() else {
+        return thinkingroot_core::permissions::PermissionStore::empty();
+    };
+    match thinkingroot_core::permissions::PermissionStore::load(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::warn!(
+                "permissions.toml load failed; starting with empty store: {e}"
+            );
+            thinkingroot_core::permissions::PermissionStore::empty()
+        }
     }
 }
 

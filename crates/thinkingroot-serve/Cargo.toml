@@ -71,11 +71,24 @@ tempfile = "3"
 # tree.
 notify = { workspace = true }
 
+# Phase D Wave 1 system-power tools (`system_power.rs`).
+thinkingroot-sandbox = { workspace = true }
+arboard = { workspace = true }
+opener = { workspace = true }
+trash = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+# `dirs` resolves the canonical `permissions.toml` path under
+# `<config_dir>/thinkingroot/`. Same crate the rest of the workspace
+# already uses for cortex.lock / credentials.toml.
+dirs = { workspace = true }
+
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }
 cozo = { workspace = true }
 thinkingroot-parse = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "incremental_smoke"

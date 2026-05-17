@@ -26,6 +26,7 @@ members = [
     "crates/tr-sigstore",
     "crates/tr-transparency",
     "crates/tr-verify",
+    "crates/thinkingroot-sandbox",
     "thinkingroot-python",
 ]
 # thinkingroot-python is a PyO3 cdylib that must be built via maturin.
@@ -57,6 +58,7 @@ default-members = [
     "crates/tr-sigstore",
     "crates/tr-transparency",
     "crates/tr-verify",
+    "crates/thinkingroot-sandbox",
 ]
 
 [workspace.package]
@@ -96,6 +98,7 @@ tr-revocation        = { path = "crates/tr-revocation",        version = "0.9.1"
 tr-sigstore          = { path = "crates/tr-sigstore",          version = "0.9.1" }
 tr-transparency      = { path = "crates/tr-transparency",      version = "0.9.1" }
 tr-verify            = { path = "crates/tr-verify",            version = "0.9.1" }
+thinkingroot-sandbox = { path = "crates/thinkingroot-sandbox",   version = "0.9.1" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -206,6 +209,29 @@ rand = "0.9"
 # Browser launcher — used by thinkingroot-cloud-auth's browser-flow login
 # to open the hub's /auth/cli URL in the user's default browser.
 webbrowser = "1"
+
+# Phase D Wave 1 — system-power tools.
+# `arboard` is the maintained clipboard fork from 1Password (dual MIT/Apache).
+# `opener` opens files/URLs in the user's default app (MIT/Apache).
+# `trash` moves files to the OS native trash, recoverable (MIT/Apache).
+# `globset` provides RegexSetBuilder-backed glob matching used both by the
+#   `glob` MCP tool and by the permission rule evaluator. (Unlicense/MIT.)
+# `nix` is the cross-platform Unix syscall wrapper — only used on Linux for
+#   the degraded sandbox fallback (PR_SET_NO_NEW_PRIVS + setrlimit) when
+#   bubblewrap is unavailable. Gated by cfg(target_os = "linux") at the
+#   consumer site; declared workspace-wide so cargo deny / cargo audit see
+#   it. (MIT.)
+arboard  = "3"
+opener   = "0.7"
+trash    = "5"
+globset  = "0.4"
+nix      = { version = "0.29", features = ["resource", "process", "fs"] }
+
+# Async trait sugar for `thinkingroot-sandbox::Sandbox` (and only that
+# trait). Native async-fn-in-trait stabilised in Rust 1.75, but the
+# `Box<dyn Sandbox>` object-safety story still requires either the
+# pin-box workaround or this crate. We use this crate for clarity.
+async-trait = "0.1"
 
 # HTTP mocking for cloud-auth dev tests (wiremock-rs spins up a local
 # Axum-backed mock hub).

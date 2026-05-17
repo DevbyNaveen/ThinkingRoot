@@ -987,6 +987,141 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": []
                 }
+            },
+            // ── Phase D Wave 1 — System-power tools ──────────────────
+            // These 10 tools operate on the user's filesystem and shell
+            // OUTSIDE the workspace. Each is gated by the agent's
+            // PermissionsGate when called via the chat agent loop;
+            // direct MCP clients (Claude Code, Cursor, etc.) bring
+            // their own permission UX.
+            {
+                "name": "file_read",
+                "description": "Read any text file on disk. Returns the content, byte size, and line count. Refuses files larger than 5 MiB and refuses binary (non-UTF-8) files — paginate or use a binary-aware tool for those. Path may be absolute or relative to CWD.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute or CWD-relative path to a UTF-8 text file." }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "file_write",
+                "description": "Atomically write or overwrite a text file. Uses tempfile + rename so a SIGKILL mid-write never leaves a torn file. Set `create_dirs: true` to mkdir -p the parent path.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":        { "type": "string", "description": "Destination path. Parent directory must exist unless create_dirs is true." },
+                        "content":     { "type": "string", "description": "File contents." },
+                        "create_dirs": { "type": "boolean", "default": false, "description": "When true, missing parent directories are created via mkdir -p." }
+                    },
+                    "required": ["path", "content"]
+                }
+            },
+            {
+                "name": "file_edit",
+                "description": "Apply line-precise edits to an existing text file. Edits are validated for non-overlap and EOF-safety BEFORE any mutation, then applied in reverse-line order via atomic tempfile + rename. Use `start_line: N, end_line: N, replacement: \"new\"` to replace line N. Use `start_line: N, end_line: 0, replacement: \"...\"` to insert before line N. Lines are 1-based.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":  { "type": "string", "description": "Path to an existing file." },
+                        "edits": {
+                            "type":  "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start_line":  { "type": "integer", "description": "1-based start line (inclusive)." },
+                                    "end_line":    { "type": "integer", "description": "1-based end line (inclusive). Use 0 for a pure insert before `start_line`." },
+                                    "replacement": { "type": "string",  "description": "Replacement text. Empty string deletes the range." }
+                                },
+                                "required": ["start_line", "end_line", "replacement"]
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"]
+                }
+            },
+            {
+                "name": "glob",
+                "description": "Find files matching a glob pattern under a base directory. Gitignore-aware (uses ripgrep's `ignore` crate). Results are canonicalised to defeat symlink-cover-name attacks. Capped at 1000 matches; sets `truncated: true` past that.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern (e.g. `**/*.rs`, `src/**/*.ts`)." },
+                        "base":    { "type": "string", "description": "Base directory to search under. Defaults to CWD." }
+                    },
+                    "required": ["pattern"]
+                }
+            },
+            {
+                "name": "grep",
+                "description": "Search file contents for a pattern under a base directory. Set `regex: true` for regex mode, false (default) for literal substring match. Gitignore-aware. Long lines are trimmed to 400 chars + ellipsis. Capped at 500 matches.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern":        { "type": "string", "description": "Pattern to search for." },
+                        "base":           { "type": "string", "description": "Base directory. Defaults to CWD." },
+                        "regex":          { "type": "boolean", "default": false, "description": "Treat pattern as a regex." },
+                        "case_sensitive": { "type": "boolean", "default": true, "description": "Match case-sensitively. When false, case-insensitive." }
+                    },
+                    "required": ["pattern"]
+                }
+            },
+            {
+                "name": "shell_exec",
+                "description": "Run a shell command under the OS-level sandbox (macOS Seatbelt or Linux bubblewrap). Returns exit_code, stdout, stderr, duration_ms, sandbox_backend. Times out after `timeout_secs` (default 30, max 300). Refused on Windows — use WSL2 there. The other 9 system-power tools work natively on Windows.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command":      { "type": "string", "description": "Executable path or command name. The agent's PATH at the time of invocation is searched." },
+                        "args":         { "type": "array", "items": { "type": "string" }, "default": [], "description": "Arguments." },
+                        "cwd":          { "type": "string", "description": "Working directory. Must be inside the workspace allowlist or omitted (defaults to workspace root)." },
+                        "timeout_secs": { "type": "integer", "default": 30, "description": "Wall-clock kill threshold (1–300 seconds)." }
+                    },
+                    "required": ["command"]
+                }
+            },
+            {
+                "name": "clipboard_read",
+                "description": "Read the current text content of the system clipboard. Returns content + byte_size.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "clipboard_write",
+                "description": "Write text to the system clipboard. Replaces any previous content. Returns bytes_written.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "Text to place on the clipboard." }
+                    },
+                    "required": ["content"]
+                }
+            },
+            {
+                "name": "open_in_default",
+                "description": "Open a file path or URL in the user's default application (Finder/Explorer/Nautilus for paths; default browser for URLs). Cross-platform via the `opener` crate.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path_or_url": { "type": "string", "description": "Absolute path or fully-qualified URL." }
+                    },
+                    "required": ["path_or_url"]
+                }
+            },
+            {
+                "name": "trash",
+                "description": "Move one or more files or directories to the OS native trash (recoverable). Returns counts of trashed paths plus per-path failures. Safer than rm — the user can restore from the system Trash.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" }, "description": "Absolute paths to trash." }
+                    },
+                    "required": ["paths"]
+                }
             }
         ]
     });
@@ -2443,6 +2578,18 @@ pub async fn handle_call(
         "fs_create_folder" => handle_fs_create_folder(id, &arguments, engine, ws).await,
         "fs_rename" => handle_fs_rename(id, &arguments, engine, ws).await,
         "fs_move" => handle_fs_move(id, &arguments, engine, ws).await,
+
+        // ── Phase D Wave 1 — system-power tool dispatch ─────────────
+        "file_read"       => handle_file_read(id, &arguments).await,
+        "file_write"      => handle_file_write(id, &arguments).await,
+        "file_edit"       => handle_file_edit(id, &arguments).await,
+        "glob"            => handle_glob(id, &arguments).await,
+        "grep"            => handle_grep(id, &arguments).await,
+        "shell_exec"      => handle_shell_exec(id, &arguments, engine, ws).await,
+        "clipboard_read"  => handle_clipboard_read(id).await,
+        "clipboard_write" => handle_clipboard_write(id, &arguments).await,
+        "open_in_default" => handle_open_in_default(id, &arguments).await,
+        "trash"           => handle_trash(id, &arguments).await,
 
         other => JsonRpcResponse::error(id, -32601, format!("Unknown tool: {}", other)),
     }
@@ -4244,5 +4391,247 @@ async fn handle_fs_move(
     match crate::fs_ops::move_paths(&root, sources, &dest_folder) {
         Ok(outcome) => mcp_text_result(id, &outcome),
         Err(msg) => JsonRpcResponse::error(id, -32603, msg),
+    }
+}
+
+// ─── Phase D Wave 1 — System-power tool handlers ────────────────────
+//
+// Thin handlers that:
+//   1. Parse arguments from the JSON-RPC `arguments` object.
+//   2. Call the corresponding pure-logic fn in `crate::system_power`.
+//   3. Wrap the result via `mcp_text_result` on success or
+//      `JsonRpcResponse::error` with -32603 on operational failure
+//      / -32602 on bad-args.
+//
+// **No permission checks here.** The agent's `PermissionsGate`
+// (intelligence/permissions_gate.rs) intercepts these BEFORE
+// dispatch via the write-class bridge. Direct MCP clients (Claude
+// Code, Cursor, Codex) bring their own permission UX — they call
+// these handlers directly and we deliberately don't double-prompt.
+
+fn sp_missing_arg(id: Option<Value>, tool: &str, arg: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error(
+        id,
+        -32602,
+        format!("{tool}: missing or invalid required argument `{arg}`"),
+    )
+}
+
+async fn handle_file_read(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "file_read", "path"),
+    };
+    match crate::system_power::file_read(std::path::Path::new(path)).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_file_write(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "file_write", "path"),
+    };
+    let content = match arguments.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        _ => return sp_missing_arg(id, "file_write", "content"),
+    };
+    let create_dirs = arguments
+        .get("create_dirs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    match crate::system_power::file_write(std::path::Path::new(path), content, create_dirs).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_file_edit(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "file_edit", "path"),
+    };
+    let edits_value = match arguments.get("edits") {
+        Some(v) => v,
+        None => return sp_missing_arg(id, "file_edit", "edits"),
+    };
+    let edits: Vec<crate::system_power::EditOp> =
+        match serde_json::from_value(edits_value.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("file_edit: invalid `edits` array: {e}"),
+                );
+            }
+        };
+    if edits.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "file_edit: `edits` must be non-empty".to_string(),
+        );
+    }
+    match crate::system_power::file_edit(std::path::Path::new(path), &edits).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_glob(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let pattern = match arguments.get("pattern").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "glob", "pattern"),
+    };
+    let base = arguments
+        .get("base")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    match crate::system_power::glob_search(pattern, &base).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_grep(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let pattern = match arguments.get("pattern").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "grep", "pattern"),
+    };
+    let base = arguments
+        .get("base")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    let regex_mode = arguments
+        .get("regex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let case_sensitive = arguments
+        .get("case_sensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match crate::system_power::grep_search(pattern, &base, regex_mode, case_sensitive).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_shell_exec(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+) -> JsonRpcResponse {
+    let command = match arguments.get("command").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c,
+        _ => return sp_missing_arg(id, "shell_exec", "command"),
+    };
+    let args: Vec<String> = arguments
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let timeout_secs = arguments
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+        .unwrap_or(30);
+
+    // Build a sandbox policy.  Workspace root becomes the writable
+    // allowed_path; CWD defaults to that if not specified. Network
+    // is denied by default — agents that need to fetch should call
+    // the dedicated `web_fetch` tool (when it ships) instead of
+    // running curl under shell_exec.
+    let workspace_root = engine.workspace_root_path(ws);
+    let cwd = arguments
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| workspace_root.clone());
+
+    let policy = thinkingroot_sandbox::SandboxPolicy {
+        allowed_paths: workspace_root.into_iter().collect(),
+        readonly_paths: vec![std::path::PathBuf::from("/usr"), std::path::PathBuf::from("/bin")],
+        allowed_hosts: Vec::new(),
+        timeout_secs,
+        cwd,
+        max_output_bytes: thinkingroot_sandbox::DEFAULT_MAX_OUTPUT_BYTES,
+    };
+
+    let sandbox: std::sync::Arc<dyn thinkingroot_sandbox::Sandbox> =
+        std::sync::Arc::from(thinkingroot_sandbox::default_sandbox());
+    match crate::system_power::shell_exec(sandbox, command, &args, &policy).await {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+async fn handle_clipboard_read(id: Option<Value>) -> JsonRpcResponse {
+    // Clipboard ops are sync — run on a blocking thread so we don't
+    // stall the async runtime on X11/Wayland init.
+    match tokio::task::spawn_blocking(crate::system_power::clipboard_read).await {
+        Ok(Ok(out)) => mcp_text_result(id, &out),
+        Ok(Err(e)) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("clipboard_read: task join: {e}")),
+    }
+}
+
+async fn handle_clipboard_write(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let content = match arguments.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c.to_string(),
+        _ => return sp_missing_arg(id, "clipboard_write", "content"),
+    };
+    match tokio::task::spawn_blocking(move || crate::system_power::clipboard_write(&content)).await
+    {
+        Ok(Ok(out)) => mcp_text_result(id, &out),
+        Ok(Err(e)) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("clipboard_write: task join: {e}")),
+    }
+}
+
+async fn handle_open_in_default(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let target = match arguments.get("path_or_url").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return sp_missing_arg(id, "open_in_default", "path_or_url"),
+    };
+    match tokio::task::spawn_blocking(move || crate::system_power::open_in_default(&target)).await
+    {
+        Ok(Ok(out)) => mcp_text_result(id, &out),
+        Ok(Err(e)) => JsonRpcResponse::error(id, -32603, e.to_string()),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("open_in_default: task join: {e}")),
+    }
+}
+
+async fn handle_trash(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let paths: Vec<String> = match arguments.get("paths").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => return sp_missing_arg(id, "trash", "paths"),
+    };
+    if paths.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "trash: `paths` must be non-empty".to_string(),
+        );
+    }
+    let outcome =
+        tokio::task::spawn_blocking(move || crate::system_power::trash_paths(&paths)).await;
+    match outcome {
+        Ok(out) => mcp_text_result(id, &out),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("trash: task join: {e}")),
     }
 }

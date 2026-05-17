@@ -130,6 +130,24 @@ pub const BRIDGE_WRITE_NAMES: &[&str] = &[
     "fs_move",
     // Engram lifecycle (mutates per-session engram store)
     "expire_engram",
+    // Phase D Wave 1 — system-power tools. `file_read`, `glob`, and
+    // `grep` are intentionally listed as write-class even though
+    // they only read from disk: they exfiltrate file contents into
+    // the LLM context window, which flows to Anthropic/Azure/OpenAI.
+    // Treating them as write-class routes them through the
+    // PermissionsGate just like writes — DEFAULT_DENY paths
+    // (~/.ssh, ~/.aws, browser profiles) are refused without
+    // prompting.
+    "file_read",
+    "file_write",
+    "file_edit",
+    "glob",
+    "grep",
+    "shell_exec",
+    "clipboard_read",
+    "clipboard_write",
+    "open_in_default",
+    "trash",
 ];
 
 /// One bridge handler instance. Cloned (via Arc) into the registry

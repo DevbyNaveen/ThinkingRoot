@@ -27,11 +27,13 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::engine::QueryEngine;
 use crate::intelligence::agent::{Agent, AgentEvent, AgentRequest, LlmBackend};
-use crate::intelligence::approval::{PendingApprovalMap, ToolApprovalRouter};
+use crate::intelligence::approval::{ApprovalGate, PendingApprovalMap, ToolApprovalRouter};
 use crate::intelligence::builtin_tools::{ToolContext, register_builtin_tools};
+use crate::intelligence::permissions_gate::PermissionsGate;
 use crate::intelligence::session::SessionStore;
 use crate::intelligence::skills::SkillRegistry;
 use crate::intelligence::trace::SharedTraceLog;
+use thinkingroot_core::permissions::PermissionStore;
 
 /// Inputs to one streaming agent invocation. Pulled out as a struct
 /// so the REST handler can fill it once and pass it through, rather
@@ -62,6 +64,14 @@ pub struct StreamAgentDeps {
     /// `list_engrams`, `expire_engram`) without minting a parallel
     /// manager that would diverge from the REST/SSE pointer space.
     pub engram_manager: Arc<crate::intelligence::engram::EngramManager>,
+    /// Phase D Wave 1 (2026-05-17) — shared identity-level
+    /// permission store. The [`PermissionsGate`] wraps the
+    /// per-request [`ToolApprovalRouter`] with rule-based path /
+    /// command authorisation: `DEFAULT_DENY` paths (`~/.ssh/**`,
+    /// `~/.aws/**`, browser profiles, etc.) are refused without
+    /// prompting; user-authored `allow_always` rules bypass the
+    /// prompt for paths they explicitly enabled.
+    pub permission_store: Arc<RwLock<PermissionStore>>,
 }
 
 /// Spawn the agent in a tokio task and return the receiver side of the
@@ -92,6 +102,16 @@ pub fn spawn_agent_run(
     let (tx, rx) = mpsc::channel::<AgentEvent>(16);
 
     let router = Arc::new(ToolApprovalRouter::new(deps.pending_approvals.clone()));
+    // Phase D Wave 1 — wrap the SSE-bridge router with the
+    // PermissionsGate so DEFAULT_DENY + user rules fire BEFORE
+    // surfacing an `approval_requested` event to the UI. Allow
+    // rules short-circuit without prompting; Deny rules reject
+    // without prompting; Ask delegates to the router for the
+    // existing UI prompt flow.
+    let permissions_gate: Arc<dyn ApprovalGate> = Arc::new(PermissionsGate::new(
+        deps.permission_store.clone(),
+        router.clone() as Arc<dyn ApprovalGate>,
+    ));
 
     // Capture the inputs the Observer wire-in needs BEFORE we hand
     // them off downstream. `req.user_question` is moved into
@@ -113,7 +133,11 @@ pub fn spawn_agent_run(
     // `agent_router` is the clone the agent itself takes; the
     // outer `router` Arc is what we return to the caller for
     // approval-decision dispatch.
-    let agent_router = router.clone();
+    // The agent receives the PermissionsGate-wrapped gate; the
+    // raw router stays exposed to the caller so the streaming
+    // handler can still call `set_pending_id` before every write
+    // dispatch (the Ask-delegation path needs that).
+    let agent_gate = permissions_gate.clone();
     let router_for_pre_emit = router.clone();
     tokio::spawn(async move {
         let _ = router_for_pre_emit; // hold the Arc alive
@@ -131,7 +155,7 @@ pub fn spawn_agent_run(
         let registry = register_builtin_tools(ctx).await;
 
         let llm: Arc<dyn LlmBackend> = deps.llm;
-        let mut agent = Agent::new(llm, registry, agent_router);
+        let mut agent = Agent::new(llm, registry, agent_gate);
         if let Some(trace) = deps.trace {
             agent = agent.with_trace_log(trace);
         }

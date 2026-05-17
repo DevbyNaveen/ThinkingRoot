@@ -1,0 +1,24 @@
+[package]
+name = "thinkingroot-sandbox"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+documentation = { workspace = true }
+rust-version = { workspace = true }
+description = "Cross-platform process sandbox for ThinkingRoot's shell_exec tool. macOS uses sandbox-exec (Seatbelt) with inline policy. Linux uses bubblewrap when available, with a setrlimit + prctl(PR_SET_NO_NEW_PRIVS) degraded fallback. Windows hard-blocks shell_exec with an UnsupportedPlatform error directing users to WSL2."
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { workspace = true }

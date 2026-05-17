@@ -5,6 +5,7 @@ pub mod global_config;
 pub mod id;
 pub mod install_manifest;
 pub mod ir;
+pub mod permissions;
 pub mod recovery_log;
 pub mod restart_state;
 pub mod resolver;
