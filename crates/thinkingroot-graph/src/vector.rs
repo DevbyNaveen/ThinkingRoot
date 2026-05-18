@@ -224,6 +224,13 @@ mod inner {
             }
         }
 
+        /// Snapshot of all currently-indexed ids. Used by
+        /// `pipeline::reconcile_vector_index` to compute the
+        /// add/remove delta against the post-compile graph state.
+        pub fn index_ids(&self) -> Vec<String> {
+            self.index.keys().cloned().collect()
+        }
+
         /// Return all stored (id, vector, metadata) triples.
         /// Used during merge to copy branch embeddings into main.
         pub fn all_items(&self) -> Vec<(String, Vec<f32>, String)> {
@@ -541,6 +548,10 @@ mod inner {
 
         pub fn remove_by_ids(&mut self, _ids: &[&str]) {}
 
+        pub fn index_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         pub fn all_items(&self) -> Vec<(String, Vec<f32>, String)> {
             vec![]
         }
@@ -608,6 +619,35 @@ mod tests {
         // Verify the method has the expected signature.
         // Full behavioral test requires an initialized store (async + model download).
         let _: fn(&mut VectorStore, &[&str]) = VectorStore::remove_by_ids;
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn index_ids_method_exists_on_real_store() {
+        let _: fn(&VectorStore) -> Vec<String> = VectorStore::index_ids;
+    }
+
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    #[ignore = "requires AllMiniLM-L6-v2 ONNX bundle staged at default_model_bundle_dir()"]
+    async fn index_ids_returns_inserted_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VectorStore::init(dir.path()).await.unwrap();
+        assert!(store.index_ids().is_empty(), "fresh store has no ids");
+
+        let items = vec![
+            ("a".to_string(), "hello".to_string(), "m1".to_string()),
+            ("b".to_string(), "world".to_string(), "m2".to_string()),
+        ];
+        store.upsert_batch(&items).unwrap();
+
+        let mut ids = store.index_ids();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+
+        store.remove_by_ids(&["a"]);
+        let after = store.index_ids();
+        assert_eq!(after, vec!["b".to_string()]);
     }
 
     #[cfg(feature = "vector")]

@@ -2967,23 +2967,22 @@ async fn finalize_successful_compile(
     }
 
     if remount_ok {
-        // Defer the vector-index rebuild to a background task
-        // (2026-05-18). Pre-fix this `await` blocked `finalize_*`
-        // for 20–30 s on a 600-claim workspace because
-        // `rebuild_vector_index` re-embeds every claim + entity
-        // through fastembed ONNX inference. That wait sat *after*
-        // the pipeline finished — the compile bar already read 100 %
-        // but `compile_stream`'s SSE `done` event didn't fire for a
-        // further half-minute, so the desktop's compile-complete UX
-        // lagged dramatically (measured: 41 s wall vs. 9 s pipeline
-        // on the `thinkingroot` workspace).
+        // Defer the vector-index reconcile to a background task
+        // (originally backgrounded 2026-05-18; switched from full
+        // rebuild to delta reconcile on the same date). Pre-fix this
+        // `await` blocked `finalize_*` for 20–30 s on a 600-claim
+        // workspace because `rebuild_vector_index` re-embedded every
+        // claim + entity through ONNX inference. Backgrounding moved
+        // the wait off the critical path; `reconcile_vector_index`
+        // then collapses the work itself — a typical 1-file edit
+        // re-embeds ~10 claims instead of all 600.
         //
         // Backgrounding is safe because:
         //   - The vector store is per-workspace and self-locked
         //     (`storage_arc.blocking_lock()` inside the spawn_blocking
-        //     pool — see `engine.rs::rebuild_vector_index`). A search
-        //     that races the rebuild blocks on that mutex until the
-        //     rebuild completes; never reads a torn intermediate.
+        //     pool — see `engine.rs::reconcile_vector_index`). A
+        //     search that races the reconcile blocks on that mutex
+        //     until it completes; never reads a torn intermediate.
         //   - Compile slot serialisation (compile-resilience.md, single
         //     `CompileHandle`) means two concurrent compiles for the
         //     same workspace cannot both spawn this — a second compile
@@ -2994,8 +2993,8 @@ async fn finalize_successful_compile(
         //     operators see the warning in `serve.log`; the next
         //     compile's `finalize_*` schedules a fresh attempt.
         //
-        // What this trades: a search that lands inside the rebuild
-        // window pays its share of the rebuild latency (mutex wait)
+        // What this trades: a search that lands inside the reconcile
+        // window pays its share of the reconcile latency (mutex wait)
         // instead of returning empty. That is the honest behaviour —
         // CLAUDE.md §honesty rule §1 forbids "fake data, ever", so we
         // never surface a half-built index as if it were complete.
@@ -3003,20 +3002,22 @@ async fn finalize_successful_compile(
         let ws = status_name.to_string();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result = engine.read().await.rebuild_vector_index(&ws).await;
+            let result = engine.read().await.reconcile_vector_index(&ws).await;
             let elapsed_ms = started.elapsed().as_millis();
             match result {
-                Ok((entities, claims)) => tracing::info!(
+                Ok(stats) => tracing::info!(
                     workspace = %ws,
                     elapsed_ms,
-                    "background vector index built: {} entities + {} claims",
-                    entities,
-                    claims
+                    existing = stats.existing,
+                    current = stats.current,
+                    removed = stats.removed,
+                    added = stats.added,
+                    "background vector index reconciled (delta path)"
                 ),
                 Err(e) => tracing::warn!(
                     workspace = %ws,
                     elapsed_ms,
-                    "background vector index rebuild failed: {e} — \
+                    "background vector index reconcile failed: {e} — \
                      semantic search and AEP probes will return empty \
                      results until the next compile re-attempts"
                 ),

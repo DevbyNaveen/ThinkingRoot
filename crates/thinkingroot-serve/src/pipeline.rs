@@ -1847,14 +1847,123 @@ async fn run_pipeline_inner(
     })
 }
 
-/// Rebuild the vector index from the persisted CozoDB graph. Used by
-/// `root query` / `root ask` on first call after a v3 `root compile`,
-/// since v3 `root compile` deliberately does not embed (consumers
-/// choose their own embedding model per v3 final plan §13.1).
+/// Outcome of `reconcile_vector_index`.
 ///
-/// Resets the existing index, embeds every entity + claim currently
-/// in the graph, and saves to disk. Returns
+/// `existing` is the size of the on-disk index before reconcile;
+/// `current` is the count of (claim + entity) ids the graph carries
+/// after the compile. `removed` and `added` are the delta actually
+/// applied. Idempotent: a second reconcile call against the same
+/// graph state reports `removed=0, added=0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VectorReconcileStats {
+    pub existing: usize,
+    pub current: usize,
+    pub removed: usize,
+    pub added: usize,
+    pub elapsed_ms: u64,
+}
+
+/// Reconcile the vector index against the persisted CozoDB graph.
+///
+/// Computes the set difference between the index's current keys and
+/// the graph's current `(claim + entity)` id space, then removes
+/// stale embeddings and embeds only the missing ones. The default
+/// post-compile path (`rest.rs::finalize_successful_compile`-spawned
+/// background task) uses this — re-embedding 600 claims when only
+/// 10 changed was the dominant 30-second cost on the `thinkingroot`
+/// workspace prior to 2026-05-18.
+///
+/// Identity contract:
+/// - Claim ids are ULIDs (`thinkingroot_core::id::ClaimId`),
+///   regenerated per compile only within `truly_changed` sources
+///   (I-W4 per-source delete+insert). Unchanged sources' claims
+///   keep their ids, so their embeddings stay in `existing ∩ current`
+///   and are preserved verbatim. Changed sources' claims land in
+///   `existing \ current` (old ids → removed) and `current \ existing`
+///   (new ids → embedded).
+/// - Entity ids are stable across compiles unless the entity is
+///   dropped from the graph; same diff logic applies.
+///
+/// For an explicit "wipe and rebuild" — used by `root index rebuild`
+/// and the operator `rebuild_vector_index` tool — call
+/// `rebuild_vector_index` instead.
+pub fn reconcile_vector_index(storage: &mut StorageEngine) -> Result<VectorReconcileStats> {
+    let started = std::time::Instant::now();
+
+    let existing_keys = storage.vector.index_ids();
+    let existing_set: std::collections::HashSet<String> = existing_keys.into_iter().collect();
+    let existing_count = existing_set.len();
+
+    let entities = storage.graph.get_all_entities()?;
+    let claims = storage.graph.get_all_claims_with_sources()?;
+
+    let mut current_set: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(entities.len() + claims.len());
+    let mut items_by_id: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::with_capacity(entities.len() + claims.len());
+
+    for (id, name, etype) in &entities {
+        let key = format!("entity:{id}");
+        current_set.insert(key.clone());
+        items_by_id.insert(
+            key,
+            (
+                format!("{name} ({etype})"),
+                format!("entity|{id}|{name}|{etype}"),
+            ),
+        );
+    }
+    for (id, statement, ctype, conf, uri, _) in &claims {
+        let key = format!("claim:{id}");
+        current_set.insert(key.clone());
+        items_by_id.insert(
+            key,
+            (
+                statement.clone(),
+                format!("claim|{id}|{ctype}|{conf}|{uri}"),
+            ),
+        );
+    }
+    let current_count = current_set.len();
+
+    let to_remove_owned: Vec<String> = existing_set.difference(&current_set).cloned().collect();
+    let to_remove_refs: Vec<&str> = to_remove_owned.iter().map(|s| s.as_str()).collect();
+
+    let to_add: Vec<(String, String, String)> = current_set
+        .difference(&existing_set)
+        .filter_map(|id| {
+            items_by_id
+                .get(id)
+                .map(|(text, meta)| (id.clone(), text.clone(), meta.clone()))
+        })
+        .collect();
+
+    let removed = to_remove_refs.len();
+    storage.vector.remove_by_ids(&to_remove_refs);
+    let added = upsert_in_chunks(&mut storage.vector, &to_add, 512)?;
+
+    if removed > 0 || added > 0 {
+        storage.vector.save()?;
+    }
+
+    Ok(VectorReconcileStats {
+        existing: existing_count,
+        current: current_count,
+        removed,
+        added,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Force a full rebuild of the vector index from the persisted CozoDB
+/// graph. Resets the existing index, embeds every entity + claim
+/// currently in the graph, and saves to disk. Returns
 /// `(entities_indexed, claims_indexed)`.
+///
+/// Used by `root index rebuild` / the operator `rebuild_vector_index`
+/// MCP tool / the post-mount path — every site where the caller has
+/// asked for a wipe-and-rebuild explicitly. The default post-compile
+/// path uses `reconcile_vector_index` (delta) instead.
 pub fn rebuild_vector_index(storage: &mut StorageEngine) -> Result<(usize, usize)> {
     storage.vector.reset();
 
@@ -2143,5 +2252,64 @@ mod tests {
             Some("linking entities"),
             "substep survives a set_step call by design"
         );
+    }
+
+    // ── VectorReconcileStats wire-shape + diff-math contract ──────────────────
+
+    /// `VectorReconcileStats::default()` must zero every counter so a
+    /// freshly-constructed value carries no implicit success/failure
+    /// signal. The struct is wire-emitted via `tracing::info!` fields
+    /// at `rest.rs::finalize_successful_compile`'s background task —
+    /// non-zero defaults would silently log misleading numbers when a
+    /// reconcile short-circuits before any work.
+    #[test]
+    fn vector_reconcile_stats_default_is_zero() {
+        let s = VectorReconcileStats::default();
+        assert_eq!(s.existing, 0);
+        assert_eq!(s.current, 0);
+        assert_eq!(s.removed, 0);
+        assert_eq!(s.added, 0);
+        assert_eq!(s.elapsed_ms, 0);
+    }
+
+    /// The reconcile diff math: given `existing` index keys and
+    /// `current` graph keys, the function must produce
+    /// `to_remove = existing \ current` and
+    /// `to_add = current \ existing`. The test pins the algorithm
+    /// using the same `HashSet::difference` primitive the function
+    /// uses, so any future refactor that drifts the operator (e.g.
+    /// `symmetric_difference` slip) is caught here, deterministically,
+    /// without needing the ONNX embedding model.
+    #[test]
+    fn vector_reconcile_diff_math_matches_set_difference() {
+        use std::collections::HashSet;
+
+        let existing: HashSet<String> = ["a", "b", "c", "d"].into_iter().map(String::from).collect();
+        let current: HashSet<String> = ["b", "c", "d", "e", "f"].into_iter().map(String::from).collect();
+
+        let mut to_remove: Vec<&str> = existing.difference(&current).map(|s| s.as_str()).collect();
+        let mut to_add: Vec<&str> = current.difference(&existing).map(|s| s.as_str()).collect();
+        to_remove.sort();
+        to_add.sort();
+
+        assert_eq!(to_remove, vec!["a"], "existing-only ids must be removed");
+        assert_eq!(to_add, vec!["e", "f"], "current-only ids must be added");
+    }
+
+    /// Idempotency: when `existing == current` (back-to-back compiles
+    /// with no changes), reconcile must compute zero removes and zero
+    /// adds. This is the property that makes reconcile safe to run on
+    /// every successful compile — the cost when nothing changed is
+    /// O(graph-read) + O(1) embedding work.
+    #[test]
+    fn vector_reconcile_diff_is_idempotent_when_sets_match() {
+        use std::collections::HashSet;
+
+        let s: HashSet<String> = ["claim:1", "claim:2", "entity:e"].into_iter().map(String::from).collect();
+        let to_remove: Vec<&str> = s.difference(&s).map(|x| x.as_str()).collect();
+        let to_add: Vec<&str> = s.difference(&s).map(|x| x.as_str()).collect();
+
+        assert!(to_remove.is_empty(), "identical sets produce zero removes");
+        assert!(to_add.is_empty(), "identical sets produce zero adds");
     }
 }

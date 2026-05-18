@@ -4608,6 +4608,28 @@ Rules: \
         Ok(counts)
     }
 
+    /// Delta-reconcile the workspace's vector index against its
+    /// current CozoDB state. Removes embeddings whose ids are no
+    /// longer in the graph and embeds only the missing ones. Used by
+    /// the post-compile background task at `rest.rs::compile_stream`
+    /// — the dominant 30-second cost on a 600-claim workspace prior
+    /// to 2026-05-18 was the full re-embed; reconcile collapses it
+    /// to "embed only the changed claims".
+    pub async fn reconcile_vector_index(
+        &self,
+        ws: &str,
+    ) -> Result<crate::pipeline::VectorReconcileStats> {
+        let handle = self.get_workspace(ws)?;
+        let storage_arc = Arc::clone(&handle.storage);
+        let stats = tokio::task::spawn_blocking(move || {
+            let mut storage = storage_arc.blocking_lock();
+            crate::pipeline::reconcile_vector_index(&mut storage)
+        })
+        .await
+        .map_err(|e| Error::Config(format!("vector-index reconcile task panicked: {e}")))??;
+        Ok(stats)
+    }
+
     /// Return `(provider, model)` when the named workspace has a usable
     /// LLM client attached, or `None` when the workspace is unmounted
     /// or its config did not yield a working client.
