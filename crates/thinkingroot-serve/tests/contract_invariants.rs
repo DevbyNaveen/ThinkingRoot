@@ -147,7 +147,8 @@ fn run_structural_pipeline_into(
         .expect("insert_claims_batch");
 
     let doc_refs: Vec<&DocumentIR> = docs.iter().collect();
-    let _ = phase_6_7_structural_persist(&doc_refs, &mut extraction, &graph, &byte_store)
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _ = phase_6_7_structural_persist(&doc_refs, &mut extraction, &graph, &byte_store, &cancel)
         .expect("phase_6_7_structural_persist");
 
     (graph, byte_store)

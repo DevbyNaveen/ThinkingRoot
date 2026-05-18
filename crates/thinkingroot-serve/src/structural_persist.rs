@@ -44,6 +44,7 @@ use thinkingroot_graph::rows::{
 use thinkingroot_graph::Blake3Cache;
 use thinkingroot_graph::graph::{GraphStore, PerSourceRows};
 use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
+use tokio_util::sync::CancellationToken;
 
 mod code_metrics;
 mod git_blame;
@@ -116,11 +117,31 @@ pub fn phase_6_7_structural_persist(
     extraction: &mut ExtractionOutput,
     graph: &GraphStore,
     byte_store: &FileSystemSourceStore,
+    cancel: &CancellationToken,
 ) -> Result<Phase67Stats> {
     let started = Instant::now();
     let mut stats = Phase67Stats::default();
 
+    // Accumulate per-source rebuild payloads here, then commit all
+    // sources in ONE `multi_transaction` via
+    // `transactional_rebuild_sources` after the loop. Pre-2026-05-18
+    // every source committed its own transaction inside the loop —
+    // 47 commits on a 47-source incremental compile, paying the
+    // fsync + tx-acquisition overhead each time. The batched commit
+    // widens I-W4's atomicity boundary from per-source to per-compile,
+    // which is strictly stronger for concurrent readers.
+    let mut batch: Vec<(String, PerSourceRows)> = Vec::with_capacity(documents.len());
+
     for doc in documents {
+        // Cancel observation between sources — keeps the Stop button
+        // honest during the bucket-emit + transaction-prep phase. The
+        // batched commit itself is one atomic Cozo call with no
+        // mid-transaction cancel point (correct by design — cancelling
+        // a multi_transaction mid-flight would leave a torn graph).
+        if cancel.is_cancelled() {
+            return Err(thinkingroot_core::Error::Cancelled);
+        }
+
         let bytes = match byte_store
             .get(&doc.content_hash)
             .map_err(|e| thinkingroot_core::Error::Compilation {
@@ -262,79 +283,56 @@ pub fn phase_6_7_structural_persist(
         // row) and emit one chunks_residual row per uncovered gap so
         // I-3 holds end-to-end. Per contract §15 Q1 we store the gap's
         // raw bytes inline.
+        // Build the covered-byte set for this source. `buckets` is
+        // reset per source (line above), so every row in every vec
+        // belongs to `source_id_str` by construction — the legacy
+        // `if r.source_id == source_id_str` filter on each loop was
+        // dead code (always true) and was deleted on 2026-05-18.
         let mut covered: Vec<(u64, u64)> = Vec::new();
         for span in &claim_spans {
             covered.push(*span);
         }
         for r in &buckets.function_calls {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.doc_tags {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.code_links {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.code_signatures {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.config_tree {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.data_rows {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.headings {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.chunks_residual {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.source_annotations {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.code_markers {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.test_annotations {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.code_metrics {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.git_blame {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         for r in &buckets.git_commits {
-            if r.source_id == source_id_str {
-                covered.push((r.byte_start, r.byte_end));
-            }
+            covered.push((r.byte_start, r.byte_end));
         }
         let total_bytes = bytes.len() as u64;
         for (gap_start, gap_end) in compute_gaps(&covered, total_bytes) {
@@ -387,21 +385,83 @@ pub fn phase_6_7_structural_persist(
             &mut buckets.quantities,
         );
 
-        // Drain buckets via the T7 transactional rebuild — cascade :rm
-        // for the 16 structural tables scoped to this source, then :put
-        // every non-empty bucket, all inside one Cozo `multi_transaction`.
-        // Concurrent AEP/Hybrid readers either see the prior compile's
-        // rows or the new compile's rows, never a torn intermediate.
-        // (Closes invariant I-W4 of the water-flow incremental compile
-        // spec.)
-        flush_buckets(graph, &source_id_str, &mut buckets, &mut stats)?;
+        // Drain buckets into a PerSourceRows payload and queue it for
+        // the batched commit below. The single-tx batch widens I-W4's
+        // atomicity boundary from per-source to per-compile, which is
+        // strictly stronger for concurrent AEP/Hybrid readers — they
+        // observe either the full pre-batch state or the full
+        // post-batch state of every source touched, never a torn
+        // intermediate. The cascade in `transactional_rebuild_sources`
+        // still fires for every source, including those with empty
+        // bucket sets, so stale rows from prior compiles are cleared.
+        let rows = drain_buckets_to_per_source_rows(&mut buckets);
+        batch.push((source_id_str.clone(), rows));
 
         stats.sources_processed += 1;
         stats.blake3_distinct_spans += cache.len();
     }
 
+    // One commit for every truly-changed source. Empty batches are an
+    // explicit no-op inside `transactional_rebuild_sources`.
+    graph.transactional_rebuild_sources(&batch)?;
+
+    // Record per-table counts AFTER the batched commit succeeded —
+    // we never claim rows that were rolled back. `Phase67Stats::record`
+    // accumulates via `+=`, so iterating the batch sums correctly.
+    for (_, rows) in &batch {
+        record_per_source_counts(&mut stats, rows);
+    }
+
     stats.elapsed = started.elapsed();
     Ok(stats)
+}
+
+/// Drain every per-table bucket into a `PerSourceRows` for the
+/// transactional rebuild path. `source_references` is intentionally
+/// left empty — Phase 7e (post-resolution) is its canonical writer.
+fn drain_buckets_to_per_source_rows(buckets: &mut PerTableBuckets) -> PerSourceRows {
+    PerSourceRows {
+        function_calls: std::mem::take(&mut buckets.function_calls),
+        doc_tags: std::mem::take(&mut buckets.doc_tags),
+        code_links: std::mem::take(&mut buckets.code_links),
+        code_signatures: std::mem::take(&mut buckets.code_signatures),
+        config_tree: std::mem::take(&mut buckets.config_tree),
+        data_rows: std::mem::take(&mut buckets.data_rows),
+        headings: std::mem::take(&mut buckets.headings),
+        chunks_residual: std::mem::take(&mut buckets.chunks_residual),
+        quantities: std::mem::take(&mut buckets.quantities),
+        source_annotations: std::mem::take(&mut buckets.source_annotations),
+        code_markers: std::mem::take(&mut buckets.code_markers),
+        test_annotations: std::mem::take(&mut buckets.test_annotations),
+        code_metrics: std::mem::take(&mut buckets.code_metrics),
+        git_blame: std::mem::take(&mut buckets.git_blame),
+        git_commits: std::mem::take(&mut buckets.git_commits),
+        // Phase 7e is the canonical writer — the cascade in
+        // `transactional_rebuild_sources` still clears any stale rows
+        // for this source so the linker emits cleanly.
+        source_references: Vec::new(),
+    }
+}
+
+/// Record per-table counts from one source's `PerSourceRows` onto
+/// `stats`. Called once per source AFTER the batched commit succeeds
+/// so the counts always reflect what is durably written.
+fn record_per_source_counts(stats: &mut Phase67Stats, rows: &PerSourceRows) {
+    stats.record("function_calls", rows.function_calls.len());
+    stats.record("doc_tags", rows.doc_tags.len());
+    stats.record("code_links", rows.code_links.len());
+    stats.record("code_signatures", rows.code_signatures.len());
+    stats.record("config_tree", rows.config_tree.len());
+    stats.record("data_rows", rows.data_rows.len());
+    stats.record("headings", rows.headings.len());
+    stats.record("chunks_residual", rows.chunks_residual.len());
+    stats.record("quantities", rows.quantities.len());
+    stats.record("source_annotations", rows.source_annotations.len());
+    stats.record("code_markers", rows.code_markers.len());
+    stats.record("test_annotations", rows.test_annotations.len());
+    stats.record("code_metrics", rows.code_metrics.len());
+    stats.record("git_blame", rows.git_blame.len());
+    stats.record("git_commits", rows.git_commits.len());
 }
 
 /// Compute uncovered byte ranges given a set of `(start, end)` covered
@@ -501,89 +561,6 @@ fn total_row_count(b: &PerTableBuckets) -> usize {
         + b.code_metrics.len()
         + b.git_blame.len()
         + b.git_commits.len()
-}
-
-/// Drain `buckets` for the source `source_id` via the T7 transactional
-/// rebuild path: cascade-then-emit on the 16 structural tables, all
-/// inside one `multi_transaction`.  Per-table row counts are still
-/// recorded into `stats` (zero-row tables stay out of `per_table_counts`).
-///
-/// Why we cascade even when every bucket is empty: a source whose new
-/// compile produced no structural rows means the prior compile's rows
-/// are stale by definition.  The cascade clears them.  See the
-/// rationale at the top of `crates/thinkingroot-graph/src/per_source_rows.rs`.
-fn flush_buckets(
-    graph: &GraphStore,
-    source_id: &str,
-    buckets: &mut PerTableBuckets,
-    stats: &mut Phase67Stats,
-) -> Result<()> {
-    // Capture per-table counts BEFORE the std::mem::take moves so the
-    // counts survive the move into PerSourceRows.  Stats are recorded
-    // AFTER transactional_rebuild_source returns Ok so we never claim
-    // rows that were rolled back on error (the ? operator short-circuits
-    // before the record() calls when the rebuild fails).
-    let function_calls_n = buckets.function_calls.len();
-    let doc_tags_n = buckets.doc_tags.len();
-    let code_links_n = buckets.code_links.len();
-    let code_signatures_n = buckets.code_signatures.len();
-    let config_tree_n = buckets.config_tree.len();
-    let data_rows_n = buckets.data_rows.len();
-    let headings_n = buckets.headings.len();
-    let chunks_residual_n = buckets.chunks_residual.len();
-    let quantities_n = buckets.quantities.len();
-    let source_annotations_n = buckets.source_annotations.len();
-    let code_markers_n = buckets.code_markers.len();
-    let test_annotations_n = buckets.test_annotations.len();
-    let code_metrics_n = buckets.code_metrics.len();
-    let git_blame_n = buckets.git_blame.len();
-    let git_commits_n = buckets.git_commits.len();
-
-    let rows = PerSourceRows {
-        function_calls: std::mem::take(&mut buckets.function_calls),
-        doc_tags: std::mem::take(&mut buckets.doc_tags),
-        code_links: std::mem::take(&mut buckets.code_links),
-        code_signatures: std::mem::take(&mut buckets.code_signatures),
-        config_tree: std::mem::take(&mut buckets.config_tree),
-        data_rows: std::mem::take(&mut buckets.data_rows),
-        headings: std::mem::take(&mut buckets.headings),
-        chunks_residual: std::mem::take(&mut buckets.chunks_residual),
-        quantities: std::mem::take(&mut buckets.quantities),
-        source_annotations: std::mem::take(&mut buckets.source_annotations),
-        code_markers: std::mem::take(&mut buckets.code_markers),
-        test_annotations: std::mem::take(&mut buckets.test_annotations),
-        code_metrics: std::mem::take(&mut buckets.code_metrics),
-        git_blame: std::mem::take(&mut buckets.git_blame),
-        git_commits: std::mem::take(&mut buckets.git_commits),
-        // `source_references` is not emitted by Phase 6.7 — Phase 7e
-        // (`thinkingroot_link::structural_resolve`) builds it.  The rebuild
-        // still cascades source_references for this source so any stale
-        // reference rows from a prior compile are cleared; the linker
-        // re-inserts after we return.
-        source_references: Vec::new(),
-    };
-
-    graph.transactional_rebuild_source(source_id, &rows)?;
-
-    // Record stats only after the commit succeeded — counts reflect what
-    // is durably written, not what was attempted.
-    stats.record("function_calls", function_calls_n);
-    stats.record("doc_tags", doc_tags_n);
-    stats.record("code_links", code_links_n);
-    stats.record("code_signatures", code_signatures_n);
-    stats.record("config_tree", config_tree_n);
-    stats.record("data_rows", data_rows_n);
-    stats.record("headings", headings_n);
-    stats.record("chunks_residual", chunks_residual_n);
-    stats.record("quantities", quantities_n);
-    stats.record("source_annotations", source_annotations_n);
-    stats.record("code_markers", code_markers_n);
-    stats.record("test_annotations", test_annotations_n);
-    stats.record("code_metrics", code_metrics_n);
-    stats.record("git_blame", git_blame_n);
-    stats.record("git_commits", git_commits_n);
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

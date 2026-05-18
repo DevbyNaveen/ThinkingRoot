@@ -260,6 +260,83 @@ impl GraphStore {
             }
         }
     }
+
+    /// Batched per-compile rebuild across multiple sources.
+    ///
+    /// Same atomic semantics as [`Self::transactional_rebuild_source`]
+    /// but folds N sources into ONE `multi_transaction(write=true)`
+    /// boundary. The cascade :rm phase runs for every source first,
+    /// then the per-table :put phase runs for every source. On any
+    /// failure inside the transaction the entire batch is rolled back
+    /// — no partial visibility to concurrent readers.
+    ///
+    /// Why batch: per-source commits paid the same Cozo fsync /
+    /// transaction-acquisition overhead 47 times on a 47-source
+    /// incremental compile. Batching collapses that to one commit;
+    /// I-W4's atomicity floor (per-source) is strictly subsumed by
+    /// the new per-compile boundary — readers still observe either
+    /// the full pre-batch state or the full post-batch state, never
+    /// a torn intermediate. That is a stronger guarantee than I-W4
+    /// requires, so no rule documentation needs to relax.
+    ///
+    /// Empty batches are an explicit no-op (caller's safety net for
+    /// "every source skipped"). For a single non-empty source the
+    /// behaviour is identical to `transactional_rebuild_source`.
+    pub fn transactional_rebuild_sources(
+        &self,
+        batch: &[(String, PerSourceRows)],
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.raw_db().multi_transaction(true);
+
+        let result = (|| -> Result<()> {
+            // Phase 1: cascade :rm for every (source, table) pair.
+            // Iterates STRUCTURAL_TABLES in fixed order per source so
+            // any future reader that inspects the tx log sees a
+            // deterministic operation sequence.
+            for (source_id, _) in batch {
+                for spec in STRUCTURAL_TABLES {
+                    let script = pk_rm_script_for_table(spec.name, spec.source_id_column);
+                    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+                    params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                    tx.run_script(&script, params).map_err(|e| {
+                        Error::GraphStorage(format!(
+                            "transactional rebuild batch (source {source_id}): cascade :rm on {} failed: {e}",
+                            spec.name,
+                        ))
+                    })?;
+                }
+            }
+
+            // Phase 2: per-source :put for tables with new rows.
+            for (source_id, rows) in batch {
+                rows.append_put_scripts(&tx).map_err(|e| match e {
+                    Error::GraphStorage(msg) => Error::GraphStorage(format!(
+                        "transactional rebuild batch (source {source_id}): {msg}"
+                    )),
+                    other => other,
+                })?;
+            }
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => tx.commit().map_err(|e| {
+                Error::GraphStorage(format!(
+                    "transactional rebuild batch: commit failed across {} sources: {e}",
+                    batch.len()
+                ))
+            }),
+            Err(e) => {
+                let _ = tx.abort();
+                Err(e)
+            }
+        }
+    }
 }
 
 // ─── Per-table put-block emitters ─────────────────────────────────────
@@ -860,5 +937,160 @@ mod tests {
             .query_read("?[id] := *function_calls{id, source_id: 'src-b'}")
             .unwrap();
         assert_eq!(probe_b.rows.len(), 1);
+    }
+
+    // ── transactional_rebuild_sources (batched per-compile rebuild) ──────────
+
+    #[test]
+    fn batched_rebuild_empty_batch_is_noop() {
+        let (_dir, store) = make_store();
+        // Empty batch must NOT open a transaction or write anything.
+        store.transactional_rebuild_sources(&[]).unwrap();
+    }
+
+    #[test]
+    fn batched_rebuild_single_source_matches_per_source_call() {
+        let (_dir, store) = make_store();
+        let mut rows = PerSourceRows::default();
+        rows.function_calls.push(FunctionCall {
+            id: "fc-batched-1".into(),
+            caller_claim_id: "c".into(),
+            callee_name: "n".into(),
+            callee_claim_id: String::new(),
+            source_id: "src-bs-1".into(),
+            byte_start: 0,
+            byte_end: 5,
+            content_blake3: "b".into(),
+        });
+        store
+            .transactional_rebuild_sources(&[("src-bs-1".to_string(), rows)])
+            .unwrap();
+
+        let probe = store
+            .query_read("?[id] := *function_calls{id, source_id: 'src-bs-1'}")
+            .unwrap();
+        assert_eq!(probe.rows.len(), 1);
+    }
+
+    #[test]
+    fn batched_rebuild_three_sources_atomic() {
+        let (_dir, store) = make_store();
+
+        // Seed: source A has 2 old rows that the rebuild must clear.
+        let mut seed = PerSourceRows::default();
+        for k in 0..2 {
+            seed.function_calls.push(FunctionCall {
+                id: format!("fc-seed-{k}"),
+                caller_claim_id: "c".into(),
+                callee_name: format!("seed-{k}"),
+                callee_claim_id: String::new(),
+                source_id: "src-batch-a".into(),
+                byte_start: k * 10,
+                byte_end: k * 10 + 5,
+                content_blake3: format!("b-seed-{k}"),
+            });
+        }
+        store
+            .transactional_rebuild_source("src-batch-a", &seed)
+            .unwrap();
+
+        // Now batched rebuild for 3 sources, one of which is A (with new rows).
+        let mut rows_a = PerSourceRows::default();
+        rows_a.function_calls.push(FunctionCall {
+            id: "fc-new-a".into(),
+            caller_claim_id: "c".into(),
+            callee_name: "new-a".into(),
+            callee_claim_id: String::new(),
+            source_id: "src-batch-a".into(),
+            byte_start: 0,
+            byte_end: 5,
+            content_blake3: "b-a".into(),
+        });
+        let mut rows_b = PerSourceRows::default();
+        rows_b.headings.push(HeadingRow {
+            id: "h-batch-b".into(),
+            source_id: "src-batch-b".into(),
+            level: 1,
+            text: "B".into(),
+            parent_heading_id: String::new(),
+            byte_start: 0,
+            byte_end: 5,
+            content_blake3: "b-h-b".into(),
+        });
+        // Source C: empty rows — cascade still fires (no-op since nothing exists).
+        let rows_c = PerSourceRows::default();
+
+        store
+            .transactional_rebuild_sources(&[
+                ("src-batch-a".to_string(), rows_a),
+                ("src-batch-b".to_string(), rows_b),
+                ("src-batch-c".to_string(), rows_c),
+            ])
+            .unwrap();
+
+        // A: old 2 rows cleared, new 1 row present.
+        let probe_a = store
+            .query_read("?[id] := *function_calls{id, source_id: 'src-batch-a'}")
+            .unwrap();
+        assert_eq!(probe_a.rows.len(), 1);
+
+        // B: headings row present.
+        let probe_b = store
+            .query_read("?[id] := *headings{id, source_id: 'src-batch-b'}")
+            .unwrap();
+        assert_eq!(probe_b.rows.len(), 1);
+
+        // C: nothing to query (no rows ever existed).
+        let probe_c = store
+            .query_read("?[id] := *function_calls{id, source_id: 'src-batch-c'}")
+            .unwrap();
+        assert_eq!(probe_c.rows.len(), 0);
+    }
+
+    #[test]
+    fn batched_rebuild_other_sources_untouched() {
+        let (_dir, store) = make_store();
+
+        // Seed an unrelated source — must not be affected by the batch.
+        let mut bystander = PerSourceRows::default();
+        bystander.function_calls.push(FunctionCall {
+            id: "fc-bystander".into(),
+            caller_claim_id: "c".into(),
+            callee_name: "by".into(),
+            callee_claim_id: String::new(),
+            source_id: "src-bystander".into(),
+            byte_start: 0,
+            byte_end: 5,
+            content_blake3: "b-by".into(),
+        });
+        store
+            .transactional_rebuild_source("src-bystander", &bystander)
+            .unwrap();
+
+        // Batch covers only src-x + src-y.
+        let mut rows_x = PerSourceRows::default();
+        rows_x.function_calls.push(FunctionCall {
+            id: "fc-x".into(),
+            caller_claim_id: "c".into(),
+            callee_name: "x".into(),
+            callee_claim_id: String::new(),
+            source_id: "src-x".into(),
+            byte_start: 0,
+            byte_end: 5,
+            content_blake3: "b-x".into(),
+        });
+        let rows_y = PerSourceRows::default();
+        store
+            .transactional_rebuild_sources(&[
+                ("src-x".to_string(), rows_x),
+                ("src-y".to_string(), rows_y),
+            ])
+            .unwrap();
+
+        // Bystander still has its row.
+        let probe = store
+            .query_read("?[id] := *function_calls{id, source_id: 'src-bystander'}")
+            .unwrap();
+        assert_eq!(probe.rows.len(), 1, "bystander row must survive batch");
     }
 }

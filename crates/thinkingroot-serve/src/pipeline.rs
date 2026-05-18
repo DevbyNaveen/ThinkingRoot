@@ -1386,6 +1386,7 @@ async fn run_pipeline_inner(
         &mut filtered_extraction,
         &storage.graph,
         &byte_store,
+        &cancel,
     )?;
     tracing::info!(
         sources = phase_6_7_stats.sources_processed,

@@ -169,6 +169,7 @@ pub fn backfill_structural(data_dir: &Path) -> Result<BackfillReport> {
             &mut empty_extraction,
             &graph,
             &byte_store,
+            &tokio_util::sync::CancellationToken::new(),
         )?;
         report.rows_emitted += stats.structural_rows_emitted;
         report.residual_emitted += stats.residual_rows_emitted;
