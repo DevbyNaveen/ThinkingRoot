@@ -3000,9 +3000,19 @@ async fn finalize_successful_compile(
         // never surface a half-built index as if it were complete.
         let engine = state.engine.clone();
         let ws = status_name.to_string();
+        // The reconcile inherits a fresh cancel token. Today there is
+        // no producer-side path that fires it — the background task
+        // runs to completion or fails. Future work (Tier 2: yield to
+        // a fresh compile or unmount) will arm this token at those
+        // points. The plumbing lands now so the contract is in place.
+        let reconcile_cancel = tokio_util::sync::CancellationToken::new();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result = engine.read().await.reconcile_vector_index(&ws).await;
+            let result = engine
+                .read()
+                .await
+                .reconcile_vector_index(&ws, reconcile_cancel)
+                .await;
             let elapsed_ms = started.elapsed().as_millis();
             match result {
                 Ok(stats) => tracing::info!(

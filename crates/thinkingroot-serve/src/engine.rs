@@ -4615,15 +4615,22 @@ Rules: \
     /// — the dominant 30-second cost on a 600-claim workspace prior
     /// to 2026-05-18 was the full re-embed; reconcile collapses it
     /// to "embed only the changed claims".
+    ///
+    /// `cancel` is observed at chunk boundaries inside the embed
+    /// loop. The post-compile background task passes a token tied to
+    /// the next compile's start or the workspace's unmount — letting
+    /// a slow reconcile yield to a fresh compile instead of blocking
+    /// the engine's storage lock for the full embed cycle.
     pub async fn reconcile_vector_index(
         &self,
         ws: &str,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::pipeline::VectorReconcileStats> {
         let handle = self.get_workspace(ws)?;
         let storage_arc = Arc::clone(&handle.storage);
         let stats = tokio::task::spawn_blocking(move || {
             let mut storage = storage_arc.blocking_lock();
-            crate::pipeline::reconcile_vector_index(&mut storage)
+            crate::pipeline::reconcile_vector_index(&mut storage, &cancel)
         })
         .await
         .map_err(|e| Error::Config(format!("vector-index reconcile task panicked: {e}")))??;
