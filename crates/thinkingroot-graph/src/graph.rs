@@ -4894,12 +4894,14 @@ impl GraphStore {
         // tx (edges-before-rows preserves I-W9 even mid-cascade).
         let witness_ids = self.collect_witness_ids_for_sources(source_ids)?;
 
-        // Build the candidate $rows parameter shapes once. Each entry
-        // is a 1-element inner list: candidate[sid] <- [[s1], [s2], ...].
-        let sid_rows: Vec<DataValue> = source_ids
-            .iter()
-            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
-            .collect();
+        // Build the candidate $rows parameter shapes for the
+        // claim- and witness-keyed cascades (those don't have a
+        // per-source variant; only IN-set makes sense). Source-keyed
+        // cascades run as per-source single-row queries below so
+        // they hit `:by_source` indexes — Cozo's planner doesn't
+        // push the `source_id = sid` predicate from a candidate-
+        // relation join down into the indexed scan, so IN-set runs
+        // ~3× slower than the indexed binding form. Tier 3 commit L.
         let cid_rows: Vec<DataValue> = claim_ids
             .iter()
             .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
@@ -4913,7 +4915,7 @@ impl GraphStore {
         let tx = self.db.multi_transaction(true);
         let cascade_result = self.run_remove_cascade_in_tx(
             &tx,
-            &sid_rows,
+            source_ids,
             &cid_rows,
             &wid_rows,
             !claim_ids.is_empty(),
@@ -5001,85 +5003,104 @@ impl GraphStore {
     /// The cascade body that runs inside `transactional_remove_sources`'s
     /// `multi_transaction(true)`. Extracted as a separate fn so the
     /// caller can map its Result to a clean commit/abort branch.
+    ///
+    /// Tier 3 commit L: source-keyed cascades use per-source single-row
+    /// queries (one query per (source, table) pair, inside the SAME
+    /// transaction). This hits the `:by_source` index on every cascade-
+    /// touched table — empirically 3× faster than the IN-set candidate-
+    /// relation pattern because Cozo's planner doesn't push the join
+    /// predicate down into the indexed scan. Claim- and witness-edge
+    /// cascades stay IN-set because those keys aren't source-shaped.
     fn run_remove_cascade_in_tx(
         &self,
         tx: &cozo::MultiTransaction,
-        sid_rows: &[DataValue],
+        source_ids: &[String],
         cid_rows: &[DataValue],
         wid_rows: &[DataValue],
         have_claims: bool,
         have_witnesses: bool,
     ) -> Result<()> {
         use thinkingroot_core::structural_registry::{
-            pk_rm_script_for_table_batched, STRUCTURAL_TABLES,
+            pk_rm_script_for_table, STRUCTURAL_TABLES,
         };
 
-        let sids_param = || DataValue::List(sid_rows.to_vec());
         let cids_param = || DataValue::List(cid_rows.to_vec());
         let wids_param = || DataValue::List(wid_rows.to_vec());
 
-        // ── Source-keyed cascades ─────────────────────────────────
+        // ── Source-keyed cascades (per-source, indexed) ───────────
+        // Each table has a `:by_source` (or `:by_from` for
+        // source_references) secondary index; the binding form
+        // `*table{..., source_id: $sid}` uses the index directly.
+        // The same multi_transaction wraps every iteration so I-W4
+        // atomicity is preserved at the per-batch granularity.
+        for source_id in source_ids {
+            // source_entity_relations — composite-key projection.
+            {
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                tx.run_script(
+                    "?[source_id, from_id, to_id, relation_type] := \
+                       *source_entity_relations{source_id, from_id, to_id, relation_type, strength}, \
+                       source_id = $sid \
+                     :rm source_entity_relations {source_id, from_id, to_id, relation_type}",
+                    params,
+                ).map_err(|e| Error::GraphStorage(format!(
+                    "per-source rm source_entity_relations ({source_id}): {e}"
+                )))?;
+            }
 
-        // source_entity_relations
-        {
-            let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
-            tx.run_script(
-                "candidate[sid] <- $sids \
-                 ?[source_id, from_id, to_id, relation_type] := \
-                   candidate[sid], \
-                   *source_entity_relations{source_id, from_id, to_id, relation_type, strength}, \
-                   source_id = sid \
-                 :rm source_entity_relations {source_id, from_id, to_id, relation_type}",
-                params,
-            ).map_err(|e| Error::GraphStorage(format!("batched rm source_entity_relations: {e}")))?;
+            // 16 structural tables — `pk_rm_script_for_table`
+            // generates the indexed binding form.
+            for spec in STRUCTURAL_TABLES {
+                let script = pk_rm_script_for_table(spec.name, spec.source_id_column);
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                tx.run_script(&script, params).map_err(|e| {
+                    Error::GraphStorage(format!(
+                        "per-source rm structural table {} ({source_id}): {e}",
+                        spec.name
+                    ))
+                })?;
+            }
+
+            // events — id-keyed, indexed by source.
+            {
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                tx.run_script(
+                    "?[id] := *events{id, source_id: $sid} \
+                     :rm events {id}",
+                    params,
+                ).map_err(|e| Error::GraphStorage(format!(
+                    "per-source rm events ({source_id}): {e}"
+                )))?;
+            }
+
+            // resolution_deps — both directions, indexed via
+            // :by_from and :by_to. The OR forces the planner to
+            // union two index scans, which is still much faster
+            // than a full table scan.
+            {
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                tx.run_script(
+                    "?[from_source_id, to_source_id, kind, edge_id] := \
+                       *resolution_deps{from_source_id, to_source_id, kind, edge_id}, \
+                       (from_source_id = $sid or to_source_id = $sid) \
+                     :rm resolution_deps {from_source_id, to_source_id, kind, edge_id}",
+                    params,
+                ).map_err(|e| Error::GraphStorage(format!(
+                    "per-source rm resolution_deps ({source_id}): {e}"
+                )))?;
+            }
         }
 
-        // 16 structural tables, one IN-set query each
-        for spec in STRUCTURAL_TABLES {
-            let script = pk_rm_script_for_table_batched(spec.name, spec.source_id_column);
-            let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
-            tx.run_script(&script, params).map_err(|e| {
-                Error::GraphStorage(format!(
-                    "batched rm structural table {}: {e}",
-                    spec.name
-                ))
-            })?;
-        }
-
-        // events (derived SVO calendar) — id-keyed
-        {
-            let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
-            tx.run_script(
-                "candidate[sid] <- $sids \
-                 ?[id] := candidate[sid], *events{id, source_id: sid} \
-                 :rm events {id}",
-                params,
-            ).map_err(|e| Error::GraphStorage(format!("batched rm events: {e}")))?;
-        }
-
-        // resolution_deps — both directions, single query
-        {
-            let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
-            tx.run_script(
-                "candidate[sid] <- $sids \
-                 ?[from_source_id, to_source_id, kind, edge_id] := \
-                   candidate[sid], \
-                   *resolution_deps{from_source_id, to_source_id, kind, edge_id}, \
-                   (from_source_id = sid or to_source_id = sid) \
-                 :rm resolution_deps {from_source_id, to_source_id, kind, edge_id}",
-                params,
-            ).map_err(|e| Error::GraphStorage(format!("batched rm resolution_deps: {e}")))?;
-        }
-
-        // Witness Mesh substrate — edges first (I-W9 audit safety),
-        // then rows. All scoped by the pre-collected witness IN-set.
+        // ── Witness Mesh substrate (IN-set on witness_ids) ────────
+        // Witness edges are keyed by witness ids, not source ids.
+        // The IN-set candidate-relation pattern is the right tool
+        // here — there's no `:by_source` analogue we'd otherwise
+        // hit. I-W9 (DAG audit safety) requires edges-before-rows.
         if have_witnesses {
-            // witness_input_edges where parent OR child is in the
-            // batch's witness set
             let mut params = BTreeMap::new();
             params.insert("wids".into(), wids_param());
             tx.run_script(
@@ -5092,7 +5113,6 @@ impl GraphStore {
                 params,
             ).map_err(|e| Error::GraphStorage(format!("batched rm witness_input_edges: {e}")))?;
 
-            // witness_typed_edges where from OR to is in the witness set
             let mut params = BTreeMap::new();
             params.insert("wids".into(), wids_param());
             tx.run_script(
@@ -5105,15 +5125,21 @@ impl GraphStore {
                 params,
             ).map_err(|e| Error::GraphStorage(format!("batched rm witness_typed_edges: {e}")))?;
 
-            // witnesses rows themselves, by source IN-set
-            let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
-            tx.run_script(
-                "candidate[sid] <- $sids \
-                 ?[id] := candidate[sid], *witnesses{id, source_id: sid} \
-                 :rm witnesses {id}",
-                params,
-            ).map_err(|e| Error::GraphStorage(format!("batched rm witnesses: {e}")))?;
+            // witnesses rows themselves: per-source indexed (same
+            // pattern as the other source-keyed cascades). Inside
+            // the per-source loop above would be cleaner but
+            // ordering it here keeps witness-related ops grouped.
+            for source_id in source_ids {
+                let mut params = BTreeMap::new();
+                params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
+                tx.run_script(
+                    "?[id] := *witnesses{id, source_id: $sid} \
+                     :rm witnesses {id}",
+                    params,
+                ).map_err(|e| Error::GraphStorage(format!(
+                    "per-source rm witnesses ({source_id}): {e}"
+                )))?;
+            }
         }
 
         // ── Claim-keyed cascades ──────────────────────────────────
@@ -5207,16 +5233,19 @@ impl GraphStore {
         }
 
         // sources — must land LAST so prior queries that filter by
-        // source_id still match.
-        {
+        // source_id still match. Per-source PK lookup (sources.id
+        // IS the PK; no IN-set wrapper needed and per-row :rm is
+        // the indexed path).
+        for source_id in source_ids {
             let mut params = BTreeMap::new();
-            params.insert("sids".into(), sids_param());
+            params.insert("sid".into(), DataValue::Str(source_id.as_str().into()));
             tx.run_script(
-                "candidate[sid] <- $sids \
-                 ?[id] := candidate[sid], *sources{id}, id = sid \
+                "?[id] <- [[$sid]] \
                  :rm sources {id}",
                 params,
-            ).map_err(|e| Error::GraphStorage(format!("batched rm sources: {e}")))?;
+            ).map_err(|e| Error::GraphStorage(format!(
+                "per-source rm sources ({source_id}): {e}"
+            )))?;
         }
 
         Ok(())
