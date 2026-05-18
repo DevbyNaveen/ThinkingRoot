@@ -1029,26 +1029,35 @@ async fn run_pipeline_inner(
         affected_triples.extend(cross_file_triples);
     }
 
-    // Per-source cascade — kept sequential per the I-W4 atomic-rebuild
-    // boundary. The cancel checkpoint inside each iteration honors Stop
-    // within one source-removal cycle even on a large workspace.
-    for doc in &truly_changed {
-        bail_if_cancelled!();
-        if uri_to_existing_sids
-            .get(&doc.uri)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-        {
-            storage.graph.remove_source_by_uri(&doc.uri)?;
+    // Batched cascade — ONE multi_transaction across every sid in
+    // `all_phase4_sids`. Tier 2 commit G. Pre-Tier-2 this loop opened
+    // 47 separate Cozo transactions on the canonical 47-source
+    // incremental and additionally fanned out ~30 child :rm scripts
+    // per source — the bench measured 948 ms (47% of total wall
+    // time) here. The batched path runs ~31 IN-set :rm queries
+    // total across the whole batch inside ONE transaction.
+    //
+    // I-W4 atomicity widens from per-source to per-batch (strictly
+    // stronger for concurrent readers — no torn intermediates within
+    // a Phase 4 cycle anymore).
+    bail_if_cancelled!();
+    if !all_phase4_sids.is_empty() {
+        let _stats = storage.graph.transactional_remove_sources(&all_phase4_sids)?;
+        // Advance progress for every source the batch covered.
+        for _ in &truly_changed {
+            progress_state.advance(1);
         }
-        progress_state.advance(1);
+        for _ in &deleted_sources {
+            progress_state.advance(1);
+        }
     }
 
+    // Fingerprints.remove(uri) is filesystem I/O — must run outside
+    // the Cozo transaction (it doesn't participate in the substrate
+    // atomic boundary anyway). Only deleted_sources need this; truly
+    // changed sources' fingerprints get refreshed in Phase 3.
     for (_source_id, uri) in &deleted_sources {
-        bail_if_cancelled!();
-        storage.graph.remove_source_by_uri(uri)?;
         fingerprints.remove(uri);
-        progress_state.advance(1);
     }
     mark_phase!("remove_sources");
 
@@ -1568,15 +1577,21 @@ async fn run_pipeline_inner(
     }
 
     // ─── Phase 8: Incremental entity relation update for new sources ───
+    //
+    // Tier 2 commit H: batched gather. Pre-Tier-2 this loop ran
+    // `get_source_relation_triples(source_id)` ONCE PER truly-changed
+    // source — N round trips on a workspace where N could be 47+.
+    // The batched API consolidates into one CozoDB query with an
+    // IN-set parameter, matching the pattern from Phase 4's pre-
+    // cascade reader block at pipeline.rs:1012.
     progress_state.set_substep("updating relations");
-    let mut new_triples: Vec<(String, String, String)> = Vec::new();
-    for doc in &truly_changed {
-        new_triples.extend(
-            storage
-                .graph
-                .get_source_relation_triples(&doc.source_id.to_string())?,
-        );
-    }
+    let phase8_source_ids: Vec<String> = truly_changed
+        .iter()
+        .map(|d| d.source_id.to_string())
+        .collect();
+    let mut new_triples = storage
+        .graph
+        .get_source_relation_triples_for_sources(&phase8_source_ids)?;
     if new_triples.is_empty() && link_output.relations_linked > 0 {
         tracing::warn!(
             "relations were linked ({}) but no source relation triples found; \

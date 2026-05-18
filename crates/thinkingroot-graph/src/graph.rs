@@ -55,6 +55,20 @@ pub struct V3ClaimExportRow {
 /// it.  The mutex is still required for the writer side because
 /// vector-store mutations and graph schema migrations need to be
 /// linearised against each other.
+/// Outcome of a batched source-removal call.
+///
+/// `entities_removed` counts orphan-sweep deletions (entities that
+/// had no remaining claims AND no remaining source relations after
+/// the cascade landed). The other two counters report the input
+/// shape so callers can sanity-check that the batch covered what
+/// they intended.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveSourcesStats {
+    pub sources_removed: usize,
+    pub claims_removed: usize,
+    pub entities_removed: usize,
+}
+
 #[derive(Clone)]
 pub struct GraphStore {
     db: DbInstance,
@@ -4812,6 +4826,402 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Batched per-compile source removal — atomic across the entire
+    /// batch. Tier 2 commit G (2026-05-18).
+    ///
+    /// Replaces the per-source `remove_source_by_uri` loop in Phase 4.
+    /// Mirrors the `transactional_rebuild_sources` pattern shipped in
+    /// commit B but for the removal direction. The pre-Tier-2 path
+    /// opened one `multi_transaction(true)` per source (47 sources →
+    /// 47 commits → 47 fsyncs) and additionally fanned out ~30 child
+    /// scripts per source — for the canonical 47-source incremental
+    /// the bench measured `remove_sources` at 948 ms, ~47% of total
+    /// wall time. Batching collapses to ONE commit + ~30 IN-set
+    /// queries that fan out across the whole batch.
+    ///
+    /// Strengthens **I-W4** from per-source to per-batch atomicity
+    /// on the removal direction. Concurrent AEP/Hybrid readers now
+    /// observe either the full pre-batch state or the full post-batch
+    /// state of every source touched, never a torn intermediate.
+    /// (Pre-fix, `remove_source_by_id` violated I-W4 — its acknowledged
+    /// "the parent `remove_source_by_id` is not transactional across
+    /// all its child cascades" comment at graph.rs:4722 documented
+    /// the gap.)
+    ///
+    /// Cascade coverage (I-W1) — every byte-anchored substrate row
+    /// vanishes with its source:
+    ///   - 16 structural tables (via `pk_rm_script_for_table_batched`)
+    ///   - source_entity_relations
+    ///   - witnesses + witness_input_edges + witness_typed_edges
+    ///   - resolution_deps (both directions)
+    ///   - events (derived SVO calendar)
+    ///   - all claim-keyed tables: claim_entity_edges,
+    ///     claim_source_edges, claim_temporal, contradictions,
+    ///     trial_verdicts, verification_certificates,
+    ///     derivation_edges, claims
+    ///   - sources
+    ///
+    /// Post-tx (outside the atomic boundary, conservative): turns
+    /// prune (JSON-encoded references; existing helper) + orphan
+    /// entity sweep (per-entity conditional `:rm` keeps the I-W1
+    /// guarantee that an entity with no remaining claims and no
+    /// remaining source relations is GCd).
+    pub fn transactional_remove_sources(
+        &self,
+        source_ids: &[String],
+    ) -> Result<RemoveSourcesStats> {
+        if source_ids.is_empty() {
+            return Ok(RemoveSourcesStats::default());
+        }
+
+        // ── Pre-tx reads: collect every claim_id, entity_id, and
+        // witness_id that will need cascading. Outside the tx because
+        // they're pure reads; the tx body needs them as IN-set
+        // parameters and `multi_transaction(true)` is write-mode.
+        let claim_ids_by_source = self.get_claim_ids_for_sources(source_ids)?;
+        let claim_ids: Vec<String> = claim_ids_by_source
+            .into_values()
+            .flatten()
+            .collect();
+
+        let entity_ids: Vec<String> = self
+            .get_entity_ids_for_sources(source_ids)?
+            .into_iter()
+            .collect();
+
+        // Witness ids that will be cascaded — needed BEFORE the tx so
+        // we can :rm witness edge rows by witness IN-set inside the
+        // tx (edges-before-rows preserves I-W9 even mid-cascade).
+        let witness_ids = self.collect_witness_ids_for_sources(source_ids)?;
+
+        // Build the candidate $rows parameter shapes once. Each entry
+        // is a 1-element inner list: candidate[sid] <- [[s1], [s2], ...].
+        let sid_rows: Vec<DataValue> = source_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let cid_rows: Vec<DataValue> = claim_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let wid_rows: Vec<DataValue> = witness_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+
+        // ── Tx body ────────────────────────────────────────────────
+        let tx = self.db.multi_transaction(true);
+        let cascade_result = self.run_remove_cascade_in_tx(
+            &tx,
+            &sid_rows,
+            &cid_rows,
+            &wid_rows,
+            !claim_ids.is_empty(),
+            !witness_ids.is_empty(),
+        );
+
+        match cascade_result {
+            Ok(()) => tx.commit().map_err(|e| {
+                Error::GraphStorage(format!(
+                    "transactional_remove_sources: commit failed across {} sources: {e}",
+                    source_ids.len()
+                ))
+            })?,
+            Err(e) => {
+                let _ = tx.abort();
+                return Err(e);
+            }
+        }
+
+        // ── Post-tx ops ────────────────────────────────────────────
+        // turns prune walks the (small) turns table in Rust because
+        // claim_ids are JSON-encoded inside the row; the existing
+        // helper already batches across &[String].
+        if !claim_ids.is_empty() {
+            self.prune_turns_referencing_claims(&claim_ids)?;
+        }
+
+        // Orphan entity sweep: per-entity conditional remove. Kept
+        // outside the tx because the condition (`entity_has_claims`
+        // AND `entity_has_source_relations`) reads tables we just
+        // mutated and would deadlock if folded into the same tx —
+        // also the count of affected entities is small relative to
+        // the cascade work that just landed.
+        let mut entities_removed = 0;
+        for entity_id in &entity_ids {
+            if !self.entity_has_claims(entity_id)?
+                && !self.entity_has_source_relations(entity_id)?
+            {
+                self.remove_entity(entity_id)?;
+                entities_removed += 1;
+            }
+        }
+
+        Ok(RemoveSourcesStats {
+            sources_removed: source_ids.len(),
+            claims_removed: claim_ids.len(),
+            entities_removed,
+        })
+    }
+
+    /// Collect every witness id whose `source_id` is in the batch.
+    /// One CozoDB query; used by `transactional_remove_sources` to
+    /// pre-build the IN-set for the witness edge cascades.
+    fn collect_witness_ids_for_sources(&self, source_ids: &[String]) -> Result<Vec<String>> {
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sid_rows: Vec<DataValue> = source_ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("sids".into(), DataValue::List(sid_rows));
+        let result = self
+            .db
+            .run_script(
+                "candidate[sid] <- $sids \
+                 ?[id] := candidate[sid], *witnesses{id, source_id: sid}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("collect_witness_ids_for_sources: {e}"))
+            })?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|dv| match dv {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            }))
+            .collect())
+    }
+
+    /// The cascade body that runs inside `transactional_remove_sources`'s
+    /// `multi_transaction(true)`. Extracted as a separate fn so the
+    /// caller can map its Result to a clean commit/abort branch.
+    fn run_remove_cascade_in_tx(
+        &self,
+        tx: &cozo::MultiTransaction,
+        sid_rows: &[DataValue],
+        cid_rows: &[DataValue],
+        wid_rows: &[DataValue],
+        have_claims: bool,
+        have_witnesses: bool,
+    ) -> Result<()> {
+        use thinkingroot_core::structural_registry::{
+            pk_rm_script_for_table_batched, STRUCTURAL_TABLES,
+        };
+
+        let sids_param = || DataValue::List(sid_rows.to_vec());
+        let cids_param = || DataValue::List(cid_rows.to_vec());
+        let wids_param = || DataValue::List(wid_rows.to_vec());
+
+        // ── Source-keyed cascades ─────────────────────────────────
+
+        // source_entity_relations
+        {
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(
+                "candidate[sid] <- $sids \
+                 ?[source_id, from_id, to_id, relation_type] := \
+                   candidate[sid], \
+                   *source_entity_relations{source_id, from_id, to_id, relation_type, strength}, \
+                   source_id = sid \
+                 :rm source_entity_relations {source_id, from_id, to_id, relation_type}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm source_entity_relations: {e}")))?;
+        }
+
+        // 16 structural tables, one IN-set query each
+        for spec in STRUCTURAL_TABLES {
+            let script = pk_rm_script_for_table_batched(spec.name, spec.source_id_column);
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(&script, params).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "batched rm structural table {}: {e}",
+                    spec.name
+                ))
+            })?;
+        }
+
+        // events (derived SVO calendar) — id-keyed
+        {
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(
+                "candidate[sid] <- $sids \
+                 ?[id] := candidate[sid], *events{id, source_id: sid} \
+                 :rm events {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm events: {e}")))?;
+        }
+
+        // resolution_deps — both directions, single query
+        {
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(
+                "candidate[sid] <- $sids \
+                 ?[from_source_id, to_source_id, kind, edge_id] := \
+                   candidate[sid], \
+                   *resolution_deps{from_source_id, to_source_id, kind, edge_id}, \
+                   (from_source_id = sid or to_source_id = sid) \
+                 :rm resolution_deps {from_source_id, to_source_id, kind, edge_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm resolution_deps: {e}")))?;
+        }
+
+        // Witness Mesh substrate — edges first (I-W9 audit safety),
+        // then rows. All scoped by the pre-collected witness IN-set.
+        if have_witnesses {
+            // witness_input_edges where parent OR child is in the
+            // batch's witness set
+            let mut params = BTreeMap::new();
+            params.insert("wids".into(), wids_param());
+            tx.run_script(
+                "candidate[wid] <- $wids \
+                 ?[parent_witness_id, child_witness_id] := \
+                   candidate[wid], \
+                   *witness_input_edges{parent_witness_id, child_witness_id}, \
+                   (parent_witness_id = wid or child_witness_id = wid) \
+                 :rm witness_input_edges {parent_witness_id, child_witness_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm witness_input_edges: {e}")))?;
+
+            // witness_typed_edges where from OR to is in the witness set
+            let mut params = BTreeMap::new();
+            params.insert("wids".into(), wids_param());
+            tx.run_script(
+                "candidate[wid] <- $wids \
+                 ?[from_witness_id, to_witness_id, edge_type] := \
+                   candidate[wid], \
+                   *witness_typed_edges{from_witness_id, to_witness_id, edge_type}, \
+                   (from_witness_id = wid or to_witness_id = wid) \
+                 :rm witness_typed_edges {from_witness_id, to_witness_id, edge_type}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm witness_typed_edges: {e}")))?;
+
+            // witnesses rows themselves, by source IN-set
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(
+                "candidate[sid] <- $sids \
+                 ?[id] := candidate[sid], *witnesses{id, source_id: sid} \
+                 :rm witnesses {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm witnesses: {e}")))?;
+        }
+
+        // ── Claim-keyed cascades ──────────────────────────────────
+        if have_claims {
+            // claim_entity_edges
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[claim_id, entity_id] := candidate[cid], *claim_entity_edges{claim_id, entity_id}, claim_id = cid \
+                 :rm claim_entity_edges {claim_id, entity_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm claim_entity_edges: {e}")))?;
+
+            // claim_source_edges
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[claim_id, source_id] := candidate[cid], *claim_source_edges{claim_id, source_id}, claim_id = cid \
+                 :rm claim_source_edges {claim_id, source_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm claim_source_edges: {e}")))?;
+
+            // claim_temporal
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[claim_id] := candidate[cid], *claim_temporal{claim_id} \
+                 :rm claim_temporal {claim_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm claim_temporal: {e}")))?;
+
+            // contradictions where claim_a OR claim_b in cid set
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[id] := candidate[cid], *contradictions{id, claim_a, claim_b}, (claim_a = cid or claim_b = cid) \
+                 :rm contradictions {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm contradictions: {e}")))?;
+
+            // trial_verdicts
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[id] := candidate[cid], *trial_verdicts{id, claim_id}, claim_id = cid \
+                 :rm trial_verdicts {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm trial_verdicts: {e}")))?;
+
+            // verification_certificates
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[hash] := candidate[cid], *verification_certificates{hash, claim_id}, claim_id = cid \
+                 :rm verification_certificates {hash}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm verification_certificates: {e}")))?;
+
+            // derivation_edges — parent OR child in cid set
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[parent_claim_id, child_claim_id] := \
+                   candidate[cid], \
+                   *derivation_edges{parent_claim_id, child_claim_id}, \
+                   (parent_claim_id = cid or child_claim_id = cid) \
+                 :rm derivation_edges {parent_claim_id, child_claim_id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm derivation_edges: {e}")))?;
+
+            // claims themselves — must land LAST among claim-keyed
+            // cascades because the prior :rm queries match against
+            // claim_id columns and we need claims rows to still
+            // exist for them to find. The order below mirrors the
+            // per-source path's order at graph.rs:4821-4838.
+            let mut params = BTreeMap::new();
+            params.insert("cids".into(), cids_param());
+            tx.run_script(
+                "candidate[cid] <- $cids \
+                 ?[id] := candidate[cid], *claims{id}, id = cid \
+                 :rm claims {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm claims: {e}")))?;
+        }
+
+        // sources — must land LAST so prior queries that filter by
+        // source_id still match.
+        {
+            let mut params = BTreeMap::new();
+            params.insert("sids".into(), sids_param());
+            tx.run_script(
+                "candidate[sid] <- $sids \
+                 ?[id] := candidate[sid], *sources{id}, id = sid \
+                 :rm sources {id}",
+                params,
+            ).map_err(|e| Error::GraphStorage(format!("batched rm sources: {e}")))?;
+        }
+
+        Ok(())
+    }
+
     fn remove_source_by_id(&self, source_id: &str) -> Result<()> {
         let claim_ids = self.get_claim_ids_for_source(source_id)?;
         self.remove_source_relations(source_id)?;
@@ -6789,6 +7199,218 @@ mod tests {
                 .find_sources_by_uri("test://doc.md")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // ── transactional_remove_sources (Tier 2 commit G) ──────────────────
+
+    #[test]
+    fn transactional_remove_sources_empty_batch_is_noop() {
+        let store = mem_store();
+        let stats = store.transactional_remove_sources(&[]).unwrap();
+        assert_eq!(stats, RemoveSourcesStats::default());
+    }
+
+    #[test]
+    fn transactional_remove_sources_single_matches_per_source_path() {
+        let store = mem_store();
+        let source = thinkingroot_core::Source::new(
+            "test://single.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("hash-single".into()));
+        store.insert_source(&source).unwrap();
+
+        let entity = thinkingroot_core::Entity::new(
+            "Alpha",
+            thinkingroot_core::types::EntityType::System,
+        );
+        store.insert_entity(&entity).unwrap();
+
+        let claim = thinkingroot_core::Claim::new(
+            "single claim",
+            thinkingroot_core::types::ClaimType::Fact,
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        store.insert_claim(&claim).unwrap();
+        store
+            .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())
+            .unwrap();
+        store
+            .link_claim_to_entity(&claim.id.to_string(), &entity.id.to_string())
+            .unwrap();
+        store
+            .link_entities_for_source(
+                &source.id.to_string(),
+                &entity.id.to_string(),
+                &entity.id.to_string(),
+                "Uses",
+                1.0,
+            )
+            .unwrap();
+
+        let stats = store
+            .transactional_remove_sources(&[source.id.to_string()])
+            .unwrap();
+        assert_eq!(stats.sources_removed, 1);
+        assert_eq!(stats.claims_removed, 1);
+        assert!(stats.entities_removed >= 1, "orphan sweep should remove the entity");
+
+        let (sources, claims, entities) = store.get_counts().unwrap();
+        assert_eq!(sources, 0);
+        assert_eq!(claims, 0);
+        // Entity count may be 0 (cleaned by sweep) or higher if test
+        // fixtures pre-seeded entities; the invariant is "the test
+        // entity has no remaining claim refs", not "entity count is 0".
+        assert!(entities <= 1);
+    }
+
+    #[test]
+    fn transactional_remove_sources_three_atomic_clears_all() {
+        let store = mem_store();
+        let ws = thinkingroot_core::types::WorkspaceId::new();
+        let mut source_ids = Vec::new();
+        let mut claim_ids = Vec::new();
+
+        for k in 0..3 {
+            let source = thinkingroot_core::Source::new(
+                format!("test://batch-{k}.md"),
+                thinkingroot_core::types::SourceType::File,
+            )
+            .with_hash(thinkingroot_core::types::ContentHash(format!("hash-batch-{k}")));
+            store.insert_source(&source).unwrap();
+            source_ids.push(source.id.to_string());
+
+            let claim = thinkingroot_core::Claim::new(
+                format!("claim {k}"),
+                thinkingroot_core::types::ClaimType::Fact,
+                source.id,
+                ws,
+            );
+            store.insert_claim(&claim).unwrap();
+            store
+                .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())
+                .unwrap();
+            claim_ids.push(claim.id.to_string());
+        }
+
+        let stats = store.transactional_remove_sources(&source_ids).unwrap();
+        assert_eq!(stats.sources_removed, 3);
+        assert_eq!(stats.claims_removed, 3);
+
+        let (sources, claims, _entities) = store.get_counts().unwrap();
+        assert_eq!(sources, 0, "all three sources must be removed");
+        assert_eq!(claims, 0, "all three claims must be removed");
+    }
+
+    #[test]
+    fn transactional_remove_sources_leaves_bystander_untouched() {
+        let store = mem_store();
+        let ws = thinkingroot_core::types::WorkspaceId::new();
+
+        let bystander = thinkingroot_core::Source::new(
+            "test://bystander.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("h-by".into()));
+        store.insert_source(&bystander).unwrap();
+        let bystander_claim = thinkingroot_core::Claim::new(
+            "bystander claim",
+            thinkingroot_core::types::ClaimType::Fact,
+            bystander.id,
+            ws,
+        );
+        store.insert_claim(&bystander_claim).unwrap();
+        store
+            .link_claim_to_source(
+                &bystander_claim.id.to_string(),
+                &bystander.id.to_string(),
+            )
+            .unwrap();
+
+        let target = thinkingroot_core::Source::new(
+            "test://target.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("h-t".into()));
+        store.insert_source(&target).unwrap();
+        let target_claim = thinkingroot_core::Claim::new(
+            "target claim",
+            thinkingroot_core::types::ClaimType::Fact,
+            target.id,
+            ws,
+        );
+        store.insert_claim(&target_claim).unwrap();
+        store
+            .link_claim_to_source(
+                &target_claim.id.to_string(),
+                &target.id.to_string(),
+            )
+            .unwrap();
+
+        let stats = store
+            .transactional_remove_sources(&[target.id.to_string()])
+            .unwrap();
+        assert_eq!(stats.sources_removed, 1);
+        assert_eq!(stats.claims_removed, 1);
+
+        // Bystander state is fully preserved.
+        let (sources, claims, _) = store.get_counts().unwrap();
+        assert_eq!(sources, 1);
+        assert_eq!(claims, 1);
+
+        let bystander_lookup = store.find_sources_by_uri("test://bystander.md").unwrap();
+        assert_eq!(bystander_lookup.len(), 1);
+    }
+
+    #[test]
+    fn transactional_remove_sources_cascades_resolution_deps_both_directions() {
+        let store = mem_store();
+        let source = thinkingroot_core::Source::new(
+            "test://rd-target.rs".into(),
+            thinkingroot_core::types::SourceType::File,
+        )
+        .with_hash(thinkingroot_core::types::ContentHash("h-rd".into()));
+        store.insert_source(&source).unwrap();
+
+        // Seed resolution_deps where this source is the target (from-other-to-target).
+        store
+            .record_resolution_dep(
+                "other-src-A",
+                &source.id.to_string(),
+                "function_call",
+                "edge-incoming",
+            )
+            .unwrap();
+        // And where this source is the from-side (target-to-other).
+        store
+            .record_resolution_dep(
+                &source.id.to_string(),
+                "other-src-B",
+                "code_link",
+                "edge-outgoing",
+            )
+            .unwrap();
+
+        let stats = store
+            .transactional_remove_sources(&[source.id.to_string()])
+            .unwrap();
+        assert_eq!(stats.sources_removed, 1);
+
+        // Both resolution_deps directions must be cascaded — I-W3 setup
+        // requires that no resolution_deps row references a deleted
+        // source on either side, otherwise list_dependent_sources
+        // returns phantom deps.
+        let rd_probe = store
+            .query_read(
+                "?[from_source_id, to_source_id] := *resolution_deps{from_source_id, to_source_id, kind, edge_id}",
+            )
+            .unwrap();
+        assert!(
+            rd_probe.rows.is_empty(),
+            "resolution_deps both directions must be cascaded; got {} surviving rows",
+            rd_probe.rows.len()
         );
     }
 
