@@ -61,7 +61,6 @@
     @apply ring-1 ring-ring/45 ring-offset-0;
   }
 
-  /* Removed custom webkit scrollbar rules to allow native OS auto-hiding overlay scrollbars. */
 }
 
 @layer utilities {
@@ -73,6 +72,47 @@
   .window-no-drag {
     -webkit-app-region: no-drag;
     app-region: no-drag;
+  }
+
+  /*
+   * Radix ScrollArea injects a wrapper with display:table + min-width:100%,
+   * which makes sidebar rows flush the panel border at minimum width.
+   */
+  .sidebar-scroll-viewport > div {
+    display: block !important;
+    min-width: 0 !important;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  /* Thin, dim scrollbars — scoped to main panes (not global *). */
+  .app-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.18) transparent;
+  }
+  .app-scroll::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  .app-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .app-scroll::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.18);
+    border-radius: 3px;
+  }
+  .app-scroll::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.28);
+  }
+
+  /* Chat inline file/path refs — read like prose, not boxed chips. */
+  .chat-markdown .inline-reference {
+    border: none;
+    background: transparent;
+    padding: 0;
+    border-bottom: 1px dotted hsl(var(--muted-foreground) / 0.38);
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
   }
 
   /* Shimmer used by skeleton loaders while streaming. */

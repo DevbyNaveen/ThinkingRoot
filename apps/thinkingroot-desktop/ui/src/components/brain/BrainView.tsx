@@ -10,18 +10,18 @@
  * ratio survives a reload.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RefreshCw, AlertTriangle } from "lucide-react";
+import { AlertTriangle, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { RefreshIcon } from "@/components/ui/refresh-icon";
 import { useApp } from "@/store/app";
-import {
-  onWorkspacesChanged,
-} from "@/lib/tauri";
+import { onWorkspacesChanged, type BrainSnapshot } from "@/lib/tauri";
 import {
   getCachedBrainSnapshot,
   refreshBrainSnapshotCache,
   subscribeBrainSnapshotCache,
 } from "@/store/brain-cache";
+import { cn } from "@/lib/utils";
 import { BrainGraph } from "./BrainGraph";
 import { BrainTable } from "./BrainTable";
 
@@ -180,60 +180,12 @@ export function BrainView({
 
   return (
     <div className="flex h-full flex-col">
-      {panelMode ? (
-        <div className="flex shrink-0 items-center justify-between border-b border-border/50 px-3 py-1.5">
-          {snap && (
-            <span className="text-[10px] text-muted-foreground">
-              {snap.claims.length} claims · {snap.entities.length} entities
-              {loading && " · updating"}
-            </span>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            className="ml-auto h-5 w-5"
-            onClick={() => void load()}
-            disabled={loading}
-            aria-label="Reload"
-          >
-            <RefreshCw className={loading ? "size-3 animate-spin" : "size-3"} />
-          </Button>
-        </div>
-      ) : (
+      {!panelMode && (
         <>
           <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-4">
             <span className="text-sm font-medium">{activeWorkspace}</span>
             <span className="text-muted-foreground">·</span>
             <span className="text-xs text-muted-foreground">Brain</span>
-            {snap && (
-              <span className="ml-2 text-[10px] text-muted-foreground">
-                {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
-                {snap.relations.length} relations
-                {loading && <> · updating</>}
-                {!loading && lastLoadedAt > 0 && (
-                  <> · cached {formatCacheAge(lastLoadedAt)}</>
-                )}
-                {brief && brief.contradiction_count > 0 && (
-                  <>
-                    {" · "}
-                    <span className="text-amber-600 dark:text-amber-400">
-                      {brief.contradiction_count} contradiction
-                      {brief.contradiction_count === 1 ? "" : "s"}
-                    </span>
-                  </>
-                )}
-              </span>
-            )}
-            <Button
-              variant="ghost"
-              size="icon"
-              className="ml-auto h-7 w-7"
-              onClick={() => void load()}
-              disabled={loading}
-              aria-label="Reload"
-            >
-              <RefreshCw className={loading ? "size-3.5 animate-spin" : "size-3.5"} />
-            </Button>
           </header>
           {brief && brief.top_entities.length > 0 && (
             <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border bg-muted/10 px-4 py-1.5">
@@ -275,12 +227,21 @@ export function BrainView({
           className="relative min-h-[100px] border-b border-border"
           style={{ height: `${topHeight}%` }}
         >
+          {snap ? (
+            <BrainGraphHud
+              snap={snap}
+              loading={loading}
+              panelMode={panelMode}
+              lastLoadedAt={lastLoadedAt}
+              contradictionCount={brief?.contradiction_count ?? 0}
+              onReload={() => void load()}
+            />
+          ) : null}
           <div className={isDragging ? "pointer-events-none h-full" : "h-full"}>
             {snap ? (
               <BrainGraph
                 key={activeWorkspace}
                 cacheKey={activeWorkspace}
-                isRefreshing={loading}
                 isVisible={isVisible}
                 entities={snap.entities}
                 relations={snap.relations}
@@ -317,6 +278,67 @@ export function BrainView({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function BrainGraphHud({
+  snap,
+  loading,
+  panelMode,
+  lastLoadedAt,
+  contradictionCount,
+  onReload,
+}: {
+  snap: BrainSnapshot;
+  loading: boolean;
+  panelMode: boolean;
+  lastLoadedAt: number;
+  contradictionCount: number;
+  onReload: () => void;
+}) {
+  return (
+    <div className="pointer-events-none absolute right-2 top-2 z-20 flex items-center gap-1.5">
+      <span
+        className={cn(
+          "rounded-lg border border-border/50 bg-surface/90 px-2.5 py-1",
+          "text-[10px] tabular-nums text-muted-foreground shadow-sm backdrop-blur-md",
+        )}
+      >
+        {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
+        {snap.relations.length} relations
+        {loading ? (
+          <span className="ml-1.5 text-accent">updating</span>
+        ) : !panelMode && lastLoadedAt > 0 ? (
+          <span className="ml-1.5 opacity-70">· {formatCacheAge(lastLoadedAt)}</span>
+        ) : null}
+        {contradictionCount > 0 ? (
+          <span className="ml-1.5 text-amber-600 dark:text-amber-400">
+            · {contradictionCount} contradiction
+            {contradictionCount === 1 ? "" : "s"}
+          </span>
+        ) : null}
+      </span>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className={cn(
+          "pointer-events-auto h-7 w-7 rounded-lg border border-border/50",
+          "bg-surface/90 shadow-sm backdrop-blur-md",
+          "hover:bg-muted/60",
+        )}
+        onClick={onReload}
+        disabled={loading}
+        aria-label={loading ? "Refreshing graph" : "Refresh graph"}
+        title={loading ? "Refreshing…" : "Refresh graph"}
+      >
+        {loading ? (
+          <Loader2 className="size-3.5 animate-spin text-accent" aria-hidden />
+        ) : (
+          <RefreshIcon className="size-3.5 text-muted-foreground" aria-hidden />
+        )}
+      </Button>
     </div>
   );
 }

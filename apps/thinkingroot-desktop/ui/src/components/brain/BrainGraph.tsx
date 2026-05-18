@@ -51,8 +51,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { zoom, zoomIdentity, type ZoomBehavior, type ZoomTransform } from "d3-zoom";
 import { select } from "d3-selection";
-import { motion } from "framer-motion";
-
 import type { BrainEntity, BrainRelation, ClaimRow } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useBrainActivation, type ActivationKind } from "@/store/brain";
@@ -74,7 +72,6 @@ interface Props {
   claims?: ClaimRow[];
   searchQuery?: string;
   cacheKey?: string;
-  isRefreshing?: boolean;
   /** When false the simulation pauses.  Defaults to true. */
   isVisible?: boolean;
 }
@@ -181,7 +178,6 @@ export function BrainGraph({
   claims = [],
   searchQuery,
   cacheKey,
-  isRefreshing = false,
   isVisible = true,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -856,61 +852,31 @@ export function BrainGraph({
         onMouseLeave={() => setHovered(null)}
         className="block h-full w-full touch-none outline-none cursor-crosshair"
       />
-      <Legend
-        nodeCount={nodes.length}
-        linkCount={links.length}
-        isRefreshing={isRefreshing}
-        isPaused={!isVisible}
-      />
+      <GraphInteractionHint isPaused={!isVisible} />
     </div>
   );
 }
 
 // ───────────────────────── Auxiliaries ────────────────────────────────
 
-function Legend({
-  nodeCount,
-  linkCount,
-  isRefreshing,
-  isPaused,
-}: {
-  nodeCount: number;
-  linkCount: number;
-  isRefreshing: boolean;
-  isPaused: boolean;
-}) {
+/** Pan/zoom hint only — counts live in BrainView's top-right HUD. */
+function GraphInteractionHint({ isPaused }: { isPaused: boolean }) {
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
+    <div
       className={cn(
-        "pointer-events-none absolute bottom-3 left-3 flex items-center gap-3",
-        "rounded-md border border-border bg-surface-elevated/95 px-3 py-1.5",
-        "text-[10px] text-muted-foreground shadow-pill",
+        "pointer-events-none absolute bottom-3 left-3 flex items-center gap-2",
+        "rounded-lg border border-border/50 bg-surface/90 px-2.5 py-1",
+        "text-[10px] text-muted-foreground shadow-sm backdrop-blur-md",
       )}
     >
-      <span>
-        <span className="font-mono text-foreground">{nodeCount}</span> entities
-      </span>
-      <span className="text-border">·</span>
-      <span>
-        <span className="font-mono text-foreground">{linkCount}</span> relations
-      </span>
-      {isRefreshing && (
+      {isPaused ? (
         <>
-          <span className="text-border">·</span>
-          <span className="text-accent">updating</span>
-        </>
-      )}
-      {isPaused && (
-        <>
-          <span className="text-border">·</span>
           <span className="text-muted-foreground/80">paused</span>
+          <span className="text-border/80">·</span>
         </>
-      )}
-      <span className="text-border">·</span>
+      ) : null}
       <span>scroll to zoom · drag to pan</span>
-    </motion.div>
+    </div>
   );
 }
 

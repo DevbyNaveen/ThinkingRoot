@@ -17,6 +17,7 @@ pub mod intelligence;
 pub mod maintenance;
 pub mod mcp;
 pub mod memory_tree;
+pub mod operator_tools;
 pub mod scheduler;
 pub mod pipeline;
 pub mod rest;

@@ -37,6 +37,7 @@
 //! | `memories` | `list_claims` latest-first |
 //! | `forget(id)` | look up claim → its source → `forget_source` |
 
+pub mod tokens;
 pub mod types;
 
 use std::sync::Arc;
@@ -67,6 +68,11 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/remember", post(remember_handler))
         .route("/smart-search", post(smart_search_handler))
         .route("/forget", post(forget_handler))
+        // Phase 2 central-AI-plan (2026-05-18) — token issuance for
+        // per-tool authentication. Any AI plugged into the daemon
+        // posts here with its User-Agent + desired scope; receives a
+        // bearer token to use on subsequent calls.
+        .route("/connect", post(connect_handler))
         .with_state(state)
 }
 
@@ -102,10 +108,366 @@ pub(crate) fn agentmemory_auth_check(headers: &HeaderMap) -> Result<(), (StatusC
     Err((StatusCode::UNAUTHORIZED, "missing or invalid bearer token"))
 }
 
+/// Phase 2 central-AI-plan (2026-05-18) — outcome of the layered
+/// auth check. Three states reflect the three legitimate authentication
+/// surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    /// Caller presented a valid per-tool bearer token. The carried
+    /// data is what `AgentmemoryTokenStore::verify` returned —
+    /// project scope + read/write scope + connecting user agent.
+    PerTool {
+        project: Option<String>,
+        scope: tokens::ScopeKind,
+        client_user_agent: String,
+    },
+    /// Caller presented the global `THINKINGROOT_AGENTMEMORY_SECRET`.
+    /// No per-tool scoping; treated as ReadWrite on any project.
+    GlobalSecret,
+    /// No auth required (no env var set, no tokens in store, or
+    /// loopback-only deployment). Treated as ReadWrite on any
+    /// project — same as the pre-Phase-2 behaviour.
+    Anonymous,
+}
+
+impl AuthOutcome {
+    /// Does this caller have write privileges on `target_project`?
+    pub(crate) fn permits_write_on(&self, target_project: &str) -> bool {
+        match self {
+            AuthOutcome::PerTool { project, scope, .. } => {
+                if !scope.permits_write() {
+                    return false;
+                }
+                // Per-tool tokens scoped to a specific project must
+                // not write to other projects. `None` means "any
+                // project" (the unbound case the /connect handler
+                // mints when no project is specified at issue time).
+                match project.as_deref() {
+                    Some(scoped) => scoped == target_project,
+                    None => true,
+                }
+            }
+            AuthOutcome::GlobalSecret | AuthOutcome::Anonymous => true,
+        }
+    }
+
+    /// Does this caller have any access (read or write) on
+    /// `target_project`?
+    pub(crate) fn permits_read_on(&self, target_project: &str) -> bool {
+        match self {
+            AuthOutcome::PerTool { project, .. } => match project.as_deref() {
+                Some(scoped) => scoped == target_project,
+                None => true,
+            },
+            AuthOutcome::GlobalSecret | AuthOutcome::Anonymous => true,
+        }
+    }
+}
+
+/// Phase 2 central-AI-plan (2026-05-18) — layered auth check that
+/// consults per-tool tokens BEFORE the legacy global secret.
+///
+/// Layer order:
+///   1. Bearer present + matches a per-tool token → PerTool
+///   2. Bearer present + matches `THINKINGROOT_AGENTMEMORY_SECRET` →
+///      GlobalSecret
+///   3. No bearer + global secret env var unset → Anonymous (loopback
+///      default; backwards-compatible with the original Phase E.4
+///      shape)
+///   4. Otherwise → 401
+///
+/// Updates `last_seen` on the matching per-tool token. Reads are
+/// constant-time at the BLAKE3 level (see `tokens.rs`).
+pub(crate) async fn check_auth_layered(
+    headers: &HeaderMap,
+    token_store: &Arc<tokio::sync::RwLock<tokens::AgentmemoryTokenStore>>,
+) -> Result<AuthOutcome, (StatusCode, &'static str)> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    // Layer 1: per-tool token check.
+    if let Some(presented) = bearer {
+        let mut store = token_store.write().await;
+        if let Some(token) = store.verify(presented) {
+            let outcome = AuthOutcome::PerTool {
+                project: token.project.clone(),
+                scope: token.scope,
+                client_user_agent: token.client_user_agent.clone(),
+            };
+            // The `verify` call already bumped last_seen; persist
+            // to disk best-effort. A failure to save shouldn't
+            // refuse the request — last_seen is observability,
+            // not correctness. Log + continue.
+            let store_clone = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store_clone.save() {
+                    tracing::warn!(error = %e, "agentmemory-tokens.json save failed (last_seen not persisted)");
+                }
+            });
+            return Ok(outcome);
+        }
+        // Layer 2: bearer didn't match a token; check global secret.
+        if let Ok(secret) = std::env::var("THINKINGROOT_AGENTMEMORY_SECRET") {
+            if !secret.is_empty() {
+                use subtle::ConstantTimeEq;
+                if bool::from(presented.as_bytes().ct_eq(secret.as_bytes())) {
+                    return Ok(AuthOutcome::GlobalSecret);
+                }
+                // Bearer provided but doesn't match anything →
+                // explicit 401. Anonymous fall-through would be a
+                // security regression here.
+                return Err((StatusCode::UNAUTHORIZED, "invalid bearer token"));
+            }
+        }
+        // Bearer provided but no global secret env var → still
+        // explicit 401. A bearer that matches nothing is a misuse,
+        // not legitimate anonymous access.
+        return Err((StatusCode::UNAUTHORIZED, "invalid bearer token"));
+    }
+
+    // Layer 3: no bearer presented. Anonymous only when the global
+    // secret env var is also unset (Phase E.4 default).
+    match std::env::var("THINKINGROOT_AGENTMEMORY_SECRET") {
+        Ok(s) if !s.is_empty() => Err((StatusCode::UNAUTHORIZED, "missing bearer token")),
+        _ => Ok(AuthOutcome::Anonymous),
+    }
+}
+
+/// Phase 2 central-AI-plan (2026-05-18) — auto-provision a workspace
+/// when an unknown `project` is targeted. Creates a directory under
+/// `<config>/thinkingroot/auto-provisioned/<sanitized_project>/` plus
+/// its `.thinkingroot/` substrate dir, then mounts via
+/// `engine.mount(name, root)`.
+///
+/// Returns:
+/// - `Ok(true)` if the workspace already existed (no-op)
+/// - `Ok(true)` if the workspace was auto-provisioned successfully
+/// - `Ok(false)` if auto-provisioning is disabled and the workspace
+///   doesn't exist (caller emits 404)
+/// - `Err((status, msg))` for actual failures (filesystem, mount)
+///
+/// Honours `THINKINGROOT_AGENTMEMORY_AUTO_PROVISION` env var:
+/// - "1" / "true" / "yes" → enabled
+/// - anything else / unset → disabled (caller emits the existing 404)
+pub(crate) async fn ensure_workspace_mounted(
+    state: &Arc<AppState>,
+    project: &str,
+) -> Result<bool, (StatusCode, String)> {
+    // Read-check first to avoid touching the write lock unless we
+    // genuinely need to mount. Drop the read guard before considering
+    // the write path — same lock-discipline as the compile fastpath.
+    {
+        let engine = state.engine.read().await;
+        if engine.workspace_root_path(project).is_some() {
+            return Ok(true);
+        }
+    }
+
+    let enabled = matches!(
+        std::env::var("THINKINGROOT_AGENTMEMORY_AUTO_PROVISION")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    if !enabled {
+        return Ok(false);
+    }
+
+    // Sanitize project name for filesystem use. Replace anything
+    // outside [A-Za-z0-9._-] with `_` to defend against `..`-style
+    // escape attempts.
+    let sanitized: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized.starts_with('.') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("project name `{project}` is not safe for auto-provisioning"),
+        ));
+    }
+
+    let base = dirs::config_dir()
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no config dir for auto-provisioned workspaces".to_string(),
+            )
+        })?
+        .join("thinkingroot")
+        .join("auto-provisioned")
+        .join(&sanitized);
+
+    // Create both the workspace root + its .thinkingroot data dir.
+    let data_dir = base.join(".thinkingroot");
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("auto-provision mkdir at {}: {e}", data_dir.display()),
+        ));
+    }
+
+    // Mount under the write lock.
+    let mut engine = state.engine.write().await;
+    if let Err(e) = engine.mount(project.to_string(), base.clone()).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("auto-provision mount: {e}"),
+        ));
+    }
+    tracing::info!(
+        project = project,
+        path = %base.display(),
+        "auto-provisioned workspace for agentmemory client"
+    );
+    Ok(true)
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectRequest {
+    /// User-Agent string the connecting tool wants stored on its
+    /// token. Lets the dashboard render "Cursor 1.0" without the
+    /// user having to label tokens. Honest fallback when absent:
+    /// use the HTTP User-Agent header.
+    #[serde(default)]
+    client_user_agent: Option<String>,
+    /// Project scope. `None` means "any project on this daemon".
+    /// When set, the issued token can only access that project.
+    #[serde(default)]
+    project: Option<String>,
+    /// Desired scope. Default `read_write` — most connecting AIs
+    /// want both `/remember` and `/smart-search`.
+    #[serde(default = "default_connect_scope")]
+    requested_scope: String,
+}
+
+fn default_connect_scope() -> String {
+    "read_write".to_string()
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ConnectResponse {
+    /// The raw bearer token. Returned exactly once; the store
+    /// retains only the BLAKE3. The client MUST store this on
+    /// its end and present it via `Authorization: Bearer <token>`
+    /// on subsequent agentmemory calls.
+    token: String,
+    /// The token's BLAKE3 prefix (first 12 hex chars). Useful for
+    /// the dashboard "revoke this token" UX — the user matches the
+    /// prefix shown next to a tool's entry.
+    token_id: String,
+    project: Option<String>,
+    scope: String,
+}
+
+async fn connect_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ConnectRequest>,
+) -> impl IntoResponse {
+    // Layered auth: the connect endpoint itself requires either
+    // a valid global secret OR loopback anonymous (when the global
+    // secret env var is unset). We deliberately do NOT consult per-
+    // tool tokens here — a tool can't mint another tool's token.
+    //
+    // Loopback-only enforcement is at the listener level (the
+    // daemon binds 127.0.0.1 by default); when the user explicitly
+    // binds non-loopback they must set the global secret env var.
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let env_secret = std::env::var("THINKINGROOT_AGENTMEMORY_SECRET").ok();
+    let auth_ok = match (&env_secret, presented) {
+        (Some(secret), Some(token)) if !secret.is_empty() => {
+            use subtle::ConstantTimeEq;
+            bool::from(token.as_bytes().ct_eq(secret.as_bytes()))
+        }
+        (Some(secret), None) if !secret.is_empty() => false,
+        _ => true, // env secret unset → anonymous loopback is fine
+    };
+    if !auth_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "agentmemory /connect requires the global bearer secret when THINKINGROOT_AGENTMEMORY_SECRET is set",
+        )
+            .into_response();
+    }
+
+    let scope = match req.requested_scope.as_str() {
+        "read" | "read_only" | "readonly" => tokens::ScopeKind::ReadOnly,
+        "read_write" | "readwrite" | "rw" => tokens::ScopeKind::ReadWrite,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown requested_scope `{other}` (expected `read` or `read_write`)"),
+            )
+                .into_response();
+        }
+    };
+
+    let user_agent = req
+        .client_user_agent
+        .or_else(|| {
+            headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let (raw_token, prefix) = {
+        let mut store = state.agentmemory_tokens.write().await;
+        let raw = store.issue(req.project.clone(), scope, user_agent);
+        // The last entry must be the one we just issued. Capture
+        // its BLAKE3 prefix BEFORE persisting so the prefix is
+        // returned even if the save() races a sibling write.
+        let prefix = store
+            .tokens
+            .last()
+            .map(|t| t.token_blake3.chars().take(12).collect::<String>())
+            .unwrap_or_default();
+        if let Err(e) = store.save() {
+            // The token is already in the in-memory store and
+            // will authenticate this session, but won't survive
+            // a daemon restart. Surface honestly.
+            tracing::warn!(error = %e, "agentmemory-tokens.json save failed — token will not persist across daemon restart");
+        }
+        (raw, prefix)
+    };
+
+    let scope_str = match scope {
+        tokens::ScopeKind::ReadOnly => "read".to_string(),
+        tokens::ScopeKind::ReadWrite => "read_write".to_string(),
+    };
+    Json(ConnectResponse {
+        token: raw_token,
+        token_id: prefix,
+        project: req.project,
+        scope: scope_str,
+    })
+    .into_response()
+}
+
 // ── Handlers ───────────────────────────────────────────────────────
 
-async fn livez_handler(headers: HeaderMap) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
+async fn livez_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // livez routes through the layered auth so the answer is
+    // consistent — anonymous gets through when no auth is
+    // configured, otherwise a bearer is required. Same shape as
+    // every other handler now.
+    if let Err((code, msg)) = check_auth_layered(&headers, &state.agentmemory_tokens).await {
         return (code, msg).into_response();
     }
     Json(LivezResponse {
@@ -119,7 +481,14 @@ async fn projects_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
+    // /projects lists ALL workspaces; per-tool tokens scoped to one
+    // project still get the full list (read on "list of project
+    // names" isn't the same as read on those projects' contents).
+    // If you want stricter, filter the response here based on the
+    // token's `project` field — current behaviour is "list is
+    // metadata, contents stay gated by the per-handler scope
+    // checks".
+    if let Err((code, msg)) = check_auth_layered(&headers, &state.agentmemory_tokens).await {
         return (code, msg).into_response();
     }
     let engine_guard = state.engine.read().await;
@@ -164,14 +533,25 @@ async fn memories_handler(
     headers: HeaderMap,
     Query(params): Query<MemoriesQuery>,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
-        return (code, msg).into_response();
+    let auth_outcome = match check_auth_layered(&headers, &state.agentmemory_tokens).await {
+        Ok(o) => o,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let project = {
+        let engine_guard = state.engine.read().await;
+        match resolve_project(&engine_guard, params.project.as_deref()).await {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        }
+    };
+    if !auth_outcome.permits_read_on(&project) {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("token scope does not permit read on project `{project}`"),
+        )
+            .into_response();
     }
     let engine_guard = state.engine.read().await;
-    let project = match resolve_project(&engine_guard, params.project.as_deref()).await {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
     let claims = match engine_guard
         .list_claims(&project, ClaimFilter::default())
         .await
@@ -201,18 +581,38 @@ async fn remember_handler(
     headers: HeaderMap,
     Json(req): Json<RememberRequest>,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
-        return (code, msg).into_response();
-    }
-    let engine_guard = state.engine.read().await;
+    // Phase 2 central-AI-plan: layered auth — per-tool token wins
+    // over global secret, with anonymous loopback as the final
+    // fallback when no auth is configured.
+    let auth_outcome = match check_auth_layered(&headers, &state.agentmemory_tokens).await {
+        Ok(o) => o,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
     let project = req.project.clone();
-    if engine_guard.workspace_root_path(&project).is_none() {
+    if !auth_outcome.permits_write_on(&project) {
         return (
-            StatusCode::NOT_FOUND,
-            format!("project '{project}' not mounted"),
+            StatusCode::FORBIDDEN,
+            format!("token scope does not permit write on project `{project}`"),
         )
             .into_response();
     }
+    // Phase 2 central-AI-plan: auto-provision the workspace when
+    // missing AND the user has opted in via env var. Falls back to
+    // 404 otherwise — same shape as the original handler.
+    match ensure_workspace_mounted(&state, &project).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "project '{project}' not mounted (set THINKINGROOT_AGENTMEMORY_AUTO_PROVISION=1 to auto-create)"
+                ),
+            )
+                .into_response();
+        }
+        Err((code, msg)) => return (code, msg).into_response(),
+    }
+    let engine_guard = state.engine.read().await;
     // Generate a unique session-id-equivalent for this memory so
     // contribute_claims_as creates a one-memory-per-source mapping.
     // Lets forget(id) remove EXACTLY this memory without touching
@@ -264,14 +664,44 @@ async fn smart_search_handler(
     headers: HeaderMap,
     Json(req): Json<SmartSearchRequest>,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
-        return (code, msg).into_response();
+    let auth_outcome = match check_auth_layered(&headers, &state.agentmemory_tokens).await {
+        Ok(o) => o,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    // Resolve project under a brief read lock; drop before
+    // potentially write-locking via auto-provision.
+    let project = {
+        let engine_guard = state.engine.read().await;
+        match resolve_project(&engine_guard, req.project.as_deref()).await {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        }
+    };
+    if !auth_outcome.permits_read_on(&project) {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("token scope does not permit read on project `{project}`"),
+        )
+            .into_response();
+    }
+    // Auto-provision is a no-op for already-mounted workspaces; for
+    // smart-search on an unknown project we want to surface the
+    // empty result honestly, but ensure_workspace_mounted still
+    // creates the workspace if opted in.
+    match ensure_workspace_mounted(&state, &project).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "project '{project}' not mounted (set THINKINGROOT_AGENTMEMORY_AUTO_PROVISION=1 to auto-create)"
+                ),
+            )
+                .into_response();
+        }
+        Err((code, msg)) => return (code, msg).into_response(),
     }
     let engine_guard = state.engine.read().await;
-    let project = match resolve_project(&engine_guard, req.project.as_deref()).await {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
     let retrieval = RetrievalRequest {
         query_text: req.query.clone(),
         typed_predicates: Vec::new(),
@@ -354,8 +784,33 @@ async fn forget_handler(
     headers: HeaderMap,
     Json(req): Json<ForgetRequest>,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = agentmemory_auth_check(&headers) {
-        return (code, msg).into_response();
+    let auth_outcome = match check_auth_layered(&headers, &state.agentmemory_tokens).await {
+        Ok(o) => o,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    // forget is write-class — refuse for ReadOnly tokens up-front
+    // so the per-workspace claim scan below doesn't burn cycles
+    // for a request that's going to 403 at the end.
+    //
+    // Project scope is checked per-workspace as the scan progresses
+    // — a per-tool token scoped to project X must not forget claims
+    // owned by project Y even if the memory id happens to exist in Y.
+    if !auth_outcome.permits_write_on("__forget_scope_check__") {
+        // The dummy project string above unconditionally fails the
+        // scope check for ReadOnly tokens. ReadWrite tokens with
+        // a specific project scope will fall through here (the
+        // sentinel won't match their scoped project) — and that's
+        // fine because the per-workspace check below catches it.
+    }
+    // Explicit pre-flight: ReadOnly is always refused on write.
+    if let AuthOutcome::PerTool { scope, .. } = &auth_outcome {
+        if !scope.permits_write() {
+            return (
+                StatusCode::FORBIDDEN,
+                "token scope `read_only` does not permit /forget",
+            )
+                .into_response();
+        }
     }
     // Each engine access is scoped tightly — pre-fix this handler
     // held a single read guard across `list_workspaces` + an N-step
@@ -564,6 +1019,155 @@ mod tests {
             std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
         }
         assert!(result.is_err());
+    }
+
+    // ── Phase 2 central-AI-plan: layered auth + scope tests ──
+
+    fn empty_token_store() -> Arc<tokio::sync::RwLock<tokens::AgentmemoryTokenStore>> {
+        Arc::new(tokio::sync::RwLock::new(tokens::AgentmemoryTokenStore::empty()))
+    }
+
+    #[tokio::test]
+    async fn layered_auth_returns_anonymous_when_no_secret_and_no_bearer() {
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
+        }
+        let store = empty_token_store();
+        let h = headers_with(None);
+        let outcome = check_auth_layered(&h, &store).await.expect("ok");
+        assert_eq!(outcome, AuthOutcome::Anonymous);
+        assert!(
+            outcome.permits_write_on("any-project"),
+            "anonymous must permit write on any project (Phase E.4 default)"
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_auth_returns_global_secret_when_correct_bearer() {
+        let _g = test_lock();
+        unsafe {
+            std::env::set_var("THINKINGROOT_AGENTMEMORY_SECRET", "topsecret123");
+        }
+        let store = empty_token_store();
+        let h = headers_with(Some("Bearer topsecret123"));
+        let outcome = check_auth_layered(&h, &store).await;
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
+        }
+        let outcome = outcome.expect("global secret must authenticate");
+        assert_eq!(outcome, AuthOutcome::GlobalSecret);
+        assert!(outcome.permits_write_on("any-project"));
+    }
+
+    #[tokio::test]
+    async fn layered_auth_returns_per_tool_when_token_matches() {
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
+        }
+        let store = empty_token_store();
+        let raw_token = {
+            let mut s = store.write().await;
+            s.issue(
+                Some("project-foo".into()),
+                tokens::ScopeKind::ReadWrite,
+                "Cursor/1.0",
+            )
+        };
+        let h = headers_with(Some(&format!("Bearer {raw_token}")));
+        let outcome = check_auth_layered(&h, &store).await.expect("ok");
+        match &outcome {
+            AuthOutcome::PerTool {
+                project,
+                scope,
+                client_user_agent,
+            } => {
+                assert_eq!(project.as_deref(), Some("project-foo"));
+                assert_eq!(*scope, tokens::ScopeKind::ReadWrite);
+                assert_eq!(client_user_agent, "Cursor/1.0");
+            }
+            other => panic!("expected PerTool outcome, got {other:?}"),
+        }
+        assert!(outcome.permits_write_on("project-foo"));
+        assert!(
+            !outcome.permits_write_on("other-project"),
+            "per-tool token scoped to project-foo must NOT permit write on other-project"
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_auth_rejects_invalid_bearer_when_secret_set() {
+        let _g = test_lock();
+        unsafe {
+            std::env::set_var("THINKINGROOT_AGENTMEMORY_SECRET", "topsecret123");
+        }
+        let store = empty_token_store();
+        let h = headers_with(Some("Bearer not-the-secret"));
+        let result = check_auth_layered(&h, &store).await;
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
+        }
+        assert!(result.is_err(), "wrong bearer with secret-set must 401");
+    }
+
+    #[tokio::test]
+    async fn layered_auth_rejects_invalid_bearer_when_only_tokens_exist() {
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_SECRET");
+        }
+        let store = empty_token_store();
+        {
+            let mut s = store.write().await;
+            // Issue one valid token so the store is non-empty.
+            let _real = s.issue(None, tokens::ScopeKind::ReadOnly, "ua");
+        }
+        // Present a DIFFERENT bearer that doesn't match the issued token.
+        let h = headers_with(Some("Bearer not-the-issued-token"));
+        let result = check_auth_layered(&h, &store).await;
+        assert!(
+            result.is_err(),
+            "bearer that matches neither tokens nor global secret must 401"
+        );
+    }
+
+    #[test]
+    fn permits_write_on_read_only_scope_returns_false() {
+        let outcome = AuthOutcome::PerTool {
+            project: None,
+            scope: tokens::ScopeKind::ReadOnly,
+            client_user_agent: "ua".into(),
+        };
+        assert!(!outcome.permits_write_on("any"));
+        assert!(outcome.permits_read_on("any"));
+    }
+
+    #[test]
+    fn permits_read_on_per_tool_enforces_project_scope() {
+        let outcome = AuthOutcome::PerTool {
+            project: Some("scoped".into()),
+            scope: tokens::ScopeKind::ReadWrite,
+            client_user_agent: "ua".into(),
+        };
+        assert!(outcome.permits_read_on("scoped"));
+        assert!(!outcome.permits_read_on("other"));
+    }
+
+    #[tokio::test]
+    async fn ensure_workspace_mounted_returns_false_when_disabled_and_missing() {
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("THINKINGROOT_AGENTMEMORY_AUTO_PROVISION");
+        }
+        // Build a minimal AppState without an actual engine workspace.
+        let engine = crate::engine::QueryEngine::new();
+        let state = AppState::new(engine, None);
+        let result = ensure_workspace_mounted(&state, "unknown-project").await;
+        assert!(
+            matches!(result, Ok(false)),
+            "auto-provision disabled + missing workspace must return Ok(false), got {result:?}"
+        );
     }
 
     #[test]

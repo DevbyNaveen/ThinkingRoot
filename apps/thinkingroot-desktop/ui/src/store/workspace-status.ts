@@ -423,11 +423,28 @@ export async function refreshWorkspaceStatus(
 export const SUBSTRATE_BADGE_SURFACE_CLASS =
   "rounded-md border border-border/50 bg-muted/[0.06] font-medium text-muted-foreground/90 shadow-none";
 
-/** Human-readable substrate badge label. UIs render this directly. */
+/** Human-readable substrate badge label. UIs render this directly.
+ *
+ * **Compile state takes precedence over substrate state when a compile
+ * is in flight.** Pre-fix the badge only consulted `substrate.kind`, so
+ * during a long-running recompile (substrate is still `populated` from
+ * the *previous* compile until the new run commits) the badge claimed
+ * "Up to date" while a fresh compile was actively rewriting the graph
+ * — that's exactly the dishonest UX CLAUDE.md §honesty-rule §7 forbids
+ * ("The desktop never claims something synced when it didn't"). When
+ * `compile.kind === "running" | "cancelling"`, surface that fact in
+ * the badge; substrate-derived labels apply only when the engine is
+ * idle. */
 export function substrateBadge(
   status: WorkspaceStatus | null,
 ): { label: string; tone: "ok" | "info" | "warn" | "error" | "muted" } {
   if (!status) return { label: "Loading", tone: "muted" };
+  if (status.compile.kind === "running") {
+    return { label: "Compiling", tone: "info" };
+  }
+  if (status.compile.kind === "cancelling") {
+    return { label: "Stopping", tone: "warn" };
+  }
   switch (status.substrate.kind) {
     case "absent":
       return { label: "Behind", tone: "warn" };

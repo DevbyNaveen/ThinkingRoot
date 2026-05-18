@@ -55,7 +55,7 @@ pub struct IncrementalSummary {
 pub const PHASE_NAMES: &[&str] = &[
     "diff", "extract", "fingerprint", "remove_sources",
     "entity_relations", "witness_mesh", "link", "structural_persist",
-    "audit", "other",
+    "audit", "synth_paper", "other",
 ];
 
 /// User-facing compile step.

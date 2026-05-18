@@ -618,12 +618,10 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       run: phase("/keybindings", "D-10"),
     },
 
-    // ─── Themes (5) ───
+    // ─── Themes (3) ───
     theme("dark", "Dark"),
     theme("light", "Light"),
-    theme("daltonized-protanopia", "Daltonized · Protanopia"),
-    theme("daltonized-deuteranopia", "Daltonized · Deuteranopia"),
-    theme("daltonized-tritanopia", "Daltonized · Tritanopia"),
+    theme("auto", "Auto"),
 
     // ─── Info / diagnostics (10) ───
     {

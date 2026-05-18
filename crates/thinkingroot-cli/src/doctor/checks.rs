@@ -1002,11 +1002,20 @@ pub fn sandbox_macos_available() -> CheckResult {
                 }),
             };
         }
-        // Probe with a trivial deny-network policy that should succeed.
+        // Probe with a trivial allow-all policy that should succeed.
+        // Use `/usr/bin/true` (canonical POSIX path, present on every
+        // macOS version). `/bin/true` was removed in macOS 26 (Tahoe);
+        // the legacy path's absence would surface here as a spurious
+        // Seatbelt failure even though sandbox-exec itself is fine.
+        let true_bin = if std::path::Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
         let probe = std::process::Command::new(bin)
             .arg("-p")
             .arg("(version 1)(allow default)")
-            .arg("/bin/true")
+            .arg(true_bin)
             .status();
         match probe {
             Ok(s) if s.success() => CheckResult {

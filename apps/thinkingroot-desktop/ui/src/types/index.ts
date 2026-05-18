@@ -1,11 +1,5 @@
 /** Theme identifiers mirror `thinkingroot-tui::app::state::Theme`. */
-export type Theme =
-  | "auto"
-  | "dark"
-  | "light"
-  | "daltonized-protanopia"
-  | "daltonized-deuteranopia"
-  | "daltonized-tritanopia";
+export type Theme = "auto" | "dark" | "light";
 
 /** Trust filter matches `TrustFilter` in thinkingroot-tui. */
 export type TrustFilter = "any" | "rooted" | "attested";
@@ -45,6 +39,16 @@ export type SettingsSectionId =
   | "mcp"
   | "channels"
   | "cloud";
+
+/** Left-rail categories when the main pane is on Docs. */
+export type DocSectionId =
+  | "overview"
+  | "cursor"
+  | "node"
+  | "python"
+  | "curl"
+  | "lovable"
+  | "export";
 
 /** One entry in the conversations sidebar. */
 export interface ConversationSummary {

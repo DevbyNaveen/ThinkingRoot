@@ -550,7 +550,7 @@ function BranchGraphSvg({
 }
 
 const BRANCH_FORM_INPUT =
-  "w-full min-w-0 rounded-lg border border-border/45 bg-background/55 px-3 py-2 text-xs text-foreground shadow-sm outline-none transition-[border-color,background-color] placeholder:text-muted-foreground/55 focus:border-ring/45 focus:bg-background/90";
+  "w-full min-w-0 rounded-md border border-border/40 bg-background/40 px-2 py-1.5 text-[11px] text-foreground outline-none transition-[border-color,background-color] placeholder:text-muted-foreground/50 focus:border-ring/40 focus:bg-background/70";
 
 function BranchCreatePanel({
   workspace,
@@ -612,81 +612,66 @@ function BranchCreatePanel({
   }
 
   return (
-    <div
-      className={cn(
-        "rounded-xl border border-border/60 bg-muted/25 p-4 shadow-md ring-1 ring-border/20",
-        "dark:bg-muted/15 dark:ring-border/15",
-      )}
-    >
-      <div className="mb-4 flex items-start gap-3">
-        <div className="flex size-10 shrink-0 items-center justify-center rounded-xl border border-border/40 bg-background/50 shadow-inner">
-          <GitBranchPlus className="size-4 text-accent" strokeWidth={2} aria-hidden />
-        </div>
-        <div className="min-w-0 flex-1">
-          <h4 className="text-sm font-medium tracking-tight text-foreground">
-            New workspace branch
-          </h4>
-          <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
-            Fork from a parent branch. Nothing merges until you run a merge from
-            the branch tools.
-          </p>
-        </div>
+    <div className="flex flex-col gap-2 border-b border-border/30 pb-3">
+      <p className="text-[11px] font-medium text-foreground">New branch</p>
+
+      <div className="space-y-0.5">
+        <label
+          htmlFor="compile-branch-name"
+          className="text-[9px] font-medium uppercase tracking-wide text-muted-foreground"
+        >
+          Name
+        </label>
+        <input
+          id="compile-branch-name"
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="feature/review"
+          disabled={listLoading || creating}
+          className={BRANCH_FORM_INPUT}
+          autoComplete="off"
+          autoFocus
+        />
       </div>
 
-      <div className="flex flex-col gap-3">
-        <div className="space-y-1">
-          <label htmlFor="compile-branch-name" className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Name
-          </label>
-          <input
-            id="compile-branch-name"
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. feature/review"
-            disabled={listLoading || creating}
-            className={BRANCH_FORM_INPUT}
-            autoComplete="off"
-          />
-        </div>
-        <div className="space-y-1">
-          <label htmlFor="compile-branch-parent" className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Parent
-          </label>
-          <input
-            id="compile-branch-parent"
-            type="text"
-            value={parent}
-            onChange={(e) => setParent(e.target.value)}
-            placeholder="main"
-            disabled={listLoading || creating}
-            className={BRANCH_FORM_INPUT}
-            autoComplete="off"
-          />
-        </div>
-        <div className="space-y-1">
-          <label htmlFor="compile-branch-desc" className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Description <span className="font-normal normal-case text-muted-foreground/70">(optional)</span>
-          </label>
-          <input
-            id="compile-branch-desc"
-            type="text"
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="What this branch is for"
-            disabled={listLoading || creating}
-            className={BRANCH_FORM_INPUT}
-            autoComplete="off"
-          />
-        </div>
+      <div className="space-y-0.5">
+        <label
+          htmlFor="compile-branch-parent"
+          className="text-[9px] font-medium uppercase tracking-wide text-muted-foreground"
+        >
+          Parent
+        </label>
+        <input
+          id="compile-branch-parent"
+          type="text"
+          value={parent}
+          onChange={(e) => setParent(e.target.value)}
+          placeholder="main"
+          disabled={listLoading || creating}
+          className={BRANCH_FORM_INPUT}
+          autoComplete="off"
+        />
       </div>
 
-      <div className="mt-4 flex flex-wrap items-center justify-end gap-2 border-t border-border/40 pt-3">
+      <input
+        id="compile-branch-desc"
+        type="text"
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        placeholder="Description (optional)"
+        disabled={listLoading || creating}
+        className={BRANCH_FORM_INPUT}
+        autoComplete="off"
+        aria-label="Branch description (optional)"
+      />
+
+      <div className="flex items-center justify-end gap-1 pt-0.5">
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="h-8 text-xs text-muted-foreground hover:text-foreground"
+          className="h-7 px-2 text-[11px] text-muted-foreground hover:text-foreground"
           disabled={creating}
           onClick={onDismiss}
         >
@@ -695,21 +680,21 @@ function BranchCreatePanel({
         <Button
           type="button"
           size="sm"
-          variant="secondary"
           disabled={listLoading || creating || !name.trim()}
           onClick={() => void handleCreate()}
-          className="h-8 gap-1.5 rounded-lg px-3 text-xs font-medium shadow-sm"
+          className="h-7 gap-1 border-0 bg-white px-2.5 text-[11px] font-medium text-neutral-950 shadow-none hover:bg-white/90"
         >
           {creating ? (
-            <Loader2 className="size-3.5 animate-spin" aria-hidden />
+            <Loader2 className="size-3 animate-spin" aria-hidden />
           ) : (
-            <Plus className="size-3.5" strokeWidth={2} aria-hidden />
+            <Plus className="size-3" strokeWidth={2} aria-hidden />
           )}
-          Create branch
+          Create
         </Button>
       </div>
     </div>
   );
+
 }
 
 /** Pulls the merged branch name out of an SSE `branch_event` envelope.

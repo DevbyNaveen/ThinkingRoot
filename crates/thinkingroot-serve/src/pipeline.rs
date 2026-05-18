@@ -1681,16 +1681,40 @@ async fn run_pipeline_inner(
     // Per-compile `paper.md` artefact (deterministic skeleton in v1;
     // AI narrative sections in v1.1). Single file with YAML
     // frontmatter (machine-readable spine) + markdown body (human
-    // body + Mermaid architecture diagram). Same `branch` gating as
-    // Phase 10b — Living Paper synthesis. Workspace-level state, not
-    // per-branch. Non-fatal — a stale paper is not a corrupt graph.
+    // body + Mermaid architecture diagram). Workspace-level state,
+    // not per-branch. Non-fatal — a stale paper is not a corrupt
+    // graph.
     //
-    // When the workspace has a configured LLM provider, drive the
-    // v1.1 async variant so the five AI-narrative sections render
-    // with citation-validated `[[witness:<id>]]` markers. Without a
-    // provider we fall back to the v1 deterministic-only path so a
-    // misconfigured workspace still yields a (skeleton-only) paper.
-    if matches!(branch, None | Some("main")) {
+    // **Small-change skip gate (2026-05-18)**. The LLM-driven
+    // synthesis path makes hundreds of provider calls and dominates
+    // wall-clock on every compile (real measurement: 26.3 s of a
+    // 33.8 s compile for 1 truly-changed source, ~78% of wall time
+    // hidden in the previously-uninstrumented "other" bucket). For
+    // an N-source workspace where the user just edited 1–3 files,
+    // the regenerated paper is functionally identical to the
+    // previous version, so the 20-30 s + N LLM calls cost is pure
+    // waste on the incremental hot path.
+    //
+    // Gate: synthesise only when
+    //   (a) `paper.md` does not exist yet (first compile must populate it),
+    //   (b) the user explicitly forced a full rebuild via
+    //       `PipelineOptions::no_incremental`, OR
+    //   (c) the change set is "material" — more than
+    //       `PAPER_RESYNTH_CHANGE_FLOOR` truly-changed-or-deleted
+    //       sources.
+    //
+    // Otherwise: skip; the user refreshes the paper on demand via
+    // the `regenerate_paper` MCP tool or `root render`. The
+    // `synth_paper` phase timing is recorded either way (0 on skip)
+    // so the time line in `root compile --json` and the
+    // desktop's summary panel remains a complete accounting.
+    const PAPER_RESYNTH_CHANGE_FLOOR: usize = 5;
+    let paper_path = root_path.join(".thinkingroot").join("paper.md");
+    let paper_exists = paper_path.exists();
+    let material_change_count = truly_changed.len() + deleted_sources.len();
+    let should_synth_paper = matches!(branch, None | Some("main"))
+        && (no_incremental || !paper_exists || material_change_count > PAPER_RESYNTH_CHANGE_FLOOR);
+    if should_synth_paper {
         progress_state.set_substep("synthesizing paper");
         let workspace_name: String = root_path
             .file_name()
@@ -1752,7 +1776,17 @@ async fn run_pipeline_inner(
                 "paper synthesis failed; .thinkingroot/paper.md may be stale"
             );
         }
+    } else {
+        tracing::info!(
+            target: "paper",
+            truly_changed = truly_changed.len(),
+            deleted = deleted_sources.len(),
+            threshold = PAPER_RESYNTH_CHANGE_FLOOR,
+            "paper synth skipped on incremental compile; existing paper retained — \
+             trigger `regenerate_paper` MCP tool or a full recompile to refresh"
+        );
     }
+    mark_phase!("synth_paper");
 
     fingerprints.save()?;
     config.save(root_path)?;

@@ -23,12 +23,12 @@ export function CitationChip({ witnessId }: { witnessId: string }) {
         onClick={() => setOpen(true)}
         title={`Witness ${witnessId}`}
         className={cn(
-          "mx-0.5 inline-flex items-center gap-1 rounded-md border border-accent/30 bg-accent/10 px-1 py-px",
-          "align-baseline text-[11px] font-mono text-accent transition-colors",
-          "hover:border-accent/60 hover:bg-accent/20",
+          "mx-0.5 inline align-baseline font-mono text-[0.88em] font-normal",
+          "text-sky-400/90 underline decoration-sky-400/35 decoration-dotted underline-offset-[3px]",
+          "transition-colors hover:text-sky-300 hover:decoration-sky-400/55",
         )}
       >
-        <Sparkles className="size-2.5" />
+        <Sparkles className="mr-0.5 inline size-2.5 -translate-y-px opacity-75" aria-hidden />
         {display}
       </button>
       {open && (

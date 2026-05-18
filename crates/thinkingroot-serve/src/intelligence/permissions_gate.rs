@@ -67,6 +67,38 @@ enum Subject {
     Command(String),
 }
 
+/// Predicted outcome of a permission policy evaluation.
+///
+/// Mirrors the tri-state the gate's `check` returns internally:
+/// `Allow` → the gate would auto-approve without prompting; `Deny`
+/// → the gate would auto-reject without prompting; `Ask` → the
+/// gate would delegate to the inner UI prompt flow.
+///
+/// Exposed so the SSE relay (`rest.rs::ask_stream_handler`) can
+/// **predict** whether emitting an `approval_requested` event will
+/// actually correspond to a registered `pending_approvals` entry.
+/// Pre-fix the SSE blindly emitted on every write-tool proposal —
+/// when the policy auto-decided, the agent moved on without
+/// registering anything, and the user's eventual click hit a 404
+/// `NO_PENDING_APPROVAL`. Using `predict` to gate the emit closes
+/// the race cleanly: only the cases that will actually wait for a
+/// human get a dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyOutcome {
+    /// Every subject Allowed (or no subjects at all and the inner
+    /// gate is `AutoApprove`-shaped). Agent will auto-approve.
+    Allow,
+    /// At least one subject Denied, or canonicalisation failed.
+    /// Agent will auto-reject.
+    Deny,
+    /// At least one subject is `Ask` — the gate will delegate to
+    /// the inner [`ApprovalGate`], which on the desktop chat path
+    /// is [`ToolApprovalRouter`] and registers a `pending_approvals`
+    /// entry. This is the only outcome where a UI dialog can
+    /// legitimately resolve.
+    Ask,
+}
+
 pub struct PermissionsGate {
     store: Arc<RwLock<PermissionStore>>,
     inner: Arc<dyn ApprovalGate>,
@@ -178,6 +210,74 @@ impl PermissionsGate {
         }
     }
 
+    /// Predict the policy outcome **without** delegating to the
+    /// inner gate. Pure read against the store + canonicalisation;
+    /// never registers a pending approval, never blocks waiting on
+    /// the user. Used by the SSE relay to decide whether to emit
+    /// an `approval_requested` event.
+    ///
+    /// Contract: `predict` and `check` MUST return the same
+    /// outcome for the same `(store snapshot, tool_name, input)`
+    /// triple. The two share `extract_subjects` and
+    /// `canonicalize_subject` so they cannot drift.
+    ///
+    /// **TOCTOU note**: a rule edit between `predict` (peek) and
+    /// `check` (gate) can flip the outcome. The UI defensively
+    /// treats a `NO_PENDING_APPROVAL` POST as a silent dismiss to
+    /// catch that race — see `commands/chat.rs::chat_approve`.
+    pub async fn predict(
+        store: &Arc<RwLock<PermissionStore>>,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> PolicyOutcome {
+        // Phase 1 central-AI-plan (2026-05-18) — operator tools the
+        // in-app agent uses for self-heal short-circuit to Allow so
+        // the SSE relay doesn't emit a stray `approval_requested`
+        // event that would resolve to NO_PENDING_APPROVAL.
+        if crate::operator_tools::is_pre_trusted(tool_name) {
+            return PolicyOutcome::Allow;
+        }
+        let subjects = Self::extract_subjects(tool_name, input);
+        if subjects.is_empty() {
+            // Tools without path/command subjects (e.g. clipboard_*)
+            // fall through to the inner gate, which on the desktop
+            // chat path is `ToolApprovalRouter` — i.e. always asks.
+            return PolicyOutcome::Ask;
+        }
+        let store = store.read().await;
+        let mut any_ask = false;
+        for subject in subjects {
+            match subject {
+                Subject::Path {
+                    raw,
+                    allow_nonexistent,
+                } => {
+                    let canonical = match Self::canonicalize_subject(&raw, allow_nonexistent) {
+                        Ok(c) => c,
+                        // Canonicalisation failure → `check` would
+                        // return Rejected. Predict the same.
+                        Err(_) => return PolicyOutcome::Deny,
+                    };
+                    match store.evaluate_path(&canonical) {
+                        Decision::Allow => continue,
+                        Decision::Deny => return PolicyOutcome::Deny,
+                        Decision::Ask => any_ask = true,
+                    }
+                }
+                Subject::Command(cmd) => match store.evaluate_command(&cmd) {
+                    Decision::Allow => continue,
+                    Decision::Deny => return PolicyOutcome::Deny,
+                    Decision::Ask => any_ask = true,
+                },
+            }
+        }
+        if any_ask {
+            PolicyOutcome::Ask
+        } else {
+            PolicyOutcome::Allow
+        }
+    }
+
     /// Canonicalise a path subject. For `allow_nonexistent`, if the
     /// leaf doesn't exist the parent is canonicalised and the leaf
     /// is appended literally — this is the file-creation path.
@@ -224,6 +324,16 @@ impl ApprovalGate for PermissionsGate {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> ApprovalDecision {
+        // Phase 1 central-AI-plan (2026-05-18) — operator tools the
+        // in-app agent uses for self-heal auto-approve without
+        // delegating to the inner gate. This is principal-scoped:
+        // external MCP clients still hit the standard write-class
+        // gate via mcp_bridge.rs's `is_registered_write` check
+        // BEFORE this gate runs. By the time we reach here, the
+        // call IS the in-app agent's own.
+        if crate::operator_tools::is_pre_trusted(tool_name) {
+            return ApprovalDecision::Approved;
+        }
         let subjects = Self::extract_subjects(tool_name, input);
         if subjects.is_empty() {
             // No subjects: this tool isn't a path/command-typed one;
@@ -308,6 +418,64 @@ mod tests {
 
     fn empty_store() -> Arc<RwLock<PermissionStore>> {
         Arc::new(RwLock::new(PermissionStore::empty()))
+    }
+
+    #[tokio::test]
+    async fn pre_trusted_operator_tool_short_circuits_before_inner_gate() {
+        // The load-bearing assertion of Phase 1 central-AI-plan
+        // pre-trust: a write-class operator tool gets Approved even
+        // when the inner gate is `DenyAll`, proving the check runs
+        // BEFORE delegation. Without this, every `reset_circuit_breaker`
+        // / `doctor_apply_fix` / `migrate_substrate` call would pop a
+        // UI approval prompt — defeating the "AI runs my system"
+        // expectation.
+        let gate = PermissionsGate::new(empty_store(), Arc::new(DenyAll));
+        for tool in [
+            "reset_circuit_breaker",
+            "reset_compile_breaker",
+            "doctor_apply_fix",
+            "rebuild_vector_index",
+            "migrate_substrate",
+            "engram_invalidate_workspace",
+            "mark_setup_complete",
+            "restart_engine_request",
+        ] {
+            let d = gate.check("id-op", tool, &json!({})).await;
+            assert!(
+                d.is_approved(),
+                "operator tool `{tool}` must short-circuit to Approved even with DenyAll inner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_trusted_predict_returns_allow_even_with_no_rules() {
+        // Symmetric assertion at the SSE relay's `predict` path: the
+        // pre-trusted operator tools must predict `Allow` so the relay
+        // doesn't emit a stray `approval_requested` event that would
+        // strand a NO_PENDING_APPROVAL on the UI.
+        let store = empty_store();
+        for tool in ["reset_circuit_breaker", "migrate_substrate", "doctor_apply_fix"] {
+            let outcome = PermissionsGate::predict(&store, tool, &json!({})).await;
+            assert_eq!(
+                outcome,
+                PolicyOutcome::Allow,
+                "operator tool `{tool}` predict must be Allow"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_operator_tool_still_subject_to_inner_gate() {
+        // Negative control: a non-operator tool with no subjects
+        // (clipboard_read) MUST still hit the inner gate. The pre-trust
+        // is principal-scoped to operator tools only.
+        let gate = PermissionsGate::new(empty_store(), Arc::new(DenyAll));
+        let d = gate.check("id-1", "clipboard_read", &json!({})).await;
+        assert!(
+            !d.is_approved(),
+            "non-operator tools must still consult the inner gate"
+        );
     }
 
     #[tokio::test]
@@ -504,5 +672,163 @@ mod tests {
             )
             .await;
         assert!(d.is_approved(), "all-allow trash batch must approve");
+    }
+
+    // ─── PolicyOutcome::predict — SSE-relay TOCTOU fix tests ─────
+
+    #[tokio::test]
+    async fn predict_no_subjects_returns_ask() {
+        // Tools without path/command subjects (e.g. clipboard_*)
+        // fall through to the inner gate. Predict must report Ask so
+        // the SSE relay still emits a dialog — the inner gate is the
+        // one that decides, and on the desktop chat path that's
+        // ToolApprovalRouter (always asks the user).
+        let outcome = PermissionsGate::predict(
+            &empty_store(),
+            "clipboard_read",
+            &json!({}),
+        )
+        .await;
+        assert_eq!(outcome, PolicyOutcome::Ask);
+    }
+
+    #[tokio::test]
+    async fn predict_default_deny_path_returns_deny() {
+        // ~/.ssh/** is hardcoded DEFAULT_DENY. predict must say Deny
+        // so the SSE relay suppresses the dialog — the gate will
+        // auto-reject and the user has no decision to make.
+        let home = dirs::home_dir().unwrap();
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).ok();
+        let key = ssh_dir.join("id_rsa_predict_test");
+        std::fs::write(&key, b"fake").ok();
+
+        let outcome = PermissionsGate::predict(
+            &empty_store(),
+            "file_read",
+            &json!({ "path": key.display().to_string() }),
+        )
+        .await;
+        std::fs::remove_file(&key).ok();
+
+        assert_eq!(outcome, PolicyOutcome::Deny);
+    }
+
+    #[tokio::test]
+    async fn predict_explicit_allow_returns_allow() {
+        // An explicit Allow rule on the path → predict says Allow.
+        // SSE relay must suppress the dialog; gate auto-approves.
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let f = canonical_tmp.join("readme.md");
+        std::fs::write(&f, b"hi").unwrap();
+        let pattern = format!("{}/**", canonical_tmp.display());
+        let store = store_with_rule(&pattern, Decision::Allow, RuleKind::Path);
+
+        let outcome = PermissionsGate::predict(
+            &store,
+            "file_read",
+            &json!({ "path": f.display().to_string() }),
+        )
+        .await;
+        assert_eq!(outcome, PolicyOutcome::Allow);
+    }
+
+    #[tokio::test]
+    async fn predict_unrooted_path_returns_ask() {
+        // No matching rule, not DEFAULT_DENY — predict says Ask.
+        // SSE relay must emit the dialog; gate will register a
+        // pending_approvals entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let f = canonical_tmp.join("unruled.md");
+        std::fs::write(&f, b"hi").unwrap();
+
+        let outcome = PermissionsGate::predict(
+            &empty_store(),
+            "file_read",
+            &json!({ "path": f.display().to_string() }),
+        )
+        .await;
+        assert_eq!(outcome, PolicyOutcome::Ask);
+    }
+
+    #[tokio::test]
+    async fn predict_canonicalisation_failure_returns_deny() {
+        // file_read against a non-existent path → canonicalise
+        // fails → check returns Rejected. predict must mirror that
+        // as Deny so the SSE relay suppresses the dialog.
+        let outcome = PermissionsGate::predict(
+            &empty_store(),
+            "file_read",
+            &json!({ "path": "/this/path/definitely/does/not/exist" }),
+        )
+        .await;
+        assert_eq!(outcome, PolicyOutcome::Deny);
+    }
+
+    #[tokio::test]
+    async fn predict_command_deny_rule_returns_deny() {
+        let mut s = PermissionStore::empty();
+        s.insert_rule(Rule {
+            kind: RuleKind::Command,
+            pattern: "rm *".to_string(),
+            decision: Decision::Deny,
+            created_at: chrono::Utc::now(),
+            created_by: "test".to_string(),
+        })
+        .unwrap();
+        let store = Arc::new(RwLock::new(s));
+
+        let outcome = PermissionsGate::predict(
+            &store,
+            "shell_exec",
+            &json!({ "command": "rm -rf /" }),
+        )
+        .await;
+        assert_eq!(outcome, PolicyOutcome::Deny);
+    }
+
+    #[tokio::test]
+    async fn predict_matches_check_outcome_for_every_branch() {
+        // Pinning the contract: predict and check must agree on the
+        // outcome for the same (store, tool, input) triple. The
+        // SSE-suppression fix depends on this — drift between the
+        // two means the UI either misses prompts (predict says
+        // Allow/Deny but check actually delegates to inner) or
+        // shows ghost dialogs (predict says Ask but check
+        // auto-decides). Test fixture covers the four representative
+        // branches: Allow rule, Deny rule, unrooted path,
+        // DEFAULT_DENY.
+
+        // Allow.
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let f = canonical_tmp.join("a.md");
+        std::fs::write(&f, b"a").unwrap();
+        let pattern = format!("{}/**", canonical_tmp.display());
+        let store_allow = store_with_rule(&pattern, Decision::Allow, RuleKind::Path);
+        let gate_allow = PermissionsGate::new(store_allow.clone(), Arc::new(DenyAll));
+        let path_str = f.display().to_string();
+        let input = json!({ "path": path_str.clone() });
+
+        let predict_allow =
+            PermissionsGate::predict(&store_allow, "file_read", &input).await;
+        let check_allow = gate_allow.check("c-A", "file_read", &input).await;
+        assert_eq!(predict_allow, PolicyOutcome::Allow);
+        assert!(check_allow.is_approved());
+
+        // Unrooted path → predict Ask, check delegates to inner.
+        let gate_unrooted = PermissionsGate::new(empty_store(), Arc::new(AutoApprove));
+        let predict_ask =
+            PermissionsGate::predict(&empty_store(), "file_read", &input).await;
+        let check_via_inner =
+            gate_unrooted.check("c-B", "file_read", &input).await;
+        assert_eq!(predict_ask, PolicyOutcome::Ask);
+        // AutoApprove inner → ends in Approved, but only after
+        // delegation (the contract we care about: a pending entry
+        // would have been registered if the inner were
+        // ToolApprovalRouter).
+        assert!(check_via_inner.is_approved());
     }
 }

@@ -52,7 +52,6 @@ import {
   pickPrimaryDiagnostic,
   substrateBadge,
   SUBSTRATE_BADGE_SURFACE_CLASS,
-  useWorkspaceConnection,
   useWorkspaceStatus,
   useWorkspaceStatusSubscription,
 } from "@/store/workspace-status";
@@ -123,15 +122,15 @@ export function RightRail() {
   if (!open) {
     return (
       <div className="flex h-full w-10 shrink-0 flex-col items-center bg-surface">
-        <header className="flex h-11 w-full items-center justify-center">
+        <header className="flex h-9 w-full items-center justify-center">
           <Button
             variant="ghost"
             size="icon"
             onClick={toggle}
             aria-label="Open panel"
-            className="h-7 w-7"
+            className="h-6 w-6"
           >
-            <PanelRight className="size-3.5" />
+            <PanelRight className="size-3" />
           </Button>
         </header>
       </div>
@@ -155,9 +154,8 @@ export function RightRail() {
       />
 
       {/* ── Tab bar ────────────────────────────────────────────── */}
-      <header className="flex h-11 shrink-0 items-center border-b border-border pl-2 pr-1">
-        {/* Tab icons */}
-        <nav className="flex flex-1 items-center gap-0.5" aria-label="Panel tabs">
+      <header className="flex h-9 shrink-0 items-center border-b border-border py-0 pl-1.5 pr-0.5">
+        <nav className="flex flex-1 items-center gap-px" aria-label="Panel tabs">
           {TABS.map(({ id, Icon, label }) => (
             <button
               key={id}
@@ -167,39 +165,30 @@ export function RightRail() {
               aria-label={label}
               aria-pressed={activeTab === id}
               className={cn(
-                "flex h-7 w-7 items-center justify-center rounded-md transition-colors",
+                "flex h-6 w-6 items-center justify-center rounded-md transition-colors",
                 activeTab === id
                   ? "bg-muted text-foreground"
                   : "text-muted-foreground/60 hover:bg-muted/50 hover:text-foreground",
               )}
             >
               <Icon
-                className="size-3.5"
+                className="size-3"
                 strokeWidth={activeTab === id ? 2 : 1.5}
               />
             </button>
           ))}
         </nav>
 
-        {/* Collapse button */}
         <Button
           variant="ghost"
           size="icon"
           onClick={toggle}
           aria-label="Close panel"
-          className="h-7 w-7 shrink-0 text-muted-foreground/60 hover:text-foreground"
+          className="h-6 w-6 shrink-0 text-muted-foreground/60 hover:text-foreground"
         >
-          <PanelRight className="size-3.5" />
+          <PanelRight className="size-3" />
         </Button>
       </header>
-
-      {/* ── Panel label ────────────────────────────────────────── */}
-      <div className="flex h-7 shrink-0 items-center border-b border-border/50 px-3">
-        <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/50">
-          {TABS.find((t) => t.id === activeTab)?.label}
-          {activeWorkspace ? ` · ${activeWorkspace}` : ""}
-        </span>
-      </div>
 
       {/* ── Panel content ──────────────────────────────────────── */}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -260,7 +249,7 @@ export function RightRail() {
 
 function CompilePanel({ activeWorkspace }: { activeWorkspace: string | null }) {
   return (
-    <div className="flex flex-col gap-6 overflow-y-auto px-4 py-5">
+    <div className="flex flex-col gap-4 overflow-y-auto px-3 py-4">
       <WorkspaceCard activeWorkspace={activeWorkspace} />
       <CompilationProgressIndicator />
       {activeWorkspace && <BranchResolutionRiver workspace={activeWorkspace} />}
@@ -283,7 +272,6 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
   // by `substrate.kind`.
   useWorkspaceStatusSubscription(activeWorkspace);
   const status = useWorkspaceStatus(activeWorkspace);
-  const conn = useWorkspaceConnection(activeWorkspace);
 
   useEffect(() => {
     let cancelled = false;
@@ -310,6 +298,7 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
   const queryDiag = pickPrimaryDiagnostic(status, "for_query");
   const isPopulated = status?.substrate.kind === "populated";
   const compileButtonLabel = isPopulated ? "Recompile Workspace" : "Compile Workspace";
+  const compileButtonShort = isPopulated ? "Recompile" : "Compile";
   const badgeTitle = (() => {
     switch (status?.substrate.kind) {
       case "absent":
@@ -326,40 +315,38 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         return "Loading substrate state…";
     }
   })();
+  const shortPath = w?.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~");
+
   return (
-    <section className="flex flex-col gap-3.5">
-      <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">
-        Workspace
+    <section className="flex flex-col gap-2 border-b border-border/30 pb-3">
+      <div className="min-w-0 space-y-0.5">
+        <div className="flex items-center gap-2">
+          <h3
+            className="min-w-0 flex-1 truncate text-[13px] font-semibold leading-tight tracking-tight text-foreground"
+            title={activeWorkspace}
+          >
+            {activeWorkspace}
+          </h3>
+          <span
+            className={cn(
+              "shrink-0 px-1.5 py-px font-mono text-[9px] tracking-wide normal-case",
+              SUBSTRATE_BADGE_SURFACE_CLASS,
+            )}
+            title={badgeTitle}
+          >
+            {badge.label}
+          </span>
+        </div>
+        {shortPath ? (
+          <p
+            className="truncate font-mono text-[10px] leading-tight text-muted-foreground/75"
+            title={w?.path}
+          >
+            {shortPath}
+          </p>
+        ) : null}
       </div>
-      <div className="flex items-center gap-1.5 text-xs">
-        <span className="truncate font-medium">{activeWorkspace}</span>
-        <span
-          className={cn(
-            "ml-auto px-2 py-0.5 font-mono text-[9px] tracking-wide normal-case",
-            SUBSTRATE_BADGE_SURFACE_CLASS,
-          )}
-          title={badgeTitle}
-        >
-          {badge.label}
-        </span>
-      </div>
-      {/* Suppress the "Status disconnected" line while a compile is
-       * actively running. The workspace_status SSE broadcast actor is
-       * re-created by the post-compile engine.mount, which closes the
-       * prior stream cleanly — the client-side fix (Commit 5)
-       * suppresses the flicker, but during a long compile we may
-       * still legitimately observe a brief gap. The compile progress
-       * bar already conveys "engine is busy" honestly, so doubling
-       * up with a scary "disconnected" line is noise. */}
-      {!conn.connected
-        && conn.lastSeenMs
-        && status?.compile.kind !== "running" && (
-        <p className="text-[10px] text-muted-foreground/80">
-          Status disconnected — last seen{" "}
-          {Math.round((Date.now() - conn.lastSeenMs) / 1000)}s ago
-        </p>
-      )}
-      {(queryDiag ?? compileDiag) && (
+      {(queryDiag ?? compileDiag) ? (
         <p
           className={cn(
             "text-[11px] leading-snug",
@@ -373,17 +360,12 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
         >
           {(queryDiag ?? compileDiag)?.message}
         </p>
-      )}
-      {w && (
-        <p className="font-mono text-[10px] text-muted-foreground/80" title={w.path}>
-          {w.path.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~")}
-        </p>
-      )}
-      <div className="flex flex-wrap items-center gap-1 border-t border-border/35 pt-3">
+      ) : null}
+      <div className="flex flex-wrap items-center gap-1 pt-0.5">
         <Button
-          variant="secondary"
+          variant="default"
           size="sm"
-          className="h-8 shrink-0 gap-1.5 px-3 text-xs font-medium shadow-none"
+          className="h-7 shrink-0 gap-1 rounded-md border-0 bg-white px-2.5 text-[11px] font-medium text-neutral-950 shadow-none hover:bg-white/90"
           disabled={busy}
           title={compileButtonLabel}
           onClick={async () => {
@@ -422,36 +404,34 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
             }
           }}
         >
-          <Hammer className="size-3.5 opacity-90" />
-          <span className="max-w-[9.5rem] truncate sm:max-w-none">
-            {compileButtonLabel}
-          </span>
+          {busy ? (
+            <Loader2 className="size-3 animate-spin" aria-hidden />
+          ) : (
+            <Hammer className="size-3 opacity-90" aria-hidden />
+          )}
+          {compileButtonShort}
         </Button>
-        <span
-          className="hidden h-4 w-px shrink-0 bg-border/60 sm:block"
-          aria-hidden
-        />
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 shrink-0 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+          className="h-7 shrink-0 gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           type="button"
           title="Export workspace as .tr pack"
           onClick={() => setPackExportTarget({ workspace: activeWorkspace })}
         >
-          <Package className="size-3.5 opacity-80" />
+          <Package className="size-3 opacity-80" aria-hidden />
           Export .tr
         </Button>
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 shrink-0 gap-1.5 px-2.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+          className="h-7 shrink-0 gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           type="button"
           title="Open readme and folder inspector"
           onClick={() => setRightRailTab("files")}
         >
-          <FolderTree className="size-3.5 opacity-80" />
-          Workspace
+          <FolderTree className="size-3 opacity-80" aria-hidden />
+          Files
         </Button>
       </div>
     </section>
@@ -480,6 +460,24 @@ function formatEta(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
+  return `${m}m${s.toString().padStart(2, "0")}s`;
+}
+
+/**
+ * Render the daemon's `CompileTick.step_elapsed_ms` (a u64 ms value
+ * that resets at every step boundary) as a compact running counter
+ * for the indeterminate-sub-phase fallback in the ETA slot. Differs
+ * from {@link formatEta}: this is "time spent in this step so far",
+ * not "estimated time remaining". Format mirrors `formatEta` so the
+ * two read consistently when they alternate on the same compile
+ * (1–59s ⇒ `Ns`, 60s+ ⇒ `MmSSs`).
+ */
+function formatStepElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
   return `${m}m${s.toString().padStart(2, "0")}s`;
 }
 
@@ -538,7 +536,15 @@ function substrateSegmentClass(
       isDone && "bg-emerald-600 dark:bg-emerald-400",
       isError && "bg-destructive",
       isCancelled && "bg-muted-foreground/75",
-      !isDone && !isError && !isCancelled && "bg-primary",
+      // `bg-accent` (not `bg-primary`). The Tailwind config
+      // (`apps/thinkingroot-desktop/ui/tailwind.config.ts`) defines
+      // only `accent` / `destructive` / `success` / `warn` / `info`
+      // and the muted/foreground neutrals — there is no `primary`
+      // colour in the palette. Pre-fix `bg-primary` resolved to no
+      // CSS at all, so the "lit" segments rendered as transparent
+      // boxes over the bar track and the bar looked empty even at
+      // 99% filled (visible in the 01:28 screenshot from 2026-05-18).
+      !isDone && !isError && !isCancelled && "bg-accent",
     );
   }
   return cn(
@@ -841,7 +847,19 @@ function CompilationProgressIndicator() {
     case "verification_done":
       title = "Verification complete"; details = `Health ${progress.health}`; percent = 99; break;
     case "phase_done":
-      title = "Phase complete"; details = `${progress.name} in ${progress.elapsed_ms}ms`; percent = 99; break;
+      // `phase_done` fires after **every** internal pipeline phase
+      // (parse → diff → extract → link → persist → audit → …). It is
+      // an informational event, NOT a positional one. Pre-fix this
+      // set `percent = 99`, which combined with the monotonic-max
+      // clamp below pegged the bar to 99% from the moment the FIRST
+      // phase (usually `parse` at real 5% progress) completed —
+      // making the bar useless for the remaining ~95% of the run.
+      // Leave the bar position alone; the next `tick` event will
+      // re-derive percent from the current step's band.
+      title = "Phase complete";
+      details = `${progress.name} in ${progress.elapsed_ms}ms`;
+      percent = maxPercentRef.current;
+      break;
     case "cancelled":
       title = "Compilation stopped"; details = "Stopped by user";
       percent = 100; isCancelled = true; break;
@@ -909,15 +927,32 @@ function CompilationProgressIndicator() {
             {!isDone && !isError && !isCancelled && (
               <div className="flex shrink-0 items-center gap-1">
                 <span className="whitespace-nowrap font-mono text-[10px] tabular-nums text-muted-foreground">
+                  <span className="text-foreground">{Math.round(displayPercent)}%</span>
                   {eta ? (
+                    // Daemon supplied a known ETA — sub-phase has
+                    // total > 0 and at least one tick of progress to
+                    // extrapolate from.
                     <>
-                      <span className="text-foreground">{Math.round(displayPercent)}%</span>
                       <span> · </span>
-                      <span className="text-primary">ETA {eta}</span>
+                      <span className="text-accent">ETA {eta}</span>
                     </>
-                  ) : (
-                    <span className="text-foreground">{Math.round(displayPercent)}%</span>
-                  )}
+                  ) : progress.phase === "tick" && progress.step_elapsed_ms > 0 ? (
+                    // Indeterminate sub-phase (`updating relations`,
+                    // `synthesizing paper`, etc. — daemon's total is
+                    // 0 so it can't divide). Show a live counter of
+                    // step-local elapsed seconds so the user sees the
+                    // clock tick rather than a frozen percentage with
+                    // no time signal. Matches the daemon's
+                    // `step_elapsed_ms` semantics (resets at each
+                    // step boundary) so the counter restarts when
+                    // the bar enters a new step band.
+                    <>
+                      <span> · </span>
+                      <span className="text-muted-foreground">
+                        {formatStepElapsed(progress.step_elapsed_ms)}
+                      </span>
+                    </>
+                  ) : null}
                 </span>
                 <Button
                   variant="ghost"

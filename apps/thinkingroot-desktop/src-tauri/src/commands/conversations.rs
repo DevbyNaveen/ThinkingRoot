@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use thinkingroot_core::WorkspaceRegistry;
 use uuid::Uuid;
 
@@ -32,6 +33,12 @@ pub struct ConversationSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
+    /// Set after the sidecar LLM names this session (sidebar title).
+    #[serde(default)]
+    pub title_ai_generated: bool,
+    /// Set when the user renames — blocks automatic title overwrite.
+    #[serde(default)]
+    pub title_user_customized: bool,
 }
 
 /// One persisted message. Mirrors the UI's `ChatMessage` shape closely
@@ -76,8 +83,15 @@ pub struct ConversationCreateArgs {
     pub title: Option<String>,
 }
 
+fn emit_conversations_changed(app: &tauri::AppHandle) {
+    let _ = app.emit("conversations-changed", true);
+}
+
 #[tauri::command]
-pub fn conversations_create(args: ConversationCreateArgs) -> Result<ConversationSummary, String> {
+pub fn conversations_create(
+    app: tauri::AppHandle,
+    args: ConversationCreateArgs,
+) -> Result<ConversationSummary, String> {
     let entry = lookup_workspace(&args.workspace)?;
     let dir = conv_dir(&entry.path);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create dir: {e}"))?;
@@ -96,6 +110,8 @@ pub fn conversations_create(args: ConversationCreateArgs) -> Result<Conversation
         created_at: now,
         updated_at: now,
         message_count: 0,
+        title_ai_generated: false,
+        title_user_customized: false,
     };
 
     let conv = Conversation {
@@ -104,6 +120,7 @@ pub fn conversations_create(args: ConversationCreateArgs) -> Result<Conversation
     };
     write_conversation(&dir, &conv)?;
     upsert_index(&dir, summary.clone())?;
+    emit_conversations_changed(&app);
     Ok(summary)
 }
 
@@ -171,7 +188,10 @@ pub struct ConversationDeleteArgs {
 }
 
 #[tauri::command]
-pub fn conversations_delete(args: ConversationDeleteArgs) -> Result<bool, String> {
+pub fn conversations_delete(
+    app: tauri::AppHandle,
+    args: ConversationDeleteArgs,
+) -> Result<bool, String> {
     // Sandbox the id before joining it into the conversations
     // directory — without this guard, an id like `../../etc/passwd`
     // resolves outside the conversations dir and lets a malicious
@@ -191,6 +211,9 @@ pub fn conversations_delete(args: ConversationDeleteArgs) -> Result<bool, String
     let mut idx = read_index(&dir).unwrap_or_default();
     idx.retain(|s| s.id != args.id);
     write_index(&dir, &idx)?;
+    if removed {
+        emit_conversations_changed(&app);
+    }
     Ok(removed)
 }
 
@@ -204,7 +227,10 @@ pub struct ConversationRenameArgs {
 }
 
 #[tauri::command]
-pub fn conversations_rename(args: ConversationRenameArgs) -> Result<ConversationSummary, String> {
+pub fn conversations_rename(
+    app: tauri::AppHandle,
+    args: ConversationRenameArgs,
+) -> Result<ConversationSummary, String> {
     let entry = lookup_workspace(&args.workspace)?;
     let dir = conv_dir(&entry.path);
     let mut conv = read_conversation(&dir, &args.id)?;
@@ -213,19 +239,21 @@ pub fn conversations_rename(args: ConversationRenameArgs) -> Result<Conversation
         return Err("title cannot be empty".to_string());
     }
     conv.summary.title = trimmed.to_string();
+    conv.summary.title_user_customized = true;
     conv.summary.updated_at = Utc::now();
     write_conversation(&dir, &conv)?;
     upsert_index(&dir, conv.summary.clone())?;
+    emit_conversations_changed(&app);
     Ok(conv.summary)
 }
 
-// ─── Internals ───────────────────────────────────────────────────────
+// ─── Internals (pub(crate) for conversation_title) ───────────────────
 
-fn conv_dir(workspace_root: &Path) -> PathBuf {
+pub(crate) fn conv_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".thinkingroot").join("conversations")
 }
 
-fn lookup_workspace(name: &str) -> Result<thinkingroot_core::WorkspaceEntry, String> {
+pub(crate) fn lookup_workspace(name: &str) -> Result<thinkingroot_core::WorkspaceEntry, String> {
     let registry = WorkspaceRegistry::load().map_err(|e| e.to_string())?;
     registry
         .workspaces
@@ -266,7 +294,7 @@ fn write_index(dir: &Path, idx: &[ConversationSummary]) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
 }
 
-fn upsert_index(dir: &Path, summary: ConversationSummary) -> Result<(), String> {
+pub(crate) fn upsert_index(dir: &Path, summary: ConversationSummary) -> Result<(), String> {
     let mut idx = read_index(dir).unwrap_or_default();
     if let Some(existing) = idx.iter_mut().find(|s| s.id == summary.id) {
         *existing = summary;
@@ -277,7 +305,7 @@ fn upsert_index(dir: &Path, summary: ConversationSummary) -> Result<(), String> 
     write_index(dir, &idx)
 }
 
-fn read_conversation(dir: &Path, id: &str) -> Result<Conversation, String> {
+pub(crate) fn read_conversation(dir: &Path, id: &str) -> Result<Conversation, String> {
     if !is_safe_id(id) {
         return Err("invalid conversation id".to_string());
     }
@@ -286,7 +314,7 @@ fn read_conversation(dir: &Path, id: &str) -> Result<Conversation, String> {
     serde_json::from_str(&raw).map_err(|e| format!("decode: {e}"))
 }
 
-fn write_conversation(dir: &Path, conv: &Conversation) -> Result<(), String> {
+pub(crate) fn write_conversation(dir: &Path, conv: &Conversation) -> Result<(), String> {
     if !is_safe_id(&conv.summary.id) {
         return Err("invalid conversation id".to_string());
     }
@@ -298,10 +326,10 @@ fn write_conversation(dir: &Path, conv: &Conversation) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
 }
 
-fn derive_title(content: &str) -> String {
+pub(crate) fn derive_title(content: &str) -> String {
     let line = content.lines().next().unwrap_or(content).trim();
-    let mut t = line.chars().take(60).collect::<String>();
-    if line.chars().count() > 60 {
+    let mut t = line.chars().take(48).collect::<String>();
+    if line.chars().count() > 48 {
         t.push('…');
     }
     if t.is_empty() {

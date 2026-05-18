@@ -849,6 +849,34 @@ pub async fn chat_approve(app: AppHandle, args: ChatApproveArgs) -> Result<(), S
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Defensive silent-dismiss for the predict/check TOCTOU race
+        // (2026-05-18). The daemon's SSE relay calls
+        // `PermissionsGate::predict` BEFORE emitting
+        // `approval_requested`, so the dialog should only render for
+        // requests the gate will actually wait on. But a rule edit
+        // between predict (peek) and check (gate) can flip the
+        // outcome — the daemon auto-decides, the agent moves on, and
+        // the user's click hits 404 `NO_PENDING_APPROVAL`. Surface
+        // that case as Ok(()) with a tracing log so the dialog
+        // dismisses cleanly instead of toasting an error the user
+        // can't act on (the agent has already proceeded).
+        //
+        // String match on the wire-format `code` field rather than
+        // a structured enum because adding a Tauri-side typed shape
+        // here would force every desktop UI surface to learn the
+        // race semantics — the silent-dismiss is local to this
+        // command and self-contained.
+        if status == reqwest::StatusCode::NOT_FOUND
+            && body.contains("NO_PENDING_APPROVAL")
+        {
+            tracing::info!(
+                target: "chat_approve",
+                tool_use_id = %args.tool_use_id,
+                "approval decision arrived after daemon auto-decide; \
+                 dialog dismissed silently (predict/check TOCTOU)"
+            );
+            return Ok(());
+        }
         return Err(format!("approval endpoint returned {status}: {body}"));
     }
     Ok(())

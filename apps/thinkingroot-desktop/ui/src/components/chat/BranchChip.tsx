@@ -1,7 +1,7 @@
 // apps/thinkingroot-desktop/ui/src/components/chat/BranchChip.tsx
 //
-// Header chip that shows the active branch + lets the user switch.
-// Lives in the chat header above the messages list.
+// Branch chip — active branch + switcher. Shown in the composer footer
+// (session chat); was previously in the chat context header.
 //
 // Wire path:
 //   - Initial load: `branchList(workspace)` → find `current === true`
@@ -38,9 +38,15 @@ interface BranchChipProps {
   workspace: string;
   /** Smaller label for the chat context header. */
   compact?: boolean;
+  /** Open the branch menu upward (composer footer). */
+  dropUp?: boolean;
 }
 
-export function BranchChip({ workspace, compact = false }: BranchChipProps) {
+export function BranchChip({
+  workspace,
+  compact = false,
+  dropUp = false,
+}: BranchChipProps) {
   const [branches, setBranches] = useState<BranchView[]>([]);
   const [open, setOpen] = useState(false);
   const [switching, setSwitching] = useState<string | null>(null);
@@ -184,7 +190,10 @@ export function BranchChip({ workspace, compact = false }: BranchChipProps) {
         <div
           role="listbox"
           aria-label="Branches"
-          className="absolute left-0 top-full z-30 mt-1.5 w-72 overflow-hidden rounded-xl border border-border/70 bg-surface-elevated shadow-elevated"
+          className={cn(
+            "absolute left-0 z-30 w-72 overflow-hidden rounded-xl border border-border/70 bg-surface-elevated shadow-elevated",
+            dropUp ? "bottom-full mb-1.5" : "top-full mt-1.5",
+          )}
         >
           <ul className="max-h-72 overflow-y-auto p-1">
             {branches.map((b) => {

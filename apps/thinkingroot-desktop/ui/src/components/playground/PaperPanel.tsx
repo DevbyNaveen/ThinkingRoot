@@ -1,7 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeSanitize from "rehype-sanitize";
 import { FileText, RefreshCw, RotateCcw } from "lucide-react";
 
 import {
@@ -9,7 +6,7 @@ import {
   paperRegenerate,
   type PaperPayload,
 } from "@/lib/tauri";
-import { transformCitations } from "@/components/playground/CitationChip";
+import { ChatMarkdown } from "@/components/chat/ChatMarkdown";
 import { cn } from "@/lib/utils";
 
 /**
@@ -22,11 +19,7 @@ import { cn } from "@/lib/utils";
  * + workspace metadata are surfaced separately in the header
  * strip) and renders the body via ReactMarkdown.
  *
- * Mermaid code-blocks render as preformatted text in v1 — wiring
- * the mermaid npm package in is part of the next ship. The
- * structurally-valid Mermaid source is still byte-perfect in the
- * markdown, so a future viewer (or the public hub) renders it
- * without changing the `paper.md` byte-stream.
+ * Mermaid fences render as diagrams via {@link ChatMarkdown}.
  */
 export function PaperPanel({
   workspace,
@@ -167,17 +160,7 @@ export function PaperPanel({
         </div>
       </header>
       <div className="prose prose-sm dark:prose-invert max-w-none flex-1 overflow-auto px-6 py-4">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeSanitize]}
-          components={{
-            p: ({ children }) => <p>{transformCitations(children)}</p>,
-            li: ({ children }) => <li>{transformCitations(children)}</li>,
-            td: ({ children }) => <td>{transformCitations(children)}</td>,
-          }}
-        >
-          {body}
-        </ReactMarkdown>
+        <ChatMarkdown citations>{body}</ChatMarkdown>
       </div>
     </div>
   );

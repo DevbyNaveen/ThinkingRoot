@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Plug, Check, Copy, Loader2, X, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Plug, Copy, Loader2, X, Trash2 } from "lucide-react";
 import {
   configPaths,
   credentialsRemove,
@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { PasswordInput } from "@/components/ui/password-input";
 import { cn } from "@/lib/utils";
 import { CloudPanel } from "@/components/cloud/CloudPanel";
+import { McpConnectedToolsList } from "@/components/settings/McpConnectedToolsList";
 import type { SettingsSectionId, Theme } from "@/types";
 
 /** Provider keys the Settings UI surfaces. The `env_var` matches the
@@ -53,9 +54,6 @@ const THEMES: Array<{ id: Theme; label: string; note?: string }> = [
   { id: "dark", label: "Dark", note: "Catppuccin Mocha" },
   { id: "light", label: "Light" },
   { id: "auto", label: "Auto", note: "Follow system" },
-  { id: "daltonized-protanopia", label: "CVD · Protanopia", note: "red-deficient palette" },
-  { id: "daltonized-deuteranopia", label: "CVD · Deuteranopia", note: "green-deficient palette" },
-  { id: "daltonized-tritanopia", label: "CVD · Tritanopia", note: "blue-deficient palette" },
 ];
 
 /** Large title + subtitle for the active settings category (center pane). */
@@ -72,7 +70,7 @@ const SETTINGS_PAGE_META: Record<SettingsSectionId, { title: string; subtitle: s
   },
   appearance: {
     title: "Appearance",
-    subtitle: "Theme applies immediately across the app. CVD palettes keep trust colors distinguishable.",
+    subtitle: "Theme applies immediately across the app.",
   },
   mcp: {
     title: "MCP",
@@ -371,36 +369,26 @@ export function SettingsView() {
                 <SettingsGroup label="Backend">
                   <div className="divide-y divide-border/35">
                     <SettingsRow
+                      stack
                       label="Default provider"
                       description="Used for extraction and compilation unless a workspace sets its own models."
                     >
-                      <div className="flex flex-wrap justify-end gap-2">
-                        {PROVIDER_META.map((p) => {
-                          const active = provider === p.id;
+                      <SettingsPickerGrid
+                        value={provider}
+                        onChange={(id) => {
+                          setProvider(id);
+                          setGlobalPending((g) => ({ ...g, default_provider: id }));
+                        }}
+                        options={PROVIDER_META.map((p) => {
                           const cred = credentials.find((c) => c.env_var === p.env_var);
-                          const configured =
-                            cred?.persisted === true || cred?.in_process_env === true;
-                          return (
-                            <button
-                              key={p.id}
-                              type="button"
-                              onClick={() => {
-                                setProvider(p.id);
-                                setGlobalPending((g) => ({ ...g, default_provider: p.id }));
-                              }}
-                              className={cn(
-                                "flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors",
-                                active
-                                  ? "border-accent bg-accent/15 text-accent"
-                                  : "border-border/80 bg-background/40 text-muted-foreground hover:border-border hover:text-foreground",
-                              )}
-                            >
-                              {configured && <Check className="size-3 text-success" />}
-                              {p.label}
-                            </button>
-                          );
+                          return {
+                            id: p.id,
+                            label: p.label,
+                            configured:
+                              cred?.persisted === true || cred?.in_process_env === true,
+                          };
                         })}
-                      </div>
+                      />
                     </SettingsRow>
                     <SettingsRow
                       label={`${providerMeta.label} API key`}
@@ -475,7 +463,7 @@ export function SettingsView() {
                           key={w.name}
                           className={cn(
                             "flex items-stretch gap-0 transition-colors",
-                            isActive ? "bg-accent/[0.07]" : "hover:bg-muted/25",
+                            isActive ? "bg-muted/70" : "hover:bg-muted/25",
                           )}
                         >
                           <button
@@ -496,9 +484,7 @@ export function SettingsView() {
                                 {w.path}
                               </p>
                             </div>
-                            {isActive && (
-                              <Check className="size-4 shrink-0 text-accent" aria-label="Active" />
-                            )}
+
                           </button>
                           <Button
                             type="button"
@@ -519,54 +505,26 @@ export function SettingsView() {
               </SettingsGroup>
             )}
 
-            {settingsSection === "appearance" && (
+                        {settingsSection === "appearance" && (
               <SettingsGroup label="Theme">
                 <div className="space-y-3 p-4 sm:p-5">
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium text-foreground">Color palette</p>
-                    <p className="text-[13px] leading-snug text-muted-foreground">
-                      Dark is the default. CVD options tune admission-tier colors for protanopia,
-                      deuteranopia, and tritanopia.
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                    {THEMES.map((opt) => {
-                      const active = theme === opt.id;
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          onClick={() => setTheme(opt.id)}
-                          className={cn(
-                            "flex items-start gap-3 rounded-xl border p-3.5 text-left transition-colors",
-                            active
-                              ? "border-accent bg-accent/10 shadow-sm"
-                              : "border-border/60 bg-background/30 hover:border-border hover:bg-muted/30",
-                          )}
-                        >
-                          <span
-                            className={cn(
-                              "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border",
-                              active ? "border-accent bg-accent" : "border-border",
-                            )}
-                          >
-                            {active && <Check className="size-2.5 text-accent-foreground" />}
-                          </span>
-                          <div className="min-w-0">
-                            <p className="text-sm font-medium text-foreground">{opt.label}</p>
-                            {opt.note && (
-                              <p className="mt-0.5 text-[11px] text-muted-foreground">{opt.note}</p>
-                            )}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
+                  <p className="text-[13px] leading-snug text-muted-foreground">
+                    Dark is the default. Light uses the day palette. Auto follows your system.
+                  </p>
+                  <SettingsPickerGrid
+                    value={theme}
+                    onChange={setTheme}
+                    options={THEMES.map((opt) => ({
+                      id: opt.id,
+                      label: opt.label,
+                      note: opt.note,
+                    }))}
+                  />
                 </div>
               </SettingsGroup>
             )}
 
-            {settingsSection === "mcp" && <McpPane />}
+{settingsSection === "mcp" && <McpPane />}
 
             {settingsSection === "channels" && (
               <SettingsGroup label="Messaging">
@@ -585,7 +543,7 @@ export function SettingsView() {
   );
 }
 
-function SettingsGroup({
+export function SettingsGroup({
   label,
   children,
 }: {
@@ -606,24 +564,81 @@ function SettingsGroup({
   );
 }
 
-function SettingsRow({
+export function SettingsRow({
   label,
   description,
   children,
+  stack,
 }: {
   label: string;
   description?: string;
   children: React.ReactNode;
+  stack?: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:gap-8 sm:px-5 sm:py-5">
+    <div
+      className={cn(
+        "gap-3 px-4 py-4 sm:px-5 sm:py-5",
+        stack
+          ? "flex flex-col"
+          : "flex flex-col sm:flex-row sm:items-start sm:justify-between sm:gap-8",
+      )}
+    >
       <div className="min-w-0 flex-1 space-y-1">
         <p className="text-sm font-medium leading-snug text-foreground">{label}</p>
         {description ? (
           <p className="text-[13px] leading-relaxed text-muted-foreground">{description}</p>
         ) : null}
       </div>
-      <div className="w-full shrink-0 sm:w-auto sm:max-w-[min(100%,22rem)] sm:pt-0.5">{children}</div>
+      <div className={cn("w-full shrink-0", !stack && "sm:w-auto sm:max-w-[min(100%,22rem)] sm:pt-0.5")}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** Equal bento tiles — shared picker UI across settings sections. */
+function SettingsPickerGrid<T extends string>({
+  options,
+  value,
+  onChange,
+}: {
+  options: Array<{ id: T; label: string; note?: string; configured?: boolean }>;
+  value: T;
+  onChange: (id: T) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+      {options.map((opt) => {
+        const active = value === opt.id;
+        return (
+          <button
+            key={opt.id}
+            type="button"
+            onClick={() => onChange(opt.id)}
+            aria-pressed={active}
+            className={cn(
+              "relative flex min-h-[2.25rem] flex-col items-center justify-center rounded-md border px-1 py-1.5 text-center transition-colors",
+              active
+                ? "border-border/50 bg-muted/70 text-foreground"
+                : "border-border/30 bg-background/25 text-muted-foreground hover:bg-muted/35 hover:text-foreground",
+            )}
+          >
+            {opt.configured ? (
+              <span
+                className="absolute right-1 top-1 size-1.5 rounded-full bg-success"
+                aria-label="Configured"
+              />
+            ) : null}
+            <span className="text-[10px] font-medium leading-tight">{opt.label}</span>
+            {opt.note ? (
+              <span className="mt-0.5 text-[9px] leading-none text-muted-foreground">
+                {opt.note}
+              </span>
+            ) : null}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -685,15 +700,20 @@ function AzureWorkspaceCard({
   return (
     <div className="space-y-10">
       <SettingsGroup label="Azure — global">
-        <div className="space-y-4 p-4 sm:p-5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm font-medium text-foreground">Shared defaults</p>
+        <div className="divide-y divide-border/35">
+          <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:gap-6 sm:px-5 sm:py-5">
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium leading-snug text-foreground">Shared defaults</p>
+              <p className="text-[13px] leading-relaxed text-muted-foreground">
+                Used when a workspace does not define its own Azure deployment settings.
+              </p>
+            </div>
             <span
               className={cn(
-                "rounded-md px-2 py-0.5 text-[10px] font-medium",
+                "shrink-0 rounded-md border px-2.5 py-1 text-[11px] font-medium",
                 globalAzure.api_key_env_present
-                  ? "bg-success/15 text-success"
-                  : "bg-yellow-500/15 text-yellow-300",
+                  ? "border-success/25 bg-success/10 text-success"
+                  : "border-yellow-500/25 bg-yellow-500/10 text-yellow-600 dark:text-yellow-300",
               )}
             >
               {globalAzure.api_key_env_present
@@ -701,93 +721,95 @@ function AzureWorkspaceCard({
                 : `${globalAzure.api_key_env ?? "AZURE_OPENAI_API_KEY"} not in env`}
             </span>
           </div>
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Resource name">
+          <SettingsRow
+            label="Resource name"
+            description="Azure OpenAI resource name in your subscription."
+          >
             <input
               type="text"
               value={
-                globalPending.azure?.resource_name ??
-                globalAzure.resource_name ??
-                ""
+                globalPending.azure?.resource_name ?? globalAzure.resource_name ?? ""
               }
               onChange={(e) => patchGlobalAzure("resource_name", e.target.value)}
-              className={fieldClass}
+              className={settingsInputClass}
               placeholder="my-company-openai"
             />
-          </Field>
-          <Field label="Endpoint base (override)">
+          </SettingsRow>
+          <SettingsRow
+            label="Endpoint base"
+            description="Optional override when the default Azure endpoint pattern does not apply."
+          >
             <input
               type="text"
               value={
-                globalPending.azure?.endpoint_base ??
-                globalAzure.endpoint_base ??
-                ""
+                globalPending.azure?.endpoint_base ?? globalAzure.endpoint_base ?? ""
               }
               onChange={(e) => patchGlobalAzure("endpoint_base", e.target.value)}
-              className={fieldClass}
-              placeholder="https://*.cognitiveservices.azure.com"
+              className={settingsInputClass}
+              placeholder="https://your-resource.cognitiveservices.azure.com"
             />
-          </Field>
-          <Field label="Deployment">
+          </SettingsRow>
+          <SettingsRow label="Deployment" description="Model deployment name in Azure OpenAI Studio.">
             <input
               type="text"
-              value={
-                globalPending.azure?.deployment ??
-                globalAzure.deployment ??
-                ""
-              }
+              value={globalPending.azure?.deployment ?? globalAzure.deployment ?? ""}
               onChange={(e) => patchGlobalAzure("deployment", e.target.value)}
-              className={fieldClass}
+              className={settingsInputClass}
               placeholder="gpt-4.1-mini"
             />
-          </Field>
-          <Field label="API version">
+          </SettingsRow>
+          <SettingsRow label="API version" description="Azure OpenAI REST API version string.">
             <input
               type="text"
-              value={
-                globalPending.azure?.api_version ??
-                globalAzure.api_version ??
-                ""
-              }
+              value={globalPending.azure?.api_version ?? globalAzure.api_version ?? ""}
               onChange={(e) => patchGlobalAzure("api_version", e.target.value)}
-              className={fieldClass}
+              className={settingsInputClass}
               placeholder="2024-12-01-preview"
             />
-          </Field>
-        </div>
+          </SettingsRow>
         </div>
       </SettingsGroup>
 
       {wsLlm?.config_exists && (
         <SettingsGroup label="Azure — this workspace">
-          <div className="space-y-4 p-4 sm:p-5">
-            <p className="text-[13px] leading-relaxed text-muted-foreground">
-              <span className="font-medium text-foreground">Override path</span>{" "}
-              <span className="break-all font-mono text-[11px]">{wsLlm.workspace_path ?? "—"}</span>
-            </p>
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-
-            <Field label="Extraction model">
+          <div className="divide-y divide-border/35">
+            <SettingsRow
+              stack
+              label="Override file"
+              description="Models below are written to this workspace config.toml."
+            >
+              <p className="break-all rounded-lg border border-input/80 bg-background/80 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-foreground">
+                {wsLlm.workspace_path ? `${wsLlm.workspace_path}/.thinkingroot/config.toml` : "—"}
+              </p>
+            </SettingsRow>
+            <SettingsRow
+              label="Extraction model"
+              description="Used during claim extraction for this workspace only."
+            >
               <input
                 type="text"
                 value={wsField("extraction_model") ?? wsLlm.extraction_model ?? ""}
                 onChange={(e) =>
                   setWsPending((p) => ({ ...p, extraction_model: e.target.value }))
                 }
-                className={fieldClass}
+                className={settingsInputClass}
+                placeholder="gpt-4.1-mini"
               />
-            </Field>
-            <Field label="Compilation model">
+            </SettingsRow>
+            <SettingsRow
+              label="Compilation model"
+              description="Used during compile-time LLM steps for this workspace only."
+            >
               <input
                 type="text"
                 value={wsField("compilation_model") ?? wsLlm.compilation_model ?? ""}
                 onChange={(e) =>
                   setWsPending((p) => ({ ...p, compilation_model: e.target.value }))
                 }
-                className={fieldClass}
+                className={settingsInputClass}
+                placeholder="gpt-4.1-mini"
               />
-            </Field>
-            </div>
+            </SettingsRow>
           </div>
         </SettingsGroup>
       )}
@@ -918,26 +940,17 @@ function McpPane() {
         </div>
       </SettingsGroup>
 
+      <SettingsGroup label="Available tools">
+        <McpConnectedToolsList />
+      </SettingsGroup>
+
       <SettingsGroup label="Editor or CLI">
-        <div className="flex flex-wrap gap-2 p-4 sm:p-5">
-          {MCP_TOOLS.map((opt) => {
-            const active = tool === opt.id;
-            return (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => setTool(opt.id)}
-                className={cn(
-                  "rounded-lg border px-3 py-2 text-xs font-medium transition-colors",
-                  active
-                    ? "border-accent bg-accent/15 text-accent"
-                    : "border-border/80 bg-background/40 text-muted-foreground hover:border-border hover:text-foreground",
-                )}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
+        <div className="p-4 sm:p-5">
+          <SettingsPickerGrid
+            value={tool}
+            onChange={setTool}
+            options={MCP_TOOLS.map((opt) => ({ id: opt.id, label: opt.label }))}
+          />
         </div>
       </SettingsGroup>
 
@@ -982,26 +995,5 @@ function McpPane() {
   );
 }
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  const id = useMemo(() => `f-${label.replace(/\s+/g, "-").toLowerCase()}`, [label]);
-  return (
-    <label htmlFor={id} className="flex flex-col gap-1">
-      <span className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
-        {label}
-      </span>
-      <div id={id}>{children}</div>
-      {hint && <span className="text-[10px] text-muted-foreground">{hint}</span>}
-    </label>
-  );
-}
-
-const fieldClass =
-  "h-9 w-full rounded-lg border border-input/70 bg-background/70 px-2.5 text-xs font-mono text-foreground focus:outline-none";
+const settingsInputClass =
+  "h-9 w-full min-w-[12rem] rounded-lg border border-input/80 bg-background/80 px-2.5 text-xs font-mono text-foreground placeholder:text-muted-foreground focus:outline-none";

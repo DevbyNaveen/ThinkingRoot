@@ -8,10 +8,6 @@
  *      conversation titles (minimal list; no file-tree chrome).
  *      When the main pane is Settings, this column switches to a
  *      category list (Provider, Workspace, …) plus Back to chats.
- *   4. MCP TOOLS → tool names from the sidecar `/.well-known/mcp`
- *      manifest (same catalog as MCP `tools/list`). Each row inherits
- *      the live `/livez` status for the local SSE transport.
- *
  * Settings and Docs are also reachable from the account menu at the
  * bottom of the rail (opens above the control; no bottom blur strip).
  *
@@ -25,7 +21,12 @@ import * as ScrollArea from "@radix-ui/react-scroll-area";
 import {
   ArrowLeft,
   BookOpen,
+  Braces,
+  FileCode,
   FolderPlus,
+  Package,
+  Sparkles,
+  Terminal,
   Plus,
   RefreshCw,
   SlidersHorizontal,
@@ -55,18 +56,17 @@ import {
   cloudLoginStart,
   conversationsCreate,
   conversationsList,
-  mcpListConnected,
   workspaceAdd,
   workspaceList,
   workspaceScan,
   workspaceSetActive,
+  onConversationsChanged,
   onWorkspacesChanged,
   type AuthState,
   type ConversationSummary,
-  type McpServerRow,
   type WorkspaceView,
 } from "@/lib/tauri";
-import type { Surface, SettingsSectionId } from "@/types";
+import type { DocSectionId, Surface, SettingsSectionId } from "@/types";
 
 const MAX_PINNED_CONVS = 6;
 
@@ -83,6 +83,20 @@ const SETTINGS_NAV: Array<{
   { id: "cloud", label: "Cloud", icon: Cloud },
 ];
 
+const DOCS_NAV: Array<{
+  id: DocSectionId;
+  label: string;
+  icon: typeof BookOpen;
+}> = [
+  { id: "overview", label: "Overview", icon: BookOpen },
+  { id: "cursor", label: "Cursor / MCP", icon: Plug },
+  { id: "node", label: "Node", icon: Braces },
+  { id: "python", label: "Python", icon: FileCode },
+  { id: "curl", label: "curl", icon: Terminal },
+  { id: "lovable", label: "Lovable", icon: Sparkles },
+  { id: "export", label: ".tr Export", icon: Package },
+];
+
 type WorkspaceWithConvs = WorkspaceView & {
   conversations: ConversationSummary[];
 };
@@ -96,10 +110,11 @@ export function Sidebar() {
   const activeConv = useApp((s) => s.activeConversationId);
   const setSettingsSection = useApp((s) => s.setSettingsSection);
   const settingsSection = useApp((s) => s.settingsSection);
+  const docsSection = useApp((s) => s.docsSection);
+  const setDocsSection = useApp((s) => s.setDocsSection);
   const setActiveConv = useApp((s) => s.setActiveConversationId);
 
   const [workspaces, setWorkspaces] = useState<WorkspaceWithConvs[]>([]);
-  const [mcp, setMcp] = useState<McpServerRow[]>([]);
   const [scanning, setScanning] = useState(false);
 
   const storedWidth = useApp((s) => s.sidebarWidth);
@@ -183,15 +198,21 @@ export function Sidebar() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    onWorkspacesChanged(() => {
+    let unlistenWs: (() => void) | undefined;
+    let unlistenConv: (() => void) | undefined;
+    const bump = () => {
       if (!cancelled) void refresh();
-    }).then((fn) => {
-      if (!cancelled) unlisten = fn;
+    };
+    onWorkspacesChanged(bump).then((fn) => {
+      if (!cancelled) unlistenWs = fn;
+    });
+    onConversationsChanged(bump).then((fn) => {
+      if (!cancelled) unlistenConv = fn;
     });
     return () => {
       cancelled = true;
-      unlisten?.();
+      unlistenWs?.();
+      unlistenConv?.();
     };
   }, [refresh]);
 
@@ -212,13 +233,6 @@ export function Sidebar() {
       }
       if (cancelled) return;
       await refresh();
-      try {
-        const m = await mcpListConnected();
-        if (cancelled) return;
-        setMcp(m);
-      } catch {
-        /* honest empty if sidecar unreachable */
-      }
     })();
     return () => {
       cancelled = true;
@@ -270,204 +284,192 @@ export function Sidebar() {
       />
       <Header />
 
-      <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-        <ScrollArea.Root className="h-full min-h-0 min-w-0">
-          <ScrollArea.Viewport className="h-full min-h-0 w-full max-h-full">
-            <div className="flex min-w-0 flex-col px-2 pb-4 pt-2">
-            {surface === "settings" ? (
-              <SettingsSidebarNav
-                active={settingsSection}
-                onPick={setSettingsSection}
-                onBackToChats={() => setSurface("chats")}
-              />
-            ) : (
-              <>
-            <PrimaryActions
-              surface={surface}
-              setSurface={setSurface}
-              activeWorkspace={activeWorkspace}
-              hasWorkspaces={workspaces.length > 0}
-              onNewConversation={async () => {
-                let target = activeWorkspace;
-                if (!target) {
-                  if (workspaces.length === 0) {
-                    toast("No workspace yet", {
-                      kind: "warn",
-                      body: "Use Add workspace next to Workspaces, or run `root compile <path>` in your terminal.",
-                    });
-                    return;
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {surface === "settings" ? (
+          <ScrollArea.Root className="h-full min-h-0 min-w-0">
+            <ScrollArea.Viewport className="h-full min-h-0 w-full max-h-full">
+              <div className="flex min-w-0 flex-col px-2 pb-4 pt-2">
+                <SettingsSidebarNav
+                  active={settingsSection}
+                  onPick={setSettingsSection}
+                  onBackToChats={() => setSurface("chats")}
+                />
+              </div>
+            </ScrollArea.Viewport>
+            <ScrollArea.Scrollbar orientation="vertical" className="w-1.5 touch-none select-none p-0">
+              <ScrollArea.Thumb className="rounded-sm bg-muted-foreground/18" />
+            </ScrollArea.Scrollbar>
+          </ScrollArea.Root>
+        ) : surface === "docs" ? (
+          <ScrollArea.Root className="h-full min-h-0 min-w-0">
+            <ScrollArea.Viewport className="h-full min-h-0 w-full max-h-full">
+              <div className="flex min-w-0 flex-col px-2 pb-4 pt-2">
+                <DocsSidebarNav
+                  active={docsSection}
+                  onPick={setDocsSection}
+                  onBackToChats={() => setSurface("chats")}
+                />
+              </div>
+            </ScrollArea.Viewport>
+            <ScrollArea.Scrollbar orientation="vertical" className="w-1.5 touch-none select-none p-0">
+              <ScrollArea.Thumb className="rounded-sm bg-muted-foreground/18" />
+            </ScrollArea.Scrollbar>
+          </ScrollArea.Root>
+        ) : (
+          <>
+            <div className="window-no-drag shrink-0 bg-surface px-2 pb-2.5 pt-2">
+              <PrimaryActions
+                surface={surface}
+                setSurface={setSurface}
+                activeWorkspace={activeWorkspace}
+                hasWorkspaces={workspaces.length > 0}
+                onNewConversation={async () => {
+                  let target = activeWorkspace;
+                  if (!target) {
+                    if (workspaces.length === 0) {
+                      toast("No workspace yet", {
+                        kind: "warn",
+                        body: "Use Add workspace next to Workspaces, or run `root compile <path>` in your terminal.",
+                      });
+                      return;
+                    }
+                    const first = workspaces[0];
+                    if (!first) return;
+                    target = first.name;
                   }
-                  const first = workspaces[0];
-                  if (!first) return;
-                  target = first.name;
-                }
-                await createConversationIn(target);
-              }}
-            />
+                  await createConversationIn(target);
+                }}
+              />
 
-            <SectionHeader
-              label="Workspaces"
-              right={
-                <div className="flex items-center gap-1">
-                  <IconBtn
-                    title="Refresh workspace list"
-                    aria-label="Refresh workspaces"
-                    busy={scanning}
-                    onClick={async () => {
-                      setScanning(true);
-                      try {
-                        const r = await workspaceScan();
-                        if (r.registered.length > 0) {
-                          toast(
-                            `Found ${r.registered.length} new workspace${r.registered.length === 1 ? "" : "s"}`,
-                            { kind: "success" },
-                          );
-                        } else {
-                          toast("Workspace list refreshed", {
-                            kind: "success",
-                            body: "Scanned your workspace roots for folders containing `.thinkingroot`.",
-                          });
-                        }
-                        await refresh();
-                      } catch (e) {
-                        toast("Scan failed", {
-                          kind: "error",
-                          body: e instanceof Error ? e.message : String(e),
-                        });
-                      } finally {
-                        setScanning(false);
-                      }
-                    }}
-                  >
-                    <RefreshCw
-                      className={cn("size-3.5", scanning && "animate-spin")}
-                    />
-                  </IconBtn>
-                  <IconBtn
-                    title="Add workspace folder"
-                    aria-label="Add workspace"
-                    onClick={async () => {
-                      try {
-                        const picked = await openDialog({
-                          directory: true,
-                          multiple: false,
-                        });
-                        if (typeof picked !== "string") return;
-                        const previousActive = useApp.getState().activeWorkspace;
-                        const w = await workspaceAdd({ path: picked });
-                        useApp.getState().setActiveWorkspace(w.name);
+              <SectionHeader
+                label="Workspaces"
+                right={
+                  <div className="flex items-center gap-1">
+                    <IconBtn
+                      title="Refresh workspace list"
+                      aria-label="Refresh workspaces"
+                      busy={scanning}
+                      onClick={async () => {
+                        setScanning(true);
                         try {
-                          await workspaceSetActive(w.name);
+                          const r = await workspaceScan();
+                          if (r.registered.length > 0) {
+                            toast(
+                              `Found ${r.registered.length} new workspace${r.registered.length === 1 ? "" : "s"}`,
+                              { kind: "success" },
+                            );
+                          } else {
+                            toast("Workspace list refreshed", {
+                              kind: "success",
+                              body: "Scanned your workspace roots for folders containing `.thinkingroot`.",
+                            });
+                          }
+                          await refresh();
                         } catch (e) {
-                          useApp.getState().setActiveWorkspace(previousActive);
-                          toast("Set active failed", {
+                          toast("Scan failed", {
                             kind: "error",
                             body: e instanceof Error ? e.message : String(e),
                           });
-                          await refresh();
+                        } finally {
+                          setScanning(false);
                         }
-                      } catch (e) {
-                        toast("Add failed", {
-                          kind: "error",
-                          body: e instanceof Error ? e.message : String(e),
-                        });
-                      }
-                    }}
-                  >
-                    <FolderPlus className="size-3.5" />
-                  </IconBtn>
+                      }}
+                    >
+                      <RefreshCw
+                        className={cn("size-3.5", scanning && "animate-spin")}
+                      />
+                    </IconBtn>
+                    <IconBtn
+                      title="Add workspace folder"
+                      aria-label="Add workspace"
+                      onClick={async () => {
+                        try {
+                          const picked = await openDialog({
+                            directory: true,
+                            multiple: false,
+                          });
+                          if (typeof picked !== "string") return;
+                          const previousActive = useApp.getState().activeWorkspace;
+                          const w = await workspaceAdd({ path: picked });
+                          useApp.getState().setActiveWorkspace(w.name);
+                          try {
+                            await workspaceSetActive(w.name);
+                          } catch (e) {
+                            useApp.getState().setActiveWorkspace(previousActive);
+                            toast("Set active failed", {
+                              kind: "error",
+                              body: e instanceof Error ? e.message : String(e),
+                            });
+                            await refresh();
+                          }
+                        } catch (e) {
+                          toast("Add failed", {
+                            kind: "error",
+                            body: e instanceof Error ? e.message : String(e),
+                          });
+                        }
+                      }}
+                    >
+                      <FolderPlus className="size-3.5" />
+                    </IconBtn>
+                  </div>
+                }
+              />
+            </div>
+
+            <ScrollArea.Root className="min-h-0 flex-1 min-w-0 overflow-hidden">
+              <ScrollArea.Viewport className="sidebar-scroll-viewport h-full min-h-0 w-full max-h-full overflow-x-hidden">
+                <div className="box-border flex min-w-0 max-w-full flex-col px-2 pb-4 pt-1 pr-3">
+                  {workspaces.length === 0 ? (
+                    <p className="px-2 py-3 text-[11px] text-muted-foreground">
+                      No workspaces yet. Use refresh to scan for folders that already
+                      contain <code className="font-mono">.thinkingroot</code>, or add
+                      one with the button beside Workspaces.
+                    </p>
+                  ) : (
+                    <ul className="flex min-w-0 max-w-full flex-col">
+                      {workspaces.map((w) => (
+                        <WorkspaceRow
+                          key={w.name}
+                          workspace={w}
+                          surface={surface}
+                          activeWorkspace={activeWorkspace}
+                          activeConv={activeConv}
+                          onNewChat={() => void createConversationIn(w.name)}
+                          onSelectWorkspace={async () => {
+                            // Workspace click should take the user back to chats:
+                            // one clear selection state in the sidebar.
+                            try {
+                              await workspaceSetActive(w.name);
+                              setActiveWorkspace(w.name);
+                              setSurface("chats");
+                            } catch (e) {
+                              toast("Set active failed", {
+                                kind: "error",
+                                body: e instanceof Error ? e.message : String(e),
+                              });
+                            }
+                          }}
+                          onSelectConv={(id) => {
+                            setActiveWorkspace(w.name);
+                            setActiveConv(id);
+                            setSurface("chats");
+                          }}
+                        />
+                      ))}
+                    </ul>
+                  )}
                 </div>
-              }
-            />
-
-            {workspaces.length === 0 ? (
-              <p className="px-2 py-3 text-[11px] text-muted-foreground">
-                No workspaces yet. Use refresh to scan for folders that already
-                contain <code className="font-mono">.thinkingroot</code>, or add
-                one with the button beside Workspaces.
-              </p>
-            ) : (
-              <ul className="flex min-w-0 flex-col">
-                {workspaces.map((w) => (
-                  <WorkspaceRow
-                    key={w.name}
-                    workspace={w}
-                    surface={surface}
-                    activeWorkspace={activeWorkspace}
-                    activeConv={activeConv}
-                    onNewChat={() => void createConversationIn(w.name)}
-                    onSelectWorkspace={async () => {
-                      // Workspace click should take the user back to chats:
-                      // one clear selection state in the sidebar.
-                      try {
-                        await workspaceSetActive(w.name);
-                        setActiveWorkspace(w.name);
-                        setSurface("chats");
-                      } catch (e) {
-                        toast("Set active failed", {
-                          kind: "error",
-                          body: e instanceof Error ? e.message : String(e),
-                        });
-                      }
-                    }}
-                    onSelectConv={(id) => {
-                      setActiveWorkspace(w.name);
-                      setActiveConv(id);
-                      setSurface("chats");
-                    }}
-                  />
-                ))}
-              </ul>
-            )}
-
-            <SectionHeader label="MCP Tools" />
-            {mcp.length === 0 ? (
-              <p className="px-2 py-2 text-[11px] text-muted-foreground">
-                Sidecar starting…
-              </p>
-            ) : (
-              <ul className="flex min-h-0 min-w-0 max-h-52 flex-col gap-0.5 overflow-y-auto overflow-x-hidden pr-0.5">
-                {mcp.map((row, i) => (
-                  <li
-                    key={`${row.name}-${i}`}
-                    className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-2 py-1.5 text-xs"
-                    title={row.description ?? row.name}
-                  >
-                    {/* status dot */}
-                    <span
-                      className={cn(
-                        "size-1.5 shrink-0 rounded-full",
-                        row.status === "running"
-                          ? "bg-emerald-500"
-                          : row.status === "configured"
-                            ? "bg-amber-500/90"
-                            : row.status === "unhealthy"
-                              ? "bg-amber-500"
-                              : "bg-zinc-500",
-                      )}
-                    />
-                    {/* plug icon */}
-                    <Plug className="size-3.5 shrink-0 text-muted-foreground" />
-                    {/* name */}
-                    <span className="min-w-0 flex-1 basis-0 break-words text-foreground/80">
-                      {row.name}
-                    </span>
-                    {/* transport badge */}
-                    <span className="shrink-0 rounded bg-muted/60 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-                      {row.transport}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-              </>
-            )}
-          </div>
-        </ScrollArea.Viewport>
-        <ScrollArea.Scrollbar orientation="vertical" className="w-2 p-0.5">
-          <ScrollArea.Thumb className="rounded-full bg-muted-foreground/30" />
-        </ScrollArea.Scrollbar>
-        </ScrollArea.Root>
+              </ScrollArea.Viewport>
+              <ScrollArea.Scrollbar
+                orientation="vertical"
+                className="right-1 w-1.5 touch-none select-none p-0"
+              >
+                <ScrollArea.Thumb className="rounded-sm bg-muted-foreground/18" />
+              </ScrollArea.Scrollbar>
+            </ScrollArea.Root>
+          </>
+        )}
       </div>
 
       <SidebarAuthStrip />
@@ -683,6 +685,58 @@ function SettingsSidebarNav({
   );
 }
 
+function DocsSidebarNav({
+  active,
+  onPick,
+  onBackToChats,
+}: {
+  active: DocSectionId;
+  onPick: (id: DocSectionId) => void;
+  onBackToChats: () => void;
+}) {
+  return (
+    <>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        onClick={onBackToChats}
+        className="mb-1 h-8 w-full justify-start gap-2 px-2 text-xs text-muted-foreground hover:text-foreground"
+      >
+        <ArrowLeft className="size-3.5 shrink-0" />
+        Back to chats
+      </Button>
+      <SectionHeader label="Docs" />
+      <nav
+        className="mt-1 flex flex-col gap-0.5"
+        role="navigation"
+        aria-label="Docs guides"
+      >
+        {DOCS_NAV.map(({ id, label, icon: Icon }) => {
+          const isActive = active === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => onPick(id)}
+              className={cn(
+                "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
+                isActive
+                  ? "bg-muted/90 font-medium text-foreground"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+              )}
+              aria-current={isActive ? "page" : undefined}
+            >
+              <Icon className="size-3.5 shrink-0 opacity-85" strokeWidth={2} />
+              <span className="truncate">{label}</span>
+            </button>
+          );
+        })}
+      </nav>
+    </>
+  );
+}
+
 function Header() {
   return (
     <header className="window-drag flex h-11 min-w-0 shrink-0 items-center gap-2 px-3 pl-14">
@@ -767,9 +821,8 @@ function WorkspaceRow({
   return (
     <li
       className={cn(
-        "mb-3 min-w-0 rounded-lg px-1 py-0.5 last:mb-1",
-        isActive &&
-          "bg-muted/35 ring-1 ring-border/60 ring-inset",
+        "mb-3 box-border min-w-0 max-w-full rounded-lg px-1 py-0.5 last:mb-1",
+        isActive && "mx-0.5 bg-muted/35",
       )}
     >
       <div className="group/workspace-head flex min-w-0 items-start gap-0.5">
@@ -816,7 +869,7 @@ function WorkspaceRow({
       <ul className="mt-0.5 flex min-w-0 flex-col gap-0.5">
         {workspace.conversations.length === 0 ? (
           <li>
-            <div className="rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] italic leading-snug text-muted-foreground/80">
+            <div className="rounded-sm py-1.5 pl-3 pr-2 text-left text-[11px] italic leading-snug text-muted-foreground/80">
               No conversations yet.
             </div>
           </li>
@@ -830,15 +883,33 @@ function WorkspaceRow({
                 onClick={() => onSelectConv(c.id)}
                 aria-current={selected ? "true" : undefined}
                 className={cn(
-                  "w-full rounded-md py-1.5 pl-3 pr-2 text-left text-[11px] leading-snug transition-colors",
+                  "w-full rounded-sm py-1 pl-3 pr-2.5 text-left transition-colors",
                   selected
-                    ? "bg-muted/90 font-medium text-foreground"
+                    ? "bg-muted/80 text-foreground"
                     : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
                 )}
                 title={c.title}
               >
-                <span className="block min-w-0 whitespace-normal break-words text-pretty">
-                  {c.title}
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span
+                    className={cn(
+                      "shrink-0 text-[9px] leading-none",
+                      selected
+                        ? "text-muted-foreground/80"
+                        : "text-muted-foreground/45",
+                    )}
+                    aria-hidden
+                  >
+                    {selected ? "●" : "○"}
+                  </span>
+                  <span
+                    className={cn(
+                      "min-w-0 truncate text-[10.5px] leading-snug",
+                      selected ? "font-medium" : "font-normal",
+                    )}
+                  >
+                    {c.title}
+                  </span>
                 </span>
               </button>
             </li>

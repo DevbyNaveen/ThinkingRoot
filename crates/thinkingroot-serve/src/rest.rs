@@ -120,6 +120,24 @@ pub struct AppState {
     /// this when the user clicks "Allow always" / "Deny always" in
     /// the desktop permission prompt.
     pub permission_store: Arc<RwLock<thinkingroot_core::permissions::PermissionStore>>,
+
+    /// Phase 2 central-AI-plan (2026-05-18) — per-tool agentmemory
+    /// tokens. Loaded from `<config>/thinkingroot/agentmemory-tokens.json`
+    /// at startup. Mutated by `POST /agentmemory/connect` (issue) and
+    /// by `agentmemory_auth_check` (last_seen bump). The agentmemory
+    /// auth path consults this store BEFORE the legacy
+    /// `THINKINGROOT_AGENTMEMORY_SECRET` env var fallback — per-tool
+    /// scoping wins when both are present.
+    pub agentmemory_tokens: Arc<RwLock<crate::agentmemory::tokens::AgentmemoryTokenStore>>,
+
+    /// Phase 3 central-AI-plan (2026-05-18) — per-MCP-session
+    /// telemetry. Parallel to `mcp_sessions` (which holds the SSE
+    /// channel for dispatch); this map carries
+    /// User-Agent / counters / errors for the "AI Tools" dashboard.
+    /// Populated at `handle_sse` open, bumped on each `handle_post`
+    /// dispatch, persisted to `<config>/thinkingroot/mcp-sessions.jsonl`
+    /// on disconnect.
+    pub mcp_session_telemetry: crate::mcp::telemetry::SessionTelemetryMap,
 }
 
 impl AppState {
@@ -139,6 +157,47 @@ impl AppState {
         // (export_memory_tree, import_memory_tree). Idempotent —
         // duplicate entries collapse in the tool_trait registry.
         crate::memory_tree::register_memory_tree_tools();
+        // Phase 1 of the central-AI-plan (2026-05-18) — register
+        // 16 self-heal operator tools so the in-app agent can run
+        // doctor / read the recovery log / reset breakers / migrate
+        // schemas without bouncing through Tauri commands.
+        crate::operator_tools::register_all();
+        // Wire the restart-request broadcast channel + an internal
+        // subscriber that performs the actual graceful self-exit.
+        //
+        // The flow on `restart_engine_request`:
+        //   1. MCP handler calls `tx.send(AgentInitiated { reason })`.
+        //   2. The tool returns immediately so the SSE response can flush.
+        //   3. This subscriber wakes, logs the reason, sleeps briefly
+        //      (so the in-flight HTTP/SSE responses drain), and calls
+        //      `std::process::exit(0)`.
+        //   4. The OS service manager (`dev.thinkingroot` launchd /
+        //      systemd / Task Scheduler from Phase universal-install)
+        //      or the desktop's sidecar watchdog (which sees the
+        //      child exit cleanly, NOT as a crash signal) respawns
+        //      the daemon.
+        //
+        // The 500ms sleep is the smallest interval that reliably
+        // lets a 1-frame SSE response complete on the loopback
+        // socket on every platform — measured during Phase F
+        // bring-up.
+        let (restart_tx, mut restart_rx) = broadcast::channel(8);
+        crate::operator_tools::install_restart_channel(restart_tx);
+        tokio::spawn(async move {
+            // `broadcast::Receiver::recv` returns Err on channel
+            // closure (sender dropped) or on lag. Lag is impossible
+            // here — capacity 8, single-producer-per-call — so any
+            // error means the channel is dead and we exit the task.
+            while let Ok(reason) = restart_rx.recv().await {
+                tracing::warn!(
+                    target = "operator_tools",
+                    ?reason,
+                    "restart_engine_request received — initiating graceful self-exit in 500ms"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                std::process::exit(0);
+            }
+        });
         Arc::new(Self {
             engine: Arc::new(RwLock::new(engine)),
             api_key,
@@ -157,6 +216,34 @@ impl AppState {
             workspace_status: Arc::new(WorkspaceStateRegistry::new()),
             substrate_bus: Arc::new(RwLock::new(HashMap::new())),
             permission_store: Arc::new(RwLock::new(load_permission_store_or_empty())),
+            // Phase 2 central-AI-plan (2026-05-18) — load
+            // per-tool agentmemory tokens from disk. First-run
+            // returns Self::empty() honestly (no fake tokens).
+            // If the file is corrupt or schema-incompatible we
+            // log + start fresh; a misparseable token store
+            // shouldn't refuse to boot the daemon.
+            agentmemory_tokens: Arc::new(RwLock::new(
+                match crate::agentmemory::tokens::AgentmemoryTokenStore::load() {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "agentmemory-tokens.json failed to load — starting with an empty store"
+                        );
+                        crate::agentmemory::tokens::AgentmemoryTokenStore::empty()
+                    }
+                },
+            )),
+            // Phase 3 central-AI-plan (2026-05-18) — fresh, empty
+            // in-memory session telemetry map. Past sessions live on
+            // disk in `mcp-sessions.jsonl`; the dashboard's history
+            // view reads them via `crate::mcp::telemetry::tail`.
+            mcp_session_telemetry: {
+                let map = crate::mcp::telemetry::new_telemetry_map();
+                // Expose process-globally for visibility MCP tools.
+                crate::mcp::telemetry::install_global_map(map.clone());
+                map
+            },
         })
     }
 
@@ -2541,6 +2628,63 @@ pub(crate) enum UnifiedCompileOutcome {
     Failed(String),
 }
 
+/// Maps a [`crate::pipeline::ProgressEvent`] to the canonical
+/// user-facing phase token. The token matches the snake_case form of
+/// [`thinkingroot_core::types::CompileStep`] so the diagnostic line
+/// rendered by `workspace_status.rs::derive_diagnostics`
+/// (`"Compile in progress (phase: {phase})"`) and the desktop's
+/// progress-bar step label show the **same** word — pre-fix the badge
+/// was frozen at `"starting"` for the whole compile because
+/// `WorkspaceStatusMsg::CompilePhase` had no emitter anywhere in the
+/// daemon.
+///
+/// Returns `None` for terminal / informational variants
+/// (`PhaseDone`, `IncrementalDone`, `PipelineFailed`, the deleted
+/// legacy `Grounding*` family) where dispatching a phase update would
+/// either be redundant or actively wrong.
+fn phase_token_from_event(ev: &crate::pipeline::ProgressEvent) -> Option<&'static str> {
+    use crate::pipeline::ProgressEvent::*;
+    use thinkingroot_core::types::CompileStep;
+    match ev {
+        ParseStart | ParseComplete { .. } | DiffStart | DiffComplete { .. } => Some("reading"),
+        ExtractionStart { .. }
+        | ExtractionBatchStart { .. }
+        | ChunkDone { .. }
+        | ExtractionComplete { .. }
+        | ExtractionPartial { .. } => Some("extracting"),
+        // Witness Mesh persist + fingerprint sit under the "persisting"
+        // umbrella — they write to the substrate, not the LLM-driven
+        // extract pass.
+        WitnessMeshStart { .. } | WitnessMeshDone { .. } | FingerprintDone { .. } => {
+            Some("persisting")
+        }
+        RootingStart { .. } | RootingProgress { .. } | RootingDone { .. } => Some("linking"),
+        LinkingStart { .. } | EntityResolved { .. } | LinkComplete { .. } => Some("linking"),
+        VectorProgress { .. } | VectorUpdateDone { .. } => Some("persisting"),
+        CompilationProgress { .. } | CompilationDone { .. } | VerificationDone { .. } => {
+            Some("packing")
+        }
+        // Authoritative ticker — already carries the canonical step;
+        // serialize as snake_case to match the other arms above.
+        CompileTick(t) => Some(match t.step {
+            CompileStep::Reading => "reading",
+            CompileStep::Extracting => "extracting",
+            CompileStep::Linking => "linking",
+            CompileStep::Persisting => "persisting",
+            CompileStep::Packing => "packing",
+        }),
+        // Legacy grounding tribunal family — removed in the Witness
+        // Mesh cutover but variants retained for SSE deserializer
+        // back-compat. They never fire post-cutover; map to None so a
+        // misbehaving consumer doesn't see a grounding phase that
+        // doesn't exist anymore.
+        GroundingStart { .. } | GroundingModelReady | GroundingProgress { .. }
+        | GroundingDone { .. } => None,
+        // Informational / terminal — don't move the badge.
+        PhaseDone { .. } | IncrementalDone { .. } | PipelineFailed { .. } => None,
+    }
+}
+
 /// Shared compile workflow used by the SSE `/compile/stream` endpoint
 /// AND the MCP `compile` tool dispatch. Owns the **complete** post-
 /// compile reconciliation contract: workspace remount, vector-index
@@ -2566,7 +2710,7 @@ pub(crate) async fn run_unified_compile(
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::pipeline::ProgressEvent>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> (String, UnifiedCompileOutcome) {
-    use crate::pipeline::{PipelineOptions, run_pipeline_with_options};
+    use crate::pipeline::{PipelineOptions, ProgressEvent, run_pipeline_with_options};
 
     let compile_started = std::time::Instant::now();
 
@@ -2600,15 +2744,78 @@ pub(crate) async fn run_unified_compile(
         )
         .await;
 
-    // Run the pipeline directly in this task. The caller controls
-    // cancellation via `cancel`; the pipeline writes progress events
-    // straight to `progress_tx` (caller's channel) so a sibling task
-    // forwarding SSE events sees them as they fire, with no internal
-    // forwarding loop in the helper.
+    // Sidecar forwarder: intercepts pipeline events so the
+    // `workspace_status` actor sees live `CompilePhase` updates AND
+    // the caller's `progress_tx` keeps receiving the unchanged event
+    // stream. Pre-fix, the actor only saw `CompileStarted` and
+    // `CompileFinished` — so `CompileState::Running.phase` stayed
+    // frozen at `"starting"` for the whole run, and the
+    // `Diagnostic` text in workspace_status.rs:772 displayed
+    // `(phase: starting)` even at 99% extracting.
+    //
+    // **Phase-change-only** dispatch. The pipeline emits one
+    // `CompileTick` every 250 ms; the workspace_status actor
+    // broadcasts a fresh `WorkspaceStatus` snapshot on every
+    // meaningful change; four UI surfaces (ChatView, BuildersPanel,
+    // RightRail, PackExportSheet) re-render on every broadcast. A
+    // per-tick dispatch produced 4 broadcasts/sec → 16 component
+    // re-renders/sec → visible flicker across the entire shell while
+    // a compile ran. Dispatching only when the phase token changes
+    // collapses this to ~5 dispatches per compile (one per CompileStep
+    // boundary). `WorkspaceStatus.compile.progress` is intentionally
+    // left as `None` because no UI surface reads it — the live
+    // per-source counter flows over the separate Tauri-event channel
+    // (`workspace_compile_progress`) consumed by `RightRail`'s
+    // progress meter.
+    //
+    // The forwarder task lives until the pipeline drops its sender
+    // clone, then receives `None` and exits naturally — no abort, no
+    // explicit cancellation token. We hold the `JoinHandle` to await
+    // its drain after the pipeline returns so the final phase
+    // dispatch is observed before `CompileFinished` lands (the actor
+    // is single-writer so ordering inside it is preserved by message
+    // arrival order on the inbox).
+    let (forwarder_tx, mut forwarder_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
+    let workspace_status = state.workspace_status.clone();
+    let status_name_for_fwd = status_name.clone();
+    let root_path_for_fwd = req.root_path.clone();
+    let caller_tx = progress_tx;
+    let forwarder = tokio::spawn(async move {
+        let mut last_phase: Option<&'static str> = None;
+        while let Some(ev) = forwarder_rx.recv().await {
+            if let Some(phase) = phase_token_from_event(&ev) {
+                if last_phase != Some(phase) {
+                    workspace_status
+                        .dispatch(
+                            &status_name_for_fwd,
+                            root_path_for_fwd.clone(),
+                            WorkspaceStatusMsg::CompilePhase {
+                                phase: phase.into(),
+                                progress: None,
+                            },
+                        )
+                        .await;
+                    last_phase = Some(phase);
+                }
+            }
+            if let Some(tx) = &caller_tx {
+                // Caller's receiver may have already dropped (chat
+                // turn cancel, SSE disconnect). Suppress the send
+                // error — pipeline cancellation is handled via the
+                // `cancel` token, not via channel close.
+                let _ = tx.send(ev);
+            }
+        }
+    });
+
+    // Run the pipeline. Events flow into `forwarder_tx` (the only
+    // pipeline-visible sender); the forwarder task fans them out to
+    // the workspace_status actor + the caller's optional channel.
     let pipeline_result = run_pipeline_with_options(
         &req.root_path,
         req.branch.as_deref(),
-        progress_tx,
+        Some(forwarder_tx),
         PipelineOptions {
             cancel,
             no_rooting: req.no_rooting,
@@ -2617,6 +2824,13 @@ pub(crate) async fn run_unified_compile(
         },
     )
     .await;
+
+    // Pipeline returned → its sender clone is dropped → forwarder's
+    // `recv()` will return `None` on the next iteration. Awaiting
+    // the JoinHandle guarantees the final `CompilePhase` dispatch
+    // lands before `CompileFinished` so observers never see the
+    // terminal-state badge with a stale "(phase: extracting)" line.
+    let _ = forwarder.await;
 
     let duration_ms = compile_started.elapsed().as_millis() as u64;
 
@@ -2753,30 +2967,61 @@ async fn finalize_successful_compile(
     }
 
     if remount_ok {
-        match state
-            .engine
-            .read()
-            .await
-            .rebuild_vector_index(status_name)
-            .await
-        {
-            Ok((entities, claims)) => {
-                tracing::info!(
-                    workspace = %status_name,
-                    "post-compile vector index built: {} entities + {} claims",
-                    entities, claims
-                );
+        // Defer the vector-index rebuild to a background task
+        // (2026-05-18). Pre-fix this `await` blocked `finalize_*`
+        // for 20–30 s on a 600-claim workspace because
+        // `rebuild_vector_index` re-embeds every claim + entity
+        // through fastembed ONNX inference. That wait sat *after*
+        // the pipeline finished — the compile bar already read 100 %
+        // but `compile_stream`'s SSE `done` event didn't fire for a
+        // further half-minute, so the desktop's compile-complete UX
+        // lagged dramatically (measured: 41 s wall vs. 9 s pipeline
+        // on the `thinkingroot` workspace).
+        //
+        // Backgrounding is safe because:
+        //   - The vector store is per-workspace and self-locked
+        //     (`storage_arc.blocking_lock()` inside the spawn_blocking
+        //     pool — see `engine.rs::rebuild_vector_index`). A search
+        //     that races the rebuild blocks on that mutex until the
+        //     rebuild completes; never reads a torn intermediate.
+        //   - Compile slot serialisation (compile-resilience.md, single
+        //     `CompileHandle`) means two concurrent compiles for the
+        //     same workspace cannot both spawn this — a second compile
+        //     can only start after the first's `finalize_*` has
+        //     returned, by which time the previous `tokio::spawn`'s
+        //     own task is the only contender for the storage lock.
+        //   - Failures still surface via `tracing::warn!` — daemon
+        //     operators see the warning in `serve.log`; the next
+        //     compile's `finalize_*` schedules a fresh attempt.
+        //
+        // What this trades: a search that lands inside the rebuild
+        // window pays its share of the rebuild latency (mutex wait)
+        // instead of returning empty. That is the honest behaviour —
+        // CLAUDE.md §honesty rule §1 forbids "fake data, ever", so we
+        // never surface a half-built index as if it were complete.
+        let engine = state.engine.clone();
+        let ws = status_name.to_string();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = engine.read().await.rebuild_vector_index(&ws).await;
+            let elapsed_ms = started.elapsed().as_millis();
+            match result {
+                Ok((entities, claims)) => tracing::info!(
+                    workspace = %ws,
+                    elapsed_ms,
+                    "background vector index built: {} entities + {} claims",
+                    entities,
+                    claims
+                ),
+                Err(e) => tracing::warn!(
+                    workspace = %ws,
+                    elapsed_ms,
+                    "background vector index rebuild failed: {e} — \
+                     semantic search and AEP probes will return empty \
+                     results until the next compile re-attempts"
+                ),
             }
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %status_name,
-                    "post-compile vector index rebuild failed: {e} — \
-                     keyword search will work but semantic search and \
-                     AEP probes will return empty results until the \
-                     index is built"
-                );
-            }
-        }
+        });
     }
 
     if remount_ok {
@@ -5470,33 +5715,61 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         // dispatch task.
         let _router_anchor = router;
         while let Some(event) = rx.recv().await {
-            // Surface the approval prompt to the UI for every write
-            // proposal. The agent has already (or will momentarily)
-            // call `ApprovalGate::check` with the same id, which
-            // registers the matching oneshot in `pending_approvals`.
+            // Surface the approval prompt to the UI only when the
+            // agent's `PermissionsGate` will actually delegate to
+            // the inner UI-prompt path. Pre-fix (2026-05-18) the SSE
+            // emitted `approval_requested` for **every** write-tool
+            // proposal — but the agent's gate may auto-decide via
+            // policy (Allow rule or DEFAULT_DENY hit) without ever
+            // registering a `pending_approvals` entry. The user's
+            // subsequent click then hit a 404 `NO_PENDING_APPROVAL`
+            // ("Permission decision failed" toast in the 2026-05-18
+            // bug report).
+            //
+            // `PermissionsGate::predict` runs the same
+            // canonicalisation + policy evaluation as the gate's
+            // `check`, returning a tri-state outcome. Emit ONLY
+            // when the prediction is `Ask`. The agent's gate may
+            // observe a different store snapshot if a rule edit
+            // races between predict + check — that TOCTOU is caught
+            // defensively by `commands/chat.rs::chat_approve`
+            // treating `NO_PENDING_APPROVAL` as a silent dismiss.
             if let AgentEvent::ToolCallProposed { id, is_write, name, input } = &event {
                 if *is_write {
-                    // Phase D Wave 1 — when this is a Phase D
-                    // system-power tool, attach a `permission_context`
-                    // so the UI can render a permission-aware prompt
-                    // (Allow once / Allow always for pattern X /
-                    // Deny once / Deny always; deny-only when the
-                    // canonical path matches DEFAULT_DENY).
-                    let permission_context =
-                        build_permission_context_for_tool(name, input);
-                    let mut payload = serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "input": input,
-                    });
-                    if let Some(ctx) = permission_context {
-                        payload["permission_context"] = ctx;
+                    use crate::intelligence::permissions_gate::{PermissionsGate, PolicyOutcome};
+                    let outcome = PermissionsGate::predict(
+                        &state.permission_store,
+                        name,
+                        input,
+                    )
+                    .await;
+                    if matches!(outcome, PolicyOutcome::Ask) {
+                        // Phase D Wave 1 — when this is a Phase D
+                        // system-power tool, attach a `permission_context`
+                        // so the UI can render a permission-aware prompt
+                        // (Allow once / Allow always for pattern X /
+                        // Deny once / Deny always; deny-only when the
+                        // canonical path matches DEFAULT_DENY).
+                        let permission_context =
+                            build_permission_context_for_tool(name, input);
+                        let mut payload = serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        });
+                        if let Some(ctx) = permission_context {
+                            payload["permission_context"] = ctx;
+                        }
+                        yield Ok(
+                            Event::default()
+                                .event("approval_requested")
+                                .data(payload.to_string())
+                        );
                     }
-                    yield Ok(
-                        Event::default()
-                            .event("approval_requested")
-                            .data(payload.to_string())
-                    );
+                    // Allow / Deny outcomes: agent auto-decides; the
+                    // ToolCallExecuting / ToolCallRejected event that
+                    // follows below carries the actual outcome to the
+                    // UI.
                 }
             }
 

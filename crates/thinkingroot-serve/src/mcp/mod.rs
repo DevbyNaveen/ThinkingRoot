@@ -4,6 +4,7 @@ pub mod http_transport;
 pub mod resources;
 pub mod sse;
 pub mod stdio;
+pub mod telemetry;
 pub mod stdio_transport;
 pub mod tool_trait;
 pub mod tools;

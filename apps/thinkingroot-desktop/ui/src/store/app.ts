@@ -6,6 +6,7 @@ import type {
   EngramActivationEntry,
   GapEntry,
   RightRailTab,
+  DocSectionId,
   SettingsSectionId,
   StreamState,
   Surface,
@@ -59,6 +60,11 @@ function normalizeSurface(surface: unknown): Surface {
   return "chats";
 }
 
+function normalizeTheme(theme: unknown): Theme {
+  if (theme === "auto" || theme === "dark" || theme === "light") return theme;
+  return "dark";
+}
+
 /**
  * App-wide UI store.
  *
@@ -84,6 +90,9 @@ interface AppStore {
   /** When `surface === "settings"`, the left sidebar lists these. */
   settingsSection: SettingsSectionId;
   setSettingsSection: (id: SettingsSectionId) => void;
+  /** When `surface === "docs"`, the left sidebar lists these. */
+  docsSection: DocSectionId;
+  setDocsSection: (id: DocSectionId) => void;
   theme: Theme;
   setTheme: (t: Theme) => void;
   sidebarOpen: boolean;
@@ -206,16 +215,19 @@ export const useApp = create<AppStore>()(
       setSurface: (surface) => set({ surface: normalizeSurface(surface) }),
       settingsSection: "provider",
       setSettingsSection: (settingsSection) => set({ settingsSection }),
+      docsSection: "overview",
+      setDocsSection: (docsSection) => set({ docsSection }),
       theme: "dark",
       setTheme: (theme) => {
-        set({ theme });
+        const next = normalizeTheme(theme);
+        set({ theme: next });
         if (typeof document !== "undefined") {
           document.documentElement.dataset.theme =
-            theme === "auto"
+            next === "auto"
               ? (window.matchMedia("(prefers-color-scheme: light)").matches
                   ? "light"
                   : "dark")
-              : theme;
+              : next;
         }
       },
       sidebarOpen: true,
@@ -428,6 +440,7 @@ export const useApp = create<AppStore>()(
           merged.workspaceInspectorPage,
         );
         merged.surface = normalizeSurface(merged.surface);
+        merged.theme = normalizeTheme(merged.theme);
         return merged;
       },
     },

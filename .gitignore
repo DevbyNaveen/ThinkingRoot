@@ -66,6 +66,7 @@ include/
 
 # Node
 node_modules/
+.pnpm-store/
 
 # Desktop app build outputs (apps/thinkingroot-desktop/)
 apps/thinkingroot-desktop/ui/dist/

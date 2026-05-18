@@ -196,6 +196,7 @@ pub fn run() {
             commands::conversations::conversations_append_message,
             commands::conversations::conversations_delete,
             commands::conversations::conversations_rename,
+            commands::conversation_title::conversations_generate_title,
             commands::chat::chat_send_stream,
             commands::chat::chat_approve,
             commands::chat::llm_health,

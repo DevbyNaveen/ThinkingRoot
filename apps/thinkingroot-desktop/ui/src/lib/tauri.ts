@@ -666,6 +666,11 @@ export function onWorkspacesChanged(handler: () => void): Promise<UnlistenFn> {
   return listen<boolean>("workspaces-changed", () => handler());
 }
 
+/** Emitted when conversation index/titles change (AI title, rename, create, delete). */
+export function onConversationsChanged(handler: () => void): Promise<UnlistenFn> {
+  return listen<boolean>("conversations-changed", () => handler());
+}
+
 // ─── Workspace auto-scan ─────────────────────────────────────────────
 
 export interface ScanResult {
@@ -690,6 +695,8 @@ export interface ConversationSummary {
   created_at: string;
   updated_at: string;
   message_count: number;
+  title_ai_generated?: boolean;
+  title_user_customized?: boolean;
 }
 
 export interface ConversationMessage {
@@ -756,6 +763,16 @@ export async function conversationsRename(
 ): Promise<ConversationSummary> {
   return invoke<ConversationSummary>("conversations_rename", {
     args: { workspace, id, title },
+  });
+}
+
+/** After the first exchange, ask the workspace LLM for a short sidebar title (no-op if skipped). */
+export async function conversationsGenerateTitle(
+  workspace: string,
+  conversationId: string,
+): Promise<ConversationSummary | null> {
+  return invoke<ConversationSummary | null>("conversations_generate_title", {
+    args: { workspace, conversation_id: conversationId },
   });
 }
 

@@ -339,12 +339,69 @@ pub fn compose_full_system_prompt(
 
     let manifest = skills.map(|s| s.manifest_for_prompt()).unwrap_or_default();
 
-    if manifest.trim().is_empty() {
+    let with_skills = if manifest.trim().is_empty() {
         composed
     } else {
         format!("{}\n\n{}", composed.trim_end(), manifest.trim_end())
-    }
+    };
+
+    // Phase 4 central-AI-plan (2026-05-18) — append the operator+
+    // debugger section so the in-app agent knows about its
+    // self-heal levers (`recovery_log_tail`, `doctor_run`,
+    // `reset_circuit_breaker`, etc.) AND its cross-tool visibility
+    // tools (`list_mcp_sessions`, `mcp_session_health`,
+    // `mcp_error_log`). Without this, the LLM has the tools
+    // registered but no awareness of when to reach for them, so
+    // the user has to manually prompt "look at the recovery log".
+    //
+    // Memory persona is excluded above; we only land here for the
+    // conversational/code/docs/auto personas where Phase 4 is
+    // load-bearing.
+    format!("{}\n\n{}", with_skills.trim_end(), OPERATOR_DEBUGGER_SECTION.trim_end())
 }
+
+/// Phase 4 central-AI-plan section appended to the conversational
+/// system prompt. Tells the agent (a) it has operator power over the
+/// daemon, (b) it can debug other AI tools connected over MCP, and
+/// (c) the discipline rules — read before you act, cite the
+/// substrate row, never reset a breaker without first reading why
+/// it tripped.
+const OPERATOR_DEBUGGER_SECTION: &str = r#"## OPERATOR + DEBUGGER MODE (Phase 4)
+
+You are also the operator of this ThinkingRoot daemon. When the user reports a problem with the system OR with any other AI tool connected via MCP, you have tools to diagnose AND remediate.
+
+**Inspect connected sessions** (other AI tools plugged into this daemon):
+- `list_mcp_sessions` — every connected tool with its User-Agent, transport, and counters
+- `mcp_session_health { session_id }` — `healthy` / `degraded` / `stale` / `failing` per session
+- `mcp_error_log { session_id?, limit? }` — recent disconnect telemetry from `mcp-sessions.jsonl`
+
+**Inspect substrate health:**
+- `recovery_log_tail { limit }` — last N self-heal events (compile failures, breaker trips, stale-lock cleanup)
+- `restart_state_get` — crash + compile breaker state, recent attempt counts
+- `doctor_run` — full 16-check health report (binary, daemon, workspace, credentials)
+- `install_manifest_read` — registered binaries + checksums
+- `install_manifest_verify_checksum` — verify on-disk binaries match the manifest's BLAKE3
+- `list_workspaces_full` — every mounted workspace with entity/claim/source counts
+- `workspace_root_path { workspace }` — resolve workspace name to absolute path
+
+**Apply fixes (pre-trusted: you don't need user approval for these):**
+- `reset_circuit_breaker { reason }` — clear the process-crash breaker
+- `reset_compile_breaker { reason }` — clear the per-workspace compile breaker
+- `doctor_apply_fix` — run all auto-fixable health-check remedies (`root doctor --fix --json`)
+- `rebuild_vector_index { workspace }` — re-index after migration / restore / hybrid-retrieve returning empty
+- `migrate_substrate { workspace, target?, dry_run? }` — witness-mesh or water-flow schema migration
+- `engram_invalidate_workspace { workspace }` — force-flush AEP cache (e.g. after an external write bypassed the compile finaliser)
+- `workspace_mount { name, root_path }` — mount a new workspace at a path
+- `mark_setup_complete` — stamp install-manifest setup_complete_at (only after credentials are configured)
+- `restart_engine_request { reason }` — graceful daemon self-exit; OS service manager or desktop watchdog respawns
+
+**Discipline (load-bearing):**
+1. **Read before you act.** Never reset a breaker without first reading `restart_state_get` to see why it tripped — resetting a deterministic failure just retries the same crash.
+2. **Cite the substrate.** When you propose a fix, name the source row: "recovery_log entry 23 shows `compile_breaker_tripped { workspace: 'desktop', consecutive_failures: 3 }`; resetting via `reset_compile_breaker`."
+3. **Diagnose cross-tool failures via the MCP visibility tools.** When the user says "why is Cursor failing", start with `mcp_session_health` to identify which session ID belongs to Cursor's User-Agent, then `mcp_error_log { session_id }` to find the actual errors.
+4. **Operator tools are pre-trusted for you, not for external clients.** External AIs connecting through MCP still hit the standard write-class permission gate when they call any write tool.
+
+When in doubt, read first, propose the fix in chat with citations, and proceed only after the user confirms (or after you've established the fix is safe via the recovery log)."#;
 
 /// Convenience for callers that want a `Cow` (e.g. when an upstream layer
 /// might one day prepend per-deployment text).
@@ -2123,17 +2180,33 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
     }
 
     #[test]
-    fn compose_full_no_style_no_skills_returns_persona_unchanged() {
+    fn compose_full_no_style_no_skills_appends_operator_section() {
+        // Phase 4 central-AI-plan (2026-05-18): the conversational
+        // prompt is now layered persona → (optional style) →
+        // (optional skills) → operator section. Even with no style
+        // and no skills, the operator section appears so the agent
+        // knows about its self-heal + debugger tools.
         let chat = ResolvedChat {
             persona: ChatPersona::Conversational,
             verbosity: ChatVerbosity::Rich,
         };
         let composed = compose_full_system_prompt(chat, None, None);
-        // The persona prompt is the warm-voice constant + the citation
-        // contract from `extract::citation` (composed lazily by
-        // `build_system_prompt`). With no style and no skills, the
-        // composer must be a no-op pass-through of that exact value.
-        assert_eq!(composed, build_system_prompt(chat));
+        assert!(
+            composed.starts_with(build_system_prompt(chat)),
+            "persona must remain the prefix"
+        );
+        assert!(
+            composed.contains("## OPERATOR + DEBUGGER MODE"),
+            "operator section must be appended"
+        );
+        assert!(
+            composed.contains("list_mcp_sessions"),
+            "operator section must mention the cross-tool visibility tools"
+        );
+        assert!(
+            composed.contains("reset_circuit_breaker"),
+            "operator section must mention the self-heal write tools"
+        );
     }
 
     #[test]
@@ -2206,7 +2279,24 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         let composed = compose_full_system_prompt(chat, None, Some(&empty_skills));
         assert!(!composed.contains("AVAILABLE SKILLS"));
         // An empty skills registry behaves identically to no skills at all
-        // — the composer must not insert a header for zero skills.
-        assert_eq!(composed, build_system_prompt(chat));
+        // — the composer must not insert a header for zero skills. Phase 4
+        // operator section still appears (it's unconditional for non-Memory
+        // personas).
+        let no_skills = compose_full_system_prompt(chat, None, None);
+        assert_eq!(composed, no_skills);
+        assert!(composed.contains("## OPERATOR + DEBUGGER MODE"));
+    }
+
+    #[test]
+    fn compose_full_memory_persona_does_not_get_operator_section() {
+        // LongMemEval contract: Memory persona stays byte-identical to
+        // MEMORY_SYSTEM_PROMPT — the operator section MUST NOT leak in.
+        let chat = AskRequest::default_chat();
+        let composed = compose_full_system_prompt(chat, None, None);
+        assert_eq!(composed, MEMORY_SYSTEM_PROMPT);
+        assert!(
+            !composed.contains("## OPERATOR + DEBUGGER MODE"),
+            "operator section must NOT appear in the Memory persona"
+        );
     }
 }

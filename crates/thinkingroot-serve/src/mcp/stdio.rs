@@ -28,6 +28,14 @@ pub async fn run(
     // for the duration of the process. SSE transport uses the AppState's
     // shared manager.
     let engram_manager = EngramManager::new(EngramConfig::default());
+
+    // Phase 1 central-AI-plan (2026-05-18) — register operator tools
+    // so the stdio MCP path (editor integrations like Cursor / Claude
+    // Code / Codex) also gets `recovery_log_tail`, `doctor_run`,
+    // `migrate_substrate`, etc. The `restart_engine_request` tool will
+    // honestly refuse here because no broadcast channel is installed —
+    // stdio MCP has no sidecar to restart from this process.
+    crate::operator_tools::register_all();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);

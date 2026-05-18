@@ -21,6 +21,10 @@ use tokio_util::sync::CancellationToken;
 fn phase_names_constant_is_complete() {
     // "structural_resolve" (Phase 7e) is intentionally absent — it runs
     // inside Linker::link() and its time is subsumed under "link".
+    // "synth_paper" was promoted out of the "other" residual on
+    // 2026-05-18 after a perf audit found paper synth (LLM-driven,
+    // ~26 s/compile) was the single dominant uninstrumented cost
+    // on incremental compiles.
     let expected = [
         "diff",
         "extract",
@@ -31,12 +35,13 @@ fn phase_names_constant_is_complete() {
         "link",
         "structural_persist",
         "audit",
+        "synth_paper",
         "other",
     ];
     assert_eq!(
         PHASE_NAMES.len(),
         expected.len(),
-        "PHASE_NAMES must have exactly 10 stable keys"
+        "PHASE_NAMES must have exactly 11 stable keys"
     );
     for name in &expected {
         assert!(

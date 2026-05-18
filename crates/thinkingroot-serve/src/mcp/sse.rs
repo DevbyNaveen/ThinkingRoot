@@ -62,7 +62,16 @@ pub fn build_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 ///   2. An `event: endpoint` message carrying the POST URL is sent immediately.
 ///   3. Subsequent `event: message` frames deliver JSON-RPC responses.
 ///   4. A 30-second keep-alive comment prevents proxy/firewall timeouts.
-async fn handle_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// Phase 3 central-AI-plan (2026-05-18): also captures the client's
+/// `User-Agent` header at open so the "AI Tools" dashboard can show
+/// which AI is connected. Sessions without a User-Agent are
+/// classified as `InAppAgent` (the desktop's own chat fetcher
+/// doesn't set one).
+async fn handle_sse(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let session_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::unbounded_channel::<SseMsg>();
 
@@ -72,6 +81,30 @@ async fn handle_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .lock()
         .await
         .insert(session_id.clone(), tx.clone());
+
+    // Phase 3 — capture telemetry. User-Agent identifies the
+    // connecting tool ("Cursor/1.0", "Claude-Code/0.5", etc.).
+    // A missing or empty UA is treated as the desktop's in-app
+    // agent — its fetch is internal to the daemon's process.
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let principal = if user_agent.is_empty() {
+        crate::mcp::telemetry::PrincipalKind::InAppAgent
+    } else {
+        crate::mcp::telemetry::PrincipalKind::McpClient {
+            user_agent: user_agent.clone(),
+        }
+    };
+    crate::mcp::telemetry::record_session_opened(
+        &state.mcp_session_telemetry,
+        session_id.clone(),
+        crate::mcp::telemetry::TransportKind::Sse,
+        principal,
+    )
+    .await;
 
     // Queue the endpoint URL — MCP clients use this to discover the POST address.
     let endpoint_url = format!("/mcp?sessionId={session_id}");
@@ -93,10 +126,22 @@ async fn handle_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     {
         let session_id = session_id.clone();
         let sessions = state.mcp_sessions.clone();
+        let telemetry = state.mcp_session_telemetry.clone();
         let tx_watch = tx.clone();
         tokio::spawn(async move {
             tx_watch.closed().await;
             sessions.lock().await.remove(&session_id);
+            // Phase 3 — persist the final telemetry snapshot to
+            // `mcp-sessions.jsonl` and drop the live entry. The
+            // reaper firing means the receiver was dropped (clean
+            // client disconnect, network drop, browser refresh) —
+            // always reason ChannelClosed.
+            crate::mcp::telemetry::record_session_closed(
+                &telemetry,
+                &session_id,
+                crate::mcp::telemetry::DisconnectReason::ChannelClosed,
+            )
+            .await;
             tracing::debug!(
                 target: "mcp_sse",
                 "session reaper: removed entry after receiver drop"
@@ -230,6 +275,123 @@ async fn compile_request_fastpath(
     Some(response)
 }
 
+/// Phase 1 central-AI-plan (2026-05-18) — `workspace_mount` fastpath.
+///
+/// Mounting a workspace requires `&mut QueryEngine` (the engine's
+/// internal `workspaces: HashMap<...>` is mutated). The shared
+/// `mcp::tools::handle_call` only gets `&QueryEngine`, so the
+/// `WorkspaceMount` trait handler refuses honestly when called from
+/// stdio. SSE goes through this fastpath instead, which acquires
+/// `state.engine.write().await` and calls `engine.mount` directly.
+///
+/// Returns `None` when the request isn't a `workspace_mount` call,
+/// allowing the dispatcher to fall through to normal MCP dispatch.
+async fn workspace_mount_fastpath(
+    request: &JsonRpcRequest,
+    state: &Arc<AppState>,
+) -> Option<JsonRpcResponse> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    let tool_name = request.params.get("name").and_then(|v| v.as_str())?;
+    if tool_name != "workspace_mount" {
+        return None;
+    }
+    let id = request.id.clone();
+    let arguments = request
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
+
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            return Some(JsonRpcResponse::error(
+                id,
+                -32602,
+                "workspace_mount: missing or empty `name` argument".to_string(),
+            ));
+        }
+    };
+    let root_path_raw = match arguments.get("root_path").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Some(JsonRpcResponse::error(
+                id,
+                -32602,
+                "workspace_mount: missing `root_path` argument".to_string(),
+            ));
+        }
+    };
+    let root_path = std::path::PathBuf::from(&root_path_raw);
+    if !root_path.is_absolute() {
+        return Some(JsonRpcResponse::error(
+            id,
+            -32602,
+            format!("workspace_mount: root_path `{root_path_raw}` must be absolute"),
+        ));
+    }
+    let data_dir = arguments
+        .get("data_dir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+
+    let mount_result = {
+        let mut engine = state.engine.write().await;
+        match data_dir {
+            Some(dd) => {
+                engine
+                    .mount_with_data_dir(name.clone(), root_path.clone(), dd)
+                    .await
+            }
+            None => engine.mount(name.clone(), root_path.clone()).await,
+        }
+    };
+    if let Err(e) = mount_result {
+        return Some(JsonRpcResponse::error(
+            id,
+            -32603,
+            format!("workspace_mount failed: {e}"),
+        ));
+    }
+
+    // Refresh counts so the response is useful for the in-app AI to
+    // confirm the mount took. Read-lock is fine here — the write
+    // guard above has been dropped.
+    let info = {
+        let engine = state.engine.read().await;
+        engine
+            .list_workspaces()
+            .await
+            .ok()
+            .and_then(|list| list.into_iter().find(|w| w.name == name))
+    };
+
+    let (entity_count, claim_count, source_count) = info
+        .map(|w| (w.entity_count, w.claim_count, w.source_count))
+        .unwrap_or((0, 0, 0));
+
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "workspace": name,
+        "root_path": root_path.display().to_string(),
+        "entity_count": entity_count,
+        "claim_count": claim_count,
+        "source_count": source_count,
+    });
+    let response = match serde_json::to_string_pretty(&payload) {
+        Ok(content) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": content }],
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(id, -32603, format!("serialize result: {e}")),
+    };
+    Some(response)
+}
+
 /// POST /mcp?sessionId=X
 ///
 /// Receives a JSON-RPC request, dispatches it, and routes the response back
@@ -270,7 +432,27 @@ async fn handle_post(
     // `state.engine` for remount, which deadlocks if a read guard is
     // still held in this scope. We resolve the workspace path while
     // holding the read briefly, drop it, then run the unified compile.
+    // Phase 3 central-AI-plan (2026-05-18): capture the tool name
+    // BEFORE dispatch so we can record telemetry against it
+    // regardless of which branch (fastpath vs. standard) handles
+    // the request.
+    let dispatched_tool_name = if request.method == "tools/call" {
+        request
+            .params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
     let response = if let Some(fastpath) = compile_request_fastpath(&request, &state).await {
+        fastpath
+    } else if let Some(fastpath) = workspace_mount_fastpath(&request, &state).await {
+        // Phase 1 central-AI-plan (2026-05-18) — workspace_mount needs
+        // `&mut QueryEngine` so it can't go through the standard
+        // `mcp::tools::handle_call` path. The trait handler in
+        // `operator_tools.rs` refuses honestly for stdio; SSE comes here.
         fastpath
     } else {
         let engine = state.engine.read().await;
@@ -292,6 +474,30 @@ async fn handle_post(
         drop(engine);
         response
     };
+
+    // Phase 3 central-AI-plan (2026-05-18): bump telemetry counters.
+    // Every `tools/call` increments `tool_calls_total`; if the
+    // response carries a JSON-RPC error envelope, we additionally
+    // record an error against the session. We use the public
+    // `is_error_response` helper-shape from `JsonRpcResponse` — when
+    // `response.error` is Some, it's a structured error.
+    if let Some(tool_name) = dispatched_tool_name.as_deref() {
+        crate::mcp::telemetry::record_tool_call(
+            &state.mcp_session_telemetry,
+            &session_id,
+        )
+        .await;
+        if let Some(err) = response.error.as_ref() {
+            crate::mcp::telemetry::record_error(
+                &state.mcp_session_telemetry,
+                &session_id,
+                tool_name.to_string(),
+                err.code as i64,
+                err.message.clone(),
+            )
+            .await;
+        }
+    }
 
     let json_str = match serde_json::to_string(&response) {
         Ok(s) => s,

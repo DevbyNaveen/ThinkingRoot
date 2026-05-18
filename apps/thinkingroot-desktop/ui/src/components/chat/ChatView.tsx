@@ -22,17 +22,21 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from "react";
 import {
   ArrowUp,
   Square,
   AlertTriangle,
+  ChevronDown,
   Hammer,
   Inbox,
   Loader2,
+  Mic,
   Plus,
   FileText,
   Image as ImageIcon,
@@ -45,17 +49,16 @@ import {
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import rehypeSanitize from "rehype-sanitize";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
-
 import { cn } from "@/lib/utils";
+import {
+  COMPOSER_FILE_DROP_EVENT,
+  formatDroppedPathsForComposer,
+} from "@/lib/format-dropped-paths";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
-import { transformCitations } from "@/components/playground/CitationChip";
+import { ChatMarkdown } from "@/components/chat/ChatMarkdown";
+import { UserMessageContent } from "@/components/chat/UserMessageContent";
 import {
   pickPrimaryDiagnostic,
   useWorkspaceStatus,
@@ -65,6 +68,7 @@ import {
   chatSendStream,
   conversationsAppendMessage,
   conversationsCreate,
+  conversationsGenerateTitle,
   conversationsGet,
   llmHealth,
   workspaceCompile,
@@ -76,7 +80,12 @@ import {
   type LlmHealth,
 } from "@/lib/tauri";
 import { BrainCitationParser, useBrainActivation } from "@/store/brain";
-import type { ChatMessage, EngramActivationEntry, GapEntry } from "@/types";
+import type {
+  ChatMessage,
+  EngramActivationEntry,
+  GapEntry,
+  StreamState,
+} from "@/types";
 import { BranchChip } from "./BranchChip";
 import { TopicBranchesPanel } from "@/components/branches/TopicBranchesPanel";
 import { PermissionPromptDialog } from "@/components/permissions/PermissionPromptDialog";
@@ -122,6 +131,43 @@ function buildHistoryPayload(messages: ChatMessage[]): ChatTurnPayload[] {
     }
   }
   return turns.slice(-MAX_HISTORY_TURNS);
+}
+
+/** One user question plus every assistant reply before the next user turn. */
+interface ConversationTurn {
+  user: ChatMessage;
+  replies: ChatMessage[];
+}
+
+function groupMessagesIntoTurns(messages: ChatMessage[]): ConversationTurn[] {
+  const turns: ConversationTurn[] = [];
+  for (const m of messages) {
+    if (m.kind === "user") {
+      turns.push({ user: m, replies: [] });
+    } else if (turns.length > 0) {
+      turns[turns.length - 1]!.replies.push(m);
+    }
+  }
+  return turns;
+}
+
+/** Cursor-style: land the new question ~35% below the viewport top so ~65%
+ *  of the pane still shows the tail of the prior answer. */
+const QUESTION_SCROLL_ANCHOR_RATIO = 0.35;
+
+function scrollQuestionIntoView(
+  container: HTMLDivElement,
+  questionEl: HTMLElement,
+  anchorRatio = QUESTION_SCROLL_ANCHOR_RATIO,
+) {
+  const cRect = container.getBoundingClientRect();
+  const qRect = questionEl.getBoundingClientRect();
+  const targetTop =
+    container.scrollTop + (qRect.top - cRect.top) - cRect.height * anchorRatio;
+  container.scrollTo({
+    top: Math.max(0, targetTop),
+    behavior: "smooth",
+  });
 }
 
 /** Collapse temp-id + disk-id echo pairs left in cache from older builds. */
@@ -587,6 +633,9 @@ export function ChatView() {
                 convId: ctx.convId,
                 messageId,
               });
+              void conversationsGenerateTitle(ctx.workspace, ctx.convId).catch(() => {
+                /* LLM title is best-effort; interim first-line title stays */
+              });
             }
 
             const latest = useApp.getState();
@@ -739,11 +788,26 @@ export function ChatView() {
     return () => window.clearInterval(id);
   }, [streaming]);
 
-  // Auto-scroll on append.
-  const bottomRef = useRef<HTMLDivElement>(null);
+  // Cursor-style: scroll the latest question to ~35% viewport height so the
+  // prior answer tail stays visible above; answer streams in the space below.
+  const activeQuestionRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const conversationTurns = useMemo(
+    () => groupMessagesIntoTurns(messages),
+    [messages],
+  );
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, streaming?.partial]);
+    const last = messages[messages.length - 1];
+    if (last?.kind !== "user" && !streaming) return;
+    requestAnimationFrame(() => {
+      const container = scrollContainerRef.current;
+      const question = activeQuestionRef.current;
+      if (container && question) {
+        scrollQuestionIntoView(container, question);
+      }
+    });
+  }, [messages.length, messages[messages.length - 1]?.id, streaming?.turnId]);
 
   if (!activeWorkspace) {
     return <NoWorkspace />;
@@ -873,7 +937,7 @@ export function ChatView() {
 
             {/* Hint below the card */}
             <p className="text-center text-[11px] text-muted-foreground/40">
-              Ask anything · <kbd className="font-mono">/</kbd> for commands · <kbd className="font-mono">@</kbd> to mention
+              Knowledge chat grounded in your workspace · <kbd className="font-mono">/</kbd> commands · <kbd className="font-mono">@</kbd> files
             </p>
           </div>
         </div>
@@ -884,60 +948,44 @@ export function ChatView() {
   return (
     <div className="flex h-full flex-col bg-background">
       <ChatContextHeader workspace={activeWorkspace} />
-      <div className="flex-1 overflow-y-auto px-8 py-6">
-        <ul className="mx-auto flex max-w-3xl flex-col gap-6">
-          {messages.map((m) => (
-            <li key={m.id}>
-              <MessageBubble msg={m} />
-            </li>
-          ))}
-          {streaming && (
-            <li className="space-y-3">
-              <LiveActivityStrip
-                steps={streaming.agentSteps}
-                workspace={activeWorkspace}
-                hasAnswer={streaming.partial.length > 0}
-              />
-              {streaming.engramActivations.length > 0 && (
-                <div className="mx-auto w-full max-w-3xl">
-                  <EngramTimeline
-                    activations={streaming.engramActivations}
-                    turnStartedAtMs={streaming.startedAt.getTime()}
+      <div
+        ref={scrollContainerRef}
+        className="app-scroll flex-1 overflow-y-auto px-8 py-6"
+      >
+        <ul className="mx-auto flex max-w-3xl flex-col gap-10">
+          {conversationTurns.map((turn, index) => {
+            const isActive = index === conversationTurns.length - 1;
+            return (
+              <li
+                key={turn.user.id}
+                className={cn(
+                  "group/turn flex flex-col gap-2.5",
+                  isActive && "min-h-[calc(100dvh-12rem)]",
+                )}
+              >
+                <div ref={isActive ? activeQuestionRef : undefined}>
+                  <MessageBubble msg={turn.user} />
+                </div>
+                {turn.replies.map((reply) => (
+                  <MessageBubble key={reply.id} msg={reply} />
+                ))}
+                {isActive && streaming ? (
+                  <ChatTurnStreaming
+                    streaming={streaming}
+                    workspace={activeWorkspace}
                   />
-                </div>
-              )}
-              {streaming.gaps.length > 0 && (
-                <div className="mx-auto w-full max-w-3xl">
-                  <GapCards gaps={streaming.gaps} />
-                </div>
-              )}
-              {streaming.partial.length > 0 && (
-                <MessageBubble
-                  msg={{
-                    id: streaming.turnId,
-                    kind: "assistant",
-                    body: streaming.partial,
-                    at: streaming.startedAt,
-                  }}
-                  pending
-                />
-              )}
-              {/* Option A: agent steps use dragonfly row inside LiveActivityStrip only — no duplicate ThinkingLoader */}
-              {streaming.partial.length === 0 && streaming.agentSteps.length === 0 && (
-                <MessageBubble
-                  msg={{
-                    id: streaming.turnId,
-                    kind: "assistant",
-                    body: streaming.partial,
-                    at: streaming.startedAt,
-                  }}
-                  pending
-                  pendingLabel="Searching your knowledge base..."
-                />
-              )}
+                ) : null}
+              </li>
+            );
+          })}
+          {conversationTurns.length === 0 && streaming ? (
+            <li className="min-h-[calc(100dvh-12rem)]">
+              <ChatTurnStreaming
+                streaming={streaming}
+                workspace={activeWorkspace}
+              />
             </li>
-          )}
-          <div ref={bottomRef} />
+          ) : null}
         </ul>
       </div>
 
@@ -1022,33 +1070,15 @@ export function ChatView() {
  * letting the user submit and watch a spinner. Renders nothing on the
  * happy path (configured + has claims).
  */
-/** Workspace + branch label — left-aligned beside the sidebar, no divider.
- *
- * Phase B.3 (2026-05-17): adds a small Inbox icon button right of the
- * BranchChip that opens [`TopicBranchesPanel`] — the surface where
- * users review and act on auto-created `topic/*` branches before they
- * promote (manually) to `main`. The trigger lives next to BranchChip
- * because both affordances are about "which branches matter right
- * now"; keeping them in the same visual neighbourhood matches the
- * cognitive flow.
- */
+/** Workspace label + topic-branch inbox. Branch switcher is in the composer footer. */
 function ChatContextHeader({ workspace }: { workspace: string }) {
   const [topicsOpen, setTopicsOpen] = useState(false);
   return (
-    <div className="shrink-0 px-4 py-1.5">
-      <div className="flex min-w-0 items-center gap-x-1.5">
+    <div className="flex h-11 min-h-11 shrink-0 items-center px-4">
+      <div className="flex min-w-0 flex-1 items-center gap-x-1.5">
         <span className="min-w-0 shrink truncate text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
           {workspace}
         </span>
-        <span
-          className="shrink-0 select-none text-[10px] font-medium tabular-nums leading-none text-muted-foreground/45"
-          aria-hidden
-        >
-          /
-        </span>
-        <div className="min-w-0 shrink leading-none">
-          <BranchChip workspace={workspace} compact />
-        </div>
         <button
           type="button"
           onClick={() => setTopicsOpen(true)}
@@ -1287,7 +1317,7 @@ function AssistantMessageFooter({
   if (!showActions && !showTrust) return null;
 
   return (
-    <div className="mt-3 flex min-h-8 items-center justify-between gap-3">
+    <div className="mt-2 flex min-h-7 items-center justify-between gap-3 opacity-50 transition-opacity group-hover/message:opacity-100 focus-within:opacity-100">
       <div className="min-w-0 flex-1">
         {showTrust && trustReceipt ? <TrustReceiptChip receipt={trustReceipt} /> : null}
       </div>
@@ -1319,7 +1349,66 @@ function AssistantMessageFooter({
   );
 }
 
-function ThinkingLoader({ label = "Thinking" }: { label?: string }) {
+function ChatTurnStreaming({
+  streaming,
+  workspace,
+}: {
+  streaming: StreamState;
+  workspace: string | null;
+}) {
+  return (
+    <div className="space-y-3">
+      {workspace ? (
+        <LiveActivityStrip
+          steps={streaming.agentSteps}
+          workspace={workspace}
+          hasAnswer={streaming.partial.length > 0}
+        />
+      ) : null}
+      {streaming.engramActivations.length > 0 && (
+        <div className="mx-auto w-full max-w-3xl">
+          <EngramTimeline
+            activations={streaming.engramActivations}
+            turnStartedAtMs={streaming.startedAt.getTime()}
+          />
+        </div>
+      )}
+      {streaming.gaps.length > 0 && (
+        <div className="mx-auto w-full max-w-3xl">
+          <GapCards gaps={streaming.gaps} />
+        </div>
+      )}
+      {streaming.partial.length > 0 && (
+        <MessageBubble
+          msg={{
+            id: streaming.turnId,
+            kind: "assistant",
+            body: streaming.partial,
+            at: streaming.startedAt,
+          }}
+          pending
+        />
+      )}
+      {streaming.partial.length === 0 && streaming.agentSteps.length === 0 && (
+        <MessageBubble
+          msg={{
+            id: streaming.turnId,
+            kind: "assistant",
+            body: streaming.partial,
+            at: streaming.startedAt,
+          }}
+          pending
+          pendingLabel={STREAM_OPENING_LABEL}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Shown before agent steps arrive — dragonfly moment, not knowledge-base copy yet. */
+const STREAM_OPENING_LABEL = "Flying over…";
+
+function ThinkingLoader({ label = STREAM_OPENING_LABEL }: { label?: string }) {
   return (
     <div className="flex h-12 items-center justify-start px-2" role="status" aria-label={label}>
       <div className="inline-flex items-center gap-2.5 py-1.5 text-xs text-muted-foreground">
@@ -1371,64 +1460,9 @@ function MessageBubble({
   }
   if (!isUser) {
     return (
-      <div className={cn("flex w-full px-2", pending && "opacity-90")}>
-        <div className="w-full max-w-3xl text-[15px] leading-7 text-foreground">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeSanitize]}
-            components={{
-              code({ node, inline, className, children, ...props }: any) {
-                const match = /language-(\w+)/.exec(className || "");
-                return !inline && match ? (
-                  <div className="my-4 overflow-hidden rounded-md border border-border/50">
-                    <div className="flex items-center justify-between bg-muted/50 px-4 py-1.5 text-xs font-medium text-muted-foreground">
-                      <span>{match[1]}</span>
-                    </div>
-                    <SyntaxHighlighter
-                      style={vscDarkPlus as any}
-                      language={match[1]}
-                      PreTag="div"
-                      customStyle={{ margin: 0, background: "transparent", padding: "16px" }}
-                      {...props}
-                    >
-                      {String(children).replace(/\n$/, "")}
-                    </SyntaxHighlighter>
-                  </div>
-                ) : (
-                  <code className="rounded bg-muted/80 px-1.5 py-0.5 text-[13px] font-mono text-foreground" {...props}>
-                    {children}
-                  </code>
-                );
-              },
-              p: ({ children }) => (
-                <p className="mb-4 last:mb-0 leading-relaxed">
-                  {transformCitations(children)}
-                </p>
-              ),
-              ul: ({ children }) => <ul className="mb-4 list-disc pl-6 last:mb-0 space-y-1">{children}</ul>,
-              ol: ({ children }) => <ol className="mb-4 list-decimal pl-6 last:mb-0 space-y-1">{children}</ol>,
-              li: ({ children }) => (
-                <li className="mb-1 leading-relaxed">
-                  {transformCitations(children)}
-                </li>
-              ),
-              h1: ({ children }) => <h1 className="mb-4 mt-6 text-2xl font-bold">{children}</h1>,
-              h2: ({ children }) => <h2 className="mb-4 mt-6 text-xl font-bold border-b border-border/50 pb-2">{children}</h2>,
-              h3: ({ children }) => <h3 className="mb-4 mt-4 text-lg font-bold">{children}</h3>,
-              a: ({ href, children }) => (
-                <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary underline underline-offset-4">
-                  {children}
-                </a>
-              ),
-              blockquote: ({ children }) => (
-                <blockquote className="border-l-4 border-muted pl-4 italic text-muted-foreground my-4">
-                  {children}
-                </blockquote>
-              ),
-            }}
-          >
-            {msg.body}
-          </ReactMarkdown>
+      <div className={cn("group/message flex w-full px-2", pending && "opacity-90")}>
+        <div className="w-full max-w-3xl">
+          <ChatMarkdown>{msg.body}</ChatMarkdown>
           {pending && (
             <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
           )}
@@ -1457,16 +1491,16 @@ function MessageBubble({
     );
   }
 
-  // User Message: Right-aligned bubble
+  // User question at top of each turn — visible bubble, right-aligned.
   return (
-    <div className="flex w-full justify-end px-2">
+    <div className="flex w-full justify-end px-2 pt-0.5">
       <div
         className={cn(
-          "max-w-2xl whitespace-pre-wrap break-words rounded-2xl bg-accent/15 px-4 py-3 text-[15px] text-foreground transition-all duration-300",
-          pending && "opacity-90"
+          "max-w-[min(42rem,92%)] rounded-2xl border border-border/50 bg-muted/40 px-4 py-3 text-[15px] font-normal leading-relaxed text-foreground shadow-sm",
+          pending && "opacity-90",
         )}
       >
-        {msg.body}
+        <UserMessageContent body={msg.body} />
       </div>
     </div>
   );
@@ -1537,13 +1571,82 @@ function formatLlmProviderTag(provider: string | null): string {
   return map[k] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
 }
 
+/** Cursor-style circular control used at both ends of the session composer pill. */
+function SessionComposerCircleButton({
+  children,
+  className,
+  ...props
+}: ComponentProps<"button">) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
+        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ComposerBranchFootnote({ workspace }: { workspace: string }) {
+  return (
+    <div className="mt-2 px-2 text-[11px] leading-none text-muted-foreground/50">
+      <BranchChip workspace={workspace} compact dropUp />
+    </div>
+  );
+}
+
+function composerModelShortLabel(health?: LlmHealth | null): string {
+  if (health == null) return "Auto";
+  const model = health.model?.trim();
+  if (health.configured && model) {
+    const tail = model.split("/").pop() ?? model;
+    return tail.length > 18 ? `${tail.slice(0, 16)}…` : tail;
+  }
+  if (health.configured && health.provider) {
+    return formatLlmProviderTag(health.provider);
+  }
+  return "Auto";
+}
+
 function ComposerModelFootnote({
   health,
   openSettings,
+  variant = "idle",
 }: {
   health?: LlmHealth | null;
   openSettings: () => void;
+  variant?: "idle" | "session";
 }) {
+  if (variant === "session") {
+    const fullLabel =
+      health?.configured && health.model?.trim()
+        ? `${formatLlmProviderTag(health.provider)} – ${health.model}`
+        : health?.configured && health.provider
+          ? formatLlmProviderTag(health.provider)
+          : "Default model routing";
+    return (
+      <button
+        type="button"
+        onClick={openSettings}
+        title={fullLabel}
+        className={cn(
+          "inline-flex h-8 max-w-[8.5rem] shrink-0 items-center gap-0.5 rounded-md px-1",
+          "text-[13px] text-muted-foreground/75 transition-colors",
+          "hover:text-foreground/90",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/45",
+        )}
+      >
+        <span className="truncate">{composerModelShortLabel(health)}</span>
+        <ChevronDown className="size-3 shrink-0 opacity-45" strokeWidth={2} aria-hidden />
+      </button>
+    );
+  }
+
   if (health == null) {
     return (
       <span className="shrink-0 text-[10.5px] text-muted-foreground/50">
@@ -1593,9 +1696,11 @@ function firstOpenDialogPath(
 function ComposerAttachMenu({
   disabled,
   insertText,
+  variant = "idle",
 }: {
   disabled: boolean;
   insertText: (snippet: string, opts?: { cursorOffset?: number }) => void;
+  variant?: "idle" | "session";
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -1694,6 +1799,68 @@ function ComposerAttachMenu({
       {label}
     </button>
   );
+
+  if (variant === "session") {
+    return (
+      <div ref={rootRef} className="relative shrink-0">
+        <SessionComposerCircleButton
+          disabled={disabled}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-label="Add context"
+          className="bg-black/35 text-muted-foreground/85 hover:bg-black/45 hover:text-foreground disabled:opacity-40"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <Plus className="size-4" strokeWidth={2} />
+        </SessionComposerCircleButton>
+        {open && (
+          <div
+            className="absolute bottom-full left-0 z-[100] mb-2 min-w-[12.5rem] rounded-lg border border-border bg-muted p-1 text-foreground shadow-elevated"
+            role="menu"
+          >
+            <Row
+              icon={<FileText className="size-3.5" />}
+              label="Insert document path…"
+              onClick={() =>
+                void pickPath({
+                  filters: [{ name: "Documents & code", extensions: DOC_ATTACH_EXTENSIONS }],
+                })
+              }
+            />
+            <Row
+              icon={<ImageIcon className="size-3.5" />}
+              label="Insert image (markdown)…"
+              onClick={() => void pickImageMarkdown()}
+            />
+            <Row
+              icon={<FileText className="size-3.5 opacity-70" />}
+              label="Insert any file path…"
+              onClick={() => void pickPath({})}
+            />
+            <Row
+              icon={<FolderOpen className="size-3.5" />}
+              label="Insert folder path…"
+              onClick={() => void pickPath({ directory: true })}
+            />
+            <div className="my-1 h-px bg-border" />
+            <Row
+              icon={<ClipboardPaste className="size-3.5" />}
+              label="Paste clipboard text"
+              onClick={() => void onPasteClipboard()}
+            />
+            <Row
+              icon={<Code2 className="size-3.5" />}
+              label="Insert code block"
+              onClick={() => {
+                insertText("```\n\n```", { cursorOffset: 4 });
+                close();
+              }}
+            />
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div ref={rootRef} className="relative shrink-0">
@@ -1849,6 +2016,16 @@ function Composer({
     if (!text) setSlashDismissed(false);
   }, [text]);
 
+  useEffect(() => {
+    const onFileDrop = (e: Event) => {
+      const paths = (e as CustomEvent<string[]>).detail;
+      if (!Array.isArray(paths) || paths.length === 0) return;
+      insertText(formatDroppedPathsForComposer(paths));
+    };
+    window.addEventListener(COMPOSER_FILE_DROP_EVENT, onFileDrop);
+    return () => window.removeEventListener(COMPOSER_FILE_DROP_EVENT, onFileDrop);
+  }, [insertText]);
+
   // Auto-resize textarea
   useLayoutEffect(() => {
     const el = textareaRef.current;
@@ -1894,24 +2071,39 @@ function Composer({
     }
   }
 
+  const placeholder = disabled
+    ? "Generating…"
+    : isIdleCentered
+      ? "Understand this space — start asking"
+      : "Send follow-up";
+
   return (
-    <div className="px-5 py-3">
+    <div className={cn("px-5", isIdleCentered ? "py-3" : "px-6 pb-4 pt-2")}>
       <div
         className={cn(
           "mx-auto",
           isIdleCentered ? "max-w-[38rem]" : "max-w-3xl",
         )}
       >
-        {/* Floating card — large radius, subtle shadow, gentle border */}
+        {!isIdleCentered && health && (
+          <div className="mb-2 px-1">
+            <LlmHealthBanner
+              health={health}
+              workspace={workspace}
+              workspaceRootPath={workspaceRootPath}
+              openSettings={openComposerSettings}
+            />
+          </div>
+        )}
         <div
           className={cn(
-            "group relative flex flex-col overflow-visible border border-border/60 bg-surface-elevated shadow-[0_2px_16px_rgba(0,0,0,0.25)] transition-shadow",
-            isIdleCentered ? "rounded-xl" : "rounded-2xl",
+            "group relative flex flex-col overflow-visible",
+            isIdleCentered
+              ? "rounded-xl border border-border/60 bg-surface-elevated"
+              : "rounded-[26px] border border-white/[0.1] bg-[hsl(0,0%,13.5%)]",
           )}
         >
-
-          {/* Health banner inside the card, above the textarea */}
-          {health && (
+          {isIdleCentered && health && (
             <div className="px-4 pt-3">
               <LlmHealthBanner
                 health={health}
@@ -1936,16 +2128,12 @@ function Composer({
                 onDismiss={() => setSlashDismissed(true)}
               />
             )}
-            {/* Textarea */}
+            {isIdleCentered ? (
             <textarea
               ref={textareaRef}
               value={text}
               onChange={(e) => setText(e.target.value)}
-              placeholder={
-                disabled
-                  ? "Generating…"
-                  : "Plan, Build, / for commands, @ for context"
-              }
+              placeholder={placeholder}
               rows={1}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -1953,21 +2141,68 @@ function Composer({
                   void send();
                 }
               }}
-              className={cn(
-                "w-full resize-none border-0 bg-transparent pl-4 pr-4 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0",
-                isIdleCentered
-                  ? "min-h-[92px] py-5 pb-12"
-                  : "py-2.5 pb-10",
-              )}
+              className="w-full min-h-[92px] resize-none border-0 bg-transparent py-5 pb-12 pl-4 pr-4 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
             />
+            ) : (
+              <div className="flex min-h-[46px] items-center gap-1 pl-2 pr-1.5 py-1">
+                <ComposerAttachMenu
+                  disabled={disabled || busy}
+                  insertText={insertText}
+                  variant="session"
+                />
+                <textarea
+                  ref={textareaRef}
+                  value={text}
+                  onChange={(e) => setText(e.target.value)}
+                  placeholder={placeholder}
+                  rows={1}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
+                  className="max-h-[min(200px,40vh)] min-h-[22px] flex-1 resize-none border-0 bg-transparent px-1 py-2.5 text-[13px] leading-5 text-foreground caret-foreground placeholder:text-muted-foreground/50 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                />
+                <div className="flex shrink-0 items-center gap-0.5">
+                  <ComposerModelFootnote
+                    health={health}
+                    openSettings={openComposerSettings}
+                    variant="session"
+                  />
+                  {disabled ? (
+                    <SessionComposerCircleButton
+                      onClick={onCancel}
+                      aria-label="Stop generating"
+                      className="bg-black/35 text-foreground hover:bg-black/45"
+                    >
+                      <Square className="size-2.5 fill-current" />
+                    </SessionComposerCircleButton>
+                  ) : text.trim() ? (
+                    <SessionComposerCircleButton
+                      disabled={busy}
+                      onClick={() => void send()}
+                      aria-label="Send message"
+                      className="bg-white text-[hsl(0,0%,9%)] hover:bg-white/92 disabled:opacity-35"
+                    >
+                      <ArrowUp className="size-4" strokeWidth={2.5} />
+                    </SessionComposerCircleButton>
+                  ) : (
+                    <SessionComposerCircleButton
+                      disabled
+                      aria-hidden
+                      tabIndex={-1}
+                      className="bg-black/35 text-muted-foreground/70"
+                    >
+                      <Mic className="size-3.5" strokeWidth={2} />
+                    </SessionComposerCircleButton>
+                  )}
+                </div>
+              </div>
+            )}
 
-            {/* Bottom row: + · model (left) · compile + send (right) */}
-            <div
-              className={cn(
-                "absolute inset-x-0 bottom-0 flex items-center gap-2 px-1.5",
-                isIdleCentered ? "pb-2 pt-1" : "pb-1.5 pt-0.5",
-              )}
-            >
+            {isIdleCentered && (
+            <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 px-1.5 pb-2 pt-1">
               <ComposerAttachMenu
                 disabled={disabled || busy}
                 insertText={insertText}
@@ -1980,7 +2215,7 @@ function Composer({
               </div>
               <div className="min-w-0 flex-1" />
               <div className="flex shrink-0 items-center justify-end gap-2">
-                {isIdleCentered && compileAction && (
+                {compileAction && (
                   <Button
                     variant="outline"
                     size="sm"
@@ -1996,7 +2231,7 @@ function Composer({
                     {compileAction.busy ? "…" : compileAction.label}
                   </Button>
                 )}
-                {isIdleCentered && compileAction && (
+                {compileAction && (
                   <Button
                     variant="outline"
                     size="icon"
@@ -2046,8 +2281,12 @@ function Composer({
                 )}
               </div>
             </div>
+            )}
           </div>
         </div>
+        {!isIdleCentered && (
+          <ComposerBranchFootnote workspace={workspace} />
+        )}
       </div>
     </div>
   );

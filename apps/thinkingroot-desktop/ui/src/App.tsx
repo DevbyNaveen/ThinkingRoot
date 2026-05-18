@@ -8,6 +8,7 @@ import { ToastStack } from "@/components/ui/toast-stack";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
 import { EngineGate } from "@/components/engine/EngineGate";
+import { WindowDragDropOverlay } from "@/components/shell/WindowDragDropOverlay";
 import { onTrFileOpened, onWorkspaceCompileProgress } from "@/lib/tauri";
 import { useApp } from "@/store/app";
 import { refreshBrainSnapshotCache } from "@/store/brain-cache";
@@ -102,6 +103,7 @@ export default function App() {
             <RightRail />
           </div>
         </div>
+        <WindowDragDropOverlay />
         <CommandPalette />
         <InstallTrSheet
           path={installTrPath}

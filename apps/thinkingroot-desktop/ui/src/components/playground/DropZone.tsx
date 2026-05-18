@@ -1,40 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { CheckCircle2, FileUp, Loader2, XCircle } from "lucide-react";
 
-import {
-  onPlaygroundFilesDropped,
-  playgroundDrop,
-  workspaceCompile,
-  type DropOutcome,
-} from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-
-type ZoneState =
-  | { kind: "idle" }
-  | { kind: "ingesting"; count: number }
-  | { kind: "compiling"; outcome: DropOutcome }
-  | { kind: "done"; outcome: DropOutcome; compiledOk: boolean }
-  | { kind: "error"; message: string };
+import { useFileDropStore, type FileDropZoneState } from "@/store/file-drop";
 
 /**
- * DropZone — accepts files dragged onto the desktop window and
- * routes them into the active workspace's `inbox/` directory, then
- * auto-triggers a compile.
- *
- * Listens for `playground-files-dropped` events emitted by the Tauri
- * lib.rs window-event handler. The handler already strips `.tr`
- * paths off to the install sheet, so anything reaching this listener
- * is genuine source material.
- *
- * Honest UX:
- * - Visual feedback is staged (ingesting → compiling → done) so a
- *   user can see what's happening.
- * - The `DropOutcome` summary surfaces verbatim — we never silently
- *   overwrite a same-name source; the user sees `skipped_duplicate`
- *   and can rename + retry.
- * - Compile failure doesn't roll back the file copy; the toast
- *   honestly reports "files added, compile failed — run compile
- *   manually".
+ * Playground status strip for inbox ingest + compile after a window drop.
+ * Drag UI and routing live in {@link WindowDragDropOverlay}.
  */
 export function DropZone({
   workspace,
@@ -43,69 +15,18 @@ export function DropZone({
   workspace: string | null;
   visible: boolean;
 }) {
-  const [state, setState] = useState<ZoneState>({ kind: "idle" });
-  // Hold the latest workspace in a ref so the listener callback (set
-  // up once on mount) can read the current value without re-binding.
-  const workspaceRef = useRef(workspace);
-  workspaceRef.current = workspace;
+  const state = useFileDropStore((s) => s.zoneState);
+  const setZoneState = useFileDropStore((s) => s.setZoneState);
 
-  const handleDrop = useCallback(async (paths: string[]) => {
-    const ws = workspaceRef.current;
-    if (!ws) {
-      setState({
-        kind: "error",
-        message: "No active workspace — pick one before dropping files.",
-      });
-      return;
-    }
-    setState({ kind: "ingesting", count: paths.length });
-    try {
-      const outcome = await playgroundDrop(ws, paths);
-      if (outcome.copied === 0) {
-        setState({ kind: "done", outcome, compiledOk: true });
-        return;
-      }
-      setState({ kind: "compiling", outcome });
-      let compiledOk = true;
-      try {
-        await workspaceCompile({ target: ws });
-      } catch {
-        compiledOk = false;
-      }
-      setState({ kind: "done", outcome, compiledOk });
-    } catch (e) {
-      setState({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
-    }
-  }, []);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    onPlaygroundFilesDropped(handleDrop).then((un) => {
-      unlisten = un;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [handleDrop]);
-
-  // Auto-clear the "done" / "error" badge so the strip returns to
-  // idle and the user can drop again without manual dismissal.
   useEffect(() => {
     if (state.kind === "done" || state.kind === "error") {
-      const t = setTimeout(() => setState({ kind: "idle" }), 6000);
+      const t = setTimeout(() => setZoneState({ kind: "idle" }), 6000);
       return () => clearTimeout(t);
     }
     return;
-  }, [state.kind]);
+  }, [state.kind, setZoneState]);
 
-  if (!visible) {
-    // Still listen (the effect above), but render nothing — the
-    // user is on a different surface.
-    return null;
-  }
+  if (!visible) return null;
 
   return (
     <div
@@ -126,7 +47,7 @@ export function DropZone({
   );
 }
 
-function ZoneIcon({ state }: { state: ZoneState }) {
+function ZoneIcon({ state }: { state: FileDropZoneState }) {
   if (state.kind === "ingesting" || state.kind === "compiling") {
     return <Loader2 className="size-4 shrink-0 animate-spin" />;
   }
@@ -147,7 +68,7 @@ function ZoneLabel({
   state,
   workspace,
 }: {
-  state: ZoneState;
+  state: FileDropZoneState;
   workspace: string | null;
 }) {
   switch (state.kind) {
@@ -155,8 +76,8 @@ function ZoneLabel({
       return (
         <span>
           {workspace
-            ? `Drop files onto this window — they'll land in ${workspace}/inbox and compile.`
-            : "Drop files — no workspace is active yet."}
+            ? `Drop files anywhere — they land in ${workspace}/inbox and compile.`
+            : "Drop files anywhere — pick a workspace first."}
         </span>
       );
     case "ingesting":
@@ -172,25 +93,11 @@ function ZoneLabel({
     case "done":
       return (
         <span>
-          {summariseOutcome(state.outcome)}
           {state.outcome.copied > 0 &&
-            (state.compiledOk
-              ? " · compile finished"
-              : " · compile failed (run manually)")}
+            (state.compiledOk ? "Compile finished" : "Compile failed (run manually)")}
         </span>
       );
     case "error":
       return <span>Drop failed: {state.message}</span>;
   }
-}
-
-function summariseOutcome(o: DropOutcome): string {
-  const parts: string[] = [];
-  if (o.copied > 0) parts.push(`${o.copied} added`);
-  if (o.skipped_duplicate > 0)
-    parts.push(`${o.skipped_duplicate} duplicate skipped`);
-  if (o.skipped_unreadable > 0)
-    parts.push(`${o.skipped_unreadable} unreadable skipped`);
-  if (parts.length === 0) return "Nothing to add";
-  return parts.join(", ");
 }

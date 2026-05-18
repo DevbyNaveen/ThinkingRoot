@@ -2487,48 +2487,149 @@ impl GraphStore {
         &self,
         triples: &[(String, String, String)],
     ) -> Result<()> {
-        for (from_id, to_id, relation_type) in triples {
-            // Remove stale aggregated edge.
-            let mut params = BTreeMap::new();
-            params.insert("fid".into(), DataValue::Str(from_id.clone().into()));
-            params.insert("tid".into(), DataValue::Str(to_id.clone().into()));
-            params.insert("rtype".into(), DataValue::Str(relation_type.clone().into()));
-            self.query(
-                r#"?[from_id, to_id, relation_type] <- [[$fid, $tid, $rtype]]
-                :rm entity_relations {from_id, to_id, relation_type}"#,
-                params.clone(),
-            )?;
+        // Batched implementation (2026-05-18). Pre-fix this method ran
+        // **three serialised Cozo queries per triple** (one `:rm`, one
+        // strength SELECT, one `:put` via `link_entities`). For
+        // incremental compiles where Phase 4 cross-file fan-out
+        // produces tens of thousands of affected triples, that was
+        // ~150 K serialised CozoDB round-trips — the dominant cost in
+        // the `entity_relations` phase (measured at 329 s for a
+        // 4-source incremental compile on the `thinkingroot`
+        // workspace, ~89 % of total wall time). The batched form
+        // collapses this to **exactly three queries total** regardless
+        // of triple count: one inline-relation `:rm`, one inline-
+        // relation strength-join, one inline-relation `:put`. The
+        // noisy-OR aggregation (`1 − ∏(1 − sᵢ)`) is computed in app
+        // code after the strength SELECT — Cozo lacks a native
+        // noisy-OR aggregator and inlining it as `1 - prod(1-s)` would
+        // bloat the script.
+        //
+        // Semantic invariants preserved verbatim:
+        //   - A triple with no remaining `source_entity_relations`
+        //     rows after the cascade stays deleted (no `:put` emitted).
+        //   - Multiple sources with the same strength all contribute
+        //     (the inline-relation projection keeps source_id as a
+        //     join key — no dedup on (strength) alone).
+        //   - Strength clamped to [0, 1] per-source before product.
+        //   - Output strength clamped to [0, 1] after `1 - product`.
+        if triples.is_empty() {
+            return Ok(());
+        }
 
-            // Re-aggregate using noisy-OR: 1 − ∏(1 − s_i)
-            // Include source_id in the projection so CozoDB does not deduplicate
-            // rows that share the same strength value (e.g., three sources all at 0.5).
-            let result = self
-                .db
-                .run_script(
-                    "?[source_id, strength] := *source_entity_relations{source_id, from_id: $fid, to_id: $tid, relation_type: $rtype, strength}",
-                    params,
-                    ScriptMutability::Immutable,
-                )
-                .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+        // Deduplicate the input — the caller's `sort_unstable + dedup`
+        // (pipeline.rs:1063-1064) covers the Phase 5 path, but Phase 8
+        // (pipeline.rs:1555) feeds in `new_triples` straight from the
+        // linker which is not pre-deduped. Idempotent here so both
+        // call sites get the same fast contract.
+        let mut deduped: Vec<&(String, String, String)> = triples.iter().collect();
+        deduped.sort_unstable();
+        deduped.dedup();
 
-            if result.rows.is_empty() {
-                // No sources remain — edge stays deleted.
+        // Inline-relation rows for the IN-set joins. Each row is a
+        // length-3 list of strings — the schema expected by both the
+        // `:rm` head and the strength-select head below.
+        let triple_rows: Vec<DataValue> = deduped
+            .iter()
+            .map(|(f, t, r)| {
+                DataValue::List(vec![
+                    DataValue::Str(f.clone().into()),
+                    DataValue::Str(t.clone().into()),
+                    DataValue::Str(r.clone().into()),
+                ])
+            })
+            .collect();
+
+        // Query 1 of 3: batch DELETE every stale aggregated edge.
+        let mut rm_params = BTreeMap::new();
+        rm_params.insert("triples".into(), DataValue::List(triple_rows.clone()));
+        self.query(
+            r#"?[from_id, to_id, relation_type] <- $triples
+            :rm entity_relations {from_id, to_id, relation_type}"#,
+            rm_params,
+        )?;
+
+        // Query 2 of 3: batch SELECT every contributing source-strength
+        // for every affected triple in one Datalog evaluation. The
+        // `affected[...]` inline relation pins the IN-set; the join
+        // against `*source_entity_relations` uses Cozo's index on
+        // (from_id, to_id, relation_type). `source_id` is included in
+        // the projection so two rows with the same (triple, strength)
+        // but different source_ids both contribute to the noisy-OR.
+        let mut select_params = BTreeMap::new();
+        select_params.insert("triples".into(), DataValue::List(triple_rows));
+        let result = self
+            .db
+            .run_script(
+                r#"affected[from_id, to_id, relation_type] <- $triples
+                ?[from_id, to_id, relation_type, source_id, strength] :=
+                    affected[from_id, to_id, relation_type],
+                    *source_entity_relations{
+                        source_id, from_id, to_id, relation_type, strength
+                    }"#,
+                select_params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+
+        if result.rows.is_empty() {
+            // Every affected triple lost its last contributing source.
+            // The Query 1 `:rm` already deleted them — nothing to put.
+            return Ok(());
+        }
+
+        // Group strengths by (from, to, rtype) in app code and compute
+        // the per-triple noisy-OR. `HashMap` keyed by owned strings is
+        // the right shape — `result.rows` is `Vec<Vec<DataValue>>` so
+        // we own the strings via `dv_to_string` regardless.
+        let mut grouped: std::collections::HashMap<
+            (String, String, String),
+            f64,
+        > = std::collections::HashMap::with_capacity(deduped.len());
+        for row in &result.rows {
+            if row.len() < 5 {
                 continue;
             }
-
-            // Compute noisy-OR across all source strengths.
-            let complement_product = result.rows.iter().fold(1.0_f64, |acc, row| {
-                let s = match &row[1] {
-                    DataValue::Num(Num::Float(f)) => f.clamp(0.0, 1.0),
-                    DataValue::Num(Num::Int(i)) => (*i as f64).clamp(0.0, 1.0),
-                    _ => 0.0,
-                };
-                acc * (1.0 - s)
-            });
-            let noisy_or_strength = (1.0 - complement_product).clamp(0.0, 1.0);
-
-            self.link_entities(from_id, to_id, relation_type, noisy_or_strength)?;
+            let s = match &row[4] {
+                DataValue::Num(Num::Float(f)) => f.clamp(0.0, 1.0),
+                DataValue::Num(Num::Int(i)) => (*i as f64).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let key = (
+                dv_to_string(&row[0]),
+                dv_to_string(&row[1]),
+                dv_to_string(&row[2]),
+            );
+            // Maintain the running complement product per key. Default
+            // is 1.0 — the identity for multiplication — so the first
+            // contribution gives `1.0 * (1 - s)`.
+            let entry = grouped.entry(key).or_insert(1.0_f64);
+            *entry *= 1.0 - s;
         }
+
+        // Query 3 of 3: batch PUT the recomputed noisy-OR strengths.
+        // Translate the running complement product into the final
+        // strength `1 - product` here so the inline-relation rows
+        // carry the wire-form expected by `entity_relations`.
+        let put_rows: Vec<DataValue> = grouped
+            .into_iter()
+            .map(|((f, t, r), complement)| {
+                let strength = (1.0 - complement).clamp(0.0, 1.0);
+                DataValue::List(vec![
+                    DataValue::Str(f.into()),
+                    DataValue::Str(t.into()),
+                    DataValue::Str(r.into()),
+                    DataValue::Num(Num::Float(strength)),
+                ])
+            })
+            .collect();
+        let mut put_params = BTreeMap::new();
+        put_params.insert("rows".into(), DataValue::List(put_rows));
+        self.query(
+            r#"?[from_id, to_id, relation_type, strength] <- $rows
+            :put entity_relations {from_id, to_id, relation_type => strength}"#,
+            put_params,
+        )?;
+
         Ok(())
     }
 

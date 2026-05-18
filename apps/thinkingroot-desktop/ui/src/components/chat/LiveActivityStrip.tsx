@@ -119,7 +119,25 @@ export function currentActivityText(steps: AgentStep[], hasAnswer: boolean): str
     return "Answering with verified local evidence...";
   }
 
-  return "Composing answer from your knowledge base...";
+  const recent = [...steps].reverse();
+  const searchStep = recent.find((s) => {
+    const n = s.name.toLowerCase();
+    return (
+      n.includes("search") ||
+      n.includes("query") ||
+      n.includes("witness") ||
+      n.includes("relation")
+    );
+  });
+  if (searchStep && searchStep.status !== "rejected") {
+    return "Searching your knowledge base...";
+  }
+
+  if (steps.length > 0) {
+    return "Putting it together...";
+  }
+
+  return "Flying over...";
 }
 
 export function labelForTool(name: string): string {

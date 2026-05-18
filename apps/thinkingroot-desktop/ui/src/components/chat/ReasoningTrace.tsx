@@ -75,11 +75,11 @@ export function ReasoningTrace({ steps }: ReasoningTraceProps) {
   const finishedCount = steps.filter((s) => s.status === "finished" && !s.isError).length;
 
   return (
-    <div className="rounded border border-border/60 bg-muted/10">
+    <div className="rounded-md border border-border/25 bg-transparent">
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted/20"
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted/15"
         aria-expanded={open}
         aria-label={open ? "Hide evidence trail" : "Show evidence trail"}
       >
@@ -89,7 +89,7 @@ export function ReasoningTrace({ steps }: ReasoningTraceProps) {
           <ChevronRight className="h-3 w-3 flex-shrink-0" aria-hidden />
         )}
         <ListTree className="h-3 w-3 flex-shrink-0 text-muted-foreground" aria-hidden />
-        <span className="font-semibold text-muted-foreground">Evidence trail</span>
+        <span className="font-medium text-muted-foreground/90">Evidence trail</span>
         <span className="text-muted-foreground/70">
           {steps.length} tool call{steps.length === 1 ? "" : "s"} ·{" "}
           {finishedCount} ok
@@ -103,7 +103,7 @@ export function ReasoningTrace({ steps }: ReasoningTraceProps) {
       </button>
 
       {open && (
-        <ol className="space-y-1.5 border-t border-border/60 px-2.5 py-2 text-xs">
+        <ol className="space-y-1.5 border-t border-border/25 px-2.5 py-2 text-xs">
           {steps.map((step, idx) => {
             const Icon = statusIcon(step);
             return (

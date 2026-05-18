@@ -25,6 +25,7 @@ pub mod chat;
 pub mod claims;
 pub mod cloud;
 pub mod commits;
+pub mod conversation_title;
 pub mod conversations;
 pub mod doctor;
 pub mod engram;
