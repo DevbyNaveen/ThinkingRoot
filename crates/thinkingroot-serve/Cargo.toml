@@ -57,6 +57,7 @@ ulid = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
+rayon = "1"
 async-trait = "0.1"
 regex = { workspace = true }
 lru = "0.12"

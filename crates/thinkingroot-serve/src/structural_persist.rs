@@ -119,290 +119,85 @@ pub fn phase_6_7_structural_persist(
     byte_store: &FileSystemSourceStore,
     cancel: &CancellationToken,
 ) -> Result<Phase67Stats> {
+    use rayon::prelude::*;
+
     let started = Instant::now();
-    let mut stats = Phase67Stats::default();
 
-    // Accumulate per-source rebuild payloads here, then commit all
-    // sources in ONE `multi_transaction` via
-    // `transactional_rebuild_sources` after the loop. Pre-2026-05-18
-    // every source committed its own transaction inside the loop —
-    // 47 commits on a 47-source incremental compile, paying the
-    // fsync + tx-acquisition overhead each time. The batched commit
-    // widens I-W4's atomicity boundary from per-source to per-compile,
-    // which is strictly stronger for concurrent readers.
-    let mut batch: Vec<(String, PerSourceRows)> = Vec::with_capacity(documents.len());
+    // Bucket emission is per-source CPU-bound work — chunk dispatch,
+    // BLAKE3 hashing, row construction. It reads `extraction` only
+    // immutably (the `&mut extraction.claims` write at line 264 in
+    // the legacy code is captured as a Vec of (claim_id, blake3) stamps
+    // here and applied sequentially after the parallel phase). Tier 3
+    // commit J: parallelise the per-source loop via rayon.
+    let git_blame_enabled = std::env::var("TR_GIT_BLAME")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
 
-    for doc in documents {
-        // Cancel observation between sources — keeps the Stop button
-        // honest during the bucket-emit + transaction-prep phase. The
-        // batched commit itself is one atomic Cozo call with no
-        // mid-transaction cancel point (correct by design — cancelling
-        // a multi_transaction mid-flight would leave a torn graph).
-        if cancel.is_cancelled() {
-            return Err(thinkingroot_core::Error::Cancelled);
-        }
-
-        let bytes = match byte_store
-            .get(&doc.content_hash)
-            .map_err(|e| thinkingroot_core::Error::Compilation {
-                artifact_type: "phase_6_7".to_string(),
-                message: format!("byte_store: {e}"),
-            })?
-        {
-            Some(b) => b.bytes,
-            None => {
-                tracing::warn!(
-                    source_id = %doc.source_id,
-                    content_hash = %doc.content_hash.0,
-                    "phase 6.7: source bytes missing in byte_store; skipping (chunks_residual would have nothing to hash)"
-                );
-                continue;
+    // Cancel observation in the parallel phase: each closure checks
+    // `cancel.is_cancelled()` at entry; `try_collect` short-circuits
+    // on the first `Err(Cancelled)` so the parallel work bails fast.
+    // The check is best-effort granularity = "per source"; finer-
+    // grain cancel would require threading the token through every
+    // emitter, which doesn't pay for itself given typical per-source
+    // walltime is ~10ms.
+    let extraction_view: &ExtractionOutput = extraction;
+    let per_source_results: Vec<Option<PerSourceWorkResult>> = documents
+        .par_iter()
+        .map(|doc| {
+            if cancel.is_cancelled() {
+                return Err(thinkingroot_core::Error::Cancelled);
             }
-        };
-        let mut cache = Blake3Cache::new(&bytes);
-        let mut buckets = PerTableBuckets::default();
-        let source_id_str = doc.source_id.to_string();
+            phase_6_7_per_source(doc, extraction_view, byte_store, git_blame_enabled)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-        // ── File-level emitters (run once per doc) ─────────────────────
-        // Source annotations — license / copyright / shebang / encoding /
-        // mode / trailing_newline_norm. Always emitted (zero rows allowed
-        // when the file has no recognised pragma).
-        source_annotations::emit(
-            doc,
-            &bytes,
-            &source_id_str,
-            &mut cache,
-            &mut buckets.source_annotations,
-        );
+    // ── Sequential merge ──────────────────────────────────────────
+    // Build the claim_id → index map once so applying blake3 stamps
+    // is O(stamps), not O(stamps × claims). The map borrows
+    // extraction.claims immutably; we drop it before the mutating
+    // pass that applies stamps so the borrow checker is happy.
+    let mut stats = Phase67Stats::default();
+    let mut batch: Vec<(String, PerSourceRows)> = Vec::with_capacity(per_source_results.len());
 
-        // git_commits — fires once per git-source DocumentIR, reading
-        // the SourceMetadata fields populated by parse_git_log.
-        git_commits::emit(doc, &bytes, &source_id_str, &mut cache, &mut buckets.git_commits);
-
-        // git_blame — fires for File-typed sources whose URI maps to a
-        // path on disk in a git repo. Default-enabled per contract §15
-        // Q2; opt-out via the `compile.git_blame` config flag is read
-        // upstream by the caller and gated by setting the env var.
-        let git_blame_enabled = std::env::var("TR_GIT_BLAME")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
-        if git_blame_enabled {
-            run_git_blame_for_file_source(
-                doc,
-                &bytes,
-                &source_id_str,
-                &mut cache,
-                &mut buckets.git_blame,
-            );
-        }
-
-        // Build a quick claim-byte-span index so the chunks_residual
-        // emitter can skip chunks that already produced ≥1 admitted claim.
-        let claim_spans: std::collections::HashSet<(u64, u64)> = extraction
+    // First pass: accumulate stats and collect (idx, blake3) stamps.
+    let claim_index: std::collections::HashMap<thinkingroot_core::types::ClaimId, usize> =
+        extraction
             .claims
             .iter()
-            .filter(|c| c.source == doc.source_id)
-            .filter_map(|c| {
-                c.source_span
-                    .as_ref()
-                    .and_then(|s| match (s.byte_start, s.byte_end) {
-                        (Some(bs), Some(be)) if be > bs => Some((bs, be)),
-                        _ => None,
-                    })
-            })
+            .enumerate()
+            .map(|(i, c)| (c.id, i))
             .collect();
-
-        // Maintain a (heading_level, heading_id) stack so the headings
-        // emitter can resolve `parent_heading_id` to the actual emitted
-        // row id rather than the heading text.
-        let mut heading_stack: Vec<(u8, String)> = Vec::new();
-
-        // Per-chunk emitter dispatch.
-        for chunk in &doc.chunks {
-            let pre_count = total_row_count(&buckets);
-            dispatch_chunk(
-                chunk,
-                doc,
-                &bytes,
-                &source_id_str,
-                &mut cache,
-                &mut heading_stack,
-                &mut buckets,
-                extraction,
-            );
-            let added_rows = total_row_count(&buckets) - pre_count;
-
-            // chunks_residual fall-through: only when 0 typed rows AND 0
-            // admitted claims for this chunk's byte span.
-            let span = (chunk.byte_start, chunk.byte_end);
-            let claim_covered = claim_spans.contains(&span);
-            if added_rows == 0 && !claim_covered && chunk.byte_end > chunk.byte_start {
-                let id = stable_row_id(
-                    "chunks_residual",
-                    &source_id_str,
-                    chunk.byte_start,
-                    chunk.byte_end,
-                    "",
-                );
-                buckets.chunks_residual.push(ResidualChunk {
-                    id,
-                    source_id: source_id_str.clone(),
-                    chunk_type: chunk_type_str(chunk.chunk_type).to_string(),
-                    content: chunk.content.clone(),
-                    metadata_json: serde_json::to_string(&chunk.metadata).unwrap_or_default(),
-                    byte_start: chunk.byte_start,
-                    byte_end: chunk.byte_end,
-                    content_blake3: cache.get(chunk.byte_start, chunk.byte_end).to_string(),
-                });
-                stats.residual_rows_emitted += 1;
+    let mut stamps_by_index: Vec<(usize, String)> = Vec::new();
+    for result in &per_source_results {
+        let Some(r) = result else { continue };
+        for (claim_id, blake3_hex) in &r.blake3_stamps {
+            if let Some(&idx) = claim_index.get(claim_id) {
+                stamps_by_index.push((idx, blake3_hex.clone()));
             }
         }
-
-        // Stamp content_blake3 onto every Claim from this source so the
-        // linker writes the final value into `claims.content_blake3` in
-        // a single insert (no second pass).
-        for claim in extraction.claims.iter_mut().filter(|c| c.source == doc.source_id) {
-            if let Some(span) = &claim.source_span
-                && let (Some(bs), Some(be)) = (span.byte_start, span.byte_end)
-                && be > bs
-            {
-                claim.row_blake3 = Some(cache.get(bs, be).to_string());
-            }
-        }
-
-        // ─── Gap-filling chunks_residual emission (Compile Completeness
-        // Contract I-3) ────────────────────────────────────────────────
-        // Per-chunk chunks_residual catches CHUNKS the structural
-        // emitters didn't claim. But chunks themselves don't cover the
-        // full byte range of a source — there are gaps between chunks
-        // (whitespace, line endings, file headers, blank lines). Phase 9
-        // would fail with orphan ranges in those gaps.
-        //
-        // Sweep the doc here: collect every `(byte_start, byte_end)`
-        // already emitted by this doc's pass (claims + every bucket
-        // row) and emit one chunks_residual row per uncovered gap so
-        // I-3 holds end-to-end. Per contract §15 Q1 we store the gap's
-        // raw bytes inline.
-        // Build the covered-byte set for this source. `buckets` is
-        // reset per source (line above), so every row in every vec
-        // belongs to `source_id_str` by construction — the legacy
-        // `if r.source_id == source_id_str` filter on each loop was
-        // dead code (always true) and was deleted on 2026-05-18.
-        let mut covered: Vec<(u64, u64)> = Vec::new();
-        for span in &claim_spans {
-            covered.push(*span);
-        }
-        for r in &buckets.function_calls {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.doc_tags {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.code_links {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.code_signatures {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.config_tree {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.data_rows {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.headings {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.chunks_residual {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.source_annotations {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.code_markers {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.test_annotations {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.code_metrics {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.git_blame {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        for r in &buckets.git_commits {
-            covered.push((r.byte_start, r.byte_end));
-        }
-        let total_bytes = bytes.len() as u64;
-        for (gap_start, gap_end) in compute_gaps(&covered, total_bytes) {
-            // Synthesise a unique id keyed on the gap's range. Re-running
-            // Phase 6.7 over identical bytes produces identical ids →
-            // `:put` is upsert-safe.
-            let id = stable_row_id(
-                "chunks_residual",
-                &source_id_str,
-                gap_start,
-                gap_end,
-                "gap",
-            );
-            // Inline content if reasonably small; truncate above 4KB to
-            // keep the table from ballooning on pathological gaps (e.g.
-            // a 2MB binary blob between two parsed sections).
-            let s_idx = (gap_start as usize).min(bytes.len());
-            let e_idx = (gap_end as usize).min(bytes.len());
-            let raw = &bytes[s_idx..e_idx];
-            let content = if raw.len() <= 4096 {
-                String::from_utf8_lossy(raw).to_string()
-            } else {
-                format!(
-                    "[gap of {} bytes; first 256: {}]",
-                    raw.len(),
-                    String::from_utf8_lossy(&raw[..256])
-                )
-            };
-            buckets.chunks_residual.push(ResidualChunk {
-                id,
-                source_id: source_id_str.clone(),
-                chunk_type: "byte_gap".to_string(),
-                content,
-                metadata_json: "{}".to_string(),
-                byte_start: gap_start,
-                byte_end: gap_end,
-                content_blake3: cache.get(gap_start, gap_end).to_string(),
-            });
-            stats.residual_rows_emitted += 1;
-        }
-
-        // Emit `quantities` rows from the §5 decorator output. The map
-        // is keyed by claim_id — every claim entry yields N rows.
-        emit_quantities(
-            extraction,
-            doc,
-            &source_id_str,
-            &bytes,
-            &mut cache,
-            &mut buckets.quantities,
-        );
-
-        // Drain buckets into a PerSourceRows payload and queue it for
-        // the batched commit below. The single-tx batch widens I-W4's
-        // atomicity boundary from per-source to per-compile, which is
-        // strictly stronger for concurrent AEP/Hybrid readers — they
-        // observe either the full pre-batch state or the full
-        // post-batch state of every source touched, never a torn
-        // intermediate. The cascade in `transactional_rebuild_sources`
-        // still fires for every source, including those with empty
-        // bucket sets, so stale rows from prior compiles are cleared.
-        let rows = drain_buckets_to_per_source_rows(&mut buckets);
-        batch.push((source_id_str.clone(), rows));
-
+        stats.residual_rows_emitted += r.residual_rows_emitted;
+        stats.blake3_distinct_spans += r.blake3_distinct_spans;
         stats.sources_processed += 1;
-        stats.blake3_distinct_spans += cache.len();
+    }
+    drop(claim_index);
+
+    // Apply blake3 stamps now that no immutable borrow is alive on
+    // extraction.claims. Order doesn't matter — each stamp targets
+    // a distinct claim.
+    for (idx, blake3_hex) in stamps_by_index {
+        extraction.claims[idx].row_blake3 = Some(blake3_hex);
+    }
+
+    // Move PerSourceRows into the batch (consume results).
+    for result in per_source_results {
+        if let Some(r) = result {
+            batch.push((r.source_id_str, r.rows));
+        }
     }
 
     // One commit for every truly-changed source. Empty batches are an
-    // explicit no-op inside `transactional_rebuild_sources`.
+    // explicit no-op inside `transactional_rebuild_sources`. Widens
+    // I-W4 atomicity from per-source to per-compile.
     graph.transactional_rebuild_sources(&batch)?;
 
     // Record per-table counts AFTER the batched commit succeeded —
@@ -414,6 +209,247 @@ pub fn phase_6_7_structural_persist(
 
     stats.elapsed = started.elapsed();
     Ok(stats)
+}
+
+/// Per-source result returned from `phase_6_7_per_source`.
+///
+/// `blake3_stamps` defers the `extraction.claims[i].row_blake3 = ...`
+/// write out of the parallel phase so the closure only borrows
+/// `extraction` immutably. The sequential merge in
+/// `phase_6_7_structural_persist` applies the stamps after the
+/// parallel collection finishes.
+struct PerSourceWorkResult {
+    source_id_str: String,
+    rows: PerSourceRows,
+    blake3_stamps: Vec<(thinkingroot_core::types::ClaimId, String)>,
+    residual_rows_emitted: usize,
+    blake3_distinct_spans: usize,
+}
+
+/// Per-source bucket emission — the pure CPU work that Tier 3 commit J
+/// parallelises via rayon. Reads `extraction` immutably; mutations to
+/// `extraction.claims` happen in the sequential merge step.
+///
+/// Returns `Ok(None)` when the byte store has no entry for the doc's
+/// content hash (skip the source; matches the legacy `continue` path).
+fn phase_6_7_per_source(
+    doc: &DocumentIR,
+    extraction: &ExtractionOutput,
+    byte_store: &FileSystemSourceStore,
+    git_blame_enabled: bool,
+) -> Result<Option<PerSourceWorkResult>> {
+    let bytes = match byte_store
+        .get(&doc.content_hash)
+        .map_err(|e| thinkingroot_core::Error::Compilation {
+            artifact_type: "phase_6_7".to_string(),
+            message: format!("byte_store: {e}"),
+        })?
+    {
+        Some(b) => b.bytes,
+        None => {
+            tracing::warn!(
+                source_id = %doc.source_id,
+                content_hash = %doc.content_hash.0,
+                "phase 6.7: source bytes missing in byte_store; skipping (chunks_residual would have nothing to hash)"
+            );
+            return Ok(None);
+        }
+    };
+    let mut cache = Blake3Cache::new(&bytes);
+    let mut buckets = PerTableBuckets::default();
+    let source_id_str = doc.source_id.to_string();
+    let mut residual_rows_emitted: usize = 0;
+
+    // ── File-level emitters (run once per doc) ─────────────────────
+    source_annotations::emit(
+        doc,
+        &bytes,
+        &source_id_str,
+        &mut cache,
+        &mut buckets.source_annotations,
+    );
+
+    git_commits::emit(doc, &bytes, &source_id_str, &mut cache, &mut buckets.git_commits);
+
+    if git_blame_enabled {
+        run_git_blame_for_file_source(
+            doc,
+            &bytes,
+            &source_id_str,
+            &mut cache,
+            &mut buckets.git_blame,
+        );
+    }
+
+    // Claim-byte-span index for residual-skip + blake3 stamp collection.
+    let claim_spans: std::collections::HashSet<(u64, u64)> = extraction
+        .claims
+        .iter()
+        .filter(|c| c.source == doc.source_id)
+        .filter_map(|c| {
+            c.source_span
+                .as_ref()
+                .and_then(|s| match (s.byte_start, s.byte_end) {
+                    (Some(bs), Some(be)) if be > bs => Some((bs, be)),
+                    _ => None,
+                })
+        })
+        .collect();
+
+    let mut heading_stack: Vec<(u8, String)> = Vec::new();
+
+    // Per-chunk emitter dispatch.
+    for chunk in &doc.chunks {
+        let pre_count = total_row_count(&buckets);
+        dispatch_chunk(
+            chunk,
+            doc,
+            &bytes,
+            &source_id_str,
+            &mut cache,
+            &mut heading_stack,
+            &mut buckets,
+            extraction,
+        );
+        let added_rows = total_row_count(&buckets) - pre_count;
+
+        let span = (chunk.byte_start, chunk.byte_end);
+        let claim_covered = claim_spans.contains(&span);
+        if added_rows == 0 && !claim_covered && chunk.byte_end > chunk.byte_start {
+            let id = stable_row_id(
+                "chunks_residual",
+                &source_id_str,
+                chunk.byte_start,
+                chunk.byte_end,
+                "",
+            );
+            buckets.chunks_residual.push(ResidualChunk {
+                id,
+                source_id: source_id_str.clone(),
+                chunk_type: chunk_type_str(chunk.chunk_type).to_string(),
+                content: chunk.content.clone(),
+                metadata_json: serde_json::to_string(&chunk.metadata).unwrap_or_default(),
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                content_blake3: cache.get(chunk.byte_start, chunk.byte_end).to_string(),
+            });
+            residual_rows_emitted += 1;
+        }
+    }
+
+    // Collect blake3 stamps for the sequential merge — DOES NOT
+    // mutate `extraction.claims`. Each stamp is (claim_id,
+    // blake3_hex) over the claim's source byte span.
+    let mut blake3_stamps: Vec<(thinkingroot_core::types::ClaimId, String)> = Vec::new();
+    for claim in extraction.claims.iter().filter(|c| c.source == doc.source_id) {
+        if let Some(span) = &claim.source_span
+            && let (Some(bs), Some(be)) = (span.byte_start, span.byte_end)
+            && be > bs
+        {
+            blake3_stamps.push((claim.id, cache.get(bs, be).to_string()));
+        }
+    }
+
+    // ─── Gap-filling chunks_residual emission (CCC I-3) ───────────
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for span in &claim_spans {
+        covered.push(*span);
+    }
+    for r in &buckets.function_calls {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.doc_tags {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.code_links {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.code_signatures {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.config_tree {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.data_rows {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.headings {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.chunks_residual {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.source_annotations {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.code_markers {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.test_annotations {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.code_metrics {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.git_blame {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    for r in &buckets.git_commits {
+        covered.push((r.byte_start, r.byte_end));
+    }
+    let total_bytes = bytes.len() as u64;
+    for (gap_start, gap_end) in compute_gaps(&covered, total_bytes) {
+        let id = stable_row_id(
+            "chunks_residual",
+            &source_id_str,
+            gap_start,
+            gap_end,
+            "gap",
+        );
+        let s_idx = (gap_start as usize).min(bytes.len());
+        let e_idx = (gap_end as usize).min(bytes.len());
+        let raw = &bytes[s_idx..e_idx];
+        let content = if raw.len() <= 4096 {
+            String::from_utf8_lossy(raw).to_string()
+        } else {
+            format!(
+                "[gap of {} bytes; first 256: {}]",
+                raw.len(),
+                String::from_utf8_lossy(&raw[..256])
+            )
+        };
+        buckets.chunks_residual.push(ResidualChunk {
+            id,
+            source_id: source_id_str.clone(),
+            chunk_type: "byte_gap".to_string(),
+            content,
+            metadata_json: "{}".to_string(),
+            byte_start: gap_start,
+            byte_end: gap_end,
+            content_blake3: cache.get(gap_start, gap_end).to_string(),
+        });
+        residual_rows_emitted += 1;
+    }
+
+    emit_quantities(
+        extraction,
+        doc,
+        &source_id_str,
+        &bytes,
+        &mut cache,
+        &mut buckets.quantities,
+    );
+
+    let rows = drain_buckets_to_per_source_rows(&mut buckets);
+    let blake3_distinct_spans = cache.len();
+
+    Ok(Some(PerSourceWorkResult {
+        source_id_str,
+        rows,
+        blake3_stamps,
+        residual_rows_emitted,
+        blake3_distinct_spans,
+    }))
 }
 
 /// Drain every per-table bucket into a `PerSourceRows` for the
