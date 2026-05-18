@@ -146,6 +146,21 @@ export interface AgentStep {
   output?: string;
   /** True when the tool reported a runtime error. */
   isError?: boolean;
+  /** SOTA polish ship (2026-05-18): live partial output streamed
+   *  via `tool_call_progress` events for long-running tools.
+   *  Accumulates as deltas arrive. Replaced by final `output` once
+   *  `tool_call_finished` fires. */
+  progress?: string;
+  /** SOTA polish ship: byte length the LLM has emitted progress
+   *  for so far. Useful for showing "Read 12 KB so far" UX. */
+  progressBytes?: number;
+  /** SOTA Ship B (chronological interleaving): snapshot of
+   *  `streaming.partial.length` at the moment this step was
+   *  `proposed`. Lets the renderer split the streamed prose at
+   *  that byte offset and render the tool card inline at its
+   *  chronological position, Cursor-style. Undefined for steps
+   *  hydrated from persisted messages. */
+  proposedAtPartialLen?: number;
 }
 
 /** In-flight streaming state. */
@@ -167,6 +182,25 @@ export interface StreamState {
    *  `gaps_surfaced` SSE event). Copied to the assistant
    *  ChatMessage on `final`. */
   gaps: GapEntry[];
+  /** SOTA stability ship (2026-05-18): when the agent loop hits a
+   *  soft cap (iteration budget exhausted, max_tokens, loop
+   *  detected) it emits `continuation_offered` with partial work
+   *  preserved. The UI captures it here so the assistant bubble
+   *  renders a "Continue?" affordance instead of a dead-end
+   *  error banner. Cleared when a fresh turn starts. */
+  continuation?: ContinuationOffer;
+}
+
+/** SOTA stability ship (2026-05-18): soft-cap continuation offer
+ *  surfaced when the agent loop pauses without a terminal answer.
+ *  Mirrors the Rust `AgentEvent::ContinuationOffered` variant. */
+export interface ContinuationOffer {
+  partialText: string;
+  iterationsUsed: number;
+  /** Canonical reasons: `iteration_budget`, `max_tokens`,
+   *  `loop_detected`. UI switches on this to choose the prompt
+   *  copy ("Continue?" vs "Try a different angle?"). */
+  reason: string;
 }
 
 /** One engram activation observed during a turn. Mirrors the

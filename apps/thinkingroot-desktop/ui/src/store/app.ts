@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import type {
   AgentStep,
   ChatMessage,
+  ContinuationOffer,
   EngramActivationEntry,
   GapEntry,
   RightRailTab,
@@ -159,6 +160,15 @@ interface AppStore {
   /** Append reflection gaps observed during the active turn.
    *  No-op when `streaming` is null. */
   appendGaps: (gaps: GapEntry[]) => void;
+  /** SOTA polish ship (2026-05-18): append a tool-output progress
+   *  delta to a specific in-flight step. Matches the
+   *  `tool_call_progress` SSE event from the agent loop.
+   *  Append-only by design — each event carries new content. */
+  appendStepProgress: (id: string, delta: string, byteCount: number) => void;
+  /** SOTA stability ship (2026-05-18): set the streaming turn's
+   *  continuation offer (iteration ceiling / max_tokens / loop
+   *  detected). Cleared on next turn or explicit dismiss. */
+  setContinuationOffer: (offer: ContinuationOffer | undefined) => void;
 
   // Per-turn routing context. Survives component re-mounts (React
   // Strict Mode, Vite HMR) so SSE Final/Error events that arrive AFTER
@@ -371,6 +381,28 @@ export const useApp = create<AppStore>()(
               ...s.streaming,
               gaps: [...s.streaming.gaps, ...gaps],
             },
+          };
+        }),
+      appendStepProgress: (id, delta, byteCount) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          const idx = s.streaming.agentSteps.findIndex((a) => a.id === id);
+          if (idx < 0) return {};
+          const prior = s.streaming.agentSteps[idx];
+          if (!prior) return {};
+          const next = [...s.streaming.agentSteps];
+          next[idx] = {
+            ...prior,
+            progress: (prior.progress ?? "") + delta,
+            progressBytes: byteCount,
+          };
+          return { streaming: { ...s.streaming, agentSteps: next } };
+        }),
+      setContinuationOffer: (offer: ContinuationOffer | undefined) =>
+        set((s) => {
+          if (!s.streaming) return {};
+          return {
+            streaming: { ...s.streaming, continuation: offer },
           };
         }),
 

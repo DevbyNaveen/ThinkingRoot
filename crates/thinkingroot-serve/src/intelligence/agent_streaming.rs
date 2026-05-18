@@ -496,6 +496,20 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
         AgentEvent::ToolCallExecuting { id, name } => {
             ("tool_call_executing", json!({"id": id, "name": name}))
         }
+        AgentEvent::ToolCallProgress {
+            id,
+            name,
+            partial_content,
+            byte_count,
+        } => (
+            "tool_call_progress",
+            json!({
+                "id": id,
+                "name": name,
+                "partial_content": partial_content,
+                "byte_count": byte_count,
+            }),
+        ),
         AgentEvent::ToolCallFinished {
             id,
             name,
@@ -527,6 +541,22 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
             }),
         ),
         AgentEvent::Error { message } => ("error", json!({"message": message})),
+        // SOTA stability ship (2026-05-18): soft-cap continuation
+        // offer. Wire event name is `continuation_offered` so the UI
+        // can route it to the "Continue?" affordance instead of the
+        // red error banner.
+        AgentEvent::ContinuationOffered {
+            partial_text,
+            iterations_used,
+            reason,
+        } => (
+            "continuation_offered",
+            json!({
+                "partial_text": partial_text,
+                "iterations_used": iterations_used,
+                "reason": reason,
+            }),
+        ),
     }
 }
 

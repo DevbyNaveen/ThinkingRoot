@@ -850,6 +850,41 @@ export type ChatEvent =
       name: string;
     }
   | {
+      /** SOTA polish ship (2026-05-18): live tool-output progress
+       *  for long-running tools (compile, shell_exec, deep search).
+       *  `partial_content` is APPEND-ONLY — each event carries new
+       *  content, not the full accumulated buffer. UI concatenates.
+       *  Tools that don't emit progress simply skip this event;
+       *  the existing Proposed → Executing → Finished sequence
+       *  remains valid. */
+      type: "tool_call_progress";
+      turn_id: string;
+      id: string;
+      name: string;
+      partial_content: string;
+      byte_count: number;
+    }
+  | {
+      /** SOTA stability ship (2026-05-18): soft-cap continuation
+       *  offer (iteration budget exhausted, model output truncated
+       *  at max_tokens, or same-tool-same-args loop detected).
+       *  Replaces what used to be a fatal `error` event for these
+       *  three recoverable cases. The UI renders a "Continue?"
+       *  affordance instead of the dead-end red banner. A terminal
+       *  `final` event still follows so the standard chat-message
+       *  persistence path runs on the partial reply.
+       *
+       *  `reason` is one of: `iteration_budget`, `max_tokens`,
+       *  `loop_detected`. Other values may surface from future
+       *  agent-loop limits and the UI should fall back to the
+       *  generic "Continue?" copy. */
+      type: "continuation_offered";
+      turn_id: string;
+      partial_text: string;
+      iterations_used: number;
+      reason: string;
+    }
+  | {
       type: "tool_call_finished";
       turn_id: string;
       id: string;

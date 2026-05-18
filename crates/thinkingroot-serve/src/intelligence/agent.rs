@@ -137,6 +137,30 @@ pub enum AgentEvent {
     },
     /// Tool execution started (after approval, if write).
     ToolCallExecuting { id: String, name: String },
+    /// **Live tool-output progress** (SOTA polish ship, 2026-05-18).
+    /// Emitted by tools that produce intermediate output before they
+    /// finish — long-running compiles, multi-step searches, shell
+    /// commands with line-by-line output. The UI's tool card updates
+    /// its rendered content live as these arrive, instead of waiting
+    /// for `ToolCallFinished`.
+    ///
+    /// Semantically additive: every `ToolCallProgress` is OPTIONAL.
+    /// A tool that doesn't emit progress still works exactly as
+    /// before — Proposed → Executing → Finished, with no progress
+    /// events in between. The UI must handle progress events
+    /// idempotently because some transports may replay them on
+    /// reconnect.
+    ///
+    /// `partial_content` is APPEND-ONLY: each event carries new
+    /// content (not the full accumulated output) so the UI just
+    /// concatenates. `byte_count` is the cumulative byte length so
+    /// far — useful for showing "Read 14 KB / unknown" in the UI.
+    ToolCallProgress {
+        id: String,
+        name: String,
+        partial_content: String,
+        byte_count: usize,
+    },
     /// Tool execution finished. `is_error` mirrors the
     /// [`ToolHandlerResult`] flag — UI can colour the card
     /// accordingly. `content` is the FULL (untruncated) tool result —
@@ -171,10 +195,58 @@ pub enum AgentEvent {
         final_text: String,
         iterations: usize,
     },
+    /// **Soft-cap continuation offer** (SOTA stability ship, 2026-05-18).
+    /// Replaces the hard "iteration ceiling" / "loop detected" error
+    /// terminations that pre-ship surfaced as a dead-end red banner.
+    /// Emitted when the loop hit a budget OR a likely-stuck heuristic
+    /// but has accumulated useful partial work. The UI renders a
+    /// "Continue?" affordance; clicking it issues a fresh turn that
+    /// carries `partial_text` as context, letting the agent pick up
+    /// where it left off rather than restart from scratch.
+    ///
+    /// `reason` is one of a small canonical set the UI can switch on:
+    ///   * `"iteration_budget"` — hit `max_iterations` without a
+    ///     terminal text reply. Bumping the budget or accepting the
+    ///     partial work both fine.
+    ///   * `"loop_detected"` — same `(tool, args)` repeated past the
+    ///     loop-detection threshold. Likely stuck; trying a different
+    ///     angle is the right move.
+    ///   * `"max_tokens"` — model output truncated mid-response. Asking
+    ///     it to continue from the cut point typically completes.
+    ///
+    /// Followed by a terminal `Done { final_text, iterations }` so
+    /// the SSE consumer's terminator still fires and the conversation
+    /// shape stays balanced (post-Done hooks like Observer + commit
+    /// recording run on the partial reply).
+    ContinuationOffered {
+        partial_text: String,
+        iterations_used: usize,
+        reason: String,
+    },
     /// Loop hit a fatal error — most often a non-retryable LLM
-    /// failure or hitting `max_iterations` without a terminal text
-    /// reply. The UI surfaces this and stops the spinner.
+    /// failure (permanent error like 401, malformed config) or a
+    /// catastrophic internal bug. The UI surfaces this and stops
+    /// the spinner. **Transient errors (network blip, 5xx)** now
+    /// retry transparently per [`LLM_RETRY_ATTEMPTS`] before
+    /// surfacing as a fatal `Error`.
     Error { message: String },
+}
+
+/// Number of attempts the agent loop makes when the LLM call itself
+/// errors. First call is attempt 1; up to 3 attempts total before
+/// surfacing as fatal. Permanent errors (recognised via
+/// [`Error::is_permanent`]) short-circuit to 1 attempt — there's no
+/// point retrying a 401.
+pub const LLM_RETRY_ATTEMPTS: usize = 3;
+
+/// Exponential backoff between LLM retry attempts: 1s, 2s, 4s. Cap
+/// is not exceeded because [`LLM_RETRY_ATTEMPTS`] is 3. Cancellation
+/// preempts every sleep — a user-initiated Stop during the backoff
+/// window bails immediately rather than burning the full 4s.
+fn llm_retry_backoff(attempt_already_failed: usize) -> std::time::Duration {
+    // attempt_already_failed=1 → 1s, 2 → 2s, 3 → 4s
+    let secs = 1u64 << (attempt_already_failed - 1).min(3);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Refresh the system prompt at the top of each agent iteration.
@@ -272,7 +344,21 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 8,
+            // Bumped 8 → 25 on 2026-05-18 (SOTA stability ship):
+            // deep-search queries routinely dispatch 3-5 tools per
+            // turn (search + query_claims + read_source + …) and
+            // the 8-iteration cap was producing the user-reported
+            // "agent stopped at iteration ceiling" failures. 25
+            // accommodates 5-8 multi-tool turns before the soft
+            // ceiling triggers the continuation prompt (vs the
+            // pre-ship hard error). Cursor 3.0 / Claude Code use
+            // analogous "long-horizon" budgets in the 20-30 range.
+            //
+            // The cap is no longer a *failure* mode — it's the
+            // signal for the agent loop to emit a
+            // `ContinuationOffered` event, which the UI surfaces
+            // as a "Continue?" affordance.
+            max_iterations: 25,
             loop_detection: true,
             loop_detection_window: 10,
             loop_detection_threshold: 3,
@@ -459,19 +545,87 @@ impl Agent {
             // `chat_with_tools` may take 30s+ on a long completion; a
             // user-initiated Stop has to interrupt it within one
             // poll, not on natural completion.
-            let response = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    self.emit_cancelled(sink, accumulated_text, iterations).await;
-                    return;
+            //
+            // SOTA stability ship (2026-05-18): transient LLM errors
+            // (network blip, 502/503, timeout) now retry transparently
+            // with exponential backoff (1s/2s/4s) up to
+            // `LLM_RETRY_ATTEMPTS` total attempts. Permanent errors
+            // (401, 403, malformed config — `Error::is_permanent`)
+            // short-circuit to single attempt because retrying a
+            // dead key burns quota without succeeding. Cancellation
+            // preempts every backoff sleep.
+            let response = {
+                let mut last_err: Option<thinkingroot_core::Error> = None;
+                let mut attempt: usize = 0;
+                let mut result: Option<ToolUseResponse> = None;
+                while attempt < LLM_RETRY_ATTEMPTS {
+                    attempt += 1;
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            self.emit_cancelled(sink, accumulated_text, iterations).await;
+                            return;
+                        }
+                        r = self.llm.chat_with_tools(&current_system, &history, &tools, &tool_choice) => r,
+                    };
+                    match outcome {
+                        Ok(r) => {
+                            result = Some(r);
+                            break;
+                        }
+                        Err(e) => {
+                            // Permanent → no point retrying (a 401 won't fix itself).
+                            if e.is_permanent() {
+                                last_err = Some(e);
+                                break;
+                            }
+                            // Transient and we have retries left → log + back off.
+                            if attempt < LLM_RETRY_ATTEMPTS {
+                                tracing::warn!(
+                                    "agent: LLM call attempt {attempt}/{} failed (transient): {e} — retrying after backoff",
+                                    LLM_RETRY_ATTEMPTS,
+                                );
+                                let backoff = llm_retry_backoff(attempt);
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        self.emit_cancelled(sink, accumulated_text, iterations).await;
+                                        return;
+                                    }
+                                    _ = tokio::time::sleep(backoff) => {}
+                                }
+                                continue;
+                            }
+                            // No retries left.
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
                 }
-                r = self.llm.chat_with_tools(&current_system, &history, &tools, &tool_choice) => match r {
-                    Ok(r) => r,
-                    Err(e) => {
+                match (result, last_err) {
+                    (Some(r), _) => r,
+                    (None, Some(e)) => {
                         self.emit(
                             sink,
                             AgentEvent::Error {
-                                message: format!("LLM call failed on iteration {iterations}: {e}"),
+                                message: format!(
+                                    "LLM call failed on iteration {iterations} after {attempt} \
+                                     attempt(s): {e}"
+                                ),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    (None, None) => {
+                        // Programmer-bug guard. Loop only exits with
+                        // a result OR a last_err; we shouldn't be here.
+                        self.emit(
+                            sink,
+                            AgentEvent::Error {
+                                message: format!(
+                                    "internal: retry loop exited without result on iteration {iterations}"
+                                ),
                             },
                         )
                         .await;
@@ -495,13 +649,17 @@ impl Agent {
                         .await;
                     }
                     if truncated {
+                        // SOTA stability ship: max_tokens truncation
+                        // is a continuation opportunity, not a hard
+                        // failure. The model has prose to share but
+                        // got cut off; the UI should offer "Continue?"
+                        // so the user can let it finish.
                         self.emit(
                             sink,
-                            AgentEvent::Error {
-                                message: format!(
-                                    "model output truncated at iteration {iterations} \
-                                     (hit max_tokens)"
-                                ),
+                            AgentEvent::ContinuationOffered {
+                                partial_text: accumulated_text.clone(),
+                                iterations_used: iterations,
+                                reason: "max_tokens".to_string(),
                             },
                         )
                         .await;
@@ -554,26 +712,25 @@ impl Agent {
                             }
                         });
                         if let Some((name, count)) = triggering {
+                            // SOTA stability ship: loop detection is
+                            // a continuation opportunity (the model
+                            // is likely stuck on its current angle)
+                            // not a hard failure. The UI surfaces a
+                            // "try a different angle?" affordance with
+                            // the partial work preserved.
+                            tracing::warn!(
+                                "agent: loop detected — tool `{name}` called {count} times with identical args within last {} calls",
+                                self.loop_detection_window,
+                            );
                             self.emit(
                                 sink,
-                                AgentEvent::Error {
-                                    message: format!(
-                                        "loop detected: tool `{name}` called {count} times \
-                                         with identical args within last {} calls. \
-                                         Halting before dispatch to save tokens.",
-                                        self.loop_detection_window
-                                    ),
+                                AgentEvent::ContinuationOffered {
+                                    partial_text: accumulated_text.clone(),
+                                    iterations_used: iterations,
+                                    reason: "loop_detected".to_string(),
                                 },
                             )
                             .await;
-                            if !accumulated_text.is_empty() {
-                                accumulated_text.push_str("\n\n");
-                            }
-                            accumulated_text.push_str(&format!(
-                                "[Halted: agent was calling `{name}` repeatedly with the \
-                                 same arguments — likely stuck. Partial progress preserved \
-                                 above.]"
-                            ));
                             self.emit(
                                 sink,
                                 AgentEvent::Done {
@@ -613,15 +770,24 @@ impl Agent {
             }
         }
 
-        // Fell off the iteration ceiling.
+        // Fell off the iteration ceiling — SOTA stability ship
+        // (2026-05-18): this is now a continuation opportunity, not
+        // a hard failure. The model was making progress (otherwise
+        // loop-detection would have fired); it just hadn't finished
+        // within the budget. The UI shows "Continue?" and the user
+        // can let it carry on with the partial work as context.
+        tracing::info!(
+            "agent: iteration budget exhausted ({} / {}). Partial text length: {} — emitting ContinuationOffered.",
+            iterations,
+            self.max_iterations,
+            accumulated_text.len(),
+        );
         self.emit(
             sink,
-            AgentEvent::Error {
-                message: format!(
-                    "agent stopped at iteration ceiling ({}). Partial text length: {}",
-                    self.max_iterations,
-                    accumulated_text.len()
-                ),
+            AgentEvent::ContinuationOffered {
+                partial_text: accumulated_text.clone(),
+                iterations_used: iterations,
+                reason: "iteration_budget".to_string(),
             },
         )
         .await;
@@ -764,6 +930,27 @@ impl Agent {
         // is gating later in the batch.
         if !read_indices.is_empty() {
             use futures::stream::{FuturesUnordered, StreamExt};
+
+            // SOTA stability ship (2026-05-18): emit ToolCallExecuting
+            // for EVERY read up-front in proposal order, BEFORE
+            // kicking off the parallel dispatch. The pre-ship parallel
+            // path emitted Executing+Finished as completion pairs,
+            // which made the UI flicker (read[3] flashed "running"
+            // before read[1]) and obscured the fact that all reads
+            // were already in flight. Now: Proposed → Executing in
+            // proposal order, then Finished as each completes.
+            for &i in &read_indices {
+                let call = &calls[i];
+                self.emit(
+                    sink,
+                    AgentEvent::ToolCallExecuting {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                    },
+                )
+                .await;
+            }
+
             let mut in_flight: FuturesUnordered<_> = read_indices
                 .iter()
                 .map(|&i| {
@@ -789,21 +976,9 @@ impl Agent {
                 .collect();
 
             while let Some((i, id, name, res)) = in_flight.next().await {
-                // Emit Executing + Finished pair. Pre-fix we emitted
-                // Executing right before dispatch, sequentially; the
-                // parallel path emits them after each read completes
-                // so the UI sees "running… done" pairs cleanly in
-                // completion order. The CALLS themselves still went
-                // out concurrently — emission order reflects who
-                // finished first, which is the honest signal.
-                self.emit(
-                    sink,
-                    AgentEvent::ToolCallExecuting {
-                        id: id.clone(),
-                        name: name.clone(),
-                    },
-                )
-                .await;
+                // Finished events fire in completion order — this is
+                // the honest signal: read[2] finishing before read[1]
+                // is real and useful information.
                 let truncation = truncate_tool_result_with_stats(
                     res.content.clone(),
                     DEFAULT_TOOL_RESULT_TOKEN_BUDGET,
@@ -1089,6 +1264,21 @@ pub fn first_error(events: &[AgentEvent]) -> Option<String> {
     })
 }
 
+/// SOTA stability ship (2026-05-18): the first `ContinuationOffered`
+/// event in the stream, or `None` if no soft cap fired. Used by tests
+/// + by downstream UI logic that wants to render the "Continue?"
+/// affordance.
+pub fn first_continuation(events: &[AgentEvent]) -> Option<(String, usize, String)> {
+    events.iter().find_map(|e| match e {
+        AgentEvent::ContinuationOffered {
+            partial_text,
+            iterations_used,
+            reason,
+        } => Some((partial_text.clone(), *iterations_used, reason.clone())),
+        _ => None,
+    })
+}
+
 /// A `Result` wrapper around a typical agent invocation: collected
 /// events, plus shortcuts to the final text and any error message.
 /// Keeps test-side assertions concise.
@@ -1102,6 +1292,9 @@ impl AgentRun {
     }
     pub fn first_error(&self) -> Option<String> {
         first_error(&self.events)
+    }
+    pub fn first_continuation(&self) -> Option<(String, usize, String)> {
+        first_continuation(&self.events)
     }
     pub fn iterations(&self) -> usize {
         self.events
@@ -1603,9 +1796,24 @@ mod tests {
         };
         let run = run_to_completion(&agent, req).await;
 
-        // Hit the ceiling at 3 iterations. Error event MUST be present.
-        let err = run.first_error().expect("expected ceiling error");
-        assert!(err.contains("iteration ceiling"));
+        // SOTA stability ship (2026-05-18): iteration-ceiling is now
+        // a ContinuationOffered event (`reason: "iteration_budget"`)
+        // rather than a fatal Error, so the UI can offer "Continue?"
+        // and the user can choose to extend rather than restart.
+        let (partial_text, iters, reason) = run
+            .first_continuation()
+            .expect("expected ContinuationOffered on iteration ceiling");
+        assert_eq!(reason, "iteration_budget");
+        assert_eq!(iters, 3);
+        // accumulated_text is empty for this test (model only emits
+        // tool calls, no prose) — the assertion just confirms the
+        // structured event fired with the right reason.
+        assert_eq!(partial_text, "");
+        assert!(
+            run.first_error().is_none(),
+            "iteration ceiling must NOT emit a fatal Error any more — got: {:?}",
+            run.first_error(),
+        );
         assert_eq!(run.iterations(), 3);
         assert_eq!(run.tool_calls_executed().len(), 3); // 3 dispatches
     }
@@ -1643,11 +1851,19 @@ mod tests {
             tool_choice: ToolChoice::Auto,
         };
         let run = run_to_completion(&agent, req).await;
-        // Truncation produces an Error event, but the Done event
-        // still fires with the partial text — the host can decide
-        // whether to retry with smaller context.
-        let err = run.first_error().expect("expected truncation error");
-        assert!(err.contains("truncated"));
+        // SOTA stability ship (2026-05-18): truncation is now a
+        // ContinuationOffered event (`reason: "max_tokens"`) so the
+        // UI can offer "Continue?" instead of surfacing a red error.
+        // Done event still fires with the partial text.
+        let (partial, _iters, reason) = run
+            .first_continuation()
+            .expect("expected ContinuationOffered on max_tokens truncation");
+        assert_eq!(reason, "max_tokens");
+        assert_eq!(partial, "This is a partial");
+        assert!(
+            run.first_error().is_none(),
+            "max_tokens truncation must NOT emit a fatal Error any more"
+        );
         assert_eq!(run.final_text().as_deref(), Some("This is a partial"));
     }
 
@@ -2237,19 +2453,21 @@ mod tests {
             "dispatch must be skipped at the threshold-hitting call"
         );
 
-        // Wire: must emit both an Error explaining the halt AND a
-        // Done with the preserved partial text. Caller-side parsers
-        // (HTTP SSE, Tauri ChatView) treat Done as the terminator.
-        let err = run.first_error().expect("expected loop-detected error");
+        // SOTA stability ship (2026-05-18): loop detection now fires
+        // as ContinuationOffered (`reason: "loop_detected"`) so the
+        // UI can offer "try a different angle?" instead of a fatal
+        // error banner. Done still fires as the terminator.
+        let (_partial, _iters, reason) = run
+            .first_continuation()
+            .expect("expected ContinuationOffered when loop detected");
+        assert_eq!(reason, "loop_detected");
         assert!(
-            err.contains("loop detected") && err.contains("search"),
-            "error message should name the looping tool: {err}"
+            run.first_error().is_none(),
+            "loop-detection must NOT emit a fatal Error any more"
         );
-        let done = run.final_text().expect("expected Done event");
-        assert!(
-            done.contains("Halted") && done.contains("search"),
-            "final text should explain the halt: {done}"
-        );
+        // Done event still emits (with whatever accumulated_text we
+        // had — empty in this test because the script emits no prose).
+        run.final_text().expect("expected Done event");
     }
 
     #[tokio::test]

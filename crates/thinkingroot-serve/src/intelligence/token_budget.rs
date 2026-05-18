@@ -21,13 +21,20 @@
 // (C6 fix, plan 2026-05-09. Defense-in-depth — does NOT replace the
 // `max_iterations` loop ceiling, which still bounds total LLM calls.)
 
-/// Per-tool-result token budget. Chosen so a single result never
-/// dominates a typical 200K-context conversation: 2,048 tokens leaves
-/// ample room for the surrounding history, the next user turn, and
-/// the model's response. Tool authors needing more context should
-/// summarize server-side or expose pagination — not push raw
-/// 50K-token blobs through the agent loop.
-pub const DEFAULT_TOOL_RESULT_TOKEN_BUDGET: usize = 2_048;
+/// Per-tool-result token budget. Bumped from 2,048 → 8,192 on
+/// 2026-05-18 as part of the SOTA stability ship: the prior cap was
+/// aggressive enough that ~50-hit `search` / `query_claims` / large
+/// `read_file` calls were truncated, forcing the model to re-query
+/// with a tighter scope and burning iterations. 8,192 leaves plenty
+/// of head-room in a 200K context while still preventing a single
+/// pathological blob (10MB diff, full DB dump) from poisoning the
+/// rest of the history.
+///
+/// Tool authors with deterministically-large outputs (full-file
+/// reads on multi-MB files, multi-thousand-row queries) should
+/// still expose pagination or summarisation server-side — not push
+/// raw 100K-token blobs through the agent loop.
+pub const DEFAULT_TOOL_RESULT_TOKEN_BUDGET: usize = 8_192;
 
 /// Marker the LLM (and downstream verifier) can recognise as evidence
 /// of a truncation. Single line so it doesn't bloat the cut content.

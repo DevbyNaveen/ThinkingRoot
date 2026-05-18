@@ -26,6 +26,7 @@ import {
   AlertTriangle,
   ChevronRight,
   ChevronDown,
+  Lightbulb,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -39,14 +40,82 @@ interface ClaimCardProps {
   workspace: string;
 }
 
+/**
+ * SOTA polish ship (2026-05-18): special-case render for the
+ * Anthropic `think` tool. The tool is a no-op reasoning scratchpad,
+ * NOT a substrate query — rendering it as a normal ClaimCard with
+ * "checking witnesses" / "queued" / etc. is wrong. Render as a
+ * compact collapsed "Thought ▸" block matching Anthropic's UX.
+ */
+function ThoughtBlock({ step }: { step: AgentStep }) {
+  const [expanded, setExpanded] = useState(false);
+  // The thought text lives in `step.input` as `{"thought": "..."}`
+  // pre-execution, and as the ToolHandler's "noted: ..." echo in
+  // `step.output` post-execution. Prefer the echo (it's what the
+  // model actually saw); fall back to the input.
+  let thoughtText = "";
+  if (step.output) {
+    thoughtText = step.output.replace(/^noted:\s*/, "");
+  } else if (step.input) {
+    try {
+      const parsed = JSON.parse(step.input);
+      if (parsed && typeof parsed === "object" && typeof parsed.thought === "string") {
+        thoughtText = parsed.thought;
+      }
+    } catch {
+      // ignore — show empty
+    }
+  }
+  const isThinking = step.status === "proposed" || step.status === "executing";
+  return (
+    <div className="my-1 flex items-start gap-2 text-xs">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="group inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+        aria-expanded={expanded}
+      >
+        {isThinking ? (
+          <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+        ) : (
+          <Lightbulb className="h-3 w-3 text-amber-400/80" aria-hidden />
+        )}
+        <span className="italic">
+          {isThinking ? "Thinking…" : expanded ? "Thought" : "Thought ▸"}
+        </span>
+      </button>
+      {expanded && thoughtText && (
+        <div className="ml-1 max-w-prose whitespace-pre-wrap text-muted-foreground/90">
+          {thoughtText}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ClaimCard({ step, workspace }: ClaimCardProps) {
   const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectInput, setShowRejectInput] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  // SOTA Ship B (2026-05-18): Read tools collapse to a one-line
+  // summary by default ("Searched X"); write tools auto-expand so
+  // the user can review what's about to change BEFORE clicking
+  // approve. Awaiting-approval cards always start expanded too —
+  // the user needs to see what they're consenting to.
+  const initialExpanded =
+    step.isWrite || step.status === "awaiting_approval";
+  const [expanded, setExpanded] = useState(initialExpanded);
+
+  // SOTA polish ship: special-case the `think` tool render as a
+  // compact "Thought ▸" block. Must come AFTER the hook calls
+  // above to honour React's rules-of-hooks (consistent hook order
+  // across renders).
+  if (step.name === "think") {
+    return <ThoughtBlock step={step} />;
+  }
 
   const hasInput = !!step.input && step.input !== "{}";
-  const hasOutput = !!step.output;
+  const hasOutput = !!step.output || !!step.progress;
   const hasDetails = hasInput || hasOutput;
   const friendlyName = getFriendlyStepName(step.name);
 
@@ -187,8 +256,21 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
       {expanded && (
         <div className="mt-2 space-y-2">
           {hasInput && (
+            <WriteToolInputView input={step.input} isWrite={step.isWrite} />
+          )}
+          {/* SOTA polish ship: show live progress (tool_call_progress
+              deltas) BEFORE final output arrives, so long-running
+              tools don't look frozen. Replaced by `output` once
+              tool_call_finished fires. */}
+          {step.status === "executing" && step.progress && (
             <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-background/60 p-2 font-mono text-[11px] leading-snug text-muted-foreground">
-              {step.input}
+              {step.progress}
+              <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-muted-foreground/40 align-middle" aria-hidden />
+              {typeof step.progressBytes === "number" && step.progressBytes > 0 && (
+                <span className="ml-2 text-muted-foreground/60">
+                  {humanBytes(step.progressBytes)}
+                </span>
+              )}
             </pre>
           )}
           {step.status === "finished" && step.output && (
@@ -207,6 +289,98 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
       )}
     </div>
   );
+}
+
+/**
+ * SOTA Ship B (2026-05-18): inline JSON view for tool args. For
+ * write tools the rendering highlights each top-level field as a
+ * coloured row so the user can quickly scan what's about to be
+ * mutated — closer to a diff than a raw `<pre>` dump. Read tools
+ * use a quieter monospaced render since the args are usually a
+ * short query string.
+ */
+function WriteToolInputView({
+  input,
+  isWrite,
+}: {
+  input: string;
+  isWrite: boolean;
+}) {
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const v = JSON.parse(input);
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      parsed = v as Record<string, unknown>;
+    }
+  } catch {
+    parsed = null;
+  }
+
+  // Fallback: opaque JSON or array → render as a quieter <pre>.
+  if (!parsed) {
+    return (
+      <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-background/60 p-2 font-mono text-[11px] leading-snug text-muted-foreground">
+        {input}
+      </pre>
+    );
+  }
+
+  const entries = Object.entries(parsed);
+  if (entries.length === 0) {
+    return (
+      <div className="rounded bg-background/60 px-2 py-1 text-[11px] italic text-muted-foreground">
+        (no arguments)
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "rounded p-2",
+        isWrite ? "border border-amber-500/20 bg-amber-500/[0.04]" : "bg-background/60",
+      )}
+    >
+      <div className="space-y-0.5">
+        {entries.map(([k, v]) => (
+          <div
+            key={k}
+            className="flex items-baseline gap-2 font-mono text-[11px] leading-snug"
+          >
+            <span
+              className={cn(
+                "shrink-0 font-semibold",
+                isWrite ? "text-amber-300/90" : "text-muted-foreground/80",
+              )}
+            >
+              {k}:
+            </span>
+            <span className="min-w-0 break-words text-muted-foreground">
+              {formatFieldValue(v)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatFieldValue(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean" || v === null) {
+    return String(v);
+  }
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
+function humanBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function statusText(status: AgentStep["status"]): string {

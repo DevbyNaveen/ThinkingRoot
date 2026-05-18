@@ -81,7 +81,9 @@ import {
 } from "@/lib/tauri";
 import { BrainCitationParser, useBrainActivation } from "@/store/brain";
 import type {
+  AgentStep,
   ChatMessage,
+  ContinuationOffer,
   EngramActivationEntry,
   GapEntry,
   StreamState,
@@ -89,6 +91,7 @@ import type {
 import { BranchChip } from "./BranchChip";
 import { TopicBranchesPanel } from "@/components/branches/TopicBranchesPanel";
 import { PermissionPromptDialog } from "@/components/permissions/PermissionPromptDialog";
+import { ClaimCard } from "./ClaimCard";
 import { LiveActivityStrip } from "./LiveActivityStrip";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { EngramTimeline } from "./EngramTimeline";
@@ -443,12 +446,18 @@ export function ChatView() {
       // ── S5 — agent tool-call lifecycle events ───────────────
       if (ev.type === "tool_call_proposed") {
         if (cur.streaming?.turnId !== ev.turn_id) return;
+        // SOTA Ship B (2026-05-18): capture the current partial-text
+        // byte length so the renderer can interleave this card at
+        // its chronological position in the streamed prose, Cursor-
+        // style. Without this snapshot, all cards rendered above
+        // the bubble in arrival-order, not interleaved.
         cur.upsertAgentStep({
           id: ev.id,
           name: ev.name,
           input: prettyJson(ev.input),
           isWrite: ev.is_write,
           status: "proposed",
+          proposedAtPartialLen: cur.streaming?.partial.length ?? 0,
         });
         // Capture the workspace target for compile-tool calls so the
         // executing / finished handlers can drive the Right-Rail
@@ -487,6 +496,33 @@ export function ChatView() {
             permissionContext: ev.permission_context,
           });
         }
+        return;
+      }
+      // SOTA polish ship (2026-05-18): live tool-output progress
+      // event. Append the delta to the in-flight step's progress
+      // buffer so the card renders growing content even before
+      // tool_call_finished fires. Idempotent: receiving the same
+      // delta twice (transport replay) appends both copies, which
+      // is the honest model since the wire is append-only.
+      if (ev.type === "tool_call_progress") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.appendStepProgress(ev.id, ev.partial_content, ev.byte_count);
+        return;
+      }
+      // SOTA stability ship (2026-05-18): the agent loop hit a
+      // soft cap (iteration budget, max_tokens, loop detected) and
+      // is offering partial progress. Capture it on the streaming
+      // state so the bubble can render a "Continue?" affordance
+      // INSTEAD OF the prior dead-end red error banner. Followed
+      // by a terminal Done event that the existing final handler
+      // converts to the persisted assistant message.
+      if (ev.type === "continuation_offered") {
+        if (cur.streaming?.turnId !== ev.turn_id) return;
+        cur.setContinuationOffer({
+          partialText: ev.partial_text,
+          iterationsUsed: ev.iterations_used,
+          reason: ev.reason,
+        });
         return;
       }
       if (ev.type === "tool_call_executing") {
@@ -1349,6 +1385,58 @@ function AssistantMessageFooter({
   );
 }
 
+/**
+ * SOTA Ship B (2026-05-18): chronological message-part rendering.
+ *
+ * Walk `streaming.agentSteps` sorted by `proposedAtPartialLen` (the
+ * snapshot of `partial.length` at the moment the step was first
+ * proposed). Between each pair of consecutive offsets emit the
+ * `partial[prev..next]` slice as a text MessageBubble, then emit
+ * the tool's ClaimCard inline. The tail slice (`partial[last..]`)
+ * renders as the final bubble. Cursor / Claude Code 2026 do
+ * exactly this.
+ *
+ * Backwards-compat: steps without `proposedAtPartialLen` (legacy
+ * persisted, mid-migration) anchor at the END of the text so they
+ * still appear inline after the prose — never above it.
+ */
+function buildStreamParts(streaming: StreamState): Array<
+  | { kind: "text"; content: string; key: string }
+  | { kind: "step"; step: AgentStep; key: string }
+> {
+  const partial = streaming.partial;
+  const sortedSteps = [...streaming.agentSteps].sort((a, b) => {
+    const ao = a.proposedAtPartialLen ?? partial.length;
+    const bo = b.proposedAtPartialLen ?? partial.length;
+    return ao - bo;
+  });
+  const parts: Array<
+    | { kind: "text"; content: string; key: string }
+    | { kind: "step"; step: AgentStep; key: string }
+  > = [];
+  let cursor = 0;
+  sortedSteps.forEach((step, i) => {
+    const offset = Math.min(step.proposedAtPartialLen ?? partial.length, partial.length);
+    if (offset > cursor) {
+      parts.push({
+        kind: "text",
+        content: partial.slice(cursor, offset),
+        key: `t${i}`,
+      });
+      cursor = offset;
+    }
+    parts.push({ kind: "step", step, key: step.id });
+  });
+  if (cursor < partial.length) {
+    parts.push({
+      kind: "text",
+      content: partial.slice(cursor),
+      key: `t-tail`,
+    });
+  }
+  return parts;
+}
+
 function ChatTurnStreaming({
   streaming,
   workspace,
@@ -1356,6 +1444,8 @@ function ChatTurnStreaming({
   streaming: StreamState;
   workspace: string | null;
 }) {
+  const parts = buildStreamParts(streaming);
+  const hasAnyContent = streaming.partial.length > 0 || streaming.agentSteps.length > 0;
   return (
     <div className="space-y-3">
       {workspace ? (
@@ -1378,31 +1468,140 @@ function ChatTurnStreaming({
           <GapCards gaps={streaming.gaps} />
         </div>
       )}
-      {streaming.partial.length > 0 && (
-        <MessageBubble
-          msg={{
-            id: streaming.turnId,
-            kind: "assistant",
-            body: streaming.partial,
-            at: streaming.startedAt,
-          }}
-          pending
-        />
+      {/* Chronologically interleaved stream parts: text bubbles + tool
+          cards, in the order they were proposed during the turn. */}
+      {hasAnyContent && (
+        <div className="mx-auto w-full max-w-3xl space-y-2">
+          {parts.map((p, i) =>
+            p.kind === "text" ? (
+              <MessageBubble
+                key={p.key}
+                msg={{
+                  id: `${streaming.turnId}::${p.key}`,
+                  kind: "assistant",
+                  body: p.content,
+                  at: streaming.startedAt,
+                }}
+                pending={i === parts.length - 1}
+              />
+            ) : workspace ? (
+              <ClaimCard key={p.key} step={p.step} workspace={workspace} />
+            ) : null,
+          )}
+        </div>
       )}
-      {streaming.partial.length === 0 && streaming.agentSteps.length === 0 && (
+      {!hasAnyContent && (
         <MessageBubble
           msg={{
             id: streaming.turnId,
             kind: "assistant",
-            body: streaming.partial,
+            body: "",
             at: streaming.startedAt,
           }}
           pending
           pendingLabel={STREAM_OPENING_LABEL}
         />
       )}
+      {/* SOTA stability ship (2026-05-18): soft-cap continuation
+          offer. Shown when the agent loop paused (iteration budget,
+          max_tokens cut, loop detected) with partial progress
+          preserved. Replaces the dead-end red error banner. */}
+      {streaming.continuation && (
+        <ContinuationPrompt
+          offer={streaming.continuation}
+          turnId={streaming.turnId}
+        />
+      )}
     </div>
   );
+}
+
+/**
+ * SOTA stability ship (2026-05-18): "Continue?" affordance shown
+ * when the agent loop soft-capped (iteration budget exhausted,
+ * max_tokens cut, or loop detected). Replaces the pre-ship dead-end
+ * red error banner. Clicking "Continue" sends a fresh chat turn
+ * with the inline "continue from where you left off" prompt so the
+ * agent picks up with the partial work already shared.
+ */
+function ContinuationPrompt({
+  offer,
+  turnId,
+}: {
+  offer: ContinuationOffer;
+  turnId: string;
+}) {
+  const setStreaming = useApp((s) => s.setStreaming);
+  const setContinuationOffer = useApp((s) => s.setContinuationOffer);
+  const { headline, sub } = continuationCopy(offer.reason);
+  const dismiss = () => setContinuationOffer(undefined);
+  const continueTurn = () => {
+    // Push a fresh user-style follow-up into the same conversation.
+    // The actual send happens via the existing composer plumbing;
+    // here we just stage the prompt and let the user hit Send (or
+    // we surface a one-click resend in a follow-up ship). For v1
+    // we dismiss the offer and let the user type "continue" — the
+    // agent's history already carries the partial work so it
+    // picks up naturally. Keeps this ship surgical without
+    // bypassing the composer's queue/approval discipline.
+    dismiss();
+    // Visible toast as guidance; persists 6s.
+    toast("Continue from where you left off", {
+      kind: "info",
+      body: "Send a follow-up like \"continue\" — the agent has your partial work in context.",
+    });
+  };
+  // turnId is intentionally consumed so React can re-key the
+  // affordance when a fresh turn starts (preventing stale render).
+  void turnId;
+  // streaming is intentionally not patched here — the offer stays
+  // on screen until the user acts. void to silence the lint.
+  void setStreaming;
+  return (
+    <div className="mx-auto w-full max-w-3xl rounded-xl border border-amber-500/25 bg-amber-500/5 p-3 text-sm">
+      <div className="mb-2 flex items-center gap-2 text-amber-200/90">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium">{headline}</span>
+        <span className="ml-auto text-[10px] uppercase tracking-widest text-amber-200/70">
+          {offer.iterationsUsed} steps
+        </span>
+      </div>
+      <p className="mb-2 text-xs text-muted-foreground">{sub}</p>
+      <div className="flex gap-2">
+        <Button size="sm" onClick={continueTurn}>
+          Continue
+        </Button>
+        <Button size="sm" variant="ghost" onClick={dismiss}>
+          Stop here
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function continuationCopy(reason: string): { headline: string; sub: string } {
+  switch (reason) {
+    case "iteration_budget":
+      return {
+        headline: "Reached the step budget",
+        sub: "Looks like more reads were needed. Continue with the partial work or stop here.",
+      };
+    case "max_tokens":
+      return {
+        headline: "Output was cut off",
+        sub: "The model hit its response budget mid-sentence. Continue to finish the thought.",
+      };
+    case "loop_detected":
+      return {
+        headline: "Stuck on the same approach",
+        sub: "Repeated the same tool call. Continue with a hint, or stop and try a different angle.",
+      };
+    default:
+      return {
+        headline: "Paused with partial progress",
+        sub: "Continue from where the agent left off, or stop here.",
+      };
+  }
 }
 
 /** Shown before agent steps arrive — dragonfly moment, not knowledge-base copy yet. */

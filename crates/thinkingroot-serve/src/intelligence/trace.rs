@@ -98,10 +98,18 @@ pub mod kind {
     pub const AGENT_TOOL_PROPOSED: &str = "agent.tool.proposed";
     pub const AGENT_TOOL_REJECTED: &str = "agent.tool.rejected";
     pub const AGENT_TOOL_EXECUTING: &str = "agent.tool.executing";
+    /// SOTA polish ship (2026-05-18): live tool-output progress event
+    /// for long-running tools (compile, shell_exec, multi-step search).
+    pub const AGENT_TOOL_PROGRESS: &str = "agent.tool.progress";
     pub const AGENT_TOOL_FINISHED: &str = "agent.tool.finished";
     pub const AGENT_TEXT: &str = "agent.text";
     pub const AGENT_RUN_DONE: &str = "agent.run.done";
     pub const AGENT_RUN_ERROR: &str = "agent.run.error";
+    /// SOTA stability ship (2026-05-18): soft-cap continuation offer
+    /// (max_tokens cut, iteration budget exhausted, loop detected).
+    /// Replaces what used to be `agent.run.error` for these three
+    /// recoverable cases.
+    pub const AGENT_CONTINUATION_OFFERED: &str = "agent.continuation.offered";
 }
 
 /// The canonical pre-image is what BLAKE3 hashes and what Ed25519
@@ -320,6 +328,20 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
         AgentEvent::ToolCallExecuting { id, name } => {
             (kind::AGENT_TOOL_EXECUTING, json!({"id": id, "name": name}))
         }
+        AgentEvent::ToolCallProgress {
+            id,
+            name,
+            partial_content,
+            byte_count,
+        } => (
+            kind::AGENT_TOOL_PROGRESS,
+            json!({
+                "id": id,
+                "name": name,
+                "partial_content": partial_content,
+                "byte_count": byte_count,
+            }),
+        ),
         AgentEvent::ToolCallFinished {
             id,
             name,
@@ -348,6 +370,18 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
             json!({"final_text": final_text, "iterations": iterations}),
         ),
         AgentEvent::Error { message } => (kind::AGENT_RUN_ERROR, json!({"message": message})),
+        AgentEvent::ContinuationOffered {
+            partial_text,
+            iterations_used,
+            reason,
+        } => (
+            kind::AGENT_CONTINUATION_OFFERED,
+            json!({
+                "partial_text": partial_text,
+                "iterations_used": iterations_used,
+                "reason": reason,
+            }),
+        ),
     }
 }
 
@@ -749,6 +783,15 @@ mod tests {
                 kind::AGENT_TOOL_EXECUTING,
             ),
             (
+                AgentEvent::ToolCallProgress {
+                    id: "c".into(),
+                    name: "x".into(),
+                    partial_content: "chunk".into(),
+                    byte_count: 5,
+                },
+                kind::AGENT_TOOL_PROGRESS,
+            ),
+            (
                 AgentEvent::ToolCallFinished {
                     id: "c".into(),
                     name: "x".into(),
@@ -772,6 +815,14 @@ mod tests {
                     message: "oops".into(),
                 },
                 kind::AGENT_RUN_ERROR,
+            ),
+            (
+                AgentEvent::ContinuationOffered {
+                    partial_text: "halfway".into(),
+                    iterations_used: 7,
+                    reason: "iteration_budget".into(),
+                },
+                kind::AGENT_CONTINUATION_OFFERED,
             ),
         ];
         for (event, expected_kind) in cases {
