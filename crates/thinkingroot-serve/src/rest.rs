@@ -30,6 +30,31 @@ pub struct AppState {
     /// hopping through `Arc<AppState>`. All existing call sites that
     /// did `state.engine.read().await` keep working unchanged because
     /// `Arc<RwLock<T>>` derefs to `RwLock<T>`.
+    ///
+    /// **Locking discipline (Tier 3 M, 2026-05-19):** Brain reads and
+    /// concurrent compiles are non-blocking by design. The contract:
+    ///
+    /// 1. `compile_stream` / `run_unified_compile` run the pipeline
+    ///    via `run_pipeline_with_options`, which opens its OWN
+    ///    `StorageEngine` against `root_path`. The daemon's
+    ///    `state.engine` RwLock is **not** held during the pipeline
+    ///    body — readers (Brain view, search, AEP probes) flow
+    ///    concurrently the entire time the pipeline runs.
+    /// 2. The only `state.engine.write().await` acquisition during a
+    ///    compile is the post-compile remount inside
+    ///    `finalize_successful_compile` — held for the duration of
+    ///    `engine.mount(...)` (~100 ms typical). Brain reads briefly
+    ///    queue, then immediately see fresh substrate state.
+    /// 3. The vector reconcile (post-compile) runs in a `tokio::spawn`
+    ///    that takes only `state.engine.read().await` — multiple
+    ///    reconciles can run concurrently with Brain reads.
+    ///
+    /// MVCC-style "readers never block" is therefore already provided
+    /// without a substrate refactor; the earlier Brain-freeze symptom
+    /// pre-2026-05-18 came from in-process compile holding the engine
+    /// write lock for the full pipeline duration. Both root causes
+    /// (in-process compile + foreground vector rebuild) shipped fixes
+    /// across Tiers 1-3.
     pub engine: Arc<RwLock<QueryEngine>>,
     pub api_key: Option<String>,
     pub mcp_sessions: crate::mcp::sse::SseSessionMap,
