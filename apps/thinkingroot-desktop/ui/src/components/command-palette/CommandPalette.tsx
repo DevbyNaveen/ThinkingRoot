@@ -22,10 +22,7 @@ export function CommandPalette() {
   const setTrust = useApp((s) => s.setTrust);
   const toggleSidebar = useApp((s) => s.toggleSidebar);
   const toggleRightRail = useApp((s) => s.toggleRightRail);
-  const setRightRailOpen = (o: boolean) => {
-    const current = useApp.getState().rightRailOpen;
-    if (current !== o) useApp.getState().toggleRightRail();
-  };
+  const setRightRailOpen = useApp((s) => s.setRightRailOpen);
   const recordCommand = useApp((s) => s.recordCommand);
   const recentIds = useApp((s) => s.recentCommandIds);
 

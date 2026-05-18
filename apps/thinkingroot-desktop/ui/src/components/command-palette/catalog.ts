@@ -206,7 +206,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       run: (c) => {
         c.setSurface("chats");
         const app = useApp.getState();
-        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailOpen(true);
         app.setRightRailTab("compile");
         c.close();
       },
@@ -321,7 +321,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       keywords: ["browser", "web", "docs", "search", "url", "internet"],
       run: (c) => {
         const app = useApp.getState();
-        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailOpen(true);
         app.setRightRailTab("browser");
         c.close();
       },
@@ -334,7 +334,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       keywords: ["terminal", "shell", "console", "tty", "pty", "claude", "cli"],
       run: (c) => {
         const app = useApp.getState();
-        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailOpen(true);
         app.setRightRailTab("terminal");
         c.close();
       },
@@ -347,7 +347,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       keywords: ["readme", "markdown", "overview", "docs", "workspace"],
       run: (c) => {
         const app = useApp.getState();
-        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailOpen(true);
         app.setRightRailTab("files");
         app.setWorkspaceInspectorPage("readme");
         c.close();
@@ -361,7 +361,7 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       keywords: ["files", "folder", "tree", "explorer", "browse", "workspace"],
       run: (c) => {
         const app = useApp.getState();
-        if (!app.rightRailOpen) app.toggleRightRail();
+        app.setRightRailOpen(true);
         app.setRightRailTab("files");
         app.setWorkspaceInspectorPage("folder");
         c.close();

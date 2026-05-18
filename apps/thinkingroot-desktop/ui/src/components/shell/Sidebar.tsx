@@ -394,6 +394,11 @@ export function Sidebar() {
                           useApp.getState().setActiveWorkspace(w.name);
                           try {
                             await workspaceSetActive(w.name);
+                            // A freshly-added workspace is by definition uncompiled —
+                            // surface the Compile button so the user has an obvious
+                            // next step.
+                            useApp.getState().setRightRailTab("compile");
+                            useApp.getState().setRightRailOpen(true);
                           } catch (e) {
                             useApp.getState().setActiveWorkspace(previousActive);
                             toast("Set active failed", {
@@ -443,6 +448,14 @@ export function Sidebar() {
                               await workspaceSetActive(w.name);
                               setActiveWorkspace(w.name);
                               setSurface("chats");
+                              // First-time discoverability: if this workspace has
+                              // never been compiled, force-open the right rail to
+                              // the compile tab. Compiled workspaces are left alone
+                              // — the user is here to chat, not be pestered.
+                              if (!w.compiled) {
+                                useApp.getState().setRightRailTab("compile");
+                                useApp.getState().setRightRailOpen(true);
+                              }
                             } catch (e) {
                               toast("Set active failed", {
                                 kind: "error",

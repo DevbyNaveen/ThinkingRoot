@@ -99,6 +99,7 @@ interface AppStore {
   toggleSidebar: () => void;
   rightRailOpen: boolean;
   toggleRightRail: () => void;
+  setRightRailOpen: (open: boolean) => void;
   rightRailTab: RightRailTab;
   setRightRailTab: (tab: RightRailTab) => void;
   /** Readme vs folder tree inside the Workspace right-rail tab. */
@@ -234,6 +235,7 @@ export const useApp = create<AppStore>()(
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       rightRailOpen: true,
       toggleRightRail: () => set((s) => ({ rightRailOpen: !s.rightRailOpen })),
+      setRightRailOpen: (rightRailOpen) => set({ rightRailOpen }),
       rightRailTab: "compile",
       setRightRailTab: (rightRailTab) =>
         set({ rightRailTab: normalizeRightRailTab(rightRailTab) }),
