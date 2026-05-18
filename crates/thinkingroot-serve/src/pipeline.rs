@@ -1434,8 +1434,43 @@ async fn run_pipeline_inner(
     bail_if_cancelled!();
 
     // ─── Phase 7: Link ─────────────────────────────────────────────────
+    //
+    // Build the Phase 7e revalidation scope BEFORE constructing the
+    // linker. Scope = truly_changed ∪ dependents(truly_changed). The
+    // dependents lookup uses `resolution_deps:by_to` — every source
+    // that resolves TO a truly-changed source has its own
+    // function_calls / code_links rows potentially invalidated and
+    // must be revalidated. Sources outside the union cannot have had
+    // their resolutions affected by this compile, so we save the
+    // workspace-wide scan for them.
+    //
+    // We pass scope=None (workspace-wide) only on the early-incremental
+    // edge case where truly_changed.is_empty() but Phase 4 deletions
+    // landed — those deletions can dangle resolutions in any source,
+    // and we don't currently capture the reverse map for deleted
+    // sources at this point. The workspace-wide fallback is safe and
+    // matches pre-2026-05-18 behaviour.
+    let resolution_scope: Option<std::collections::HashSet<String>> = if truly_changed.is_empty() {
+        None
+    } else {
+        let truly_changed_ids: Vec<String> = truly_changed
+            .iter()
+            .map(|d| d.source_id.to_string())
+            .collect();
+        let mut scope: std::collections::HashSet<String> =
+            truly_changed_ids.iter().cloned().collect();
+        let downstream = storage
+            .graph
+            .list_dependent_sources_for_many(&truly_changed_ids)?;
+        scope.extend(downstream);
+        Some(scope)
+    };
+
     let linker = {
-        let l = thinkingroot_link::Linker::new(&storage.graph);
+        let mut l = thinkingroot_link::Linker::new(&storage.graph);
+        if let Some(scope) = resolution_scope.clone() {
+            l = l.with_resolution_scope(scope);
+        }
         if let Some(ref tx) = progress {
             let tx_link = tx.clone();
             let total_entities = filtered_extraction.entities.len();

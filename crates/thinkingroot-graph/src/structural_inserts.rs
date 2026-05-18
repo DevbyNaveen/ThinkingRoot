@@ -685,6 +685,64 @@ impl GraphStore {
             .collect())
     }
 
+    /// Scoped form of [`Self::list_all_function_calls`]: returns rows
+    /// only for sources in `scope`. Empty scope returns empty Vec
+    /// without touching CozoDB. Used by Phase 7e to revalidate the
+    /// call edges that could have changed in the current incremental
+    /// compile — `truly_changed` plus their downstream dependents
+    /// from `resolution_deps:by_to`. Rows in sources outside that
+    /// union cannot have changed (their inputs didn't change), so
+    /// re-reading them is wasted I/O.
+    ///
+    /// Datalog idiom (witness-mesh rule): bind the source-id parameter
+    /// to a separate name (`sid`), then equate to the column inside
+    /// the predicate body — Cozo's stratified evaluator forbids
+    /// reusing the same column name as both a head symbol and a
+    /// parameter-bound capture in the `{column: $cap}` form.
+    pub fn list_function_calls_for_sources(
+        &self,
+        scope: &std::collections::HashSet<String>,
+    ) -> Result<Vec<FunctionCall>> {
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<DataValue> = scope
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("sids".into(), DataValue::List(rows));
+        let result = self
+            .query(
+                "candidate[sid] <- $sids \
+                 ?[id, caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3] := \
+                   candidate[sid], \
+                   *function_calls{id, caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3}, \
+                   source_id = sid",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_function_calls_for_sources: {e}")))?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 8 {
+                    return None;
+                }
+                Some(FunctionCall {
+                    id: dv_to_string(&r[0]),
+                    caller_claim_id: dv_to_string(&r[1]),
+                    callee_name: dv_to_string(&r[2]),
+                    callee_claim_id: dv_to_string(&r[3]),
+                    source_id: dv_to_string(&r[4]),
+                    byte_start: dv_to_u64(&r[5]),
+                    byte_end: dv_to_u64(&r[6]),
+                    content_blake3: dv_to_string(&r[7]),
+                })
+            })
+            .collect())
+    }
+
     /// Pull every `code_links` row, regardless of resolution state.
     /// Used by Phase 7e to revalidate previously-resolved `target_source_id`
     /// pointers against the current live source set. Rows whose target has
@@ -696,6 +754,58 @@ impl GraphStore {
             "?[id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3] := \
              *code_links{id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3}",
         )?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 10 {
+                    return None;
+                }
+                let is_internal = matches!(&r[5], DataValue::Bool(b) if *b);
+                Some(CodeLink {
+                    id: dv_to_string(&r[0]),
+                    source_id: dv_to_string(&r[1]),
+                    chunk_id: dv_to_string(&r[2]),
+                    url: dv_to_string(&r[3]),
+                    link_text: dv_to_string(&r[4]),
+                    is_internal,
+                    target_source_id: dv_to_string(&r[6]),
+                    byte_start: dv_to_u64(&r[7]),
+                    byte_end: dv_to_u64(&r[8]),
+                    content_blake3: dv_to_string(&r[9]),
+                })
+            })
+            .collect())
+    }
+
+    /// Scoped form of [`Self::list_all_code_links`]: returns rows only
+    /// for sources in `scope`. Empty scope returns empty Vec without
+    /// touching CozoDB. Used by Phase 7e to revalidate cross-source
+    /// link edges in the same scoped manner as
+    /// [`Self::list_function_calls_for_sources`].
+    pub fn list_code_links_for_sources(
+        &self,
+        scope: &std::collections::HashSet<String>,
+    ) -> Result<Vec<CodeLink>> {
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<DataValue> = scope
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("sids".into(), DataValue::List(rows));
+        let result = self
+            .query(
+                "candidate[sid] <- $sids \
+                 ?[id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3] := \
+                   candidate[sid], \
+                   *code_links{id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3}, \
+                   source_id = sid",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_code_links_for_sources: {e}")))?;
         Ok(result
             .rows
             .iter()
@@ -1507,5 +1617,140 @@ mod tests {
             }
         }
         assert_eq!(deps, single_union, "batched must equal per-target union");
+    }
+
+    // ─── Phase 7e scoped reader tests (Tier 1 commit C) ──────────────────
+
+    #[test]
+    fn list_function_calls_for_sources_empty_scope_short_circuits() {
+        let store = make_store();
+        // Seed a row to prove the empty-scope path doesn't return everything.
+        store
+            .insert_function_calls_batch(&[FunctionCall {
+                id: "fc-bg".into(),
+                caller_claim_id: "c".into(),
+                callee_name: "n".into(),
+                callee_claim_id: String::new(),
+                source_id: "src-bg".into(),
+                byte_start: 0,
+                byte_end: 5,
+                content_blake3: "b".into(),
+            }])
+            .unwrap();
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let rows = store.list_function_calls_for_sources(&empty).unwrap();
+        assert!(rows.is_empty(), "empty scope returns empty Vec");
+    }
+
+    #[test]
+    fn list_function_calls_for_sources_filters_to_scope() {
+        let store = make_store();
+        store
+            .insert_function_calls_batch(&[
+                FunctionCall {
+                    id: "fc-a".into(),
+                    caller_claim_id: "c1".into(),
+                    callee_name: "n1".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-A".into(),
+                    byte_start: 0,
+                    byte_end: 5,
+                    content_blake3: "b1".into(),
+                },
+                FunctionCall {
+                    id: "fc-b".into(),
+                    caller_claim_id: "c2".into(),
+                    callee_name: "n2".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-B".into(),
+                    byte_start: 0,
+                    byte_end: 5,
+                    content_blake3: "b2".into(),
+                },
+                FunctionCall {
+                    id: "fc-c".into(),
+                    caller_claim_id: "c3".into(),
+                    callee_name: "n3".into(),
+                    callee_claim_id: String::new(),
+                    source_id: "src-C".into(),
+                    byte_start: 0,
+                    byte_end: 5,
+                    content_blake3: "b3".into(),
+                },
+            ])
+            .unwrap();
+
+        let mut scope = std::collections::HashSet::new();
+        scope.insert("src-A".to_string());
+        scope.insert("src-C".to_string());
+
+        let rows = store.list_function_calls_for_sources(&scope).unwrap();
+        assert_eq!(rows.len(), 2, "scope {{A, C}} must return exactly 2 rows");
+        let ids: std::collections::HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+        assert!(ids.contains("fc-a"));
+        assert!(ids.contains("fc-c"));
+        assert!(!ids.contains("fc-b"), "src-B is out of scope");
+    }
+
+    #[test]
+    fn list_code_links_for_sources_empty_scope_short_circuits() {
+        let store = make_store();
+        store
+            .insert_code_links_batch(&[CodeLink {
+                id: "cl-bg".into(),
+                source_id: "src-bg".into(),
+                chunk_id: "ch".into(),
+                url: "http://x".into(),
+                link_text: "x".into(),
+                is_internal: false,
+                target_source_id: String::new(),
+                byte_start: 0,
+                byte_end: 5,
+                content_blake3: "b".into(),
+            }])
+            .unwrap();
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let rows = store.list_code_links_for_sources(&empty).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn list_code_links_for_sources_filters_to_scope() {
+        let store = make_store();
+        store
+            .insert_code_links_batch(&[
+                CodeLink {
+                    id: "cl-a".into(),
+                    source_id: "src-A".into(),
+                    chunk_id: "ch1".into(),
+                    url: "http://a".into(),
+                    link_text: "a".into(),
+                    is_internal: false,
+                    target_source_id: String::new(),
+                    byte_start: 0,
+                    byte_end: 5,
+                    content_blake3: "b1".into(),
+                },
+                CodeLink {
+                    id: "cl-b".into(),
+                    source_id: "src-B".into(),
+                    chunk_id: "ch2".into(),
+                    url: "http://b".into(),
+                    link_text: "b".into(),
+                    is_internal: false,
+                    target_source_id: String::new(),
+                    byte_start: 0,
+                    byte_end: 5,
+                    content_blake3: "b2".into(),
+                },
+            ])
+            .unwrap();
+
+        let mut scope = std::collections::HashSet::new();
+        scope.insert("src-B".to_string());
+
+        let rows = store.list_code_links_for_sources(&scope).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "cl-b");
     }
 }

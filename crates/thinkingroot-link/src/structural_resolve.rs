@@ -47,15 +47,44 @@ pub struct ResolutionStats {
     pub metrics_resolved: usize,
 }
 
-/// Run all three resolution passes. Called from `Linker::link`.
-///
-/// T4 (I-W3): every `function_calls` and `code_links` row is revalidated
-/// on each compile, not just unresolved ones.  Previously-resolved rows
-/// whose target claim / source was deleted in a later compile are reset to
-/// `""` (external).  If a live target now exists under the same callee_name
-/// or URL, the row is re-resolved to the new target — covering the case
-/// where a function or file moved between sources between compiles.
+/// Run all four resolution passes workspace-wide. Convenience wrapper
+/// around [`resolve_scoped`] with `scope = None`. Kept for callers
+/// (migration backfill, tests) that don't yet have a scope to pass.
 pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
+    resolve_scoped(graph, None)
+}
+
+/// Scoped revalidation. `scope = None` means workspace-wide (preserves
+/// the pre-2026-05-18 contract). `scope = Some(set)` restricts the
+/// revalidation reads at steps 1+2 to rows whose `source_id` is in
+/// the set — typically `truly_changed ∪ list_dependent_sources_for_many
+/// (truly_changed)`, captured at the Phase 7e call site.
+///
+/// Step 4 (fan_in / fan_out metric aggregation) intentionally stays
+/// workspace-wide: a function's fan_in depends on calls from every
+/// source in the workspace, and scoping the read would miscompute
+/// metrics for functions in unchanged sources whose callers landed
+/// in `truly_changed`. The workspace-wide read at step 4 is one
+/// CozoDB query + an in-memory aggregation; the dominant cost is the
+/// scoped reads at steps 1+2 plus the writes.
+///
+/// T4 (I-W3): every `function_calls` and `code_links` row in scope
+/// is revalidated. Previously-resolved rows whose target claim /
+/// source was deleted in a later compile are reset to `""` (external).
+/// If a live target now exists under the same callee_name or URL,
+/// the row is re-resolved to the new target — covering the case
+/// where a function or file moved between sources between compiles.
+/// The scope captures every row that could need this treatment in
+/// the current compile: source X's calls can only point at rows X
+/// resolves to (recorded in `resolution_deps:by_from`), and the
+/// reverse lookup `:by_to` captures every X that resolves to any
+/// truly-changed source. Combined with truly_changed itself
+/// (whose own rows may have changed), the union is the smallest
+/// sound scope.
+pub fn resolve_scoped(
+    graph: &GraphStore,
+    scope: Option<&HashSet<String>>,
+) -> Result<ResolutionStats> {
     let mut stats = ResolutionStats::default();
 
     // ── 1. function_calls.callee_claim_id (revalidation) ───────────────
@@ -75,8 +104,12 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     let all_claim_ids = graph.get_all_claim_ids()?;
     let live_claim_ids: HashSet<String> = all_claim_ids.into_iter().collect();
 
-    // Revalidate ALL function_calls rows (resolved + unresolved).
-    let all_calls = graph.list_all_function_calls()?;
+    // Revalidate function_calls rows. Scoped when `scope` is Some;
+    // workspace-wide when None.
+    let all_calls = match scope {
+        Some(s) => graph.list_function_calls_for_sources(s)?,
+        None => graph.list_all_function_calls()?,
+    };
     let mut updated_calls: Vec<FunctionCall> = Vec::new();
     for mut call in all_calls {
         let original = call.callee_claim_id.clone();
@@ -131,8 +164,12 @@ pub fn resolve(graph: &GraphStore) -> Result<ResolutionStats> {
     }
     let live_source_ids: HashSet<String> = uri_lookup.values().cloned().collect();
 
-    // Revalidate ALL code_links rows (resolved + unresolved).
-    let all_links = graph.list_all_code_links()?;
+    // Revalidate code_links rows. Scoped when `scope` is Some;
+    // workspace-wide when None.
+    let all_links = match scope {
+        Some(s) => graph.list_code_links_for_sources(s)?,
+        None => graph.list_all_code_links()?,
+    };
     let mut updated_links: Vec<CodeLink> = Vec::new();
     for mut link in all_links {
         let original = link.target_source_id.clone();

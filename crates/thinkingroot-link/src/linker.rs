@@ -19,6 +19,13 @@ pub type EntityProgressFn = Arc<dyn Fn(usize, usize) + Send + Sync>;
 pub struct Linker<'a> {
     graph: &'a GraphStore,
     progress: Option<EntityProgressFn>,
+    /// When `Some(set)`, Phase 7e revalidates only function_calls /
+    /// code_links rows whose `source_id` is in the set (typically
+    /// `truly_changed ∪ dependents(truly_changed)`). When `None`,
+    /// Phase 7e runs workspace-wide — preserves the pre-2026-05-18
+    /// contract for callers (migration backfill, tests) that don't
+    /// yet have a scope to pass.
+    resolution_scope: Option<std::collections::HashSet<String>>,
 }
 
 /// Output of the linking stage.
@@ -41,6 +48,7 @@ impl<'a> Linker<'a> {
         Self {
             graph,
             progress: None,
+            resolution_scope: None,
         }
     }
 
@@ -48,6 +56,20 @@ impl<'a> Linker<'a> {
     /// Arguments: (done, total)
     pub fn with_progress(mut self, f: EntityProgressFn) -> Self {
         self.progress = Some(f);
+        self
+    }
+
+    /// Scope Phase 7e's row revalidation to the given source-id set.
+    /// Typically `truly_changed ∪ dependents(truly_changed)` from the
+    /// pipeline's incremental driver. Steps 1+2 (function_calls and
+    /// code_links revalidation) read only rows in scope; step 4
+    /// (fan_in / fan_out aggregation) intentionally stays workspace-
+    /// wide to keep the call-graph metrics correct.
+    pub fn with_resolution_scope(
+        mut self,
+        scope: std::collections::HashSet<String>,
+    ) -> Self {
+        self.resolution_scope = Some(scope);
         self
     }
 
@@ -183,8 +205,14 @@ impl<'a> Linker<'a> {
         // Runs deferred resolutions Phase 6.7 left in place — fills
         // function_calls.callee_claim_id, code_links.is_internal /
         // target_source_id, and seeds source_references. Idempotent
-        // via deterministic row IDs.
-        let resolution = crate::structural_resolve::resolve(self.graph)?;
+        // via deterministic row IDs. When `resolution_scope` is Some,
+        // steps 1+2 read only rows whose source_id is in the set —
+        // the dominant I/O saver on incremental compiles where only
+        // a few sources changed.
+        let resolution = crate::structural_resolve::resolve_scoped(
+            self.graph,
+            self.resolution_scope.as_ref(),
+        )?;
         if resolution.calls_updated
             + resolution.links_updated
             + resolution.references_built
