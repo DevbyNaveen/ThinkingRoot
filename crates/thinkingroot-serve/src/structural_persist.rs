@@ -133,23 +133,42 @@ pub fn phase_6_7_structural_persist(
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true);
 
-    // Cancel observation in the parallel phase: each closure checks
-    // `cancel.is_cancelled()` at entry; `try_collect` short-circuits
-    // on the first `Err(Cancelled)` so the parallel work bails fast.
-    // The check is best-effort granularity = "per source"; finer-
-    // grain cancel would require threading the token through every
-    // emitter, which doesn't pay for itself given typical per-source
-    // walltime is ~10ms.
+    /// Skip rayon for small batches where thread-pool setup
+    /// dominates the per-source work. Tier 3 commit K bench
+    /// measured ~25ms overhead on 1-file incrementals vs
+    /// sequential. The threshold is set to the smallest batch
+    /// where rayon's setup amortises across cores — 4 sources
+    /// matches the rough break-even point on M-series hardware.
+    const RAYON_THRESHOLD: usize = 4;
+
+    // Cancel observation in either branch: each closure / iteration
+    // checks `cancel.is_cancelled()` at entry; `try_collect` short-
+    // circuits on the first `Err(Cancelled)` so the parallel work
+    // bails fast. The check is best-effort granularity = "per
+    // source".
     let extraction_view: &ExtractionOutput = extraction;
-    let per_source_results: Vec<Option<PerSourceWorkResult>> = documents
-        .par_iter()
-        .map(|doc| {
+    let per_source_results: Vec<Option<PerSourceWorkResult>> = if documents.len() >= RAYON_THRESHOLD {
+        documents
+            .par_iter()
+            .map(|doc| {
+                if cancel.is_cancelled() {
+                    return Err(thinkingroot_core::Error::Cancelled);
+                }
+                phase_6_7_per_source(doc, extraction_view, byte_store, git_blame_enabled)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        // Sequential fallback for small batches — same semantics,
+        // no rayon thread-pool setup cost.
+        let mut out = Vec::with_capacity(documents.len());
+        for doc in documents {
             if cancel.is_cancelled() {
                 return Err(thinkingroot_core::Error::Cancelled);
             }
-            phase_6_7_per_source(doc, extraction_view, byte_store, git_blame_enabled)
-        })
-        .collect::<Result<Vec<_>>>()?;
+            out.push(phase_6_7_per_source(doc, extraction_view, byte_store, git_blame_enabled)?);
+        }
+        out
+    };
 
     // ── Sequential merge ──────────────────────────────────────────
     // Build the claim_id → index map once so applying blake3 stamps
