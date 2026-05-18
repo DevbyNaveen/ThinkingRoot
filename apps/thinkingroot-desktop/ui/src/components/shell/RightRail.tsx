@@ -646,16 +646,34 @@ function CompilationProgressIndicator() {
    */
   const maxPercentRef = useRef<number>(0);
 
-  // Reset the monotonic-max bar tracker on compile start + retry
-  // boundary. Done/Failed/Cancelled don't reset — the terminal-state
-  // percent (100%) is always >= max so clamping is a no-op.
+  /**
+   * Monotonic-max step-band guard. The daemon's `set_step` calls
+   * aren't monotonic (Phase 5 = Linking, Phase 6 = Persisting,
+   * Phase 7 = Linking again) — see pipeline.rs:1060/1151/1406. Without
+   * clamping, the displayed label flips `Linking → Persisting →
+   * Linking` even though the percent bar moves forward monotonically.
+   * The user complaint pre-2026-05-18 was "label flickers between
+   * Linking and Persisting"; this ref pins the label to its
+   * high-water mark so the visible state machine reads
+   * `Reading → Extracting → Linking → Persisting → Packing` linearly.
+   *
+   * The index value is into `STEP_ORDER`; 0 = reading, 4 = packing.
+   * Reset on `started` / `retrying`, same triggers as `maxPercentRef`.
+   */
+  const maxStepBandRef = useRef<number>(0);
+
+  // Reset the monotonic-max trackers on compile start + retry boundary.
+  // Done/Failed/Cancelled don't reset — the terminal-state percent
+  // (100%) is always >= max so clamping is a no-op.
   useEffect(() => {
     if (!progress) {
       maxPercentRef.current = 0;
+      maxStepBandRef.current = 0;
       return;
     }
     if (progress.phase === "started" || progress.phase === "retrying") {
       maxPercentRef.current = 0;
+      maxStepBandRef.current = 0;
     }
   }, [progress?.phase]);
 
@@ -727,9 +745,9 @@ function CompilationProgressIndicator() {
   let isError = false;
   let isCancelled = false;
 
-  // Tick step → progress-bar range. Matches the legacy per-phase
-  // percent stops below so a daemon that emits BOTH event styles
-  // doesn't make the bar jump back and forth as events alternate.
+  // Tick step → progress-bar range. The step taxonomy is linear; the
+  // band ordering is the source of truth for the step-label monotonic
+  // clamp below.
   const TICK_RANGE: Record<
     "reading" | "extracting" | "linking" | "persisting" | "packing",
     [number, number]
@@ -741,33 +759,61 @@ function CompilationProgressIndicator() {
     packing: [95, 99],
   };
 
+  /** Ordering of step bands. Index N+1 is "further along" than N. */
+  const STEP_ORDER = [
+    "reading",
+    "extracting",
+    "linking",
+    "persisting",
+    "packing",
+  ] as const;
+  type StepName = (typeof STEP_ORDER)[number];
+
   switch (progress.phase) {
     case "tick": {
       // Unified 250ms-cadence event. This is the **single source of
       // truth** the daemon prefers — every other variant in the union
       // is legacy back-compat. See the type doc in `lib/tauri.ts`.
-      const [base, top] = TICK_RANGE[progress.step];
+      //
+      // Step-label monotonic clamp: the daemon's `set_step` calls
+      // aren't monotonic (Phase 5 = Linking, Phase 6 = Persisting,
+      // Phase 7 = Linking again). If we displayed the raw step the
+      // label would flip `Linking → Persisting → Linking` even
+      // though the percent bar moves forward monotonically. Clamp
+      // the displayed step to its high-water mark so the label
+      // sequence is always `Reading → Extracting → Linking →
+      // Persisting → Packing` linearly. The percent bar already has
+      // its own `maxPercentRef` clamp below.
+      const stepIdx = STEP_ORDER.indexOf(progress.step);
+      if (stepIdx > maxStepBandRef.current) {
+        maxStepBandRef.current = stepIdx;
+      }
+      // Bound the displayed index into the valid range [0, 4].
+      const clampedIdx = Math.max(
+        0,
+        Math.min(STEP_ORDER.length - 1, maxStepBandRef.current),
+      );
+      const displayStep: StepName = STEP_ORDER[clampedIdx] as StepName;
+      const [base, top] = TICK_RANGE[displayStep];
       const range = top - base;
       const stepPct =
-        progress.total > 0
+        progress.total > 0 && progress.step === displayStep
           ? Math.floor((progress.done / progress.total) * range)
           : 0;
       percent = base + stepPct;
-      title = progress.step_label || progress.step;
-      if (progress.total > 0) {
-        // Compact `47 / 523` counter — the daemon's own ETA goes in
-        // the header next to the percent.
+      // Use the displayed (clamped) step name. `step_label` from the
+      // daemon corresponds to the RAW step — substitute it only when
+      // raw == clamped so we never show "Linking" while clamped to
+      // Persisting.
+      title =
+        progress.step === displayStep
+          ? progress.step_label || displayStep
+          : displayStep;
+      if (progress.total > 0 && progress.step === displayStep) {
         details = `${progress.done} / ${progress.total}`;
       } else {
-        // total === 0 ⇒ indeterminate. Pre-fix the caption was
-        // hard-coded to "counting sources…" — a lie for every
-        // sub-phase except the literal first second of extract. The
-        // daemon now ships the actual sub-phase label as
-        // `progress.detail` (e.g. "removing changed sources",
-        // "synthesizing paper"); fall back to the step label only
-        // when nothing more specific is available.
         const sec = (progress.step_elapsed_ms / 1000).toFixed(1);
-        const sub = progress.detail || progress.step_label.toLowerCase();
+        const sub = progress.detail || displayStep;
         details = `${sec}s elapsed · ${sub}`;
       }
       break;
@@ -791,61 +837,42 @@ function CompilationProgressIndicator() {
       details = `After ${(progress.after_ms / 1000).toFixed(1)}s — ${progress.first_error}`;
       percent = 3;
       break;
-    case "diff_start":
-      title = "Diffing workspace state"; details = "Comparing changed and unchanged sources"; percent = 8; break;
-    case "diff_complete":
-      title = "Diff complete"; details = `${progress.changed} changed · ${progress.unchanged} unchanged · ${progress.deleted} deleted`; percent = 12; break;
     case "started":
       title = "Starting compilation"; details = `Workspace: ${progress.workspace}`; percent = 5; break;
+    // ── Legacy per-phase events (2026-05-18 cleanup) ─────────────────
+    // The 20 legacy ProgressEvent variants below — diff_*, parse_complete,
+    // extraction_*, grounding_*, fingerprint_done, rooting_*, linking_*,
+    // vector_*, compilation_*, verification_done — each set their own
+    // title / details / percent and competed with the canonical `tick`
+    // event for the bar label. The daemon still emits them for backward
+    // compatibility with editor MCP consumers; the desktop UI now treats
+    // them as no-ops and waits for the next CompileTick to paint
+    // authoritative state on its own 250 ms cadence.
+    case "diff_start":
+    case "diff_complete":
     case "parse_complete":
-      title = "Parsing source files"; details = `Parsed ${progress.files} files`; percent = 15; break;
     case "extraction_start":
-      title = "Extracting claims";
-      details = `Starting ${progress.total_batches} batches · ${progress.total_chunks} chunks total (count jumps when each batch finishes)`;
-      percent = 20;
-      break;
     case "extraction_progress":
-      title = "Extracting claims";
-      details = `${progress.done} / ${progress.total} chunks · can sit on one number while a batch runs`;
-      percent = 20 + Math.floor((progress.done / Math.max(1, progress.total)) * 30);
-      break;
     case "extraction_complete":
-      title = "Extraction complete"; details = `${progress.claims} claims, ${progress.entities} entities`; percent = 50; break;
     case "extraction_partial":
-      title = "Extraction partially failed"; details = `${progress.failed_batches} failed batches`; percent = 50; break;
     case "grounding_start":
-      title = "Grounding claims"; details = `${progress.llm_claims} LLM + ${progress.structural_claims} structural`; percent = 52; break;
     case "grounding_progress":
-      title = "Grounding entities"; details = `${progress.done} / ${progress.total}`;
-      percent = 50 + Math.floor((progress.done / Math.max(1, progress.total)) * 15); break;
     case "grounding_done":
-      title = "Grounding complete"; details = `${progress.accepted} accepted · ${progress.rejected} rejected`; percent = 66; break;
     case "fingerprint_done":
-      title = "Fingerprint complete"; details = `${progress.truly_changed} changed · ${progress.cutoffs} cutoffs`; percent = 68; break;
     case "rooting_start":
-      title = "Rooting claims"; details = `${progress.candidates} candidates`; percent = 70; break;
     case "rooting_progress":
-      title = "Rooting claims"; details = `${progress.done} / ${progress.total}`;
-      percent = 70 + Math.floor((progress.done / Math.max(1, progress.total)) * 8); break;
     case "rooting_done":
-      title = "Rooting complete"; details = `${progress.rooted} rooted · ${progress.attested} attested`; percent = 78; break;
     case "linking_start":
-      title = "Linking knowledge graph"; details = `${progress.total_entities} entities to link`; percent = 65; break;
     case "linking_progress":
-      title = "Linking knowledge graph"; details = `${progress.done} / ${progress.total}`;
-      percent = 65 + Math.floor((progress.done / Math.max(1, progress.total)) * 15); break;
     case "vector_progress":
-      title = "Building vector index"; details = `${progress.done} / ${progress.total}`;
-      percent = 80 + Math.floor((progress.done / Math.max(1, progress.total)) * 19); break;
     case "vector_update_done":
-      title = "Vector index updated"; details = `${progress.entities_indexed} entities · ${progress.claims_indexed} claims`; percent = 95; break;
     case "compilation_progress":
-      title = "Compiling artifacts"; details = `${progress.done} / ${progress.total}`;
-      percent = 90 + Math.floor((progress.done / Math.max(1, progress.total)) * 7); break;
     case "compilation_done":
-      title = "Artifacts complete"; details = `${progress.artifacts} artifacts`; percent = 98; break;
     case "verification_done":
-      title = "Verification complete"; details = `Health ${progress.health}`; percent = 99; break;
+      title = "Compiling…";
+      details = "";
+      percent = maxPercentRef.current;
+      break;
     case "phase_done":
       // `phase_done` fires after **every** internal pipeline phase
       // (parse → diff → extract → link → persist → audit → …). It is
