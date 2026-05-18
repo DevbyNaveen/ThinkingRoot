@@ -10,6 +10,7 @@ pub mod compressor;
 pub mod diff_cert;
 pub mod dsl;
 pub mod engram;
+pub mod environment;
 pub mod hybrid;
 pub mod hybrid_types;
 pub mod identity;

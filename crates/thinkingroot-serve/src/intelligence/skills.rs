@@ -251,7 +251,111 @@ impl SkillRegistry {
         }
         out
     }
+
+    /// Tiered-disclosure auto-surface (Anthropic Agent Skills spec,
+    /// Dec 2025): pick the top-1 most-relevant skill for the user's
+    /// message by cheap keyword overlap. Returns `None` when no
+    /// skill scores above the threshold.
+    ///
+    /// The scoring is intentionally simple — no embedding round-trip,
+    /// no LLM-as-classifier call. Reason: this runs on every chat
+    /// turn before the agent loop starts. Embedding latency (~10ms
+    /// fastembed) compounds across users; keyword overlap is sub-µs
+    /// and good enough for the common case ("refactor X" → refactor
+    /// skill, "explain how Y works" → explanation skill).
+    ///
+    /// Algorithm:
+    ///   1. Lowercase + tokenise both the query and each skill's
+    ///      `(name + description)` text into ASCII word boundaries.
+    ///   2. Score = number of unique query tokens that appear in the
+    ///      skill's token set. Tokens shorter than 3 chars and a
+    ///      small stop-word set are dropped to avoid trivial hits.
+    ///   3. Return the skill with the highest score, ties broken by
+    ///      `name` lex order for determinism, ONLY if score ≥
+    ///      [`SKILL_MATCH_MIN_SCORE`].
+    pub fn pick_relevant(&self, query: &str) -> Option<&Skill> {
+        if self.skills.is_empty() || query.trim().is_empty() {
+            return None;
+        }
+        let q_tokens = tokenise_for_match(query);
+        if q_tokens.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(usize, &Skill)> = None;
+        // Sort skills by name for deterministic tie-breaking.
+        let mut sorted: Vec<&Skill> = self.skills.iter().collect();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for s in sorted {
+            let mut haystack = String::new();
+            haystack.push_str(&s.name);
+            haystack.push(' ');
+            haystack.push_str(&s.description);
+            let s_tokens = tokenise_for_match(&haystack);
+            let mut score = 0usize;
+            for q in &q_tokens {
+                if s_tokens.contains(q.as_str()) {
+                    score += 1;
+                }
+            }
+            if score >= SKILL_MATCH_MIN_SCORE {
+                match best {
+                    Some((b_score, _)) if score <= b_score => {}
+                    _ => best = Some((score, s)),
+                }
+            }
+        }
+        best.map(|(_, s)| s)
+    }
 }
+
+/// Minimum keyword-overlap score for a skill to be auto-surfaced.
+/// 2 = at least two distinct content words from the query appear in
+/// the skill's name/description. One-word matches are too noisy
+/// (a single occurrence of "code" would match every coding-flavoured
+/// skill); requiring two raises precision while keeping recall on
+/// real intents.
+pub const SKILL_MATCH_MIN_SCORE: usize = 2;
+
+/// Tokenise a string into the set of lowercased ASCII content words
+/// used by [`SkillRegistry::pick_relevant`]. Drops tokens shorter
+/// than 3 chars and a small set of universal stop-words to avoid
+/// trivial overlap hits.
+fn tokenise_for_match(text: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let lower = text.to_lowercase();
+    let mut current = String::new();
+    for c in lower.chars() {
+        if c.is_alphanumeric() {
+            current.push(c);
+        } else {
+            push_token(&mut out, &current);
+            current.clear();
+        }
+    }
+    push_token(&mut out, &current);
+    out
+}
+
+fn push_token(out: &mut std::collections::HashSet<String>, tok: &str) {
+    if tok.len() < 3 {
+        return;
+    }
+    if STOP_WORDS.contains(&tok) {
+        return;
+    }
+    out.insert(tok.to_string());
+}
+
+/// Tiny stop-word set — universal function-words that match
+/// everything and add no signal. Kept short on purpose: every
+/// addition reduces recall on the long tail of skill intents.
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "are", "was", "but", "you", "your",
+    "have", "has", "had", "can", "use", "how", "what", "when", "why", "where", "who", "any",
+    "all", "not", "now", "one", "two", "three",
+];
 
 #[cfg(test)]
 mod tests {
@@ -400,6 +504,113 @@ mod tests {
     fn manifest_for_prompt_empty_registry_returns_empty_string() {
         let registry = SkillRegistry::empty();
         assert_eq!(registry.manifest_for_prompt(), "");
+    }
+
+    fn fixture_registry() -> SkillRegistry {
+        SkillRegistry::from_skills(vec![
+            Skill {
+                name: "refactor-rust".to_string(),
+                description: "Use this when the user asks you to refactor Rust code".to_string(),
+                body: "step 1\n".to_string(),
+                source_path: PathBuf::from("/tmp/refactor.md"),
+            },
+            Skill {
+                name: "explain-architecture".to_string(),
+                description: "Use when the user asks how the system architecture works"
+                    .to_string(),
+                body: "step 1\n".to_string(),
+                source_path: PathBuf::from("/tmp/explain.md"),
+            },
+            Skill {
+                name: "review-pr".to_string(),
+                description: "Review a pull request for bugs and style issues".to_string(),
+                body: "step 1\n".to_string(),
+                source_path: PathBuf::from("/tmp/review.md"),
+            },
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn pick_relevant_returns_none_on_empty_registry() {
+        let registry = SkillRegistry::empty();
+        assert!(registry.pick_relevant("refactor this rust code").is_none());
+    }
+
+    #[test]
+    fn pick_relevant_returns_none_on_empty_query() {
+        let registry = fixture_registry();
+        assert!(registry.pick_relevant("").is_none());
+        assert!(registry.pick_relevant("   ").is_none());
+    }
+
+    #[test]
+    fn pick_relevant_matches_rust_refactor_intent() {
+        let registry = fixture_registry();
+        // "refactor" + "rust" — both content tokens — matches the
+        // refactor-rust skill with score 2.
+        let picked = registry
+            .pick_relevant("can you refactor this rust code")
+            .expect("should match refactor-rust");
+        assert_eq!(picked.name, "refactor-rust");
+    }
+
+    #[test]
+    fn pick_relevant_matches_architecture_question() {
+        let registry = fixture_registry();
+        let picked = registry
+            .pick_relevant("explain how the architecture works")
+            .expect("should match explain-architecture");
+        assert_eq!(picked.name, "explain-architecture");
+    }
+
+    #[test]
+    fn pick_relevant_returns_none_when_score_below_threshold() {
+        let registry = fixture_registry();
+        // Single-word match on a stop-word-laden query — no skill
+        // should fire because the score requires >= 2 content words
+        // overlapping.
+        assert!(registry.pick_relevant("hi there").is_none());
+    }
+
+    #[test]
+    fn pick_relevant_ignores_stop_words() {
+        let registry = fixture_registry();
+        // "what" and "the" are stop words — they don't contribute to
+        // overlap. Query has no content tokens that match any skill.
+        assert!(registry.pick_relevant("what is the weather").is_none());
+    }
+
+    #[test]
+    fn pick_relevant_breaks_ties_by_name_lex_order() {
+        // Two skills with identical content keywords. The one whose
+        // name sorts first lexicographically wins.
+        let registry = SkillRegistry::from_skills(vec![
+            Skill {
+                name: "zzz-skill".to_string(),
+                description: "refactor rust code".to_string(),
+                body: "z".to_string(),
+                source_path: PathBuf::from("/tmp/z.md"),
+            },
+            Skill {
+                name: "aaa-skill".to_string(),
+                description: "refactor rust code".to_string(),
+                body: "a".to_string(),
+                source_path: PathBuf::from("/tmp/a.md"),
+            },
+        ])
+        .unwrap();
+        let picked = registry.pick_relevant("refactor rust").unwrap();
+        // Both score 2; aaa-skill wins by lex order (name first).
+        assert_eq!(picked.name, "aaa-skill");
+    }
+
+    #[test]
+    fn pick_relevant_is_deterministic_across_calls() {
+        let registry = fixture_registry();
+        let p1 = registry.pick_relevant("refactor rust");
+        let p2 = registry.pick_relevant("refactor rust");
+        assert_eq!(p1.map(|s| s.name.clone()), p2.map(|s| s.name.clone()));
     }
 
     #[test]

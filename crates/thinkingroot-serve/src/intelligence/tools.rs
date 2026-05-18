@@ -53,6 +53,50 @@ impl ToolHandlerResult {
             is_error: true,
         }
     }
+
+    /// Return a structured error envelope per the 2026 SOTA pattern:
+    ///
+    /// ```json
+    /// {
+    ///   "ok": false,
+    ///   "error_type": "<canonical kind>",
+    ///   "hint": "<actionable next step or null>",
+    ///   "retryable": true|false
+    /// }
+    /// ```
+    ///
+    /// The LLM is told (via `SOTA_OPERATING_PRINCIPLES` in
+    /// `synthesizer.rs`) to read the `hint` field and treat
+    /// `retryable: false` as a hard stop — don't loop. The harness
+    /// agent loop separately caps same-tool-same-args at 3 attempts
+    /// (`loop_detection_threshold`); the envelope tells the LLM why
+    /// it should stop *before* that cap fires.
+    ///
+    /// Common `error_type` values used across handlers:
+    ///   * `"missing_field"` — required input field absent
+    ///   * `"invalid_argument"` — input shape wrong (out-of-range, etc.)
+    ///   * `"not_found"` — referenced entity / workspace / file absent
+    ///   * `"permission_denied"` — user declined approval, or RBAC
+    ///   * `"upstream_failed"` — engine / external dep errored
+    ///   * `"empty_result"` — query succeeded but matched nothing
+    ///   * `"stale_index"` — vector index needs rebuild
+    ///   * `"transient"` — network blip / lock contention — retryable
+    pub fn structured_error(
+        error_type: impl Into<String>,
+        hint: impl Into<Option<String>>,
+        retryable: bool,
+    ) -> Self {
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error_type": error_type.into(),
+            "hint": hint.into(),
+            "retryable": retryable,
+        });
+        Self {
+            content: envelope.to_string(),
+            is_error: true,
+        }
+    }
 }
 
 /// Async handler invoked by the agent loop when the LLM calls a tool.
@@ -298,6 +342,35 @@ mod tests {
         let err = ToolHandlerResult::error("nope");
         assert!(err.is_error);
         assert_eq!(err.content, "nope");
+    }
+
+    #[tokio::test]
+    async fn structured_error_emits_well_formed_envelope() {
+        // 2026 SOTA: tool errors land as structured JSON so the LLM
+        // can read the `hint` and `retryable` fields directly.
+        let r = ToolHandlerResult::structured_error(
+            "not_found",
+            Some("call list_workspaces_full first to see what's mounted".to_string()),
+            false,
+        );
+        assert!(r.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error_type"], "not_found");
+        assert_eq!(parsed["retryable"], false);
+        assert_eq!(
+            parsed["hint"],
+            "call list_workspaces_full first to see what's mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_error_accepts_null_hint() {
+        let r = ToolHandlerResult::structured_error("transient", None::<String>, true);
+        let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+        assert!(parsed["hint"].is_null());
+        assert_eq!(parsed["retryable"], true);
+        assert_eq!(parsed["error_type"], "transient");
     }
 
     #[tokio::test]

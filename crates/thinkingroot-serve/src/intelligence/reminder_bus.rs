@@ -34,6 +34,7 @@
 //
 // (Task 9 / Day 2-4 P1, plan 2026-05-09.)
 
+use crate::intelligence::environment::{EnvironmentInfo, render_block as render_env_inner};
 use crate::intelligence::identity::{WorkspaceIdentity, render_identity_block};
 use crate::intelligence::session::SessionContext;
 
@@ -54,12 +55,90 @@ pub struct EngramHandle {
     pub topic: String,
 }
 
+/// Slim per-claim recall row injected as cross-session agentmemory
+/// context. Top-K of these are surfaced automatically — Mem0/Letta-
+/// style — so the AI starts each turn with the most-relevant prior
+/// claims visible without burning a `search` / `hybrid_retrieve`
+/// round-trip just to bootstrap.
+///
+/// Decoupled from `ClaimSearchHit` so reminder-bus tests don't drag
+/// in the engine/CozoDB surface and the upstream struct can evolve.
+/// Caller (typically `rest.rs::agent_stream_response`) computes the
+/// recall via the same retrieval primitives the agent would call —
+/// keeps the substrate-as-ground-truth contract.
+#[derive(Debug, Clone)]
+pub struct AgentmemoryRecall {
+    /// Claim id (the `[claim:<id>]` form the citation parser expects).
+    pub claim_id: String,
+    /// Short statement text — pre-truncated by the caller so the bus
+    /// doesn't have to make a budget decision. Recommended ≤ 240
+    /// chars; the bus enforces a hard 480-char cap defensively.
+    pub statement: String,
+    /// Confidence in `[0.0, 1.0]`. Surfaced inline so the LLM can
+    /// down-weight low-confidence recalls without re-querying.
+    /// `f64` matches `ClaimSearchHit::confidence`.
+    pub confidence: f64,
+    /// Source path / URI for citation. Either `path:line` style or
+    /// a `mcp://` / `connector://` URI. Free-form — the bus passes
+    /// through.
+    pub source_uri: String,
+}
+
+/// Slim view of an MCP-connected AI tool. Surfaces the User-Agent
+/// and counters so the in-app operator-mode AI has cross-tool
+/// awareness without calling `list_mcp_sessions` for every turn.
+#[derive(Debug, Clone)]
+pub struct McpSessionBrief {
+    /// First 12 chars of the session UUID — long enough to identify,
+    /// short enough to keep the reminder compact.
+    pub session_id_prefix: String,
+    /// User-Agent header at session open ("cursor/1.5.2", "claude-code/0.4.1",
+    /// "python-httpx/0.27.0"). Free-form — Cursor / Claude Code /
+    /// Cline / aider / OpenClaw all use distinct strings.
+    pub user_agent: String,
+    /// Transport: "sse" / "stdio" / "agentmemory".
+    pub transport: String,
+    /// Total tool calls observed on this session this run.
+    pub tool_calls_total: u64,
+    /// Total errors observed. Non-zero is a debug signal — the AI
+    /// can surface "Cursor's session has 5 errors, want me to look?"
+    pub errors_total: u64,
+}
+
+/// Slim view of a recent self-heal event (compile failure, breaker
+/// trip, stale-lock cleanup). Surfaced when non-empty in the last 5
+/// minutes so the operator-mode AI proactively notices a wedged
+/// substrate without polling `recovery_log_tail` every turn.
+#[derive(Debug, Clone)]
+pub struct RecoveryEventBrief {
+    /// One of the canonical event kinds from `recovery_log::RecoveryEventKind`
+    /// as a snake_case string ("compile_failed", "compile_breaker_tripped",
+    /// "restart_breaker_tripped", "stale_lock_cleanup", "compile_recovered",
+    /// "compile_retry_scheduled"). The bus renders as-is.
+    pub kind: String,
+    /// Workspace the event applies to, when scoped. `None` for
+    /// daemon-global events.
+    pub workspace: Option<String>,
+    /// ISO-8601 timestamp of the event.
+    pub at_iso: String,
+    /// One-line summary the AI can quote inline. Pre-formatted by
+    /// the caller from the event's payload.
+    pub summary: String,
+}
+
 /// Snapshot of every input the bus draws on for one turn. All fields
 /// are optional — the corresponding emitter is suppressed when its
 /// data source is missing, which is the right behaviour for callers
 /// like the LongMemEval bench harness that intentionally pass none.
 #[derive(Debug, Clone, Default)]
 pub struct ReminderContext<'a> {
+    /// Host environment snapshot — cwd, OS, $HOME, ~/Desktop, etc.
+    /// When `Some`, the bus emits an `# environment` block FIRST
+    /// (before workspace identity) so the LLM can resolve common
+    /// locations like "Desktop" without asking the user. Mirrors
+    /// Claude Code's `computeSimpleEnvInfo` injection mechanism
+    /// (`prompts.ts:651-710`).
+    pub environment: Option<&'a EnvironmentInfo>,
     /// Workspace identity (name, claim_count, sources, project_doc).
     /// When `None`, the `<workspace>` reminder is omitted; this
     /// preserves the LongMemEval byte-identity contract for callers
@@ -97,6 +176,39 @@ pub struct ReminderContext<'a> {
     /// ("refactor intent", "fix intent", …) so the rendered text is
     /// stable per intent class.
     pub sandbox_recommendation: Option<&'a str>,
+    /// Top-K agentmemory recalls — Mem0/Letta-style cross-session
+    /// memory surfaced automatically per turn. Empty slice when the
+    /// caller chose not to surface recalls (CLI flows, bench
+    /// harness, or simply nothing matched). Bus suppresses the
+    /// `<agentmemory_recall>` block on empty.
+    pub agentmemory_recalls: &'a [AgentmemoryRecall],
+    /// MCP-connected AI sessions (snapshot from
+    /// `mcp::telemetry::snapshot`). When non-empty, the bus emits an
+    /// `<mcp_sessions>` block so the operator-mode AI has cross-tool
+    /// awareness without polling `list_mcp_sessions`. Empty slice
+    /// suppresses the block entirely.
+    pub mcp_sessions: &'a [McpSessionBrief],
+    /// Recent (≤ 5 min) self-heal events worth surfacing. Caller
+    /// (typically `rest.rs`) tails `recovery_log` and filters by
+    /// recency + relevance. Empty slice suppresses the block.
+    pub recovery_events: &'a [RecoveryEventBrief],
+    /// Auto-surfaced skill — top-1 keyword match against the user's
+    /// message — with full body inlined so the AI doesn't have to
+    /// burn a `use_skill` round-trip on the common case. When
+    /// `Some`, the bus renders the body in a `<relevant_skill>`
+    /// block tagged with the skill name. Caller is responsible for
+    /// the classification; the bus is a pure renderer.
+    pub relevant_skill: Option<RelevantSkill<'a>>,
+}
+
+/// Slim view of an auto-surfaced skill — name plus body. The body
+/// is borrowed from the caller's `SkillRegistry` so no allocation
+/// is required on the hot path. Decoupled from `skills::Skill` so
+/// bus tests don't carry the file-format machinery.
+#[derive(Debug, Clone, Copy)]
+pub struct RelevantSkill<'a> {
+    pub name: &'a str,
+    pub body: &'a str,
 }
 
 /// Subset of the branch crate's `BranchRef` the renderer consumes —
@@ -130,7 +242,22 @@ const TOOL_BUDGET_WARN_THRESHOLD: usize = 3;
 /// anything visible to the bus. Don't reorder these calls casually.
 pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
     let mut out = String::new();
+    // Order is load-bearing for prompt caching (stable prefix → cache
+    // hit) AND for LLM attention budget: environment + workspace are
+    // most universally relevant, agentmemory + relevant-skill prime
+    // the answer, branch/session/engram tune behaviour, MCP/recovery
+    // surface operator context, sandbox/tool_budget are advisory
+    // wind-down signals.
+    if let Some(s) = render_environment_block(ctx) {
+        out.push_str(&s);
+    }
     if let Some(s) = render_workspace_block(ctx) {
+        out.push_str(&s);
+    }
+    if let Some(s) = render_agentmemory_recall_block(ctx) {
+        out.push_str(&s);
+    }
+    if let Some(s) = render_relevant_skill_block(ctx) {
         out.push_str(&s);
     }
     if let Some(s) = render_branch_state_block(ctx) {
@@ -142,6 +269,12 @@ pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
     if let Some(s) = render_engram_state_block(ctx) {
         out.push_str(&s);
     }
+    if let Some(s) = render_mcp_sessions_block(ctx) {
+        out.push_str(&s);
+    }
+    if let Some(s) = render_recovery_events_block(ctx) {
+        out.push_str(&s);
+    }
     if let Some(s) = render_sandbox_alert_block(ctx) {
         out.push_str(&s);
     }
@@ -149,6 +282,115 @@ pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
         out.push_str(&s);
     }
     out
+}
+
+/// `<environment>` — host context (cwd, OS, shell, $HOME, common
+/// well-known directories, today's date). Suppressed when the caller
+/// passes `environment: None` (LongMemEval bench harness, byte-
+/// identity callers).
+fn render_environment_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    let env = ctx.environment?;
+    let inner = render_env_inner(env);
+    Some(wrap_reminder(&inner))
+}
+
+/// `<agentmemory_recall>` — top-K semantic-match recalls from prior
+/// sessions, surfaced automatically (Mem0/Letta pattern). The AI sees
+/// the most-relevant claims for the user's current question before
+/// deciding whether to dig deeper via `search` / `hybrid_retrieve`.
+fn render_agentmemory_recall_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.agentmemory_recalls.is_empty() {
+        return None;
+    }
+    let mut inner = String::from("# agentmemory_recall\n");
+    inner.push_str(
+        "Top relevant claims from this workspace's prior turns (auto-surfaced; cite by [claim:<id>] if you use them).\n",
+    );
+    for r in ctx.agentmemory_recalls {
+        // Defensive truncation — caller should already have trimmed
+        // but we cap at 480 chars to keep one outlier from inflating
+        // the whole turn's reminder budget.
+        let statement = if r.statement.len() > 480 {
+            let mut cut = 477;
+            while !r.statement.is_char_boundary(cut) && cut > 0 {
+                cut -= 1;
+            }
+            format!("{}…", &r.statement[..cut])
+        } else {
+            r.statement.clone()
+        };
+        inner.push_str(&format!(
+            "- [claim:{}] [{:.2} conf] {} ({})\n",
+            r.claim_id, r.confidence, statement, r.source_uri,
+        ));
+    }
+    Some(wrap_reminder(&inner))
+}
+
+/// `<relevant_skill>` — top-1 auto-classified skill body inlined for
+/// the turn. Saves the `use_skill` round-trip on the common case
+/// where keyword overlap is strong. Caller-classified, bus is a
+/// pure renderer.
+///
+/// The skill body is wrapped under a `# skill: <name>` header so the
+/// LLM sees the name + full instructions in one block. Caller may
+/// trim the body to a budget; the bus passes through.
+fn render_relevant_skill_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    let skill = ctx.relevant_skill?;
+    let mut inner = format!("# skill: {}\n", skill.name);
+    inner.push_str(
+        "This skill matches the user's request — apply its instructions before reaching for general tool patterns.\n\n",
+    );
+    inner.push_str(skill.body);
+    if !skill.body.ends_with('\n') {
+        inner.push('\n');
+    }
+    Some(wrap_reminder(&inner))
+}
+
+/// `<mcp_sessions>` — connected AI tools (other agents that have
+/// opened MCP / agentmemory sessions against this daemon). Surfaced
+/// when at least one session is active so the operator-mode AI has
+/// cross-tool awareness without polling.
+fn render_mcp_sessions_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.mcp_sessions.is_empty() {
+        return None;
+    }
+    let mut inner = String::from("# mcp_sessions\n");
+    inner.push_str("Other AI tools currently plugged into this ThinkingRoot daemon:\n");
+    for s in ctx.mcp_sessions {
+        inner.push_str(&format!(
+            "- {} ({}, transport={}, calls={}, errors={})\n",
+            s.session_id_prefix, s.user_agent, s.transport, s.tool_calls_total, s.errors_total,
+        ));
+    }
+    inner.push_str(
+        "When the user reports a cross-tool problem, call `mcp_session_health` or `mcp_error_log` to drill in.\n",
+    );
+    Some(wrap_reminder(&inner))
+}
+
+/// `<substrate_health>` — recent self-heal events (compile failures,
+/// breaker trips, stale-lock cleanups). Surfaced when non-empty so
+/// the operator-mode AI proactively notices a wedged substrate.
+fn render_recovery_events_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.recovery_events.is_empty() {
+        return None;
+    }
+    let mut inner = String::from("# substrate_health\n");
+    inner.push_str("Recent self-heal events (last few minutes):\n");
+    for ev in ctx.recovery_events {
+        let ws = ev
+            .workspace
+            .as_deref()
+            .map(|w| format!(" workspace={w}"))
+            .unwrap_or_default();
+        inner.push_str(&format!("- {} at {}{}: {}\n", ev.kind, ev.at_iso, ws, ev.summary));
+    }
+    inner.push_str(
+        "Operator tools available: `recovery_log_tail`, `restart_state_get`, `reset_circuit_breaker`, `reset_compile_breaker`. Read before you act.\n",
+    );
+    Some(wrap_reminder(&inner))
 }
 
 /// `<workspace>` — wraps the existing `render_identity_block` output
@@ -459,6 +701,7 @@ mod tests {
             tool_budget_remaining: Some(2),
             tool_budget_max: Some(12),
             sandbox_recommendation: None,
+            ..Default::default()
         };
         let out = render_reactive_reminders(&ctx);
 
@@ -473,6 +716,291 @@ mod tests {
         assert!(i_br < i_sn, "branch_state must precede session_state");
         assert!(i_sn < i_eg, "session_state must precede engram_state");
         assert!(i_eg < i_tb, "engram_state must precede tool_budget");
+    }
+
+    #[test]
+    fn environment_block_fires_first_when_present() {
+        // Env precedes workspace in stable-order. Critical for the
+        // "AI knows where Desktop is" contract: the LLM reads the
+        // <environment> block before the workspace block and so can
+        // resolve "Desktop" as `~/Desktop` without asking the user.
+        let env = EnvironmentInfo {
+            cwd: Some(std::path::PathBuf::from("/Users/test/proj")),
+            home: Some(std::path::PathBuf::from("/Users/test")),
+            desktop: Some(std::path::PathBuf::from("/Users/test/Desktop")),
+            documents: None,
+            downloads: None,
+            os: "macos",
+            shell: Some("zsh".to_string()),
+            today_iso: "2026-05-18".to_string(),
+        };
+        let id = fixture_identity();
+        let ctx = ReminderContext {
+            environment: Some(&env),
+            identity: Some(&id),
+            today: Some("2026-05-18"),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        let i_env = out.find("# environment").expect("env block must render");
+        let i_ws = out.find("name: test-ws").expect("workspace block must render");
+        assert!(i_env < i_ws, "environment must precede workspace");
+        assert!(out.contains("desktop: /Users/test/Desktop"));
+        assert!(out.contains("os: macos"));
+    }
+
+    #[test]
+    fn environment_block_suppressed_when_absent() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("# environment"));
+    }
+
+    #[test]
+    fn agentmemory_recall_block_fires_when_recalls_present() {
+        let recalls = vec![
+            AgentmemoryRecall {
+                claim_id: "c-001".to_string(),
+                statement: "user prefers Rust over Go".to_string(),
+                confidence: 0.92,
+                source_uri: "session://2026-05-10".to_string(),
+            },
+            AgentmemoryRecall {
+                claim_id: "c-002".to_string(),
+                statement: "user lives in Bangalore".to_string(),
+                confidence: 0.99,
+                source_uri: "session://2026-05-12".to_string(),
+            },
+        ];
+        let ctx = ReminderContext {
+            agentmemory_recalls: &recalls,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# agentmemory_recall"));
+        assert!(out.contains("[claim:c-001]"));
+        assert!(out.contains("[claim:c-002]"));
+        assert!(out.contains("user prefers Rust over Go"));
+        assert!(out.contains("session://2026-05-10"));
+        assert!(out.contains("0.92 conf"));
+    }
+
+    #[test]
+    fn agentmemory_recall_block_suppressed_when_empty() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("agentmemory_recall"));
+    }
+
+    #[test]
+    fn agentmemory_recall_caps_oversized_statement() {
+        // Defensive: a single 1000-char recall mustn't blow the
+        // turn's reminder budget. Bus truncates to 477+ellipsis.
+        let mut statement = String::with_capacity(1000);
+        for _ in 0..1000 {
+            statement.push('x');
+        }
+        let recalls = vec![AgentmemoryRecall {
+            claim_id: "c-big".to_string(),
+            statement,
+            confidence: 1.0,
+            source_uri: "file://big".to_string(),
+        }];
+        let ctx = ReminderContext {
+            agentmemory_recalls: &recalls,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("…"), "must include truncation marker");
+        // Defensive cap: total reminder line length stays well under
+        // 600 chars (the line including header + claim_id + conf).
+        // The raw statement-rendering cap is 480 chars.
+        assert!(out.matches('x').count() <= 480);
+    }
+
+    #[test]
+    fn relevant_skill_block_inlines_skill_body() {
+        let body = "# Refactor Rust\n\nStep 1: read CLAUDE.md\nStep 2: identify the smell\n";
+        let ctx = ReminderContext {
+            relevant_skill: Some(RelevantSkill {
+                name: "refactor-rust",
+                body,
+            }),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# skill: refactor-rust"));
+        assert!(out.contains("Step 1: read CLAUDE.md"));
+        assert!(out.contains("Step 2: identify the smell"));
+    }
+
+    #[test]
+    fn relevant_skill_block_suppressed_when_none() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("# skill:"));
+    }
+
+    #[test]
+    fn mcp_sessions_block_fires_when_sessions_present() {
+        let sessions = vec![
+            McpSessionBrief {
+                session_id_prefix: "abc123def456".to_string(),
+                user_agent: "cursor/1.5.2".to_string(),
+                transport: "sse".to_string(),
+                tool_calls_total: 23,
+                errors_total: 0,
+            },
+            McpSessionBrief {
+                session_id_prefix: "789012345678".to_string(),
+                user_agent: "claude-code/0.4".to_string(),
+                transport: "stdio".to_string(),
+                tool_calls_total: 7,
+                errors_total: 2,
+            },
+        ];
+        let ctx = ReminderContext {
+            mcp_sessions: &sessions,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# mcp_sessions"));
+        assert!(out.contains("cursor/1.5.2"));
+        assert!(out.contains("claude-code/0.4"));
+        assert!(out.contains("calls=23"));
+        assert!(out.contains("errors=2"));
+    }
+
+    #[test]
+    fn mcp_sessions_block_suppressed_when_empty() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("mcp_sessions"));
+    }
+
+    #[test]
+    fn recovery_events_block_fires_when_events_present() {
+        let events = vec![
+            RecoveryEventBrief {
+                kind: "compile_breaker_tripped".to_string(),
+                workspace: Some("desktop".to_string()),
+                at_iso: "2026-05-18T12:34:56Z".to_string(),
+                summary: "3 consecutive compile failures in workspace 'desktop'".to_string(),
+            },
+            RecoveryEventBrief {
+                kind: "stale_lock_cleanup".to_string(),
+                workspace: None,
+                at_iso: "2026-05-18T12:35:00Z".to_string(),
+                summary: "removed cortex.lock owned by dead pid 4242".to_string(),
+            },
+        ];
+        let ctx = ReminderContext {
+            recovery_events: &events,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# substrate_health"));
+        assert!(out.contains("compile_breaker_tripped"));
+        assert!(out.contains("workspace=desktop"));
+        assert!(out.contains("dead pid 4242"));
+        assert!(out.contains("`reset_compile_breaker`"));
+    }
+
+    #[test]
+    fn recovery_events_block_suppressed_when_empty() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("substrate_health"));
+    }
+
+    #[test]
+    fn full_v2_context_renders_all_eleven_blocks_in_stable_order() {
+        // The complete SOTA loadout: environment → workspace →
+        // agentmemory_recall → relevant_skill → branch_state →
+        // session_state → engram_state → mcp_sessions →
+        // substrate_health → sandbox_alert → tool_budget.
+        let env = EnvironmentInfo {
+            cwd: Some(std::path::PathBuf::from("/u/x")),
+            home: Some(std::path::PathBuf::from("/u")),
+            desktop: Some(std::path::PathBuf::from("/u/Desktop")),
+            documents: None,
+            downloads: None,
+            os: "macos",
+            shell: Some("zsh".to_string()),
+            today_iso: "2026-05-18".to_string(),
+        };
+        let id = fixture_identity();
+        let session = fixture_session_with_focus();
+        let engrams = vec![fixture_engram("0x7A3F", "auth")];
+        let recalls = vec![AgentmemoryRecall {
+            claim_id: "c-001".to_string(),
+            statement: "fact".to_string(),
+            confidence: 0.9,
+            source_uri: "file:///a".to_string(),
+        }];
+        let mcp = vec![McpSessionBrief {
+            session_id_prefix: "abc123def456".to_string(),
+            user_agent: "cursor/1.0".to_string(),
+            transport: "sse".to_string(),
+            tool_calls_total: 5,
+            errors_total: 0,
+        }];
+        let recovery = vec![RecoveryEventBrief {
+            kind: "stale_lock_cleanup".to_string(),
+            workspace: None,
+            at_iso: "2026-05-18T12:00:00Z".to_string(),
+            summary: "cleaned up dead lock".to_string(),
+        }];
+        let body = "step 1\n";
+        let ctx = ReminderContext {
+            environment: Some(&env),
+            identity: Some(&id),
+            today: Some("2026-05-18"),
+            session: Some(&session),
+            branch: Some(BranchSummary {
+                name: "stream/chat-1".to_string(),
+                parent: Some("main".to_string()),
+                kind: Some("Stream".to_string()),
+            }),
+            engrams: &engrams,
+            engram_budget: 100,
+            tool_budget_remaining: Some(2),
+            tool_budget_max: Some(12),
+            sandbox_recommendation: Some("refactor intent"),
+            agentmemory_recalls: &recalls,
+            mcp_sessions: &mcp,
+            recovery_events: &recovery,
+            relevant_skill: Some(RelevantSkill {
+                name: "refactor-rust",
+                body,
+            }),
+        };
+        let out = render_reactive_reminders(&ctx);
+
+        let positions = [
+            ("# environment", out.find("# environment").expect("env")),
+            ("# workspace", out.find("name: test-ws").expect("ws")),
+            (
+                "# agentmemory_recall",
+                out.find("# agentmemory_recall").expect("recall"),
+            ),
+            ("# skill: refactor-rust", out.find("# skill: refactor-rust").expect("skill")),
+            ("# branch", out.find("active: stream/chat-1").expect("branch")),
+            ("# session", out.find("focus_entity: WebhookHandler").expect("session")),
+            ("# engrams_active", out.find("# engrams_active").expect("engrams")),
+            ("# mcp_sessions", out.find("# mcp_sessions").expect("mcp")),
+            ("# substrate_health", out.find("# substrate_health").expect("health")),
+            ("# sandbox_alert", out.find("# sandbox_alert").expect("sandbox")),
+            ("# tool_budget", out.find("# tool_budget").expect("budget")),
+        ];
+        for i in 1..positions.len() {
+            assert!(
+                positions[i - 1].1 < positions[i].1,
+                "{} must precede {}",
+                positions[i - 1].0,
+                positions[i].0,
+            );
+        }
     }
 
     #[test]

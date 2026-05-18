@@ -395,6 +395,71 @@ impl ToolHandler for UseSkillTool {
     }
 }
 
+/// `think` — explicit reasoning scratchpad invoked mid-tool-chain.
+///
+/// Anthropic-published pattern (2025; `anthropic.com/engineering/
+/// claude-think-tool`) — measured +54 % on τ-bench airline policy
+/// adherence. The tool is a deliberate no-op: it does not query the
+/// substrate, mutate state, or call out to providers. Its value is
+/// that **calling it produces a tool-result turn the model can use
+/// to reason against**, separating observation from action and giving
+/// the agent room to think between policy-heavy steps.
+///
+/// When the model invokes `think { thought: "..." }`, the handler
+/// echoes the thought back as the result. The LLM then sees its own
+/// reasoning materialised as observation context and can decide its
+/// next action against it.
+///
+/// Used at policy-heavy decision points (see `SOTA_OPERATING_PRINCIPLES`
+/// in `synthesizer.rs` for the exact guidance the agent receives):
+///   * Cross-witness synthesis before answering
+///   * Pre-flight justification before a write-class tool
+///   * Cross-tool diagnostic planning in operator mode
+///   * Branch merge sanity checks
+pub struct ThinkTool;
+
+impl ThinkTool {
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "think",
+            "Internal reasoning scratchpad. Use BEFORE a write tool (to justify the action with cited evidence), BEFORE answering a policy-heavy multi-witness question (to reconcile sources), or BEFORE issuing a cross-tool diagnostic chain (to plan the path). Does NOT query the substrate, mutate state, or call providers — it lets you observe your own reasoning before acting. Skip on trivial single-step turns.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "thought": {
+                        "type": "string",
+                        "description": "Your reasoning for the next action — citations, trade-offs, plan. Treat as a private notebook; the user does not see it directly, but it shapes your next tool call."
+                    }
+                },
+                "required": ["thought"]
+            }),
+        )
+    }
+}
+
+impl Default for ThinkTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ThinkTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let Some(thought) = input.get("thought").and_then(|v| v.as_str()) else {
+            return ToolHandlerResult::error("missing required field: thought");
+        };
+        // Echo the thought back so the LLM sees it as an observation
+        // on the next turn. Length-bounded by the same token-budget
+        // truncation the agent loop applies to every tool result —
+        // long thoughts get head+tail compressed identically.
+        ToolHandlerResult::ok(format!("noted: {thought}"))
+    }
+}
+
 /// `read_source` — fetch the exact source bytes a claim cites.
 ///
 /// Closes the "verifiable byte range" loop required by CCC I-2 (see
@@ -1188,6 +1253,11 @@ pub async fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
             UseSkillTool::spec(),
             Arc::new(UseSkillTool::new(ctx.clone())),
         )
+        // Anthropic `think` tool — no-op reasoning scratchpad. Read-
+        // class because it never mutates state. Registered before the
+        // first write tool so the model sees it as the first
+        // "thinking" affordance in tools/list.
+        .register_read(ThinkTool::spec(), Arc::new(ThinkTool::new()))
         .register_read(
             ReadSourceTool::spec(),
             Arc::new(ReadSourceTool::new(ctx.clone())),
@@ -1463,6 +1533,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn think_tool_echoes_thought_as_observation() {
+        // Anthropic's `think` tool pattern (2025): explicit no-op
+        // scratchpad. The handler returns the thought back so the
+        // LLM sees its own reasoning as an observation on the next
+        // turn.
+        let handler = ThinkTool::new();
+        let res = handler
+            .handle(json!({"thought": "I should call list_branches first to enumerate forks before merging."}))
+            .await;
+        assert!(!res.is_error);
+        assert!(res.content.starts_with("noted:"));
+        assert!(res.content.contains("list_branches"));
+        assert!(res.content.contains("merging"));
+    }
+
+    #[tokio::test]
+    async fn think_tool_rejects_missing_thought_field() {
+        let handler = ThinkTool::new();
+        let res = handler.handle(json!({})).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("thought"));
+    }
+
+    #[tokio::test]
+    async fn think_tool_spec_advertises_no_side_effects() {
+        // The schema description must tell the LLM the tool is a
+        // reasoning scratchpad, not a substrate query.
+        let spec = ThinkTool::spec();
+        let json = serde_json::to_string(&spec.input_schema).unwrap();
+        // Spec carries `thought` as a required string field.
+        assert!(json.contains("thought"));
+        // Description hint: scratchpad, no I/O.
+        assert!(
+            spec.description.contains("scratchpad")
+                || spec.description.contains("Internal"),
+            "description must signal no side effects, got: {}",
+            spec.description
+        );
+    }
+
+    #[tokio::test]
     async fn register_builtin_tools_includes_all_hand_wrapped() {
         let ctx = fixture_ctx();
         let registry = register_builtin_tools(ctx).await;
@@ -1492,6 +1603,7 @@ mod tests {
             "save_note",
             "search",
             "search_claims",
+            "think",
             "trash_files",
             "use_skill",
             "workspace_info",
@@ -1515,6 +1627,7 @@ mod tests {
             "list_claims",
             "workspace_info",
             "use_skill",
+            "think",
             "read_source",
             "read_file",
             "list_directory",

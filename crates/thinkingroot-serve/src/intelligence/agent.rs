@@ -688,35 +688,52 @@ impl Agent {
     ///   * Otherwise emits `ToolCallExecuting`, dispatches via the
     ///     registry, emits `ToolCallFinished` with the result.
     ///
-    /// Returns the [`ToolResult`] vector to append to history.
-    /// Sequential dispatch (Anthropic cookbook recommendation): keeps
-    /// the conversation shape clean and avoids tool race conditions
-    /// when tools share state (e.g. `create_branch` then
-    /// `contribute_claim` on that branch).
+    /// Returns the [`ToolResult`] vector to append to history, in the
+    /// same order as `calls`.
+    ///
+    /// **Dispatch policy (2026 SOTA, ship 2026-05-18):**
+    ///
+    ///   * **Read-class calls run concurrently** within a batch.
+    ///     When the LLM emits multiple independent reads in one
+    ///     turn (`search` + `query_claims` + `get_relations`), the
+    ///     harness fans them out via `FuturesUnordered` so the SSE
+    ///     stream isn't blocked on the slowest one. Reads are
+    ///     commutative on substrate state, so concurrent dispatch
+    ///     is safe by construction.
+    ///   * **Write-class calls run strictly sequentially.** A write
+    ///     batch (e.g. `create_branch` → `contribute_claim` on
+    ///     that branch) carries hidden dependencies through state.
+    ///     Approval flow (one prompt at a time) and ordering both
+    ///     require sequential dispatch.
+    ///   * **Mixed batch: reads then writes, both in the original
+    ///     order within their class.** The model's intent — "do
+    ///     these reads, then do these writes" — is preserved.
+    ///     Splitting on write-vs-read also keeps results aligned
+    ///     with `calls` so the history shape stays balanced.
+    ///   * **Cancellation between calls** still aborts the batch.
+    ///     A long shell_exec at call[0] followed by a write at
+    ///     call[1] does NOT run call[1] if the client disconnected
+    ///     during call[0]. Synthetic "cancelled" results keep the
+    ///     `ToolResults` vec the same length as `calls`.
     async fn dispatch_calls(
         &self,
         calls: &[ToolCall],
         sink: &mut EventSink<'_>,
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
-        let mut results: Vec<ToolResult> = Vec::with_capacity(calls.len());
-        // Cancellation between calls in a batch: a long shell_exec at
-        // call[0] followed by a remember-call at call[1] should not
-        // run call[1] if the client disconnected during call[0]. The
-        // synthetic "cancelled" result is fed back to the LLM so
-        // `history` stays balanced (every assistant_tool_calls turn
-        // has a matching tool_results turn with one entry per call).
-        let mut cancelled = false;
-        for call in calls {
-            if cancelled || cancel.is_cancelled() {
-                cancelled = true;
-                results.push(ToolResult {
-                    tool_use_id: call.id.clone(),
-                    content: "agent cancelled by client; tool dispatch skipped".to_string(),
-                    is_error: true,
-                });
-                continue;
-            }
+        // Output buffer pre-allocated so concurrent read dispatch can
+        // splice results into slots-by-index regardless of completion
+        // order. The history-shape contract requires one result per
+        // call in the same order; we preserve that invariant strictly.
+        let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
+
+        // Phase 1: emit ToolCallProposed for EVERY call (so the UI
+        // shows the full intent up front) and partition into read /
+        // write index sets. Approval gates and writes will fire in a
+        // second pass; reads kick off concurrently in a third pass.
+        let mut read_indices: Vec<usize> = Vec::new();
+        let mut write_indices: Vec<usize> = Vec::new();
+        for (i, call) in calls.iter().enumerate() {
             let is_write = self.registry.is_write(&call.name);
             self.emit(
                 sink,
@@ -728,6 +745,109 @@ impl Agent {
                 },
             )
             .await;
+            if is_write {
+                write_indices.push(i);
+            } else {
+                read_indices.push(i);
+            }
+        }
+
+        // Phase 2: parallel read dispatch. Honours cancellation by
+        // racing every read against the shared CancellationToken —
+        // if the client disconnects mid-batch, every in-flight read
+        // unwinds at the next await point and we slot synthetic
+        // "cancelled" results into the remaining holes.
+        //
+        // We DO NOT run reads inside the same join scope as writes
+        // because writes can stall on a 5-min approval prompt; the
+        // user expects read results back quickly even when a write
+        // is gating later in the batch.
+        if !read_indices.is_empty() {
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut in_flight: FuturesUnordered<_> = read_indices
+                .iter()
+                .map(|&i| {
+                    let call = &calls[i];
+                    let registry = self.registry.clone();
+                    let cancel_clone = cancel.clone();
+                    let id = call.id.clone();
+                    let name = call.name.clone();
+                    let input = call.input.clone();
+                    async move {
+                        let res = tokio::select! {
+                            biased;
+                            _ = cancel_clone.cancelled() => {
+                                crate::intelligence::tools::ToolHandlerResult::error(
+                                    "agent cancelled by client; tool dispatch aborted",
+                                )
+                            }
+                            r = registry.dispatch(&name, input) => r,
+                        };
+                        (i, id, name, res)
+                    }
+                })
+                .collect();
+
+            while let Some((i, id, name, res)) = in_flight.next().await {
+                // Emit Executing + Finished pair. Pre-fix we emitted
+                // Executing right before dispatch, sequentially; the
+                // parallel path emits them after each read completes
+                // so the UI sees "running… done" pairs cleanly in
+                // completion order. The CALLS themselves still went
+                // out concurrently — emission order reflects who
+                // finished first, which is the honest signal.
+                self.emit(
+                    sink,
+                    AgentEvent::ToolCallExecuting {
+                        id: id.clone(),
+                        name: name.clone(),
+                    },
+                )
+                .await;
+                let truncation = truncate_tool_result_with_stats(
+                    res.content.clone(),
+                    DEFAULT_TOOL_RESULT_TOKEN_BUDGET,
+                );
+                self.emit(
+                    sink,
+                    AgentEvent::ToolCallFinished {
+                        id: id.clone(),
+                        name,
+                        content: res.content,
+                        is_error: res.is_error,
+                        llm_truncated: truncation.truncated,
+                        llm_content_bytes: truncation.llm_bytes,
+                        original_content_bytes: truncation.original_bytes,
+                    },
+                )
+                .await;
+                results[i] = Some(ToolResult {
+                    tool_use_id: id,
+                    content: truncation.bounded,
+                    is_error: res.is_error,
+                });
+            }
+        }
+
+        // Phase 3: sequential write dispatch with approval gate.
+        // The original "sequential, cancel-aware, approval-gated"
+        // flow is preserved verbatim — only the loop bounds change
+        // from `calls.iter()` to `write_indices.iter()`.
+        let mut cancelled = false;
+        for &i in &write_indices {
+            let call = &calls[i];
+            if cancelled || cancel.is_cancelled() {
+                cancelled = true;
+                results[i] = Some(ToolResult {
+                    tool_use_id: call.id.clone(),
+                    content: "agent cancelled by client; tool dispatch skipped".to_string(),
+                    is_error: true,
+                });
+                continue;
+            }
+            // Re-bind so the existing flow below reads identically to
+            // pre-refactor. `is_write` is known true here.
+            let is_write = true;
 
             if is_write {
                 // `call.id` is the LLM-supplied tool_use_id. Threading
@@ -766,7 +886,7 @@ impl Agent {
                     // Feed rejection back to the model as a tool
                     // error so it can adapt (apologise, ask, etc.)
                     // rather than crashing.
-                    results.push(ToolResult {
+                    results[i] = Some(ToolResult {
                         tool_use_id: call.id.clone(),
                         content: format!("user declined: {reason}"),
                         is_error: true,
@@ -836,13 +956,39 @@ impl Agent {
                 },
             )
             .await;
-            results.push(ToolResult {
+            results[i] = Some(ToolResult {
                 tool_use_id: call.id.clone(),
                 content: truncation.bounded,
                 is_error: res.is_error,
             });
         }
+
+        // Collapse Vec<Option<ToolResult>> to Vec<ToolResult>. Every
+        // slot is guaranteed filled by construction: every call hit
+        // either the read-path branch, the write-path branch, or the
+        // cancellation early-out. A panic here would indicate the
+        // partitioning above missed a slot (programmer bug).
         results
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                slot.unwrap_or_else(|| {
+                    // Defence-in-depth: a missing slot shouldn't
+                    // crash the conversation. Synthesize an error
+                    // result so the history shape stays balanced
+                    // and the model sees a coherent signal.
+                    tracing::error!(
+                        "agent dispatch: result slot {i} not filled — partitioning bug; \
+                         synthesizing error result so history stays balanced"
+                    );
+                    ToolResult {
+                        tool_use_id: calls[i].id.clone(),
+                        content: "internal: dispatch slot unfilled".to_string(),
+                        is_error: true,
+                    }
+                })
+            })
+            .collect()
     }
 }
 

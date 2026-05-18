@@ -5361,6 +5361,109 @@ async fn ask_stream_handler(
 // `approval_requested` SSE event so the desktop UI can render its
 // claim card. The UI then POSTs the decision to
 // `/ask/approval/{tool_use_id}`.
+
+/// Project a [`thinkingroot_core::recovery_log::RecoveryEvent`] onto
+/// the slim [`crate::intelligence::reminder_bus::RecoveryEventBrief`]
+/// used by the reactive bus. Pure formatter — no I/O, no allocation
+/// beyond the strings themselves. Used by `agent_stream_response`
+/// to surface "compile breaker tripped 12s ago" style context to the
+/// operator-mode AI without polling.
+fn recovery_event_brief(
+    ev: &thinkingroot_core::recovery_log::RecoveryEvent,
+) -> crate::intelligence::reminder_bus::RecoveryEventBrief {
+    use thinkingroot_core::recovery_log::RecoveryEventKind as K;
+    let (kind, workspace, summary) = match &ev.kind {
+        K::Respawn {
+            attempt,
+            backoff_ms,
+            reason,
+        } => (
+            "respawn",
+            None,
+            format!("attempt {attempt} after {backoff_ms}ms ({reason})"),
+        ),
+        K::RespawnOk { new_pid } => ("respawn_ok", None, format!("new pid {new_pid}")),
+        K::StaleLockCleanup { dead_pid } => (
+            "stale_lock_cleanup",
+            None,
+            format!("removed cortex.lock owned by dead pid {dead_pid}"),
+        ),
+        K::PortAdvance { from, to, reason } => (
+            "port_advance",
+            None,
+            format!("port {from} → {to} ({reason})"),
+        ),
+        K::ManifestRebuild { binaries_found } => (
+            "manifest_rebuild",
+            None,
+            format!("rebuilt install manifest from disk scan ({binaries_found} binaries found)"),
+        ),
+        K::CircuitBreakerTripped {
+            consecutive_failures,
+            until_rfc3339,
+        } => (
+            "circuit_breaker_tripped",
+            None,
+            format!(
+                "{consecutive_failures} consecutive failures — daemon respawn paused until {until_rfc3339}"
+            ),
+        ),
+        K::CircuitBreakerReset { reason } => (
+            "circuit_breaker_reset",
+            None,
+            format!("breaker cleared ({reason})"),
+        ),
+        K::BinaryChecksumMismatch { path, .. } => (
+            "binary_checksum_mismatch",
+            None,
+            format!("BLAKE3 mismatch at {}", path.display()),
+        ),
+        K::CompileFailed {
+            workspace,
+            error,
+            retry_attempt,
+        } => (
+            "compile_failed",
+            Some(workspace.clone()),
+            format!("retry {retry_attempt}: {error}"),
+        ),
+        K::CompileRetryScheduled {
+            workspace,
+            attempt,
+            backoff_ms,
+        } => (
+            "compile_retry_scheduled",
+            Some(workspace.clone()),
+            format!("retry {attempt} scheduled in {backoff_ms}ms"),
+        ),
+        K::CompileBreakerTripped {
+            workspace,
+            consecutive_failures,
+            until_rfc3339,
+        } => (
+            "compile_breaker_tripped",
+            Some(workspace.clone()),
+            format!(
+                "{consecutive_failures} consecutive compile failures — paused until {until_rfc3339}"
+            ),
+        ),
+        K::CompileRecovered {
+            workspace,
+            retry_attempt,
+        } => (
+            "compile_recovered",
+            Some(workspace.clone()),
+            format!("compile succeeded on retry {retry_attempt}"),
+        ),
+    };
+    crate::intelligence::reminder_bus::RecoveryEventBrief {
+        kind: kind.to_string(),
+        workspace,
+        at_iso: ev.ts.to_rfc3339(),
+        summary,
+    }
+}
+
 async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskRequest) -> Response {
     use crate::intelligence::agent::AgentEvent;
     use crate::intelligence::agent_streaming::{
@@ -5561,9 +5664,17 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // - tool_budget: NOT wired yet (needs agent-loop iteration plumbing —
     //   v1.1 work). Passes None so the budget block stays suppressed.
     use crate::intelligence::reminder_bus::{
-        BranchSummary, EngramHandle, ReminderContext, render_reactive_reminders,
+        AgentmemoryRecall, BranchSummary, EngramHandle, McpSessionBrief, RecoveryEventBrief,
+        RelevantSkill, ReminderContext, render_reactive_reminders,
     };
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // World-class prompt foundation (ship 2026-05-18): environment
+    // gathering — Claude Code's `computeSimpleEnvInfo` pattern. Fixes
+    // the "AI can't find Desktop" class of bugs by giving the LLM
+    // explicit cwd/$HOME/~/Desktop/etc. context every turn.
+    let environment_info = crate::intelligence::environment::gather();
+
     let session_snapshot: Option<crate::intelligence::session::SessionContext> = {
         let map = state.sessions.lock().await;
         map.get(&conversation_id).cloned()
@@ -5597,7 +5708,115 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         }
         crate::intelligence::sandbox_classifier::SandboxIntent::NoAction => None,
     };
+
+    // Cross-session agentmemory recall (Mem0/Letta-style auto-surface):
+    // call the engine's search primitive on the user's question and
+    // inject the top-3 most-relevant prior claims as a
+    // `<system-reminder>`. Uses the same retrieval the agent would
+    // call manually — substrate-as-ground-truth contract preserved.
+    // Empty / errored result paths are honest: we surface nothing
+    // rather than fabricating a hit.
+    let agentmemory_recalls: Vec<AgentmemoryRecall> = {
+        let engine = state.engine.read().await;
+        match engine.search(&ws, &body.question, 3).await {
+            Ok(result) => result
+                .claims
+                .into_iter()
+                .map(|h| AgentmemoryRecall {
+                    claim_id: h.id,
+                    statement: if h.statement.len() > 240 {
+                        let mut cut = 237;
+                        while !h.statement.is_char_boundary(cut) && cut > 0 {
+                            cut -= 1;
+                        }
+                        format!("{}…", &h.statement[..cut])
+                    } else {
+                        h.statement
+                    },
+                    confidence: h.confidence,
+                    source_uri: h.source_uri,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // MCP telemetry snapshot — connected AI tools surfaced for
+    // operator-mode cross-tool awareness. Skipped on Memory persona
+    // via the prompt-layer composition (compose_full_system_prompt
+    // excludes OPERATOR_DEBUGGER_SECTION for Memory); here we still
+    // gather + pass, the bus suppresses on empty slices anyway.
+    let mcp_sessions: Vec<McpSessionBrief> = {
+        match crate::mcp::telemetry::global_map() {
+            Some(map) => {
+                let snap = map.read().await;
+                snap.values()
+                    .map(|s| {
+                        let user_agent = match &s.principal {
+                            crate::mcp::telemetry::PrincipalKind::InAppAgent => {
+                                "in-app".to_string()
+                            }
+                            crate::mcp::telemetry::PrincipalKind::McpClient { user_agent } => {
+                                user_agent.clone()
+                            }
+                            crate::mcp::telemetry::PrincipalKind::AgentMemory {
+                                user_agent,
+                                ..
+                            } => user_agent.clone(),
+                        };
+                        let transport = match s.transport {
+                            crate::mcp::telemetry::TransportKind::Sse => "sse",
+                            crate::mcp::telemetry::TransportKind::Stdio => "stdio",
+                            crate::mcp::telemetry::TransportKind::AgentMemory => "agentmemory",
+                        };
+                        let prefix_len = s.session_id.len().min(12);
+                        McpSessionBrief {
+                            session_id_prefix: s.session_id[..prefix_len].to_string(),
+                            user_agent,
+                            transport: transport.to_string(),
+                            tool_calls_total: s.tool_calls_total,
+                            errors_total: s.errors_total,
+                        }
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    };
+
+    // Substrate health — recent recovery-log events (last 5 min)
+    // so the operator-mode AI proactively notices wedged state
+    // without polling `recovery_log_tail`. Filter is best-effort:
+    // we tail the last 50 and keep only those within the recency
+    // window. Empty result = healthy substrate.
+    let recovery_events: Vec<RecoveryEventBrief> = {
+        match thinkingroot_core::recovery_log::tail(50) {
+            Ok(events) => {
+                let now = chrono::Utc::now();
+                let window = chrono::Duration::minutes(5);
+                events
+                    .into_iter()
+                    .filter(|ev| now.signed_duration_since(ev.ts) <= window)
+                    .map(|ev| recovery_event_brief(&ev))
+                    .collect::<Vec<_>>()
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    // Skill body auto-surface (tiered disclosure): keyword-overlap
+    // classifier against the user's message picks the top-1 skill
+    // and inlines its body. Beats the manifest-only model (which
+    // costs a `use_skill` round-trip on the common case). Returns
+    // None when no skill scores above the threshold.
+    let relevant_skill_pick = skills.pick_relevant(&body.question);
+    let relevant_skill = relevant_skill_pick.map(|s| RelevantSkill {
+        name: s.name.as_str(),
+        body: s.body.as_str(),
+    });
+
     let bus_ctx = ReminderContext {
+        environment: Some(&environment_info),
         identity: identity.as_ref(),
         today: Some(&today_str),
         session: session_snapshot.as_ref(),
@@ -5607,6 +5826,10 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         tool_budget_remaining: None,
         tool_budget_max: None,
         sandbox_recommendation: sandbox_reason,
+        agentmemory_recalls: &agentmemory_recalls,
+        mcp_sessions: &mcp_sessions,
+        recovery_events: &recovery_events,
+        relevant_skill,
     };
     let bus_prefix = render_reactive_reminders(&bus_ctx);
     let user_question = if bus_prefix.is_empty() {
