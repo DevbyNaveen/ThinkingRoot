@@ -641,6 +641,20 @@ fn handle_crash_and_respawn<R: Runtime>(
                 restart_state.record_respawn(pid);
                 let _ = recovery_log::append(&RecoveryEvent::respawn_ok(pid));
                 tracing::info!(pid, "auto-restart succeeded");
+                // Emit the recovery-complete signal so the EngineGate
+                // can clear its `restarting` banner and the workspace-
+                // status subscription can re-subscribe to the new
+                // daemon. Pre-fix the UI saw `restarting` and never a
+                // matching "we're back" event — the banner stuck for
+                // the rest of the session and downstream subscribers
+                // never knew to re-fetch.
+                let _ = app.emit(
+                    "engine_status_changed",
+                    serde_json::json!({
+                        "status": "healthy",
+                        "pid": pid,
+                    }),
+                );
             }
             None => {
                 restart_state.record_spawn_failed();

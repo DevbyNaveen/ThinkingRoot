@@ -154,6 +154,16 @@ pub const GLOB_MAX_RESULTS: usize = 1000;
 /// Maximum grep matches returned in a single call.
 pub const GREP_MAX_MATCHES: usize = 500;
 
+/// Maximum wall-time a single `glob_search` / `grep_search` call may
+/// burn before the handler returns a `Timeout` error. Picked at 30 s
+/// so a routine `glob` over `~/Desktop` or a small repo finishes
+/// instantly; a recursive scan of `$HOME` against an unbounded
+/// pattern gets cut off with a structured error the agent can adapt
+/// to (e.g. "narrow the base or pattern"). 30 s also stays well
+/// inside the `SSE_STALL_WATCHDOG = 60 s` budget so the desktop's
+/// compile/agent UI never observes a stall waiting on a wedged glob.
+pub const SYS_POWER_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ─── Error type ────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +185,13 @@ pub enum SystemPowerError {
         pattern: String,
         #[source]
         source: globset::Error,
+    },
+    #[error(
+        "`{tool}` timed out after {limit_secs}s — narrow the base directory or use a more specific pattern. Hint: try `sys_stat` for a single-path existence check, or scope the `base` to a sub-folder."
+    )]
+    Timeout {
+        tool: &'static str,
+        limit_secs: u64,
     },
     #[error("invalid regex pattern `{pattern}`: {source}")]
     InvalidRegex {
@@ -440,7 +457,7 @@ pub async fn glob_search(
     let base_owned = base.to_path_buf();
     let pattern_owned = pattern.to_string();
 
-    let (matches, truncated) = tokio::task::spawn_blocking(move || {
+    let walk = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         let mut truncated = false;
         for entry in ignore::Walk::new(&base_owned).flatten() {
@@ -460,9 +477,18 @@ pub async fn glob_search(
             }
         }
         (out, truncated)
-    })
-    .await
-    .unwrap_or_else(|_| (Vec::new(), false));
+    });
+
+    let (matches, truncated) = match tokio::time::timeout(SYS_POWER_WALL_TIMEOUT, walk).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => (Vec::new(), false),
+        Err(_) => {
+            return Err(SystemPowerError::Timeout {
+                tool: "glob",
+                limit_secs: SYS_POWER_WALL_TIMEOUT.as_secs(),
+            });
+        }
+    };
 
     Ok(GlobOutcome {
         pattern: pattern_owned,
@@ -503,46 +529,55 @@ pub async fn grep_search(
     let base_owned = base.to_path_buf();
     let pattern_owned = pattern.to_string();
 
-    let (matches, files_scanned, truncated) =
-        tokio::task::spawn_blocking(move || -> (Vec<GrepMatch>, usize, bool) {
-            let mut matches = Vec::new();
-            let mut files_scanned = 0usize;
-            let mut truncated = false;
-            'walk: for entry in ignore::Walk::new(&base_owned).flatten() {
-                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                files_scanned += 1;
-                let content = match std::fs::read_to_string(entry.path()) {
-                    Ok(c) => c,
-                    Err(_) => continue, // binary or unreadable
-                };
-                for (i, line) in content.lines().enumerate() {
-                    if regex.is_match(line) {
-                        let resolved = std::fs::canonicalize(entry.path())
-                            .unwrap_or_else(|_| entry.path().to_path_buf());
-                        matches.push(GrepMatch {
-                            path: resolved.display().to_string(),
-                            line_number: (i + 1) as u32,
-                            // Trim very long lines so a 10MB minified
-                            // file doesn't blow up the LLM context.
-                            line: if line.len() > 400 {
-                                format!("{}…", &line[..400])
-                            } else {
-                                line.to_string()
-                            },
-                        });
-                        if matches.len() >= GREP_MAX_MATCHES {
-                            truncated = true;
-                            break 'walk;
-                        }
+    let walk = tokio::task::spawn_blocking(move || -> (Vec<GrepMatch>, usize, bool) {
+        let mut matches = Vec::new();
+        let mut files_scanned = 0usize;
+        let mut truncated = false;
+        'walk: for entry in ignore::Walk::new(&base_owned).flatten() {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            files_scanned += 1;
+            let content = match std::fs::read_to_string(entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue, // binary or unreadable
+            };
+            for (i, line) in content.lines().enumerate() {
+                if regex.is_match(line) {
+                    let resolved = std::fs::canonicalize(entry.path())
+                        .unwrap_or_else(|_| entry.path().to_path_buf());
+                    matches.push(GrepMatch {
+                        path: resolved.display().to_string(),
+                        line_number: (i + 1) as u32,
+                        // Trim very long lines so a 10MB minified
+                        // file doesn't blow up the LLM context.
+                        line: if line.len() > 400 {
+                            format!("{}…", &line[..400])
+                        } else {
+                            line.to_string()
+                        },
+                    });
+                    if matches.len() >= GREP_MAX_MATCHES {
+                        truncated = true;
+                        break 'walk;
                     }
                 }
             }
-            (matches, files_scanned, truncated)
-        })
-        .await
-        .unwrap_or_else(|_| (Vec::new(), 0, false));
+        }
+        (matches, files_scanned, truncated)
+    });
+
+    let (matches, files_scanned, truncated) =
+        match tokio::time::timeout(SYS_POWER_WALL_TIMEOUT, walk).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => (Vec::new(), 0, false),
+            Err(_) => {
+                return Err(SystemPowerError::Timeout {
+                    tool: "grep",
+                    limit_secs: SYS_POWER_WALL_TIMEOUT.as_secs(),
+                });
+            }
+        };
 
     Ok(GrepOutcome {
         pattern: pattern_owned,

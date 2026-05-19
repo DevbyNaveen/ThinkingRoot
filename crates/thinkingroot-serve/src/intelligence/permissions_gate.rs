@@ -174,6 +174,74 @@ impl PermissionsGate {
                 .map(|s| vec![path_subject(s, false)])
                 .unwrap_or_default(),
 
+            // System-fs absolute-path mutations. Both source(s) and
+            // destination contribute subjects so DEFAULT_DENY fires
+            // on either side. `allow_nonexistent: true` for
+            // sys_create_folder + sys_move's dest leaf in case the
+            // user is creating a fresh target — the inner
+            // sys_fs_ops handler will reject if needed.
+            "sys_create_folder" => input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![path_subject(s, true)])
+                .unwrap_or_default(),
+            "sys_rename" => input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![path_subject(s, false)])
+                .unwrap_or_default(),
+            "sys_move" => {
+                // Subjects are the rows the operation actually
+                // mutates. For each source, that's BOTH the source
+                // (read + unlink) and the projected target path
+                // `dest_folder/<leaf-of-source>` (write). We
+                // deliberately do NOT add `dest_folder` itself as a
+                // subject — a user rule `~/Desktop/**` should cover
+                // "moving into Desktop" via the target path
+                // (`~/Desktop/foo`) which matches the glob, even
+                // though the dest_folder (`~/Desktop`) does not.
+                // Without this, a sane rule fails to auto-approve
+                // a move whose only privileged action is creating
+                // a child path the rule already covers.
+                let mut subjects = Vec::new();
+                let sources = input
+                    .get("sources")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let dest_folder = input
+                    .get("dest_folder")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                for src in &sources {
+                    subjects.push(path_subject(src, false));
+                    if let Some(ref dest) = dest_folder {
+                        // Compute target = dest_folder + leaf-of(src).
+                        // `Path::file_name` returns the last component
+                        // regardless of trailing slashes; falls back
+                        // to skipping the projected target on weird
+                        // inputs (e.g. `/`) so we don't add an empty
+                        // subject. allow_nonexistent: true because
+                        // the target leaf is by definition newly
+                        // created.
+                        if let Some(leaf) = std::path::Path::new(src).file_name() {
+                            let trimmed_dest = dest.trim_end_matches('/');
+                            let target = format!(
+                                "{}/{}",
+                                trimmed_dest,
+                                leaf.to_string_lossy()
+                            );
+                            subjects.push(path_subject(&target, true));
+                        }
+                    }
+                }
+                subjects
+            }
+
             "trash" => input
                 .get("paths")
                 .and_then(|v| v.as_array())
@@ -282,7 +350,31 @@ impl PermissionsGate {
     /// leaf doesn't exist the parent is canonicalised and the leaf
     /// is appended literally — this is the file-creation path.
     fn canonicalize_subject(raw: &str, allow_nonexistent: bool) -> Result<std::path::PathBuf, ApprovalDecision> {
-        let p = Path::new(raw);
+        // Tilde expansion: the agent's MCP wire format accepts
+        // `~/Desktop/foo` literally (see `sys_fs_ops::parse_absolute_input`).
+        // Without expansion here, `canonicalize_for_policy("~/Desktop/foo")`
+        // fails because the OS doesn't expand `~`, and the gate rejects
+        // every tilde-shaped subject before the handler ever runs.
+        // Mirrors the same `~` / `~/...` handling — `~user` unsupported.
+        let expanded: std::path::PathBuf = if let Some(rest) = raw.strip_prefix('~') {
+            if let Some(home) = dirs::home_dir() {
+                if rest.is_empty() {
+                    home
+                } else if let Some(tail) = rest.strip_prefix('/') {
+                    home.join(tail)
+                } else {
+                    // `~user/...` — not supported; leave literal so the
+                    // existing canonicalise path produces the same
+                    // honest "cannot canonicalise" error.
+                    std::path::PathBuf::from(raw)
+                }
+            } else {
+                std::path::PathBuf::from(raw)
+            }
+        } else {
+            std::path::PathBuf::from(raw)
+        };
+        let p: &Path = &expanded;
         match canonicalize_for_policy(p) {
             Ok(canonical) => Ok(canonical),
             Err(PathPolicyError::NotFound { .. }) if allow_nonexistent => {

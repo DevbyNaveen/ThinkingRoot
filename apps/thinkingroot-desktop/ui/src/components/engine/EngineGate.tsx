@@ -67,7 +67,7 @@ interface DoctorReport {
 // circuit_breaker_until }`. The install-manifest branch also emits
 // `{ status: "repair_needed", failing_check_ids }`.
 interface EngineStatusEventPayload {
-  status: "repair_needed" | "stopped" | "crashed" | "restarting";
+  status: "repair_needed" | "stopped" | "crashed" | "restarting" | "healthy";
   failing_check_ids?: string[];
   exit_code?: number | null;
   // Slice F T2 — restart attempt counter (1..=4) + the wall-clock the
@@ -76,6 +76,12 @@ interface EngineStatusEventPayload {
   backoff_ms?: number;
   // Slice F T3 — RFC3339 timestamp set when the breaker tripped.
   circuit_breaker_until?: string | null;
+  // Post-respawn recovery signal — the watchdog emits this after
+  // `respawn_ok` so the UI can clear the `restarting` banner and
+  // downstream subscribers (workspace status, recovery feed) can
+  // re-fetch against the fresh daemon. Without this event the
+  // banner persisted forever once shown.
+  pid?: number;
 }
 
 // Transient side-state for the in-progress restart banner. Lives
@@ -220,6 +226,18 @@ export function EngineGate({ children }: EngineGateProps) {
         // Clean SIGTERM — usually app shutdown. Leave the UI alone.
         // Also clear any lingering banner; we won't be restarting.
         setRestartInfo(null);
+        return;
+      }
+      if (payload.status === "healthy") {
+        // Post-respawn recovery — drop the banner, flip the gate
+        // back to healthy, and re-pull the doctor report so any
+        // downstream state (workspace status, restart counters)
+        // refreshes against the new daemon. Pre-fix the watchdog
+        // never emitted this; the banner stuck and the workspace
+        // status subscription kept rendering the pre-crash snapshot.
+        setRestartInfo(null);
+        setEngineStatus("healthy");
+        void refreshReport();
         return;
       }
       // crashed / repair_needed → terminal states; banner should

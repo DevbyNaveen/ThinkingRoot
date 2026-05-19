@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod pipeline;
 pub mod rest;
 pub mod structural_persist;
+pub mod sys_fs_ops;
 pub mod system_power;
 pub mod tokenjuice;
 pub mod workspace_state;

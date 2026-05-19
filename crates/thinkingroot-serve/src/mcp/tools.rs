@@ -1122,6 +1122,75 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["paths"]
                 }
+            },
+            // ── System filesystem (absolute paths, sibling of fs_*) ──
+            // The `fs_*` family is workspace-bounded — every path is
+            // resolved against `engine.workspace_root_path(ws)`. The
+            // `sys_*` family below operates on absolute paths so the
+            // agent can move/rename/list/stat anywhere on disk the
+            // PermissionsGate DEFAULT_DENY shortlist allows. `~` is
+            // expanded against the daemon user's HOME. Read-class
+            // tools (`sys_stat`, `sys_list`) enforce the DEFAULT_DENY
+            // shortlist directly in the handler rather than going
+            // through the approval flow; write-class tools
+            // (`sys_move`, `sys_rename`, `sys_create_folder`) route
+            // through the gate AND the handler's own check.
+            {
+                "name": "sys_stat",
+                "description": "Cheap absolute-path existence + metadata check — `{exists, is_dir, is_file, is_symlink, size_bytes, modified}`. Returns `exists: false` for missing paths (NOT an error). Use this BEFORE proposing a write (e.g. `sys_move`) to confirm source and destination paths resolve. Faster + bounded compared to `glob`/`shell_exec` for path verification. Path is absolute; `~` is expanded against the user's HOME. Refuses sensitive paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/Library/Keychains`, `/etc`, …).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path or tilde-expanded path (e.g. `/Users/alice/Desktop/foo`, `~/Documents/bar`)." }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "sys_list",
+                "description": "List the contents of an absolute-path directory. Same shape as `fs_list` (entries sorted dirs-first then name-asc) but operates outside any workspace root. `~` is expanded. Refuses sensitive paths. Use this when the user asks about a folder on their Desktop / Documents / Downloads / external drives.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute directory path. `~` is expanded against the user's HOME." }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "sys_create_folder",
+                "description": "Create a new directory at an absolute path. Parent must already exist; collisions are an error (no silent overwrite). Refuses sensitive paths.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute path of the new folder. `~` is expanded." }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "sys_rename",
+                "description": "Rename a file or folder in-place at an absolute path. `new_name` is a single leaf segment (no `/`, no `..`). Refuses collisions. Refuses sensitive paths (both source and post-rename destination).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":     { "type": "string", "description": "Absolute path to the existing item. `~` is expanded." },
+                        "new_name": { "type": "string", "description": "New leaf name. Single path segment." }
+                    },
+                    "required": ["path", "new_name"]
+                }
+            },
+            {
+                "name": "sys_move",
+                "description": "Move one or more files/folders into an absolute destination folder. Skips collisions honestly (counts them as `skipped_conflict`) — silent overwrite is the kind of 'helpful' that loses work. Returns `{moved, skipped_conflict, skipped_invalid, moved_paths, per_source_reason}` so the agent can report accurately. Handles cross-device moves (`EXDEV`) via copy-then-delete. Refuses sensitive paths.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sources":     { "type": "array", "items": { "type": "string" }, "description": "Absolute paths of items to move. `~` is expanded." },
+                        "dest_folder": { "type": "string", "description": "Absolute path of the destination directory (must already exist)." }
+                    },
+                    "required": ["sources", "dest_folder"]
+                }
             }
         ]
     });
@@ -2603,6 +2672,13 @@ pub async fn handle_call(
         "fs_create_folder" => handle_fs_create_folder(id, &arguments, engine, ws).await,
         "fs_rename" => handle_fs_rename(id, &arguments, engine, ws).await,
         "fs_move" => handle_fs_move(id, &arguments, engine, ws).await,
+
+        // ── System filesystem (absolute paths) ───────────────────────
+        "sys_stat" => handle_sys_stat(id, &arguments).await,
+        "sys_list" => handle_sys_list(id, &arguments).await,
+        "sys_create_folder" => handle_sys_create_folder(id, &arguments).await,
+        "sys_rename" => handle_sys_rename(id, &arguments).await,
+        "sys_move" => handle_sys_move(id, &arguments).await,
 
         // ── Phase D Wave 1 — system-power tool dispatch ─────────────
         "file_read"       => handle_file_read(id, &arguments).await,
@@ -4474,6 +4550,98 @@ async fn handle_fs_move(
     match crate::fs_ops::move_paths(&root, sources, &dest_folder) {
         Ok(outcome) => mcp_text_result(id, &outcome),
         Err(msg) => JsonRpcResponse::error(id, -32603, msg),
+    }
+}
+
+// ─── System-wide filesystem handlers (absolute paths) ───────────────
+//
+// These mirror the workspace-bound `fs_*` handlers but accept absolute
+// paths. The pure logic lives in `crate::sys_fs_ops`; the sensitive-
+// path block (DEFAULT_DENY equivalent) is enforced there so the
+// read-class tools (`sys_stat`, `sys_list`) keep their fast-path
+// while still honouring the `~/.ssh` / `~/.aws` / etc. shortlist.
+
+fn sys_err_to_response(id: Option<Value>, err: crate::sys_fs_ops::SysFsError) -> JsonRpcResponse {
+    use crate::sys_fs_ops::SysFsError;
+    match err {
+        SysFsError::InvalidPath(_) | SysFsError::SensitivePath(_) | SysFsError::NotFound(_)
+        | SysFsError::NotADirectory(_) | SysFsError::AlreadyExists(_) => {
+            JsonRpcResponse::error(id, -32602, err.to_string())
+        }
+        SysFsError::Io(_, _) => JsonRpcResponse::error(id, -32603, err.to_string()),
+    }
+}
+
+async fn handle_sys_stat(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "sys_stat", "path"),
+    };
+    match crate::sys_fs_ops::sys_stat(path) {
+        Ok(stat) => mcp_text_result(id, &stat),
+        Err(e) => sys_err_to_response(id, e),
+    }
+}
+
+async fn handle_sys_list(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "sys_list", "path"),
+    };
+    match crate::sys_fs_ops::sys_list(path) {
+        Ok(listing) => mcp_text_result(id, &listing),
+        Err(e) => sys_err_to_response(id, e),
+    }
+}
+
+async fn handle_sys_create_folder(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "sys_create_folder", "path"),
+    };
+    match crate::sys_fs_ops::sys_create_folder(path) {
+        Ok(created) => mcp_text_result(id, &serde_json::json!({ "path": created })),
+        Err(e) => sys_err_to_response(id, e),
+    }
+}
+
+async fn handle_sys_rename(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return sp_missing_arg(id, "sys_rename", "path"),
+    };
+    let new_name = match arguments.get("new_name").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return sp_missing_arg(id, "sys_rename", "new_name"),
+    };
+    match crate::sys_fs_ops::sys_rename(path, new_name) {
+        Ok(p) => mcp_text_result(id, &serde_json::json!({ "path": p })),
+        Err(e) => sys_err_to_response(id, e),
+    }
+}
+
+async fn handle_sys_move(id: Option<Value>, arguments: &Value) -> JsonRpcResponse {
+    let sources: Vec<String> = match arguments.get("sources").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        None => return sp_missing_arg(id, "sys_move", "sources"),
+    };
+    if sources.is_empty() {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "sys_move: `sources` must contain at least one absolute path".to_string(),
+        );
+    }
+    let dest = match arguments.get("dest_folder").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return sp_missing_arg(id, "sys_move", "dest_folder"),
+    };
+    match crate::sys_fs_ops::sys_move(&sources, dest) {
+        Ok(outcome) => mcp_text_result(id, &outcome),
+        Err(e) => sys_err_to_response(id, e),
     }
 }
 

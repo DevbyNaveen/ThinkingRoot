@@ -1678,6 +1678,8 @@ mod tests {
             "probe_engram",
             "list_engrams",
             "fs_list",
+            "sys_stat",
+            "sys_list",
             "tool_search",
             "get_relations",
         ] {
@@ -1710,6 +1712,9 @@ mod tests {
             "fs_create_folder",
             "fs_rename",
             "fs_move",
+            "sys_create_folder",
+            "sys_rename",
+            "sys_move",
             "expire_engram",
         ] {
             assert!(

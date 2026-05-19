@@ -124,10 +124,15 @@ pub const BRIDGE_WRITE_NAMES: &[&str] = &[
     "observe_turn",
     "flush_observations",
     "synthesize_merge",
-    // Filesystem mutation
+    // Filesystem mutation (workspace-bounded)
     "fs_create_folder",
     "fs_rename",
     "fs_move",
+    // Filesystem mutation (system-wide; sensitive-path shortlist
+    // refused inside `sys_fs_ops` regardless of approval outcome)
+    "sys_create_folder",
+    "sys_rename",
+    "sys_move",
     // Engram lifecycle (mutates per-session engram store)
     "expire_engram",
     // Phase D Wave 1 — system-power tools. `file_read`, `glob`, and
