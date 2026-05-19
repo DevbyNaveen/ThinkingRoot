@@ -1112,6 +1112,32 @@ async fn mount_workspace_handler(
             "root_path must be absolute",
         );
     }
+    if !root_path.is_dir() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "ROOT_PATH_NOT_DIR",
+            &format!("root_path is not a directory: {}", root_path.display()),
+        );
+    }
+
+    // World-class fix (2026-05-19) — auto-create `<root>/.thinkingroot/`
+    // when absent. The desktop's `workspace_add` already does this via
+    // `ensure_thinkingroot_data_dir` (apps/.../commands/workspaces.rs);
+    // pre-fix the REST mount endpoint rejected bare folders with
+    // `NOT_FOUND: no .thinkingroot directory found`, forcing every SDK
+    // caller (Python `Brain.mount`, TS `Brain.mount`, raw curl) to
+    // shell out to `root init` or hand-create the dir. Mirrors `root
+    // init` (directory only; config inherits from global). Idempotent.
+    let tr_dir = root_path.join(".thinkingroot");
+    if !tr_dir.exists() {
+        if let Err(e) = tokio::fs::create_dir_all(&tr_dir).await {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MOUNT_INIT_FAILED",
+                &format!("could not create {}: {e}", tr_dir.display()),
+            );
+        }
+    }
 
     // Slice 0 — flag the actor that mount is in flight so subscribers
     // see a `Mounting` snapshot instead of jumping NotMounted → Mounted.

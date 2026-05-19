@@ -775,6 +775,30 @@ async fn replay_pack_into_storage(
             .graph
             .insert_claims_batch(&claims_to_insert)
             .map_err(|e| anyhow!("insert claims: {e}"))?;
+
+        // World-class fix (2026-05-19) — write claim→source edges.
+        // Pre-fix: `insert_claims_batch` writes the `claims` table
+        // alone; the `claim_source_edges` relation is populated by the
+        // separate `link_claims_to_sources_batch` helper. The compile
+        // pipeline (Phase 7's Linker) calls both; the mount-replay
+        // path was only calling `insert_claims_batch`, so every
+        // remounted pack ended up with `claim_source_edges` empty.
+        // Downstream impact was severe: the legacy-fallback read in
+        // `get_all_claims_with_sources` (graph.rs:4025) requires a
+        // 3-way join `claims ⨝ claim_source_edges ⨝ sources` — with
+        // no edges the join was empty and the cache reported
+        // `claim_count: 0` even though `claims` had rows on disk.
+        // Surfaced in the 2026-05-19 pack-remount E2E audit (5
+        // entities visible, each with claim_count: 1-2, but the
+        // /api/v1/ws/{ws}/claims endpoint returned []).
+        let claim_source_pairs: Vec<(String, String)> = claims_to_insert
+            .iter()
+            .map(|c| (c.id.to_string(), c.source.to_string()))
+            .collect();
+        storage
+            .graph
+            .link_claims_to_sources_batch(&claim_source_pairs)
+            .map_err(|e| anyhow!("link claims to sources: {e}"))?;
     }
 
     // Link claims to their entities via claim_entity_edges.
@@ -1036,5 +1060,22 @@ mod tests {
         // Each claim contributes (claim_id, entity_id) edges; the two
         // claims have 2+1 = 3 entity references total.
         assert_eq!(claim_ids.len(), 3);
+
+        // World-class fix (2026-05-19) — pin claim→source edges.
+        // Pre-fix the mount-replay path forgot to call
+        // `link_claims_to_sources_batch`, leaving
+        // `claim_source_edges` empty. The downstream
+        // `get_all_claims_with_sources` legacy-fallback query joins
+        // `claims ⨝ claim_source_edges ⨝ sources` and silently
+        // returned zero rows, so `cache.claim_count == 0` for every
+        // remounted pack. This assertion catches any future
+        // regression that re-drops the edge-link step.
+        let claims_with_sources = storage.graph.get_all_claims_with_sources().unwrap();
+        assert_eq!(
+            claims_with_sources.len(),
+            2,
+            "claims must remain joinable through claim_source_edges \
+             after replay — pre-2026-05-19 bug returned 0 here"
+        );
     }
 }

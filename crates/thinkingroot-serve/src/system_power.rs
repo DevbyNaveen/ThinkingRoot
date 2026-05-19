@@ -27,7 +27,17 @@ use thinkingroot_sandbox::{Sandbox, SandboxBackend, SandboxError, SandboxPolicy}
 #[derive(Debug, Clone, Serialize)]
 pub struct FileReadOutcome {
     pub path: String,
+    /// `cat -n`-style numbered content: each line prefixed with a
+    /// 6-width right-aligned 1-based line number + tab. Eliminates
+    /// the line-number-drift class of agent citation bugs surfaced
+    /// in the 2026-05-19 real-workspace audit (the LLM had to count
+    /// lines manually from raw content and slipped by ±1). Matches
+    /// the convention every major coding agent's Read tool uses, so
+    /// the LLM sees a familiar shape.
     pub content: String,
+    /// Raw file size on disk, NOT `content.len()` — the latter would
+    /// include the line-number prefix bytes and mislead callers
+    /// budgeting against the underlying file.
     pub byte_size: usize,
     pub line_count: usize,
     pub truncated: bool,
@@ -235,18 +245,36 @@ pub async fn file_read(path: &Path) -> Result<FileReadOutcome, SystemPowerError>
         path: path_str.clone(),
         source: e,
     })?;
-    let content = String::from_utf8(bytes).map_err(|_| SystemPowerError::NotUtf8 {
+    let raw = String::from_utf8(bytes).map_err(|_| SystemPowerError::NotUtf8 {
         path: path_str.clone(),
     })?;
-    let line_count = content.lines().count();
+    let line_count = raw.lines().count();
+    let content = format_with_line_numbers(&raw);
 
     Ok(FileReadOutcome {
         path: path_str,
-        byte_size: content.len(),
+        byte_size: byte_size as usize,
         line_count,
         truncated: false,
         content,
     })
+}
+
+/// `cat -n`-style numbered rendering: each line prefixed with a
+/// 6-width right-aligned 1-based line number + tab. Empty input
+/// yields an empty string. A file ending without a trailing
+/// newline still produces a final numbered line (no synthetic
+/// newline gap). Pinned by `file_read_prepends_cat_n_style_line_numbers`.
+fn format_with_line_numbers(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut out = String::with_capacity(raw.len() + lines.len() * 8);
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+    }
+    out
 }
 
 // ─── 2. file_write ──────────────────────────────────────────────────
@@ -699,9 +727,56 @@ mod tests {
         let f = tmp.path().join("hello.md");
         tokio::fs::write(&f, "line one\nline two\n").await.unwrap();
         let out = file_read(&f).await.unwrap();
-        assert_eq!(out.content, "line one\nline two\n");
+        // Content is rendered cat -n style — 6-width number + tab + line.
+        assert_eq!(out.content, "     1\tline one\n     2\tline two\n");
         assert_eq!(out.line_count, 2);
+        // byte_size is the raw-file size on disk, not the numbered length.
+        assert_eq!(out.byte_size, 18);
         assert!(!out.truncated);
+    }
+
+    #[tokio::test]
+    async fn file_read_prepends_cat_n_style_line_numbers() {
+        // Pins the 2026-05-19 fix for the line-number drift class.
+        // Real-workspace audit caught the agent slipping ±1 when it
+        // had to count lines manually from raw file_read output.
+        // cat -n style numbering eliminates this entirely — every
+        // line's number is now byte-anchored in the tool response.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("source.java");
+        tokio::fs::write(
+            &f,
+            "package foo;\n\nimport bar;\n\npublic class X {}\n",
+        )
+        .await
+        .unwrap();
+        let out = file_read(&f).await.unwrap();
+        assert_eq!(
+            out.content,
+            "     1\tpackage foo;\n     2\t\n     3\timport bar;\n     4\t\n     5\tpublic class X {}\n"
+        );
+        assert_eq!(out.line_count, 5);
+    }
+
+    #[tokio::test]
+    async fn file_read_handles_no_trailing_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        tokio::fs::write(&f, "first\nsecond").await.unwrap();
+        let out = file_read(&f).await.unwrap();
+        assert_eq!(out.content, "     1\tfirst\n     2\tsecond\n");
+        assert_eq!(out.line_count, 2);
+    }
+
+    #[tokio::test]
+    async fn file_read_empty_file_yields_empty_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("empty.txt");
+        tokio::fs::write(&f, "").await.unwrap();
+        let out = file_read(&f).await.unwrap();
+        assert_eq!(out.content, "");
+        assert_eq!(out.line_count, 0);
+        assert_eq!(out.byte_size, 0);
     }
 
     #[tokio::test]

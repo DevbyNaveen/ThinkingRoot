@@ -996,7 +996,7 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             // their own permission UX.
             {
                 "name": "file_read",
-                "description": "Read any text file on disk. Returns the content, byte size, and line count. Refuses files larger than 5 MiB and refuses binary (non-UTF-8) files — paginate or use a binary-aware tool for those. Path may be absolute or relative to CWD.",
+                "description": "Read any text file on disk. Returns content as `cat -n`-style numbered lines (6-width right-aligned 1-based line number + tab + line content + newline), the raw file's byte size on disk, and the line count. Cite line numbers directly from the content prefix — never count manually. Refuses files larger than 5 MiB and refuses binary (non-UTF-8) files — paginate or use a binary-aware tool for those. Path may be absolute or relative to CWD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
