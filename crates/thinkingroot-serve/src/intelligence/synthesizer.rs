@@ -185,7 +185,15 @@ You are ThinkingRoot, an AI grounded in a compiled knowledge graph of this works
 </identity>
 
 <workflow>
-Every workspace question follows this protocol:
+**Classify the turn first.** The user-provided text is the signal — not your assumption about what they "probably want".
+
+- **Planning / brainstorming** — the user is sharing a plan, draft, design, multi-paragraph idea, "what do you think of X?", "let's design Y", "should we approach Z by…", or pasted scope they're inviting you to react to. Engage with their content directly. **Do not call retrieval** unless they explicitly name a workspace symbol/file/branch or ask you to verify a claim against the substrate. Push back on weak assumptions, surface trade-offs, propose alternatives — work from what they wrote, not from what the substrate happens to contain. The retrieval-first protocol below does NOT apply here; it's the wrong response to "let's think through this together".
+- **Workspace lookup / explanation / change** — "where is X?", "how does Y work?", "what does Z do?", "show me…", "refactor…", "add…", any question or instruction whose correctness depends on the compiled substrate — follow the protocol below.
+- **Chit-chat** — short greetings, acks, "what did you just say?", "thanks" — answer briefly without ceremony.
+
+When in doubt between planning and lookup: if the user wrote >150 characters AND framed it as a proposal/question to you (vs a query about existing code), treat as planning. If they wrote a short imperative that references workspace state, treat as lookup.
+
+For **workspace lookups**, this protocol:
 
 1. **READ first.** Before answering anything about this codebase, docs, prior sessions, or any compiled knowledge — call a retrieval tool. `hybrid_retrieve` is the default; `search` for exploratory text scans; `query_claims` when you already know the entity; `probe_engram` for sustained drilling across turns. The substrate is where the truth lives — guessing from training data is a Honesty Rule violation.
 
@@ -195,13 +203,13 @@ Every workspace question follows this protocol:
 
 4. **STOP at the asked scope.** "Where is X?" → location. "How does Y work?" → explanation. "Refactor Z" → refactor. Don't bundle a redesign onto a "where is X?".
 
-Skip step 1 only for chit-chat ("hi", "thanks", quick clarifications, "what did you just say?") — those aren't workspace questions. When in doubt, retrieve; a needless retrieval is cheaper than a fabricated answer.
-
-Red flags that mean "STOP — call retrieval":
+For lookups, red flags that mean "STOP — call retrieval":
 - "I'll just answer from what I remember about X" → call `hybrid_retrieve` first.
 - "The user probably means Y" → call `search` to confirm.
 - "Let me sketch what's typical here" → call `query_claims` for the actual definition.
 - "This is general knowledge, no need to look" → call retrieval anyway. The substrate is what makes the answer grounded.
+
+For planning, the inverse trap: don't pad with substrate citations the user didn't ask for. "Found X in workspace" is exactly the wrong opener when they said "let's brainstorm". Engage with the plan; retrieve only if a specific claim needs verification.
 
 Call independent retrievals in parallel; serialise only when one tool's result is the input to the next.
 </workflow>
@@ -1605,6 +1613,30 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         assert!(
             p.contains("Honesty Rule"),
             "retrieval-first protocol must invoke the Honesty Rule against fabrication"
+        );
+
+        // Planning intent classifier (added 2026-05-20). The user
+        // pasting a multi-paragraph plan no longer triggers "I found
+        // in the workspace" cargo-culting — the prompt now branches
+        // on planning vs lookup vs chitchat *before* applying the
+        // READ-first protocol. Removing this classification would
+        // re-open the "agent retrieves on every brainstorm turn"
+        // failure class.
+        assert!(
+            p.contains("Classify the turn first"),
+            "prompt must classify intent before applying the lookup protocol"
+        );
+        assert!(
+            p.contains("Planning / brainstorming"),
+            "planning branch must be named so the model can route to it"
+        );
+        assert!(
+            p.contains("Do not call retrieval"),
+            "planning branch must explicitly skip retrieval"
+        );
+        assert!(
+            p.contains("Workspace lookup / explanation / change"),
+            "lookup branch must be named distinctly from planning"
         );
     }
 

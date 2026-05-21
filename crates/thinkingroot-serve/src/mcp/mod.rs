@@ -1,7 +1,10 @@
 pub mod client;
 pub mod external_registry;
 pub mod http_transport;
+pub mod jsonrpc_envelope;
+pub mod progress;
 pub mod resources;
+pub mod sampling;
 pub mod sse;
 pub mod stdio;
 pub mod telemetry;
@@ -211,10 +214,29 @@ pub fn server_info(requested_version: Option<&str>) -> Value {
     serde_json::json!({
         "protocolVersion": version,
         "serverInfo": { "name": "thinkingroot", "version": env!("CARGO_PKG_VERSION") },
+        // C4 (2026-05-22) — capabilities expanded for the
+        // multi-agent OS surface. Per MCP spec, `notifications/progress`
+        // is opt-in by the client (via `_meta.progressToken` on each
+        // call) and does NOT require a server capability flag — the
+        // server simply honors it when present. `notifications/cancelled`
+        // similarly is incoming-only. `tools.listChanged = true`
+        // tells clients to re-fetch `tools/list` after a workspace
+        // switch (when new external::*::* tools become available via
+        // the per-workspace `ExternalMcpRegistry`). The
+        // `experimental.thinkingroot.*` flags advertise our
+        // proprietary read-side surfaces (C2 reminder context, future
+        // C13 outbound sampling, future C17 flow orchestrator) so
+        // clients that know about us can use them aggressively.
         "capabilities": {
             "resources": { "listChanged": false },
-            "tools": {},
-            "prompts": {}
+            "tools": { "listChanged": true },
+            "prompts": {},
+            "logging": {},
+            "experimental": {
+                "thinkingroot.reminderContext": { "version": 1 },
+                "thinkingroot.cancellation": { "version": 1 },
+                "thinkingroot.progress": { "version": 1 }
+            }
         }
     })
 }
@@ -355,7 +377,7 @@ pub async fn auto_create_session_branch(
 
 #[tracing::instrument(
     name = "mcp.dispatch",
-    skip(request, engine, sessions, engram_manager),
+    skip(request, engine, sessions, engram_manager, state, cancel),
     fields(
         method = %request.method,
         session_id = %session_id,
@@ -370,6 +392,18 @@ pub async fn dispatch(
     session_id: &str,
     sessions: &crate::intelligence::session::SessionStore,
     engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
+    // C2 (2026-05-22): `Some(state)` over SSE (full AppState reach
+    // for tools that need it, e.g. `get_reminder_context`). `None`
+    // over stdio — tools that need state degrade or return a typed
+    // "transport-not-supported" envelope rather than panic.
+    state: Option<&std::sync::Arc<crate::rest::AppState>>,
+    // C3 (2026-05-22): per-request `CancellationToken`. SSE
+    // transport registers it under `state.mcp_pending_calls` keyed
+    // by request id so `notifications/cancelled` can trip it. Long
+    // tool handlers observe at phase boundaries and return
+    // `Error::Cancelled`. Drop-on-disconnect is layered on top by
+    // the SSE handler via `tokio_util::sync::DropGuard`.
+    cancel: tokio_util::sync::CancellationToken,
 ) -> JsonRpcResponse {
     let id = request.id.clone();
     // If this is a tools/call, record the tool name as a span field so trace
@@ -385,9 +419,67 @@ pub async fn dispatch(
                 .params
                 .get("protocolVersion")
                 .and_then(|v| v.as_str());
+            // C6 (2026-05-22) — parse the MCP-spec `clientInfo`
+            // object and stash it on the session (creating the
+            // session lazily). `session_actor` later consults this
+            // to attribute known AI clients
+            // (claude-code/cursor/...) as `Principal::Agent`. None
+            // when the client didn't send a `clientInfo` block
+            // (typical for unit tests + bespoke MCP libraries).
+            if let Some(client_info_json) = request.params.get("clientInfo") {
+                if let Ok(client_info) = serde_json::from_value::<
+                    crate::intelligence::session::ClientInfo,
+                >(client_info_json.clone())
+                {
+                    let mut store = sessions.lock().await;
+                    let session = store
+                        .entry(session_id.to_string())
+                        .or_insert_with(|| {
+                            crate::intelligence::session::SessionContext::new(
+                                session_id,
+                                default_workspace.unwrap_or("_"),
+                            )
+                        });
+                    session.client_info = Some(client_info);
+                }
+            }
             JsonRpcResponse::success(id, server_info(requested))
         }
         "notifications/initialized" => JsonRpcResponse::success(id, Value::Null),
+        // C3 (2026-05-22) — client cancellation per MCP spec
+        // (`notifications/cancelled { requestId, reason? }`). We look
+        // up the in-flight call's `CancellationToken` and fire it;
+        // the long tool's handler observes at the next phase
+        // boundary and returns `Error::Cancelled`. Honest empty when
+        // either (a) AppState isn't available (stdio — the stdio
+        // transport's per-request token isn't registered globally)
+        // or (b) the request id isn't in the pending map (already
+        // completed, or never tracked because it's a fast tool).
+        "notifications/cancelled" => {
+            if let Some(app_state) = state {
+                let request_id = request
+                    .params
+                    .get("requestId")
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    });
+                if let Some(rid) = request_id {
+                    let mut pending = app_state.mcp_pending_calls.write().await;
+                    if let Some(token) = pending.remove(&rid) {
+                        token.cancel();
+                        tracing::info!(
+                            target: "mcp.cancellation",
+                            request_id = %rid,
+                            "tripped pending tool cancellation token"
+                        );
+                    }
+                }
+            }
+            // Notifications never get a JSON-RPC response per spec;
+            // return a placeholder success that the caller drops.
+            JsonRpcResponse::success(id, Value::Null)
+        }
         "resources/list" => resources::handle_list(id, engine, default_workspace).await,
         "resources/read" => {
             resources::handle_read(id, &request.params, engine, default_workspace).await
@@ -410,6 +502,8 @@ pub async fn dispatch(
                 session_id,
                 sessions,
                 engram_manager,
+                state,
+                cancel,
             )
             .await
         }

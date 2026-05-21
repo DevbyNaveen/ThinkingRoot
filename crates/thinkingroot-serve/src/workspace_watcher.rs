@@ -34,16 +34,21 @@
 //!   "no events" from "watcher dead" without reading server-side
 //!   telemetry.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{broadcast, RwLock};
+use notify_debouncer_mini::{
+    DebounceEventResult, DebouncedEventKind, Debouncer, new_debouncer,
+};
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use thinkingroot_core::types::{WorkspaceEvent, WorkspaceState};
+use thinkingroot_core::filesystem::is_workspace_noise;
+use thinkingroot_core::types::{SOURCE_CHANGED_PATHS_MAX, WorkspaceEvent, WorkspaceState};
 
 /// Default polling cadence for re-reading `current_workspace_root`.
 /// 500ms keeps the response to a mount-flip user-imperceptibly fast
@@ -53,6 +58,13 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default heartbeat cadence. 30s mirrors the SSE keep-alive we already
 /// emit on `/branches/{branch}/events/stream`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Default source-tree debounce quiet-window in milliseconds. 200ms
+/// matches the CLI `root compile --watch` default — bursts from a
+/// formatter-on-save (clang-format, prettier, rustfmt) settle within
+/// this window into a single batch, while a real human edit still
+/// fires within ~½ of one's perception of "instant".
+pub const DEFAULT_SOURCE_DEBOUNCE_MS: u64 = 200;
 
 /// Tunables for [`spawn_workspace_watcher`]. `Default::default()` is
 /// the production setting; tests override the intervals.
@@ -64,6 +76,12 @@ pub struct WatcherConfig {
     /// How often to emit a `Heartbeat` event when the watcher is
     /// healthy.
     pub heartbeat: Duration,
+    /// Quiet-window for the source-tree debouncer, in milliseconds.
+    /// Events arriving within this window collapse into one
+    /// [`WorkspaceEvent::SourceChanged`] batch. `0` disables source-tree
+    /// watching entirely (used by tests that don't want the second
+    /// task running).
+    pub source_debounce_ms: u64,
 }
 
 impl Default for WatcherConfig {
@@ -71,6 +89,7 @@ impl Default for WatcherConfig {
         Self {
             poll_interval: DEFAULT_POLL_INTERVAL,
             heartbeat: DEFAULT_HEARTBEAT,
+            source_debounce_ms: DEFAULT_SOURCE_DEBOUNCE_MS,
         }
     }
 }
@@ -104,15 +123,17 @@ impl WatcherHandle {
 
 /// Spawn the workspace watcher.
 ///
-/// `current_root` is a closure handed in by the caller (typically
-/// `|| state.current_workspace_root()`) so this module stays free of a
-/// cyclic dep on `AppState`.
-pub fn spawn_workspace_watcher<F>(
-    mut current_root: F,
+/// `active_root` drives the `.thinkingroot/` engine-dir watcher (orphan
+/// detection). `mounted_roots` lists every workspace root that gets a
+/// source-tree debouncer (live sync for all mounted workspaces).
+pub fn spawn_workspace_watcher<F, G>(
+    mut active_root: F,
+    mut mounted_roots: G,
     cfg: WatcherConfig,
 ) -> WatcherHandle
 where
     F: FnMut() -> Option<PathBuf> + Send + 'static,
+    G: FnMut() -> Vec<PathBuf> + Send + 'static,
 {
     let (tx, _rx) = broadcast::channel::<WorkspaceEvent>(64);
     let state = Arc::new(RwLock::new(WorkspaceState::Active));
@@ -123,8 +144,19 @@ where
     let cancel_task = cancel.clone();
 
     let task = tokio::spawn(async move {
-        // ── Watcher state captured between ticks. ──────────────────
+        let mut active_root = active_root;
+        let mut mounted_roots = mounted_roots;
+        // ── Engine-dir watcher state captured between ticks. ──────
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+
+        // ── Source-tree debouncer state. ───────────────────────────
+        // A separate channel because the debouncer batches events on
+        // its own thread before delivering — we can't share `notify_tx`
+        // without losing the debounce semantics.
+        let (source_tx, mut source_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(PathBuf, DebounceEventResult)>();
+        let mut source_debouncers: HashMap<PathBuf, Debouncer<RecommendedWatcher>> =
+            HashMap::new();
 
         let mut watcher: Option<RecommendedWatcher> = None;
         let mut current: Option<PathBuf> = None;
@@ -135,12 +167,12 @@ where
                 break;
             }
 
-            // ── 1. Reconcile the active root. ──────────────────────
-            let observed = current_root();
+            // ── 1. Reconcile the active root for BOTH watchers. ────
+            let observed = active_root();
             if observed != current {
                 if let (Some(_), Some(w)) = (current.as_ref(), watcher.as_mut()) {
-                    // Best-effort unwatch of previous root; ignore the
-                    // error — the path may already be gone.
+                    // Best-effort unwatch of previous engine dir; ignore
+                    // the error — the path may already be gone.
                     if let Some(prev) = current.as_ref() {
                         let _ = w.unwatch(prev.as_path());
                     }
@@ -179,15 +211,120 @@ where
                             }
                         }
                     }
+
                 }
                 current = observed.clone();
             }
 
-            // ── 2. Drain notify events. ───────────────────────────
+            // ── 1b. Reconcile source-tree debouncers for all mounted roots. ─
+            if cfg.source_debounce_ms > 0 {
+                let desired: Vec<PathBuf> = mounted_roots();
+                let mut desired_set: HashMap<PathBuf, ()> =
+                    desired.iter().map(|p| (p.clone(), ())).collect();
+                source_debouncers.retain(|root, _| {
+                    if desired_set.contains_key(root) {
+                        true
+                    } else {
+                        tracing::info!(
+                            target: "fs_watch",
+                            "detaching source-tree debouncer from {}",
+                            root.display()
+                        );
+                        false
+                    }
+                });
+                for root in desired {
+                    if !root.exists() || source_debouncers.contains_key(&root) {
+                        continue;
+                    }
+                    let inner_tx = source_tx.clone();
+                    let root_for_cb = root.clone();
+                    let built = new_debouncer(
+                        Duration::from_millis(cfg.source_debounce_ms),
+                        move |res: DebounceEventResult| {
+                            let _ = inner_tx.send((root_for_cb.clone(), res));
+                        },
+                    );
+                    match built {
+                        Ok(mut deb) => match deb.watcher().watch(&root, RecursiveMode::Recursive) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    target: "fs_watch",
+                                    "source-tree debouncer attached to {} ({}ms quiet-window)",
+                                    root.display(),
+                                    cfg.source_debounce_ms,
+                                );
+                                source_debouncers.insert(root, deb);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "fs_watch",
+                                    "source watch {}: {e}",
+                                    root.display()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "fs_watch",
+                                "build source-tree debouncer: {e}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                source_debouncers.clear();
+            }
+
+            // ── 2. Drain engine-dir notify events. ────────────────
             while let Ok(res) = notify_rx.try_recv() {
                 match res {
                     Ok(event) => publish_event(&tx_task, &state_task, &current, event).await,
                     Err(e) => tracing::warn!(target: "fs_watch", "notify error: {e}"),
+                }
+            }
+
+            // ── 2b. Drain source-tree debouncer batches. ───────────
+            while let Ok((root, res)) = source_rx.try_recv() {
+                match res {
+                    Ok(events) => {
+                        let mut paths: Vec<PathBuf> = events
+                            .into_iter()
+                            .filter(|e| {
+                                e.kind == DebouncedEventKind::Any
+                                    && !is_workspace_noise(&e.path)
+                            })
+                            .map(|e| e.path)
+                            .collect();
+                        // Stable dedup: sort + dedup preserves a
+                        // deterministic order for downstream consumers
+                        // even though the debouncer's internal map is
+                        // arbitrarily ordered.
+                        paths.sort();
+                        paths.dedup();
+                        if paths.is_empty() {
+                            continue;
+                        }
+                        let total = paths.len();
+                        let extra = total.saturating_sub(SOURCE_CHANGED_PATHS_MAX);
+                        paths.truncate(SOURCE_CHANGED_PATHS_MAX);
+                        let _ = tx_task.send(WorkspaceEvent::SourceChanged {
+                            workspace_root: root.clone(),
+                            paths,
+                            extra,
+                            debounce_ms: cfg.source_debounce_ms,
+                        });
+                    }
+                    Err(e) => {
+                        // Single `notify::Error` per batch under
+                        // notify-debouncer-mini 0.6. A transient ENOENT
+                        // during recursive walk is recoverable; the
+                        // next batch will continue.
+                        tracing::warn!(
+                            target: "fs_watch",
+                            "source-tree debouncer error: {e}"
+                        );
+                    }
                 }
             }
 
@@ -224,6 +361,9 @@ where
 
             tokio::time::sleep(cfg.poll_interval).await;
         }
+        // Explicit drop so the debouncer thread shuts down on the
+        // task's exit path even if compiler hoists the value.
+        drop(source_debouncers);
         tracing::info!(target: "fs_watch", "watcher shutting down");
     });
 
@@ -305,6 +445,18 @@ mod tests {
         WatcherConfig {
             poll_interval: Duration::from_millis(50),
             heartbeat: Duration::from_millis(120),
+            // Existing tests focus on the engine-dir watcher; disable
+            // the source-tree debouncer so spurious file events under
+            // the workspace root don't add noise.
+            source_debounce_ms: 0,
+        }
+    }
+
+    fn fast_cfg_with_source_watch(debounce_ms: u64) -> WatcherConfig {
+        WatcherConfig {
+            poll_interval: Duration::from_millis(50),
+            heartbeat: Duration::from_millis(600),
+            source_debounce_ms: debounce_ms,
         }
     }
 
@@ -315,8 +467,13 @@ mod tests {
         let engine = ws.join(".thinkingroot");
         std::fs::create_dir_all(engine.join("graph")).unwrap();
 
-        let ws_copy = ws.clone();
-        let handle = spawn_workspace_watcher(move || Some(ws_copy.clone()), fast_cfg());
+        let ws_active = ws.clone();
+        let ws_mounted = ws.clone();
+        let handle = spawn_workspace_watcher(
+            move || Some(ws_active.clone()),
+            move || vec![ws_mounted.clone()],
+            fast_cfg(),
+        );
         let mut rx = handle.tx.subscribe();
 
         // Give the watcher a couple of ticks to attach.
@@ -360,6 +517,7 @@ mod tests {
                     None
                 }
             },
+            move || vec![],
             fast_cfg(),
         );
 
@@ -382,8 +540,13 @@ mod tests {
         let ws = tmp.path().to_path_buf();
         std::fs::create_dir_all(ws.join(".thinkingroot")).unwrap();
 
-        let ws_copy = ws.clone();
-        let handle = spawn_workspace_watcher(move || Some(ws_copy.clone()), fast_cfg());
+        let ws_active = ws.clone();
+        let ws_mounted = ws.clone();
+        let handle = spawn_workspace_watcher(
+            move || Some(ws_active.clone()),
+            move || vec![ws_mounted.clone()],
+            fast_cfg(),
+        );
         let mut rx = handle.tx.subscribe();
 
         let mut beats = 0;
@@ -417,5 +580,96 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/abs/ws"));
         assert!(msg.contains("orphaned"));
+    }
+
+    #[tokio::test]
+    async fn source_tree_change_emits_source_changed_event() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        // Engine dir must exist so the orphan-watcher stays Active.
+        std::fs::create_dir_all(ws.join(".thinkingroot/graph")).unwrap();
+
+        let ws_active = ws.clone();
+        let ws_mounted = ws.clone();
+        let handle = spawn_workspace_watcher(
+            move || Some(ws_active.clone()),
+            move || vec![ws_mounted.clone()],
+            fast_cfg_with_source_watch(80),
+        );
+        let mut rx = handle.tx.subscribe();
+
+        // Let the watcher attach + debouncer arm.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Write a real source file; the debouncer should batch + emit
+        // a single SourceChanged within ~200ms.
+        std::fs::write(ws.join("a.rs"), b"fn main() {}").unwrap();
+
+        let mut got = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = rx.recv() => {
+                    if let Ok(WorkspaceEvent::SourceChanged { paths, debounce_ms, .. }) = ev {
+                        got = Some((paths, debounce_ms));
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        let (paths, debounce_ms) =
+            got.expect("expected SourceChanged event within deadline");
+        assert!(!paths.is_empty(), "paths must carry the change");
+        assert_eq!(debounce_ms, 80, "wire-format must surface the debounce window");
+        // Path must end with `a.rs` — the watcher must report what
+        // actually changed, not a synthetic placeholder.
+        assert!(
+            paths.iter().any(|p| p.ends_with("a.rs")),
+            "paths missing a.rs: {paths:?}"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn source_tree_filter_drops_noise() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        std::fs::create_dir_all(ws.join(".thinkingroot/graph")).unwrap();
+        std::fs::create_dir_all(ws.join("target/debug")).unwrap();
+
+        let ws_active = ws.clone();
+        let ws_mounted = ws.clone();
+        let handle = spawn_workspace_watcher(
+            move || Some(ws_active.clone()),
+            move || vec![ws_mounted.clone()],
+            fast_cfg_with_source_watch(80),
+        );
+        let mut rx = handle.tx.subscribe();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Write noise paths only — should NOT trigger SourceChanged.
+        std::fs::write(ws.join("target/debug/foo"), b"x").unwrap();
+        std::fs::write(ws.join(".thinkingroot/scratch"), b"x").unwrap();
+
+        let mut saw_source_changed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                ev = rx.recv() => {
+                    if let Ok(WorkspaceEvent::SourceChanged { .. }) = ev {
+                        saw_source_changed = true;
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(
+            !saw_source_changed,
+            "noise-only changes must not emit SourceChanged"
+        );
+        handle.shutdown().await;
     }
 }

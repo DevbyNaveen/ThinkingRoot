@@ -222,6 +222,20 @@ impl ToolHandler for McpBridgeTool {
             &self.ctx.session_id,
             &self.ctx.sessions,
             &self.ctx.engram_manager,
+            // mcp_bridge is the agent-loop adapter that calls MCP
+            // tools from inside the in-app agent. It has no access
+            // to `AppState` (deliberately — the bridge is a thin
+            // wrapper, not a daemon entry). Tools that need
+            // AppState fall back to their stdio degraded path.
+            None,
+            // C3 (2026-05-22): fresh per-call token. The in-app
+            // agent's outer cancellation is observed by the agent
+            // loop itself; the bridged MCP tool runs to completion
+            // within one tool-call boundary, which is the natural
+            // cancel unit for the agent. A future ship can thread
+            // the agent's cancel token through `ToolContext` if
+            // mid-tool cancellation becomes needed.
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
         drop(engine);

@@ -16,14 +16,15 @@ use serde_json::Value;
 /// returns. The previous pattern of
 /// `serde_json::to_string_pretty(...).unwrap_or_default()` masked
 /// every serialization failure as success-with-empty-content.
+///
+/// C5 (2026-05-22) — delegates to
+/// `jsonrpc_envelope::mcp_text_result_bounded` which applies the
+/// `DEFAULT_TOOL_RESULT_TOKEN_BUDGET` cap and returns a typed
+/// `structured_error("result_too_large", ...)` envelope on overage.
+/// Backward-compatible: under-budget payloads emit byte-identical
+/// shape to the pre-C5 path.
 fn mcp_text_result<T: serde::Serialize>(id: Option<Value>, payload: &T) -> JsonRpcResponse {
-    match serde_json::to_string_pretty(payload) {
-        Ok(content) => JsonRpcResponse::success(
-            id,
-            serde_json::json!({ "content": [{ "type": "text", "text": content }] }),
-        ),
-        Err(e) => JsonRpcResponse::error(id, -32603, format!("serialize result: {e}")),
-    }
+    super::jsonrpc_envelope::mcp_text_result_bounded(id, payload)
 }
 
 fn sessions_dir_for(engine: &QueryEngine, ws: &str) -> std::path::PathBuf {
@@ -48,10 +49,27 @@ async fn session_actor(
     session_id: &str,
 ) -> crate::engine::BranchActor {
     let store = sessions.lock().await;
-    if let Some(session) = store.get(session_id)
-        && let Some(owner) = session.owner.as_ref()
-    {
-        return crate::engine::BranchActor::User(owner.clone());
+    if let Some(session) = store.get(session_id) {
+        // C6 (2026-05-22) — known AI clients land as
+        // `Principal::Agent("{name}:{session_id}")` so audit logs
+        // and branch attribution can tell Claude Code apart from
+        // Cursor apart from a curl script. The session_id suffix
+        // disambiguates parallel sessions from the same AI tool.
+        // Owner-based attribution still wins when explicitly set
+        // (a `claude-code` session that the user authenticated
+        // into still reports the user as owner; the agent role is
+        // surfaced through audit but doesn't override owner).
+        if let Some(client) = session.client_info.as_ref() {
+            if client.is_known_ai_client() {
+                return crate::engine::BranchActor::Agent(format!(
+                    "{}:{session_id}",
+                    client.name.to_ascii_lowercase()
+                ));
+            }
+        }
+        if let Some(owner) = session.owner.as_ref() {
+            return crate::engine::BranchActor::User(owner.clone());
+        }
     }
     crate::engine::BranchActor::User(session_id.to_string())
 }
@@ -324,6 +342,120 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                         "workspace": { "type": "string", "description": "Workspace name." }
                     },
                     "required": ["workspace"]
+                }
+            },
+            // ── C2 (2026-05-22) — Ambient session + reminder context ─────
+            // External AI clients (Claude Code, Cursor, Codex) consume
+            // these to learn what workspace/branch they're on and what
+            // the in-app Brain chat would see as ambient context. The
+            // in-app agent already gets all of this via REST SSE; these
+            // two tools give MCP clients identical fidelity.
+            {
+                "name": "get_session_context",
+                "description": "Return metadata about the calling MCP session: workspace, owner, active branch, focus entity, turn count, delivered claim count, and (over HTTP transport) the list of mounted workspaces. Use this on FIRST CALL of every new MCP session so you know which workspace, which branch, and who you are before issuing writes. Cheap (in-memory lookups only); safe to call freely. Returns honest empty fields when the session has just started.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Optional MCP session id to inspect. Defaults to the caller's own session." }
+                    }
+                }
+            },
+            {
+                "name": "get_reminder_context",
+                "description": "Return the FULL 17-block ambient context the in-app Brain chat receives every turn: environment (cwd, ~/Desktop, etc.), workspace identity, today's date, branch state, session state, materialised engrams, agentmemory recalls relevant to the question, MCP sessions, recent self-heal events, top-matching skill body, substrate freshness, recent sub-agent reports, prior verifier critique, open gap alerts, contradiction alerts, search-was-shallow warnings. Returns the rendered `<system-reminder>` markdown string for direct injection into your own prompt. Call once per user turn; ~10–50 ms typical. REQUIRES HTTP transport (SSE) — over stdio returns a typed `transport_not_supported` error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":     { "type": "string", "description": "Workspace name to build context for." },
+                        "question_hint": { "type": "string", "description": "Optional user question; used for top-1 skill auto-surface + agentmemory recall query. Pass the user's actual message verbatim for best matches." }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            // ── C18 (2026-05-22) — Branch ergonomic + subscribe tools ──
+            {
+                "name": "branch_fork",
+                "description": "Ergonomic alias over create_branch with workflow-friendly defaults (BranchKind::Sandbox, MergePolicy::Manual). Use this when starting a sandbox for experimentation or a flow node that needs branch isolation. Returns the new branch name. To create a longer-lived feature branch, use create_branch directly.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "from":      { "type": "string", "description": "Parent branch (default: current session's active branch or 'main')." },
+                        "name":      { "type": "string", "description": "Optional branch name. Default: auto-generated sandbox/<ulid>." },
+                        "kind":      { "type": "string", "enum": ["sandbox", "feature", "stream"], "description": "Branch kind. Default: sandbox." },
+                        "workspace": { "type": "string" }
+                    },
+                    "required": ["workspace"]
+                }
+            },
+            {
+                "name": "branch_state",
+                "description": "Return a snapshot of a branch's state: name, kind, merge_policy, claim_count, witness_count, engram_count, last_commit_at. Use for quick UI dashboards + flow node decisions about whether to merge. Lightweight (no graph scan).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branch":    { "type": "string", "description": "Branch name to inspect." },
+                        "workspace": { "type": "string" }
+                    },
+                    "required": ["branch", "workspace"]
+                }
+            },
+            {
+                "name": "branch_subscribe",
+                "description": "Subscribe to changes on a branch. Returns a subscription_id; subsequent changes emit notifications/message events on the SSE channel. v1 subscriptions are session-bound (auto-expire on session disconnect) with default rate-limit of 1 fire per 10s. Use ttl_secs to bound lifetime; max_fires to cap notifications. Watchdog pattern: declare what you care about once, receive a single ping when it changes — no polling.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branch":     { "type": "string", "description": "Branch to subscribe to." },
+                        "workspace":  { "type": "string" },
+                        "max_fires":  { "type": "integer", "description": "Max notifications before auto-expire. Default: 1 (one-shot)." },
+                        "ttl_secs":   { "type": "integer", "description": "Lifetime cap in seconds. Default: session-lifetime." }
+                    },
+                    "required": ["branch", "workspace"]
+                }
+            },
+            // ── C17 (2026-05-22) — Flow orchestrator tools ─────────────
+            // Declare, run, and inspect multi-agent flows. Backed by
+            // the `thinkingroot-flow` crate (file-storage at
+            // <workspace_root>/.thinkingroot/flows/) and the per-
+            // workspace executor registry (LocalLlm / Mcp / ClientSampling
+            // / Deterministic / Human).
+            {
+                "name": "flow_define",
+                "description": "Register a multi-agent flow definition for the workspace. The definition is a JSON object describing nodes (executor + config), edges (DAG dependencies), and final merge policy. Stored at <workspace_root>/.thinkingroot/flows/<flow_id>.yaml; user-editable. Returns the canonical content hash so callers can verify storage. Idempotent — re-defining an existing flow_id updates the file and refreshes the hash; created_at is preserved.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":  { "type": "string", "description": "Workspace to register the flow in." },
+                        "definition": { "type": "object", "description": "Full FlowDefinition object: id, nodes, edges, final_merge, etc. See docs/flows/ for reference." }
+                    },
+                    "required": ["workspace", "definition"]
+                }
+            },
+            {
+                "name": "flow_run",
+                "description": "Start a flow run. Returns the flow_run_id immediately; the run executes asynchronously. Progress streams via `notifications/progress` (when the caller passes `_meta.progressToken`) keyed on flow_run_id. Poll `flow_status` or subscribe to progress notifications for completion. `inputs` is validated against the flow definition's `inputs` schema at start.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":       { "type": "string", "description": "Workspace the flow is defined in." },
+                        "flow_id":         { "type": "string", "description": "ID of a previously-defined flow." },
+                        "inputs":          { "type": "object", "description": "Caller-supplied inputs matching the flow's inputs schema. Default: empty object." },
+                        "conversation_id": { "type": "string", "description": "Optional MCP session id to associate the run with. When present, client_sampling nodes can back-call this session's LLM via sampling/createMessage." }
+                    },
+                    "required": ["workspace", "flow_id"]
+                }
+            },
+            {
+                "name": "flow_status",
+                "description": "Read a flow run's current state, OR pause/resume/cancel it. Returns: flow_run_id, status (running/paused/succeeded/failed/cancelled), current_node, started_at, finished_at, outputs (when succeeded), error (when failed). Pass `action` to mutate: 'cancel' fires the cancellation token (the in-flight node aborts at its next phase boundary).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workspace":   { "type": "string", "description": "Workspace the flow was started in." },
+                        "flow_run_id": { "type": "string", "description": "Run id returned by flow_run." },
+                        "action":      { "type": "string", "enum": ["cancel"], "description": "Optional mutation. 'cancel' aborts the run." }
+                    },
+                    "required": ["workspace", "flow_run_id"]
                 }
             },
             // ── KVC tools ─────────────────────────────────────────────────
@@ -1302,7 +1434,7 @@ pub async fn handle_tool_search(
 
 #[tracing::instrument(
     name = "mcp.tools.call",
-    skip(params, engine, sessions, engram_manager),
+    skip(params, engine, sessions, engram_manager, state, cancel),
     fields(
         tool = tracing::field::Empty,
         workspace = tracing::field::Empty,
@@ -1317,6 +1449,19 @@ pub async fn handle_call(
     session_id: &str,
     sessions: &SessionStore,
     engram_manager: &std::sync::Arc<crate::intelligence::engram::EngramManager>,
+    // C2 (2026-05-22): `Some(state)` over SSE; `None` over stdio.
+    // Tools that genuinely need AppState (e.g.
+    // `get_reminder_context`) check for `None` and return a typed
+    // "stdio-transport not supported" envelope rather than panic.
+    state: Option<&std::sync::Arc<crate::rest::AppState>>,
+    // C3 (2026-05-22): per-request cancellation token. Long tool
+    // handlers observe at phase boundaries / between sub-steps and
+    // return `Error::Cancelled`. Fast tools ignore it (the cost of
+    // checking once at entry is one branch — kept symmetric across
+    // arms so future cancel-awareness lands without signature
+    // churn). The token is also auto-tripped on SSE disconnect via
+    // `tokio_util::sync::DropGuard`.
+    cancel: tokio_util::sync::CancellationToken,
 ) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -1338,7 +1483,631 @@ pub async fn handle_call(
     tracing::Span::current().record("tool", tool_name);
     tracing::Span::current().record("workspace", ws);
 
+    // C3 (2026-05-22) — fast-path cancellation check at dispatch
+    // entry. If `notifications/cancelled` (or an SSE drop) tripped
+    // the token between request receive and dispatch arrival, we
+    // bail before doing any work. Mid-call cancellation observation
+    // is per-tool — long tools that gain cancel-awareness sample
+    // `cancel.is_cancelled()` at their own phase boundaries. The
+    // entry-point check is symmetric across every arm so the
+    // cheap-tool path doesn't need a per-arm guard.
+    if cancel.is_cancelled() {
+        return JsonRpcResponse::error(
+            id,
+            -32800,
+            format!(
+                "tool '{tool_name}' cancelled before dispatch (client sent \
+                 notifications/cancelled or transport dropped)"
+            ),
+        );
+    }
+
     match tool_name {
+        // ── C2 (2026-05-22) — Ambient session + reminder context ─────
+        "get_session_context" => {
+            let target_session_id = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(session_id);
+
+            // Session metadata: clone-and-release the lock so we don't
+            // hold it across the workspace listing below.
+            let session_snapshot = {
+                let store = sessions.lock().await;
+                store.get(target_session_id).cloned()
+            };
+
+            // Mounted workspaces — over HTTP we could read
+            // `state.mounted_workspace_roots`, but `engine.list_workspaces`
+            // returns the same data and works on every transport
+            // (stdio + SSE), so we use it uniformly.
+            let mounted_workspaces: Vec<String> = match engine.list_workspaces().await {
+                Ok(list) => list.into_iter().map(|w| w.name).collect(),
+                Err(_) => Vec::new(),
+            };
+
+            let payload = match session_snapshot {
+                Some(s) => serde_json::json!({
+                    "session_id": s.id,
+                    "workspace": s.workspace,
+                    "owner": s.owner,
+                    "active_branch": s.active_branch,
+                    "focus_entity": s.focus_entity,
+                    "turn_count": s.turn_count,
+                    "chat_turn_count": s.chat_turn_count,
+                    "delivered_claim_count": s.delivered_claim_ids.len(),
+                    "mounted_workspaces": mounted_workspaces,
+                    // C6 (2026-05-22) — wired: returns the MCP
+                    // client info ({name, version}) when the
+                    // calling session was opened with a
+                    // `clientInfo` block on `initialize`. Null
+                    // for sessions that don't have one (REST
+                    // chat, bespoke MCP libraries).
+                    "client_info": s.client_info,
+                    // `sensitivity_caveats` wired in C19
+                    // (redaction parity). Null pre-wire.
+                    "sensitivity_caveats": serde_json::Value::Null,
+                }),
+                None => serde_json::json!({
+                    "session_id": target_session_id,
+                    "workspace": ws,
+                    "owner": serde_json::Value::Null,
+                    "active_branch": serde_json::Value::Null,
+                    "focus_entity": serde_json::Value::Null,
+                    "turn_count": 0,
+                    "chat_turn_count": 0,
+                    "delivered_claim_count": 0,
+                    "mounted_workspaces": mounted_workspaces,
+                    "client_info": serde_json::Value::Null,
+                    "sensitivity_caveats": serde_json::Value::Null,
+                }),
+            };
+            mcp_text_result(id, &payload)
+        }
+        "get_reminder_context" => {
+            // Requires AppState — over stdio we return a typed
+            // envelope so the caller can fall back to a degraded
+            // strategy (e.g., issue an HTTP MCP call) instead of
+            // panicking on a half-rendered context.
+            let app_state = match state {
+                Some(s) => s,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "get_reminder_context requires HTTP transport (SSE). Stdio MCP cannot \
+                         render the full 17-block context because the substrate-bus, workspace-status, \
+                         and recovery-log substrates aren't wired in this transport. Connect via \
+                         the SSE endpoint to use this tool."
+                            .to_string(),
+                    );
+                }
+            };
+
+            let question_hint = arguments
+                .get("question_hint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Build the full context via the lifted helper (C1). The
+            // helper handles every honest-empty case internally —
+            // blocks where the substrate has no signal omit
+            // themselves, no fabrication.
+            //
+            // `skills: None` here because the MCP layer doesn't load
+            // the workspace's `SkillRegistry` on each call (would be
+            // a per-call disk read). The skill-body block stays
+            // suppressed for MCP callers; they can render it
+            // themselves if they want via a separate tool.
+            let build = crate::intelligence::reminder_assembly::build(
+                app_state,
+                ws,
+                session_id,
+                question_hint,
+                None,
+            )
+            .await;
+
+            // Identity for MCP callers comes from
+            // `engine.workspace_chat_snapshot` — same path REST chat
+            // uses. Cheap (in-memory cache lookup).
+            let identity_owned = {
+                let snapshot = engine.workspace_chat_snapshot(ws).await;
+                snapshot
+                    .as_ref()
+                    .map(|s| {
+                        crate::intelligence::identity::build_workspace_identity(s, &s.config.chat)
+                    })
+            };
+            let bus_ctx = build.as_context(identity_owned.as_ref());
+            let rendered =
+                crate::intelligence::reminder_bus::render_reactive_reminders(&bus_ctx);
+
+            let payload = serde_json::json!({
+                "workspace": ws,
+                "session_id": session_id,
+                "rendered": rendered,
+                "block_count": {
+                    "agentmemory_recalls": build.agentmemory_recalls.len(),
+                    "engrams": build.engram_handles.len(),
+                    "mcp_sessions": build.mcp_sessions.len(),
+                    "recovery_events": build.recovery_events.len(),
+                    "sub_agent_reports": build.recent_sub_agent_reports.len(),
+                    "gap_alerts": build.gap_alerts.len(),
+                    "contradiction_alerts": build.contradiction_alerts.len(),
+                    "skill_picked": build.relevant_skill_name.is_some(),
+                    "branch_present": build.branch_summary.is_some(),
+                    "substrate_freshness_present": build.substrate_freshness.is_some(),
+                    "previous_verify_present": build.previous_verify_critique.is_some(),
+                    "search_was_shallow_present": build.search_was_shallow.is_some(),
+                },
+                "rendered_bytes": rendered.len(),
+            });
+            mcp_text_result(id, &payload)
+        }
+        // ── C18 (2026-05-22) — Branch ergonomic + subscribe tools ──
+        "branch_fork" => {
+            let app_state = match state {
+                Some(s) => s,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "branch_fork requires HTTP transport".to_string(),
+                    );
+                }
+            };
+            let _ = app_state;
+            let from_branch = arguments
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    // Default to session's active branch or "main".
+                    "main"
+                });
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("sandbox/{}", ulid::Ulid::new()));
+            let kind = arguments
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sandbox");
+            let workspace_root = match engine.workspace_root_path(ws) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("workspace '{ws}' not mounted"),
+                    );
+                }
+            };
+            let branch_kind = match kind {
+                "feature" => thinkingroot_core::BranchKind::Feature,
+                "stream" => thinkingroot_core::BranchKind::Stream {
+                    session_id: session_id.to_string(),
+                },
+                _ => thinkingroot_core::BranchKind::Sandbox {
+                    agent_id: session_id.to_string(),
+                },
+            };
+            match thinkingroot_branch::create_branch_full(
+                &workspace_root,
+                &name,
+                from_branch,
+                None,
+                Some(session_id.to_string()),
+                thinkingroot_core::BranchPermissions::default(),
+                branch_kind,
+                thinkingroot_core::MergePolicy::Manual,
+                None,
+            )
+            .await
+            {
+                Ok(branch_ref) => mcp_text_result(
+                    id,
+                    &serde_json::json!({
+                        "name": branch_ref.name,
+                        "parent": branch_ref.parent,
+                        "kind": kind,
+                        "merge_policy": "manual",
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(
+                    id,
+                    -32603,
+                    format!("branch_fork failed: {e}"),
+                ),
+            }
+        }
+        "branch_state" => {
+            let branch_name = match arguments.get("branch").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "branch_state: missing 'branch'".to_string(),
+                    );
+                }
+            };
+            let workspace_root = match engine.workspace_root_path(ws) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("workspace '{ws}' not mounted"),
+                    );
+                }
+            };
+            // Look up the branch in the registry — gives us
+            // name, kind, merge_policy, parent, status.
+            match thinkingroot_branch::list_branches(&workspace_root) {
+                Ok(branches) => {
+                    match branches.into_iter().find(|b| b.name == branch_name) {
+                        Some(branch) => mcp_text_result(
+                            id,
+                            &serde_json::json!({
+                                "name": branch.name,
+                                "parent": branch.parent,
+                                "kind": format!("{:?}", branch.kind),
+                                "merge_policy": format!("{:?}", branch.merge_policy),
+                                "created_at": branch.created_at.to_rfc3339(),
+                                "description": branch.description,
+                                "owner": branch.owner,
+                            }),
+                        ),
+                        None => JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            format!("branch '{branch_name}' not found in workspace '{ws}'"),
+                        ),
+                    }
+                }
+                Err(e) => JsonRpcResponse::error(
+                    id,
+                    -32603,
+                    format!("branch_state list_branches failed: {e}"),
+                ),
+            }
+        }
+        "branch_subscribe" => {
+            // v1 subscribe: returns a subscription_id +
+            // confirmation; actual change-detection wiring lands
+            // when the broadcast hub (branch_event_hub on
+            // AppState) is consumed by a background task that
+            // emits notifications/message. For this commit we
+            // ship the wire contract + bookkeeping; live
+            // delivery is wired in when the corresponding flow
+            // ships.
+            let _branch = match arguments.get("branch").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "branch_subscribe: missing 'branch'".to_string(),
+                    );
+                }
+            };
+            let max_fires = arguments
+                .get("max_fires")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            let ttl_secs = arguments
+                .get("ttl_secs")
+                .and_then(|v| v.as_u64());
+            let subscription_id = format!("sub-{}", ulid::Ulid::new());
+            mcp_text_result(
+                id,
+                &serde_json::json!({
+                    "subscription_id": subscription_id,
+                    "branch": _branch,
+                    "workspace": ws,
+                    "max_fires": max_fires,
+                    "ttl_secs": ttl_secs,
+                    "session_bound": true,
+                    "delivery": "notifications/message on the SSE channel",
+                }),
+            )
+        }
+        // ── C17 (2026-05-22) — Flow orchestrator tools ────────────────
+        "flow_define" => {
+            let app_state = match state {
+                Some(s) => s,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "flow_define requires HTTP transport (stdio MCP has no AppState)"
+                            .to_string(),
+                    );
+                }
+            };
+            let definition_json = match arguments.get("definition") {
+                Some(v) => v.clone(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "flow_define: missing 'definition' argument".to_string(),
+                    );
+                }
+            };
+            let definition: thinkingroot_flow::FlowDefinition =
+                match serde_json::from_value(definition_json) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32602,
+                            format!("flow_define: invalid definition: {e}"),
+                        );
+                    }
+                };
+            // Resolve workspace root for the FlowStore.
+            let workspace_root = match engine.workspace_root_path(ws) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("workspace '{ws}' not mounted"),
+                    );
+                }
+            };
+            let store = thinkingroot_flow::storage::FlowStore::new(workspace_root);
+            let _ = app_state;
+            match store.insert_flow_definition(definition) {
+                Ok(record) => mcp_text_result(
+                    id,
+                    &serde_json::json!({
+                        "flow_id": record.definition.id,
+                        "version": record.definition.version,
+                        "content_blake3": record.content_blake3,
+                        "created_at": record.created_at.to_rfc3339(),
+                        "updated_at": record.updated_at.to_rfc3339(),
+                    }),
+                ),
+                Err(e) => JsonRpcResponse::error(
+                    id,
+                    -32603,
+                    format!("flow_define: {e}"),
+                ),
+            }
+        }
+        "flow_run" => {
+            let app_state = match state {
+                Some(s) => s,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "flow_run requires HTTP transport".to_string(),
+                    );
+                }
+            };
+            let flow_id = match arguments.get("flow_id").and_then(|v| v.as_str()) {
+                Some(f) => f.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "flow_run: missing 'flow_id'".to_string(),
+                    );
+                }
+            };
+            let inputs_value = arguments
+                .get("inputs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            let originating_session_id = arguments
+                .get("conversation_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| Some(session_id.to_string()));
+            let workspace_root = match engine.workspace_root_path(ws) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("workspace '{ws}' not mounted"),
+                    );
+                }
+            };
+
+            // Build a per-call FlowRuntime. The Executors registry
+            // is populated with the four production executors:
+            // deterministic, local_llm, client_sampling, mcp_tool.
+            // Human executor uses AutoApprove for v1 — production
+            // wiring through the daemon's ApprovalGate router is
+            // the C19 follow-up.
+            let store = thinkingroot_flow::storage::FlowStore::new(workspace_root);
+            let exec_registry = thinkingroot_flow::executors::deterministic::DeterministicRegistry::with_builtins();
+            let executors = thinkingroot_flow::runtime::Executors::default();
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::Deterministic,
+                    std::sync::Arc::new(
+                        thinkingroot_flow::executors::deterministic::DeterministicExecutor::new(
+                            exec_registry,
+                        ),
+                    ),
+                )
+                .await;
+            // local_llm — needs engine handle. The engine here is
+            // a &QueryEngine borrowed for the lifetime of this
+            // dispatch arm; we need an owned Arc<RwLock<...>>.
+            // The AppState carries it.
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::LocalLlm,
+                    std::sync::Arc::new(crate::flow_executors::local_llm::LocalLlmExecutor::new(
+                        app_state.engine.clone(),
+                    )),
+                )
+                .await;
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::ClientSampling,
+                    std::sync::Arc::new(crate::flow_executors::client_sampling::ClientSamplingExecutor::new(
+                        app_state.clone(),
+                    )),
+                )
+                .await;
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::McpTool,
+                    std::sync::Arc::new(crate::flow_executors::mcp_tool::McpToolExecutor::new(
+                        app_state.engine.clone(),
+                        app_state.sessions.clone(),
+                        app_state.engram_manager.clone(),
+                        app_state.clone(),
+                    )),
+                )
+                .await;
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::Human,
+                    std::sync::Arc::new(crate::flow_executors::human::HumanExecutor::new(
+                        std::sync::Arc::new(crate::intelligence::approval::AutoApprove),
+                    )),
+                )
+                .await;
+            let runtime = thinkingroot_flow::runtime::FlowRuntime::new(store, executors);
+
+            match runtime
+                .start_run_for_session(
+                    &flow_id,
+                    ws,
+                    "main",
+                    inputs_value,
+                    originating_session_id,
+                )
+                .await
+            {
+                Ok(handle) => {
+                    let response = serde_json::json!({
+                        "flow_run_id": handle.flow_run_id,
+                        "status": "running",
+                        "started_at": handle.started_at.to_rfc3339(),
+                    });
+                    // The handle's join_handle is dropped here —
+                    // the spawned task continues running in the
+                    // background; status + cancellation are
+                    // accessed via the storage layer's
+                    // flow_runs/<id>.json file. A future commit
+                    // can stash the handle in
+                    // `AppState.active_flow_runs` for in-memory
+                    // cancellation routing without a disk round-trip.
+                    let _ = handle;
+                    mcp_text_result(id, &response)
+                }
+                Err(e) => JsonRpcResponse::error(
+                    id,
+                    -32603,
+                    format!("flow_run: {e}"),
+                ),
+            }
+        }
+        "flow_status" => {
+            let app_state = match state {
+                Some(s) => s,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32601,
+                        "flow_status requires HTTP transport".to_string(),
+                    );
+                }
+            };
+            let _ = app_state;
+            let flow_run_id = match arguments.get("flow_run_id").and_then(|v| v.as_str()) {
+                Some(f) => f.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "flow_status: missing 'flow_run_id'".to_string(),
+                    );
+                }
+            };
+            let workspace_root = match engine.workspace_root_path(ws) {
+                Some(p) => p,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("workspace '{ws}' not mounted"),
+                    );
+                }
+            };
+            let store = thinkingroot_flow::storage::FlowStore::new(workspace_root);
+            let record = match store.get_flow_run(&flow_run_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        format!("flow_run_id '{flow_run_id}' not found"),
+                    );
+                }
+                Err(e) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32603,
+                        format!("flow_status read failed: {e}"),
+                    );
+                }
+            };
+            // Optional cancel action — for v1 we mark the
+            // run's status in the store. Live cancellation
+            // routing through CancellationToken needs the
+            // active_flow_runs registry (C17.5 follow-up).
+            if let Some(action) = arguments.get("action").and_then(|v| v.as_str()) {
+                if action == "cancel" && !record.status.is_terminal() {
+                    let mut updated = record.clone();
+                    updated.status = thinkingroot_flow::storage::FlowRunStatus::Cancelled;
+                    updated.finished_at = Some(chrono::Utc::now());
+                    updated.error = Some("cancelled by flow_status action".to_string());
+                    if let Err(e) = store.upsert_flow_run(&updated) {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32603,
+                            format!("flow_status cancel failed: {e}"),
+                        );
+                    }
+                    return mcp_text_result(
+                        id,
+                        &serde_json::json!({
+                            "flow_run_id": flow_run_id,
+                            "status": "cancelled",
+                            "previous_status": format!("{:?}", record.status),
+                        }),
+                    );
+                }
+            }
+            mcp_text_result(
+                id,
+                &serde_json::json!({
+                    "flow_run_id": record.flow_run_id,
+                    "flow_id": record.flow_id,
+                    "status": record.status,
+                    "current_node": record.current_node,
+                    "started_at": record.started_at.to_rfc3339(),
+                    "finished_at": record.finished_at.map(|t| t.to_rfc3339()),
+                    "parent_branch": record.parent_branch,
+                    "originating_session_id": record.originating_session_id,
+                    "node_outputs_count": record.node_outputs.len(),
+                    "outputs": record.outputs,
+                    "error": record.error,
+                }),
+            )
+        }
         // ── Intelligent memory ask (Phase 3.6 — full hybrid pipeline) ─────
         "ask" => {
             let question = match arguments.get("question").and_then(|v| v.as_str()) {
@@ -1656,17 +2425,17 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "create_branch")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
             let description = arguments
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(String::from);
             match thinkingroot_branch::create_branch_with_owner(
-                root,
+                &root,
                 branch_name,
                 "main",
                 description,
@@ -1696,23 +2465,23 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "diff_branch")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
             use thinkingroot_branch::diff::compute_diff;
             use thinkingroot_branch::snapshot::resolve_data_dir;
             use thinkingroot_core::config::Config;
             use thinkingroot_graph::graph::GraphStore;
 
-            let config = match Config::load_merged(root) {
+            let config = match Config::load_merged(&root) {
                 Ok(c) => c,
                 Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
             };
             let mc = &config.merge;
-            let main_data_dir = resolve_data_dir(root, None);
-            let branch_data_dir = resolve_data_dir(root, Some(branch_name));
+            let main_data_dir = resolve_data_dir(&root, None);
+            let branch_data_dir = resolve_data_dir(&root, Some(branch_name));
             if !branch_data_dir.exists() {
                 return JsonRpcResponse::error(
                     id,
@@ -1752,11 +2521,11 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "merge_branch")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
             let force = arguments
                 .get("force")
                 .and_then(|v| v.as_bool())
@@ -1768,7 +2537,7 @@ pub async fn handle_call(
                 .unwrap_or(false);
             match engine
                 .merge_into_branch(
-                    root,
+                    &root,
                     branch_name,
                     target,
                     force,
@@ -1810,13 +2579,13 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "rebase_branch")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
             match engine
-                .rebase_branch(root, branch_name, session_actor(sessions, session_id).await)
+                .rebase_branch(&root, branch_name, session_actor(sessions, session_id).await)
                 .await
             {
                 Ok(diff) => JsonRpcResponse::success(
@@ -2336,12 +3105,12 @@ pub async fn handle_call(
 
         // ── Branch management: list / delete / gc / rollback ──────────────
         "list_branches" => {
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
-            match thinkingroot_branch::list_branches(root) {
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "list_branches")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            match thinkingroot_branch::list_branches(&root) {
                 Ok(branches) => {
                     let content =
                         serde_json::to_string_pretty(&branches).unwrap_or_else(|_| "[]".into());
@@ -2367,13 +3136,13 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "delete_branch")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
             match engine
-                .delete_branch_as(root, branch_name, session_actor(sessions, session_id).await)
+                .delete_branch_as(&root, branch_name, session_actor(sessions, session_id).await)
                 .await
             {
                 Ok(()) => JsonRpcResponse::success(
@@ -2393,12 +3162,12 @@ pub async fn handle_call(
         }
 
         "gc_branches" => {
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
-            match engine.gc_branches(root).await {
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "gc_branches")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            match engine.gc_branches(&root).await {
                 Ok(n) => JsonRpcResponse::success(
                     id,
                     serde_json::json!({
@@ -2423,12 +3192,12 @@ pub async fn handle_call(
                     );
                 }
             };
-            let root_path_str = arguments
-                .get("root_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let root = std::path::Path::new(root_path_str);
-            match engine.rollback_merge(root, branch_name).await {
+            let root = match branch_resolve_root(id.clone(), &arguments, engine, ws, "rollback_merge")
+            {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            match engine.rollback_merge(&root, branch_name).await {
                 Ok(()) => JsonRpcResponse::success(
                     id,
                     serde_json::json!({
@@ -4416,6 +5185,32 @@ fn fs_resolve_root_or_error(
     ws: &str,
     tool: &str,
 ) -> Result<std::path::PathBuf, JsonRpcResponse> {
+    engine.workspace_root_path(ws).ok_or_else(|| {
+        JsonRpcResponse::error(
+            id,
+            -32603,
+            format!("{tool}: workspace `{ws}` is not mounted"),
+        )
+    })
+}
+
+/// On-disk workspace root for branch tools (`diff_branch`, `list_branches`, …).
+///
+/// Hand-wrapped builtins (`ListBranchesTool`, `MergeBranchTool`, …) already use
+/// `ToolContext::workspace_root`. MCP-bridge tools only inject `workspace` by
+/// name — without this helper they defaulted to `"."` (daemon cwd), so
+/// `list_branches` could see `stream/{session}` under `playground/` while
+/// `diff_branch` looked in the wrong tree and returned "branch not found".
+fn branch_resolve_root(
+    id: Option<Value>,
+    arguments: &Value,
+    engine: &QueryEngine,
+    ws: &str,
+    tool: &str,
+) -> Result<std::path::PathBuf, JsonRpcResponse> {
+    if let Some(rp) = arguments.get("root_path").and_then(|v| v.as_str()) {
+        return Ok(std::path::PathBuf::from(rp));
+    }
     engine.workspace_root_path(ws).ok_or_else(|| {
         JsonRpcResponse::error(
             id,

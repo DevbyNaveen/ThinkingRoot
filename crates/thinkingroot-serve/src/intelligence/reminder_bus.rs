@@ -24,15 +24,23 @@
 //   * `engram_state`   — active engram pointers + budget
 //   * `tool_budget`    — remaining tool calls in this turn
 //
-// Deferred to v1.1 (require expensive per-turn substrate queries
-// — see plan 2026-05-09 for the wiring requirements):
-//   * `contradiction_alert` (needs branch::diff::contradictions
-//     against the active focus entity)
-//   * `gap_alert` (needs reflect::list_open_gaps filtered to focus)
-//   * `search_was_shallow` (needs hook into hybrid_retrieve to
-//     track last-call result count)
-//
-// (Task 9 / Day 2-4 P1, plan 2026-05-09.)
+// v1.2 emitters (shipped 2026-05-20 as part of the world-class
+// SOTA harness ship — Ships 3A/3B/3D/3E):
+//   * `substrate_freshness`  — "brain is N edits behind disk; recompile
+//     before answering critical questions". Sourced from
+//     `SourcesState.fingerprint_match` which Ship 1 made honest.
+//   * `sub_agent_digest`     — last few `SubAgentReport`s from the
+//     `SubAgentScheduler` (Reconciler / GapHunter / Curator / Watcher)
+//     so the executive chat agent reads what the sleep-time
+//     compute layer found. Closes the observer→executive loop.
+//   * `previous_verify`      — last-turn verifier critique. When the
+//     prior answer scored low-grounding or had contradictions,
+//     surface it so the next turn self-corrects (Reflexion pattern).
+//   * `gap_alert`            — open gaps from `reflect::list_open_gaps`
+//     filtered to focus entity.
+//   * `contradiction_alert`  — branch-diff contradictions vs focus.
+//   * `search_was_shallow`   — last hybrid_retrieve returned ≤ K hits;
+//     warn before re-running with same query.
 
 use crate::intelligence::environment::{EnvironmentInfo, render_block as render_env_inner};
 use crate::intelligence::identity::{WorkspaceIdentity, render_identity_block};
@@ -103,6 +111,131 @@ pub struct McpSessionBrief {
     /// Total errors observed. Non-zero is a debug signal — the AI
     /// can surface "Cursor's session has 5 errors, want me to look?"
     pub errors_total: u64,
+}
+
+/// Honest substrate-freshness signal. Ship 1 (2026-05-20) wired
+/// `SourcesState.fingerprint_match` to the truth via mtime
+/// comparison; this struct surfaces it to the LLM via the reminder
+/// bus so the agent stops answering from stale claims as if they
+/// were current. CLAUDE.md §honesty rule §7 at the prompt layer.
+///
+/// The presence of this struct in `ReminderContext` means "we have
+/// freshness data to report"; the renderer suppresses the block
+/// when `fingerprint_match == true` because there's nothing useful
+/// to say ("brain is current" is trivially true and burns context).
+#[derive(Debug, Clone)]
+pub struct SubstrateFreshness {
+    /// `true` when the compiled substrate is at-or-ahead of disk
+    /// (file mtimes ≤ fingerprints.json mtime). `false` when the
+    /// user has edited/added/removed sources since the last compile.
+    pub fingerprint_match: bool,
+    /// ISO-8601 timestamp of the last successful compile (`fingerprints.json`
+    /// mtime). `None` when no compile has ever run for this workspace.
+    pub last_compile_at_iso: Option<String>,
+    /// Best-effort count of source files seen by the latest probe.
+    /// Sourced from `SourcesState::Some::file_count`. Honest 0 is
+    /// possible — empty workspace.
+    pub file_count: u64,
+}
+
+/// Slim per-tick summary from a background sub-agent
+/// (`SubAgentScheduler`'s Reconciler / GapHunter / Curator /
+/// Watcher). Surfaced via `recent_sub_agent_reports` so the
+/// executive chat agent reads what the sleep-time compute layer
+/// found in the background, closing the observer→executive loop
+/// that was the canonical Letta / MemGPT pattern's missing wire.
+///
+/// Decoupled from `intelligence::substrate_bus::SubAgentReport` so
+/// reminder-bus tests stay independent of the scheduler module's
+/// concrete shape — caller projects.
+#[derive(Debug, Clone)]
+pub struct SubAgentReportBrief {
+    /// Agent slug — `"reconciler"`, `"gap_hunter"`, `"curator"`,
+    /// `"watcher"`. Rendered verbatim.
+    pub agent: String,
+    /// ISO-8601 timestamp the tick finished. Lets the LLM judge
+    /// recency ("Reconciler ran 8 minutes ago…").
+    pub finished_at_iso: String,
+    /// One-line summary suitable for the reminder body. Empty when
+    /// the tick was a no-op — the bus suppresses empty entries.
+    pub summary: String,
+    /// Up to 3 most-salient observations from this tick, already
+    /// truncated by the caller. Rendered as sub-bullets.
+    pub observations: Vec<String>,
+}
+
+/// One-shot critique from the post-Done verifier. When the previous
+/// turn's grounding was weak (low-ratio cited claims, missing
+/// substrate evidence, flagged contradictions), this carries the
+/// critique forward into the next turn's reminder bus so the agent
+/// reads its own past mistake and self-corrects on the redo. This
+/// is the Reflexion pattern (Shinn et al 2023): post-task critique
+/// that biases the next task's planning, never silently dropped.
+///
+/// Suppressed when `kind` is `"chitchat"` / `"skipped_rejection"` /
+/// `"skipped_bench"` — those verdict classes don't carry useful
+/// critique signal.
+#[derive(Debug, Clone)]
+pub struct PreviousVerifyCritique {
+    /// Verdict slug as a snake_case string. Production values:
+    /// `"high_grounding"`, `"low_grounding"`, `"ungrounded"`,
+    /// `"contradiction"`, `"skipped_*"`, `"chitchat"`.
+    pub verdict: String,
+    /// Number of claims the previous answer cited that VERIFIED
+    /// against the substrate. `None` when the verifier didn't track.
+    pub citations_verified: Option<u32>,
+    /// Number of claims cited that did NOT verify (claim id not in
+    /// substrate, or content_blake3 mismatch). `None` when not tracked.
+    pub citations_unverified: Option<u32>,
+    /// One-line human-readable reason. Pre-formatted by the caller
+    /// (`rest.rs::agent_stream_response` post-verify hook).
+    pub reason: String,
+}
+
+/// Open structural gap surfaced by `reflect::list_open_gaps` filtered
+/// to the session's focus entity. Lets the agent name the gaps in
+/// its first response without paying a separate tool round-trip.
+/// Truncated to top 5 by the caller; bus enforces ≤ 10 defensively.
+#[derive(Debug, Clone)]
+pub struct GapAlert {
+    /// Free-form gap kind label from `reflect::OpenGap.kind`. Examples:
+    /// `"missing_origin"`, `"missing_definition"`, `"untyped_relation"`.
+    pub kind: String,
+    /// Subject entity name the gap is about. Usually matches or
+    /// neighbours the session's focus entity.
+    pub subject: String,
+    /// One-line "what's missing" hint for the LLM. Pre-formatted by
+    /// the caller from the gap's `details` field.
+    pub hint: String,
+}
+
+/// Branch-diff contradiction surfaced when the active session's
+/// branch carries claims that contradict main (or vice-versa).
+/// World-class agents surface conflict; lesser ones answer one
+/// arbitrarily and hope. Caller computes via `branch::diff::contradictions`.
+#[derive(Debug, Clone)]
+pub struct ContradictionAlert {
+    /// Subject entity the contradiction is about.
+    pub subject: String,
+    /// Statement from the active branch (the "new" claim).
+    pub branch_says: String,
+    /// Statement from main (the "old"/baseline claim).
+    pub main_says: String,
+}
+
+/// Signal that the last `hybrid_retrieve` returned thin evidence
+/// (≤ `SHALLOW_RETRIEVAL_THRESHOLD` hits). Warns the agent that
+/// re-running the same query is unlikely to help; better to
+/// rephrase, drill via `probe_engram`, or admit the substrate
+/// doesn't carry the answer. Sourced from `RetrievalCapture`.
+#[derive(Debug, Clone)]
+pub struct SearchWasShallow {
+    /// The query string that produced thin results. Quoted in the
+    /// reminder so the LLM doesn't re-run it verbatim.
+    pub query: String,
+    /// Hit count from the last retrieval call. `0` is the worst
+    /// case ("no hits at all"); ≤ threshold but > 0 is "weak".
+    pub hits: u32,
 }
 
 /// Slim view of a recent self-heal event (compile failure, breaker
@@ -199,6 +332,32 @@ pub struct ReminderContext<'a> {
     /// block tagged with the skill name. Caller is responsible for
     /// the classification; the bus is a pure renderer.
     pub relevant_skill: Option<RelevantSkill<'a>>,
+    /// Substrate-freshness signal (Ship 3A, 2026-05-20). Surfaced
+    /// when the daemon's source-tree watcher has flipped
+    /// `fingerprint_match` to false — the agent SEES that the brain
+    /// is N edits behind disk and can decline / qualify / suggest
+    /// recompile rather than answering from stale claims as if they
+    /// were current.
+    pub substrate_freshness: Option<&'a SubstrateFreshness>,
+    /// Last few sub-agent reports (Ship 3B, 2026-05-20). Closes the
+    /// observer→executive loop: the chat agent reads what the
+    /// `SubAgentScheduler`'s background sleep-time-compute layer
+    /// found (open gaps, structural patterns, branch drift). Empty
+    /// slice suppresses the block.
+    pub recent_sub_agent_reports: &'a [SubAgentReportBrief],
+    /// Critique from the previous turn's verifier (Ship 3D,
+    /// 2026-05-20). When the prior answer scored weak grounding,
+    /// surface it so the agent self-corrects rather than repeating
+    /// the same evidence-thin pattern. Reflexion (Shinn et al 2023).
+    pub previous_verify_critique: Option<&'a PreviousVerifyCritique>,
+    /// Open gaps in the focus area (Ship 3E, finishes v1.1 TODO).
+    /// Empty slice suppresses.
+    pub gap_alerts: &'a [GapAlert],
+    /// Branch-diff contradictions (Ship 3E). Empty slice suppresses.
+    pub contradiction_alerts: &'a [ContradictionAlert],
+    /// Most recent thin retrieval (Ship 3E). `None` when the last
+    /// retrieval either wasn't shallow or none has happened yet.
+    pub search_was_shallow: Option<&'a SearchWasShallow>,
 }
 
 /// Slim view of an auto-surfaced skill — name plus body. The body
@@ -254,6 +413,13 @@ pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
     if let Some(s) = render_workspace_block(ctx) {
         out.push_str(&s);
     }
+    // Substrate freshness rides immediately after workspace identity:
+    // the agent should know the brain may be behind disk BEFORE it
+    // reads the agentmemory recall (which is sourced from the same
+    // potentially-stale substrate).
+    if let Some(s) = render_substrate_freshness_block(ctx) {
+        out.push_str(&s);
+    }
     if let Some(s) = render_agentmemory_recall_block(ctx) {
         out.push_str(&s);
     }
@@ -269,6 +435,30 @@ pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
     if let Some(s) = render_engram_state_block(ctx) {
         out.push_str(&s);
     }
+    // Gap + contradiction alerts ride after the workspace/branch/
+    // session context so the LLM has named the focus entity before
+    // hearing what's wrong with it.
+    if let Some(s) = render_gap_alerts_block(ctx) {
+        out.push_str(&s);
+    }
+    if let Some(s) = render_contradiction_alerts_block(ctx) {
+        out.push_str(&s);
+    }
+    // Sub-agent digest rides AFTER the substrate state so the LLM
+    // can correlate "Reconciler found X gaps" with the workspace it
+    // just read about. Closes the observer→executive loop.
+    if let Some(s) = render_sub_agent_digest_block(ctx) {
+        out.push_str(&s);
+    }
+    // Previous-turn verifier critique rides late so it's the last
+    // thing the model reads before the user's new question — biases
+    // the self-correction toward THIS turn's planning.
+    if let Some(s) = render_previous_verify_block(ctx) {
+        out.push_str(&s);
+    }
+    if let Some(s) = render_search_was_shallow_block(ctx) {
+        out.push_str(&s);
+    }
     if let Some(s) = render_mcp_sessions_block(ctx) {
         out.push_str(&s);
     }
@@ -282,6 +472,167 @@ pub fn render_reactive_reminders(ctx: &ReminderContext<'_>) -> String {
         out.push_str(&s);
     }
     out
+}
+
+/// `<substrate_freshness>` — informs the LLM that the compiled
+/// substrate may be N edits behind disk. Fires only when
+/// `fingerprint_match == false` (no signal = no block = no token
+/// burn). Tells the agent what to do: prefer file_read for fresh
+/// content, qualify claims that may have drifted, surface "I'd want
+/// to recompile" when stakes are high.
+fn render_substrate_freshness_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    let f = ctx.substrate_freshness?;
+    // Fresh substrate is the silent default — no reminder.
+    if f.fingerprint_match {
+        return None;
+    }
+    let mut inner = String::from("# substrate_freshness\n");
+    inner.push_str("status: behind\n");
+    match &f.last_compile_at_iso {
+        Some(at) => inner.push_str(&format!("last_compiled_at: {at}\n")),
+        None => inner.push_str("last_compiled_at: never (substrate is fresh-built or pre-CCC)\n"),
+    }
+    inner.push_str(&format!("files_on_disk: {}\n", f.file_count));
+    inner.push_str(
+        "The compiled knowledge graph does NOT yet reflect the user's most-recent edits. \
+         Claims you retrieve may reference symbols / lines that have moved or no longer exist. \
+         When precision matters: prefer `file_read` / `grep` on the live disk over `query_claims` / \
+         `hybrid_retrieve`; qualify substrate-derived answers with \"the indexed snapshot says X — \
+         your current file may differ\"; suggest `compile` when the user is asking a verification or \
+         publish-class question. Don't claim something synced when it didn't.\n",
+    );
+    Some(wrap_reminder(&inner))
+}
+
+/// `<sub_agent_digest>` — last few `SubAgentReport`s from the
+/// background scheduler (Reconciler / GapHunter / Curator /
+/// Watcher). Closes the observer→executive loop that was the
+/// canonical Letta / MemGPT pattern's missing wire: the executive
+/// chat agent reads what sleep-time compute observed in the
+/// background, so a turn that follows a fresh Reconciler tick
+/// surfaces the patterns / gaps it found WITHOUT the user asking.
+///
+/// Suppressed when no non-empty reports exist. A scheduler running
+/// idle (all reports empty summary, no observations) correctly
+/// produces no reminder — silence is honest.
+fn render_sub_agent_digest_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.recent_sub_agent_reports.is_empty() {
+        return None;
+    }
+    // Skip the block if every report is empty (background scheduler
+    // ran but found nothing worth saying — don't burn tokens on
+    // "all quiet").
+    let any_useful = ctx
+        .recent_sub_agent_reports
+        .iter()
+        .any(|r| !r.summary.is_empty() || !r.observations.is_empty());
+    if !any_useful {
+        return None;
+    }
+    let mut inner = String::from("# sub_agent_digest\n");
+    inner.push_str(
+        "Background observers (sleep-time compute) found these signals since your last turn. \
+         Use them to surface what the user hasn't asked about yet, not as gospel — verify before \
+         acting on a write.\n",
+    );
+    for r in ctx.recent_sub_agent_reports {
+        if r.summary.is_empty() && r.observations.is_empty() {
+            continue;
+        }
+        inner.push_str(&format!("- {} (at {}):", r.agent, r.finished_at_iso));
+        if !r.summary.is_empty() {
+            inner.push_str(&format!(" {}", r.summary));
+        }
+        inner.push('\n');
+        for obs in r.observations.iter().take(3) {
+            inner.push_str(&format!("    · {obs}\n"));
+        }
+    }
+    Some(wrap_reminder(&inner))
+}
+
+/// `<previous_verify>` — critique from the last turn's verifier.
+/// Reflexion-pattern self-correction: when the prior answer scored
+/// weak grounding (citations didn't verify, low ratio, flagged
+/// contradiction), the next turn reads this and adjusts BEFORE
+/// re-running the same evidence-thin pattern.
+fn render_previous_verify_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    let c = ctx.previous_verify_critique?;
+    // Skip benign verdicts — no useful signal for the next turn.
+    let useful = matches!(
+        c.verdict.as_str(),
+        "low_grounding" | "ungrounded" | "contradiction"
+    );
+    if !useful {
+        return None;
+    }
+    let mut inner = String::from("# previous_verify\n");
+    inner.push_str(&format!("verdict: {}\n", c.verdict));
+    if let (Some(v), Some(u)) = (c.citations_verified, c.citations_unverified) {
+        inner.push_str(&format!("citations: {v} verified, {u} unverified\n"));
+    }
+    inner.push_str(&format!("reason: {}\n", c.reason));
+    inner.push_str(
+        "On this turn: cite from retrieved evidence only, not from training data; \
+         when the substrate can't ground a needed claim, say so plainly rather than \
+         repeating the previous answer's pattern.\n",
+    );
+    Some(wrap_reminder(&inner))
+}
+
+/// `<gap_alerts>` — open structural gaps surfaced in the focus area.
+/// Lets the agent name them in the first response without paying a
+/// `reflect` round-trip.
+fn render_gap_alerts_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.gap_alerts.is_empty() {
+        return None;
+    }
+    let mut inner = String::from("# gap_alerts\n");
+    inner.push_str("Open structural gaps near the session's focus:\n");
+    for g in ctx.gap_alerts.iter().take(10) {
+        inner.push_str(&format!("- {} on {}: {}\n", g.kind, g.subject, g.hint));
+    }
+    inner.push_str(
+        "Cite gaps when relevant; offer to open a proposal or contribute the missing edge. \
+         Don't fabricate the missing information — the gap exists precisely because the \
+         substrate doesn't carry it yet.\n",
+    );
+    Some(wrap_reminder(&inner))
+}
+
+/// `<contradiction_alerts>` — branch-diff contradictions vs main.
+/// World-class agents surface conflict explicitly; lesser ones pick
+/// one side silently. Caller computes via `branch::diff::contradictions`.
+fn render_contradiction_alerts_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    if ctx.contradiction_alerts.is_empty() {
+        return None;
+    }
+    let mut inner = String::from("# contradiction_alerts\n");
+    inner.push_str(
+        "The active branch contradicts main on the entities below. Surface BOTH sides \
+         when relevant — never pick one silently.\n",
+    );
+    for c in ctx.contradiction_alerts.iter().take(5) {
+        inner.push_str(&format!("- {}: branch says \"{}\"; main says \"{}\"\n",
+            c.subject, c.branch_says, c.main_says));
+    }
+    Some(wrap_reminder(&inner))
+}
+
+/// `<search_was_shallow>` — warns that the prior retrieval returned
+/// thin evidence; re-running the same query is unlikely to help.
+fn render_search_was_shallow_block(ctx: &ReminderContext<'_>) -> Option<String> {
+    let s = ctx.search_was_shallow?;
+    let mut inner = String::from("# search_was_shallow\n");
+    inner.push_str(&format!(
+        "Previous retrieval for {:?} returned {} hit(s).\n",
+        s.query, s.hits
+    ));
+    inner.push_str(
+        "Don't re-run the same query — rephrase, drill via `probe_engram` on a related entity, \
+         or admit the substrate doesn't carry the answer.\n",
+    );
+    Some(wrap_reminder(&inner))
 }
 
 /// `<environment>` — host context (cwd, OS, shell, $HOME, common
@@ -974,6 +1325,8 @@ mod tests {
                 name: "refactor-rust",
                 body,
             }),
+            // Ship 3 fields default to empty; covered by per-block tests below.
+            ..Default::default()
         };
         let out = render_reactive_reminders(&ctx);
 
@@ -1103,5 +1456,284 @@ mod tests {
         let budget_pos = out.find("# tool_budget").expect("tool_budget block missing");
         assert!(engram_pos < sandbox_pos, "engram should precede sandbox");
         assert!(sandbox_pos < budget_pos, "sandbox should precede tool_budget");
+    }
+
+    // ── Ship 3 — substrate freshness ─────────────────────────────
+
+    #[test]
+    fn substrate_freshness_silent_when_fresh() {
+        let fresh = SubstrateFreshness {
+            fingerprint_match: true,
+            last_compile_at_iso: Some("2026-05-20T10:00:00Z".to_string()),
+            file_count: 42,
+        };
+        let ctx = ReminderContext {
+            substrate_freshness: Some(&fresh),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(
+            !out.contains("substrate_freshness"),
+            "fresh substrate must NOT render a reminder (no signal = no token burn)"
+        );
+    }
+
+    #[test]
+    fn substrate_freshness_fires_when_behind() {
+        let stale = SubstrateFreshness {
+            fingerprint_match: false,
+            last_compile_at_iso: Some("2026-05-20T09:00:00Z".to_string()),
+            file_count: 42,
+        };
+        let ctx = ReminderContext {
+            substrate_freshness: Some(&stale),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# substrate_freshness"));
+        assert!(out.contains("status: behind"));
+        assert!(out.contains("last_compiled_at: 2026-05-20T09:00:00Z"));
+        assert!(
+            out.contains("prefer `file_read`"),
+            "must direct LLM to fresh-disk reads"
+        );
+    }
+
+    #[test]
+    fn substrate_freshness_handles_never_compiled() {
+        let stale = SubstrateFreshness {
+            fingerprint_match: false,
+            last_compile_at_iso: None,
+            file_count: 0,
+        };
+        let ctx = ReminderContext {
+            substrate_freshness: Some(&stale),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("last_compiled_at: never"));
+    }
+
+    // ── Ship 3 — sub-agent digest ────────────────────────────────
+
+    #[test]
+    fn sub_agent_digest_suppressed_when_empty() {
+        let ctx = ReminderContext::default();
+        let out = render_reactive_reminders(&ctx);
+        assert!(!out.contains("sub_agent_digest"));
+    }
+
+    #[test]
+    fn sub_agent_digest_suppressed_when_all_reports_empty() {
+        let reports = vec![
+            SubAgentReportBrief {
+                agent: "reconciler".to_string(),
+                finished_at_iso: "2026-05-20T10:00:00Z".to_string(),
+                summary: String::new(),
+                observations: Vec::new(),
+            },
+            SubAgentReportBrief {
+                agent: "gap_hunter".to_string(),
+                finished_at_iso: "2026-05-20T10:01:00Z".to_string(),
+                summary: String::new(),
+                observations: Vec::new(),
+            },
+        ];
+        let ctx = ReminderContext {
+            recent_sub_agent_reports: &reports,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(
+            !out.contains("sub_agent_digest"),
+            "all-quiet ticks must not burn tokens"
+        );
+    }
+
+    #[test]
+    fn sub_agent_digest_renders_summary_and_observations() {
+        let reports = vec![
+            SubAgentReportBrief {
+                agent: "reconciler".to_string(),
+                finished_at_iso: "2026-05-20T10:00:00Z".to_string(),
+                summary: "12 open gaps (+3 new this tick)".to_string(),
+                observations: vec![
+                    "pattern: WebhookHandler expects validation, frequency=0.87".to_string(),
+                    "pattern: AuthMiddleware expects timeout, frequency=0.65".to_string(),
+                ],
+            },
+            SubAgentReportBrief {
+                agent: "gap_hunter".to_string(),
+                finished_at_iso: "2026-05-20T10:01:00Z".to_string(),
+                summary: String::new(),
+                observations: Vec::new(),
+            },
+        ];
+        let ctx = ReminderContext {
+            recent_sub_agent_reports: &reports,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# sub_agent_digest"));
+        assert!(out.contains("reconciler"));
+        assert!(out.contains("12 open gaps"));
+        assert!(out.contains("WebhookHandler expects validation"));
+        // Empty gap_hunter report must be skipped (caller passes
+        // empty when nothing happened; the bus suppresses).
+        assert!(
+            !out.contains("gap_hunter"),
+            "empty reports must not render placeholder lines"
+        );
+    }
+
+    // ── Ship 3 — previous-verify (Reflexion) ─────────────────────
+
+    #[test]
+    fn previous_verify_suppressed_for_benign_verdicts() {
+        for verdict in ["high_grounding", "chitchat", "skipped_rejection", "skipped_bench"] {
+            let critique = PreviousVerifyCritique {
+                verdict: verdict.to_string(),
+                citations_verified: Some(3),
+                citations_unverified: Some(0),
+                reason: "ok".to_string(),
+            };
+            let ctx = ReminderContext {
+                previous_verify_critique: Some(&critique),
+                ..Default::default()
+            };
+            let out = render_reactive_reminders(&ctx);
+            assert!(
+                !out.contains("previous_verify"),
+                "{verdict} should not surface critique reminder"
+            );
+        }
+    }
+
+    #[test]
+    fn previous_verify_fires_on_weak_grounding() {
+        let critique = PreviousVerifyCritique {
+            verdict: "low_grounding".to_string(),
+            citations_verified: Some(1),
+            citations_unverified: Some(4),
+            reason: "4 of 5 [claim:…] markers did not resolve in the substrate".to_string(),
+        };
+        let ctx = ReminderContext {
+            previous_verify_critique: Some(&critique),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# previous_verify"));
+        assert!(out.contains("verdict: low_grounding"));
+        assert!(out.contains("1 verified, 4 unverified"));
+        assert!(out.contains("retrieved evidence only"));
+    }
+
+    // ── Ship 3 — gap + contradiction alerts ──────────────────────
+
+    #[test]
+    fn gap_alerts_render_when_present() {
+        let gaps = vec![
+            GapAlert {
+                kind: "missing_origin".to_string(),
+                subject: "WebhookHandler".to_string(),
+                hint: "no source links into WebhookHandler".to_string(),
+            },
+            GapAlert {
+                kind: "untyped_relation".to_string(),
+                subject: "AuthMiddleware".to_string(),
+                hint: "edge to TokenStore lacks a verb".to_string(),
+            },
+        ];
+        let ctx = ReminderContext {
+            gap_alerts: &gaps,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# gap_alerts"));
+        assert!(out.contains("missing_origin on WebhookHandler"));
+        assert!(out.contains("untyped_relation on AuthMiddleware"));
+    }
+
+    #[test]
+    fn contradiction_alerts_render_both_sides() {
+        let contras = vec![ContradictionAlert {
+            subject: "WebhookHandler.timeout".to_string(),
+            branch_says: "30s".to_string(),
+            main_says: "10s".to_string(),
+        }];
+        let ctx = ReminderContext {
+            contradiction_alerts: &contras,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# contradiction_alerts"));
+        assert!(out.contains("branch says \"30s\""));
+        assert!(out.contains("main says \"10s\""));
+    }
+
+    #[test]
+    fn search_was_shallow_fires_when_set() {
+        let s = SearchWasShallow {
+            query: "AuthMiddleware retries".to_string(),
+            hits: 1,
+        };
+        let ctx = ReminderContext {
+            search_was_shallow: Some(&s),
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        assert!(out.contains("# search_was_shallow"));
+        assert!(out.contains("AuthMiddleware retries"));
+        assert!(out.contains("1 hit"));
+        assert!(out.contains("rephrase"));
+    }
+
+    // ── Ship 3 — stable order including new blocks ───────────────
+
+    #[test]
+    fn ship3_blocks_render_in_stable_order() {
+        let id = fixture_identity();
+        let stale = SubstrateFreshness {
+            fingerprint_match: false,
+            last_compile_at_iso: Some("2026-05-20T09:00:00Z".to_string()),
+            file_count: 42,
+        };
+        let reports = vec![SubAgentReportBrief {
+            agent: "reconciler".to_string(),
+            finished_at_iso: "2026-05-20T10:00:00Z".to_string(),
+            summary: "3 gaps".to_string(),
+            observations: vec![],
+        }];
+        let critique = PreviousVerifyCritique {
+            verdict: "low_grounding".to_string(),
+            citations_verified: Some(1),
+            citations_unverified: Some(2),
+            reason: "thin".to_string(),
+        };
+        let gaps = vec![GapAlert {
+            kind: "missing_origin".to_string(),
+            subject: "X".to_string(),
+            hint: "y".to_string(),
+        }];
+        let ctx = ReminderContext {
+            identity: Some(&id),
+            today: Some("2026-05-20"),
+            substrate_freshness: Some(&stale),
+            recent_sub_agent_reports: &reports,
+            previous_verify_critique: Some(&critique),
+            gap_alerts: &gaps,
+            ..Default::default()
+        };
+        let out = render_reactive_reminders(&ctx);
+        let p_ws = out.find("name: test-ws").expect("workspace");
+        let p_fr = out.find("# substrate_freshness").expect("freshness");
+        let p_gp = out.find("# gap_alerts").expect("gaps");
+        let p_sd = out.find("# sub_agent_digest").expect("digest");
+        let p_pv = out.find("# previous_verify").expect("verify");
+
+        assert!(p_ws < p_fr, "workspace must precede substrate_freshness");
+        assert!(p_fr < p_gp, "substrate_freshness must precede gap_alerts");
+        assert!(p_gp < p_sd, "gap_alerts must precede sub_agent_digest");
+        assert!(p_sd < p_pv, "sub_agent_digest must precede previous_verify");
     }
 }

@@ -27,7 +27,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::QueryEngine;
-use crate::intelligence::agent::{Agent, AgentEvent, AgentRequest, LlmBackend};
+use crate::intelligence::agent::{Agent, AgentEvent, AgentRequest, LlmBackend, SystemPromptRefresher};
 use crate::intelligence::approval::{ApprovalGate, PendingApprovalMap, ToolApprovalRouter};
 use crate::intelligence::builtin_tools::{ToolContext, register_builtin_tools};
 use crate::intelligence::permissions_gate::PermissionsGate;
@@ -48,6 +48,15 @@ pub struct StreamAgentRequest {
     pub user_question: String,
     pub history: Vec<ChatMessage>,
     pub skills: Arc<SkillRegistry>,
+    /// Ship 3F (2026-05-20) — mid-turn system-prompt refresher.
+    /// Called by the agent loop at the top of every iteration so the
+    /// LLM's `system` parameter reflects the most-recent volatile
+    /// signals (substrate freshness, recent sub-agent reports, fresh
+    /// recovery events). `None` falls back to the static
+    /// `system_prompt`. The REST agent path supplies an
+    /// `Arc<RestStreamSystemRefresher>` so a long multi-iteration
+    /// turn never answers from a system prompt that's now stale.
+    pub system_refresher: Option<Arc<dyn SystemPromptRefresher>>,
 }
 
 /// Dependencies the streaming runner needs from the surrounding
@@ -173,11 +182,15 @@ pub fn spawn_agent_run(
 
         let agent_req = AgentRequest {
             system: req.system_prompt,
-            // C5: no refresher wired yet — will be set in Task 5/9
-            // (system-reminder bus). Until then, agent path uses
-            // static identity captured at request entry. Bug C5,
-            // plan 2026-05-09.
-            system_refresher: None,
+            // Ship 3F (2026-05-20) — refresher wired through from the
+            // REST handler. When supplied, the agent loop calls it at
+            // the top of every iteration so the LLM's `system`
+            // parameter carries fresh substrate-freshness +
+            // sub-agent-digest + recovery signals across long
+            // multi-iteration turns. Tests and CLI flows that don't
+            // need refresh pass `None` and the agent reuses
+            // `req.system_prompt` unchanged.
+            system_refresher: req.system_refresher,
             history: messages,
             tool_choice: ToolChoice::Auto,
         };

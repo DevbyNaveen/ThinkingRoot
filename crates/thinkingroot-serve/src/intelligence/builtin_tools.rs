@@ -1052,6 +1052,115 @@ impl ToolHandler for AbandonBranchTool {
 /// caller's responsibility (typically a `create_branch` →
 /// `git worktree add` sequence orchestrated outside this tool, or a
 /// future v1.1 `create_sandbox_worktree` tool).
+/// Ship 3G (2026-05-20) — agent-callable `compile` tool.
+///
+/// Closes the seam where `compile` lived in `BRIDGE_SKIP_NAMES` (the
+/// MCP bridge correctly refused to register it because the bridge
+/// can't do post-compile remount + engram invalidation) but the
+/// hand-wrapped builtins also didn't carry it — leaving the in-app
+/// chat agent with NO way to call compile. The desktop's
+/// `ChatView.tsx` `compileToolWorkspace` bridge was a reactive UI
+/// observer; it never actually ran compile, just rendered events.
+///
+/// This tool fills the gap: it calls `engine.compile()` (the canonical
+/// pipeline entry that already handles cache rebuild + atomic swap)
+/// and then runs the post-compile reconciliation manually:
+///   1. `engine.compile(ws)` → `PipelineResult` (cache rebuild
+///      inside, single-writer Cozo).
+///   2. `EngramManager::invalidate_workspace(ws)` so any pre-existing
+///      engrams pinned to claim ids that may have been GC'd by the
+///      compile are dropped — closes the "remount under the same
+///      name returns stale claim ids" honesty hole.
+///
+/// Write-class registration: the ApprovalGate / PermissionsGate
+/// surfaces the tool to the user for explicit approval before running
+/// — compile is a long, compute-heavy operation that mutates the
+/// substrate, exactly the kind of action that warrants prompting.
+pub struct CompileTool {
+    ctx: ToolContext,
+}
+
+impl CompileTool {
+    pub fn new(ctx: ToolContext) -> Self {
+        Self { ctx }
+    }
+    pub fn spec() -> Tool {
+        Tool::new(
+            "compile",
+            "Run the compile pipeline against the current workspace: \
+             parse → extract claims → ground → link → persist into the \
+             substrate. Use when the user explicitly requests a recompile, \
+             or when the `<substrate_freshness>` reminder reports the brain \
+             is behind disk and the user has asked for a verified answer. \
+             Long-running (seconds to minutes); the desktop UI shows a \
+             progress indicator. Returns a one-line summary of the result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace": {
+                        "type": "string",
+                        "description": "Workspace name. When omitted, the agent's bound workspace is used."
+                    }
+                }
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl ToolHandler for CompileTool {
+    async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        let ws = input
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.ctx.workspace)
+            .to_string();
+
+        // Phase 1 — drive the canonical pipeline + cache rebuild via
+        // the engine handle. `engine.compile` already holds the
+        // storage lock for the minimum window and rebuilds the
+        // in-memory cache atomically (see engine.rs:2286). A failure
+        // here is honest: surface the underlying error rather than
+        // emit a "scheduled" lie.
+        let result = {
+            let engine = self.ctx.engine.read().await;
+            match engine.compile(&ws).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return ToolHandlerResult::error(format!(
+                        "compile failed for workspace '{ws}': {e}"
+                    ));
+                }
+            }
+        };
+
+        // Phase 2 — engram invalidation. The unified compile path in
+        // `rest.rs::run_unified_compile` does this; the hand-wrapped
+        // tool mirrors it exactly because post-compile claim ids may
+        // have shifted under the engram pointers cached for the
+        // current session.
+        self.ctx
+            .engram_manager
+            .invalidate_workspace(&ws)
+            .await;
+
+        // Return a one-line summary the agent (and the desktop's
+        // `compileToolWorkspace` bridge observer) can parse + render.
+        let outcome_str = match (&result.cache_dirty, &result.failed_batches) {
+            (false, _) => "compile no-op (no sources changed)".to_string(),
+            (true, n) if *n == 0 => format!(
+                "compile success — {} claims, {} entities written",
+                result.claims_count, result.entities_count,
+            ),
+            (true, n) => format!(
+                "compile partial — {} claims, {} entities, {} batch failures",
+                result.claims_count, result.entities_count, n,
+            ),
+        };
+        ToolHandlerResult::ok(outcome_str)
+    }
+}
+
 pub struct InvokeExternalAgentTool {
     _ctx: ToolContext,
     /// Adapter selector → factory. Lets tests inject mock adapters
@@ -1285,6 +1394,15 @@ pub async fn register_builtin_tools(ctx: ToolContext) -> ToolRegistry {
         .register_write(
             AbandonBranchTool::spec(),
             Arc::new(AbandonBranchTool::new(ctx.clone())),
+        )
+        // Ship 3G (2026-05-20) — agent-callable compile. Write-class
+        // so the ApprovalGate prompts the user before a heavy
+        // long-running operation. Stays out of BRIDGE_SKIP_NAMES'
+        // duplicate-name check by virtue of being registered here as
+        // a hand-wrapped tool; the bridge would refuse anyway.
+        .register_write(
+            CompileTool::spec(),
+            Arc::new(CompileTool::new(ctx.clone())),
         )
         .register_write(
             InvokeExternalAgentTool::spec(),
@@ -1736,16 +1854,20 @@ mod tests {
 
         // `contribute_bulk` is Connector-only at the API boundary;
         // bridging it into a chat agent would be dead code (the
-        // call would always reject). `compile` skips the
-        // post-compile remount/engram-invalidation owned by the
-        // desktop's `ChatView.tsx` compile bridge.
+        // call would always reject).
         assert!(
             !names.iter().any(|n| n == "contribute_bulk"),
             "contribute_bulk must be skipped from the bridge — Connector-only at the API boundary",
         );
+        // Ship 3G (2026-05-20) — compile IS registered, but as a
+        // hand-wrapped CompileTool (not via the MCP bridge — the
+        // bridge can't safely do post-compile reconciliation). The
+        // skip-list assertion becomes a present-as-hand-wrapped
+        // assertion: the agent must reach compile, just not through
+        // the bridge.
         assert!(
-            !names.iter().any(|n| n == "compile"),
-            "compile must be skipped from the bridge — desktop's ChatView.tsx owns the canonical compile path",
+            names.iter().any(|n| n == "compile"),
+            "compile must be registered as a hand-wrapped tool (Ship 3G) so the in-app agent can invoke it"
         );
     }
 

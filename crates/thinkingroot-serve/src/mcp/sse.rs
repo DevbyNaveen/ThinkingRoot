@@ -178,6 +178,10 @@ async fn handle_sse(
 async fn compile_request_fastpath(
     request: &JsonRpcRequest,
     state: &Arc<AppState>,
+    // C4 (2026-05-22): session_id needed so `notifications/progress`
+    // frames can be routed to the same SSE channel the caller is
+    // reading.
+    session_id: &str,
 ) -> Option<JsonRpcResponse> {
     if request.method != "tools/call" {
         return None;
@@ -243,8 +247,61 @@ async fn compile_request_fastpath(
             .unwrap_or(false),
     };
 
+    // C4 (2026-05-22) — `notifications/progress` wiring. When the
+    // client passed `_meta.progressToken` per MCP 2025-03-26 spec,
+    // we open a progress channel into `run_unified_compile` and
+    // spawn a forwarder task that frames each `ProgressEvent` as a
+    // `notifications/progress` JSON-RPC notification on the SSE
+    // session's outbound channel. When no token was passed, we
+    // pass `None` so the pipeline doesn't pay the channel cost —
+    // backward-compat preserved for older clients.
+    let progress_token = super::progress::extract_progress_token(&arguments);
+    let progress_tx_opt: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::pipeline::ProgressEvent>,
+    > = if progress_token.is_some() {
+        // Look up the SSE session sender we'll push notifications onto.
+        // Honest empty: if the session has dropped between request
+        // arrival and now, the channel is dead and we skip
+        // notifications entirely (pipeline still runs).
+        let sender_opt = {
+            let sessions = state.mcp_sessions.lock().await;
+            sessions.get(session_id).cloned()
+        };
+        if let (Some(token), Some(session_sender)) =
+            (progress_token.clone(), sender_opt)
+        {
+            let (ptx, mut prx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
+            tokio::spawn(async move {
+                while let Some(evt) = prx.recv().await {
+                    if let Some((progress, total, message)) =
+                        super::progress::project_compile_progress(&evt)
+                    {
+                        // Best-effort send; abort the forwarder if the
+                        // SSE consumer dropped (closed receiver).
+                        let res = super::progress::emit_progress_notification(
+                            &session_sender,
+                            &token,
+                            progress,
+                            total,
+                            message.as_deref(),
+                        );
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Some(ptx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let (_status_name, outcome) =
-        run_unified_compile(state.clone(), req, None, cancel).await;
+        run_unified_compile(state.clone(), req, progress_tx_opt, cancel).await;
 
     let response = match outcome {
         UnifiedCompileOutcome::Done(result) => {
@@ -400,8 +457,48 @@ async fn workspace_mount_fastpath(
 async fn handle_post(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SessionQuery>,
-    Json(request): Json<JsonRpcRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // C13 (2026-05-22) — disambiguate incoming JSON-RPC frame.
+    // The MCP wire uses one POST endpoint for both client →
+    // server requests AND client → server responses (the
+    // latter exists because the server can initiate
+    // `sampling/createMessage` requests over the SSE channel
+    // that the client answers via POST). We route responses
+    // (no `method` field; has `result` or `error`) to the
+    // pending-sampling registry; requests proceed to the
+    // normal dispatch path.
+    if body.get("method").is_none()
+        && (body.get("result").is_some() || body.get("error").is_some())
+    {
+        let routed = super::sampling::route_incoming_response(&state, &body).await;
+        if routed {
+            return StatusCode::ACCEPTED.into_response();
+        }
+        // Unrouted response — no pending sampling for this id.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "response received for unknown request id"
+            })),
+        )
+            .into_response();
+    }
+
+    // Parse as a request now that we've ruled out the response shape.
+    let request: JsonRpcRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("malformed JSON-RPC request: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Per JSON-RPC 2.0, notifications have no `id` and must not generate responses.
     if request.id.is_none() {
         return StatusCode::ACCEPTED.into_response();
@@ -446,7 +543,9 @@ async fn handle_post(
         None
     };
 
-    let response = if let Some(fastpath) = compile_request_fastpath(&request, &state).await {
+    let response = if let Some(fastpath) =
+        compile_request_fastpath(&request, &state, &session_id).await
+    {
         fastpath
     } else if let Some(fastpath) = workspace_mount_fastpath(&request, &state).await {
         // Phase 1 central-AI-plan (2026-05-18) — workspace_mount needs
@@ -462,6 +561,28 @@ async fn handle_post(
             .ok()
             .and_then(|ws| ws.first().map(|w| w.name.clone()));
 
+        // C3 (2026-05-22): mint a per-request cancellation token,
+        // register it under `state.mcp_pending_calls` keyed by the
+        // JSON-RPC request id so `notifications/cancelled` can
+        // trip it, and ensure it's removed on every exit path
+        // (success, error, transport drop) via the scope guard.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let request_id_key: Option<String> = request.id.as_ref().map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        if let Some(rid) = &request_id_key {
+            state
+                .mcp_pending_calls
+                .write()
+                .await
+                .insert(rid.clone(), cancel.clone());
+        }
+        // Drop-on-disconnect: if the SSE consumer drops mid-call,
+        // the surrounding response future is dropped → this guard
+        // fires → long tools observe at next phase boundary.
+        let _drop_guard = cancel.clone().drop_guard();
+
         let response = super::dispatch(
             &request,
             &engine,
@@ -469,9 +590,21 @@ async fn handle_post(
             &session_id,
             &state.sessions,
             &state.engram_manager,
+            // C2: SSE transport carries full AppState reach so tools
+            // like `get_reminder_context` can call
+            // `reminder_assembly::build` directly.
+            Some(&state),
+            cancel,
         )
         .await;
         drop(engine);
+
+        // Reap the pending-calls entry now that the dispatch has
+        // returned — token is no longer needed; future
+        // `notifications/cancelled` for this id is a no-op.
+        if let Some(rid) = &request_id_key {
+            state.mcp_pending_calls.write().await.remove(rid);
+        }
         response
     };
 

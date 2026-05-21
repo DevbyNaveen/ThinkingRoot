@@ -113,6 +113,11 @@ pub enum Msg {
     /// Workspace was unmounted via REST `DELETE /workspaces/{name}` or
     /// the daemon shut down.
     Unmounted,
+    /// Live sync (or another scheduler) accepted a compile job; debounce
+    /// window has not elapsed yet.
+    CompileQueued {
+        reason: String,
+    },
     /// Compile pipeline started.
     CompileStarted,
     /// Compile pipeline phase tick.
@@ -442,6 +447,12 @@ async fn apply_msg(
         Msg::Unmounted => {
             *mount = MountState::NotMounted;
         }
+        Msg::CompileQueued { reason } => {
+            *compile = CompileState::Queued {
+                since: Utc::now(),
+                reason,
+            };
+        }
         Msg::CompileStarted => {
             *compile = CompileState::Running {
                 phase: "starting".into(),
@@ -592,6 +603,7 @@ async fn probe_sources(path: &Path) -> SourcesState {
 
 fn walk_sources_blocking(root: &Path) -> SourcesState {
     use std::fs;
+    use std::time::SystemTime;
 
     fn excluded(component: &str) -> bool {
         matches!(
@@ -607,12 +619,38 @@ fn walk_sources_blocking(root: &Path) -> SourcesState {
         )
     }
 
+    // ledger_mtime is the cutover point: anything on disk newer than
+    // the last successful compile's fingerprints.json is unaccounted
+    // for. Absent ledger ⇒ no compile has run ⇒ everything is "new".
+    // The pipeline writes this file atomically via `FingerprintStore::save`
+    // (tempfile + rename), so we never observe a torn mtime.
+    let ledger_mtime: Option<SystemTime> = fs::metadata(root.join(".thinkingroot/fingerprints.json"))
+        .ok()
+        .and_then(|m| m.modified().ok());
+
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut latest: Option<chrono::DateTime<Utc>> = None;
+    let mut latest_file: Option<chrono::DateTime<Utc>> = None;
+    // Track the newest *mtime* across both files AND directories. A
+    // file add/remove updates the parent dir's mtime but not any
+    // existing file's mtime, so dir-mtimes are load-bearing for
+    // detecting newly-added or just-deleted sources.
+    let mut newest_seen: Option<SystemTime> = None;
+    let bump = |slot: &mut Option<SystemTime>, t: SystemTime| {
+        *slot = Some(slot.map_or(t, |prev| prev.max(t)));
+    };
 
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        // Include the directory's own mtime in the freshness signal —
+        // directory entries change when a child is added or removed,
+        // and that's the only signal "the user just rm'd a source".
+        if let Ok(dir_meta) = fs::metadata(&dir)
+            && let Ok(mt) = dir_meta.modified()
+        {
+            bump(&mut newest_seen, mt);
+        }
+
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue,
@@ -637,7 +675,8 @@ fn walk_sources_blocking(root: &Path) -> SourcesState {
                 total_bytes = total_bytes.saturating_add(meta.len());
                 if let Ok(modified) = meta.modified() {
                     let dt: chrono::DateTime<Utc> = modified.into();
-                    latest = Some(latest.map_or(dt, |x| x.max(dt)));
+                    latest_file = Some(latest_file.map_or(dt, |x| x.max(dt)));
+                    bump(&mut newest_seen, modified);
                 }
             }
         }
@@ -646,14 +685,23 @@ fn walk_sources_blocking(root: &Path) -> SourcesState {
     if file_count == 0 {
         SourcesState::None
     } else {
-        // Fingerprint match is determined by the incremental ledger,
-        // not this walker. Default `true` here; the pipeline pushes
-        // the truth via reconcile after compile completes.
+        // Fingerprint match honest derivation: the ledger is the
+        // mtime of `.thinkingroot/fingerprints.json` (atomically
+        // rewritten at the end of every successful compile). Anything
+        // newer on disk — file edits, additions, deletions — proves
+        // the substrate is behind. No ledger ⇒ no compile ever ran ⇒
+        // we must report `false`; we never fabricate a "match" just
+        // because the directory looks populated.
+        let fingerprint_match = match (ledger_mtime, newest_seen) {
+            (Some(ledger), Some(seen)) => seen <= ledger,
+            (Some(_), None) => true, // ledger present, walker saw nothing newer
+            (None, _) => false,      // no ledger ⇒ never compiled ⇒ stale by definition
+        };
         SourcesState::Some {
             file_count,
             total_bytes,
-            last_changed_at: latest,
-            fingerprint_match: true,
+            last_changed_at: latest_file,
+            fingerprint_match,
         }
     }
 }
@@ -1128,5 +1176,91 @@ mod tests {
         }
         assert!(beats >= 2, "expected ≥2 heartbeats, got {beats}");
         actor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fingerprint_match_false_when_ledger_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), b"fn main() {}").unwrap();
+        let state = probe_sources(tmp.path()).await;
+        let SourcesState::Some { fingerprint_match, file_count, .. } = state else {
+            panic!("expected Some sources, got {state:?}");
+        };
+        assert_eq!(file_count, 1);
+        // No `.thinkingroot/fingerprints.json` exists ⇒ no compile has
+        // ever stamped these sources ⇒ honestly stale.
+        assert!(!fingerprint_match, "absent ledger must report stale");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_match_true_when_ledger_newer_than_sources() {
+        let tmp = TempDir::new().unwrap();
+        // Source first, then ledger — so ledger mtime > source mtime.
+        std::fs::write(tmp.path().join("a.rs"), b"fn main() {}").unwrap();
+        // Tiny sleep so the ledger's mtime is strictly greater than the
+        // source's mtime on filesystems with second-granularity mtime
+        // (some Linux tmpfs configurations).
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        std::fs::create_dir_all(tmp.path().join(".thinkingroot")).unwrap();
+        std::fs::write(
+            tmp.path().join(".thinkingroot/fingerprints.json"),
+            b"{}",
+        )
+        .unwrap();
+        let state = probe_sources(tmp.path()).await;
+        let SourcesState::Some { fingerprint_match, .. } = state else {
+            panic!("expected Some sources, got {state:?}");
+        };
+        assert!(fingerprint_match, "ledger newer than sources must report fresh");
+    }
+
+    #[tokio::test]
+    async fn fingerprint_match_false_after_source_edit() {
+        let tmp = TempDir::new().unwrap();
+        // Compile first (ledger), then edit a source after.
+        std::fs::create_dir_all(tmp.path().join(".thinkingroot")).unwrap();
+        std::fs::write(
+            tmp.path().join(".thinkingroot/fingerprints.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("a.rs"), b"old").unwrap();
+        // Wait past the second-granularity boundary so a fresh write
+        // is strictly newer.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        std::fs::write(tmp.path().join("a.rs"), b"new content").unwrap();
+        let state = probe_sources(tmp.path()).await;
+        let SourcesState::Some { fingerprint_match, .. } = state else {
+            panic!("expected Some sources, got {state:?}");
+        };
+        assert!(
+            !fingerprint_match,
+            "source edit after compile must report stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_match_false_after_new_file_added() {
+        let tmp = TempDir::new().unwrap();
+        // Ledger + initial source.
+        std::fs::create_dir_all(tmp.path().join(".thinkingroot")).unwrap();
+        std::fs::write(tmp.path().join("a.rs"), b"fn main() {}").unwrap();
+        std::fs::write(
+            tmp.path().join(".thinkingroot/fingerprints.json"),
+            b"{}",
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Add a brand-new file — captured via parent-dir mtime bump.
+        std::fs::write(tmp.path().join("b.rs"), b"fn new() {}").unwrap();
+        let state = probe_sources(tmp.path()).await;
+        let SourcesState::Some { fingerprint_match, file_count, .. } = state else {
+            panic!("expected Some sources, got {state:?}");
+        };
+        assert_eq!(file_count, 2);
+        assert!(
+            !fingerprint_match,
+            "file add after compile must report stale via dir mtime"
+        );
     }
 }

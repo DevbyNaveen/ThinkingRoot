@@ -4573,6 +4573,16 @@ Rules: \
         self.workspaces.get(ws).map(|h| h.config.streams.clone())
     }
 
+    /// Return the `CompilationConfig` for a workspace (live sync, artifacts).
+    pub fn workspace_compilation_config(
+        &self,
+        ws: &str,
+    ) -> Option<thinkingroot_core::config::CompilationConfig> {
+        self.workspaces
+            .get(ws)
+            .map(|h| h.config.compilation.clone())
+    }
+
     /// Return the filesystem root path of a mounted workspace.
     pub fn workspace_root_path(&self, ws: &str) -> Option<PathBuf> {
         self.workspaces.get(ws).map(|h| h.root_path.clone())

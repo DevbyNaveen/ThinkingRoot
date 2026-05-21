@@ -31,6 +31,7 @@ thinkingroot-pr = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
 thinkingroot-llm = { workspace = true }
+thinkingroot-flow = { workspace = true }
 thinkingroot-paper = { workspace = true }
 thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
@@ -73,6 +74,10 @@ tempfile = "3"
 # `root compile --watch` so we have a single notify version across the
 # tree.
 notify = { workspace = true }
+# Source-tree debouncer used by `workspace_watcher.rs` to coalesce
+# rapid filesystem events (editor save bursts, batch imports) into
+# one `WorkspaceEvent::SourceChanged` per quiet-window batch.
+notify-debouncer-mini = { workspace = true }
 
 # Phase D Wave 1 system-power tools (`system_power.rs`).
 thinkingroot-sandbox = { workspace = true }

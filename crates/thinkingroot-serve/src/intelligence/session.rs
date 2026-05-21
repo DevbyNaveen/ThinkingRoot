@@ -78,9 +78,104 @@ pub struct SessionContext {
     /// branch's `description` field at first-message receipt so it
     /// survives session eviction.
     pub first_user_message: Option<String>,
+    /// Ship 3D (2026-05-20) — Reflexion pattern. After every chat turn
+    /// the verifier produces a critique; storing it here lets the next
+    /// turn's `<previous_verify>` reminder block bias the LLM toward
+    /// self-correction when the prior answer scored weak grounding.
+    /// `None` on session entry; populated by the post-Done verify
+    /// hook in `rest.rs::agent_stream_response`.
+    pub last_verify_verdict: Option<String>,
+    /// Ship 3D — citations from the prior turn that resolved against
+    /// the substrate.
+    pub last_verify_citations_verified: Option<u32>,
+    /// Ship 3D — citations from the prior turn that DID NOT resolve.
+    /// A non-zero value here is the precise signal the next turn must
+    /// surface.
+    pub last_verify_citations_unverified: Option<u32>,
+    /// Ship 3D — one-line human-readable critique reason from the
+    /// prior turn (verdict-specific).
+    pub last_verify_reason: Option<String>,
+    /// Ship 3E (2026-05-20) — last retrieval query that returned thin
+    /// evidence. Used by the `<search_was_shallow>` reminder to warn
+    /// the next turn against re-running the same shallow query.
+    pub last_search_query: Option<String>,
+    /// Ship 3E — hit count from the last retrieval; the threshold
+    /// `SHALLOW_RETRIEVAL_THRESHOLD` determines whether the bus emits
+    /// the warning block.
+    pub last_search_hits: Option<u32>,
+    /// C6 (2026-05-22) — `clientInfo` field from the MCP
+    /// `initialize` request. When present, this identifies the AI
+    /// tool driving the session (e.g., "claude-code", "cursor",
+    /// "codex") and lets `session_actor` map known AI clients to
+    /// `Principal::Agent` instead of `Principal::User`. None over
+    /// REST chat + over MCP transports that didn't receive a
+    /// `clientInfo` block on initialize (preserves pre-C6
+    /// behaviour for tests).
+    pub client_info: Option<ClientInfo>,
     created_at: Instant,
     last_active: Instant,
 }
+
+/// MCP spec `clientInfo` object (per JSON-RPC `initialize` params).
+/// Carries the AI client's name and version so the daemon can
+/// attribute writes correctly (Claude Code vs Cursor vs Codex) and
+/// surface cross-tool awareness in the reminder bus.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+impl ClientInfo {
+    /// Return true if `self.name` matches one of the canonical AI
+    /// client identifiers we recognise. `session_actor` uses this
+    /// to decide between `Principal::Agent` (known AI client) and
+    /// `Principal::User` (human-driven CLI, unknown client, or
+    /// absent clientInfo).
+    ///
+    /// Match is case-insensitive on the name to tolerate small
+    /// vendor capitalisation differences across MCP clients.
+    pub fn is_known_ai_client(&self) -> bool {
+        is_known_ai_client_name(&self.name)
+    }
+}
+
+/// Canonical list of AI clients we recognise — kept in one place so
+/// the mapping stays consistent across `ClientInfo::is_known_ai_client`
+/// and any future MCP server-side audit / billing / quota logic.
+///
+/// Adding a client here changes its attribution from
+/// `Principal::User` to `Principal::Agent`. Don't add a vendor
+/// name without verifying their MCP client actually sends a
+/// recognisable `clientInfo.name` (verified for Claude Desktop,
+/// Claude Code, Cursor as of 2026-05).
+pub const KNOWN_AI_CLIENT_NAMES: &[&str] = &[
+    "claude-code",
+    "claude-desktop",
+    "cursor",
+    "windsurf",
+    "continue",
+    "codex",
+    "gemini-cli",
+    "zed",
+    "root-cli",
+];
+
+/// Case-insensitive name match against [`KNOWN_AI_CLIENT_NAMES`].
+pub fn is_known_ai_client_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    KNOWN_AI_CLIENT_NAMES
+        .iter()
+        .any(|known| *known == lower.as_str())
+}
+
+/// Threshold below which a retrieval call counts as "shallow" — the
+/// bus emits the `search_was_shallow` reminder when `last_search_hits`
+/// is at or below this. Chosen empirically: ≤2 hits is the danger
+/// zone where the model will re-run the same query and burn iterations
+/// without gaining new evidence.
+pub const SHALLOW_RETRIEVAL_THRESHOLD: u32 = 2;
 
 impl SessionContext {
     pub fn new(id: impl Into<String>, workspace: impl Into<String>) -> Self {
@@ -98,9 +193,45 @@ impl SessionContext {
             turn_count: 0,
             chat_turn_count: 0,
             first_user_message: None,
+            last_verify_verdict: None,
+            last_verify_citations_verified: None,
+            last_verify_citations_unverified: None,
+            last_verify_reason: None,
+            last_search_query: None,
+            last_search_hits: None,
+            client_info: None,
             created_at: now,
             last_active: now,
         }
+    }
+
+    /// Ship 3D (2026-05-20) — record the prior turn's verifier verdict
+    /// so the next turn's `<previous_verify>` reminder block can read
+    /// it. Idempotent within a turn; overwritten on every new verify.
+    /// Touching `last_active` so eviction policy treats verifier feedback
+    /// as session liveness.
+    pub fn record_verify_critique(
+        &mut self,
+        verdict: impl Into<String>,
+        citations_verified: u32,
+        citations_unverified: u32,
+        reason: impl Into<String>,
+    ) {
+        self.last_active = Instant::now();
+        self.last_verify_verdict = Some(verdict.into());
+        self.last_verify_citations_verified = Some(citations_verified);
+        self.last_verify_citations_unverified = Some(citations_unverified);
+        self.last_verify_reason = Some(reason.into());
+    }
+
+    /// Ship 3E (2026-05-20) — record the most recent retrieval call's
+    /// query + hit count so the `<search_was_shallow>` reminder fires
+    /// next turn when evidence was thin. Hits at or below
+    /// `SHALLOW_RETRIEVAL_THRESHOLD` are the trigger condition.
+    pub fn record_search_outcome(&mut self, query: impl Into<String>, hits: u32) {
+        self.last_active = Instant::now();
+        self.last_search_query = Some(query.into());
+        self.last_search_hits = Some(hits);
     }
 
     /// Phase B.1 (2026-05-17): record the user's first message in

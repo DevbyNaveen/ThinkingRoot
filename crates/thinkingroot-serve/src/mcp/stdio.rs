@@ -77,6 +77,14 @@ pub async fn run(
         }
 
         let engine_guard = engine.read().await;
+        // C3 (2026-05-22): fresh per-request token. Stdio MCP has
+        // no `notifications/cancelled` listener (the transport is
+        // strictly line-oriented synchronous from the editor's
+        // perspective), but the token is required by the dispatch
+        // signature. Long tools running over stdio aren't
+        // cancellable mid-call today; an explicit Ctrl-C kills the
+        // whole stdio binary.
+        let cancel = tokio_util::sync::CancellationToken::new();
         let response = super::dispatch(
             &request,
             &engine_guard,
@@ -84,6 +92,11 @@ pub async fn run(
             &stdio_session_id,
             &sessions,
             &engram_manager,
+            // Stdio has no AppState — tools that require it (e.g.
+            // `get_reminder_context`) return a typed
+            // "transport-not-supported" envelope.
+            None,
+            cancel,
         )
         .await;
         drop(engine_guard);

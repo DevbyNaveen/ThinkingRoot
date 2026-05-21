@@ -119,6 +119,29 @@ pub struct AppState {
     /// from the map on every exit path (success, failure, cancellation)
     /// by the merge handler so a long-cancelled merge never leaks.
     pub active_merges: Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// C3 (2026-05-22) — in-flight MCP `tools/call`
+    /// `CancellationToken`s keyed by the JSON-RPC request id (as a
+    /// string). `notifications/cancelled` looks up the matching id
+    /// and trips its token; long tool handlers observe the token
+    /// at phase boundaries and return `Error::Cancelled` cleanly.
+    /// The SSE transport's `handle_post` is the sole writer + reaper.
+    /// Tokens are removed on every exit path so a long-cancelled
+    /// tool never leaks.
+    pub mcp_pending_calls:
+        Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// C13 (2026-05-22) — in-flight outbound
+    /// `sampling/createMessage` calls keyed by the JSON-RPC
+    /// request id we minted. When the MCP client POSTs back a
+    /// response with the matching id, `mcp::sse::handle_post`
+    /// detects it as a response (no `method` field) and routes
+    /// to the matching oneshot via
+    /// `mcp::sampling::route_incoming_response`. The receiver
+    /// awakens + returns the result to the original caller (a
+    /// flow `client_sampling` executor, etc.). Entries are
+    /// reaped on every exit path (success, timeout, refusal,
+    /// session-drop) so a late response never leaks.
+    pub mcp_pending_sampling:
+        Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     /// Slice 3 — optional file-system watcher handle.  When `Some`,
     /// `/api/v1/ws/{ws}/events/stream` subscribes to its broadcast
     /// channel and stateful handlers consult [`WatcherHandle::state`]
@@ -134,6 +157,11 @@ pub struct AppState {
     /// `workspace_compile_state`, right-rail substrate poll) all collapse
     /// to a single subscriber on this registry.
     pub workspace_status: Arc<WorkspaceStateRegistry>,
+    /// Canonical mount table for multi-root source-tree watching and
+    /// live sync (name → filesystem root).
+    pub mounted_workspace_roots: Arc<RwLock<HashMap<String, PathBuf>>>,
+    /// Debounced auto-compile when `compilation.auto_sync` is enabled.
+    pub live_sync: Arc<crate::live_sync::LiveSyncScheduler>,
     /// Phase D Wave 1 (2026-05-17) — identity-level permission rules
     /// for the system-power tools. Loaded from
     /// `<config_dir>/thinkingroot/permissions.toml` at startup (or
@@ -223,52 +251,48 @@ impl AppState {
                 std::process::exit(0);
             }
         });
-        Arc::new(Self {
-            engine: Arc::new(RwLock::new(engine)),
-            api_key,
-            mcp_sessions: crate::mcp::sse::new_session_map(),
-            sessions: crate::intelligence::session::new_session_store(),
-            workspace_root: tokio::sync::RwLock::new(workspace_root),
-            pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
-            engram_manager: crate::intelligence::engram::EngramManager::new(
-                crate::intelligence::engram::EngramConfig::default(),
-            ),
-            branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
-            branch_event_aggregate: broadcast::channel(256).0,
-            head_change_tx: broadcast::channel(64).0,
-            active_merges: Arc::new(RwLock::new(HashMap::new())),
-            workspace_watcher: Arc::new(RwLock::new(None)),
-            workspace_status: Arc::new(WorkspaceStateRegistry::new()),
-            substrate_bus: Arc::new(RwLock::new(HashMap::new())),
-            permission_store: Arc::new(RwLock::new(load_permission_store_or_empty())),
-            // Phase 2 central-AI-plan (2026-05-18) — load
-            // per-tool agentmemory tokens from disk. First-run
-            // returns Self::empty() honestly (no fake tokens).
-            // If the file is corrupt or schema-incompatible we
-            // log + start fresh; a misparseable token store
-            // shouldn't refuse to boot the daemon.
-            agentmemory_tokens: Arc::new(RwLock::new(
-                match crate::agentmemory::tokens::AgentmemoryTokenStore::load() {
-                    Ok(store) => store,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "agentmemory-tokens.json failed to load — starting with an empty store"
-                        );
-                        crate::agentmemory::tokens::AgentmemoryTokenStore::empty()
-                    }
+        Arc::new_cyclic(|weak| {
+            let state = Self {
+                engine: Arc::new(RwLock::new(engine)),
+                api_key,
+                mcp_sessions: crate::mcp::sse::new_session_map(),
+                sessions: crate::intelligence::session::new_session_store(),
+                workspace_root: tokio::sync::RwLock::new(workspace_root),
+                pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
+                engram_manager: crate::intelligence::engram::EngramManager::new(
+                    crate::intelligence::engram::EngramConfig::default(),
+                ),
+                branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
+                branch_event_aggregate: broadcast::channel(256).0,
+                head_change_tx: broadcast::channel(64).0,
+                active_merges: Arc::new(RwLock::new(HashMap::new())),
+                mcp_pending_calls: Arc::new(RwLock::new(HashMap::new())),
+                mcp_pending_sampling: Arc::new(RwLock::new(HashMap::new())),
+                workspace_watcher: Arc::new(RwLock::new(None)),
+                workspace_status: Arc::new(WorkspaceStateRegistry::new()),
+                mounted_workspace_roots: Arc::new(RwLock::new(HashMap::new())),
+                live_sync: crate::live_sync::LiveSyncScheduler::new(weak.clone()),
+                substrate_bus: Arc::new(RwLock::new(HashMap::new())),
+                permission_store: Arc::new(RwLock::new(load_permission_store_or_empty())),
+                agentmemory_tokens: Arc::new(RwLock::new(
+                    match crate::agentmemory::tokens::AgentmemoryTokenStore::load() {
+                        Ok(store) => store,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "agentmemory-tokens.json failed to load — starting with an empty store"
+                            );
+                            crate::agentmemory::tokens::AgentmemoryTokenStore::empty()
+                        }
+                    },
+                )),
+                mcp_session_telemetry: {
+                    let map = crate::mcp::telemetry::new_telemetry_map();
+                    crate::mcp::telemetry::install_global_map(map.clone());
+                    map
                 },
-            )),
-            // Phase 3 central-AI-plan (2026-05-18) — fresh, empty
-            // in-memory session telemetry map. Past sessions live on
-            // disk in `mcp-sessions.jsonl`; the dashboard's history
-            // view reads them via `crate::mcp::telemetry::tail`.
-            mcp_session_telemetry: {
-                let map = crate::mcp::telemetry::new_telemetry_map();
-                // Expose process-globally for visibility MCP tools.
-                crate::mcp::telemetry::install_global_map(map.clone());
-                map
-            },
+            };
+            state
         })
     }
 
@@ -1253,6 +1277,28 @@ async fn mount_workspace_handler(
     // requiring a daemon restart.
     state.set_workspace_root(Some(root_path.clone())).await;
 
+    state
+        .mounted_workspace_roots
+        .write()
+        .await
+        .insert(name.clone(), root_path.clone());
+    state
+        .live_sync
+        .register_workspace(&name, root_path.clone())
+        .await;
+
+    // Ship 3B (2026-05-20) — auto-start the substrate-bus scheduler
+    // on mount so the Reconciler / GapHunter / Curator / Watcher
+    // sub-agents actually run in the background. Pre-fix the bus was
+    // opt-in via a separate `/substrate_bus/start` HTTP endpoint that
+    // no UI surface ever called, so the sub-agents emitted zero
+    // reports in normal use and the chat agent's
+    // `<sub_agent_digest>` reminder block stayed silent regardless of
+    // workspace activity. `ensure_substrate_bus` is idempotent — a
+    // second call on the same workspace returns the existing
+    // scheduler without spawning a duplicate.
+    let _scheduler = state.ensure_substrate_bus(&name).await;
+
     let rest_url = format!("/api/v1/ws/{name}/");
     let mcp_url = "/mcp/sse".to_string();
     ok_response(MountWorkspaceResponse {
@@ -1278,6 +1324,9 @@ async fn unmount_workspace_handler(
     drop(engine);
 
     state.engram_manager.invalidate_workspace(&name).await;
+
+    state.mounted_workspace_roots.write().await.remove(&name);
+    state.live_sync.unregister_workspace(&name).await;
 
     // Slice 0 — flip the status actor to `NotMounted`. The actor
     // remains live so subscribers keep their stream until the
@@ -5424,105 +5473,49 @@ async fn ask_stream_handler(
 // claim card. The UI then POSTs the decision to
 // `/ask/approval/{tool_use_id}`.
 
-/// Project a [`thinkingroot_core::recovery_log::RecoveryEvent`] onto
-/// the slim [`crate::intelligence::reminder_bus::RecoveryEventBrief`]
-/// used by the reactive bus. Pure formatter — no I/O, no allocation
-/// beyond the strings themselves. Used by `agent_stream_response`
-/// to surface "compile breaker tripped 12s ago" style context to the
-/// operator-mode AI without polling.
-fn recovery_event_brief(
-    ev: &thinkingroot_core::recovery_log::RecoveryEvent,
-) -> crate::intelligence::reminder_bus::RecoveryEventBrief {
-    use thinkingroot_core::recovery_log::RecoveryEventKind as K;
-    let (kind, workspace, summary) = match &ev.kind {
-        K::Respawn {
-            attempt,
-            backoff_ms,
-            reason,
-        } => (
-            "respawn",
-            None,
-            format!("attempt {attempt} after {backoff_ms}ms ({reason})"),
-        ),
-        K::RespawnOk { new_pid } => ("respawn_ok", None, format!("new pid {new_pid}")),
-        K::StaleLockCleanup { dead_pid } => (
-            "stale_lock_cleanup",
-            None,
-            format!("removed cortex.lock owned by dead pid {dead_pid}"),
-        ),
-        K::PortAdvance { from, to, reason } => (
-            "port_advance",
-            None,
-            format!("port {from} → {to} ({reason})"),
-        ),
-        K::ManifestRebuild { binaries_found } => (
-            "manifest_rebuild",
-            None,
-            format!("rebuilt install manifest from disk scan ({binaries_found} binaries found)"),
-        ),
-        K::CircuitBreakerTripped {
-            consecutive_failures,
-            until_rfc3339,
-        } => (
-            "circuit_breaker_tripped",
-            None,
-            format!(
-                "{consecutive_failures} consecutive failures — daemon respawn paused until {until_rfc3339}"
-            ),
-        ),
-        K::CircuitBreakerReset { reason } => (
-            "circuit_breaker_reset",
-            None,
-            format!("breaker cleared ({reason})"),
-        ),
-        K::BinaryChecksumMismatch { path, .. } => (
-            "binary_checksum_mismatch",
-            None,
-            format!("BLAKE3 mismatch at {}", path.display()),
-        ),
-        K::CompileFailed {
-            workspace,
-            error,
-            retry_attempt,
-        } => (
-            "compile_failed",
-            Some(workspace.clone()),
-            format!("retry {retry_attempt}: {error}"),
-        ),
-        K::CompileRetryScheduled {
-            workspace,
-            attempt,
-            backoff_ms,
-        } => (
-            "compile_retry_scheduled",
-            Some(workspace.clone()),
-            format!("retry {attempt} scheduled in {backoff_ms}ms"),
-        ),
-        K::CompileBreakerTripped {
-            workspace,
-            consecutive_failures,
-            until_rfc3339,
-        } => (
-            "compile_breaker_tripped",
-            Some(workspace.clone()),
-            format!(
-                "{consecutive_failures} consecutive compile failures — paused until {until_rfc3339}"
-            ),
-        ),
-        K::CompileRecovered {
-            workspace,
-            retry_attempt,
-        } => (
-            "compile_recovered",
-            Some(workspace.clone()),
-            format!("compile succeeded on retry {retry_attempt}"),
-        ),
-    };
-    crate::intelligence::reminder_bus::RecoveryEventBrief {
-        kind: kind.to_string(),
-        workspace,
-        at_iso: ev.ts.to_rfc3339(),
-        summary,
+
+/// Ship 3F (2026-05-20) — mid-turn system-prompt refresher.
+///
+/// The agent loop calls `refresh()` at the top of every iteration so
+/// the LLM's `system` parameter carries fresh volatile signals
+/// (substrate freshness, recent sub-agent reports, fresh recovery
+/// events) across long multi-iteration turns. The base system prompt
+/// is the static identity + workflow + skill manifest captured at
+/// request entry; the refresher appends a small `<system-reminder>`
+/// suffix with whatever has changed since.
+///
+/// **Design decision: append-only suffix, not full re-render.** The
+/// full reminder bus runs once on the user-message side at request
+/// entry. The refresher only injects signals that mutate WITHIN the
+/// turn — typically these three. Identity / today / branch / skills
+/// don't change between iterations of the same turn, so re-rendering
+/// them would burn LLM tokens for no signal. Aligns with Anthropic
+/// "right context at right time" — and minimises prompt-cache churn.
+struct RestStreamSystemRefresher {
+    state: Arc<AppState>,
+    workspace: String,
+    base_system_prompt: String,
+}
+
+#[async_trait::async_trait]
+impl crate::intelligence::agent::SystemPromptRefresher for RestStreamSystemRefresher {
+    async fn refresh(&self, _iteration: usize) -> String {
+        use crate::intelligence::reminder_assembly::build_mid_turn;
+        use crate::intelligence::reminder_bus::render_reactive_reminders;
+
+        // Mid-turn volatile-signals gather lifted into
+        // `reminder_assembly::build_mid_turn` (C1, 2026-05-22). Both
+        // this REST agent-loop refresher and the new MCP
+        // `get_reminder_context` tool (C2) walk the same helper —
+        // mid-turn refresh stays cheap (~2 ms) and drift-free.
+        let refresh = build_mid_turn(&self.state, &self.workspace).await;
+        let ctx = refresh.as_context();
+        let suffix = render_reactive_reminders(&ctx);
+        if suffix.is_empty() {
+            self.base_system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.base_system_prompt, suffix)
+        }
     }
 }
 
@@ -5537,6 +5530,26 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         AskRequest as SynthAskRequest, ChatRole, ChatTurn, build_system_prompt,
         compose_full_system_prompt,
     };
+
+    // Chat-turn timeline instrumentation (ship 2026-05-20). Every
+    // stage logs an `elapsed_ms` so a `RUST_LOG=thinkingroot_serve::rest=info`
+    // capture answers the "why does chat feel slow?" question
+    // without guessing. The user-facing complaint that drove this
+    // ("60s watchdog kills chat", which turns out to be misdiagnosed
+    // because the watchdog only wraps compile) gets a real
+    // measurement surface: prompt-build vs LLM-call vs first-token
+    // vs total-turn elapsed are all visible. No new code paths, no
+    // wire-format changes — just `tracing::info!` events on the
+    // existing path so an operator running `journalctl -u thinkingroot
+    // -f` or the desktop's sidecar log sees the timeline.
+    let chat_started_at = std::time::Instant::now();
+    tracing::info!(
+        target: "chat_turn",
+        workspace = %ws,
+        question_len = body.question.len(),
+        history_turns = body.history.len(),
+        "received"
+    );
 
     // Snapshot engine state we need before releasing the read lock —
     // the agent path goes async via spawn() and can't hold a guard
@@ -5617,8 +5630,56 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // Compose the full system prompt: persona + (no style — styles
     // are resolved server-side from `[chat]` config in a future
     // sprint) + skill manifest.
-    let system_prompt = compose_full_system_prompt(chat, None, Some(&skills));
+    let mut system_prompt = compose_full_system_prompt(chat, None, Some(&skills));
     let _ = build_system_prompt; // re-export for callers that want raw
+
+    // Ship 3C (2026-05-20) — classify intent BEFORE the agent runs
+    // and splice the mode-specific workflow appendix onto the system
+    // prompt. The classifier is deterministic + sub-µs (keyword +
+    // length heuristics) so the path is cache-friendly per-mode (4
+    // possible suffixes, not N-questions-many). Recovery signals
+    // surface from the workspace status snapshot.
+    // Lightweight recovery-event probe for intent classification
+    // (the full `RecoveryEventBrief` list is built later for the
+    // reminder bus). Only checks "did anything land in the last 5
+    // minutes" — sub-ms — and doesn't need the per-event projection.
+    let has_recent_recovery = match thinkingroot_core::recovery_log::tail(50) {
+        Ok(events) => {
+            let now = chrono::Utc::now();
+            let window = chrono::Duration::minutes(5);
+            events
+                .into_iter()
+                .any(|ev| now.signed_duration_since(ev.ts) <= window)
+        }
+        Err(_) => false,
+    };
+    let intent_inputs = crate::intelligence::intent::ClassifyInputs {
+        question: &body.question,
+        has_recent_recovery_events: has_recent_recovery,
+        last_compile_failed: {
+            let snapshots = state.workspace_status.snapshot_all().await;
+            snapshots
+                .into_iter()
+                .find(|s| s.name == ws)
+                .map(|s| matches!(
+                    s.compile,
+                    thinkingroot_core::types::CompileState::Idle {
+                        last_outcome: Some(thinkingroot_core::types::CompileOutcome::Failed { .. }),
+                        ..
+                    }
+                ))
+                .unwrap_or(false)
+        },
+    };
+    let intent = crate::intelligence::intent::classify_intent(&intent_inputs);
+    let workflow_appendix = crate::intelligence::intent::workflow_appendix(intent);
+    system_prompt.push_str(workflow_appendix);
+    tracing::info!(
+        target: "chat_turn",
+        workspace = %ws,
+        intent = intent.slug(),
+        "intent_classified"
+    );
 
     // Translate wire-format history into ChatTurn → ChatMessage.
     let chat_history: Vec<ChatTurn> = body
@@ -5713,187 +5774,20 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         }
     }
 
-    // C2 (Task 5) + Task 9: build the reactive `<system-reminder>` bus
-    // payload. The agent path now emits the FULL bus — workspace +
-    // branch_state + session_state + engram_state + tool_budget — with
-    // each emitter checking its own precondition (only blocks where the
-    // substrate state warrants emission actually appear in the prompt).
-    //
-    // - identity: workspace pulse (always emitted when present)
-    // - session_snapshot: focus_entity + delivered_claim_count
-    // - branch: surfaces only when session is on a non-default branch
-    // - engram_handles: surfaces only when engrams are materialised
-    // - tool_budget: NOT wired yet (needs agent-loop iteration plumbing —
-    //   v1.1 work). Passes None so the budget block stays suppressed.
-    use crate::intelligence::reminder_bus::{
-        AgentmemoryRecall, BranchSummary, EngramHandle, McpSessionBrief, RecoveryEventBrief,
-        RelevantSkill, ReminderContext, render_reactive_reminders,
-    };
-    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // C1 (2026-05-22): the full 17-block gather (formerly inline,
+    // ~300 LOC) is lifted into `intelligence::reminder_assembly::build`.
+    // Both this REST chat path and the new MCP `get_reminder_context`
+    // tool (C2) walk through the same helper — drift between the
+    // two surfaces is structurally impossible from here on.
+    use crate::intelligence::reminder_assembly::build as build_reminder_context;
+    use crate::intelligence::reminder_bus::render_reactive_reminders;
 
-    // World-class prompt foundation (ship 2026-05-18): environment
-    // gathering — Claude Code's `computeSimpleEnvInfo` pattern. Fixes
-    // the "AI can't find Desktop" class of bugs by giving the LLM
-    // explicit cwd/$HOME/~/Desktop/etc. context every turn.
-    let environment_info = crate::intelligence::environment::gather();
-
-    let session_snapshot: Option<crate::intelligence::session::SessionContext> = {
-        let map = state.sessions.lock().await;
-        map.get(&conversation_id).cloned()
-    };
-    let engram_handles: Vec<EngramHandle> = state
-        .engram_manager
-        .list_engrams(&conversation_id)
-        .await
-        .into_iter()
-        .map(|r| EngramHandle {
-            pointer: r.pointer,
-            topic: r.topic,
-        })
-        .collect();
-    let branch_summary: Option<BranchSummary> = session_snapshot
-        .as_ref()
-        .and_then(|s| s.active_branch.clone())
-        .map(|name| BranchSummary {
-            name,
-            parent: None, // Branch registry lookup deferred to v1.1
-            kind: None,
-        });
-    // Sandbox-by-default classifier (Task 17, plan 2026-05-09): the
-    // user's question is run through `intelligence/sandbox_classifier`
-    // and any RecommendSandbox reason is forwarded to the reactive
-    // bus. Keeps the recommendation advisory — the model decides
-    // whether to actually fork. Pure function, no I/O, sub-µs runtime.
-    let sandbox_reason: Option<&'static str> = match crate::intelligence::sandbox_classifier::classify(&body.question) {
-        crate::intelligence::sandbox_classifier::SandboxIntent::RecommendSandbox { reason } => {
-            Some(reason)
-        }
-        crate::intelligence::sandbox_classifier::SandboxIntent::NoAction => None,
-    };
-
-    // Cross-session agentmemory recall (Mem0/Letta-style auto-surface):
-    // call the engine's search primitive on the user's question and
-    // inject the top-3 most-relevant prior claims as a
-    // `<system-reminder>`. Uses the same retrieval the agent would
-    // call manually — substrate-as-ground-truth contract preserved.
-    // Empty / errored result paths are honest: we surface nothing
-    // rather than fabricating a hit.
-    let agentmemory_recalls: Vec<AgentmemoryRecall> = {
-        let engine = state.engine.read().await;
-        match engine.search(&ws, &body.question, 3).await {
-            Ok(result) => result
-                .claims
-                .into_iter()
-                .map(|h| AgentmemoryRecall {
-                    claim_id: h.id,
-                    statement: if h.statement.len() > 240 {
-                        let mut cut = 237;
-                        while !h.statement.is_char_boundary(cut) && cut > 0 {
-                            cut -= 1;
-                        }
-                        format!("{}…", &h.statement[..cut])
-                    } else {
-                        h.statement
-                    },
-                    confidence: h.confidence,
-                    source_uri: h.source_uri,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // MCP telemetry snapshot — connected AI tools surfaced for
-    // operator-mode cross-tool awareness. Skipped on Memory persona
-    // via the prompt-layer composition (compose_full_system_prompt
-    // excludes OPERATOR_DEBUGGER_SECTION for Memory); here we still
-    // gather + pass, the bus suppresses on empty slices anyway.
-    let mcp_sessions: Vec<McpSessionBrief> = {
-        match crate::mcp::telemetry::global_map() {
-            Some(map) => {
-                let snap = map.read().await;
-                snap.values()
-                    .map(|s| {
-                        let user_agent = match &s.principal {
-                            crate::mcp::telemetry::PrincipalKind::InAppAgent => {
-                                "in-app".to_string()
-                            }
-                            crate::mcp::telemetry::PrincipalKind::McpClient { user_agent } => {
-                                user_agent.clone()
-                            }
-                            crate::mcp::telemetry::PrincipalKind::AgentMemory {
-                                user_agent,
-                                ..
-                            } => user_agent.clone(),
-                        };
-                        let transport = match s.transport {
-                            crate::mcp::telemetry::TransportKind::Sse => "sse",
-                            crate::mcp::telemetry::TransportKind::Stdio => "stdio",
-                            crate::mcp::telemetry::TransportKind::AgentMemory => "agentmemory",
-                        };
-                        let prefix_len = s.session_id.len().min(12);
-                        McpSessionBrief {
-                            session_id_prefix: s.session_id[..prefix_len].to_string(),
-                            user_agent,
-                            transport: transport.to_string(),
-                            tool_calls_total: s.tool_calls_total,
-                            errors_total: s.errors_total,
-                        }
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
-        }
-    };
-
-    // Substrate health — recent recovery-log events (last 5 min)
-    // so the operator-mode AI proactively notices wedged state
-    // without polling `recovery_log_tail`. Filter is best-effort:
-    // we tail the last 50 and keep only those within the recency
-    // window. Empty result = healthy substrate.
-    let recovery_events: Vec<RecoveryEventBrief> = {
-        match thinkingroot_core::recovery_log::tail(50) {
-            Ok(events) => {
-                let now = chrono::Utc::now();
-                let window = chrono::Duration::minutes(5);
-                events
-                    .into_iter()
-                    .filter(|ev| now.signed_duration_since(ev.ts) <= window)
-                    .map(|ev| recovery_event_brief(&ev))
-                    .collect::<Vec<_>>()
-            }
-            Err(_) => Vec::new(),
-        }
-    };
-
-    // Skill body auto-surface (tiered disclosure): keyword-overlap
-    // classifier against the user's message picks the top-1 skill
-    // and inlines its body. Beats the manifest-only model (which
-    // costs a `use_skill` round-trip on the common case). Returns
-    // None when no skill scores above the threshold.
-    let relevant_skill_pick = skills.pick_relevant(&body.question);
-    let relevant_skill = relevant_skill_pick.map(|s| RelevantSkill {
-        name: s.name.as_str(),
-        body: s.body.as_str(),
-    });
-
-    let bus_ctx = ReminderContext {
-        environment: Some(&environment_info),
-        identity: identity.as_ref(),
-        today: Some(&today_str),
-        session: session_snapshot.as_ref(),
-        branch: branch_summary,
-        engrams: &engram_handles,
-        engram_budget: 100, // mirrors EngramConfig::default().max_engrams_per_session
-        tool_budget_remaining: None,
-        tool_budget_max: None,
-        sandbox_recommendation: sandbox_reason,
-        agentmemory_recalls: &agentmemory_recalls,
-        mcp_sessions: &mcp_sessions,
-        recovery_events: &recovery_events,
-        relevant_skill,
-    };
+    let reminder_build =
+        build_reminder_context(&state, &ws, &conversation_id, &body.question, Some(&skills))
+            .await;
+    let bus_ctx = reminder_build.as_context(identity.as_ref());
     let bus_prefix = render_reactive_reminders(&bus_ctx);
+
     let user_question = if bus_prefix.is_empty() {
         body.question.clone()
     } else {
@@ -5909,6 +5803,31 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     let user_question_for_persist = body.question.clone();
     let sessions_for_persist = state.sessions.clone();
 
+    tracing::info!(
+        target: "chat_turn",
+        workspace = %ws,
+        elapsed_ms = chat_started_at.elapsed().as_millis() as u64,
+        prompt_bytes = system_prompt.len(),
+        bus_bytes = bus_prefix.len(),
+        history_turns = agent_messages.len(),
+        recalls = reminder_build.agentmemory_recalls.len(),
+        engrams = reminder_build.engram_handles.len(),
+        skill_picked = reminder_build.relevant_skill_name.is_some(),
+        "prompt_built"
+    );
+
+    // Ship 3F (2026-05-20) — wire the mid-turn refresher so long
+    // agent runs (up to 25 iterations) re-inject fresh volatile
+    // signals into the `system` parameter at the top of every LLM
+    // call. `state.clone()` is cheap (Arc bump); `system_prompt` is
+    // captured by value as the baseline the refresher appends to.
+    let refresher = Arc::new(RestStreamSystemRefresher {
+        state: state.clone(),
+        workspace: ws.clone(),
+        base_system_prompt: system_prompt.clone(),
+    })
+        as Arc<dyn crate::intelligence::agent::SystemPromptRefresher>;
+
     let req = StreamAgentRequest {
         workspace: ws.clone(),
         workspace_root,
@@ -5918,6 +5837,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         user_question,
         history: agent_messages,
         skills,
+        system_refresher: Some(refresher),
     };
     let deps = StreamAgentDeps {
         engine: state.engine.clone(),
@@ -5939,6 +5859,12 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // until natural completion.
     let cancel = tokio_util::sync::CancellationToken::new();
     let drop_guard = cancel.clone().drop_guard();
+    tracing::info!(
+        target: "chat_turn",
+        workspace = %ws,
+        elapsed_ms = chat_started_at.elapsed().as_millis() as u64,
+        "agent_spawning"
+    );
     let (mut rx, router) = spawn_agent_run(req, deps, cancel);
 
     // The streaming task watches the event channel. For every
@@ -5961,10 +5887,16 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     //     without it.
     let engine_for_verify = state.engine.clone();
     let workspace_for_verify = ws.clone();
+    // Hand the timeline marker + workspace label into the stream block
+    // so first-token + done log lines carry the same correlation
+    // identity as the pre-spawn events. No clone — `chat_started_at`
+    // is `Copy`.
+    let chat_started_at_for_stream = chat_started_at;
+    let workspace_for_timeline = ws.clone();
     let stream = async_stream::stream! {
         use crate::intelligence::retrieval_capture::{HashSetSubstrate, RetrievalCapture};
         use crate::intelligence::verifier::{
-            DEFAULT_AUTO_CITE_THRESHOLD, VerifyInput, VerifyKind, verify,
+            DEFAULT_AUTO_CITE_THRESHOLD, Verdict, VerifyInput, VerifyKind, verify,
         };
 
         // Move the DropGuard inside the stream block. When the SSE
@@ -5973,6 +5905,14 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         // token and the spawned agent task observes it at its next
         // safe checkpoint.
         let _agent_drop_guard = drop_guard;
+
+        // First-token watermark for the chat-turn timeline. Flips
+        // exactly once on the first Text/ToolCallProposed/
+        // ToolCallExecuting event so a `RUST_LOG=chat_turn=info`
+        // capture pinpoints whether the wait is in retrieval setup
+        // (long pre-first-token gap) or in tool execution (short
+        // first-token, long total).
+        let mut first_event_logged = false;
 
         // Surface a cheap meta event up front so UIs that show a
         // "category" header have something to render before tokens
@@ -5990,6 +5930,24 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         let mut last_was_rejection = false;
         let mut final_text_for_verify: Option<String> = None;
 
+        // Ship 3E (2026-05-20) — retrieval outcome snoop. Correlates
+        // ToolCallProposed id+query with ToolCallFinished id+hit-count
+        // so the post-Done hook can write back the LAST retrieval's
+        // query + hits onto the session for the next turn's
+        // `<search_was_shallow>` reminder. Map cleared on each new
+        // proposal so a flurry of retrievals only retains the most
+        // recent. Names matched are the canonical retrieval-class
+        // tools — keep in sync with `RetrievalCapture::observe_tool_finished`.
+        const RETRIEVAL_TOOLS: &[&str] = &[
+            "hybrid_retrieve",
+            "search",
+            "search_claims",
+            "query_claims",
+        ];
+        let mut pending_retrieval_query: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        let mut last_retrieval_outcome: Option<(String, u32)> = None;
+
         // `router` is kept alive for the lifetime of the stream (the
         // agent task holds its own Arc via the PermissionsGate wrap);
         // SSE no longer needs to call `set_pending_id` because the
@@ -6000,6 +5958,32 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         // dispatch task.
         let _router_anchor = router;
         while let Some(event) = rx.recv().await {
+            // Timeline: log the first downstream event so an
+            // operator can see whether the user-visible wait is
+            // pre-first-token (LLM warm-up + reminder bus emission)
+            // or post-first-token (tool fan-out, retrieval ranking).
+            if !first_event_logged {
+                first_event_logged = true;
+                let kind_tag = match &event {
+                    AgentEvent::Text { .. } => "text",
+                    AgentEvent::ToolCallProposed { .. } => "tool_call_proposed",
+                    AgentEvent::ToolCallExecuting { .. } => "tool_call_executing",
+                    AgentEvent::ToolCallFinished { .. } => "tool_call_finished",
+                    AgentEvent::ToolCallRejected { .. } => "tool_call_rejected",
+                    AgentEvent::ToolCallProgress { .. } => "tool_call_progress",
+                    AgentEvent::ContinuationOffered { .. } => "continuation_offered",
+                    AgentEvent::Done { .. } => "done",
+                    _ => "other",
+                };
+                tracing::info!(
+                    target: "chat_turn",
+                    workspace = %workspace_for_timeline,
+                    elapsed_ms = chat_started_at_for_stream.elapsed().as_millis() as u64,
+                    first_event = kind_tag,
+                    "first_token"
+                );
+            }
+
             // Surface the approval prompt to the UI only when the
             // agent's `PermissionsGate` will actually delegate to
             // the inner UI-prompt path. Pre-fix (2026-05-18) the SSE
@@ -6020,6 +6004,20 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             // defensively by `commands/chat.rs::chat_approve`
             // treating `NO_PENDING_APPROVAL` as a silent dismiss.
             if let AgentEvent::ToolCallProposed { id, is_write, name, input } = &event {
+                // Ship 3E — record proposed retrieval queries so the
+                // matching ToolCallFinished can correlate hits → query.
+                if RETRIEVAL_TOOLS.contains(&name.as_str()) {
+                    let query = input
+                        .get("query")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| input.get("q").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    if !query.is_empty() {
+                        pending_retrieval_query
+                            .insert(id.clone(), (name.clone(), query));
+                    }
+                }
                 if *is_write {
                     use crate::intelligence::permissions_gate::{PermissionsGate, PolicyOutcome};
                     let outcome = PermissionsGate::predict(
@@ -6073,9 +6071,28 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             let mut engram_activation: Option<serde_json::Value> = None;
             let mut gap_surfacing: Option<serde_json::Value> = None;
             match &event {
-                AgentEvent::ToolCallFinished { name, content, is_error, .. } => {
+                AgentEvent::ToolCallFinished { id, name, content, is_error, .. } => {
                     capture.observe_tool_finished(name, content, *is_error);
                     last_was_rejection = false;
+                    // Ship 3E — correlate retrieval finishes with the
+                    // earlier proposal to record query + hit count.
+                    // Hit count is parsed from common substrate-tool
+                    // wire shapes: top-level `"hits"` / `"claims"` /
+                    // `"results"` array length. When the shape doesn't
+                    // match we honestly record 0 hits — the agent saw
+                    // an empty / error result and the next turn's
+                    // shallow-search warning should fire.
+                    if !*is_error && RETRIEVAL_TOOLS.contains(&name.as_str()) {
+                        if let Some((_, query)) = pending_retrieval_query.remove(id) {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+                            let hit_count: u32 = ["hits", "claims", "results", "items"]
+                                .iter()
+                                .find_map(|k| parsed.get(*k).and_then(|v| v.as_array()).map(|a| a.len()))
+                                .unwrap_or(0) as u32;
+                            last_retrieval_outcome = Some((query, hit_count));
+                        }
+                    }
                     // 2026-05-17 — shape-driven side-event detection.
                     // Pre-fix the dispatch keyed on the literal tool
                     // name; new aggregate/wrapper tools that produce
@@ -6120,6 +6137,15 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             // Terminal events end the stream after we emit the
             // trust-receipt follow-up.
             if matches!(event, AgentEvent::Done { .. }) {
+                tracing::info!(
+                    target: "chat_turn",
+                    workspace = %workspace_for_timeline,
+                    elapsed_ms = chat_started_at_for_stream.elapsed().as_millis() as u64,
+                    tools_called = capture.claim_ids().count(),
+                    last_was_rejection,
+                    final_text_bytes = final_text_for_verify.as_ref().map(|s| s.len()).unwrap_or(0),
+                    "done"
+                );
                 // Build the Substrate by batching claim_exists across
                 // every captured retrieval hit. Cheap (one DbInstance
                 // clone + per-id Cozo lookups; bounded by retrieval
@@ -6151,6 +6177,78 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                     substrate: &substrate,
                     auto_cite_threshold: DEFAULT_AUTO_CITE_THRESHOLD,
                 });
+
+                // Ship 3D (2026-05-20) — Reflexion writeback. Capture
+                // the verdict's critique into the session so the NEXT
+                // turn's `<previous_verify>` reminder block surfaces it
+                // and the LLM self-corrects when grounding was weak.
+                // Only writes when the verdict carries actionable
+                // signal — benign verdicts (FullyGrounded / Skipped*)
+                // store empty placeholders so a stale prior critique
+                // doesn't linger across turns.
+                {
+                    let (verdict_slug, verified, unverified, reason) = match &verdict {
+                        Verdict::FullyGrounded { claims_used, .. } => (
+                            "high_grounding".to_string(),
+                            claims_used.len() as u32,
+                            0u32,
+                            String::new(),
+                        ),
+                        Verdict::PartiallyGrounded { claims_used, related_count } => (
+                            "low_grounding".to_string(),
+                            claims_used.len() as u32,
+                            *related_count as u32,
+                            format!(
+                                "{} claim(s) cited, but {} only matched by surface vocabulary — \
+                                 the prior answer leaned on related context, not strict evidence",
+                                claims_used.len(),
+                                related_count
+                            ),
+                        ),
+                        Verdict::UnverifiedCitations { bad_claim_ids, claims_used } => (
+                            "ungrounded".to_string(),
+                            claims_used.len() as u32,
+                            bad_claim_ids.len() as u32,
+                            format!(
+                                "{} [claim:…] marker(s) referenced ids that don't exist in the substrate",
+                                bad_claim_ids.len()
+                            ),
+                        ),
+                        Verdict::SkippedChitchat => (
+                            "chitchat".to_string(),
+                            0,
+                            0,
+                            String::new(),
+                        ),
+                        Verdict::SkippedRejection => (
+                            "skipped_rejection".to_string(),
+                            0,
+                            0,
+                            String::new(),
+                        ),
+                        Verdict::SkippedBenchHarness => (
+                            "skipped_bench".to_string(),
+                            0,
+                            0,
+                            String::new(),
+                        ),
+                    };
+                    let mut store = sessions_for_persist.lock().await;
+                    if let Some(s) = store.get_mut(&conversation_id_for_persist) {
+                        s.record_verify_critique(verdict_slug, verified, unverified, reason);
+                        // Ship 3E — record this turn's last retrieval
+                        // outcome so the NEXT turn's
+                        // `<search_was_shallow>` reminder block can
+                        // surface it. Honest: when no retrieval ran
+                        // this turn, leave the prior turn's outcome
+                        // untouched — that's an accurate "the last
+                        // retrieval was the previous turn's" signal.
+                        if let Some((query, hits)) = last_retrieval_outcome.take() {
+                            s.record_search_outcome(query, hits);
+                        }
+                    }
+                }
+
                 let payload = verdict.to_sse_payload();
                 yield Ok(
                     Event::default()
