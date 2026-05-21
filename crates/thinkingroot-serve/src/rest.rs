@@ -437,6 +437,27 @@ impl AppState {
 /// every mutation handler into the test setup.  Production code
 /// already calls it from inside the rest crate after every successful
 /// branch mutation.
+/// Invalidate the engram cache for the workspace whose root matches
+/// `root`. Best-effort: no-op when the root isn't registered in
+/// `mounted_workspace_roots` (e.g. legacy single-workspace boot).
+///
+/// Mirrors `finalize_successful_compile`'s post-write reconciliation:
+/// after main's graph mutates (compile, merge, …) any AEP probe
+/// cached against the prior claim ids would resolve to GC'd rows.
+/// Same hygiene, applied at the second main-graph-mutating surface
+/// (the first being compile).
+async fn invalidate_engrams_for_root(state: &AppState, root: &PathBuf) {
+    let name_opt = {
+        let map = state.mounted_workspace_roots.read().await;
+        map.iter()
+            .find(|(_, p)| *p == root)
+            .map(|(n, _)| n.clone())
+    };
+    if let Some(name) = name_opt {
+        state.engram_manager.invalidate_workspace(&name).await;
+    }
+}
+
 pub async fn publish_latest_branch_event(state: &AppState, branch: &str) {
     let Some(root) = state.current_workspace_root().await else {
         return;
@@ -4814,6 +4835,10 @@ async fn merge_branch_handler(
 
     match result {
         Ok(diff) => {
+            // merge_branch_handler always targets `main` (the default
+            // when `target = None` upstream), so this branch always
+            // mutates main's graph — invalidate engrams unconditionally.
+            invalidate_engrams_for_root(&state, &root).await;
             publish_latest_branch_event(&state, &branch).await;
             ok_response(serde_json::json!({
                 "merged": branch,
@@ -4921,6 +4946,13 @@ async fn merge_into_branch_handler(
 
     match result {
         Ok(diff) => {
+            // Cross-branch merges that don't touch main don't change
+            // what BrainView reads, but per-workspace engrams stay
+            // honest only when invalidated on every main-touching
+            // mutation. So gate on target == "main" here.
+            if target == "main" {
+                invalidate_engrams_for_root(&state, &root).await;
+            }
             publish_latest_branch_event(&state, &source).await;
             ok_response(serde_json::json!({
                 "merged": source,

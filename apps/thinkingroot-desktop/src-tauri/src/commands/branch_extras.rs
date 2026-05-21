@@ -252,6 +252,15 @@ async fn run_branch_event_subscription(
                             .unwrap_or("")
                             .to_string();
                         let event = json.get("event").cloned().unwrap_or(Value::Null);
+                        // A merge that lands on main mutates the graph
+                        // BrainView reads. Re-emit on the
+                        // `workspaces-changed` channel so the existing
+                        // `onWorkspacesChanged` subscriber on the UI
+                        // side refreshes the brain snapshot — no new
+                        // event type required.
+                        if merge_landed_on_main(&event) {
+                            let _ = app.emit("workspaces-changed", true);
+                        }
                         let _ = app.emit(
                             "branch-event",
                             BranchEventEnvelope::Event { branch, event },
@@ -291,5 +300,69 @@ async fn run_branch_event_subscription(
                 }
             }
         }
+    }
+}
+
+/// True iff `event` is the JSON form of `BranchEvent::Merged` whose
+/// `into` target is `main`. Extracted as a pure helper so the
+/// branch-event subscriber's "should I also signal BrainView?"
+/// decision is unit-testable without an `AppHandle` mock.
+///
+/// Wire shape from `thinkingroot_core::types::BranchEvent`'s
+/// `#[serde(tag = "kind", rename_all = "snake_case")]`:
+/// `{"kind": "merged", "at": "...", "actor": "...", "into": "..."}`.
+fn merge_landed_on_main(event: &Value) -> bool {
+    event.get("kind").and_then(|v| v.as_str()) == Some("merged")
+        && event.get("into").and_then(|v| v.as_str()) == Some("main")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_landed_on_main;
+    use serde_json::json;
+
+    #[test]
+    fn merged_into_main_returns_true() {
+        let ev = json!({
+            "kind": "merged",
+            "at": "2026-05-21T00:00:00Z",
+            "actor": "alice",
+            "into": "main",
+        });
+        assert!(merge_landed_on_main(&ev));
+    }
+
+    #[test]
+    fn merged_into_other_branch_returns_false() {
+        let ev = json!({
+            "kind": "merged",
+            "at": "2026-05-21T00:00:00Z",
+            "actor": "alice",
+            "into": "feature/x",
+        });
+        assert!(!merge_landed_on_main(&ev));
+    }
+
+    #[test]
+    fn non_merge_event_returns_false() {
+        let created = json!({
+            "kind": "created",
+            "at": "2026-05-21T00:00:00Z",
+            "actor": "alice",
+            "parent": "main",
+        });
+        assert!(!merge_landed_on_main(&created));
+
+        let abandoned = json!({
+            "kind": "abandoned",
+            "at": "2026-05-21T00:00:00Z",
+            "actor": "alice",
+        });
+        assert!(!merge_landed_on_main(&abandoned));
+
+        // Defensive: malformed event (missing fields) must not
+        // accidentally trigger a brain refresh.
+        let empty = json!({});
+        assert!(!merge_landed_on_main(&empty));
     }
 }
