@@ -1,29 +1,5 @@
-// apps/thinkingroot-desktop/ui/src/components/permissions/PermissionPromptDialog.tsx
-//
-// Phase D Wave 1 (2026-05-17) — permission-aware approval modal
-// for the 10 system-power tools (file_read, file_write, file_edit,
-// glob, grep, shell_exec, clipboard_*, open_in_default, trash).
-//
-// Wire path:
-//   - Backend emits an `approval_requested` SSE event carrying
-//     `permission_context` (rest.rs::build_permission_context_for_tool).
-//   - commands/chat.rs decodes the event, includes `permission_context`
-//     on the Tauri `ChatEvent::ApprovalRequested` payload.
-//   - ChatView listens for `approval_requested` events and renders
-//     this dialog when `permission_context` is present.
-//   - User clicks Allow once / Allow always / Deny once / Deny always.
-//   - Component calls `chatApprove` with optional `persistRule`.
-//
-// Architectural invariants enforced by this component:
-//   - When `permission_context.default_deny_matched === true`, the
-//     UI MUST hide the Allow buttons. The path is protected by
-//     ThinkingRoot's hardcoded security policy and the backend will
-//     reject any `allow_*` rule that overlaps DEFAULT_DENY anyway —
-//     hiding the buttons here is honest UX, not just a safety net.
-//   - "Once" decisions omit `persistRule`; "Always" decisions
-//     attach it. The backend persists to permissions.toml BEFORE
-//     resolving the oneshot, so the next turn's PermissionsGate
-//     sees the new rule immediately.
+// Permission approval sheet — expands upward from the chat composer
+// (Cursor-style), not a centered modal with backdrop blur.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Loader2, Lock, Shield, X } from "lucide-react";
@@ -37,14 +13,12 @@ import {
   type PersistRule,
 } from "@/lib/tauri";
 
-interface Props {
+export interface PermissionPromptProps {
   workspace: string;
   toolUseId: string;
   toolName: string;
   toolInput: unknown;
   permissionContext: PermissionContext;
-  /** Called after the user has acted (approve/deny) — parent should
-   *  unmount the dialog. */
   onResolved: () => void;
 }
 
@@ -57,14 +31,17 @@ export function PermissionPromptDialog({
   toolInput,
   permissionContext,
   onResolved,
-}: Props) {
+  variant = "session",
+}: PermissionPromptProps & {
+  /** Match the active composer shell (bottom session vs idle centered). */
+  variant?: "session" | "idle";
+}) {
   const [pending, setPending] = useState<ActionKind | null>(null);
-  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const defaultDenyMatched = permissionContext.default_deny_matched === true;
 
-  // Focus close on open; ESC defaults to "deny_once" (fail-safe).
   useEffect(() => {
-    closeBtnRef.current?.focus();
+    panelRef.current?.focus();
     function onKey(ev: KeyboardEvent) {
       if (ev.key === "Escape" && pending == null) {
         void resolve("deny_once");
@@ -137,181 +114,165 @@ export function PermissionPromptDialog({
 
   return (
     <div
-      role="dialog"
-      aria-modal="true"
+      ref={panelRef}
+      role="region"
       aria-label={`Permission required for ${toolName}`}
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-background/70 backdrop-blur-sm"
-      onClick={(e) => {
-        if (e.target === e.currentTarget && pending == null) {
-          void resolve("deny_once");
-        }
-      }}
+      tabIndex={-1}
+      className={cn(
+        "permission-sheet-enter flex w-full max-h-[min(42vh,320px)] flex-col overflow-hidden border border-b-0",
+        "shadow-[0_-4px_24px_-8px_rgba(0,0,0,0.35)]",
+        variant === "idle"
+          ? "rounded-t-xl border-border/60 bg-surface-elevated"
+          : "rounded-t-[26px] border-white/[0.1] bg-[hsl(0,0%,13.5%)]",
+      )}
     >
-      <div className="flex w-full max-w-lg flex-col overflow-hidden rounded-xl border border-border bg-surface-elevated shadow-elevated">
-        <header className="flex items-start gap-3 border-b border-border/60 px-5 py-3.5">
-          <div
-            className={cn(
-              "flex size-8 shrink-0 items-center justify-center rounded-md",
-              defaultDenyMatched
-                ? "bg-destructive/15 text-destructive"
-                : "bg-primary/12 text-primary",
-            )}
-          >
-            {defaultDenyMatched ? (
-              <Shield className="size-4" aria-hidden />
-            ) : (
-              <Lock className="size-4" aria-hidden />
-            )}
-          </div>
-          <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-medium tracking-tight">
-              {defaultDenyMatched
-                ? `Blocked by security policy: ${toolName}`
-                : `Allow ${toolName}?`}
-            </h3>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">
-              The AI wants to{" "}
-              <span className="font-medium text-foreground">{toolName}</span>{" "}
-              on:
-            </p>
-          </div>
-          <button
-            ref={closeBtnRef}
-            type="button"
-            disabled={pending != null}
-            onClick={() => void resolve("deny_once")}
-            className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/45 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/55"
-            aria-label="Deny once and close"
-          >
-            <X className="size-4" aria-hidden />
-          </button>
-        </header>
-
-        <div className="space-y-3 px-5 py-3.5">
-          <div className="rounded-md border border-border/55 bg-background/40 px-3 py-2 font-mono text-[11px] leading-relaxed text-foreground">
-            <span className="break-all">{subject}</span>
-          </div>
-
-          {defaultDenyMatched && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 text-[11px] leading-relaxed text-destructive">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
-                <p>
-                  This path is protected by ThinkingRoot's hardcoded security
-                  policy (e.g. SSH keys, AWS credentials, browser profiles,
-                  <code className="mx-0.5 rounded bg-destructive/15 px-1 py-0.5 text-[10px]">
-                    .env
-                  </code>{" "}
-                  files). No user click can override this rule.
-                </p>
-              </div>
-            </div>
+        <div
+          className={cn(
+            "flex shrink-0 items-start gap-2.5 border-b px-3 py-2.5",
+            variant === "idle" ? "border-border/50" : "border-white/[0.08]",
           )}
-
-          {permissionContext.suggested_pattern && !defaultDenyMatched && (
-            <p className="text-[11px] leading-relaxed text-muted-foreground">
-              "Always" decisions persist a rule for{" "}
-              <code className="rounded bg-muted/45 px-1 py-0.5 font-mono text-[10px] text-foreground">
-                {permissionContext.suggested_pattern}
-              </code>{" "}
-              under your user-level{" "}
-              <code className="rounded bg-muted/45 px-1 py-0.5 font-mono text-[10px] text-foreground">
-                permissions.toml
-              </code>
-              .
-            </p>
+        >
+        <div
+          className={cn(
+            "flex size-7 shrink-0 items-center justify-center rounded-md",
+            defaultDenyMatched
+              ? "bg-destructive/15 text-destructive"
+              : "bg-warn/15 text-warn",
+          )}
+        >
+          {defaultDenyMatched ? (
+            <Shield className="size-3.5" aria-hidden />
+          ) : (
+            <Lock className="size-3.5" aria-hidden />
           )}
         </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-medium leading-snug text-foreground">
+            {defaultDenyMatched
+              ? `Blocked: ${toolName}`
+              : `Allow ${toolName}?`}
+          </p>
+          <p
+            className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground"
+            title={subject}
+          >
+            {subject}
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={pending != null}
+          onClick={() => void resolve("deny_once")}
+          className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
+          aria-label="Deny once"
+        >
+          <X className="size-3.5" aria-hidden />
+        </button>
+      </div>
 
-        <footer className="flex flex-wrap items-center justify-end gap-1.5 border-t border-border/60 bg-background/35 px-5 py-2.5">
-          {!defaultDenyMatched && (
-            <>
+      {defaultDenyMatched && (
+        <div
+          className={cn(
+            "flex items-start gap-2 border-b px-3 py-2 text-[11px] leading-relaxed text-destructive",
+            variant === "idle" ? "border-border/40" : "border-white/[0.06]",
+          )}
+        >
+          <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+          <p>
+            Protected by security policy — cannot be overridden.
+          </p>
+        </div>
+      )}
+
+      {permissionContext.suggested_pattern && !defaultDenyMatched && (
+        <p
+          className={cn(
+            "border-b px-3 py-1.5 text-[10px] leading-relaxed text-muted-foreground",
+            variant === "idle" ? "border-border/40" : "border-white/[0.06]",
+          )}
+        >
+          &quot;Always&quot; saves{" "}
+          <code className="font-mono text-foreground/80">
+            {permissionContext.suggested_pattern}
+          </code>{" "}
+          to permissions.toml
+        </p>
+      )}
+
+      <div className="flex shrink-0 flex-wrap items-center gap-1.5 overflow-y-auto px-3 py-2">
+        {!defaultDenyMatched && (
+          <>
+            <Button
+              type="button"
+              size="sm"
+              variant="default"
+              disabled={pending != null}
+              className="h-7 text-[11px]"
+              onClick={() => void resolve("allow_once")}
+            >
+              {pending === "allow_once" ? (
+                <Loader2 className="size-3 animate-spin" aria-hidden />
+              ) : (
+                <Check className="size-3" aria-hidden />
+              )}
+              <span className="ml-1">Allow once</span>
+            </Button>
+            {permissionContext.suggested_pattern && (
               <Button
                 type="button"
                 size="sm"
-                variant="default"
+                variant="secondary"
                 disabled={pending != null}
-                onClick={() => void resolve("allow_once")}
+                className="h-7 max-w-[14rem] truncate text-[11px]"
+                title={`Allow always for ${permissionContext.suggested_pattern}`}
+                onClick={() => void resolve("allow_always")}
               >
-                {pending === "allow_once" ? (
-                  <Loader2 className="size-3 animate-spin" aria-hidden />
+                {pending === "allow_always" ? (
+                  <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
                 ) : (
-                  <Check className="size-3" aria-hidden />
+                  <Check className="size-3 shrink-0" aria-hidden />
                 )}
-                <span className="ml-1 text-[11px]">Allow once</span>
+                <span className="ml-1 truncate">Always allow</span>
               </Button>
-              {permissionContext.suggested_pattern && (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="default"
-                  disabled={pending != null}
-                  onClick={() => void resolve("allow_always")}
-                >
-                  {pending === "allow_always" ? (
-                    <Loader2 className="size-3 animate-spin" aria-hidden />
-                  ) : (
-                    <Check className="size-3" aria-hidden />
-                  )}
-                  <span className="ml-1 text-[11px]">
-                    Allow always for{" "}
-                    <code className="font-mono">
-                      {permissionContext.suggested_pattern}
-                    </code>
-                  </span>
-                </Button>
-              )}
-            </>
+            )}
+          </>
+        )}
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          disabled={pending != null}
+          className="h-7 text-[11px]"
+          onClick={() => void resolve("deny_once")}
+        >
+          {pending === "deny_once" ? (
+            <Loader2 className="size-3 animate-spin" aria-hidden />
+          ) : (
+            <X className="size-3" aria-hidden />
           )}
+          <span className="ml-1">Deny</span>
+        </Button>
+        {permissionContext.suggested_pattern && (
           <Button
             type="button"
             size="sm"
             variant="ghost"
             disabled={pending != null}
-            onClick={() => void resolve("deny_once")}
+            className="h-7 max-w-[12rem] truncate text-[11px]"
+            title={`Deny always for ${permissionContext.suggested_pattern}`}
+            onClick={() => void resolve("deny_always")}
           >
-            {pending === "deny_once" ? (
-              <Loader2 className="size-3 animate-spin" aria-hidden />
-            ) : (
-              <X className="size-3" aria-hidden />
-            )}
-            <span className="ml-1 text-[11px]">Deny once</span>
+            {pending === "deny_always" ? (
+              <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />
+            ) : null}
+            <span className="ml-1 truncate">Always deny</span>
           </Button>
-          {permissionContext.suggested_pattern && (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              disabled={pending != null}
-              onClick={() => void resolve("deny_always")}
-            >
-              {pending === "deny_always" ? (
-                <Loader2 className="size-3 animate-spin" aria-hidden />
-              ) : (
-                <X className="size-3" aria-hidden />
-              )}
-              <span className="ml-1 text-[11px]">
-                Deny always for{" "}
-                <code className="font-mono">
-                  {permissionContext.suggested_pattern}
-                </code>
-              </span>
-            </Button>
-          )}
-        </footer>
+        )}
       </div>
     </div>
   );
 }
 
-/**
- * For shell_exec, take the user's full command line and produce a
- * glob-friendly pattern. Example: `git push origin main` →
- * `git push *`. Conservative: only keeps the first 2 tokens
- * literal and replaces the rest with `*`. The user can always edit
- * the persisted rule by hand in `permissions.toml` if they want
- * different scoping.
- */
 function deriveCommandPattern(command: string): string {
   const trimmed = command.trim();
   if (trimmed.length === 0) return command;

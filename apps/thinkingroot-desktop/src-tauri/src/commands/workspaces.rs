@@ -1267,26 +1267,6 @@ pub async fn workspace_compile_status(app: AppHandle) -> Result<CompileStatus, S
     })
 }
 
-/// `GET /api/v1/ws/{ws}/readme` proxy. Returns the engine-canonical
-/// workspace README markdown (auto-synthesised by Phase 10 of the
-/// compile pipeline). Backs the desktop's right-rail Readme tab.
-/// Empty string when the workspace has not been compiled yet — the
-/// view renders an "no README yet" empty state, never a fabricated
-/// placeholder (CLAUDE.md honesty rule §1).
-#[derive(Debug, serde::Deserialize)]
-struct ReadmeEnvelope {
-    readme: String,
-}
-
-#[tauri::command]
-pub async fn workspace_readme(app: AppHandle) -> Result<String, String> {
-    use crate::commands::sidecar_client::SidecarClient;
-    let sc = SidecarClient::ensure_active(&app).await?;
-    let path = format!("/api/v1/ws/{}/readme", sc.workspace);
-    let env: ReadmeEnvelope = sc.get(&path).await?;
-    Ok(env.readme)
-}
-
 fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgress> {
     match event {
         // The unified ticker event — single canonical path. Mapped

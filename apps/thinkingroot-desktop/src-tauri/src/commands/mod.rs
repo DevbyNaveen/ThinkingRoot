@@ -40,6 +40,7 @@ pub mod playground;
 pub mod playground_fs;
 pub mod privacy;
 pub mod proposal;
+pub mod providers;
 pub mod recovery;
 pub mod retrieve;
 pub mod scan;

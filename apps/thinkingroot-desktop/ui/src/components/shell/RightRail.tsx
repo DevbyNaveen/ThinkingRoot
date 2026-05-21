@@ -3,7 +3,7 @@
  *
  * Tab bar (top, icon-only):
  *   Hammer  → Compile   (workspace card + live compile progress + branch graph)
- *   FolderTree → Workspace (readme + folder tree in one panel; readme default)
+ *   FolderTree → Workspace (Living Paper + folder tree in one panel; paper default)
  *   KnowledgeMark → Knowledge (custom substrate glyph, not Lucide stock)
  *   Globe2  → Browser   (manual web browser)
  *   Terminal → Terminal (PTY shells)
@@ -207,7 +207,7 @@ export function RightRail() {
         <div
           className={cn(
             "min-h-0 flex-1 overflow-hidden",
-            activeTab === "brain" ? "flex flex-col" : "hidden",
+            activeTab === "brain" ? "flex flex-col bg-background" : "hidden",
           )}
         >
           <BrainView panelMode isVisible={activeTab === "brain"} />
@@ -427,7 +427,7 @@ function WorkspaceCard({ activeWorkspace }: { activeWorkspace: string | null }) 
           size="sm"
           className="h-7 shrink-0 gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           type="button"
-          title="Open readme and folder inspector"
+          title="Open Living Paper and folder inspector"
           onClick={() => setRightRailTab("files")}
         >
           <FolderTree className="size-3 opacity-80" aria-hidden />

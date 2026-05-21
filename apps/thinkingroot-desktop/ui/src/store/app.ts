@@ -42,8 +42,9 @@ function normalizeRightRailTab(tab: unknown): RightRailTab {
 function normalizeWorkspaceInspectorPage(
   p: unknown,
 ): WorkspaceInspectorPage {
-  if (p === "readme" || p === "folder") return p;
-  return "readme";
+  if (p === "paper" || p === "folder") return p;
+  if (p === "readme") return "paper";
+  return "paper";
 }
 
 function normalizeSurface(surface: unknown): Surface {
@@ -206,6 +207,13 @@ interface AppStore {
   totalTokensIn: number;
   totalTokensOut: number;
   addTurnUsage: (inTok: number, outTok: number, costUsd: number) => void;
+
+  /** User dismissed the hybrid auth gate via "Continue with local key". */
+  skippedCloudSignIn: boolean;
+  setSkippedCloudSignIn: (skipped: boolean) => void;
+  /** Session-only — re-open the welcome gate from Settings (not persisted). */
+  showWelcomeScreen: boolean;
+  setShowWelcomeScreen: (show: boolean) => void;
 }
 
 function key(workspace: string, conversationId: string): string {
@@ -249,7 +257,7 @@ export const useApp = create<AppStore>()(
       rightRailTab: "compile",
       setRightRailTab: (rightRailTab) =>
         set({ rightRailTab: normalizeRightRailTab(rightRailTab) }),
-      workspaceInspectorPage: "readme",
+      workspaceInspectorPage: "paper",
       setWorkspaceInspectorPage: (workspaceInspectorPage) =>
         set({
           workspaceInspectorPage:
@@ -447,6 +455,11 @@ export const useApp = create<AppStore>()(
           totalTokensOut: s.totalTokensOut + outTok,
           totalCostUsd: s.totalCostUsd + costUsd,
         })),
+
+      skippedCloudSignIn: false,
+      setSkippedCloudSignIn: (skippedCloudSignIn) => set({ skippedCloudSignIn }),
+      showWelcomeScreen: false,
+      setShowWelcomeScreen: (showWelcomeScreen) => set({ showWelcomeScreen }),
     }),
     {
       name: "thinkingroot-desktop-ui",
@@ -462,6 +475,7 @@ export const useApp = create<AppStore>()(
         trust: s.trust,
         recentCommandIds: s.recentCommandIds,
         activeWorkspace: s.activeWorkspace,
+        skippedCloudSignIn: s.skippedCloudSignIn,
       }),
       merge: (persisted, current) => {
         const p =

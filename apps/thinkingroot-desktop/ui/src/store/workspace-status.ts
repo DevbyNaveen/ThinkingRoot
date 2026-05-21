@@ -118,7 +118,8 @@ export type CompileState =
       progress: CompileProgress | null;
       started_at: string;
     }
-  | { kind: "cancelling"; since: string };
+  | { kind: "cancelling"; since: string }
+  | { kind: "queued"; since: string; reason: string };
 
 export interface BranchState {
   current: string;
@@ -434,13 +435,25 @@ export const SUBSTRATE_BADGE_SURFACE_CLASS =
  * ("The desktop never claims something synced when it didn't"). When
  * `compile.kind === "running" | "cancelling"`, surface that fact in
  * the badge; substrate-derived labels apply only when the engine is
- * idle. */
+ * idle.
+ *
+ * **Source-tree freshness also overrides "Up to date".** When the
+ * substrate is `populated` but the daemon's source-tree watcher has
+ * flipped `sources.fingerprint_match` to `false` (file edited /
+ * added / removed since the last successful compile), the substrate
+ * is by definition behind the user's files. Returning "Up to date"
+ * in that state was the central lie of the pre-2026-05-20 UX. We
+ * surface "Behind" with `tone: "warn"` so the user knows a recompile
+ * is needed before chat/query results reflect their edits. */
 export function substrateBadge(
   status: WorkspaceStatus | null,
 ): { label: string; tone: "ok" | "info" | "warn" | "error" | "muted" } {
   if (!status) return { label: "Loading", tone: "muted" };
   if (status.compile.kind === "running") {
     return { label: "Compiling", tone: "info" };
+  }
+  if (status.compile.kind === "queued") {
+    return { label: "Syncing soon", tone: "info" };
   }
   if (status.compile.kind === "cancelling") {
     return { label: "Stopping", tone: "warn" };
@@ -451,6 +464,12 @@ export function substrateBadge(
     case "empty":
       return { label: "Behind", tone: "warn" };
     case "populated":
+      if (
+        status.sources.kind === "some" &&
+        status.sources.fingerprint_match === false
+      ) {
+        return { label: "Behind", tone: "warn" };
+      }
       return { label: "Up to date", tone: "ok" };
     case "orphaned":
       return { label: "Behind", tone: "error" };

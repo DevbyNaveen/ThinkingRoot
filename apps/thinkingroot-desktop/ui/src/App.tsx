@@ -7,6 +7,7 @@ import { CommandPalette } from "@/components/command-palette/CommandPalette";
 import { ToastStack } from "@/components/ui/toast-stack";
 import { InstallTrSheet } from "@/components/install/InstallTrSheet";
 import { PackExportSheet } from "@/components/export/PackExportSheet";
+import { AuthGate } from "@/components/auth/AuthGate";
 import { EngineGate } from "@/components/engine/EngineGate";
 import { WindowDragDropOverlay } from "@/components/shell/WindowDragDropOverlay";
 import { onTrFileOpened, onWorkspaceCompileProgress } from "@/lib/tauri";
@@ -95,6 +96,7 @@ export default function App() {
 
   return (
     <EngineGate>
+      <AuthGate>
       <TooltipProvider delayDuration={250} skipDelayDuration={120}>
         <div className="flex h-full w-full flex-col bg-background text-foreground">
           <div className="flex min-h-0 min-w-0 flex-1">
@@ -118,6 +120,7 @@ export default function App() {
         )}
         <ToastStack />
       </TooltipProvider>
+      </AuthGate>
     </EngineGate>
   );
 }

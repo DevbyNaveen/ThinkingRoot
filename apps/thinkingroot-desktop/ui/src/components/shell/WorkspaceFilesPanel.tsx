@@ -1,5 +1,5 @@
 /**
- * Right-rail workspace inspector: **Readme** (default) and **Folder**
+ * Right-rail workspace inspector: **Living Paper** (default) and **Folder**
  * sub-tabs in one panel — tree over the workspace root, optional
  * `.thinkingroot` scope, text preview, and `.tr` export on Folder.
  */
@@ -32,6 +32,17 @@ export function WorkspaceFilesPanel({
   const setPackExportTarget = useApp((s) => s.setPackExportTarget);
   const inspectorPage = useApp((s) => s.workspaceInspectorPage);
   const setInspectorPage = useApp((s) => s.setWorkspaceInspectorPage);
+  const compileProgress = useApp((s) => s.compileProgress);
+  const [paperRefreshNonce, setPaperRefreshNonce] = useState(0);
+  useEffect(() => {
+    if (
+      compileProgress?.phase === "done" ||
+      compileProgress?.phase === "failed" ||
+      compileProgress?.phase === "cancelled"
+    ) {
+      setPaperRefreshNonce((n) => n + 1);
+    }
+  }, [compileProgress?.phase]);
 
   const [w, setW] = useState<WorkspaceView | null>(null);
   const [scope, setScope] = useState<Scope>("project");
@@ -138,7 +149,7 @@ export function WorkspaceFilesPanel({
         role="tablist"
         aria-label="Workspace view"
       >
-        {(["readme", "folder"] as const).map((id) => (
+        {(["paper", "folder"] as const).map((id) => (
           <button
             key={id}
             type="button"
@@ -152,14 +163,14 @@ export function WorkspaceFilesPanel({
             )}
             onClick={() => setInspectorPage(id)}
           >
-            {id === "readme" ? "Readme" : "Folder"}
+            {id === "paper" ? "Paper" : "Folder"}
           </button>
         ))}
       </div>
 
-      {inspectorPage === "readme" && (
+      {inspectorPage === "paper" && (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <ReadmeView panelMode />
+          <ReadmeView panelMode refreshNonce={paperRefreshNonce} />
         </div>
       )}
 

@@ -50,7 +50,7 @@ export function BrainTable({
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border bg-surface px-3 py-2">
+      <header className="flex shrink-0 items-center gap-2 border-b border-border/60 bg-background px-3 py-2">
         <div className="relative flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
@@ -136,7 +136,7 @@ function TableHeader() {
   return (
     <div
       role="row"
-      className="sticky top-0 z-10 grid grid-cols-[110px_90px_1fr_180px_90px] items-center gap-3 border-b border-border bg-surface px-3 py-2 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground"
+      className="sticky top-0 z-10 grid grid-cols-[110px_90px_1fr_180px_90px] items-center gap-3 border-b border-border/60 bg-background px-3 py-2 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground"
     >
       <span>Claim ID</span>
       <span>Tier</span>

@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useApp } from "@/store/app";
 import {
   type AuthState,
   type CloudStatusEventPayload,
@@ -111,6 +112,7 @@ export function CloudPanel() {
             auth: {
               signed_in: true,
               handle: p.handle,
+              display_name: p.display_name,
               tier: p.tier,
               credits_remaining: p.credits_remaining,
               credits_total: p.credits_total,
@@ -184,6 +186,12 @@ export function CloudPanel() {
         )}
         <Button onClick={() => cloudLoginStart()} className="gap-2">
           <LogIn className="h-4 w-4" /> Sign in to ThinkingRoot Cloud
+        </Button>
+        <Button
+          variant="outline"
+          onClick={() => useApp.getState().setShowWelcomeScreen(true)}
+        >
+          Preview login page (dev)
         </Button>
       </section>
     );

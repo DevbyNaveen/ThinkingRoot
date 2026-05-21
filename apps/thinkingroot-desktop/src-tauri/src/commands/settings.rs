@@ -545,6 +545,79 @@ pub fn workspace_llm_write(args: WorkspaceLlmWriteArgs) -> Result<String, String
     Ok(cfg_path.to_string_lossy().into_owned())
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceCompilationConfig {
+    pub workspace_path: Option<String>,
+    pub config_exists: bool,
+    /// When true, the daemon recompiles after debounced source edits.
+    pub auto_sync: bool,
+}
+
+#[tauri::command]
+pub fn workspace_compilation_config(
+    workspace_path: String,
+) -> Result<WorkspaceCompilationConfig, String> {
+    let root = ensure_registered_workspace(&workspace_path)?;
+    let cfg_path = root.join(".thinkingroot").join("config.toml");
+    if !cfg_path.exists() {
+        return Ok(WorkspaceCompilationConfig {
+            workspace_path: Some(workspace_path),
+            config_exists: false,
+            auto_sync: true,
+        });
+    }
+    let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+    let parsed: toml::Value = toml::from_str(&raw).map_err(|e| e.to_string())?;
+    let auto_sync = parsed
+        .get("compilation")
+        .and_then(|t| t.get("auto_sync"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    Ok(WorkspaceCompilationConfig {
+        workspace_path: Some(workspace_path),
+        config_exists: true,
+        auto_sync,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceCompilationWriteArgs {
+    pub workspace_path: String,
+    pub auto_sync: bool,
+}
+
+#[tauri::command]
+pub fn workspace_compilation_write(args: WorkspaceCompilationWriteArgs) -> Result<String, String> {
+    let root = ensure_registered_workspace(&args.workspace_path)?;
+    let cfg_path = root.join(".thinkingroot").join("config.toml");
+
+    let mut doc: toml::Table = if cfg_path.exists() {
+        let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+        toml::from_str(&raw).map_err(|e| e.to_string())?
+    } else {
+        toml::Table::new()
+    };
+
+    let compilation = doc
+        .entry("compilation".to_string())
+        .or_insert_with(|| Value::Table(toml::Table::new()));
+    if let Value::Table(t) = compilation {
+        t.insert(
+            "auto_sync".to_string(),
+            Value::Boolean(args.auto_sync),
+        );
+    }
+
+    let serialized = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = cfg_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, serialized).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &cfg_path).map_err(|e| e.to_string())?;
+    Ok(cfg_path.to_string_lossy().into_owned())
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────

@@ -11,9 +11,19 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
+  authState,
+  cloudLoginStart,
+  CLOUD_STATUS_EVENT,
   getSetupCompleteAt,
+  listProviders,
   markSetupComplete,
+  providerFetchModels,
+  providerSave,
+  providerValidateKey,
   resetCircuitBreaker,
+  type AuthState,
+  type CloudStatusEventPayload,
+  type ProviderInfo,
 } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 
@@ -841,7 +851,12 @@ function WizardPanel({
           {report && setupChecks.length > 0 && (
             <ol className="flex flex-col gap-3">
               {setupChecks.map((c, idx) => (
-                <WizardStepRow key={c.id} step={idx + 1} check={c} />
+                <WizardStepRow
+                  key={c.id}
+                  step={idx + 1}
+                  check={c}
+                  onRecheck={onRecheck}
+                />
               ))}
             </ol>
           )}
@@ -916,6 +931,7 @@ function WizardPanel({
 interface WizardStepRowProps {
   step: number;
   check: CheckResult;
+  onRecheck: () => void;
 }
 
 /** A single numbered wizard step. Renders one of three states:
@@ -924,7 +940,7 @@ interface WizardStepRowProps {
  *              provider key", "Choose a workspace", etc.)
  *  - warn /
  *    skipped → numbered circle, no action, informational only. */
-function WizardStepRow({ step, check }: WizardStepRowProps) {
+function WizardStepRow({ step, check, onRecheck }: WizardStepRowProps) {
   const isDone = check.status === "ok";
   const isFail = check.status === "fail";
 
@@ -955,7 +971,9 @@ function WizardStepRow({ step, check }: WizardStepRowProps) {
             {check.detail}
           </div>
         )}
-        {isFail && check.fix && <WizardFixHint check={check} />}
+        {isFail && check.fix && (
+          <WizardFixHint check={check} onRecheck={onRecheck} />
+        )}
       </div>
     </li>
   );
@@ -965,8 +983,16 @@ function WizardStepRow({ step, check }: WizardStepRowProps) {
  *  id family into a user-facing action label without inventing
  *  capabilities the engine doesn't have — actual remediation still
  *  goes through the existing fix kinds (shell-hint / run-command /
- *  fill-in). */
-function WizardFixHint({ check }: { check: CheckResult }) {
+ *  fill-in). The credentials family additionally gets an inline BYOK
+ *  picker (provider → paste key → validate → pick model) so the user
+ *  never has to leave the wizard for first-launch setup. */
+function WizardFixHint({
+  check,
+  onRecheck,
+}: {
+  check: CheckResult;
+  onRecheck: () => void;
+}) {
   const fix = check.fix!;
   const actionLabel = wizardActionLabel(check.id);
 
@@ -990,7 +1016,12 @@ function WizardFixHint({ check }: { check: CheckResult }) {
       </p>
     );
   }
-  // fill-in — credential the user must paste in.
+  // fill-in — credential the user must paste in. For credentials.*
+  // checks we render the inline BYOK picker; other fill-in families
+  // (none today, future-proofing only) keep the legacy hint text.
+  if (check.id.startsWith("credentials.")) {
+    return <ByokPicker onSaved={onRecheck} />;
+  }
   return (
     <p className="mt-2 text-[11px] text-muted-foreground">
       {fix.prompt}{" "}
@@ -998,6 +1029,297 @@ function WizardFixHint({ check }: { check: CheckResult }) {
         ({fix.credential_key})
       </code>
     </p>
+  );
+}
+
+/** Inline BYOK picker — provider dropdown → paste key → validate +
+ *  fetch live models → pick default model → save. On success, fires
+ *  `onSaved` so the wizard re-runs the doctor check and the credentials
+ *  step flips from failed to done.
+ *
+ *  Architecture intentionally small: no Redux/Zustand, no React Query.
+ *  Three Tauri commands, three local states (key, models, picked),
+ *  one save action. Errors are surfaced inline; nothing is fabricated
+ *  if validation fails. */
+function ByokPicker({ onSaved }: { onSaved: () => void }) {
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [providerId, setProviderId] = useState<string>("openrouter");
+  const [apiKey, setApiKey] = useState<string>("");
+  const [models, setModels] = useState<string[] | null>(null);
+  const [pickedModel, setPickedModel] = useState<string>("");
+  const [busy, setBusy] = useState<"idle" | "validating" | "saving" | "signing-in">(
+    "idle",
+  );
+  const [error, setError] = useState<string | null>(null);
+  // Cloud auth state — only populated when the user picks the
+  // managed-cloud provider. `null` = not yet probed; the picker
+  // hydrates on provider change so other providers don't pay the
+  // round-trip.
+  const [cloudAuth, setCloudAuth] = useState<AuthState | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    listProviders()
+      .then((list) => {
+        if (cancelled) return;
+        setProviders(list);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(`Failed to load providers: ${e}`);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const provider = providers.find((p) => p.id === providerId);
+  const isCloud = provider?.id === "thinkingroot-cloud";
+  const cloudSignedIn = cloudAuth?.signed_in === true;
+  const keyNeeded = !isCloud && (provider?.requires_key ?? true);
+
+  // Hydrate + watch cloud auth state when the cloud provider is
+  // picked. Subscribes to the `cloud_status_changed` event so signing
+  // in via the browser flow auto-advances the wizard without the user
+  // needing to click anything else.
+  useEffect(() => {
+    if (!isCloud) return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    authState()
+      .then((s) => {
+        if (!cancelled) setCloudAuth(s);
+      })
+      .catch(() => {
+        if (!cancelled) setCloudAuth({ signed_in: false, server: "" });
+      });
+    listen<CloudStatusEventPayload>(CLOUD_STATUS_EVENT, (ev) => {
+      if (cancelled) return;
+      if (ev.payload.status === "signed_in") {
+        authState().then((s) => {
+          if (!cancelled) {
+            setCloudAuth(s);
+            setBusy("idle");
+            setError(null);
+          }
+        });
+      } else if (ev.payload.status === "signed_out") {
+        setCloudAuth({ signed_in: false, server: cloudAuth?.server ?? "" });
+        setBusy("idle");
+      } else if (ev.payload.status === "login_failed") {
+        setBusy("idle");
+        setError(`Sign-in failed: ${ev.payload.reason}`);
+      }
+    }).then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [isCloud]); // intentionally only re-fires on provider change
+
+  const canValidate =
+    !!provider &&
+    (isCloud
+      ? cloudSignedIn
+      : !keyNeeded || apiKey.trim().length >= 8);
+
+  const handleValidate = async () => {
+    if (!provider) return;
+    setBusy("validating");
+    setError(null);
+    setModels(null);
+    setPickedModel("");
+    try {
+      await providerValidateKey(provider.id, apiKey);
+      const fetched = await providerFetchModels(provider.id, apiKey);
+      setModels(fetched);
+      const first = fetched[0];
+      if (first) setPickedModel(first);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
+  const handleSave = async () => {
+    if (!provider) return;
+    const model = pickedModel.trim();
+    if (!model) {
+      setError("Pick a model or enter one manually.");
+      return;
+    }
+    setBusy("saving");
+    setError(null);
+    try {
+      await providerSave(provider.id, apiKey, model);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
+  return (
+    <div className="mt-3 flex flex-col gap-2 rounded-md border border-border bg-background/40 p-3">
+      <div className="grid grid-cols-[110px_1fr] items-center gap-2 text-[11px]">
+        <label className="font-medium text-foreground">Provider</label>
+        <select
+          value={providerId}
+          onChange={(e) => {
+            setProviderId(e.target.value);
+            setApiKey("");
+            setModels(null);
+            setPickedModel("");
+            setError(null);
+          }}
+          disabled={busy !== "idle" || providers.length === 0}
+          className="h-7 rounded border border-border bg-surface px-2 text-[11px]"
+        >
+          {providers.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+
+        {keyNeeded && (
+          <>
+            <label className="font-medium text-foreground">API key</label>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={provider?.default_env ?? "paste key…"}
+              disabled={busy !== "idle"}
+              className="h-7 rounded border border-border bg-surface px-2 font-mono text-[11px]"
+            />
+          </>
+        )}
+
+        {isCloud && (
+          <>
+            <label className="font-medium text-foreground">Account</label>
+            <div className="flex items-center gap-2 text-[11px]">
+              {cloudSignedIn ? (
+                <span className="rounded border border-success/40 bg-success/10 px-2 py-0.5 font-mono text-success">
+                  ✓ @{cloudAuth?.handle ?? "you"}
+                  {cloudAuth?.tier ? ` · ${cloudAuth.tier}` : ""}
+                </span>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={async () => {
+                    setBusy("signing-in");
+                    setError(null);
+                    try {
+                      await cloudLoginStart();
+                      // Listener wires the rest — we just opened the
+                      // browser tab. busy clears on `signed_in` event.
+                    } catch (e) {
+                      setBusy("idle");
+                      setError(e instanceof Error ? e.message : String(e));
+                    }
+                  }}
+                  disabled={busy !== "idle"}
+                  className="h-7 text-[11px]"
+                >
+                  {busy === "signing-in" ? (
+                    <>
+                      <Loader2 className="size-3 animate-spin" />
+                      Waiting for browser…
+                    </>
+                  ) : (
+                    "Sign in to ThinkingRoot"
+                  )}
+                </Button>
+              )}
+            </div>
+          </>
+        )}
+
+        {models && models.length > 0 && (
+          <>
+            <label className="font-medium text-foreground">Model</label>
+            <select
+              value={pickedModel}
+              onChange={(e) => setPickedModel(e.target.value)}
+              disabled={busy !== "idle"}
+              className="h-7 rounded border border-border bg-surface px-2 text-[11px]"
+            >
+              {models.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+
+        {models && models.length === 0 && (
+          <>
+            <label className="font-medium text-foreground">Model</label>
+            <input
+              type="text"
+              value={pickedModel}
+              onChange={(e) => setPickedModel(e.target.value)}
+              placeholder="model id (e.g. gpt-4o-mini)"
+              disabled={busy !== "idle"}
+              className="h-7 rounded border border-border bg-surface px-2 font-mono text-[11px]"
+            />
+          </>
+        )}
+      </div>
+
+      {error && (
+        <div className="rounded border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
+          {error}
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-2">
+        {!models && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleValidate}
+            disabled={!canValidate || busy !== "idle"}
+            className="h-7 text-[11px]"
+          >
+            {busy === "validating" ? (
+              <>
+                <Loader2 className="size-3 animate-spin" />
+                Validating…
+              </>
+            ) : (
+              "Validate key"
+            )}
+          </Button>
+        )}
+        {models && (
+          <Button
+            size="sm"
+            onClick={handleSave}
+            disabled={busy !== "idle" || !pickedModel.trim()}
+            className="h-7 text-[11px]"
+          >
+            {busy === "saving" ? (
+              <>
+                <Loader2 className="size-3 animate-spin" />
+                Saving…
+              </>
+            ) : (
+              "Save & continue"
+            )}
+          </Button>
+        )}
+      </div>
+    </div>
   );
 }
 

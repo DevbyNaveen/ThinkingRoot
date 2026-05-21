@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
-use thinkingroot_cloud_auth::auth_flow::{run_browser_login, Surface};
+use thinkingroot_cloud_auth::auth_flow::{run_browser_login_deeplink, Surface};
 use thinkingroot_cloud_auth::config::Config;
 use thinkingroot_cloud_auth::{config, me, CloudError};
 use tokio::sync::Mutex;
@@ -29,6 +29,7 @@ const EVENT_CLOUD_STATUS_CHANGED: &str = "cloud_status_changed";
 pub struct AuthState {
     pub signed_in: bool,
     pub handle: Option<String>,
+    pub display_name: Option<String>,
     pub tier: Option<String>,
     pub credits_remaining: Option<u64>,
     pub credits_total: Option<u64>,
@@ -55,6 +56,7 @@ impl From<Config> for AuthState {
         Self {
             signed_in: c.is_signed_in(),
             handle: c.handle.clone(),
+            display_name: c.display_name.clone(),
             tier: c.tier.clone(),
             credits_remaining: c.credits_remaining,
             credits_total: c.credits_total,
@@ -118,7 +120,7 @@ pub async fn cloud_login_start(
     let state_for_task = state.inner().clone();
     let cancel_for_task = cancel.clone();
     tokio::spawn(async move {
-        let outcome = run_browser_login(&server, Surface::Desktop, cancel_for_task).await;
+        let outcome = run_browser_login_deeplink(&server, Surface::Desktop, cancel_for_task).await;
         // Clear the in-flight slot regardless of outcome.
         {
             let mut guard = state_for_task.lock().await;
@@ -132,6 +134,7 @@ pub async fn cloud_login_start(
                     serde_json::json!({
                         "status": "signed_in",
                         "handle": o.handle,
+                        "display_name": cfg.display_name,
                         "tier": o.tier,
                         "credits_remaining": cfg.credits_remaining.unwrap_or(0),
                         "credits_total": cfg.credits_total.unwrap_or(0),
@@ -196,6 +199,7 @@ pub async fn cloud_refresh_me(app: AppHandle) -> Result<AuthState, String> {
             config::update(|c| {
                 c.user_id = Some(me_resp.user.id.clone());
                 c.handle = Some(me_resp.user.handle.clone());
+                c.display_name = me_resp.user.display_name.clone();
                 c.tier = Some(me_resp.user.tier.clone());
                 c.credit_period_end = Some(me_resp.credit_period_end);
                 c.token_expires_at = Some(me_resp.token_expires_at);

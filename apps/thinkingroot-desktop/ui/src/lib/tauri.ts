@@ -160,6 +160,68 @@ export async function credentialsRemove(envVar: string): Promise<void> {
   return invoke<void>("credentials_remove", { args: { env_var: envVar } });
 }
 
+// ─── BYOK wizard (provider catalog + paste-key flow) ─────────────────
+//
+// Backs the inline form in `EngineGate.tsx::WizardFixHint`. The catalog
+// mirrors `commands::providers::PROVIDERS` server-side. `validateKey`
+// + `fetchModels` are network-bound; `saveProvider` is local I/O.
+
+export interface ProviderInfo {
+  id: string;
+  label: string;
+  default_env: string;
+  base_url: string | null;
+  validate_url: string | null;
+  requires_key: boolean;
+}
+
+export async function listProviders(): Promise<ProviderInfo[]> {
+  return invoke<ProviderInfo[]>("list_providers");
+}
+
+export async function providerValidateKey(
+  providerId: string,
+  apiKey: string,
+): Promise<void> {
+  return invoke<void>("provider_validate_key", {
+    args: { provider_id: providerId, api_key: apiKey },
+  });
+}
+
+export async function providerFetchModels(
+  providerId: string,
+  apiKey: string,
+): Promise<string[]> {
+  return invoke<string[]>("provider_fetch_models", {
+    args: { provider_id: providerId, api_key: apiKey },
+  });
+}
+
+/** List models for a provider using on-disk credentials / cloud session. */
+export async function providerFetchModelsStored(
+  providerId: string,
+): Promise<string[]> {
+  return invoke<string[]>("provider_fetch_models_stored", { providerId });
+}
+
+export async function providerSetActiveModel(model: string): Promise<void> {
+  return invoke<void>("provider_set_active_model", { model });
+}
+
+export async function providerSave(
+  providerId: string,
+  apiKey: string,
+  defaultModel: string,
+): Promise<void> {
+  return invoke<void>("provider_save", {
+    args: {
+      provider_id: providerId,
+      api_key: apiKey,
+      default_model: defaultModel,
+    },
+  });
+}
+
 // ─── First-run setup (install manifest `setup_complete_at`) ──────────
 //
 // Mirrors `get_setup_complete_at` / `mark_setup_complete` in
@@ -503,17 +565,6 @@ export interface CompileStatus {
 /** Snapshot whether a compile is currently running (and for which workspace). */
 export async function workspaceCompileStatus(): Promise<CompileStatus> {
   return invoke<CompileStatus>("workspace_compile_status");
-}
-
-/**
- * Fetch the engine-canonical workspace README markdown — the contents of
- * `<workspace>/.thinkingroot/README.md`, auto-synthesised by Phase 10 of
- * the compile pipeline. Returns an empty string when the workspace has
- * not been compiled yet (the UI renders an empty-state message rather
- * than a fabricated placeholder).
- */
-export async function workspaceReadme(): Promise<string> {
-  return invoke<string>("workspace_readme");
 }
 
 /**
@@ -1106,6 +1157,27 @@ export async function workspaceLlmWrite(
   return invoke<string>("workspace_llm_write", { args });
 }
 
+export interface WorkspaceCompilationConfig {
+  workspace_path: string | null;
+  config_exists: boolean;
+  auto_sync: boolean;
+}
+
+export async function workspaceCompilationConfig(
+  workspacePath: string,
+): Promise<WorkspaceCompilationConfig> {
+  return invoke<WorkspaceCompilationConfig>("workspace_compilation_config", {
+    workspacePath,
+  });
+}
+
+export async function workspaceCompilationWrite(args: {
+  workspace_path: string;
+  auto_sync: boolean;
+}): Promise<string> {
+  return invoke<string>("workspace_compilation_write", { args });
+}
+
 // ─── Branch slash commands ───────────────────────────────────────────
 
 export interface BranchView {
@@ -1618,6 +1690,7 @@ export async function engramExpire(args: {
 export interface AuthState {
   signed_in: boolean;
   handle?: string | null;
+  display_name?: string | null;
   tier?: string | null;
   credits_remaining?: number | null;
   credits_total?: number | null;
@@ -1639,6 +1712,7 @@ export type CloudStatusEventPayload =
   | {
       status: "signed_in";
       handle: string;
+      display_name?: string | null;
       tier: "free" | "pro";
       credits_remaining: number;
       credits_total: number;

@@ -340,16 +340,16 @@ export function buildCatalog(ctx: CommandContext): CommandDef[] {
       },
     },
     {
-      id: "readme-open",
-      label: "Open workspace readme",
+      id: "paper-open",
+      label: "Open Living Paper",
       group: "Tools",
       Icon: BookOpen,
-      keywords: ["readme", "markdown", "overview", "docs", "workspace"],
+      keywords: ["paper", "living paper", "mermaid", "diagram", "overview", "docs", "workspace"],
       run: (c) => {
         const app = useApp.getState();
         app.setRightRailOpen(true);
         app.setRightRailTab("files");
-        app.setWorkspaceInspectorPage("readme");
+        app.setWorkspaceInspectorPage("paper");
         c.close();
       },
     },

@@ -41,6 +41,12 @@ pub fn run() {
         // release. Verified against the public key pinned in
         // tauri.conf.json. See commands::updater::check_for_updates.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Deep-link plugin — registers the `thinkingroot://` URL
+        // scheme with the OS (Info.plist on macOS, Registry on
+        // Windows, .desktop on Linux). The handler in the setup
+        // closure below routes incoming URLs through the cloud-auth
+        // deep_link_bus so an in-flight browser-login can resume.
+        .plugin(tauri_plugin_deep_link::init())
         .manage::<commands::cloud::LoginInFlightState>(std::sync::Arc::new(
             tokio::sync::Mutex::new(commands::cloud::LoginInFlight::default()),
         ))
@@ -93,6 +99,37 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 commands::updater::check_for_updates(handle).await;
+            });
+
+            // Deep-link handler. Every `thinkingroot://signed-in?...`
+            // URL the OS hands us flows through cloud_auth's parser
+            // and bus. Drop URLs we don't recognise.
+            use tauri_plugin_deep_link::DeepLinkExt;
+            app.deep_link().on_open_url(|event| {
+                for url in event.urls() {
+                    let url_str = url.to_string();
+                    match thinkingroot_cloud_auth::auth_flow::parse_deep_link_callback(
+                        &url_str,
+                    ) {
+                        Some((state, callback)) => {
+                            let outcome =
+                                thinkingroot_cloud_auth::deep_link_bus::deliver(
+                                    &state, callback,
+                                );
+                            tracing::info!(
+                                target: "deep_link",
+                                ?outcome,
+                                "received {url_str}"
+                            );
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "deep_link",
+                                "ignoring unrecognised URL: {url_str}"
+                            );
+                        }
+                    }
+                }
             });
 
             Ok(())
@@ -154,6 +191,8 @@ pub fn run() {
             commands::settings::credentials_remove,
             commands::settings::mark_setup_complete,
             commands::settings::workspace_llm_config,
+            commands::settings::workspace_compilation_config,
+            commands::settings::workspace_compilation_write,
             commands::settings::workspace_llm_write,
             commands::workspaces::workspace_list,
             commands::workspaces::workspace_add,
@@ -162,7 +201,6 @@ pub fn run() {
             commands::workspaces::workspace_compile,
             commands::workspaces::workspace_compile_stop,
             commands::workspaces::workspace_compile_status,
-            commands::workspaces::workspace_readme,
             commands::fs::fs_list_dir,
             commands::fs::fs_read_text,
             commands::git::git_branches,
@@ -220,6 +258,12 @@ pub fn run() {
             commands::proposal::proposal_list,
             commands::proposal::proposal_review,
             commands::proposal::proposal_close,
+            commands::providers::list_providers,
+            commands::providers::provider_validate_key,
+            commands::providers::provider_fetch_models,
+            commands::providers::provider_fetch_models_stored,
+            commands::providers::provider_set_active_model,
+            commands::providers::provider_save,
             commands::recovery::get_circuit_breaker_status,
             commands::recovery::reset_circuit_breaker,
             commands::brain::brain_brief,

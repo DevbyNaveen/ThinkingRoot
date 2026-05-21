@@ -97,8 +97,8 @@ function FolderNode({
         type="button"
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          "flex w-full items-center gap-1 rounded-sm px-1 py-[2px] text-left transition-colors",
-          "hover:bg-muted/60",
+          "flex w-full items-center gap-1 rounded-[1px] px-1 py-[2px] text-left transition-colors",
+          "hover:bg-muted/50",
         )}
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
       >
@@ -178,8 +178,10 @@ function FileNode({
       type="button"
       onClick={() => onSelect?.(entry)}
       className={cn(
-        "flex w-full items-center gap-1 rounded-sm px-1 py-[2px] text-left transition-colors",
-        selected ? "bg-accent/15 text-accent" : "hover:bg-muted/60 text-foreground",
+        "flex w-full items-center gap-1 rounded-[1px] px-1 py-[2px] text-left transition-colors",
+        selected
+          ? "bg-muted/55 text-foreground"
+          : "text-foreground hover:bg-muted/50",
       )}
       style={{ paddingLeft: `${depth * 12 + 6 + 12}px` }}
       title={entry.path}
@@ -187,7 +189,7 @@ function FileNode({
       <Icon
         className={cn(
           "size-3.5 shrink-0",
-          selected ? "text-accent" : "text-muted-foreground",
+          selected ? "text-foreground" : "text-muted-foreground",
         )}
       />
       <span className="min-w-0 truncate">{entry.name}</span>

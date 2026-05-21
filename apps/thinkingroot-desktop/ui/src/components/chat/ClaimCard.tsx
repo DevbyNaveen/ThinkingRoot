@@ -34,10 +34,21 @@ import { cn } from "@/lib/utils";
 import { chatApprove } from "@/lib/tauri";
 import { toast } from "@/store/toast";
 import type { AgentStep } from "@/types";
+import { ToolStepOutput } from "./ToolStepOutput";
+import {
+  extractShellCommand,
+  friendlyToolTitle,
+  isShellTool,
+  isThinkTool,
+  shouldDefaultExpandStep,
+  stepActivityLabel,
+} from "./tool-step-present";
 
 interface ClaimCardProps {
   step: AgentStep;
   workspace: string;
+  /** Open details when embedded from the flight path. */
+  startExpanded?: boolean;
 }
 
 /**
@@ -93,31 +104,22 @@ function ThoughtBlock({ step }: { step: AgentStep }) {
   );
 }
 
-export function ClaimCard({ step, workspace }: ClaimCardProps) {
+export function ClaimCard({ step, workspace, startExpanded }: ClaimCardProps) {
   const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectInput, setShowRejectInput] = useState(false);
-  // SOTA Ship B (2026-05-18): Read tools collapse to a one-line
-  // summary by default ("Searched X"); write tools auto-expand so
-  // the user can review what's about to change BEFORE clicking
-  // approve. Awaiting-approval cards always start expanded too —
-  // the user needs to see what they're consenting to.
-  const initialExpanded =
-    step.isWrite || step.status === "awaiting_approval";
+  const initialExpanded = startExpanded ?? shouldDefaultExpandStep(step);
   const [expanded, setExpanded] = useState(initialExpanded);
 
-  // SOTA polish ship: special-case the `think` tool render as a
-  // compact "Thought ▸" block. Must come AFTER the hook calls
-  // above to honour React's rules-of-hooks (consistent hook order
-  // across renders).
-  if (step.name === "think") {
+  if (isThinkTool(step.name)) {
     return <ThoughtBlock step={step} />;
   }
 
   const hasInput = !!step.input && step.input !== "{}";
   const hasOutput = !!step.output || !!step.progress;
   const hasDetails = hasInput || hasOutput;
-  const friendlyName = getFriendlyStepName(step.name);
+  const friendlyName = friendlyToolTitle(step.name);
+  const collapsedHint = stepActivityLabel(step);
 
   const onApprove = async () => {
     if (busy) return;
@@ -159,29 +161,39 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-border/60 bg-background/30 px-2.5 py-2 text-sm transition-colors",
-        step.status === "finished" && !step.isError && "border-emerald-500/30",
+        "rounded-lg border border-border/45 bg-background/25 text-sm transition-colors",
+        expanded ? "px-2.5 py-2" : "px-2.5 py-1.5",
+        step.status === "finished" && !step.isError && "border-emerald-500/25",
         (step.status === "rejected" || (step.status === "finished" && step.isError)) &&
           "border-destructive/40",
       )}
     >
-      <div className="flex items-center gap-2">
+      <div className="flex min-w-0 items-center gap-2">
         <StatusIcon status={step.status} isError={step.isError} />
-        <span className="text-xs font-medium text-foreground">{friendlyName}</span>
+        <span className="shrink-0 text-xs font-medium text-foreground">
+          {friendlyName}
+        </span>
         <span className="text-[10px] text-muted-foreground">{statusText(step.status)}</span>
         {step.isWrite && (
-          <span className="ml-auto rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-amber-700 dark:text-amber-300">
+          <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-amber-700 dark:text-amber-300">
             write
           </span>
+        )}
+        {!expanded && hasDetails ? (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground/75">
+            {collapsedHint}
+          </span>
+        ) : (
+          <span className="flex-1" />
         )}
         {hasDetails && (
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="ml-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           >
             {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            {expanded ? "Hide details" : "Show details"}
+            {expanded ? "Hide" : "Details"}
           </button>
         )}
       </div>
@@ -256,34 +268,24 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
       {expanded && (
         <div className="mt-2 space-y-2">
           {hasInput && (
-            <WriteToolInputView input={step.input} isWrite={step.isWrite} />
+            <ToolStepInputView
+              input={step.input}
+              isWrite={step.isWrite}
+              toolName={step.name}
+            />
           )}
-          {/* SOTA polish ship: show live progress (tool_call_progress
-              deltas) BEFORE final output arrives, so long-running
-              tools don't look frozen. Replaced by `output` once
-              tool_call_finished fires. */}
           {step.status === "executing" && step.progress && (
-            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-background/60 p-2 font-mono text-[11px] leading-snug text-muted-foreground">
-              {step.progress}
-              <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-muted-foreground/40 align-middle" aria-hidden />
+            <div className="space-y-1">
+              <ToolStepOutput step={step} live />
               {typeof step.progressBytes === "number" && step.progressBytes > 0 && (
-                <span className="ml-2 text-muted-foreground/60">
-                  {humanBytes(step.progressBytes)}
+                <span className="text-[10px] text-muted-foreground/60">
+                  {humanBytes(step.progressBytes)} streamed
                 </span>
               )}
-            </pre>
+            </div>
           )}
           {step.status === "finished" && step.output && (
-            <pre
-              className={cn(
-                "overflow-x-auto whitespace-pre-wrap break-words rounded p-2 font-mono text-[11px] leading-snug",
-                step.isError
-                  ? "bg-destructive/10 text-destructive"
-                  : "bg-background/60 text-muted-foreground",
-              )}
-            >
-              {step.output}
-            </pre>
+            <ToolStepOutput step={step} />
           )}
         </div>
       )}
@@ -299,13 +301,31 @@ export function ClaimCard({ step, workspace }: ClaimCardProps) {
  * use a quieter monospaced render since the args are usually a
  * short query string.
  */
-function WriteToolInputView({
+function ToolStepInputView({
   input,
   isWrite,
+  toolName,
 }: {
   input: string;
   isWrite: boolean;
+  toolName: string;
 }) {
+  if (isShellTool(toolName)) {
+    const command = extractShellCommand(input);
+    if (command) {
+      return (
+        <div className="rounded-md border border-border/40 bg-background/50 px-2.5 py-2">
+          <p className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+            Command
+          </p>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-foreground/90">
+            {command}
+          </pre>
+        </div>
+      );
+    }
+  }
+
   let parsed: Record<string, unknown> | null = null;
   try {
     const v = JSON.parse(input);
@@ -396,16 +416,6 @@ function statusText(status: AgentStep["status"]): string {
     case "rejected":
       return "rejected";
   }
-}
-
-function getFriendlyStepName(name: string): string {
-  const n = name.toLowerCase();
-  if (n.includes("witness")) return "Checking witnesses";
-  if (n.includes("relation") || n.includes("graph")) return "Reading graph context";
-  if (n.includes("search") || n.includes("query")) return "Searching knowledge base";
-  if (n.includes("claim") || n.includes("read")) return "Reading relevant claims";
-  if (n.includes("summar") || n.includes("synth")) return "Composing answer";
-  return name.replace(/_/g, " ");
 }
 
 function StatusIcon({

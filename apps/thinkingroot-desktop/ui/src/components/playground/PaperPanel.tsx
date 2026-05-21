@@ -7,6 +7,7 @@ import {
   type PaperPayload,
 } from "@/lib/tauri";
 import { ChatMarkdown } from "@/components/chat/ChatMarkdown";
+import { splitPaperFrontmatter } from "@/lib/paper-frontmatter";
 import { cn } from "@/lib/utils";
 
 /**
@@ -77,9 +78,10 @@ export function PaperPanel({
     }
   }, [workspace, regenerating]);
 
-  const { frontmatter, body } = useMemo(() => splitFrontmatter(payload?.markdown), [
-    payload?.markdown,
-  ]);
+  const { frontmatter, body } = useMemo(
+    () => splitPaperFrontmatter(payload?.markdown),
+    [payload?.markdown],
+  );
 
   if (!workspace) {
     return (
@@ -164,46 +166,6 @@ export function PaperPanel({
       </div>
     </div>
   );
-}
-
-interface FrontmatterPreview {
-  workspace?: string;
-  witness_count?: number;
-  source_count?: number;
-}
-
-/** Split a `paper.md` body at the YAML frontmatter fence. Returns
- * `{ frontmatter, body }` where `frontmatter` is parsed best-effort
- * for the header strip and `body` is the renderable markdown. */
-function splitFrontmatter(
-  markdown: string | undefined,
-): { frontmatter: FrontmatterPreview | null; body: string } {
-  if (!markdown) return { frontmatter: null, body: "" };
-  if (!markdown.startsWith("---\n")) {
-    return { frontmatter: null, body: markdown };
-  }
-  const rest = markdown.slice(4);
-  const endIdx = rest.indexOf("\n---");
-  if (endIdx < 0) return { frontmatter: null, body: markdown };
-  const fmYaml = rest.slice(0, endIdx);
-  // Crude key extraction — we don't pull in a YAML parser just to
-  // surface two integers in the header strip. The full machine-
-  // readable spine is available to AI agents that parse the file
-  // directly.
-  const fm: FrontmatterPreview = {};
-  for (const line of fmYaml.split("\n")) {
-    const m = line.match(/^([a-z_]+):\s*(.*)$/);
-    if (!m) continue;
-    const key = m[1] ?? "";
-    const value = (m[2] ?? "").trim();
-    if (key === "workspace") fm.workspace = value;
-    else if (key === "witness_count") fm.witness_count = parseInt(value, 10);
-    else if (key === "source_count") fm.source_count = parseInt(value, 10);
-  }
-  const bodyStart = endIdx + 4; // skip "\n---"
-  const newline = rest.indexOf("\n", bodyStart);
-  const body = newline >= 0 ? rest.slice(newline + 1).trimStart() : "";
-  return { frontmatter: fm, body };
 }
 
 function EmptyState({

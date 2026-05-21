@@ -7,7 +7,7 @@
 
 [package]
 name = "thinkingroot-desktop-app"
-version = "0.1.0"
+version = "0.9.3"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -44,6 +44,12 @@ tauri-plugin-window-state = "2"
 # verifies via the public key pinned in tauri.conf.json, and
 # installs over the running .app/.exe/.AppImage at quit.
 tauri-plugin-updater = "2"
+# Deep-link plugin: register the `thinkingroot://` URL scheme with
+# the OS (Info.plist on macOS, Registry on Windows, .desktop on
+# Linux). The browser-login callback fires `thinkingroot://signed-in?...`
+# which the OS routes to the app — same UX pattern as Cursor /
+# Antigravity / VS Code Insiders.
+tauri-plugin-deep-link = "2"
 
 # OSS engine path-deps reaching into the parent workspace. The
 # desktop talks directly to the engine's QueryEngine — no helloroot

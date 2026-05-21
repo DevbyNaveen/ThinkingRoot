@@ -217,6 +217,199 @@
     }
   }
 
+  /* Agent HUD — one phase row + one changing hop line (sources count). */
+  .agent-hud {
+    margin-top: 0.15rem;
+    padding: 0.1rem 0 0.25rem;
+  }
+
+  .agent-hud__row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-height: 1.75rem;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    color: hsl(var(--muted-foreground) / 0.92);
+  }
+
+  .agent-hud__phase {
+    color: hsl(var(--foreground) / 0.84);
+  }
+
+  .agent-hud__count {
+    font-size: 11px;
+    font-weight: 500;
+    color: hsl(var(--muted-foreground) / 0.62);
+  }
+
+  .agent-hud__count-num {
+    color: hsl(var(--foreground) / 0.78);
+  }
+
+  .agent-hud__count-sep {
+    margin: 0 0.05em;
+    color: hsl(var(--muted-foreground) / 0.4);
+  }
+
+  .agent-hud__count-label {
+    font-weight: 400;
+    color: hsl(var(--muted-foreground) / 0.55);
+  }
+
+  .agent-hud__hop {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    margin: 0.1rem 0 0 1.65rem;
+    min-height: 1.25rem;
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 11px;
+    line-height: 1.4;
+    color: hsl(var(--muted-foreground) / 0.72);
+    transition: opacity 0.2s ease;
+  }
+
+  .agent-hud__hop--live {
+    color: hsl(var(--foreground) / 0.82);
+  }
+
+  .agent-hud__hop-verb {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground) / 0.5);
+  }
+
+  .agent-hud__hop--live .agent-hud__hop-verb {
+    color: hsl(var(--accent) / 0.7);
+  }
+
+  .agent-hud__hop-target {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: hsl(var(--foreground) / 0.76);
+  }
+
+  .agent-hud__hop-target--pulse {
+    color: hsl(var(--foreground) / 0.95);
+    animation: agent-hud-hop-pulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes agent-hud-hop-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.38;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .agent-hud__hop-target--pulse {
+      animation: none;
+      opacity: 0.9;
+    }
+  }
+
+  /* Assistant stream — stable markdown prefix + plain tail (Cursor-style). */
+  .stream-assistant {
+    contain: layout style;
+  }
+
+  .stream-assistant__committed {
+    contain: layout style;
+  }
+
+  .stream-assistant__tail {
+    margin: 0;
+    overflow-x: auto;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 15px;
+    line-height: 1.75;
+    color: hsl(var(--foreground) / 0.9);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .stream-assistant__tail--continued {
+    margin-top: 0.15rem;
+  }
+
+  .stream-assistant__tail code {
+    font-family: inherit;
+    font-size: inherit;
+    background: transparent;
+    padding: 0;
+  }
+
+  .stream-caret {
+    display: inline-block;
+    width: 2px;
+    height: 1.05em;
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    border-radius: 1px;
+    background: hsl(var(--accent) / 0.7);
+    animation: stream-caret-blink 1.05s step-end infinite;
+  }
+
+  .stream-caret--solo {
+    margin-left: 0;
+    margin-top: 0.35rem;
+  }
+
+  @keyframes stream-caret-blink {
+    0%,
+    45% {
+      opacity: 1;
+    }
+    50%,
+    100% {
+      opacity: 0.2;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .stream-caret {
+      animation: none;
+      opacity: 0.85;
+    }
+  }
+
+  /* Permission sheet — slides up from the composer (no modal backdrop). */
+  @keyframes permission-sheet-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .permission-sheet-enter {
+    animation: permission-sheet-in 0.2s ease-out;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .permission-sheet-enter {
+      animation: none;
+    }
+  }
+
   /* Subtle surface elevation. */
   .surface {
     @apply bg-surface;

@@ -11,6 +11,8 @@ import {
   mcpGetConfigSnippet,
   mcpStatus,
   workspaceList,
+  workspaceCompilationConfig,
+  workspaceCompilationWrite,
   workspaceLlmConfig,
   workspaceLlmWrite,
   workspaceRemove,
@@ -20,6 +22,7 @@ import {
   type GlobalLlmConfig,
   type McpStatus,
   type McpToolKey,
+  type WorkspaceCompilationConfig,
   type WorkspaceLlmConfig,
   type WorkspaceView,
 } from "@/lib/tauri";
@@ -115,6 +118,8 @@ export function SettingsView() {
   const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([]);
   const [activeWorkspace, setActiveWorkspaceLocal] = useState<string | null>(null);
   const [wsLlm, setWsLlm] = useState<WorkspaceLlmConfig | null>(null);
+  const [wsCompilation, setWsCompilation] =
+    useState<WorkspaceCompilationConfig | null>(null);
   const [wsPending, setWsPending] = useState<Record<string, string>>({});
   const [globalPending, setGlobalPending] = useState<{
     default_provider?: string;
@@ -158,8 +163,14 @@ export function SettingsView() {
         }
         if (active) {
           try {
-            const llm = await workspaceLlmConfig(active.path);
-            if (!cancelled) setWsLlm(llm);
+            const [llm, compilation] = await Promise.all([
+              workspaceLlmConfig(active.path),
+              workspaceCompilationConfig(active.path),
+            ]);
+            if (!cancelled) {
+              setWsLlm(llm);
+              setWsCompilation(compilation);
+            }
           } catch {
             /* leave wsLlm null — section just hides */
           }
@@ -273,8 +284,12 @@ export function SettingsView() {
       setWorkspaces(wsRes);
       const ws = wsRes.find((w) => w.name === name);
       if (ws) {
-        const llm = await workspaceLlmConfig(ws.path);
+        const [llm, compilation] = await Promise.all([
+          workspaceLlmConfig(ws.path),
+          workspaceCompilationConfig(ws.path),
+        ]);
         setWsLlm(llm);
+        setWsCompilation(compilation);
       }
     } catch (e) {
       toast("Activate workspace failed", {
@@ -503,9 +518,68 @@ export function SettingsView() {
                   </div>
                 )}
               </SettingsGroup>
+
+              {wsCompilation && (
+                <SettingsGroup label="Live sync">
+                  <div className="flex items-start justify-between gap-4 p-4 sm:p-5">
+                    <div className="min-w-0 space-y-1">
+                      <p className="text-sm font-medium text-foreground">
+                        Auto-compile on save
+                      </p>
+                      <p className="text-[13px] leading-snug text-muted-foreground">
+                        When enabled, edits under this workspace trigger a background
+                        compile on <span className="font-mono text-xs">main</span> after a
+                        short debounce. Stored in{" "}
+                        <span className="font-mono text-xs">.thinkingroot/config.toml</span>.
+                      </p>
+                    </div>
+                    <label className="flex shrink-0 cursor-pointer items-center gap-2">
+                      <input
+                        type="checkbox"
+                        className="size-4 rounded border-border accent-primary"
+                        checked={wsCompilation.auto_sync}
+                        onChange={(e) => {
+                          const active = workspaces.find(
+                            (w) => w.name === activeWorkspace,
+                          );
+                          if (!active) return;
+                          const next = e.target.checked;
+                          void (async () => {
+                            try {
+                              await workspaceCompilationWrite({
+                                workspace_path: active.path,
+                                auto_sync: next,
+                              });
+                              setWsCompilation({
+                                ...wsCompilation,
+                                auto_sync: next,
+                                config_exists: true,
+                              });
+                              toast(
+                                next ? "Live sync enabled" : "Live sync disabled",
+                                { kind: "success" },
+                              );
+                            } catch (err) {
+                              toast("Could not update live sync", {
+                                kind: "error",
+                                body:
+                                  err instanceof Error ? err.message : String(err),
+                              });
+                            }
+                          })();
+                        }}
+                      />
+                      <span className="text-xs text-muted-foreground">
+                        {wsCompilation.auto_sync ? "On" : "Off"}
+                      </span>
+                    </label>
+                  </div>
+                </SettingsGroup>
+              )}
             )}
 
-                        {settingsSection === "appearance" && (
+            {settingsSection === "appearance" && (
+              <>
               <SettingsGroup label="Theme">
                 <div className="space-y-3 p-4 sm:p-5">
                   <p className="text-[13px] leading-snug text-muted-foreground">
@@ -522,6 +596,23 @@ export function SettingsView() {
                   />
                 </div>
               </SettingsGroup>
+              <SettingsGroup label="Developer">
+                <SettingsRow
+                  label="Preview login page"
+                  description="Temporary — reopens the welcome gate for UI testing."
+                >
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      useApp.getState().setShowWelcomeScreen(true);
+                    }}
+                  >
+                    Open login page
+                  </Button>
+                </SettingsRow>
+              </SettingsGroup>
+              </>
             )}
 
 {settingsSection === "mcp" && <McpPane />}

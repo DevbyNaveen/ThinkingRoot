@@ -32,7 +32,6 @@ import {
   ArrowUp,
   Square,
   AlertTriangle,
-  ChevronDown,
   Hammer,
   Inbox,
   Loader2,
@@ -58,6 +57,13 @@ import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/store/toast";
 import { ChatMarkdown } from "@/components/chat/ChatMarkdown";
+import { StreamingAssistantContent } from "@/components/chat/StreamingAssistantContent";
+import { ComposerModelPicker } from "@/components/chat/ComposerModelPicker";
+import {
+  flushStreamDeltaBuffer,
+  pushStreamDelta,
+  resetStreamDeltaBuffer,
+} from "@/lib/stream-delta-buffer";
 import { UserMessageContent } from "@/components/chat/UserMessageContent";
 import {
   pickPrimaryDiagnostic,
@@ -90,7 +96,10 @@ import type {
 } from "@/types";
 import { BranchChip } from "./BranchChip";
 import { TopicBranchesPanel } from "@/components/branches/TopicBranchesPanel";
-import { PermissionPromptDialog } from "@/components/permissions/PermissionPromptDialog";
+import {
+  PermissionPromptDialog,
+  type PermissionPromptProps,
+} from "@/components/permissions/PermissionPromptDialog";
 import { ClaimCard } from "./ClaimCard";
 import { LiveActivityStrip } from "./LiveActivityStrip";
 import { SlashAutocomplete } from "./SlashAutocomplete";
@@ -256,6 +265,13 @@ export function ChatView() {
     };
   }, [activeWorkspace]);
 
+  const refreshLlmHealth = useCallback(() => {
+    if (!activeWorkspace) return;
+    void llmHealth(activeWorkspace)
+      .then(setHealth)
+      .catch(() => setHealth(null));
+  }, [activeWorkspace]);
+
   useEffect(() => {
     if (!activeWorkspace) {
       setHealth(null);
@@ -412,7 +428,7 @@ export function ChatView() {
         // turnId match is the only gate — it stays set from the
         // moment onStartTurn fired until Final/Error.
         if (cur.streaming?.turnId === ev.turn_id) {
-          appendDelta(ev.text);
+          pushStreamDelta(ev.text, appendDelta);
 
           // Streaming citation extraction. Lazy-create a parser on
           // first token for this turn; feed every token; touch the
@@ -613,6 +629,7 @@ export function ChatView() {
       }
 
       if (ev.type === "final" || ev.type === "error") {
+        flushStreamDeltaBuffer(appendDelta);
         const msgBody =
           ev.type === "final" ? ev.full_text : `⚠️ ${ev.message}`;
 
@@ -865,10 +882,8 @@ export function ChatView() {
     return (
       <div className="flex h-full flex-col bg-background">
         <ChatContextHeader workspace={activeWorkspace} />
-        {/* Vertically centered floating composer — Cursor-style */}
-        <div className="flex flex-1 flex-col items-center justify-center px-8">
-          <div className="flex w-full max-w-3xl flex-col gap-3">
-            {/* Floating composer card */}
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-8">
+          <div className="mx-auto flex w-full max-w-[36rem] flex-col items-center gap-2">
             <Composer
               workspace={activeWorkspace}
               workspaceRootPath={activeWorkspaceRoot}
@@ -876,6 +891,18 @@ export function ChatView() {
               disabled={streaming != null}
               autoFocus
               isIdleCentered
+              permissionPrompt={
+                permissionPrompt && activeWorkspace
+                  ? {
+                      workspace: activeWorkspace,
+                      toolUseId: permissionPrompt.toolUseId,
+                      toolName: permissionPrompt.toolName,
+                      toolInput: permissionPrompt.toolInput,
+                      permissionContext: permissionPrompt.permissionContext,
+                      onResolved: () => setPermissionPrompt(null),
+                    }
+                  : null
+              }
               compileAction={
                 rightRailOpen
                   ? undefined
@@ -914,7 +941,9 @@ export function ChatView() {
               }
               health={health}
               recentHistory={buildHistoryPayload(messages)}
+              onModelChanged={refreshLlmHealth}
               onCancel={() => {
+                flushStreamDeltaBuffer(appendDelta);
                 setStreaming(null);
                 toast("Cancelled — partial message kept.", { kind: "warn" });
               }}
@@ -957,6 +986,7 @@ export function ChatView() {
                   });
               }}
               onStartTurn={(turnId, ws, cid) => {
+                resetStreamDeltaBuffer();
                 useApp.getState().registerTurn(turnId, ws, cid);
                 setStreaming({
                   turnId,
@@ -971,8 +1001,7 @@ export function ChatView() {
               }}
             />
 
-            {/* Hint below the card */}
-            <p className="text-center text-[11px] text-muted-foreground/40">
+            <p className="px-1 text-center text-[11px] text-muted-foreground/40">
               Knowledge chat grounded in your workspace · <kbd className="font-mono">/</kbd> commands · <kbd className="font-mono">@</kbd> files
             </p>
           </div>
@@ -1030,9 +1059,22 @@ export function ChatView() {
         workspaceRootPath={activeWorkspaceRoot}
         convId={activeConv}
         disabled={streaming != null}
+        permissionPrompt={
+          permissionPrompt
+            ? {
+                workspace: activeWorkspace,
+                toolUseId: permissionPrompt.toolUseId,
+                toolName: permissionPrompt.toolName,
+                toolInput: permissionPrompt.toolInput,
+                permissionContext: permissionPrompt.permissionContext,
+                onResolved: () => setPermissionPrompt(null),
+              }
+            : null
+        }
         health={health}
         recentHistory={buildHistoryPayload(messages)}
         onCancel={() => {
+          flushStreamDeltaBuffer(appendDelta);
           setStreaming(null);
           toast("Cancelled — partial message kept.", { kind: "warn" });
         }}
@@ -1072,6 +1114,7 @@ export function ChatView() {
             });
         }}
         onStartTurn={(turnId, ws, cid) => {
+          resetStreamDeltaBuffer();
           useApp.getState().registerTurn(turnId, ws, cid);
           setStreaming({
             turnId,
@@ -1085,16 +1128,6 @@ export function ChatView() {
           });
         }}
       />
-      {permissionPrompt && activeWorkspace && (
-        <PermissionPromptDialog
-          workspace={activeWorkspace}
-          toolUseId={permissionPrompt.toolUseId}
-          toolName={permissionPrompt.toolName}
-          toolInput={permissionPrompt.toolInput}
-          permissionContext={permissionPrompt.permissionContext}
-          onResolved={() => setPermissionPrompt(null)}
-        />
-      )}
     </div>
   );
 }
@@ -1445,7 +1478,12 @@ function ChatTurnStreaming({
   workspace: string | null;
 }) {
   const parts = buildStreamParts(streaming);
-  const hasAnyContent = streaming.partial.length > 0 || streaming.agentSteps.length > 0;
+  const inlineEvidence = parts.some((p) => p.kind === "step");
+  const visibleParts = inlineEvidence
+    ? parts.filter((p) => p.kind !== "step")
+    : parts;
+  const hasAnyContent =
+    streaming.partial.length > 0 || streaming.agentSteps.length > 0;
   return (
     <div className="space-y-3">
       {workspace ? (
@@ -1453,6 +1491,7 @@ function ChatTurnStreaming({
           steps={streaming.agentSteps}
           workspace={workspace}
           hasAnswer={streaming.partial.length > 0}
+          inlineEvidence={inlineEvidence}
         />
       ) : null}
       {streaming.engramActivations.length > 0 && (
@@ -1472,7 +1511,7 @@ function ChatTurnStreaming({
           cards, in the order they were proposed during the turn. */}
       {hasAnyContent && (
         <div className="mx-auto w-full max-w-3xl space-y-2">
-          {parts.map((p, i) =>
+          {visibleParts.map((p, i) =>
             p.kind === "text" ? (
               <MessageBubble
                 key={p.key}
@@ -1482,7 +1521,7 @@ function ChatTurnStreaming({
                   body: p.content,
                   at: streaming.startedAt,
                 }}
-                pending={i === parts.length - 1}
+                pending={i === visibleParts.length - 1}
               />
             ) : workspace ? (
               <ClaimCard key={p.key} step={p.step} workspace={workspace} />
@@ -1659,11 +1698,12 @@ function MessageBubble({
   }
   if (!isUser) {
     return (
-      <div className={cn("group/message flex w-full px-2", pending && "opacity-90")}>
+      <div className="group/message flex w-full px-2">
         <div className="w-full max-w-3xl">
-          <ChatMarkdown>{msg.body}</ChatMarkdown>
-          {pending && (
-            <span className="ml-1 inline-block h-3.5 w-1.5 translate-y-0.5 bg-accent/60 animate-pulse" />
+          {pending ? (
+            <StreamingAssistantContent body={msg.body} />
+          ) : (
+            <ChatMarkdown>{msg.body}</ChatMarkdown>
           )}
           <AssistantMessageFooter
             body={msg.body}
@@ -1753,23 +1793,6 @@ const DOC_ATTACH_EXTENSIONS = [
   "log",
 ];
 
-function formatLlmProviderTag(provider: string | null): string {
-  if (!provider) return "";
-  const k = provider.toLowerCase();
-  const map: Record<string, string> = {
-    anthropic: "Anthropic",
-    openai: "OpenAI",
-    azure: "Azure",
-    google: "Google",
-    gemini: "Google",
-    groq: "Groq",
-    ollama: "Ollama",
-    mistral: "Mistral",
-    deepseek: "DeepSeek",
-  };
-  return map[k] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
-}
-
 /** Cursor-style circular control used at both ends of the session composer pill. */
 function SessionComposerCircleButton({
   children,
@@ -1796,91 +1819,6 @@ function ComposerBranchFootnote({ workspace }: { workspace: string }) {
     <div className="mt-2 px-2 text-[11px] leading-none text-muted-foreground/50">
       <BranchChip workspace={workspace} compact dropUp />
     </div>
-  );
-}
-
-function composerModelShortLabel(health?: LlmHealth | null): string {
-  if (health == null) return "Auto";
-  const model = health.model?.trim();
-  if (health.configured && model) {
-    const tail = model.split("/").pop() ?? model;
-    return tail.length > 18 ? `${tail.slice(0, 16)}…` : tail;
-  }
-  if (health.configured && health.provider) {
-    return formatLlmProviderTag(health.provider);
-  }
-  return "Auto";
-}
-
-function ComposerModelFootnote({
-  health,
-  openSettings,
-  variant = "idle",
-}: {
-  health?: LlmHealth | null;
-  openSettings: () => void;
-  variant?: "idle" | "session";
-}) {
-  if (variant === "session") {
-    const fullLabel =
-      health?.configured && health.model?.trim()
-        ? `${formatLlmProviderTag(health.provider)} – ${health.model}`
-        : health?.configured && health.provider
-          ? formatLlmProviderTag(health.provider)
-          : "Default model routing";
-    return (
-      <button
-        type="button"
-        onClick={openSettings}
-        title={fullLabel}
-        className={cn(
-          "inline-flex h-8 max-w-[8.5rem] shrink-0 items-center gap-0.5 rounded-md px-1",
-          "text-[13px] text-muted-foreground/75 transition-colors",
-          "hover:text-foreground/90",
-          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/45",
-        )}
-      >
-        <span className="truncate">{composerModelShortLabel(health)}</span>
-        <ChevronDown className="size-3 shrink-0 opacity-45" strokeWidth={2} aria-hidden />
-      </button>
-    );
-  }
-
-  if (health == null) {
-    return (
-      <span className="shrink-0 text-[10.5px] text-muted-foreground/50">
-        Model…
-      </span>
-    );
-  }
-  const configured = health.configured;
-  const model = health.model?.trim();
-  const provider = health.provider;
-  const label =
-    configured && model
-      ? `${formatLlmProviderTag(provider)} – ${model}`
-      : configured && provider
-        ? formatLlmProviderTag(provider)
-        : null;
-
-  if (label) {
-    return (
-      <div
-        className="max-w-[14rem] shrink truncate text-left text-[10.5px] leading-tight text-muted-foreground/90"
-        title={label}
-      >
-        <span className="font-medium text-muted-foreground">{label}</span>
-      </div>
-    );
-  }
-  return (
-    <button
-      type="button"
-      onClick={openSettings}
-      className="shrink-0 text-[10.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-    >
-      Configure model
-    </button>
   );
 }
 
@@ -2134,10 +2072,12 @@ function Composer({
   compileAction,
   health,
   recentHistory,
+  onModelChanged,
   onCancel,
   onCreateConvIfNeeded,
   onUserMessage,
   onStartTurn,
+  permissionPrompt,
 }: {
   workspace: string;
   /** Absolute path for `workspace` — used to align compile progress with this row. */
@@ -2156,10 +2096,12 @@ function Composer({
    *  Forwarded to the engine so the agent can treat them as memory.
    *  Empty for fresh conversations. */
   recentHistory: ChatTurnPayload[];
+  onModelChanged?: () => void;
   onCancel: () => void;
   onCreateConvIfNeeded: (firstUserText: string) => Promise<string>;
   onUserMessage: (content: string) => void;
   onStartTurn: (turnId: string, workspace: string, convId: string) => void;
+  permissionPrompt?: PermissionPromptProps | null;
 }) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -2277,11 +2219,11 @@ function Composer({
       : "Send follow-up";
 
   return (
-    <div className={cn("px-5", isIdleCentered ? "py-3" : "px-6 pb-4 pt-2")}>
+    <div className={cn(isIdleCentered ? "w-full" : "px-6 pb-4 pt-2")}>
       <div
         className={cn(
           "mx-auto",
-          isIdleCentered ? "max-w-[38rem]" : "max-w-3xl",
+          isIdleCentered ? "max-w-[36rem]" : "max-w-3xl",
         )}
       >
         {!isIdleCentered && health && (
@@ -2294,16 +2236,33 @@ function Composer({
             />
           </div>
         )}
-        <div
-          className={cn(
-            "group relative flex flex-col overflow-visible",
-            isIdleCentered
-              ? "rounded-xl border border-border/60 bg-surface-elevated"
-              : "rounded-[26px] border border-white/[0.1] bg-[hsl(0,0%,13.5%)]",
-          )}
-        >
+        <div className="flex w-full flex-col">
+          {permissionPrompt ? (
+            <PermissionPromptDialog
+              {...permissionPrompt}
+              variant={isIdleCentered ? "idle" : "session"}
+            />
+          ) : null}
+          <div
+            className={cn(
+              "group relative flex flex-col overflow-visible",
+              isIdleCentered
+                ? cn(
+                    "border border-border/60 bg-surface-elevated",
+                    permissionPrompt
+                      ? "rounded-b-xl rounded-t-none border-t-0"
+                      : "rounded-xl",
+                  )
+                : cn(
+                    "border border-white/[0.1] bg-[hsl(0,0%,13.5%)]",
+                    permissionPrompt
+                      ? "rounded-b-[26px] rounded-t-none border-t-0"
+                      : "rounded-[26px]",
+                  ),
+            )}
+          >
           {isIdleCentered && health && (
-            <div className="px-4 pt-3">
+            <div className="max-h-[min(24vh,180px)] shrink-0 overflow-y-auto px-4 pt-3">
               <LlmHealthBanner
                 health={health}
                 workspace={workspace}
@@ -2313,7 +2272,7 @@ function Composer({
             </div>
           )}
 
-          {/* Slash autocomplete — anchored to textarea; opens up when composer is at bottom */}
+          {/* Slash autocomplete — below when idle/centered, above when session dock */}
           <div className="relative w-full overflow-visible">
             {slashQuery && (
               <SlashAutocomplete
@@ -2340,7 +2299,7 @@ function Composer({
                   void send();
                 }
               }}
-              className="w-full min-h-[92px] resize-none border-0 bg-transparent py-5 pb-12 pl-4 pr-4 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
+              className="w-full min-h-[72px] max-h-[min(28vh,220px)] resize-none border-0 bg-transparent py-4 pb-12 pl-4 pr-4 text-[14px] leading-6 text-foreground placeholder:text-muted-foreground/40 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
             />
             ) : (
               <div className="flex min-h-[46px] items-center gap-1 pl-2 pr-1.5 py-1">
@@ -2348,6 +2307,11 @@ function Composer({
                   disabled={disabled || busy}
                   insertText={insertText}
                   variant="session"
+                />
+                <ComposerModelPicker
+                  health={health ?? null}
+                  variant="session"
+                  onModelChanged={onModelChanged}
                 />
                 <textarea
                   ref={textareaRef}
@@ -2364,11 +2328,6 @@ function Composer({
                   className="max-h-[min(200px,40vh)] min-h-[22px] flex-1 resize-none border-0 bg-transparent px-1 py-2.5 text-[13px] leading-5 text-foreground caret-foreground placeholder:text-muted-foreground/50 outline-none ring-0 shadow-none appearance-none focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 />
                 <div className="flex shrink-0 items-center gap-0.5">
-                  <ComposerModelFootnote
-                    health={health}
-                    openSettings={openComposerSettings}
-                    variant="session"
-                  />
                   {disabled ? (
                     <SessionComposerCircleButton
                       onClick={onCancel}
@@ -2401,15 +2360,16 @@ function Composer({
             )}
 
             {isIdleCentered && (
-            <div className="absolute inset-x-0 bottom-0 flex items-center gap-2 px-1.5 pb-2 pt-1">
-              <ComposerAttachMenu
-                disabled={disabled || busy}
-                insertText={insertText}
-              />
-              <div className="min-w-0 max-w-[min(46vw,15rem)] shrink">
-                <ComposerModelFootnote
-                  health={health}
-                  openSettings={openComposerSettings}
+            <div className="absolute inset-x-0 bottom-0 flex items-center gap-1 px-1.5 pb-2 pt-1">
+              <div className="flex shrink-0 items-center gap-0.5">
+                <ComposerAttachMenu
+                  disabled={disabled || busy}
+                  insertText={insertText}
+                />
+                <ComposerModelPicker
+                  health={health ?? null}
+                  variant="idle"
+                  onModelChanged={onModelChanged}
                 />
               </div>
               <div className="min-w-0 flex-1" />
@@ -2481,6 +2441,7 @@ function Composer({
               </div>
             </div>
             )}
+          </div>
           </div>
         </div>
         {!isIdleCentered && (

@@ -17,6 +17,7 @@
  * compiled / new badges stay honest).
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as ScrollArea from "@radix-ui/react-scroll-area";
 import {
   ArrowLeft,
@@ -54,6 +55,8 @@ import { toast } from "@/store/toast";
 import {
   authState,
   cloudLoginStart,
+  CLOUD_STATUS_EVENT,
+  type CloudStatusEventPayload,
   conversationsCreate,
   conversationsList,
   workspaceAdd,
@@ -66,6 +69,7 @@ import {
   type ConversationSummary,
   type WorkspaceView,
 } from "@/lib/tauri";
+import { cloudUserFirstName } from "@/lib/cloud-user-label";
 import type { DocSectionId, Surface, SettingsSectionId } from "@/types";
 
 const MAX_PINNED_CONVS = 6;
@@ -492,43 +496,55 @@ export function Sidebar() {
 
 function authLabel(auth: AuthState | null): string {
   if (auth == null) return "…";
-  if (!auth.signed_in) return "Login";
-  if (auth.handle) return `@${auth.handle}`;
-  if (auth.server) {
-    try {
-      return new URL(auth.server).host;
-    } catch {
-      return auth.server;
-    }
-  }
-  return "Signed in";
+  if (!auth.signed_in) return "Sign in";
+  return cloudUserFirstName(auth);
 }
 
-/** Account / Login — opens upward; Docs + Settings + sign-in notes. */
+/** Account strip — opens upward; Docs + Settings + sign-in. */
 function SidebarAuthStrip() {
   const setSurface = useApp((s) => s.setSurface);
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    let alive = true;
-    const refresh = () => {
-      authState()
-        .then((a) => {
-          if (alive) setAuth(a);
-        })
-        .catch(() => {
-          if (alive) setAuth(null);
-        });
-    };
-    refresh();
-    window.addEventListener("focus", refresh);
-    return () => {
-      alive = false;
-      window.removeEventListener("focus", refresh);
-    };
+  const refreshAuth = useCallback(() => {
+    authState()
+      .then((a) => setAuth(a))
+      .catch(() => setAuth(null));
   }, []);
+
+  useEffect(() => {
+    refreshAuth();
+    window.addEventListener("focus", refreshAuth);
+
+    let unlisten: UnlistenFn | null = null;
+    void listen<CloudStatusEventPayload>(CLOUD_STATUS_EVENT, (event) => {
+      const p = event.payload;
+      if (p.status === "signed_in") {
+        setSigningIn(false);
+        refreshAuth();
+      } else if (p.status === "logging_in") {
+        setSigningIn(true);
+      } else if (p.status === "login_failed") {
+        setSigningIn(false);
+        toast("Sign in failed", {
+          kind: "error",
+          body: p.detail ?? p.reason,
+        });
+      } else if (p.status === "signed_out" || p.status === "auth_expired") {
+        setSigningIn(false);
+        refreshAuth();
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      window.removeEventListener("focus", refreshAuth);
+      unlisten?.();
+    };
+  }, [refreshAuth]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -547,7 +563,7 @@ function SidebarAuthStrip() {
     };
   }, [menuOpen]);
 
-  const label = authLabel(auth);
+  const label = signingIn ? "Signing in…" : authLabel(auth);
 
   const goDocs = () => {
     setSurface("docs");
@@ -558,9 +574,18 @@ function SidebarAuthStrip() {
     setSurface("settings");
     setMenuOpen(false);
   };
-  const signIn = () => {
-    void cloudLoginStart();
+  const signIn = async () => {
     setMenuOpen(false);
+    setSigningIn(true);
+    try {
+      await cloudLoginStart();
+    } catch (e) {
+      setSigningIn(false);
+      toast("Sign in failed", {
+        kind: "error",
+        body: e instanceof Error ? e.message : String(e),
+      });
+    }
   };
 
   return (
@@ -633,8 +658,9 @@ function SidebarAuthStrip() {
             <button
               type="button"
               role="menuitem"
-              onClick={signIn}
-              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-muted/60"
+              onClick={() => void signIn()}
+              disabled={signingIn}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-muted/60 disabled:opacity-50"
             >
               <LogIn className="size-3.5 shrink-0 text-muted-foreground" />
               Sign in

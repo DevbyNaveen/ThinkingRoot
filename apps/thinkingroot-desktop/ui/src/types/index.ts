@@ -13,8 +13,8 @@ export type RightRailTab =
   | "privacy"
   | "terminal";
 
-/** Sub-page inside the right-rail Workspace (files) inspector — readme first, folder tree second. */
-export type WorkspaceInspectorPage = "readme" | "folder";
+/** Sub-page inside the right-rail Workspace (files) inspector — Living Paper first, folder tree second. */
+export type WorkspaceInspectorPage = "paper" | "folder";
 
 /** Surfaces in the layout.
  *

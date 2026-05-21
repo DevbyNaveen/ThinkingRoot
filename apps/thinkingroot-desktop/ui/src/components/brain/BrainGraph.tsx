@@ -478,8 +478,12 @@ export function BrainGraph({
 
     const draw = () => {
       const positions = positionsRef.current;
+      const container = containerRef.current;
       ctx.save();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = container
+        ? getComputedStyle(container).backgroundColor
+        : "hsl(var(--background))";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.scale(dpr, dpr);
 
       const t = transformRef.current;
@@ -865,8 +869,8 @@ function GraphInteractionHint({ isPaused }: { isPaused: boolean }) {
     <div
       className={cn(
         "pointer-events-none absolute bottom-3 left-3 flex items-center gap-2",
-        "rounded-lg border border-border/50 bg-surface/90 px-2.5 py-1",
-        "text-[10px] text-muted-foreground shadow-sm backdrop-blur-md",
+        "rounded-lg border border-border/50 bg-background/95 px-2.5 py-1",
+        "text-[10px] text-muted-foreground",
       )}
     >
       {isPaused ? (

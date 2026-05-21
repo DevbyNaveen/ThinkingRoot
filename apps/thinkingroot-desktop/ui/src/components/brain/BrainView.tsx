@@ -9,7 +9,15 @@
  * Split position is persisted to localStorage so the graph/table
  * ratio survives a reload.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -26,18 +34,42 @@ import { BrainGraph } from "./BrainGraph";
 import { BrainTable } from "./BrainTable";
 
 const SPLIT_STORAGE_KEY = "brain_split_v1";
+/** Visible seam height (px) — also excluded from drag math. */
+const SPLITTER_H = 8;
+const MIN_GRAPH_PX = 80;
+const MIN_TABLE_PX = 140;
+const DEFAULT_SPLIT_RATIO = 0.55;
 
-function readPersistedSplit(): number {
-  if (typeof window === "undefined") return 55;
+function readPersistedSplitRatio(): number {
+  if (typeof window === "undefined") return DEFAULT_SPLIT_RATIO;
   try {
     const raw = window.localStorage.getItem(SPLIT_STORAGE_KEY);
-    if (!raw) return 55;
+    if (!raw) return DEFAULT_SPLIT_RATIO;
     const n = Number.parseFloat(raw);
-    if (!Number.isFinite(n)) return 55;
-    return Math.max(10, Math.min(90, n));
+    if (!Number.isFinite(n)) return DEFAULT_SPLIT_RATIO;
+    // Legacy v1 stored 10–90 percent; new writes store 0–1 ratio.
+    const ratio = n > 1 ? n / 100 : n;
+    return Math.max(0.1, Math.min(0.9, ratio));
   } catch {
-    return 55;
+    return DEFAULT_SPLIT_RATIO;
   }
+}
+
+function clampSplitRatio(ratio: number, trackPx: number): number {
+  if (trackPx <= MIN_GRAPH_PX + MIN_TABLE_PX) return DEFAULT_SPLIT_RATIO;
+  const min = MIN_GRAPH_PX / trackPx;
+  const max = 1 - MIN_TABLE_PX / trackPx;
+  return Math.max(min, Math.min(max, ratio));
+}
+
+function ratioFromPointer(clientY: number, rect: DOMRect): number {
+  const track = rect.height - SPLITTER_H;
+  if (track <= 0) return DEFAULT_SPLIT_RATIO;
+  const graphPx = Math.max(
+    MIN_GRAPH_PX,
+    Math.min(track - MIN_TABLE_PX, clientY - rect.top),
+  );
+  return graphPx / track;
 }
 
 export function BrainView({
@@ -60,8 +92,9 @@ export function BrainView({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [topHeight, setTopHeight] = useState<number>(() => readPersistedSplit());
+  const [splitRatio, setSplitRatio] = useState(() => readPersistedSplitRatio());
   const [isDragging, setIsDragging] = useState(false);
+  const [containerHeight, setContainerHeight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -142,33 +175,57 @@ export function BrainView({
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      window.localStorage.setItem(SPLIT_STORAGE_KEY, topHeight.toFixed(2));
+      window.localStorage.setItem(SPLIT_STORAGE_KEY, splitRatio.toFixed(4));
     } catch {
       /* localStorage may be disabled in private mode — non-fatal */
     }
-  }, [topHeight]);
+  }, [splitRatio]);
+
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const h = el.getBoundingClientRect().height;
+      setContainerHeight(h);
+      setSplitRatio((prev) => clampSplitRatio(prev, Math.max(0, h - SPLITTER_H)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!isDragging) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      const offset = e.clientY - rect.top;
-      const percent = (offset / rect.height) * 100;
-      // Clamp between 10% and 90%
-      setTopHeight(Math.max(10, Math.min(90, percent)));
-    };
-
-    const handleMouseUp = () => setIsDragging(false);
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    const prevCursor = document.body.style.cursor;
+    const prevSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevSelect;
     };
   }, [isDragging]);
+
+  const applySplitFromPointer = useCallback((clientY: number) => {
+    const el = containerRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    setSplitRatio(clampSplitRatio(ratioFromPointer(clientY, rect), rect.height - SPLITTER_H));
+  }, []);
+
+  const endSplitDrag = useCallback((e: ReactPointerEvent) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setIsDragging(false);
+  }, []);
+
+  const trackPx = Math.max(0, containerHeight - SPLITTER_H);
+  const graphPanePx =
+    trackPx > 0
+      ? Math.round(clampSplitRatio(splitRatio, trackPx) * trackPx)
+      : null;
 
   if (!activeWorkspace) {
     return (
@@ -221,11 +278,15 @@ export function BrainView({
 
       <div
         ref={containerRef}
-        className={`relative flex flex-1 flex-col overflow-hidden ${isDragging ? "select-none" : ""}`}
+        className={`relative flex flex-1 flex-col overflow-hidden bg-background ${isDragging ? "select-none" : ""}`}
       >
         <div
-          className="relative min-h-[100px] border-b border-border"
-          style={{ height: `${topHeight}%` }}
+          className="relative shrink-0 overflow-hidden bg-background"
+          style={
+            graphPanePx !== null
+              ? { height: graphPanePx, minHeight: MIN_GRAPH_PX }
+              : { height: `${splitRatio * 100}%`, minHeight: MIN_GRAPH_PX }
+          }
         >
           {snap ? (
             <BrainGraphHud
@@ -252,17 +313,36 @@ export function BrainView({
               <Skeleton text="Loading graph…" />
             )}
           </div>
-
-          {/* Invisible resize handle */}
-          <div
-            className="absolute bottom-[-4px] left-0 right-0 z-50 h-2 cursor-row-resize bg-transparent"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              setIsDragging(true);
-            }}
-          />
         </div>
-        <div className="flex-1 overflow-hidden">
+
+        <BrainSplitHandle
+          isDragging={isDragging}
+          splitPercent={Math.round(splitRatio * 100)}
+          onNudge={(delta) => {
+            setSplitRatio((prev) =>
+              clampSplitRatio(prev + delta, trackPx > 0 ? trackPx : 1),
+            );
+          }}
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            setIsDragging(true);
+            applySplitFromPointer(e.clientY);
+          }}
+          onPointerMove={(e) => {
+            if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+            applySplitFromPointer(e.clientY);
+          }}
+          onPointerUp={endSplitDrag}
+          onPointerCancel={endSplitDrag}
+        />
+
+        <div
+          className="flex-1 overflow-hidden bg-background"
+          style={{ minHeight: MIN_TABLE_PX }}
+        >
           <div className={isDragging ? "pointer-events-none h-full" : "h-full"}>
             {snap ? (
               <BrainTable 
@@ -281,6 +361,79 @@ export function BrainView({
     </div>
   );
 }
+
+/** Draggable seam between graph and claims table. */
+const BrainSplitHandle = forwardRef<
+  HTMLDivElement,
+  {
+    isDragging: boolean;
+    splitPercent: number;
+    onNudge: (delta: number) => void;
+    onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => void;
+    onPointerMove: (e: ReactPointerEvent<HTMLDivElement>) => void;
+    onPointerUp: (e: ReactPointerEvent<HTMLDivElement>) => void;
+    onPointerCancel: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  }
+>(function BrainSplitHandle(
+  {
+    isDragging,
+    splitPercent,
+    onNudge,
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel,
+  },
+  ref,
+) {
+  return (
+    <div
+      ref={ref}
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="Resize graph and claims table"
+      aria-valuemin={10}
+      aria-valuemax={90}
+      aria-valuenow={splitPercent}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+        e.preventDefault();
+        const step = e.shiftKey ? 0.06 : 0.025;
+        onNudge(e.key === "ArrowDown" ? step : -step);
+      }}
+      className="relative z-30 shrink-0 touch-none select-none"
+      style={{ height: SPLITTER_H }}
+    >
+      {/* Wide hit target — layout stays SPLITTER_H; drag stays smooth off-seam */}
+      <div
+        className="absolute inset-x-0 -top-3 -bottom-3 cursor-row-resize"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+      />
+      <div
+        className={cn(
+          "pointer-events-none flex h-full w-full items-center justify-center transition-[background-color,border-color,box-shadow]",
+          isDragging
+            ? "border-y-2 border-accent bg-accent/20 shadow-[inset_0_0_0_1px_hsl(var(--accent)/0.45)]"
+            : "border-y border-border bg-muted/25",
+        )}
+      >
+        <div
+          className={cn(
+            "rounded-full transition-all",
+            isDragging
+              ? "h-1 w-16 bg-accent/80"
+              : "h-1 w-10 bg-muted-foreground/40",
+          )}
+          aria-hidden
+        />
+      </div>
+    </div>
+  );
+});
 
 function BrainGraphHud({
   snap,
@@ -301,8 +454,8 @@ function BrainGraphHud({
     <div className="pointer-events-none absolute right-2 top-2 z-20 flex items-center gap-1.5">
       <span
         className={cn(
-          "rounded-lg border border-border/50 bg-surface/90 px-2.5 py-1",
-          "text-[10px] tabular-nums text-muted-foreground shadow-sm backdrop-blur-md",
+          "rounded-lg border border-border/50 bg-background/95 px-2.5 py-1",
+          "text-[10px] tabular-nums text-muted-foreground",
         )}
       >
         {snap.claims.length} claims · {snap.entities.length} entities ·{" "}
@@ -325,8 +478,7 @@ function BrainGraphHud({
         size="icon"
         className={cn(
           "pointer-events-auto h-7 w-7 rounded-lg border border-border/50",
-          "bg-surface/90 shadow-sm backdrop-blur-md",
-          "hover:bg-muted/60",
+          "bg-background/95 hover:bg-muted/60",
         )}
         onClick={onReload}
         disabled={loading}

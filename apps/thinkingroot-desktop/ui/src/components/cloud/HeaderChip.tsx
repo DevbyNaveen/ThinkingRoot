@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Cloud, CloudOff, LogIn, Loader2 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { toast } from "@/store/toast";
 import {
   type AuthState,
   type CloudStatusEventPayload,
@@ -51,6 +52,7 @@ export function HeaderChip({ onClick }: { onClick?: () => void }) {
             auth: {
               signed_in: true,
               handle: p.handle,
+              display_name: p.display_name,
               tier: p.tier,
               credits_remaining: p.credits_remaining,
               credits_total: p.credits_total,
@@ -59,6 +61,12 @@ export function HeaderChip({ onClick }: { onClick?: () => void }) {
             },
           });
         } else if (p.status === "signed_out" || p.status === "login_failed") {
+          if (p.status === "login_failed") {
+            toast("Sign in failed", {
+              kind: "error",
+              body: p.detail ?? p.reason,
+            });
+          }
           setState({ kind: "signed_out" });
         } else if (p.status === "logging_in") {
           setState({ kind: "logging_in" });
@@ -99,7 +107,17 @@ export function HeaderChip({ onClick }: { onClick?: () => void }) {
   }
   if (state.kind === "signed_out") {
     return (
-      <button onClick={() => cloudLoginStart()} className={cn(baseCls, "hover:bg-muted")}>
+      <button
+        onClick={() => {
+          void cloudLoginStart().catch((e) => {
+            toast("Sign in failed", {
+              kind: "error",
+              body: e instanceof Error ? e.message : String(e),
+            });
+          });
+        }}
+        className={cn(baseCls, "hover:bg-muted")}
+      >
         <LogIn className="h-3 w-3" /> Sign in
       </button>
     );

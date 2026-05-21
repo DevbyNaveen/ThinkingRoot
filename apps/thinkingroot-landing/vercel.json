@@ -1,0 +1,49 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "redirects": [
+    {
+      "source": "/install.sh",
+      "destination": "https://github.com/DevbyNaveen/releases/releases/latest/download/install.sh",
+      "statusCode": 302
+    },
+    {
+      "source": "/install.ps1",
+      "destination": "https://github.com/DevbyNaveen/releases/releases/latest/download/install.ps1",
+      "statusCode": 302
+    },
+    {
+      "source": "/download/mac",
+      "destination": "https://github.com/DevbyNaveen/releases/releases/latest/download/ThinkingRoot-mac.dmg",
+      "statusCode": 302
+    },
+    {
+      "source": "/download/linux",
+      "destination": "https://github.com/DevbyNaveen/releases/releases/latest/download/ThinkingRoot-linux.AppImage",
+      "statusCode": 302
+    },
+    {
+      "source": "/download/windows",
+      "destination": "https://github.com/DevbyNaveen/releases/releases/latest/download/ThinkingRoot-windows-setup.exe",
+      "statusCode": 302
+    },
+    {
+      "source": "/releases",
+      "destination": "https://github.com/DevbyNaveen/releases/releases",
+      "statusCode": 302
+    }
+  ],
+  "headers": [
+    {
+      "source": "/install.sh",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/install.ps1",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+      ]
+    }
+  ]
+}

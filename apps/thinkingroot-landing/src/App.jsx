@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Terminal } from 'lucide-react';
 import './App.css';
 
@@ -100,10 +100,49 @@ const INSTALL_COMMANDS = {
   windows: 'irm https://thinkingroot.com/install.ps1 | iex',
 };
 
+// Direct-download fallbacks served via vercel.json 302 redirects to
+// the latest GitHub Release. The right-click-Open caveat lives in the
+// JSX next to the link — keep the warning visible so non-technical
+// users don't bounce on Gatekeeper / SmartScreen.
+const FALLBACK_DOWNLOADS = {
+  macos: { href: 'https://thinkingroot.com/download/mac', label: 'Download .dmg for macOS' },
+  linux: { href: 'https://thinkingroot.com/download/linux', label: 'Download .AppImage for Linux' },
+  windows: { href: 'https://thinkingroot.com/download/windows', label: 'Download installer for Windows' },
+};
+
+// Best-effort OS detection so the default tab matches what the user
+// is actually on. Never lies about the result — defaults to macOS
+// during SSR / before the browser is available, then upgrades on
+// mount. Don't gate UX on this — every tab is still clickable.
+const detectOS = () => {
+  if (typeof navigator === 'undefined') return 'macos';
+  const ua = (navigator.userAgent || '').toLowerCase();
+  const plat = (navigator.platform || '').toLowerCase();
+  if (ua.includes('mac') || plat.includes('mac')) return 'macos';
+  if (ua.includes('win') || plat.includes('win')) return 'windows';
+  if (ua.includes('linux') || plat.includes('linux')) return 'linux';
+  return 'macos';
+};
+
+// Cloud hub URL — single source of truth for the "Sign in → Dashboard"
+// header link. Override at build-time with VITE_HUB_URL when staging
+// against a non-prod hub (e.g. preview deployments). No runtime
+// fallback: shipping with a wrong URL is louder than silently pointing
+// at the wrong host.
+const HUB_URL = import.meta.env.VITE_HUB_URL || 'https://thinkingroot.com';
+
 const InstallSection = () => {
   const [active, setActive] = useState('macos');
   const [copied, setCopied] = useState(false);
+  const [detected, setDetected] = useState(false);
   const command = INSTALL_COMMANDS[active];
+  const fallback = FALLBACK_DOWNLOADS[active];
+
+  useEffect(() => {
+    const os = detectOS();
+    setActive(os);
+    setDetected(true);
+  }, []);
 
   const handleCopy = async () => {
     try {
@@ -146,8 +185,48 @@ const InstallSection = () => {
         </button>
       </div>
       <p className="install-note">
-        CLI + desktop app + daemon auto-start. Open-source, no telemetry, no signing fees.
+        {detected
+          ? 'CLI + desktop app + daemon auto-start. Open-source, no telemetry, no signing fees.'
+          : 'CLI + desktop app + daemon auto-start.'}
       </p>
+      <ul className="install-bullets" aria-label="What this installs">
+        <li><span className="install-bullet-key">root</span> CLI in <code>/usr/local/bin</code></li>
+        <li>ThinkingRoot Desktop in <code>/Applications</code></li>
+        <li>Login-agent so the engine auto-starts on reboot</li>
+        <li>Models (~340 MB) cached under your user directory</li>
+      </ul>
+      <details className="install-fallback">
+        <summary>Prefer a direct download?</summary>
+        <div className="install-fallback-body">
+          <a className="install-fallback-link" href={fallback.href}>
+            {fallback.label}
+          </a>
+          {active === 'macos' && (
+            <p className="install-fallback-note">
+              The first time you open it, macOS will say <em>“ThinkingRoot can’t
+              be opened because Apple cannot check it for malicious software.”</em>{' '}
+              Right-click the app in Applications → <strong>Open</strong> →{' '}
+              <strong>Open</strong> in the dialog. After that it opens normally
+              forever. (Apple notarization is on the roadmap once funding allows
+              the $99/yr Developer ID.)
+            </p>
+          )}
+          {active === 'windows' && (
+            <p className="install-fallback-note">
+              Windows SmartScreen may warn the first time. Click <strong>More
+              info</strong> → <strong>Run anyway</strong>. The PowerShell
+              one-liner above skips this entirely.
+            </p>
+          )}
+          {active === 'linux' && (
+            <p className="install-fallback-note">
+              <code>chmod +x ThinkingRoot.AppImage</code> then double-click or
+              run it. No signing warnings — Linux trusts you to read what you
+              download.
+            </p>
+          )}
+        </div>
+      </details>
     </div>
   );
 };
@@ -220,6 +299,55 @@ const GithubBadge = () => {
         </svg>
       </div>
     </a>
+  );
+};
+
+// Private Packs (cloud dashboard preview)
+const PrivatePacks = () => {
+  return (
+    <div className="private-packs">
+      <div className="private-packs-grid">
+        <div className="private-pack-card glass-frame">
+          <div className="ppc-head">
+            <span className="ppc-slug">acme/api-knowledge</span>
+            <span className="ppc-chip private">PRIVATE</span>
+          </div>
+          <p className="ppc-desc">Stripe + internal API docs · compiled nightly</p>
+          <div className="ppc-stats">
+            <span>94% rooted</span>
+            <span>·</span>
+            <span>v1.4.0</span>
+          </div>
+        </div>
+        <div className="private-pack-card glass-frame">
+          <div className="ppc-head">
+            <span className="ppc-slug">acme/runbooks</span>
+            <span className="ppc-chip private">PRIVATE</span>
+          </div>
+          <p className="ppc-desc">On-call playbooks for the platform team</p>
+          <div className="ppc-stats">
+            <span>91% rooted</span>
+            <span>·</span>
+            <span>v0.7.2</span>
+          </div>
+        </div>
+        <div className="private-pack-card glass-frame">
+          <div className="ppc-head">
+            <span className="ppc-slug">acme/research-2026</span>
+            <span className="ppc-chip private">PRIVATE</span>
+          </div>
+          <p className="ppc-desc">Quarterly market research · drafts only</p>
+          <div className="ppc-stats">
+            <span>88% rooted</span>
+            <span>·</span>
+            <span>v0.2.0</span>
+          </div>
+        </div>
+      </div>
+      <pre className="private-packs-cmd">
+        <span className="cmd-prompt">$ </span>root cloud publish
+      </pre>
+    </div>
   );
 };
 
@@ -391,6 +519,9 @@ function App() {
           <img src="/logo.png" alt="ThinkingRoot Logo" className="logo-img" />
           <span className="logo-text">ThinkingRoot</span>
         </div>
+        <a href={`${HUB_URL}/dashboard`} className="header-signin-link">
+          DASHBOARD
+        </a>
         <a href="https://github.com/DevbyNaveen/ThinkingRoot" target="_blank" rel="noreferrer" className="header-github-link">
           GITHUB
         </a>
@@ -480,6 +611,23 @@ function App() {
         {/* AEP REPORT SHOWCASE */}
         <section className="scroll-section aep-report-sequence" style={{paddingTop: '0'}}>
           <AEPReportShowcase />
+        </section>
+
+        {/* PRIVATE PACKS — sign-in + dashboard preview */}
+        <section className="scroll-section private-packs-sequence">
+          <h3 className="section-eyebrow reveal">Your private knowledge, anywhere</h3>
+          <h2 className="statement-text reveal delay-1">
+            Push <span className="text-accent">.tr</span> packs to your private dashboard.<br/>
+            Any agent. Any laptop. <span className="text-accent">Same brain.</span>
+          </h2>
+          <div className="reveal delay-2" style={{marginTop: '3rem'}}>
+            <PrivatePacks />
+          </div>
+          <div className="cta-flow reveal delay-3" style={{marginTop: '3rem'}}>
+            <a href={`${HUB_URL}/dashboard`} className="pill-button" style={{textDecoration: 'none'}}>
+              Open Dashboard
+            </a>
+          </div>
         </section>
 
         {/* ANY AI CAN PLUG IN / METRICS */}

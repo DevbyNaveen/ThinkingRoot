@@ -17,7 +17,7 @@
  * (UI-update, daemon-sync, rollback-on-failure) trio by hand. Some
  * forgot the daemon-sync entirely (e.g. `onSelectConv` in Sidebar.tsx),
  * which made right-panel readouts that read from the daemon's notion of
- * "active workspace" (notably `workspace_readme`) silently return data
+ * "active workspace" (notably `paper_get`) silently return data
  * for the *previous* workspace. Funneling through one helper makes
  * that class of bug impossible.
  *
@@ -33,7 +33,7 @@ export async function selectWorkspace(name: string): Promise<void> {
   useApp.getState().setActiveWorkspace(name);
   try {
     // Step 2 — converge daemon-side state with the UI's view of
-    // "active". Without this, server-side reads (workspace_readme,
+    // "active". Without this, server-side reads (paper_get,
     // anything else built on `SidecarClient::ensure_active`) return
     // results for the previously-mounted workspace.
     await workspaceSetActive(name);
