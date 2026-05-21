@@ -27,6 +27,7 @@ members = [
     "crates/tr-transparency",
     "crates/tr-verify",
     "crates/thinkingroot-sandbox",
+    "crates/thinkingroot-flow",
     "thinkingroot-python",
 ]
 # thinkingroot-python is a PyO3 cdylib that must be built via maturin.
@@ -59,10 +60,11 @@ default-members = [
     "crates/tr-transparency",
     "crates/tr-verify",
     "crates/thinkingroot-sandbox",
+    "crates/thinkingroot-flow",
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.3"
 edition = "2024"
 authors = ["Naveen <naveen@thinkingroot.dev>"]
 license = "MIT"
@@ -99,6 +101,7 @@ tr-sigstore          = { path = "crates/tr-sigstore",          version = "0.9.1"
 tr-transparency      = { path = "crates/tr-transparency",      version = "0.9.1" }
 tr-verify            = { path = "crates/tr-verify",            version = "0.9.1" }
 thinkingroot-sandbox = { path = "crates/thinkingroot-sandbox",   version = "0.9.1" }
+thinkingroot-flow    = { path = "crates/thinkingroot-flow",    version = "0.9.3" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

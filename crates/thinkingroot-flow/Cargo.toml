@@ -1,0 +1,49 @@
+[package]
+name = "thinkingroot-flow"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+description = "Multi-agent flow orchestrator for ThinkingRoot — declarative YAML/TOML workflows whose state lives on branches and survives daemon restarts via cognition-commit checkpoints."
+
+[dependencies]
+# Internal — we depend on the core types (CognitionCommit, branch
+# primitives) but NOT on thinkingroot-serve directly. The runtime
+# (C10) hooks into serve via a trait the serve crate implements,
+# keeping the dependency one-way: serve depends on flow, not the
+# reverse. This avoids a circular crate dep and keeps flow
+# unit-testable without spinning up a full daemon.
+thinkingroot-core = { workspace = true }
+
+# Advisory file locking — used by storage.rs for concurrent flow
+# run state writes (same fs2 primitive the branch registry uses).
+fs2      = { workspace = true }
+tempfile = { workspace = true }
+
+# Serialization — YAML preferred per user decision (locked in plan),
+# TOML accepted, JSON used internally for substrate storage.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml       = { workspace = true }
+
+# Async + cancellation
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = "0.1"
+
+# IDs + time + hashing
+ulid     = { workspace = true }
+chrono   = { workspace = true }
+blake3   = { workspace = true }
+
+# Error handling + logging
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
