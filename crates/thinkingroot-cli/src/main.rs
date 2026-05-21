@@ -324,6 +324,15 @@ enum Commands {
         /// Path to the file to hash.
         path: std::path::PathBuf,
     },
+    /// Multi-agent flow orchestration (C19, 2026-05-22).
+    ///
+    /// Declare YAML/TOML flow definitions and run them locally
+    /// against per-workspace storage. For agent-driven runs
+    /// (Claude Code / Cursor / etc.), use the `flow_run` MCP tool.
+    Flow {
+        #[command(subcommand)]
+        action: thinkingroot_cli::flow_cmd::FlowAction,
+    },
     /// Manage registered workspaces
     Workspace {
         #[command(subcommand)]
@@ -1770,6 +1779,10 @@ async fn async_main() -> anyhow::Result<()> {
             std::io::copy(&mut file, &mut hasher)?;
             println!("{}", hasher.finalize().to_hex());
             return Ok(());
+        }
+        Some(Commands::Flow { action }) => {
+            let code = thinkingroot_cli::flow_cmd::run(action).await?;
+            std::process::exit(code);
         }
         Some(Commands::Workspace { action }) => match action {
             WorkspaceAction::Add { path, name, port } => {

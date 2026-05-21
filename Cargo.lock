@@ -6618,6 +6618,7 @@ dependencies = [
  "thinkingroot-core",
  "thinkingroot-cortex-async",
  "thinkingroot-extract",
+ "thinkingroot-flow",
  "thinkingroot-graph",
  "thinkingroot-health",
  "thinkingroot-link",
