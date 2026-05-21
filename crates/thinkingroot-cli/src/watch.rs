@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebouncedEventKind, DebounceEventResult, new_debouncer};
+use thinkingroot_core::filesystem::is_workspace_noise;
 
 /// Options for the `run_watch_loop` driver.
 #[derive(Debug, Clone, Copy)]
@@ -29,59 +30,13 @@ impl Default for WatchOptions {
 
 /// Returns `true` for paths the watcher should **ignore** (noise).
 ///
-/// Excludes:
-/// - `.git/`, `.thinkingroot/`, `target/`, `node_modules/`, `.next/`,
-///   `dist/`, `build/`, `__pycache__/`, `.tox/`, `.venv/`
-/// - Dotfiles (final component starts with `.`)
-/// - Editor swap files: `.swp`, `.swo`, `.swx`, `~`-suffixed, `.tmp`,
-///   `.bak`, `4913` (vim pre-write probe)
+/// Re-exports `thinkingroot_core::filesystem::is_workspace_noise` — the
+/// canonical home of the noise filter, shared with the serve daemon's
+/// `workspace_watcher` source-tree task. See that function for the full
+/// classification rules.
+#[inline]
 pub fn is_noise(p: &Path) -> bool {
-    const NOISE_DIRS: &[&str] = &[
-        ".thinkingroot",
-        ".git",
-        "target",
-        "node_modules",
-        ".next",
-        "dist",
-        "build",
-        "__pycache__",
-        ".tox",
-        ".venv",
-    ];
-
-    for component in p.components() {
-        let s = component.as_os_str();
-        if NOISE_DIRS.iter().any(|&d| s == d) {
-            return true;
-        }
-    }
-
-    let Some(file_name) = p.file_name() else {
-        return true;
-    };
-    let name = file_name.to_string_lossy();
-
-    if name.starts_with('.') {
-        return true;
-    }
-
-    if name == "4913" {
-        return true;
-    }
-
-    if name.ends_with('~') {
-        return true;
-    }
-
-    const NOISE_EXTENSIONS: &[&str] = &["swp", "swo", "swx", "tmp", "bak"];
-    if let Some(ext) = p.extension() {
-        let ext = ext.to_string_lossy();
-        if NOISE_EXTENSIONS.iter().any(|&e| ext == e) {
-            return true;
-        }
-    }
-
-    false
+    is_workspace_noise(p)
 }
 
 /// Run the watch loop until `max_ticks` is reached or the channel closes.

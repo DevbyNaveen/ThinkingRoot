@@ -276,6 +276,14 @@ pub enum CompileState {
         /// When the cancel signal fired.
         since: DateTime<Utc>,
     },
+    /// Live sync accepted a stale fingerprint and is waiting for the
+    /// debounce window before starting compile.
+    Queued {
+        /// When the job was accepted.
+        since: DateTime<Utc>,
+        /// Stable reason token — today always `"auto_sync"`.
+        reason: String,
+    },
 }
 
 /// Outcome of a finished compile run, surfaced under
@@ -432,6 +440,8 @@ pub mod diagnostic_codes {
     /// Source files have changed since last compile (fingerprint
     /// mismatch) — UI may suggest a re-compile.
     pub const SOURCES_STALE: &str = "sources_stale";
+    /// Live sync is paused because the compile circuit breaker tripped.
+    pub const AUTO_SYNC_PAUSED: &str = "auto_sync_paused";
     /// Active branch has uncommitted writes.
     pub const BRANCH_DIRTY: &str = "branch_dirty";
     /// Workspace path on disk does not exist.
@@ -543,7 +553,9 @@ impl WorkspaceStatus {
         );
         let compile_running = matches!(
             compile,
-            CompileState::Running { .. } | CompileState::Cancelling { .. }
+            CompileState::Running { .. }
+                | CompileState::Cancelling { .. }
+                | CompileState::Queued { .. }
         );
 
         let for_compile = path_exists && !compile_running && !matches!(substrate, SubstrateState::Corrupt { .. } | SubstrateState::Orphaned { .. });
@@ -780,6 +792,13 @@ impl WorkspaceStatus {
                 code: diagnostic_codes::COMPILE_RUNNING.into(),
                 severity: DiagnosticSeverity::Info,
                 message: "Compile cancelling…".into(),
+                blocks: vec!["for_compile".into()],
+                actions: Vec::new(),
+            }),
+            CompileState::Queued { reason, .. } => out.push(Diagnostic {
+                code: diagnostic_codes::COMPILE_RUNNING.into(),
+                severity: DiagnosticSeverity::Info,
+                message: format!("Live sync queued ({reason})"),
                 blocks: vec!["for_compile".into()],
                 actions: Vec::new(),
             }),

@@ -28,11 +28,42 @@ pub enum WorkspaceEvent {
     /// provider settings on next request.  No immediate action is
     /// taken; the event is emitted as a hint.
     ConfigModified { path: PathBuf },
+    /// One or more **source-tree** files changed inside the workspace
+    /// root (outside `.thinkingroot/`).  Already debounced server-side
+    /// — subscribers receive one event per quiet-window batch, not one
+    /// per filesystem syscall.  Drives the desktop's honest "Behind"
+    /// badge by re-running the state-actor's sources probe.
+    ///
+    /// `workspace_root` matches the active root the watcher saw at
+    /// emission time so multi-workspace consumers can demultiplex.
+    /// `paths` carries the distinct paths from this batch, capped at
+    /// [`SOURCE_CHANGED_PATHS_MAX`] entries (excess collapse into the
+    /// `extra` counter so the wire shape stays bounded).
+    SourceChanged {
+        /// Workspace root the watcher was attached to.
+        workspace_root: PathBuf,
+        /// Distinct source paths from this debounce batch (up to
+        /// `SOURCE_CHANGED_PATHS_MAX`).
+        paths: Vec<PathBuf>,
+        /// Additional changed paths beyond `paths.len()` that were
+        /// dropped for wire-size bounds.  Zero when the batch fit.
+        extra: usize,
+        /// Width of the debounce window the watcher used, in
+        /// milliseconds.  Lets clients distinguish "quick edit" from
+        /// "batch import" without recomputing.
+        debounce_ms: u64,
+    },
     /// Heartbeat emitted every `heartbeat_secs` while the watcher is
     /// healthy.  Lets clients distinguish "no events" from "watcher
     /// dead" without reading server-side telemetry.
     Heartbeat,
 }
+
+/// Maximum distinct paths carried inline on a [`WorkspaceEvent::SourceChanged`].
+/// A batch import of an entire `target/` artefact dump can spike to
+/// thousands of paths; the cap keeps the SSE frame under ~32 KiB while
+/// the `extra` counter preserves the honest total.
+pub const SOURCE_CHANGED_PATHS_MAX: usize = 64;
 
 /// Coarse-grained workspace lifecycle state, derived from the watcher.
 /// Read by the serve handlers via [`AppState::workspace_state`] (defined
@@ -75,6 +106,35 @@ mod tests {
         let ev = WorkspaceEvent::Heartbeat;
         let s = serde_json::to_string(&ev).unwrap();
         assert_eq!(s, r#"{"kind":"heartbeat"}"#);
+    }
+
+    #[test]
+    fn workspace_event_source_changed_round_trip() {
+        let ev = WorkspaceEvent::SourceChanged {
+            workspace_root: PathBuf::from("/abs/ws"),
+            paths: vec![PathBuf::from("/abs/ws/src/a.rs"), PathBuf::from("/abs/ws/src/b.rs")],
+            extra: 0,
+            debounce_ms: 200,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains("source_changed"));
+        assert!(s.contains("debounce_ms"));
+        let back: WorkspaceEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn workspace_event_source_changed_extra_is_honest() {
+        let ev = WorkspaceEvent::SourceChanged {
+            workspace_root: PathBuf::from("/abs/ws"),
+            paths: vec![PathBuf::from("a.rs")],
+            extra: 1_999,
+            debounce_ms: 200,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        // `extra` lets a 2000-file batch report honestly without
+        // ballooning the wire frame.
+        assert!(s.contains("\"extra\":1999"));
     }
 
     #[test]

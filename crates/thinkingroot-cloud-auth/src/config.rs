@@ -31,6 +31,9 @@ pub struct Config {
     pub handle: Option<String>,
 
     #[serde(default)]
+    pub display_name: Option<String>,
+
+    #[serde(default)]
     pub user_id: Option<String>,
 
     #[serde(default)]
@@ -53,6 +56,31 @@ pub struct Config {
 
     #[serde(default)]
     pub model_catalogue_cached: Option<ModelCatalogue>,
+
+    /// Per-user Azure OpenAI provider vended by the hub at signin.
+    /// `None` when the hub doesn't have APIM configured (dev) or when
+    /// the user is signed out. Distinct from any BYOK Azure entry
+    /// in the engine's own `ProvidersConfig` — the `managed: true`
+    /// semantics here are: cloud-auth owns the lifecycle (mint at
+    /// login, delete at logout), the engine just reads the values.
+    #[serde(default)]
+    pub managed_azure: Option<ManagedAzureProvider>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedAzureProvider {
+    /// OpenAI-compatible endpoint exposed by the hub's Azure APIM
+    /// product (e.g. `https://tr-prod.azure-api.net/openai`).
+    pub endpoint: String,
+    /// Azure REST API version (e.g. `2024-12-01-preview`).
+    pub api_version: String,
+    /// Default deployment / model id (e.g. `gpt-4o-mini`).
+    pub default_deployment: String,
+    /// `Ocp-Apim-Subscription-Key` value. Sensitive — never log.
+    pub api_key: String,
+    /// When the hub minted this key. Used for `root doctor` display
+    /// and for "rotate older than 90 days" hygiene.
+    pub provisioned_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,7 +98,12 @@ pub struct ModelEntry {
     pub context_window: u64,
 }
 
-const DEFAULT_SERVER: &str = "https://api.thinkingroot.dev";
+/// Hub URL. landing-v2 (Next.js on Vercel) owns identity + the Azure
+/// APIM gateway, so the same host serves `/auth/cli` (browser-login
+/// bridge), `/api/auth/*` (signup/signin/signout), `/api/me`, and
+/// `/api/v1/models`. Override via `Config::server` per-install or
+/// at test time.
+const DEFAULT_SERVER: &str = "https://thinkingroot.com";
 
 fn default_schema_version() -> u16 {
     SCHEMA_VERSION
@@ -83,6 +116,7 @@ impl Config {
             token: None,
             server: DEFAULT_SERVER.to_string(),
             handle: None,
+            display_name: None,
             user_id: None,
             tier: None,
             credits_remaining: None,
@@ -91,6 +125,7 @@ impl Config {
             token_expires_at: None,
             me_refreshed_at: None,
             model_catalogue_cached: None,
+            managed_azure: None,
         }
     }
 

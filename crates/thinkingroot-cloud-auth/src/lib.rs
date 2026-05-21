@@ -5,6 +5,7 @@
 //! Spec: `docs/superpowers/specs/2026-05-13-oss-cloud-readiness-design.md`.
 
 pub mod config;
+pub mod deep_link_bus;
 pub mod error;
 pub mod http;
 pub mod me;

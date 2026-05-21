@@ -363,6 +363,18 @@ pub async fn run_serve(
     };
     let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
 
+    for (ws_name, path, _) in &resolved_paths {
+        state
+            .mounted_workspace_roots
+            .write()
+            .await
+            .insert(ws_name.clone(), path.clone());
+        state
+            .live_sync
+            .register_workspace(ws_name, path.clone())
+            .await;
+    }
+
     // Spawn background stream-branch cleanup for single-workspace mounts.
     // Multi-workspace mounts skip this — a single cleanup task can't safely
     // scan across heterogeneous workspace roots with different configs.
@@ -388,19 +400,35 @@ pub async fn run_serve(
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
     // watcher's target automatically.
-    let watcher_state = state.clone();
+    let watcher_active = state.clone();
+    let watcher_mounted = state.clone();
     let watcher_handle = thinkingroot_serve::workspace_watcher::spawn_workspace_watcher(
         move || {
-            // Best-effort try-read; on contention return the previous
-            // root next tick.  The watcher is poll-driven; missing one
-            // tick delays the re-attach by `poll_interval` (500ms).
-            watcher_state.workspace_root.try_read().ok().and_then(|g| g.clone())
+            watcher_active
+                .workspace_root
+                .try_read()
+                .ok()
+                .and_then(|g| g.clone())
+        },
+        move || {
+            watcher_mounted
+                .mounted_workspace_roots
+                .try_read()
+                .ok()
+                .map(|g| g.values().cloned().collect())
+                .unwrap_or_default()
         },
         thinkingroot_serve::workspace_watcher::WatcherConfig::default(),
     );
-    state
-        .attach_workspace_watcher(std::sync::Arc::new(watcher_handle))
-        .await;
+    let watcher_arc = std::sync::Arc::new(watcher_handle);
+    state.attach_workspace_watcher(watcher_arc.clone()).await;
+    // Wire the source-tree → state-actor bridge so edits under the
+    // workspace root flip `fingerprint_match` to false and the
+    // desktop badge surfaces "Behind" honestly.
+    thinkingroot_serve::live_sync::spawn_live_sync_bridge(
+        state.clone(),
+        state.live_sync.clone(),
+    );
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
 
@@ -656,6 +684,18 @@ async fn run_serve_with_listener(
     };
     let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
 
+    for (ws_name, path) in &resolved_paths {
+        state
+            .mounted_workspace_roots
+            .write()
+            .await
+            .insert(ws_name.clone(), path.clone());
+        state
+            .live_sync
+            .register_workspace(ws_name, path.clone())
+            .await;
+    }
+
     let _cleanup_handle = if let Some(ref root) = workspace_root {
         let ws_name = resolved_paths[0].0.clone();
         let engine = state.engine.read().await;
@@ -675,16 +715,32 @@ async fn run_serve_with_listener(
     };
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
-    let watcher_state = state.clone();
+    let watcher_active = state.clone();
+    let watcher_mounted = state.clone();
     let watcher_handle = thinkingroot_serve::workspace_watcher::spawn_workspace_watcher(
         move || {
-            watcher_state.workspace_root.try_read().ok().and_then(|g| g.clone())
+            watcher_active
+                .workspace_root
+                .try_read()
+                .ok()
+                .and_then(|g| g.clone())
+        },
+        move || {
+            watcher_mounted
+                .mounted_workspace_roots
+                .try_read()
+                .ok()
+                .map(|g| g.values().cloned().collect())
+                .unwrap_or_default()
         },
         thinkingroot_serve::workspace_watcher::WatcherConfig::default(),
     );
-    state
-        .attach_workspace_watcher(std::sync::Arc::new(watcher_handle))
-        .await;
+    let watcher_arc = std::sync::Arc::new(watcher_handle);
+    state.attach_workspace_watcher(watcher_arc.clone()).await;
+    thinkingroot_serve::live_sync::spawn_live_sync_bridge(
+        state.clone(),
+        state.live_sync.clone(),
+    );
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
 

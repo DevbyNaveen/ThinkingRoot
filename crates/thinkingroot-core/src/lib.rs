@@ -1,6 +1,7 @@
 pub mod config;
 pub mod cortex;
 pub mod error;
+pub mod filesystem;
 pub mod global_config;
 pub mod id;
 pub mod install_manifest;

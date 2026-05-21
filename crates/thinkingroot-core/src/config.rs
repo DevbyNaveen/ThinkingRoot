@@ -448,6 +448,18 @@ pub struct CompilationConfig {
     pub enabled_artifacts: Vec<String>,
     /// Output directory for artifact files (relative to .thinkingroot/).
     pub output_dir: String,
+    /// When `true`, the daemon debounces source-tree edits and runs an
+    /// incremental compile automatically (live sync). Default: on.
+    #[serde(default = "default_auto_sync_enabled")]
+    pub auto_sync: bool,
+    /// Quiet-window for live-sync debouncing, in milliseconds. When
+    /// `0`, the daemon uses its built-in default (200ms).
+    #[serde(default)]
+    pub auto_sync_debounce_ms: u64,
+}
+
+fn default_auto_sync_enabled() -> bool {
+    true
 }
 
 impl Default for CompilationConfig {
@@ -460,6 +472,20 @@ impl Default for CompilationConfig {
                 "health_report".to_string(),
             ],
             output_dir: "artifacts".to_string(),
+            auto_sync: default_auto_sync_enabled(),
+            auto_sync_debounce_ms: 0,
+        }
+    }
+}
+
+impl CompilationConfig {
+    /// Effective debounce for live sync. `0` means caller supplies the
+    /// daemon default (`workspace_watcher::DEFAULT_SOURCE_DEBOUNCE_MS`).
+    pub fn effective_auto_sync_debounce_ms(&self, daemon_default_ms: u64) -> u64 {
+        if self.auto_sync_debounce_ms == 0 {
+            daemon_default_ms
+        } else {
+            self.auto_sync_debounce_ms
         }
     }
 }

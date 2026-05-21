@@ -359,6 +359,9 @@ fn format_compile(c: &CompileState) -> String {
         CompileState::Cancelling { since } => {
             format!("cancelling… (since {})", since.to_rfc3339())
         }
+        CompileState::Queued { reason, since } => {
+            format!("queued ({reason}) since {}", since.to_rfc3339())
+        }
     }
 }
 
