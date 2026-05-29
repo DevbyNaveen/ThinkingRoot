@@ -8,6 +8,7 @@
 pub mod agentmemory;
 pub mod backfill;
 pub mod branch_cache;
+pub mod egress;
 pub mod engine;
 pub mod fingerprint;
 pub mod flow_executors;
@@ -20,6 +21,8 @@ pub mod maintenance;
 pub mod mcp;
 pub mod memory_tree;
 pub mod operator_tools;
+pub mod acquisition_tools;
+pub mod root_function_runtime;
 pub mod scheduler;
 pub mod pipeline;
 pub mod rest;

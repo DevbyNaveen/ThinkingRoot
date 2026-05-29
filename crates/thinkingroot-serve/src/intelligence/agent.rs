@@ -230,6 +230,28 @@ pub enum AgentEvent {
     /// retry transparently per [`LLM_RETRY_ATTEMPTS`] before
     /// surfacing as a fatal `Error`.
     Error { message: String },
+
+    /// JIT (Just-In-Time capability acquisition): the agent hit a gap
+    /// and classified it. `kind` is one of `knowledge` / `capability` /
+    /// `impossible`. The UI renders this as a "diagnosing gap" step.
+    GapClassified { kind: String, rationale: String },
+
+    /// JIT: an acquisition-ladder rung was attempted to fill a
+    /// capability gap. `rung` names the mechanism (e.g.
+    /// `install_mcp_server`, `define_skill`, `deploy_root_function`);
+    /// `outcome` is a short human-readable result.
+    AcquisitionAttempt { rung: String, outcome: String },
+}
+
+/// True iff a tool result represents a genuine *execution* failure — the
+/// tool ran and errored — as opposed to an approval-gate rejection
+/// (`"user declined: …"`) or a client cancellation
+/// (`"agent cancelled by client…"`). JIT only fires on the former: a
+/// policy rejection or cancellation is not a capability gap to acquire.
+fn is_execution_error(r: &ToolResult) -> bool {
+    r.is_error
+        && !r.content.starts_with("user declined:")
+        && !r.content.starts_with("agent cancelled by client")
 }
 
 /// Number of attempts the agent loop makes when the LLM call itself
@@ -506,6 +528,10 @@ impl Agent {
         let mut history = req.history;
         let mut iterations: usize = 0;
         let mut accumulated_text = String::new();
+        // JIT: classify a capability gap at most once per turn (the
+        // classification is an extra LLM call, so we don't re-run it on
+        // every subsequent error in the same conversation).
+        let mut jit_attempted = false;
         // First call uses the caller-supplied tool_choice; subsequent
         // calls always use `Auto` because forcing a tool on a
         // post-results turn would loop forever.
@@ -755,7 +781,23 @@ impl Agent {
                     // Append the assistant's tool_use turn so the
                     // next call sees the conversation in shape.
                     history.push(ChatMessage::AssistantToolCalls(calls.clone()));
-                    let results = self.dispatch_calls(&calls, sink, &cancel).await;
+                    let mut results = self.dispatch_calls(&calls, sink, &cancel).await;
+                    // JIT capability acquisition: if a tool genuinely
+                    // FAILED TO EXECUTE (not a policy rejection or a
+                    // client cancellation — those aren't capability
+                    // gaps) and we haven't classified yet this turn,
+                    // diagnose the gap and graft a one-line acquisition
+                    // hint onto the failing result so the model's next
+                    // turn knows which mechanism to reach for.
+                    if !jit_attempted && results.iter().any(is_execution_error) {
+                        jit_attempted = true;
+                        if let Some(hint) = self.run_jit_diagnosis(&calls, &results, sink).await {
+                            if let Some(r) = results.iter_mut().find(|r| is_execution_error(r)) {
+                                r.content.push_str("\n\n[JIT] ");
+                                r.content.push_str(&hint);
+                            }
+                        }
+                    }
                     // If cancellation tripped mid-batch, the per-call
                     // synth result already accounts for it and the
                     // outer loop's pre-iteration gate will halt before
@@ -844,6 +886,56 @@ impl Agent {
             }
         }
         sink.push(event).await;
+    }
+
+    /// JIT: classify the capability gap behind a failed tool batch and
+    /// emit the diagnosis (`GapClassified`) + the recommended next rung
+    /// (`AcquisitionAttempt`). Returns a one-line hint the caller grafts
+    /// onto the failing tool result so the model's next turn reaches for
+    /// the right acquisition mechanism instead of giving up. Best-effort:
+    /// a classifier failure logs + returns `None` (never breaks the run).
+    async fn run_jit_diagnosis(
+        &self,
+        calls: &[ToolCall],
+        results: &[ToolResult],
+        sink: &mut EventSink<'_>,
+    ) -> Option<String> {
+        use crate::intelligence::jit;
+
+        let mut situation = String::from(
+            "An AI agent's tool call just failed. Classify the underlying gap.\nFailures:\n",
+        );
+        for (call, res) in calls.iter().zip(results.iter()) {
+            if is_execution_error(res) {
+                situation.push_str(&format!("- tool `{}` failed: {}\n", call.name, res.content));
+            }
+        }
+
+        let (kind, rationale) = match jit::classify_gap(self.llm.as_ref(), &situation).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("jit classify_gap failed: {e}");
+                return None;
+            }
+        };
+        self.emit(
+            sink,
+            AgentEvent::GapClassified {
+                kind: kind.as_str().to_string(),
+                rationale,
+            },
+        )
+        .await;
+        let (rung, outcome) = jit::acquisition_hint(kind);
+        self.emit(
+            sink,
+            AgentEvent::AcquisitionAttempt {
+                rung: rung.as_str().to_string(),
+                outcome: outcome.clone(),
+            },
+        )
+        .await;
+        Some(outcome)
     }
 
     /// Dispatch one batch of tool calls. Each call:
@@ -1347,6 +1439,34 @@ mod tests {
     use crate::intelligence::approval::{AutoApprove, DenyAll};
     use crate::intelligence::tools::{ToolHandler, ToolHandlerResult};
     use serde_json::json;
+
+    #[test]
+    fn jit_fires_only_on_genuine_execution_errors() {
+        let exec = ToolResult {
+            tool_use_id: "1".into(),
+            content: "search backend connection refused".into(),
+            is_error: true,
+        };
+        let declined = ToolResult {
+            tool_use_id: "2".into(),
+            content: "user declined: not allowed".into(),
+            is_error: true,
+        };
+        let cancelled = ToolResult {
+            tool_use_id: "3".into(),
+            content: "agent cancelled by client; tool dispatch skipped".into(),
+            is_error: true,
+        };
+        let ok = ToolResult {
+            tool_use_id: "4".into(),
+            content: "ok".into(),
+            is_error: false,
+        };
+        assert!(is_execution_error(&exec));
+        assert!(!is_execution_error(&declined), "approval rejection is not a capability gap");
+        assert!(!is_execution_error(&cancelled), "cancellation is not a capability gap");
+        assert!(!is_execution_error(&ok));
+    }
     use std::sync::Mutex;
     use thinkingroot_llm::scheduler::HeaderRateLimits;
 

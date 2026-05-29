@@ -977,6 +977,65 @@ impl GraphStore {
                 =>
                 resolved_at: Validity
             }",
+
+            // ─── Compiled Prompt substrate (Root Functions / Compiled
+            //     Prompts slice). `prompt_templates` is versioned:
+            //     every `put_template` writes a NEW row with an
+            //     incremented `version`, so older versions stay
+            //     readable for diff/rollback. The latest version for a
+            //     `name` is `max(version)`. `variables_json` is the
+            //     JSON array of `{{var}}` names the template references,
+            //     derived deterministically at write time so the
+            //     declared variable set never drifts from the body.
+            ":create prompt_templates {
+                id: String
+                =>
+                name: String,
+                template_text: String,
+                variables_json: String default '[]',
+                version: Int default 1,
+                created_at: Float default 0.0
+            }",
+            // ─── prompt_nodes — composable prompt fragments that
+            //     reference a template by id and carry an ordering +
+            //     role (system/user/assistant) for multi-part prompt
+            //     assembly. PK is the node id.
+            ":create prompt_nodes {
+                id: String
+                =>
+                template_id: String,
+                name: String,
+                role: String default 'system',
+                order_idx: Int default 0
+            }",
+
+            // ─── Root Functions — user/agent-authored code units the
+            //     `deno_core` isolate executor runs (flow node type
+            //     `root_function`). Versioned append-only like
+            //     prompt_templates so a deploy never clobbers history.
+            //     `language` is 'js' for v1. PK is `"{name}@{version}"`.
+            ":create root_functions {
+                id: String
+                =>
+                name: String,
+                body: String,
+                language: String default 'js',
+                version: Int default 1,
+                created_at: Float default 0.0
+            }",
+            // ─── root_function_runs — one row per invocation, for the
+            //     Console Functions tab's run log + the CLI `invoke`
+            //     output. `status` is 'ok' | 'error'. PK is the run id.
+            ":create root_function_runs {
+                id: String
+                =>
+                function_name: String,
+                status: String,
+                started_at: Float default 0.0,
+                finished_at: Float default 0.0,
+                output_json: String default '',
+                error: String default ''
+            }",
         ];
 
         for stmt in &relations {

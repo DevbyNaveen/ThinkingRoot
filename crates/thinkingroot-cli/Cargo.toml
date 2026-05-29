@@ -144,6 +144,9 @@ sysinfo = { workspace = true }
 ## --no-default-features for faster test builds that skip ONNX Runtime linking.
 default = ["vector"]
 vector = ["thinkingroot-graph/vector", "thinkingroot-serve/vector", "thinkingroot-branch/vector"]
+## Passthrough: build the engine with the Root Function V8 isolate so
+## `root serve` can execute deployed functions end-to-end.
+root-functions = ["thinkingroot-serve/root-functions"]
 
 [dev-dependencies]
 tempfile = "3"

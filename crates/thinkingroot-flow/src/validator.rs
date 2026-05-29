@@ -115,6 +115,19 @@ pub fn validate(
                     });
                 }
             }
+            NodeType::RootFunction { function, .. } => {
+                // Root Functions are workspace-stored and authored at
+                // runtime, so we can't check existence against a
+                // compile-time registry here — we only reject an empty
+                // name. The executor resolves + errors honestly if the
+                // named function isn't deployed.
+                if function.trim().is_empty() {
+                    errors.push(FlowError::UnknownFunction {
+                        node_id: node_id.clone(),
+                        function: function.clone(),
+                    });
+                }
+            }
             NodeType::ClientSampling { .. } | NodeType::Human { .. } => {
                 // No external dependencies to validate.
             }

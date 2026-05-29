@@ -36,6 +36,11 @@ pub async fn run(
     // honestly refuse here because no broadcast channel is installed —
     // stdio MCP has no sidecar to restart from this process.
     crate::operator_tools::register_all();
+    // JIT acquisition tools too. `mcp_server_install` works over stdio
+    // (it writes config + remounts the global registry); its
+    // `tools/list_changed` broadcast is a no-op here since stdio has no
+    // SSE session map installed.
+    crate::acquisition_tools::register_all();
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);

@@ -62,6 +62,7 @@ pub enum NodeTypeKind {
     ClientSampling,
     Deterministic,
     Human,
+    RootFunction,
 }
 
 impl NodeTypeKind {
@@ -72,6 +73,7 @@ impl NodeTypeKind {
             NodeType::ClientSampling { .. } => Self::ClientSampling,
             NodeType::Deterministic { .. } => Self::Deterministic,
             NodeType::Human { .. } => Self::Human,
+            NodeType::RootFunction { .. } => Self::RootFunction,
         }
     }
 }

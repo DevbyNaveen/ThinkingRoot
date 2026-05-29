@@ -64,6 +64,9 @@ pub enum CloudError {
     #[error("auth.json JSON parse error: {0}")]
     JsonParse(#[source] serde_json::Error),
 
+    #[error("secrets.toml parse/serialize error: {0}")]
+    TomlParse(String),
+
     #[error("HTTP transport error: {0}")]
     Http(#[source] reqwest::Error),
 }

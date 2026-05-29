@@ -1409,6 +1409,254 @@ impl QueryEngine {
         storage.graph.list_witnesses(limit)
     }
 
+    // ─── Compiled Prompt substrate ──────────────────────────────────
+    // Thin delegations to the workspace `GraphStore`'s prompt API
+    // (`thinkingroot_graph::prompt`). Same lock-then-graph pattern as
+    // the witness methods above.
+
+    /// Write a new template version; returns the stored row.
+    pub async fn prompt_put_template(
+        &self,
+        ws: &str,
+        name: &str,
+        template_text: &str,
+    ) -> Result<thinkingroot_graph::prompt::PromptTemplate> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.prompt_put_template(name, template_text)
+    }
+
+    /// Latest version of a single template, or `None`.
+    pub async fn prompt_get_latest(
+        &self,
+        ws: &str,
+        name: &str,
+    ) -> Result<Option<thinkingroot_graph::prompt::PromptTemplate>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.prompt_get_latest(name)
+    }
+
+    /// The latest version of every distinct template.
+    pub async fn prompt_list_latest(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::prompt::PromptTemplate>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.prompt_list_latest()
+    }
+
+    /// Every stored version of `name`, ascending.
+    pub async fn prompt_list_versions(
+        &self,
+        ws: &str,
+        name: &str,
+    ) -> Result<Vec<thinkingroot_graph::prompt::PromptTemplate>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.prompt_list_versions(name)
+    }
+
+    /// Assemble the latest version of `name` with `vars`.
+    pub async fn assemble_prompt(
+        &self,
+        ws: &str,
+        name: &str,
+        vars: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.assemble_prompt(name, vars)
+    }
+
+    // ─── Root Functions ─────────────────────────────────────────────
+    // Storage delegations to the workspace `GraphStore` plus the
+    // `invoke_function` execution path (loads the body, runs it in the
+    // feature-gated `deno_core` isolate, records a run row).
+
+    /// Deploy a new function version; returns the stored row.
+    pub async fn put_function(
+        &self,
+        ws: &str,
+        name: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<thinkingroot_graph::root_function::RootFunction> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.put_function(name, body, language)
+    }
+
+    /// Latest version of a single function, or `None`.
+    pub async fn get_function(
+        &self,
+        ws: &str,
+        name: &str,
+    ) -> Result<Option<thinkingroot_graph::root_function::RootFunction>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_function(name)
+    }
+
+    /// Latest version of every distinct function.
+    pub async fn list_functions(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::root_function::RootFunction>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_functions()
+    }
+
+    /// Invocation history for a function, newest first.
+    pub async fn list_function_runs(
+        &self,
+        ws: &str,
+        name: &str,
+    ) -> Result<Vec<thinkingroot_graph::root_function::RootFunctionRun>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_function_runs(name)
+    }
+
+    /// Invoke the latest version of `name` with `input`. Resolves the
+    /// body, builds the secret-backed `env` map, runs it in the isolate,
+    /// records a run row, and returns the JSON result. Errors (function
+    /// missing, JS error, feature disabled) are recorded as `error` runs
+    /// and propagated.
+    pub async fn invoke_function(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use thinkingroot_graph::root_function::RootFunctionRun;
+
+        let func = self
+            .get_function(ws, name)
+            .await?
+            .ok_or_else(|| Error::Template(format!("root function '{name}' is not deployed")))?;
+
+        // Secret-backed env: every name in the local secrets store,
+        // resolved through the env-var-first precedence so cloud-injected
+        // values win. See `thinkingroot_cloud_auth::secrets`.
+        let mut env = std::collections::BTreeMap::new();
+        if let Ok(names) = thinkingroot_cloud_auth::secrets::list_names() {
+            for n in names {
+                if let Some(v) = thinkingroot_cloud_auth::secrets::resolve_secret(&n) {
+                    env.insert(n, v);
+                }
+            }
+        }
+
+        let started_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let run_id = ulid::Ulid::new().to_string();
+        let result =
+            crate::root_function_runtime::run_js(&func.body, input, &env, 30).await;
+        let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+        let run = match &result {
+            Ok(v) => RootFunctionRun {
+                id: run_id,
+                function_name: name.to_string(),
+                status: "ok".to_string(),
+                started_at,
+                finished_at,
+                output_json: serde_json::to_string(v).unwrap_or_default(),
+                error: String::new(),
+            },
+            Err(e) => RootFunctionRun {
+                id: run_id,
+                function_name: name.to_string(),
+                status: "error".to_string(),
+                started_at,
+                finished_at,
+                output_json: String::new(),
+                error: e.clone(),
+            },
+        };
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.record_function_run(&run);
+        }
+
+        result.map_err(Error::Template)
+    }
+
+    // ─── MCP connectors ─────────────────────────────────────────────
+    // The Console manages external MCP servers (GitHub, Slack, …) over
+    // REST. These reuse the same `acquisition_tools` config writer + the
+    // global `external_registry` remount the `mcp_server_install` MCP
+    // tool uses, so the CLI/agent and the Console drive one source of
+    // truth (`<workspace>/.thinkingroot/mcp-servers.toml`).
+
+    /// Installed connectors with live tool counts.
+    pub async fn list_mcp_servers(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<crate::acquisition_tools::McpServerInfo>> {
+        let root = self
+            .workspace_root_path(ws)
+            .ok_or_else(|| Error::GraphStorage(format!("workspace '{ws}' not mounted")))?;
+        let configured = crate::acquisition_tools::list_configured_servers(&root)
+            .map_err(Error::GraphStorage)?;
+        // Live tool counts per server, by `<server>::` prefix.
+        let registry = crate::mcp::external_registry::global().await;
+        let tools = registry.list_all_tools().await;
+        let mut out = Vec::new();
+        for entry in configured {
+            let prefix = format!("{}::", entry.name);
+            let tool_count = tools.iter().filter(|(n, _)| n.starts_with(&prefix)).count();
+            let transport = match entry.transport {
+                crate::mcp::external_registry::TransportKind::Stdio => "stdio",
+                crate::mcp::external_registry::TransportKind::Http => "http",
+            };
+            out.push(crate::acquisition_tools::McpServerInfo {
+                name: entry.name,
+                transport: transport.to_string(),
+                tool_count,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Install (or update) a connector, then remount the registry live.
+    /// Returns the total configured-server count.
+    pub async fn install_mcp_server(
+        &self,
+        ws: &str,
+        entry: crate::mcp::external_registry::ServerEntry,
+    ) -> Result<usize> {
+        let root = self
+            .workspace_root_path(ws)
+            .ok_or_else(|| Error::GraphStorage(format!("workspace '{ws}' not mounted")))?;
+        let count = crate::acquisition_tools::upsert_server_entry(&root, entry)
+            .map_err(Error::GraphStorage)?;
+        crate::mcp::external_registry::load_global_from_workspace_config(&root)
+            .await
+            .map_err(|e| Error::GraphStorage(format!("remount: {e}")))?;
+        crate::mcp::sse::notify_tools_list_changed().await;
+        Ok(count)
+    }
+
+    /// Remove a connector by name, then remount. `false` if absent.
+    pub async fn remove_mcp_server(&self, ws: &str, name: &str) -> Result<bool> {
+        let root = self
+            .workspace_root_path(ws)
+            .ok_or_else(|| Error::GraphStorage(format!("workspace '{ws}' not mounted")))?;
+        let removed = crate::acquisition_tools::remove_server_entry(&root, name)
+            .map_err(Error::GraphStorage)?;
+        if removed {
+            crate::mcp::external_registry::load_global_from_workspace_config(&root)
+                .await
+                .map_err(|e| Error::GraphStorage(format!("remount: {e}")))?;
+            crate::mcp::sse::notify_tools_list_changed().await;
+        }
+        Ok(removed)
+    }
+
     /// List every Witness anchored to a specific source. Used by the
     /// Playground SourceLibrary click-through to render the witness
     /// detail panel for a clicked source row.

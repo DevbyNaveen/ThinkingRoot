@@ -6,6 +6,8 @@ pub mod hybrid_queries;
 pub mod ort_session;
 pub mod spreading_activation;
 pub mod per_source_rows;
+pub mod prompt;
+pub mod root_function;
 pub mod rerank;
 pub mod row_blake3;
 pub mod rows;

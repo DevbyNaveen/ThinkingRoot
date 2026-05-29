@@ -215,6 +215,19 @@ pub enum NodeType {
     Human {
         prompt_template: String,
     },
+
+    /// Run a deployed Root Function (user/agent-authored JS) in the
+    /// `deno_core` isolate. The 6th executor — fast, deterministic,
+    /// zero LLM cost, but unlike `Deterministic` (compiled-in Rust)
+    /// the code is authored at runtime and stored in the workspace.
+    /// `function` is the function name; the executor resolves its
+    /// latest version. `input_mapping` reshapes upstream outputs into
+    /// the `input` argument the function receives.
+    RootFunction {
+        function: String,
+        #[serde(default)]
+        input_mapping: BTreeMap<String, String>,
+    },
 }
 
 fn default_max_iterations() -> u32 {

@@ -37,6 +37,49 @@ pub enum SseMsg {
     Message(String),
 }
 
+// ─── tools/list_changed broadcast ────────────────────────────
+//
+// `mcp_server_install` (a `tool_trait` tool) runs behind
+// `McpToolContext`, which carries no `AppState` reach. Mirror the
+// `operator_tools::install_restart_channel` pattern: `AppState`
+// installs the live session map here once at startup, and the tool
+// calls `notify_tools_list_changed()` after a live remount so every
+// connected MCP client re-fetches `tools/list`.
+
+static NOTIFY_SESSIONS: std::sync::OnceLock<SseSessionMap> = std::sync::OnceLock::new();
+
+/// Install the process-global session map used for server→client
+/// notifications. Called once from `AppState::new_with_root`. Repeat
+/// calls are a no-op (the first map is the source of truth).
+pub fn install_notify_sessions(map: SseSessionMap) {
+    let _ = NOTIFY_SESSIONS.set(map);
+}
+
+/// Broadcast an MCP `notifications/tools/list_changed` to every live
+/// SSE session. Returns the count of sessions the frame was queued to.
+/// Honest no-op (returns 0) when no map is installed — the stdio
+/// transport and unit tests have no SSE sessions to notify.
+pub async fn notify_tools_list_changed() -> usize {
+    let Some(map) = NOTIFY_SESSIONS.get() else {
+        return 0;
+    };
+    // Per the 2024-11-05 spec a notification is a JSON-RPC message with
+    // no `id` and no response expected.
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    })
+    .to_string();
+    let guard = map.lock().await;
+    let mut sent = 0;
+    for tx in guard.values() {
+        if tx.send(SseMsg::Message(frame.clone())).is_ok() {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 // ─── Router ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]

@@ -20,6 +20,9 @@ mod cortex_remote;
 mod doctor;
 mod engram_cmd;
 mod eval_cmd;
+mod function_cmd;
+mod prompt_cmd;
+mod secrets_cmd;
 mod mcp_cmd;
 mod mcp_config;
 mod mount_cmd;
@@ -938,6 +941,109 @@ enum Commands {
     Mcp {
         #[command(subcommand)]
         action: McpAction,
+    },
+
+    /// Manage Root Functions (deployed JS run in the engine's V8
+    /// isolate). Talks to a running `root serve` over REST.
+    Function {
+        #[command(subcommand)]
+        action: FunctionAction,
+    },
+
+    /// Manage workspace secrets in `~/.config/thinkingroot/secrets.toml`
+    /// (mode 0600). Read by Root Functions via `ctx.env`.
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+
+    /// Manage Compiled Prompt templates (versioned). Talks to a running
+    /// `root serve` over REST.
+    Prompt {
+        #[command(subcommand)]
+        action: PromptAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FunctionAction {
+    /// Deploy (or version) a function from a JS file.
+    Deploy {
+        name: String,
+        #[arg(long)]
+        code: PathBuf,
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// List deployed functions (latest version each).
+    List {
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Invoke a function with a JSON input argument.
+    Invoke {
+        name: String,
+        #[arg(long, default_value = "{}")]
+        input: String,
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretsAction {
+    /// Set a secret (value read from stdin if omitted).
+    Set { name: String, value: Option<String> },
+    /// List secret names (never values).
+    List,
+    /// Remove a secret.
+    Unset { name: String },
+}
+
+#[derive(Subcommand)]
+enum PromptAction {
+    /// Write a new version of a template from a file (or stdin).
+    Edit {
+        name: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// List templates (latest version each).
+    List {
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Show a template's version history.
+    Version {
+        name: String,
+        #[arg(long, default_value = "main")]
+        workspace: String,
+        #[arg(long, default_value = "http://127.0.0.1:31760")]
+        url: String,
+        #[arg(long)]
+        api_key: Option<String>,
     },
 }
 
@@ -2331,6 +2437,33 @@ async fn async_main() -> anyhow::Result<()> {
             }
             McpAction::Remove { name, workspace } => {
                 mcp_cmd::remove(&name, &workspace)?;
+            }
+        },
+        Some(Commands::Function { action }) => match action {
+            FunctionAction::Deploy { name, code, workspace, url, api_key } => {
+                function_cmd::deploy(&name, &code, &workspace, &url, api_key.as_deref()).await?;
+            }
+            FunctionAction::List { workspace, url, api_key } => {
+                function_cmd::list(&workspace, &url, api_key.as_deref()).await?;
+            }
+            FunctionAction::Invoke { name, input, workspace, url, api_key } => {
+                function_cmd::invoke(&name, &input, &workspace, &url, api_key.as_deref()).await?;
+            }
+        },
+        Some(Commands::Secrets { action }) => match action {
+            SecretsAction::Set { name, value } => secrets_cmd::set(&name, value.as_deref())?,
+            SecretsAction::List => secrets_cmd::list()?,
+            SecretsAction::Unset { name } => secrets_cmd::unset(&name)?,
+        },
+        Some(Commands::Prompt { action }) => match action {
+            PromptAction::Edit { name, file, workspace, url, api_key } => {
+                prompt_cmd::edit(&name, file.as_deref(), &workspace, &url, api_key.as_deref()).await?;
+            }
+            PromptAction::List { workspace, url, api_key } => {
+                prompt_cmd::list(&workspace, &url, api_key.as_deref()).await?;
+            }
+            PromptAction::Version { name, workspace, url, api_key } => {
+                prompt_cmd::version(&name, &workspace, &url, api_key.as_deref()).await?;
             }
         },
         None => {

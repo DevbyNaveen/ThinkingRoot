@@ -570,6 +570,14 @@ pub fn agent_event_to_sse(event: &AgentEvent) -> (&'static str, serde_json::Valu
                 "reason": reason,
             }),
         ),
+        AgentEvent::GapClassified { kind, rationale } => (
+            "gap_classified",
+            json!({ "kind": kind, "rationale": rationale }),
+        ),
+        AgentEvent::AcquisitionAttempt { rung, outcome } => (
+            "acquisition_attempt",
+            json!({ "rung": rung, "outcome": outcome }),
+        ),
     }
 }
 

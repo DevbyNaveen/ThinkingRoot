@@ -22,6 +22,10 @@ vector = ["thinkingroot-graph/vector", "thinkingroot-branch/vector"]
 ## `sigstore-rs` + `reqwest` + `tokio` + `openidconnect` via
 ## `tr-sigstore/live`. Off by default — `cargo build` stays lean.
 live = ["tr-sigstore/live"]
+## Enable the Root Function executor (V8 isolate via `deno_core`). OFF
+## by default so the desktop build + default CI never pay V8's build
+## cost. The cloud `root serve` image builds with this enabled.
+root-functions = ["dep:deno_core", "dep:deno_error"]
 
 [dependencies]
 thinkingroot-core = { workspace = true }
@@ -37,6 +41,7 @@ thinkingroot-link = { workspace = true }
 thinkingroot-compile = { workspace = true }
 thinkingroot-health = { workspace = true }
 thinkingroot-reflect = { workspace = true }
+thinkingroot-cloud-auth = { workspace = true }
 tr-sigstore = { workspace = true }
 blake3 = { workspace = true }
 cozo = { workspace = true }
@@ -55,6 +60,7 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 uuid = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
@@ -99,6 +105,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # (~6 KB), pure Rust, no_std. Closes the timing-side-channel class
 # that `==` allows when comparing user-supplied secrets.
 subtle = "2.6"
+deno_core = { version = "0.402.0", optional = true }
+deno_error = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

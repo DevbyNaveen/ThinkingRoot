@@ -8302,6 +8302,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkingroot-flow"
+version = "0.9.3"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "chrono",
+ "fs2",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thinkingroot-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.2",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "thinkingroot-graph"
 version = "0.9.3"
 dependencies = [
@@ -8502,6 +8523,7 @@ dependencies = [
  "thinkingroot-compile",
  "thinkingroot-core",
  "thinkingroot-extract",
+ "thinkingroot-flow",
  "thinkingroot-graph",
  "thinkingroot-health",
  "thinkingroot-link",

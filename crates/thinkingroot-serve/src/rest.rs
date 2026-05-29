@@ -215,6 +215,10 @@ impl AppState {
         // doctor / read the recovery log / reset breakers / migrate
         // schemas without bouncing through Tauri commands.
         crate::operator_tools::register_all();
+        // JIT capability-acquisition tools (mcp_server_install +
+        // skill_define). Same idempotent tool_trait registry; lets the
+        // agent acquire tools/skills at runtime.
+        crate::acquisition_tools::register_all();
         // Wire the restart-request broadcast channel + an internal
         // subscriber that performs the actual graceful self-exit.
         //
@@ -255,7 +259,16 @@ impl AppState {
             let state = Self {
                 engine: Arc::new(RwLock::new(engine)),
                 api_key,
-                mcp_sessions: crate::mcp::sse::new_session_map(),
+                mcp_sessions: {
+                    // Install the live session map as the process-global
+                    // notify target so `mcp_server_install` can broadcast
+                    // `tools/list_changed` after a live remount. Mirrors
+                    // the `mcp_session_telemetry` install-global pattern
+                    // a few fields below.
+                    let map = crate::mcp::sse::new_session_map();
+                    crate::mcp::sse::install_notify_sessions(map.clone());
+                    map
+                },
                 sessions: crate::intelligence::session::new_session_store(),
                 workspace_root: tokio::sync::RwLock::new(workspace_root),
                 pending_approvals: crate::intelligence::approval::new_pending_approval_map(),
@@ -683,6 +696,31 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/gaps", get(gaps_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
+            // ─── Compiled Prompt substrate ───────────────────────────
+            .route(
+                "/ws/{ws}/prompts",
+                get(list_prompts_handler).put(put_prompt_handler),
+            )
+            .route("/ws/{ws}/prompts/{name}", get(get_prompt_handler))
+            .route("/ws/{ws}/prompts/{name}/versions", get(prompt_versions_handler))
+            .route("/ws/{ws}/prompts/{name}/assemble", post(assemble_prompt_handler))
+            // ─── Root Functions ──────────────────────────────────────
+            .route(
+                "/ws/{ws}/functions",
+                get(list_functions_handler).put(put_function_handler),
+            )
+            .route("/ws/{ws}/functions/{name}", get(get_function_handler))
+            .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
+            .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // ─── MCP connectors ──────────────────────────────────────
+            .route(
+                "/ws/{ws}/mcp-servers",
+                get(list_mcp_servers_handler).post(install_mcp_server_handler),
+            )
+            .route(
+                "/ws/{ws}/mcp-servers/{name}",
+                delete(remove_mcp_server_handler),
+            )
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
             .route("/ws/{ws}/readme", get(workspace_readme_handler))
             .route("/ws/{ws}/relations", get(get_all_relations))
@@ -1614,6 +1652,211 @@ async fn list_sources_handler(
     let engine = state.engine.read().await;
     match engine.list_sources(&ws).await {
         Ok(sources) => ok_response(sources).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Compiled Prompt handlers ────────────────────────────────────────────────
+
+async fn list_prompts_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.prompt_list_latest(&ws).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PutPromptBody {
+    name: String,
+    template_text: String,
+}
+
+async fn put_prompt_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<PutPromptBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .prompt_put_template(&ws, &body.name, &body.template_text)
+        .await
+    {
+        Ok(t) => ok_response(t).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn get_prompt_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.prompt_get_latest(&ws, &name).await {
+        Ok(Some(t)) => ok_response(t).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("prompt template '{name}' not found"),
+        ),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn prompt_versions_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.prompt_list_versions(&ws, &name).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AssemblePromptBody {
+    #[serde(default)]
+    vars: std::collections::BTreeMap<String, String>,
+}
+
+async fn assemble_prompt_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(body): Json<AssemblePromptBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.assemble_prompt(&ws, &name, &body.vars).await {
+        Ok(s) => ok_response(serde_json::json!({ "prompt": s })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Root Function handlers ───────────────────────────────────────────────
+
+async fn list_functions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_functions(&ws).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PutFunctionBody {
+    name: String,
+    body: String,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+async fn put_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(payload): Json<PutFunctionBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let lang = payload.language.as_deref().unwrap_or("js");
+    match engine.put_function(&ws, &payload.name, &payload.body, lang).await {
+        Ok(f) => ok_response(f).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn get_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_function(&ws, &name).await {
+        Ok(Some(f)) => ok_response(f).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("root function '{name}' not found"),
+        ),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct InvokeFunctionBody {
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+async fn invoke_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(payload): Json<InvokeFunctionBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.invoke_function(&ws, &name, &payload.input).await {
+        Ok(v) => ok_response(serde_json::json!({ "result": v })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn function_runs_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_function_runs(&ws, &name).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── MCP connector handlers ───────────────────────────────────────────────
+
+async fn list_mcp_servers_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_mcp_servers(&ws).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn install_mcp_server_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // Validate + parse the connector spec with the same checks the MCP
+    // `mcp_server_install` tool uses.
+    let entry = match crate::acquisition_tools::parse_and_validate(&body) {
+        Ok(e) => e,
+        Err(msg) => return err_response(StatusCode::BAD_REQUEST, "invalid_spec", &msg),
+    };
+    let engine = state.engine.read().await;
+    match engine.install_mcp_server(&ws, entry).await {
+        Ok(count) => ok_response(serde_json::json!({ "server_count": count })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn remove_mcp_server_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.remove_mcp_server(&ws, &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => err_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("connector '{name}' not installed"),
+        ),
         Err(e) => match_engine_error(e),
     }
 }

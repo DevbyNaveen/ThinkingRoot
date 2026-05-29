@@ -17,6 +17,7 @@ scopeguard = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "signal", "time", "net"] }
 tokio-util = { workspace = true, features = ["rt"] }

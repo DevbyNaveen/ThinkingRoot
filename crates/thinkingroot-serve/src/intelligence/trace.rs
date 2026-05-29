@@ -382,6 +382,14 @@ pub fn event_to_trace(event: &AgentEvent) -> (&'static str, serde_json::Value) {
                 "reason": reason,
             }),
         ),
+        AgentEvent::GapClassified { kind: gap_kind, rationale } => (
+            "agent.gap_classified",
+            json!({ "kind": gap_kind, "rationale": rationale }),
+        ),
+        AgentEvent::AcquisitionAttempt { rung, outcome } => (
+            "agent.acquisition_attempt",
+            json!({ "rung": rung, "outcome": outcome }),
+        ),
     }
 }
 

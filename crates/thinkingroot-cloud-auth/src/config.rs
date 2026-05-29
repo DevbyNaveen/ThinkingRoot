@@ -170,7 +170,7 @@ fn redacted_token(token: &Option<String>) -> String {
 }
 
 #[cfg(unix)]
-fn chmod_0600(path: &std::path::Path) -> Result<(), CloudError> {
+pub(crate) fn chmod_0600(path: &std::path::Path) -> Result<(), CloudError> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path).map_err(CloudError::Io)?.permissions();
     perms.set_mode(0o600);
@@ -179,7 +179,7 @@ fn chmod_0600(path: &std::path::Path) -> Result<(), CloudError> {
 }
 
 #[cfg(not(unix))]
-fn chmod_0600(_path: &std::path::Path) -> Result<(), CloudError> {
+pub(crate) fn chmod_0600(_path: &std::path::Path) -> Result<(), CloudError> {
     Ok(())
 }
 

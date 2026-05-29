@@ -1978,6 +1978,18 @@ pub async fn handle_call(
                     )),
                 )
                 .await;
+            // root_function — the 6th executor. Runs deployed JS in the
+            // feature-gated deno_core isolate via invoke_function; when
+            // the engine is built without `root-functions`, the node
+            // fails with a typed "feature not enabled" error.
+            executors
+                .register(
+                    thinkingroot_flow::runtime::NodeTypeKind::RootFunction,
+                    std::sync::Arc::new(crate::flow_executors::root_function::RootFunctionExecutor::new(
+                        app_state.engine.clone(),
+                    )),
+                )
+                .await;
             let runtime = thinkingroot_flow::runtime::FlowRuntime::new(store, executors);
 
             match runtime

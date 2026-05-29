@@ -25,3 +25,4 @@ pub mod client_sampling;
 pub mod human;
 pub mod local_llm;
 pub mod mcp_tool;
+pub mod root_function;
