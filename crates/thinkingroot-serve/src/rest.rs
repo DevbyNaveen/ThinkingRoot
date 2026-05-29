@@ -713,6 +713,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/functions/{name}", get(get_function_handler))
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // ─── Flow triggers (headless) ────────────────────────────
+            .route("/ws/{ws}/flows", get(list_flows_handler))
+            .route("/ws/{ws}/flows/{flow_id}/run", post(run_flow_handler))
+            .route("/ws/{ws}/flow-runs/{run_id}", get(flow_run_status_handler))
             // ─── MCP connectors ──────────────────────────────────────
             .route(
                 "/ws/{ws}/mcp-servers",
@@ -1812,6 +1816,177 @@ async fn function_runs_handler(
     match engine.list_function_runs(&ws, &name).await {
         Ok(v) => ok_response(v).into_response(),
         Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Flow triggers (headless / cloud) ─────────────────────────────────────
+
+/// Build the executor registry for a **headless** flow run — the set that works
+/// without a connected AI client: deterministic, local LLM, MCP tool, auto-
+/// approved human, and Root Function. `ClientSampling` is intentionally absent
+/// (those nodes sample the connected client, which a REST/cron/webhook trigger
+/// has none of) — a flow that uses one fails with a clear "no executor"
+/// error instead of hanging. Triggering such flows still works over MCP.
+async fn build_headless_executors(
+    state: &Arc<AppState>,
+) -> thinkingroot_flow::runtime::Executors {
+    use thinkingroot_flow::runtime::{Executors, NodeTypeKind};
+    let exec_registry =
+        thinkingroot_flow::executors::deterministic::DeterministicRegistry::with_builtins();
+    let executors = Executors::default();
+    executors
+        .register(
+            NodeTypeKind::Deterministic,
+            std::sync::Arc::new(
+                thinkingroot_flow::executors::deterministic::DeterministicExecutor::new(
+                    exec_registry,
+                ),
+            ),
+        )
+        .await;
+    executors
+        .register(
+            NodeTypeKind::LocalLlm,
+            std::sync::Arc::new(crate::flow_executors::local_llm::LocalLlmExecutor::new(
+                state.engine.clone(),
+            )),
+        )
+        .await;
+    executors
+        .register(
+            NodeTypeKind::McpTool,
+            std::sync::Arc::new(crate::flow_executors::mcp_tool::McpToolExecutor::new(
+                state.engine.clone(),
+                state.sessions.clone(),
+                state.engram_manager.clone(),
+                state.clone(),
+            )),
+        )
+        .await;
+    executors
+        .register(
+            NodeTypeKind::Human,
+            std::sync::Arc::new(crate::flow_executors::human::HumanExecutor::new(
+                std::sync::Arc::new(crate::intelligence::approval::AutoApprove),
+            )),
+        )
+        .await;
+    executors
+        .register(
+            NodeTypeKind::RootFunction,
+            std::sync::Arc::new(
+                crate::flow_executors::root_function::RootFunctionExecutor::new(
+                    state.engine.clone(),
+                ),
+            ),
+        )
+        .await;
+    executors
+}
+
+fn flow_store_for(state_root: std::path::PathBuf) -> thinkingroot_flow::storage::FlowStore {
+    thinkingroot_flow::storage::FlowStore::new(state_root)
+}
+
+#[derive(Debug, Deserialize)]
+struct RunFlowBody {
+    /// Inputs validated against the flow definition's `inputs` schema at start.
+    #[serde(default)]
+    inputs: serde_json::Value,
+}
+
+/// `GET /api/v1/ws/{ws}/flows` — list flow definitions.
+async fn list_flows_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let root = {
+        let engine = state.engine.read().await;
+        match engine.workspace_root_path(&ws) {
+            Some(p) => p,
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "ws_not_mounted",
+                    &format!("workspace '{ws}' not mounted"),
+                )
+            }
+        }
+    };
+    match flow_store_for(root).list_flow_definitions() {
+        Ok(defs) => ok_response(defs).into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, "list_flows_failed", &e.to_string()),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/flows/{flow_id}/run` — start a headless run. Returns
+/// the flow_run_id immediately; the run executes asynchronously. Poll
+/// `GET /flow-runs/{id}` for status.
+async fn run_flow_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, flow_id)): Path<(String, String)>,
+    Json(body): Json<RunFlowBody>,
+) -> Response {
+    let root = {
+        let engine = state.engine.read().await;
+        match engine.workspace_root_path(&ws) {
+            Some(p) => p,
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "ws_not_mounted",
+                    &format!("workspace '{ws}' not mounted"),
+                )
+            }
+        }
+    };
+    let store = flow_store_for(root);
+    let executors = build_headless_executors(&state).await;
+    let runtime = thinkingroot_flow::runtime::FlowRuntime::new(store, executors);
+    match runtime
+        .start_run_for_session(&flow_id, &ws, "main", body.inputs, None)
+        .await
+    {
+        Ok(handle) => ok_response(serde_json::json!({
+            "flow_run_id": handle.flow_run_id,
+            "status": "running",
+            "started_at": handle.started_at.to_rfc3339(),
+        }))
+        .into_response(),
+        Err(e) => err_response(StatusCode::BAD_REQUEST, "flow_run_failed", &e.to_string()),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/flow-runs/{run_id}` — a run's current status/outputs.
+async fn flow_run_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, run_id)): Path<(String, String)>,
+) -> Response {
+    let root = {
+        let engine = state.engine.read().await;
+        match engine.workspace_root_path(&ws) {
+            Some(p) => p,
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "ws_not_mounted",
+                    &format!("workspace '{ws}' not mounted"),
+                )
+            }
+        }
+    };
+    match flow_store_for(root).get_flow_run(&run_id) {
+        Ok(Some(r)) => ok_response(r).into_response(),
+        Ok(None) => err_response(
+            StatusCode::NOT_FOUND,
+            "flow_run_not_found",
+            &format!("flow run '{run_id}' not found"),
+        ),
+        Err(e) => err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "flow_run_status_failed",
+            &e.to_string(),
+        ),
     }
 }
 
