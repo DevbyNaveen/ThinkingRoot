@@ -11,6 +11,7 @@ pub mod branch_cache;
 pub mod egress;
 pub mod engine;
 pub mod fingerprint;
+pub mod flow_cron;
 pub mod flow_executors;
 pub mod fs_ops;
 pub mod graph;

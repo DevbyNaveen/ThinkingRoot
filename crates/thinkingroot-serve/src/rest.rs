@@ -1827,7 +1827,7 @@ async fn function_runs_handler(
 /// (those nodes sample the connected client, which a REST/cron/webhook trigger
 /// has none of) — a flow that uses one fails with a clear "no executor"
 /// error instead of hanging. Triggering such flows still works over MCP.
-async fn build_headless_executors(
+pub(crate) async fn build_headless_executors(
     state: &Arc<AppState>,
 ) -> thinkingroot_flow::runtime::Executors {
     use thinkingroot_flow::runtime::{Executors, NodeTypeKind};

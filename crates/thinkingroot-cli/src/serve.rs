@@ -363,6 +363,10 @@ pub async fn run_serve(
     };
     let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
 
+    // Flow cron scheduler — triggers headless runs for flows whose definition
+    // carries a `schedule` (5-field cron, UTC). Reads the workspace at tick time.
+    let _flow_cron_handle = thinkingroot_serve::flow_cron::spawn_flow_cron(state.clone());
+
     for (ws_name, path, _) in &resolved_paths {
         state
             .mounted_workspace_roots
@@ -683,6 +687,10 @@ async fn run_serve_with_listener(
         None
     };
     let state = AppState::new_with_root(engine, api_key, workspace_root.clone());
+
+    // Flow cron scheduler — triggers headless runs for flows whose definition
+    // carries a `schedule` (5-field cron, UTC). Reads the workspace at tick time.
+    let _flow_cron_handle = thinkingroot_serve::flow_cron::spawn_flow_cron(state.clone());
 
     for (ws_name, path) in &resolved_paths {
         state

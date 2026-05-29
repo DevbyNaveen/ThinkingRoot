@@ -69,6 +69,13 @@ pub struct FlowDefinition {
     /// before failing the run. Default 1 (one retry total).
     #[serde(default = "default_max_node_retries")]
     pub max_node_retries: u32,
+
+    /// Optional cron schedule (standard 5-field: `min hour dom month dow`,
+    /// UTC). When set, the serve daemon's flow-cron task triggers a headless
+    /// run each matching minute. None ⇒ the flow only runs when triggered
+    /// explicitly (MCP / REST / webhook).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
 }
 
 fn default_version() -> u32 {
