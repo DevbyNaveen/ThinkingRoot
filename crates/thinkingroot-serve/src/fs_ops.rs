@@ -119,6 +119,25 @@ pub fn list_directory(root: &Path, workspace: &str, rel: &str) -> Result<DirList
     })
 }
 
+/// Read a UTF-8 text file within the workspace (size-capped). Read-only, so —
+/// unlike rename/move, which protect engine state from mutation — it may read
+/// engine-managed `.thinkingroot/*` files (e.g. flow-run status JSON). Path is
+/// escape-guarded by `safe_path_within`.
+pub fn read_file(root: &Path, rel: &str) -> Result<String, String> {
+    const MAX_BYTES: u64 = 1024 * 1024; // 1 MiB cap
+    let target = safe_path_within(root, rel)?;
+    if !target.is_file() {
+        return Err(format!("`{rel}` is not a file"));
+    }
+    let len = fs::metadata(&target)
+        .map_err(|e| format!("stat `{rel}`: {e}"))?
+        .len();
+    if len > MAX_BYTES {
+        return Err(format!("`{rel}` is too large to read ({len} bytes)"));
+    }
+    fs::read_to_string(&target).map_err(|e| format!("read `{rel}`: {e}"))
+}
+
 /// Create `<root>/<parent_rel>/<name>` as a new directory. Returns the
 /// new rel_path on success.
 pub fn create_folder(root: &Path, parent_rel: &str, name: &str) -> Result<String, String> {

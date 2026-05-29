@@ -643,6 +643,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // primitives, so AI agents can reorganise a workspace
             // exactly the way a human can.
             .route("/ws/{ws}/fs/list", get(fs_list_handler))
+            .route("/ws/{ws}/fs/read", get(fs_read_handler))
             .route("/ws/{ws}/fs/create-folder", post(fs_create_folder_handler))
             .route("/ws/{ws}/fs/rename", post(fs_rename_handler))
             .route("/ws/{ws}/fs/move", post(fs_move_handler))
@@ -2076,6 +2077,12 @@ struct FsListParams {
     rel: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FsReadParams {
+    /// Workspace-relative path of the file to read.
+    rel: String,
+}
+
 #[derive(Deserialize)]
 struct FsCreateFolderBody {
     parent_rel: String,
@@ -2121,6 +2128,25 @@ async fn fs_list_handler(
     match crate::fs_ops::list_directory(&root, &ws, &rel) {
         Ok(listing) => ok_response(listing).into_response(),
         Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_list_failed", &msg),
+    }
+}
+
+async fn fs_read_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<FsReadParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let root = match resolve_workspace_root_for_fs(&engine, &ws) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match crate::fs_ops::read_file(&root, &params.rel) {
+        Ok(content) => {
+            ok_response(serde_json::json!({ "rel_path": params.rel, "content": content }))
+                .into_response()
+        }
+        Err(msg) => err_response(StatusCode::BAD_REQUEST, "fs_read_failed", &msg),
     }
 }
 

@@ -1538,10 +1538,22 @@ impl QueryEngine {
             .await?
             .ok_or_else(|| Error::Template(format!("root function '{name}' is not deployed")))?;
 
-        // Secret-backed env: every name in the local secrets store,
-        // resolved through the env-var-first precedence so cloud-injected
-        // values win. See `thinkingroot_cloud_auth::secrets`.
+        // Secret-backed env, from two sources:
+        //  1. CLOUD: the provisioner injects each secret as a process env var
+        //     and lists their names in `TR_SECRET_NAMES` (there is no
+        //     secrets.toml inside the per-project container). We read only the
+        //     names in that manifest so system env (PATH, the daemon key,
+        //     TR_OUTBOUND_ALLOWLIST, …) never leaks into `ctx.env`.
+        //  2. DESKTOP/LOCAL: names from `secrets.toml`, resolved env-var-first
+        //     so a cloud-injected value still wins if both exist.
         let mut env = std::collections::BTreeMap::new();
+        if let Ok(manifest) = std::env::var("TR_SECRET_NAMES") {
+            for n in manifest.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Ok(v) = std::env::var(n) {
+                    env.insert(n.to_string(), v);
+                }
+            }
+        }
         if let Ok(names) = thinkingroot_cloud_auth::secrets::list_names() {
             for n in names {
                 if let Some(v) = thinkingroot_cloud_auth::secrets::resolve_secret(&n) {

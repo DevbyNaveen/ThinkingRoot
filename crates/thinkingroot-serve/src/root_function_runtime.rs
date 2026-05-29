@@ -190,9 +190,24 @@ async fn execute_in_isolate(
         "(async () => {{ const __f = ({body}); return await __f({input_json}, {env_json}); }})()"
     );
 
+    // Per-invocation heap cap so a runaway function can't exhaust the engine
+    // container's memory. Paired with the wall-clock timeout below, these are
+    // the two resource bounds on untrusted user code.
+    const MAX_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![fetch_ext::extension()],
+        create_params: Some(v8::CreateParams::default().heap_limits(0, MAX_HEAP_BYTES)),
         ..Default::default()
+    });
+
+    // If the function nears the heap cap, terminate it. We bump the limit a
+    // little inside the callback so V8 unwinds cleanly (raises a catchable
+    // termination) instead of hard-aborting the whole engine process.
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    runtime.add_near_heap_limit_callback(move |current, _initial| {
+        handle.terminate_execution();
+        current + 8 * 1024 * 1024
     });
 
     // Install the `fetch` shim before user code runs.
