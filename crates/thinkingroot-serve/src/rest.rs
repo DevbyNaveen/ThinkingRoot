@@ -713,6 +713,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/functions/{name}", get(get_function_handler))
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            .route(
+                "/ws/{ws}/cognition/{token}/answer",
+                post(answer_cognition_handler),
+            )
             // ─── Flow triggers (headless) ────────────────────────────
             .route("/ws/{ws}/flows", get(list_flows_handler))
             .route("/ws/{ws}/flows/{flow_id}/run", post(run_flow_handler))
@@ -1815,6 +1819,27 @@ async fn function_runs_handler(
     let engine = state.engine.read().await;
     match engine.list_function_runs(&ws, &name).await {
         Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AnswerCognitionBody {
+    #[serde(default)]
+    answer: serde_json::Value,
+}
+
+/// Answer a suspended Root Function's pending `ctx.cognition.ask` (by
+/// token) and resume the run. Returns the resumed result (a value, or
+/// another `{ _suspended, token, question }` marker if it asks again).
+async fn answer_cognition_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, token)): Path<(String, String)>,
+    Json(payload): Json<AnswerCognitionBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.answer_cognition(&ws, &token, &payload.answer).await {
+        Ok(v) => ok_response(serde_json::json!({ "result": v })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

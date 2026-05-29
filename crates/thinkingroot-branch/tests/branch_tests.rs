@@ -285,6 +285,7 @@ async fn ephemeral_merge_short_circuits_to_abandon() {
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -364,6 +365,7 @@ async fn requires_proposal_blocks_raw_merge() {
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -503,6 +505,7 @@ protected_branches = ["main"]
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -618,6 +621,7 @@ async fn requires_proposal_merge_succeeds_with_approved_proposal() {
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -1002,6 +1006,7 @@ async fn merge_fails_loud_on_vector_save_error() {
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -1111,6 +1116,7 @@ async fn failed_merge_leaves_intent_and_recovers() {
         new_claims: vec![],
         new_entities: vec![],
         new_relations: vec![],
+        new_functions: vec![],
         auto_resolved: Vec::<AutoResolution>::new(),
         needs_review: Vec::<ContradictionPair>::new(),
         health_before: HealthScore::default(),
@@ -1347,6 +1353,7 @@ async fn vector_contradiction_pass_flags_semantic_conflict_missed_by_negation_an
         }],
         new_entities: Vec::new(),
         new_relations: Vec::new(),
+        new_functions: Vec::new(),
         auto_resolved: Vec::new(),
         needs_review: Vec::new(),
         health_before: dummy_health.clone(),
@@ -1492,6 +1499,7 @@ async fn vector_contradiction_pass_skips_when_no_shared_entity() {
         }],
         new_entities: Vec::new(),
         new_relations: Vec::new(),
+        new_functions: Vec::new(),
         auto_resolved: Vec::new(),
         needs_review: Vec::new(),
         health_before: dummy_health.clone(),
@@ -1516,4 +1524,31 @@ async fn vector_contradiction_pass_skips_when_no_shared_entity() {
     assert_eq!(added, 0, "shared-entity gate must skip disjoint contexts");
     assert!(diff.needs_review.is_empty());
     assert!(diff.auto_resolved.is_empty());
+}
+
+// 5b: a Root Function authored on a branch is carried in the diff (and thus
+// across a merge), while a function the target already has is not "new".
+#[test]
+fn compute_diff_carries_branch_authored_functions() {
+    use thinkingroot_branch::diff::compute_diff_into;
+    use thinkingroot_graph::graph::GraphStore;
+
+    let dir = tempdir().unwrap();
+    let target_dir = dir.path().join("target");
+    let source_dir = dir.path().join("source");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let target = GraphStore::init(&target_dir).expect("init target");
+    let source = GraphStore::init(&source_dir).expect("init source");
+
+    // target shares 'shared'; source additionally authored 'authored'.
+    target.put_function("shared", "async (i, ctx) => 1", "js").unwrap();
+    source.put_function("shared", "async (i, ctx) => 1", "js").unwrap();
+    source.put_function("authored", "async (i, ctx) => 2", "js").unwrap();
+
+    let diff = compute_diff_into(&target, &source, "stream/s1", None, 0.2, 1.0, false)
+        .expect("diff");
+    let names: Vec<&str> = diff.new_functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["authored"], "only the branch-only function is carried");
+    assert_eq!(diff.new_functions[0].body, "async (i, ctx) => 2");
 }

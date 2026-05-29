@@ -121,6 +121,16 @@ async fn apply_branch_diff(
         }
     }
 
+    // Carry branch-authored Root Functions into the target (deploys a new
+    // version there; append-only, so target history is preserved).
+    for diff_function in &diff.new_functions {
+        target_graph.put_function(
+            &diff_function.name,
+            &diff_function.body,
+            &diff_function.language,
+        )?;
+    }
+
     if propagate_deletions {
         use std::collections::HashSet;
         let source_uris: HashSet<String> = source_graph

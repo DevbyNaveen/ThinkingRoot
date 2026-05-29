@@ -1488,6 +1488,134 @@ impl QueryEngine {
         storage.graph.put_function(name, body, language)
     }
 
+    /// Deploy a function version onto a specific branch's graph (e.g. a
+    /// session's `stream/{id}` quarantine branch) instead of trunk. Errors
+    /// if the branch doesn't exist. The function reaches trunk only when the
+    /// branch is merged (the diff now carries Root Functions — see
+    /// `apply_branch_diff`).
+    pub async fn put_function_on_branch(
+        &self,
+        ws: &str,
+        branch: &str,
+        name: &str,
+        body: &str,
+        language: &str,
+    ) -> Result<thinkingroot_graph::root_function::RootFunction> {
+        let root = self
+            .workspace_root_path(ws)
+            .ok_or_else(|| Error::EntityNotFound(format!("workspace '{ws}' not mounted")))?;
+        let handle = self.branch_engines().get_or_open(&root, branch).await?;
+        handle.graph.put_function(name, body, language)
+    }
+
+    /// Store a control-plane-owned test fixture (input → expected output)
+    /// for a function on trunk. Authored via the `function_test` tool — a
+    /// SEPARATE authority from the `root_function` body author, so a
+    /// self-authored function can't write its own passing tests.
+    pub async fn put_function_test(
+        &self,
+        ws: &str,
+        function_name: &str,
+        input: &serde_json::Value,
+        expected: &serde_json::Value,
+    ) -> Result<()> {
+        use thinkingroot_graph::root_function::FunctionFixture;
+        let fx = FunctionFixture {
+            function_name: function_name.to_string(),
+            fixture_id: ulid::Ulid::new().to_string(),
+            input_json: serde_json::to_string(input).unwrap_or_default(),
+            expect_json: serde_json::to_string(expected).unwrap_or_default(),
+        };
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.put_function_fixture(&fx)
+    }
+
+    /// Run a function's fixtures daemon-side and return `(passed, detail)`.
+    /// The code under test is read from `branch` (the quarantine branch, when
+    /// verifying before merge) while the fixtures come from TRUNK — code from
+    /// the author, tests from a separate authority. This is the result the
+    /// `function_tests` merge check consumes.
+    pub async fn run_function_tests(
+        &self,
+        ws: &str,
+        function_name: &str,
+        branch: Option<&str>,
+    ) -> Result<(bool, String)> {
+        // Body: from the branch under test, else trunk.
+        let func = match branch {
+            Some(b) => {
+                let root = self.workspace_root_path(ws).ok_or_else(|| {
+                    Error::EntityNotFound(format!("workspace '{ws}' not mounted"))
+                })?;
+                let handle = self.branch_engines().get_or_open(&root, b).await?;
+                handle.graph.get_function(function_name)?
+            }
+            None => self.get_function(ws, function_name).await?,
+        }
+        .ok_or_else(|| {
+            Error::Template(format!("root function '{function_name}' is not deployed"))
+        })?;
+
+        // Fixtures: always from trunk (the separate authority).
+        let fixtures_raw = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage.graph.list_function_fixtures(function_name)?
+        };
+        let fixtures: Vec<(serde_json::Value, serde_json::Value)> = fixtures_raw
+            .into_iter()
+            .map(|f| {
+                (
+                    serde_json::from_str(&f.input_json).unwrap_or(serde_json::Value::Null),
+                    serde_json::from_str(&f.expect_json).unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+
+        Ok(crate::root_function_runtime::run_fixture_check(&func.body, &fixtures, 30).await)
+    }
+
+    /// Verify-before-merge for a self-authored function: run its fixtures
+    /// against the branch copy (`run_function_tests`) and promote it to trunk
+    /// ONLY if every fixture passes. A failing function stays quarantined on
+    /// its branch. The explicit, auditable gate — no silent merge. Returns
+    /// `{ promoted, passed, detail, version? }`.
+    pub async fn verify_and_promote_function(
+        &self,
+        ws: &str,
+        function_name: &str,
+        source_branch: &str,
+    ) -> Result<serde_json::Value> {
+        let (passed, detail) = self
+            .run_function_tests(ws, function_name, Some(source_branch))
+            .await?;
+        if !passed {
+            return Ok(serde_json::json!({
+                "promoted": false,
+                "passed": false,
+                "detail": detail,
+            }));
+        }
+        // Promote: read the verified body from the branch, deploy on trunk.
+        let root = self
+            .workspace_root_path(ws)
+            .ok_or_else(|| Error::EntityNotFound(format!("workspace '{ws}' not mounted")))?;
+        let handle = self.branch_engines().get_or_open(&root, source_branch).await?;
+        let func = handle.graph.get_function(function_name)?.ok_or_else(|| {
+            Error::Template(format!(
+                "function '{function_name}' not found on branch '{source_branch}'"
+            ))
+        })?;
+        let promoted = self.put_function(ws, function_name, &func.body, &func.language).await?;
+        Ok(serde_json::json!({
+            "promoted": true,
+            "passed": true,
+            "detail": detail,
+            "version": promoted.version,
+        }))
+    }
+
     /// Latest version of a single function, or `None`.
     pub async fn get_function(
         &self,
@@ -1531,7 +1659,77 @@ impl QueryEngine {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        use thinkingroot_graph::root_function::RootFunctionRun;
+        let run_id = ulid::Ulid::new().to_string();
+        self.run_function_with_id(ws, name, input, &run_id).await
+    }
+
+    /// Function-INDEPENDENT shape of an input (top-level key set / scalar
+    /// kind). The basis for routing: functions are comparable only across a
+    /// shared, name-free class. Heuristic v1 (an LLM classifier is the upgrade).
+    fn shape_of(input: &serde_json::Value) -> String {
+        match input {
+            serde_json::Value::Object(m) => {
+                let mut keys: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                keys.sort_unstable();
+                format!("obj[{}]", keys.join(","))
+            }
+            serde_json::Value::Array(_) => "array".to_string(),
+            serde_json::Value::String(_) => "string".to_string(),
+            serde_json::Value::Number(_) => "number".to_string(),
+            serde_json::Value::Bool(_) => "bool".to_string(),
+            serde_json::Value::Null => "null".to_string(),
+        }
+    }
+
+    /// Per-function input class for run-learning: `{name}:{shape}`. Each
+    /// function accumulates experience under its own class; routing compares
+    /// them by looking up each function's class for a shared shape.
+    fn input_class_for(name: &str, input: &serde_json::Value) -> String {
+        format!("{name}:{}", Self::shape_of(input))
+    }
+
+    /// Experience-based routing: given an input, return every deployed
+    /// function ranked by its learned success on inputs of this shape (best
+    /// first). The moat made consumable — the agent picks; we don't auto-run.
+    pub async fn route_functions(
+        &self,
+        ws: &str,
+        input: &serde_json::Value,
+    ) -> Result<Vec<thinkingroot_graph::root_function::ExperienceEntry>> {
+        use thinkingroot_graph::root_function::ExperienceEntry;
+        let shape = Self::shape_of(input);
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let mut out: Vec<ExperienceEntry> = Vec::new();
+        for f in storage.graph.list_functions()? {
+            let class = format!("{}:{}", f.name, shape);
+            let entry = storage.graph.get_experience(&class, &f.name)?.unwrap_or(ExperienceEntry {
+                function_name: f.name.clone(),
+                weight: 0.0,
+                n_success: 0,
+                n_fail: 0,
+            });
+            out.push(entry);
+        }
+        // Rank by confident success rate (Wilson lower bound), not raw volume.
+        out.sort_by(|a, b| b.score().total_cmp(&a.score()));
+        Ok(out)
+    }
+
+    /// Core durable invocation, parameterised by `run_id` so a *resumed*
+    /// run reuses the same id (and thus its journal). On a suspended
+    /// `ctx.cognition.ask` it persists a pending request and returns a
+    /// `{ _suspended, token, question }` marker; on completion it returns
+    /// the JSON value. `status` is recorded as `ok` | `error` | `suspended`.
+    pub async fn run_function_with_id(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        run_id: &str,
+    ) -> Result<serde_json::Value> {
+        use crate::root_function_runtime::RunOutcome;
+        use thinkingroot_graph::root_function::{PendingRequest, RootFunctionRun};
 
         let func = self
             .get_function(ws, name)
@@ -1563,38 +1761,174 @@ impl QueryEngine {
         }
 
         let started_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        let run_id = ulid::Ulid::new().to_string();
-        let result =
-            crate::root_function_runtime::run_js(&func.body, input, &env, 30).await;
-        let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let ctx_meta = crate::root_function_runtime::FnCtxMeta {
+            run_id: run_id.to_string(),
+            ws: ws.to_string(),
+            fn_name: name.to_string(),
+            version: func.version,
+            attempt: 1,
+            // REST/flow invocation path is session-less; an MCP-originated
+            // path will thread the real session id here in a later phase.
+            session_id: None,
+        };
+        // BYO-key oracle for ctx.llm: the workspace's configured LLM client
+        // (None if the project has no provider key — ctx.llm then errors
+        // honestly rather than fabricating).
+        let llm = self.workspace_llm(ws);
 
-        let run = match &result {
-            Ok(v) => RootFunctionRun {
-                id: run_id,
-                function_name: name.to_string(),
-                status: "ok".to_string(),
-                started_at,
-                finished_at,
-                output_json: serde_json::to_string(v).unwrap_or_default(),
-                error: String::new(),
-            },
-            Err(e) => RootFunctionRun {
-                id: run_id,
-                function_name: name.to_string(),
-                status: "error".to_string(),
-                started_at,
-                finished_at,
-                output_json: String::new(),
-                error: e.clone(),
-            },
+        // Durable execution: load any steps already journaled for this run
+        // (empty for a fresh invocation; populated when resuming the same
+        // run_id — including a freshly-answered cognition), run with replay,
+        // then persist newly-recorded steps + pending requests.
+        let prior_steps: std::collections::HashMap<String, String> = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage
+                .graph
+                .list_steps_for_run(run_id)
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+        let (outcome, new_steps, new_pending, new_cites) =
+            crate::root_function_runtime::run_js_journaled(
+                &func.body, input, &env, ctx_meta, llm, prior_steps, 30,
+            )
+            .await;
+        let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        // Coarse, deterministic input class for run-learning (no LLM call).
+        let input_class = Self::input_class_for(name, input);
+
+        // Map the run outcome to a recorded status + the returned value.
+        let (status, output_json, error, ret): (&str, String, String, Result<serde_json::Value>) =
+            match &outcome {
+                RunOutcome::Done(v) => (
+                    "ok",
+                    serde_json::to_string(v).unwrap_or_default(),
+                    String::new(),
+                    Ok(v.clone()),
+                ),
+                RunOutcome::Suspended => {
+                    let token = new_pending.first().map(|p| p.token.clone()).unwrap_or_default();
+                    let question =
+                        new_pending.first().map(|p| p.question.clone()).unwrap_or_default();
+                    let marker = serde_json::json!({
+                        "_suspended": true, "token": token, "question": question
+                    });
+                    (
+                        "suspended",
+                        serde_json::to_string(&marker).unwrap_or_default(),
+                        String::new(),
+                        Ok(marker),
+                    )
+                }
+                RunOutcome::Failed(e) => {
+                    ("error", String::new(), e.clone(), Err(Error::Template(e.clone())))
+                }
+            };
+
+        let run = RootFunctionRun {
+            id: run_id.to_string(),
+            function_name: name.to_string(),
+            status: status.to_string(),
+            started_at,
+            finished_at,
+            output_json,
+            error,
         };
         {
             let handle = self.get_workspace(ws)?;
             let storage = handle.storage.lock().await;
+            if !new_steps.is_empty() {
+                let _ = storage.graph.record_function_steps(run_id, &new_steps);
+            }
+            if !new_pending.is_empty() {
+                let input_json = serde_json::to_string(input).unwrap_or_default();
+                let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                for p in &new_pending {
+                    let _ = storage.graph.put_pending_request(&PendingRequest {
+                        token: p.token.clone(),
+                        run_id: run_id.to_string(),
+                        ws: ws.to_string(),
+                        function_name: name.to_string(),
+                        step_key: p.step_key.clone(),
+                        question: p.question.clone(),
+                        input_json: input_json.clone(),
+                        status: "pending".to_string(),
+                        created_at: now,
+                    });
+                }
+            }
             let _ = storage.graph.record_function_run(&run);
+
+            // ── Run-learning (the moat) ──
+            // A completed run is positive evidence for (input_class, fn); an
+            // errored run is negative. A suspended run is incomplete — no
+            // signal yet (it'll be judged when it resumes to completion).
+            match &outcome {
+                RunOutcome::Done(_) => {
+                    let _ = storage.graph.bump_function_experience(&input_class, name, true);
+                }
+                RunOutcome::Failed(_) => {
+                    let _ = storage.graph.bump_function_experience(&input_class, name, false);
+                }
+                RunOutcome::Suspended => {}
+            }
+            // Touch edges: link this run to the claims it declared via
+            // ctx.cite, so a later change to any of them causally invalidates
+            // what we learned here.
+            for claim_id in &new_cites {
+                let _ = storage.graph.record_invocation_touch(
+                    run_id,
+                    "claim",
+                    claim_id,
+                    &input_class,
+                    name,
+                    "read",
+                );
+            }
         }
 
-        result.map_err(Error::Template)
+        ret
+    }
+
+    /// Answer a suspended run's pending cognition request (by token) and
+    /// resume the run. The answer is journaled under the request's step key,
+    /// then the function replays from the top — returning a value, or another
+    /// suspension marker if it asks again.
+    pub async fn answer_cognition(
+        &self,
+        ws: &str,
+        token: &str,
+        answer: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let pending = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            let p = storage
+                .graph
+                .get_pending_request(token)
+                .map_err(|e| Error::GraphStorage(format!("get pending request: {e}")))?
+                .ok_or_else(|| {
+                    Error::EntityNotFound(format!(
+                        "no pending cognition request for token '{token}'"
+                    ))
+                })?;
+            // Record the answer as the journaled step the cognition awaits,
+            // then mark the request answered.
+            let answer_json = serde_json::to_string(answer).unwrap_or_else(|_| "null".to_string());
+            storage
+                .graph
+                .record_function_steps(&p.run_id, &[(p.step_key.clone(), answer_json)])
+                .map_err(|e| Error::GraphStorage(format!("record answer step: {e}")))?;
+            let _ = storage.graph.mark_pending_answered(token);
+            p
+        };
+
+        let input: serde_json::Value =
+            serde_json::from_str(&pending.input_json).unwrap_or(serde_json::Value::Null);
+        self.run_function_with_id(ws, &pending.function_name, &input, &pending.run_id)
+            .await
     }
 
     // ─── MCP connectors ─────────────────────────────────────────────
@@ -5377,5 +5711,26 @@ fn cached_claim_to_info(c: &CachedClaim) -> ClaimInfo {
         confidence: c.confidence,
         source_uri: c.source_uri.clone(),
         event_date: c.event_date,
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    // Routing correctness hinges on the input class being function-INDEPENDENT
+    // so functions are comparable within a shared shape. Lock that here.
+    #[test]
+    fn shape_of_is_function_independent_and_stable() {
+        assert_eq!(QueryEngine::shape_of(&serde_json::json!({"b": 1, "a": 2})), "obj[a,b]");
+        assert_eq!(QueryEngine::shape_of(&serde_json::json!({"a": 2, "b": 1})), "obj[a,b]");
+        assert_eq!(QueryEngine::shape_of(&serde_json::json!([1, 2, 3])), "array");
+        assert_eq!(QueryEngine::shape_of(&serde_json::json!("hi")), "string");
+        assert_eq!(QueryEngine::shape_of(&serde_json::json!(7)), "number");
+        // The per-function class layers the name on top of the shared shape.
+        assert_eq!(
+            QueryEngine::input_class_for("classify", &serde_json::json!({"msg": "x"})),
+            "classify:obj[msg]"
+        );
     }
 }

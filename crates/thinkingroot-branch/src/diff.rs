@@ -5,7 +5,8 @@ use std::path::Path;
 use chrono::Utc;
 use thinkingroot_core::{
     AutoResolution, Claim, ClaimId, ClaimType, Confidence, ConflictKind, ContradictionPair,
-    DiffClaim, DiffEntity, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion, Result,
+    DiffClaim, DiffEntity, DiffFunction, DiffRelation, DiffStatus, KnowledgeDiff, PipelineVersion,
+    Result,
     Sensitivity, SourceId, WorkspaceId, config::Config,
 };
 use thinkingroot_graph::graph::GraphStore;
@@ -398,6 +399,29 @@ pub fn compute_diff_into(
         ));
     }
 
+    // New Root Functions: latest version present on the source branch but
+    // absent (by name) on the target — so a branch-authored function can be
+    // carried across the merge once it's verified.
+    let target_fn_names: HashSet<String> = target_graph
+        .list_functions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    let new_functions: Vec<DiffFunction> = source_graph
+        .list_functions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| !target_fn_names.contains(&f.name))
+        .map(|f| DiffFunction {
+            name: f.name,
+            body: f.body,
+            language: f.language,
+            version: f.version,
+            diff_status: DiffStatus::Added,
+        })
+        .collect();
+
     Ok(KnowledgeDiff {
         from_branch: from_branch.to_string(),
         to_branch: target_branch.unwrap_or("main").to_string(),
@@ -405,6 +429,7 @@ pub fn compute_diff_into(
         new_claims,
         new_entities,
         new_relations,
+        new_functions,
         auto_resolved,
         needs_review,
         health_before,

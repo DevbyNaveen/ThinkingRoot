@@ -90,6 +90,12 @@ pub struct KnowledgeProposal {
     /// reviewer (older entries are kept for audit).
     #[serde(default)]
     pub reviews: Vec<ProposalReview>,
+    /// Recorded check results (e.g. `function_tests`, `health_score`). The
+    /// effective result per check name is the LATEST entry. A proposal can
+    /// only reach `Approved` once EVERY `required_checks` name has a passing
+    /// entry here — this is what makes `required_checks` a real gate.
+    #[serde(default)]
+    pub checks: Vec<CheckRun>,
     /// Required-checks list copied from the branch's
     /// `MergePolicy::RequiresProposal { required_checks }` at proposal
     /// open time.  Frozen so a policy change post-open doesn't quietly
@@ -144,6 +150,21 @@ pub struct ProposalReview {
     pub decision: ReviewDecision,
     #[serde(default)]
     pub comment: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// A recorded result for one named check (e.g. `function_tests`). Produced
+/// outside this crate (the engine runs the check daemon-side) and recorded
+/// via [`record_check`]. The latest entry per `name` is authoritative.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckRun {
+    /// Check name; matches an entry in [`KnowledgeProposal::required_checks`].
+    pub name: String,
+    /// Whether the check passed.
+    pub passed: bool,
+    /// Optional human-readable detail (failure reason, fixture summary).
+    #[serde(default)]
+    pub detail: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -209,6 +230,7 @@ pub fn open_proposal(
         author: author.to_string(),
         description,
         reviews: Vec::new(),
+        checks: Vec::new(),
         required_checks,
         min_reviewers,
         status: ProposalStatus::Open,
@@ -271,6 +293,47 @@ pub fn review_proposal(
         reviewer = %reviewer,
         new_status = ?proposal.status,
         "knowledge-pr: review recorded"
+    );
+    Ok(proposal)
+}
+
+/// Record a check result against a proposal and recompute its status. The
+/// engine calls this after running a named check (e.g. `function_tests`)
+/// daemon-side. A failing or missing required check keeps the proposal out
+/// of `Approved`.
+pub fn record_check(
+    refs_dir: &Path,
+    proposal_id: &str,
+    name: &str,
+    passed: bool,
+    detail: Option<String>,
+) -> Result<KnowledgeProposal> {
+    validate_id(proposal_id)?;
+    let mut proposal = read_proposal(refs_dir, proposal_id)?
+        .ok_or_else(|| Error::Config(format!("proposal `{proposal_id}` not found")))?;
+    if matches!(
+        proposal.status,
+        ProposalStatus::Merged | ProposalStatus::Closed
+    ) {
+        return Err(Error::Config(format!(
+            "proposal `{proposal_id}` is in terminal state {:?} and cannot accept checks",
+            proposal.status
+        )));
+    }
+    proposal.checks.push(CheckRun {
+        name: name.to_string(),
+        passed,
+        detail,
+        at: Utc::now(),
+    });
+    proposal.status = recompute_status(&proposal);
+    write_proposal(refs_dir, &proposal)?;
+    tracing::info!(
+        proposal_id = %proposal_id,
+        check = %name,
+        passed,
+        new_status = ?proposal.status,
+        "knowledge-pr: check recorded"
     );
     Ok(proposal)
 }
@@ -459,6 +522,24 @@ fn recompute_status(proposal: &KnowledgeProposal) -> ProposalStatus {
         })
         .count();
 
+    // Every required check must have a LATEST passing result. A missing or
+    // failing check keeps the proposal out of `Approved` even with enough
+    // reviewers — this is what makes `required_checks` a real merge gate
+    // (previously they were never consulted).
+    if !proposal.required_checks.is_empty() {
+        let mut latest_check: HashMap<&str, &CheckRun> = HashMap::new();
+        for c in &proposal.checks {
+            latest_check.insert(c.name.as_str(), c);
+        }
+        let all_checks_pass = proposal
+            .required_checks
+            .iter()
+            .all(|name| latest_check.get(name.as_str()).is_some_and(|c| c.passed));
+        if !all_checks_pass {
+            return ProposalStatus::Open;
+        }
+    }
+
     if approve_count >= proposal.min_reviewers as usize {
         ProposalStatus::Approved
     } else {
@@ -475,6 +556,44 @@ mod tests {
         let r = dir.path().join(".thinkingroot-refs");
         std::fs::create_dir_all(&r).unwrap();
         r
+    }
+
+    #[test]
+    fn required_checks_gate_approval() {
+        let dir = tempdir().unwrap();
+        let refs_dir = refs(&dir);
+        // One required check, one required reviewer.
+        let p = open_proposal(
+            &refs_dir,
+            "stream/s1",
+            Some("main"),
+            "agent",
+            None,
+            1,
+            vec!["function_tests".into()],
+        )
+        .unwrap();
+
+        // Enough approvals, but the check hasn't passed → NOT approved.
+        let p = review_proposal(&refs_dir, &p.id, "alice", ReviewDecision::Approve, None).unwrap();
+        assert!(
+            matches!(p.status, ProposalStatus::Open),
+            "must not approve while a required check is unmet, got {:?}",
+            p.status
+        );
+
+        // A failing check keeps it open.
+        let p = record_check(&refs_dir, &p.id, "function_tests", false, Some("fixture 2 failed".into()))
+            .unwrap();
+        assert!(matches!(p.status, ProposalStatus::Open));
+
+        // Passing the check (latest result wins) → now approved.
+        let p = record_check(&refs_dir, &p.id, "function_tests", true, None).unwrap();
+        assert!(
+            matches!(p.status, ProposalStatus::Approved),
+            "all checks pass + reviewers met → approved, got {:?}",
+            p.status
+        );
     }
 
     #[test]

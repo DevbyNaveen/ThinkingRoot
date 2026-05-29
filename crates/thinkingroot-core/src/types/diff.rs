@@ -23,6 +23,11 @@ pub struct KnowledgeDiff {
     pub new_entities: Vec<DiffEntity>,
     /// Relations present in `from_branch` but not in `to_branch`.
     pub new_relations: Vec<DiffRelation>,
+    /// Root Functions present in `from_branch` but not in `to_branch` — so a
+    /// function authored/quarantined on a branch can be carried to the target
+    /// on merge (e.g. after verification). Empty by default.
+    #[serde(default)]
+    pub new_functions: Vec<DiffFunction>,
     /// Contradictions that were automatically resolved by confidence heuristic.
     pub auto_resolved: Vec<AutoResolution>,
     /// Contradictions that require human or agent review before merging.
@@ -73,6 +78,22 @@ pub struct DiffRelation {
     /// Relation strength [0.0, 1.0].
     pub strength: f64,
     /// Whether the relation was added, modified, or removed.
+    pub diff_status: DiffStatus,
+}
+
+/// A Root Function carried in a branch diff (latest version on the source
+/// branch that the target doesn't yet have).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffFunction {
+    /// Function name.
+    pub name: String,
+    /// Function body (source).
+    pub body: String,
+    /// Language (`"js"`).
+    pub language: String,
+    /// Source-branch version.
+    pub version: i64,
+    /// Whether the function was added, modified, or removed.
     pub diff_status: DiffStatus,
 }
 

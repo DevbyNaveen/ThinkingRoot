@@ -365,6 +365,284 @@ impl McpToolHandler for SkillDefine {
     }
 }
 
+/// JIT acquisition rung 5: author + deploy a Root Function — deterministic
+/// JS the engine runs in its `deno_core` isolate. Makes the previously
+/// advisory-only `DeployRootFunction` rung real: the agent writes code, it's
+/// validated as a callable, and deployed as a new (append-only) version.
+struct RootFunctionDefine;
+
+#[async_trait]
+impl McpToolHandler for RootFunctionDefine {
+    fn name(&self) -> &'static str {
+        "root_function"
+    }
+
+    fn description(&self) -> &'static str {
+        "Author and deploy a Root Function: deterministic JavaScript the engine runs in a secure \
+         sandbox. The body must evaluate to a callable `async (input, ctx) => { ... }`. `ctx` gives \
+         you `ctx.env` (secrets), `ctx.llm.ask(question, context)` (a tools-blind model \
+         coprocessor), `ctx.step(name, fn)` (durable memoization), `ctx.cognition.ask(question)` \
+         (suspend until answered), and `ctx.cite(claimId)`. Use this when you need a reusable, \
+         callable capability rather than a one-off answer. The body is validated as a callable \
+         before deploy and stored as a new version (old versions are preserved). This is rung 5 of \
+         the JIT acquisition ladder."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Function name, e.g. 'classify_ticket'. Re-using a name deploys a new version." },
+                "body": { "type": "string", "description": "JS evaluating to a callable: `async (input, ctx) => { ... }`." },
+                "language": { "type": "string", "description": "Optional; 'js' (default)." }
+            },
+            "required": ["name", "body"]
+        })
+    }
+
+    fn is_write(&self) -> bool {
+        true
+    }
+
+    async fn handle(
+        &self,
+        args: Value,
+        ctx: &McpToolContext<'_>,
+    ) -> Result<Value, McpToolError> {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        let language = args.get("language").and_then(|v| v.as_str()).unwrap_or("js");
+
+        if name.is_empty() {
+            return Err(McpToolError::InvalidArgs("`name` is required".into()));
+        }
+        if body.trim().is_empty() {
+            return Err(McpToolError::InvalidArgs("`body` is required".into()));
+        }
+
+        // Deploy-time gate: reject bodies that aren't a callable (syntax
+        // errors / non-functions) before they ever reach the run path.
+        crate::root_function_runtime::validate_body(body)
+            .await
+            .map_err(McpToolError::Refused)?;
+
+        // Prefer the session's `stream/{id}` quarantine branch: an authored
+        // function lands there, isolated, and reaches trunk only when the
+        // branch merges (the merge now carries Root Functions). Fall back to
+        // trunk only when the session has no branch (e.g. auto_session_branch
+        // disabled, or a session-less caller).
+        let branch = format!("stream/{}", ctx.session_id);
+        match ctx
+            .engine
+            .put_function_on_branch(ctx.workspace, &branch, name, body, language)
+            .await
+        {
+            Ok(deployed) => Ok(json!({
+                "deployed": deployed.name,
+                "version": deployed.version,
+                "language": deployed.language,
+                "branch": branch,
+                "quarantined": true,
+                "note": "validated as a callable and authored on your session branch \
+                         (quarantined). It reaches the project trunk when the branch merges \
+                         (health-gated today; a function-specific verification gate is on the \
+                         roadmap).",
+            })),
+            Err(_) => {
+                let deployed = ctx
+                    .engine
+                    .put_function(ctx.workspace, name, body, language)
+                    .await
+                    .map_err(McpToolError::Backend)?;
+                Ok(json!({
+                    "deployed": deployed.name,
+                    "version": deployed.version,
+                    "language": deployed.language,
+                    "branch": "trunk",
+                    "quarantined": false,
+                    "note": "no session quarantine branch available — deployed to trunk as a new \
+                             version. Not branch-quarantined.",
+                }))
+            }
+        }
+    }
+}
+
+/// Author a control-plane-owned test fixture for a Root Function. This is a
+/// SEPARATE authority from `root_function` (which writes the body): tests
+/// authored here gate whether a self-authored function may merge to trunk,
+/// so a function can't write its own passing tests and game the gate.
+struct FunctionTestDefine;
+
+#[async_trait]
+impl McpToolHandler for FunctionTestDefine {
+    fn name(&self) -> &'static str {
+        "function_test"
+    }
+
+    fn description(&self) -> &'static str {
+        "Author a test fixture for a Root Function: an input and the exact JSON output you expect. \
+         Fixtures are stored on trunk (a separate authority from the function body) and run \
+         daemon-side as the `function_tests` check that gates a self-authored function's merge. \
+         Add fixtures BEFORE trusting an agent-authored function."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "function_name": { "type": "string", "description": "The function these fixtures test." },
+                "input": { "description": "Input value passed to the function (any JSON)." },
+                "expected": { "description": "The exact JSON output the function must return for this input." }
+            },
+            "required": ["function_name", "input", "expected"]
+        })
+    }
+
+    fn is_write(&self) -> bool {
+        true
+    }
+
+    async fn handle(
+        &self,
+        args: Value,
+        ctx: &McpToolContext<'_>,
+    ) -> Result<Value, McpToolError> {
+        let function_name = args.get("function_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if function_name.is_empty() {
+            return Err(McpToolError::InvalidArgs("`function_name` is required".into()));
+        }
+        let input = args
+            .get("input")
+            .ok_or_else(|| McpToolError::InvalidArgs("`input` is required".into()))?;
+        let expected = args
+            .get("expected")
+            .ok_or_else(|| McpToolError::InvalidArgs("`expected` is required".into()))?;
+
+        ctx.engine
+            .put_function_test(ctx.workspace, function_name, input, expected)
+            .await
+            .map_err(McpToolError::Backend)?;
+
+        Ok(json!({
+            "function": function_name,
+            "stored": true,
+            "note": "fixture stored on trunk; runs as the `function_tests` merge check for this function.",
+        }))
+    }
+}
+
+/// Experience-based routing: given an input, rank deployed Root Functions by
+/// their learned success on inputs of that shape. Returns the ranking — the
+/// agent decides which to invoke (no auto-execution). Makes the moat
+/// consumable without hijacking control.
+struct RouteFunction;
+
+#[async_trait]
+impl McpToolHandler for RouteFunction {
+    fn name(&self) -> &'static str {
+        "route"
+    }
+
+    fn description(&self) -> &'static str {
+        "Given an input, rank this project's Root Functions by how well they've worked on inputs \
+         of this shape (learned from past runs, decayed when underlying facts change). Returns \
+         candidates best-first with success/failure counts. Use it to CHOOSE which function to \
+         invoke; it does not run anything. Empty/zero weights mean no experience yet (cold start)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "description": "The input you'd pass to a function (any JSON)." }
+            },
+            "required": ["input"]
+        })
+    }
+
+    async fn handle(
+        &self,
+        args: Value,
+        ctx: &McpToolContext<'_>,
+    ) -> Result<Value, McpToolError> {
+        let input = args
+            .get("input")
+            .ok_or_else(|| McpToolError::InvalidArgs("`input` is required".into()))?;
+        let ranked = ctx
+            .engine
+            .route_functions(ctx.workspace, input)
+            .await
+            .map_err(McpToolError::Backend)?;
+        let candidates: Vec<Value> = ranked
+            .iter()
+            .map(|e| {
+                json!({
+                    "function": e.function_name,
+                    "weight": e.weight,
+                    "n_success": e.n_success,
+                    "n_fail": e.n_fail,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "candidates": candidates,
+            "note": "ranked by learned success on this input shape; you choose + invoke. \
+                     All-zero weights = no experience yet.",
+        }))
+    }
+}
+
+/// Verify-before-merge: run a function's fixtures against the version on the
+/// session's quarantine branch and promote it to trunk ONLY if all pass. The
+/// explicit safety gate for self-authored functions — a failing function
+/// stays on the branch.
+struct PromoteFunction;
+
+#[async_trait]
+impl McpToolHandler for PromoteFunction {
+    fn name(&self) -> &'static str {
+        "promote_function"
+    }
+
+    fn description(&self) -> &'static str {
+        "Promote a function you authored on this session's branch to the project trunk — but ONLY \
+         if its `function_test` fixtures all pass (run daemon-side against the branch copy). \
+         Returns { promoted, passed, detail }. A failing function is NOT promoted and stays \
+         quarantined on the branch. Author fixtures first via `function_test`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "function_name": { "type": "string", "description": "Function to verify + promote." }
+            },
+            "required": ["function_name"]
+        })
+    }
+
+    fn is_write(&self) -> bool {
+        true
+    }
+
+    async fn handle(
+        &self,
+        args: Value,
+        ctx: &McpToolContext<'_>,
+    ) -> Result<Value, McpToolError> {
+        let function_name = args.get("function_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if function_name.is_empty() {
+            return Err(McpToolError::InvalidArgs("`function_name` is required".into()));
+        }
+        let branch = format!("stream/{}", ctx.session_id);
+        ctx.engine
+            .verify_and_promote_function(ctx.workspace, function_name, &branch)
+            .await
+            .map_err(McpToolError::Backend)
+    }
+}
+
 /// Register every acquisition tool into the global `tool_trait`
 /// registry. Idempotent (duplicate names overwrite). Call sites mirror
 /// `operator_tools::register_all`: `rest::new_with_root` (SSE/HTTP) and
@@ -372,6 +650,10 @@ impl McpToolHandler for SkillDefine {
 pub fn register_all() {
     register_tool(Arc::new(McpServerInstall));
     register_tool(Arc::new(SkillDefine));
+    register_tool(Arc::new(RootFunctionDefine));
+    register_tool(Arc::new(FunctionTestDefine));
+    register_tool(Arc::new(RouteFunction));
+    register_tool(Arc::new(PromoteFunction));
 }
 
 #[cfg(test)]

@@ -1036,6 +1036,72 @@ impl GraphStore {
                 output_json: String default '',
                 error: String default ''
             }",
+            // ─── root_function_steps — durable-execution journal. One row
+            //     per completed ctx.step()/shimmed-nondeterminism call, so a
+            //     suspended or crashed run REPLAYS recorded results instead
+            //     of re-executing side effects. PK is (run_id, step_key).
+            ":create root_function_steps {
+                run_id: String,
+                step_key: String
+                =>
+                result_json: String default '',
+                recorded_at: Float default 0.0
+            }",
+            // ─── function_pending_requests — a suspended run's outstanding
+            //     ctx.cognition.ask awaiting an answer. Answering writes the
+            //     answer as a journal step (step_key) and resumes the run.
+            //     PK is the unguessable token. `status` is 'pending'|'answered'.
+            ":create function_pending_requests {
+                token: String
+                =>
+                run_id: String,
+                ws: String,
+                function_name: String,
+                step_key: String,
+                question: String,
+                input_json: String default '',
+                status: String default 'pending',
+                created_at: Float default 0.0
+            }",
+            // ─── function_experience — the MOAT. Learned "which function
+            //     serves which input class", reweighted by run outcomes.
+            //     Competitors with stateless executors can't accumulate this.
+            ":create function_experience {
+                input_class: String,
+                function_name: String
+                =>
+                weight: Float default 0.0,
+                n_success: Int default 0,
+                n_fail: Int default 0,
+                updated_at: Float default 0.0
+            }",
+            // ─── invocation_touch_edges — links a run to the claims/
+            //     witnesses/entities it used, tagged with (input_class,
+            //     function) so a fact change can causally invalidate the
+            //     experience grounded on it. The keystone run→object edge.
+            ":create invocation_touch_edges {
+                run_id: String,
+                object_kind: String,
+                object_id: String
+                =>
+                input_class: String,
+                function_name: String,
+                role: String default 'read',
+                touched_at: Float default 0.0
+            }",
+            // ─── function_test_fixtures — control-plane-owned tests for a
+            //     Root Function: (input -> expected output). Authored by a
+            //     SEPARATE authority from the function body (the `function_test`
+            //     tool, not `root_function`), so a self-authored function can't
+            //     game its own verification. Run daemon-side before merge.
+            ":create function_test_fixtures {
+                function_name: String,
+                fixture_id: String
+                =>
+                input_json: String default '',
+                expect_json: String default '',
+                created_at: Float default 0.0
+            }",
         ];
 
         for stmt in &relations {
@@ -2836,6 +2902,9 @@ impl GraphStore {
         self.remove_claim_temporal(claim_id)?;
         self.remove_contradictions_for_claim(claim_id)?;
         self.remove_claim(claim_id)?;
+        // Moat — causal invalidation: a removed claim can no longer ground
+        // any learned function experience (best-effort; never fails removal).
+        let _ = self.invalidate_experience_for_object("claim", claim_id);
         Ok(())
     }
 
@@ -2893,6 +2962,11 @@ impl GraphStore {
             :put contradictions {id => claim_a, claim_b, explanation, status, detected_at}"#,
             params,
         )?;
+        // Moat — causal invalidation: a contradiction makes BOTH claims'
+        // standing uncertain, so decay any function experience grounded on
+        // either (best-effort; never fails the insert).
+        let _ = self.invalidate_experience_for_object("claim", claim_a);
+        let _ = self.invalidate_experience_for_object("claim", claim_b);
         Ok(())
     }
 
@@ -4698,7 +4772,12 @@ impl GraphStore {
     /// Supersede a claim: set its valid_until to now and record the superseding claim.
     pub fn supersede_claim(&self, old_claim_id: &str, new_claim_id: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp() as f64;
-        self.set_claim_temporal(old_claim_id, 0.0, now, new_claim_id)
+        self.set_claim_temporal(old_claim_id, 0.0, now, new_claim_id)?;
+        // Moat — causal invalidation: the old claim's basis changed, so any
+        // Root Function experience learned from runs that cited it is decayed
+        // (best-effort; never fails the supersede).
+        let _ = self.invalidate_experience_for_object("claim", old_claim_id);
+        Ok(())
     }
 
     /// Count superseded (expired) claims.
