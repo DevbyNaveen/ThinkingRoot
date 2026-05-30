@@ -124,3 +124,7 @@ target/wasm32-unknown-unknown/
 # Benchmarks & Evaluation
 longmemeval-workspace/
 longmemeval-data/
+
+# Research Agent Memory Branching Raw Data
+research-agent-memory-branching/raw/
+
