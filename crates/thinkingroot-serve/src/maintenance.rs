@@ -465,9 +465,12 @@ fn topic_branch_name_for_session(
 ///
 /// Returns Ok(()) when the branch is present-and-Active after the call,
 /// whether we created it or it already existed. The branch is created
-/// with `BranchKind::Feature` + `MergePolicy::Manual` so it never
-/// auto-promotes to main — only an explicit user-initiated merge can
-/// reach main from a topic branch. Concurrent cleanup ticks racing the
+/// with `BranchKind::Feature` + `MergePolicy::RequiresProposal` so the
+/// topic→main promotion is **verify-before-merge gated** (M3): reaching
+/// main requires an approved proposal whose `health_score` check passed.
+/// `min_reviewers: 0` keeps autonomous promotion possible — the checks,
+/// not a human reviewer, are the gate (open a proposal → checks run →
+/// `Approved` iff health passes). Concurrent cleanup ticks racing the
 /// same name are tolerated: `Error::BranchAlreadyExists` is folded into
 /// Ok because the post-state we wanted is already true.
 async fn ensure_topic_branch(
@@ -497,7 +500,10 @@ async fn ensure_topic_branch(
         None, // owner: system
         BranchPermissions::default(),
         BranchKind::Feature,
-        MergePolicy::Manual,
+        MergePolicy::RequiresProposal {
+            min_reviewers: 0,
+            required_checks: vec!["health_score".to_string()],
+        },
         None, // redaction
     )
     .await

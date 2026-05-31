@@ -112,8 +112,29 @@ pub struct SessionContext {
     /// `clientInfo` block on initialize (preserves pre-C6
     /// behaviour for tests).
     pub client_info: Option<ClientInfo>,
+    /// M4 — the query-INDEPENDENT capsule frame (system prompt + workspace
+    /// brief + routed tools) warmed for this session's active branch +
+    /// prompt. Reused across turns so per-turn capsule work collapses to
+    /// just retrieval. Invalidated on a contribute to this session (the
+    /// brief/tools can change) and rebuilt lazily. `brief_json` keeps this
+    /// struct decoupled from the engine-layer `WorkspaceSummary` type.
+    pub warm_frame: Option<WarmFrame>,
     created_at: Instant,
     last_active: Instant,
+}
+
+/// M4 — the cached, query-independent part of a [`crate::engine::CompiledCapsule`]
+/// held on a session so a live streaming-branch turn only pays for
+/// retrieval. `brief_json` is the serialized `WorkspaceSummary` (stored
+/// as a string to avoid coupling the session layer to the engine layer).
+#[derive(Debug, Clone)]
+pub struct WarmFrame {
+    pub branch: Option<String>,
+    pub prompt_name: String,
+    pub prompt_version: i64,
+    pub system: String,
+    pub brief_json: String,
+    pub tools: Vec<String>,
 }
 
 /// MCP spec `clientInfo` object (per JSON-RPC `initialize` params).
@@ -200,9 +221,18 @@ impl SessionContext {
             last_search_query: None,
             last_search_hits: None,
             client_info: None,
+            warm_frame: None,
             created_at: now,
             last_active: now,
         }
+    }
+
+    /// M4 — drop the warm capsule frame. Called on a contribute to this
+    /// session so the next capsule rebuilds the frame against fresh
+    /// brief/tools instead of serving a stale orientation.
+    pub fn invalidate_warm_frame(&mut self) {
+        self.last_active = Instant::now();
+        self.warm_frame = None;
     }
 
     /// Ship 3D (2026-05-20) — record the prior turn's verifier verdict

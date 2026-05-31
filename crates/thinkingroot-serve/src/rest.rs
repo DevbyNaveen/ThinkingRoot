@@ -705,6 +705,15 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/prompts/{name}", get(get_prompt_handler))
             .route("/ws/{ws}/prompts/{name}/versions", get(prompt_versions_handler))
             .route("/ws/{ws}/prompts/{name}/assemble", post(assemble_prompt_handler))
+            // ─── Compiled capsule (low-token, grounded context payload) ─
+            .route("/ws/{ws}/capsule", post(compile_capsule_handler))
+            // ─── Operating-layer artifact nodes (prompts/functions/flows/MCP) ─
+            .route("/ws/{ws}/artifact-nodes", get(list_artifact_nodes_handler))
+            .route("/ws/{ws}/branch-nodes", get(list_branch_nodes_handler))
+            .route("/ws/{ws}/agents/spawn", post(agent_spawn_handler))
+            .route("/ws/{ws}/agents/finish", post(agent_finish_handler))
+            // ─── Per-user-namespaced store (path-guardable; auto-mounts u_*) ─
+            .route("/ws/{ws}/contribute-bulk", post(ws_contribute_handler))
             // ─── Root Functions ──────────────────────────────────────
             .route(
                 "/ws/{ws}/functions",
@@ -893,6 +902,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/proposals/{id}/reviews",
                 post(review_proposal_handler),
             )
+            .route("/proposals/{id}/run-checks", post(run_checks_handler))
+            .route("/consolidate", post(consolidate_handler))
             .route("/proposals/{id}/close", post(close_proposal_handler))
             .route("/head", get(get_head_handler));
         router = router.nest("/api/v1", api_routes);
@@ -1740,6 +1751,125 @@ async fn assemble_prompt_handler(
     let engine = state.engine.read().await;
     match engine.assemble_prompt(&ws, &name, &body.vars).await {
         Ok(s) => ok_response(serde_json::json!({ "prompt": s })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/capsule` — compile (or serve from cache) a
+/// witness-grounded context capsule for one turn. Body is a `CapsuleSpec`
+/// (`prompt_name`, `query`, optional `vars`/`branch`/`top_k`/`max_tools`/
+/// `session_id`). Returns a `CompiledCapsule` whose `token_estimate`
+/// shows the payload is a fraction of raw context and whose `cache_hit`
+/// flags the warm path.
+async fn compile_capsule_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(spec): Json<crate::engine::CapsuleSpec>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    // M4 — when a session_id is supplied this is a live streaming-branch
+    // turn: reuse the session's warm frame so only retrieval runs. Without
+    // one, fall back to the shared query-keyed cache path (M1).
+    let result = match spec.session_id.clone() {
+        Some(session_id) => {
+            engine
+                .compile_capsule_session(&ws, &state.sessions, &session_id, spec)
+                .await
+        }
+        None => engine.compile_capsule(&ws, spec).await,
+    };
+    match result {
+        Ok(capsule) => ok_response(capsule).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/artifact-nodes` — the operating-layer nodes (prompts,
+/// functions, flows, MCP servers/tools) the brain runs on, with their edges,
+/// read straight from the cognition graph. (Distinct from `/artifacts`, which
+/// lists on-disk compile-artifact types.)
+async fn list_artifact_nodes_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_operating_artifacts(&ws).await {
+        Ok(arts) => ok_response(arts).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/branch-nodes` — the brain's view of its own durable
+/// branch topology: typed branch nodes (status/parent/kind/timestamps) synced
+/// from the branch registry. Ephemeral `stream/*` branches are absent by design.
+async fn list_branch_nodes_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_branch_nodes(&ws).await {
+        Ok(nodes) => ok_response(serde_json::json!({ "branches": nodes })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Multi-agent branch-brain lifecycle ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct AgentSpawnRequest {
+    agent_id: String,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+/// `POST /api/v1/ws/{ws}/agents/spawn` — spawn an agent = fork its own
+/// `agent/{id}` branch-brain (RequiresProposal-gated). Returns the branch name.
+async fn agent_spawn_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<AgentSpawnRequest>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .spawn_agent_branch(&ws, &body.agent_id, body.parent.as_deref())
+        .await
+    {
+        Ok(branch) => ok_response(serde_json::json!({ "branch": branch })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentFinishRequest {
+    agent_id: String,
+    #[serde(default)]
+    min_reviewers: Option<u8>,
+    #[serde(default)]
+    auto_merge: Option<bool>,
+}
+
+/// `POST /api/v1/ws/{ws}/agents/finish` — finish an agent = gated merge-back of
+/// its branch-brain into the shared brain (verify-before-merge). Returns the
+/// honest merge report.
+async fn agent_finish_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<AgentFinishRequest>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .finish_agent_branch(
+            &ws,
+            &body.agent_id,
+            body.min_reviewers.unwrap_or(0),
+            body.auto_merge.unwrap_or(true),
+        )
+        .await
+    {
+        Ok(report) => ok_response(serde_json::json!({ "report": report })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
@@ -2974,6 +3104,9 @@ async fn hybrid_search_handler(
     Path(ws): Path<String>,
     Json(req): Json<crate::engine::RetrievalRequest>,
 ) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
     let cancel = tokio_util::sync::CancellationToken::new();
     let _drop_guard = cancel.clone().drop_guard();
     let engine = state.engine.read().await;
@@ -3998,6 +4131,28 @@ async fn create_branch_handler(
             // already subscribed to `/branches/{name}/events/stream`
             // picks it up live.
             publish_latest_branch_event(&state, &branch.name).await;
+            // Sync the new durable branch as a graph node so the brain can
+            // describe its own topology (no-op for ephemeral `stream/*`).
+            // Best-effort — a node-sync failure never fails branch creation.
+            {
+                let kind_label = format!("{:?}", branch.kind);
+                let kind_label = kind_label
+                    .split(|c: char| c == ' ' || c == '{')
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                let created = chrono::Utc::now().timestamp() as f64;
+                let engine = state.engine.read().await;
+                let _ = engine
+                    .sync_branch_created(
+                        &root,
+                        &branch.name,
+                        Some(parent),
+                        Some(&kind_label),
+                        created,
+                    )
+                    .await;
+            }
             ok_response(serde_json::json!({ "branch": branch })).into_response()
         }
         Err(e) => err_response(
@@ -4083,6 +4238,82 @@ async fn contribute_bulk_handler(
             "CONTRIBUTE_BULK_FAILED",
             &e.to_string(),
         ),
+    }
+}
+
+/// #1 — ensure a per-user workspace is mounted before a scoped engine call.
+/// Cheap read-check first; only takes the write lock to auto-mount a `u_*`
+/// namespace on first reference. Non-`u_` names are left to the normal
+/// not-mounted error path. Returns an error `Response` on mount failure.
+async fn ensure_user_ws(state: &AppState, ws: &str) -> std::result::Result<(), Response> {
+    if !ws.starts_with("u_") {
+        return Ok(());
+    }
+    let mounted = { state.engine.read().await.is_mounted(ws) };
+    if mounted {
+        return Ok(());
+    }
+    let mut engine = state.engine.write().await;
+    engine.get_or_mount_user_ws(ws).await.map_err(|e| {
+        err_response(StatusCode::INTERNAL_SERVER_ERROR, "WS_MOUNT_FAILED", &e.to_string())
+    })
+}
+
+/// `POST /api/v1/ws/{ws}/contribute-bulk` — #1 — the per-user-namespaced
+/// store path. Writes claims into `ws`'s main (auto-mounting a per-user
+/// workspace on first use), so the gateway can confine a scoped key by the
+/// path segment (contribute-bulk's body-only workspace can't be guarded).
+#[derive(Deserialize)]
+struct WsContributeRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default = "default_sdk_connector")]
+    connector_id: String,
+    install_id: String,
+    idempotency_key: String,
+    #[serde(default)]
+    backfill: bool,
+    claims: Vec<crate::engine::AgentClaim>,
+}
+
+fn default_sdk_connector() -> String {
+    "sdk".to_string()
+}
+
+async fn ws_contribute_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<WsContributeRequest>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let principal = crate::engine::Principal::Connector {
+        connector_id: body.connector_id.clone(),
+        install_id: body.install_id.clone(),
+    };
+    let session_id = body.session_id.unwrap_or_else(|| {
+        format!(
+            "connector:{}:{}:{}",
+            body.connector_id, body.install_id, body.idempotency_key
+        )
+    });
+    let engine = state.engine.read().await;
+    match engine
+        .contribute_bulk(
+            &ws,
+            &session_id,
+            None, // write to the per-user workspace's main
+            body.claims,
+            &state.sessions,
+            principal,
+            &body.idempotency_key,
+            body.backfill,
+        )
+        .await
+    {
+        Ok(result) => ok_response(serde_json::json!(result)).into_response(),
+        Err(e) => err_response(StatusCode::BAD_REQUEST, "CONTRIBUTE_FAILED", &e.to_string()),
     }
 }
 
@@ -4906,10 +5137,76 @@ async fn open_proposal_handler(
         min_reviewers,
         required_checks,
     ) {
-        Ok(p) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Ok(p) => {
+            // M3 — run the proposal's required checks immediately so it can
+            // reach `Approved` without a manual run-checks call. Best-effort:
+            // a check-run error leaves the proposal Open (gated), not failed-open.
+            let proposal = if let Some(root) = state.current_workspace_root().await {
+                let engine = state.engine.read().await;
+                engine.run_proposal_checks(&root, &p.id).await.unwrap_or(p)
+            } else {
+                p
+            };
+            ok_response(serde_json::json!({ "proposal": proposal })).into_response()
+        }
         Err(e) => err_response(
             StatusCode::BAD_REQUEST,
             "PROPOSAL_OPEN_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// `POST /api/v1/proposals/{id}/run-checks` — run the proposal's required
+/// checks daemon-side and record each result. Returns the updated proposal;
+/// `status` advances to `Approved` once all required checks pass (and the
+/// reviewer count is met). This is the wiring that makes `required_checks`
+/// a real merge gate.
+async fn run_checks_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let root = match state.current_workspace_root().await {
+        Some(r) => r,
+        None => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "NOT_CONFIGURED",
+                "workspace_root not set",
+            );
+        }
+    };
+    let engine = state.engine.read().await;
+    match engine.run_proposal_checks(&root, &id).await {
+        Ok(p) => ok_response(serde_json::json!({ "proposal": p })).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "RUN_CHECKS_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// `POST /api/v1/consolidate` — #2 — run a promotion consolidation pass: mine
+/// quorum'd, de-identified patterns from this project's per-user brains and
+/// stage them for verify-before-merge promotion into the shared brain. The
+/// request body is a [`crate::consolidation::ConsolidationSpec`] (all fields
+/// optional → conservative defaults). This is a privileged op: the cloud only
+/// reaches it for projects with `promotion_enabled`, and it ranges solely over
+/// this daemon's own `u_*` workspaces (one daemon = one project).
+async fn consolidate_handler(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<crate::consolidation::ConsolidationSpec>>,
+) -> Response {
+    let spec = body
+        .map(|Json(s)| s)
+        .unwrap_or_default();
+    let engine = state.engine.read().await;
+    match engine.consolidate_to_shared(spec, &state.sessions).await {
+        Ok(report) => ok_response(serde_json::json!({ "report": report })).into_response(),
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "CONSOLIDATE_FAILED",
             &e.to_string(),
         ),
     }

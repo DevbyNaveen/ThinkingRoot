@@ -1162,7 +1162,17 @@ async fn run_pipeline_inner(
         truly_changed.len() as u64,
     );
     progress_state.set_substep("inserting sources");
-    let byte_store = thinkingroot_graph::FileSystemSourceStore::new(&data_dir)
+    // Write source bytes to the byte store at the SAME root the graph's
+    // `materialize_statement` reads from. `StorageEngine::init` opens the graph
+    // at `{data_dir}/graph` (storage.rs), so `GraphStore::init` roots its byte
+    // store at `{data_dir}/graph/rooting/sources`. This previously wrote to
+    // `FileSystemSourceStore::new(&data_dir)` → `{data_dir}/rooting/sources`,
+    // ONE LEVEL UP from where the graph reads. The mismatch meant
+    // `materialize_statement` never found the bytes, so statements AND their
+    // embeddings fell back to byte-anchor placeholders — hybrid/vector recall
+    // matched nothing and `ask` returned `claims_used=0`. Aligning the write
+    // dir with the graph dir restores semantic recall end-to-end.
+    let byte_store = thinkingroot_graph::FileSystemSourceStore::new(&data_dir.join("graph"))
         .map_err(|e| thinkingroot_core::Error::Config(format!("rooting byte store: {e}")))?;
     for doc in &truly_changed {
         let source = thinkingroot_core::Source::new(doc.uri.clone(), doc.source_type)

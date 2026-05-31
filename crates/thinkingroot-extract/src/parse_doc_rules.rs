@@ -83,11 +83,12 @@ pub fn extract_witnesses_from_chunk(
             // Prose with a commit_author is a git Witness, not a
             // markdown paragraph (the git adapter owns it).
             if chunk.metadata.commit_author.is_none() {
-                push_chunk_witness(
+                // Emit ONE witness per sentence (not per paragraph), so a
+                // multi-fact paragraph yields multiple byte-anchored,
+                // individually-searchable claims. Deterministic, zero-LLM.
+                push_prose_sentence_witnesses(
                     &mut out.witnesses,
                     chunk,
-                    "markdown::paragraph@v1",
-                    "documents::paragraph",
                     source_bytes,
                     file_blake3,
                     source_id,
@@ -227,6 +228,122 @@ fn push_chunk_witness(
         witness = witness.with_symbol(sym);
     }
     out.push(witness);
+}
+
+/// Minimum sentence length (bytes) to emit as its own witness — guards against
+/// emitting noise from abbreviations / stray punctuation.
+const MIN_SENTENCE_BYTES: usize = 16;
+
+/// Emit ONE `markdown::paragraph@v1` witness PER SENTENCE in a prose chunk,
+/// each anchored to its own byte sub-range. This is the granularity fix that
+/// turns a multi-fact paragraph into multiple individually-retrievable claims
+/// (so the cognition graph grows past the hybrid vector-search threshold and
+/// each claim is a single searchable fact) — fully deterministic, zero-LLM,
+/// consistent with the Witness-Mesh "structural only at compile time" design.
+///
+/// Segmentation: split on ASCII `.`/`!`/`?` followed by whitespace or
+/// end-of-chunk. ASCII terminators are single-byte, so the byte offsets stay
+/// UTF-8-exact even when a sentence contains multibyte characters. Falls back
+/// to a single whole-chunk witness when the paragraph has fewer than two
+/// substantive sentences (preserving prior behaviour for one-liners and never
+/// dropping a claim).
+#[allow(clippy::too_many_arguments)]
+fn push_prose_sentence_witnesses(
+    out: &mut Vec<Witness>,
+    chunk: &Chunk,
+    source_bytes: &[u8],
+    file_blake3: &str,
+    source_id: SourceId,
+    workspace_id: WorkspaceId,
+    now: DateTime<Utc>,
+) {
+    let start = chunk.byte_start as usize;
+    let end = (chunk.byte_end as usize).min(source_bytes.len());
+    if end <= start {
+        return;
+    }
+    let slice = &source_bytes[start..end];
+
+    // Collect (seg_start, seg_end) byte sub-ranges relative to `slice`.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    while seg_start < slice.len() && slice[seg_start].is_ascii_whitespace() {
+        seg_start += 1;
+    }
+    let mut i = seg_start;
+    while i < slice.len() {
+        let b = slice[i];
+        let is_term = b == b'.' || b == b'!' || b == b'?';
+        let at_boundary = is_term && (i + 1 >= slice.len() || slice[i + 1].is_ascii_whitespace());
+        if at_boundary {
+            let seg_end = i + 1; // include the terminator
+            if seg_end > seg_start {
+                spans.push((seg_start, seg_end));
+            }
+            let mut j = seg_end;
+            while j < slice.len() && slice[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            seg_start = j;
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    if seg_start < slice.len() {
+        spans.push((seg_start, slice.len()));
+    }
+
+    let kept: Vec<(usize, usize)> = spans
+        .into_iter()
+        .filter(|(s, e)| e.saturating_sub(*s) >= MIN_SENTENCE_BYTES)
+        .collect();
+
+    // 0 or 1 substantive sentence → nothing gained by splitting; preserve the
+    // whole-chunk witness so the claim is never lost.
+    if kept.len() < 2 {
+        push_chunk_witness(
+            out,
+            chunk,
+            "markdown::paragraph@v1",
+            "documents::paragraph",
+            source_bytes,
+            file_blake3,
+            source_id,
+            workspace_id,
+            now,
+        );
+        return;
+    }
+
+    for (s, e) in kept {
+        let abs_start = (start + s) as u64;
+        let abs_end = (start + e) as u64;
+        let span = WitnessSpan {
+            file_blake3: file_blake3.to_string(),
+            start: abs_start,
+            end: abs_end,
+        };
+        let content_blake3 = blake3::hash(&source_bytes[start + s..start + e])
+            .to_hex()
+            .to_string();
+        out.push(Witness::new(
+            "markdown::paragraph@v1".to_string(),
+            "documents::paragraph".to_string(),
+            vec![WitnessInput::ByteRef {
+                file_blake3: file_blake3.to_string(),
+                start: abs_start,
+                end: abs_end,
+            }],
+            vec![span],
+            source_id,
+            workspace_id,
+            Sensitivity::Public,
+            Confidence::new(0.99),
+            content_blake3,
+            now,
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -23,15 +23,31 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
+    /// Base directory for the global config + credentials files.
+    ///
+    /// Honours `THINKINGROOT_CONFIG_DIR` first, used **verbatim** (so a
+    /// deployment — e.g. the per-project engine container — can bake a global
+    /// config at a fixed, non-`$HOME` path like `/etc/thinkingroot` and point
+    /// the engine at it without depending on the runtime user's home). When the
+    /// env var is unset/empty it falls back to the OS config dir + `thinkingroot`
+    /// (`~/.config/thinkingroot`, `~/Library/Application Support/thinkingroot`,
+    /// `%APPDATA%\thinkingroot`).
+    fn config_root() -> Option<PathBuf> {
+        match std::env::var("THINKINGROOT_CONFIG_DIR") {
+            Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir)),
+            _ => dirs::config_dir().map(|d| d.join("thinkingroot")),
+        }
+    }
+
     /// Returns the path to the global config file, or `None` if the config dir cannot be resolved.
     pub fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("thinkingroot").join("config.toml"))
+        Self::config_root().map(|d| d.join("config.toml"))
     }
 
     /// Returns the path to the credentials file (stored separately from config.toml
     /// so the main config can be safely inspected/shared without leaking keys).
     pub fn credentials_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("thinkingroot").join("credentials.toml"))
+        Self::config_root().map(|d| d.join("credentials.toml"))
     }
 
     /// Load the global config from the OS config directory (see struct doc).

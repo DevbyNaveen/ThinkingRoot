@@ -851,6 +851,11 @@ fn apply_pagination<T>(vec: &mut Vec<T>, offset: Option<usize>, limit: Option<us
 
 pub struct QueryEngine {
     workspaces: HashMap<String, WorkspaceHandle>,
+    /// #1 — the primary (shared) workspace: the first non-`u_` workspace
+    /// mounted (the project's shared brain). Tracked explicitly because
+    /// `HashMap` iteration order is non-deterministic — per-user capsules
+    /// fall back to THIS workspace for the shared system prompt.
+    primary_ws: Option<String>,
     /// Process-wide cache of open branch `GraphStore` handles, keyed by
     /// `(workspace_root, branch_name)`. Every serve-crate code path that
     /// reads or writes a branch's graph.db goes through this cache to
@@ -875,6 +880,7 @@ impl QueryEngine {
     pub fn new() -> Self {
         Self {
             workspaces: HashMap::new(),
+            primary_ws: None,
             branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::default_cache()),
             observer: Arc::new(crate::intelligence::observer::Observer::new()),
         }
@@ -886,6 +892,7 @@ impl QueryEngine {
     pub fn with_branch_cache_config(cfg: &thinkingroot_core::config::BranchCacheConfig) -> Self {
         Self {
             workspaces: HashMap::new(),
+            primary_ws: None,
             branch_engines: Arc::new(crate::branch_cache::BranchEngineCache::new(cfg)),
             observer: Arc::new(crate::intelligence::observer::Observer::new()),
         }
@@ -1160,6 +1167,10 @@ impl QueryEngine {
             }
         };
 
+        // #1 — the first non-per-user workspace mounted is the shared brain.
+        if self.primary_ws.is_none() && !name.starts_with("u_") {
+            self.primary_ws = Some(name.clone());
+        }
         self.workspaces.insert(
             name.clone(),
             WorkspaceHandle {
@@ -1227,6 +1238,10 @@ impl QueryEngine {
             Err(_) => None,
         };
 
+        // #1 — the first non-per-user workspace mounted is the shared brain.
+        if self.primary_ws.is_none() && !name.starts_with("u_") {
+            self.primary_ws = Some(name.clone());
+        }
         self.workspaces.insert(
             name.clone(),
             WorkspaceHandle {
@@ -1248,6 +1263,59 @@ impl QueryEngine {
             .remove(name)
             .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))?;
         Ok(())
+    }
+
+    /// True when `ws` is currently mounted.
+    pub fn is_mounted(&self, ws: &str) -> bool {
+        self.workspaces.contains_key(ws)
+    }
+
+    /// The primary (shared) workspace name — the first-mounted workspace, which
+    /// is the project's shared brain. Per-user workspaces fall back to it for
+    /// the system-prompt frame they don't carry themselves (two-tier brain).
+    pub fn primary_ws_name(&self) -> Option<String> {
+        // The explicitly-tracked shared workspace; fall back to any mounted
+        // non-per-user workspace if (somehow) unset.
+        self.primary_ws.clone().or_else(|| {
+            self.workspaces
+                .keys()
+                .find(|k| !k.starts_with("u_"))
+                .cloned()
+        })
+    }
+
+    /// #1 — lazily auto-create + mount a per-user workspace `u_{user_id}` the
+    /// first time it's referenced, giving each end-user a physically isolated
+    /// brain (its own CozoDB). No-op if already mounted. Only `u_`-prefixed
+    /// names auto-mount (the gateway confines scoped requests to exactly that
+    /// namespace), so a typo can't spawn junk workspaces. Per-user data dirs
+    /// live OUTSIDE the shared workspace root (sibling `.thinkingroot-users/`)
+    /// so the shared source-tree watcher never picks them up.
+    pub async fn get_or_mount_user_ws(&mut self, ws: &str) -> Result<()> {
+        if self.workspaces.contains_key(ws) {
+            return Ok(());
+        }
+        if !ws.starts_with("u_") {
+            return Err(Error::EntityNotFound(format!(
+                "workspace '{ws}' is not mounted and is not an auto-mountable per-user namespace"
+            )));
+        }
+        let anchor = self
+            .primary_ws_name()
+            .and_then(|p| self.workspaces.get(&p))
+            .map(|h| h.root_path.clone())
+            .ok_or_else(|| {
+                Error::Config("no primary workspace mounted to anchor per-user workspaces".into())
+            })?;
+        let base = match anchor.parent() {
+            Some(p) => p.join(".thinkingroot-users"),
+            None => anchor.join(".thinkingroot-users"),
+        };
+        let root = base.join(ws);
+        let data_dir = root.join(".thinkingroot");
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| Error::Config(format!("create per-user workspace dir for '{ws}': {e}")))?;
+        self.mount(ws.to_string(), root).await
     }
 
     /// List all currently mounted workspaces with summary counts.
@@ -1468,6 +1536,388 @@ impl QueryEngine {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
         storage.graph.assemble_prompt(name, vars)
+    }
+
+    /// Compile a witness-grounded **context capsule** for one turn: the
+    /// assembled system prompt + top-k grounded claims + workspace brief
+    /// + experience-routed tools. This is the low-token, fast path that
+    /// replaces dumping raw context + every tool schema at the LLM.
+    ///
+    /// Cached in `capsule_cache` keyed by [`thinkingroot_graph::capsule::capsule_key`]
+    /// (which hashes the full query, so a hit never returns the wrong
+    /// grounding) and evicted by `invalidate_capsules_for` when any
+    /// dependency claim changes — the witness mesh as a cache DAG.
+    /// Branch orientation for a capsule: the synced node for a durable branch
+    /// (parent + live status), or a minimal "you are here" for an ephemeral
+    /// branch so an agent on a stream branch still knows its context. `None`
+    /// when there's no branch (main).
+    async fn branch_context_for(&self, ws: &str, branch: Option<&str>) -> Option<BranchContext> {
+        let name = branch?;
+        let node = self
+            .list_branch_nodes(ws)
+            .await
+            .ok()
+            .and_then(|nodes| nodes.into_iter().find(|b| b.name == name));
+        Some(match node {
+            Some(b) => BranchContext {
+                name: b.name,
+                parent: b.parent,
+                status: b.status,
+            },
+            None => BranchContext {
+                name: name.to_string(),
+                parent: None,
+                status: "active".to_string(),
+            },
+        })
+    }
+
+    pub async fn compile_capsule(&self, ws: &str, spec: CapsuleSpec) -> Result<CompiledCapsule> {
+        use thinkingroot_graph::capsule::{capsule_key, classify_query, CapsuleCacheRow};
+
+        let branch_ref = spec.branch.as_deref();
+        let query_class = classify_query(&spec.query);
+
+        // Resolve the prompt version so the cache key is stable + correct.
+        let prompt_version = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage
+                .graph
+                .prompt_latest_version(&spec.prompt_name)?
+                .unwrap_or(0)
+        };
+        let key = capsule_key(
+            &spec.prompt_name,
+            prompt_version,
+            branch_ref,
+            &spec.query,
+            &spec.vars,
+        );
+
+        // Warm path: return the cached capsule verbatim (sub-ms).
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            if let Some(row) = storage.graph.capsule_cache_get(&key)? {
+                if let Ok(mut cap) = serde_json::from_str::<CompiledCapsule>(&row.capsule_json) {
+                    cap.cache_hit = true;
+                    return Ok(cap);
+                }
+            }
+        }
+
+        // Cold path: build the query-independent frame + ground the query.
+        let (system, brief, tools, _v) = self
+            .build_capsule_frame(ws, &spec.prompt_name, &spec.vars, branch_ref, spec.max_tools)
+            .await?;
+        let session_id = spec
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("capsule:{key}"));
+        let (grounded_claims, deps) = self
+            .ground_query(ws, &spec.query, &session_id, spec.top_k)
+            .await?;
+        let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
+        let branch_context = self.branch_context_for(ws, branch_ref).await;
+
+        let capsule = CompiledCapsule {
+            system,
+            grounded_claims,
+            brief,
+            tools,
+            token_estimate,
+            query_class: query_class.clone(),
+            cache_hit: false,
+            frame_warm: false,
+            branch_context,
+        };
+
+        // Persist + record the provenance set for causal invalidation.
+        let capsule_json = serde_json::to_string(&capsule)
+            .map_err(|e| Error::Serialization(format!("serialize capsule: {e}")))?;
+        let row = CapsuleCacheRow {
+            key,
+            capsule_json,
+            prompt_name: spec.prompt_name.clone(),
+            prompt_version,
+            branch: branch_ref.unwrap_or("").to_string(),
+            query_class,
+            token_estimate: token_estimate as i64,
+            created_at: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+        };
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage.graph.capsule_cache_put(&row, &deps)?;
+        }
+        Ok(capsule)
+    }
+
+    /// M4 — build the query-INDEPENDENT capsule frame: assembled system
+    /// prompt + workspace brief + experience-routed tools + the prompt's
+    /// current version. Tools rank on the (constant) query-input *shape*,
+    /// so the frame is stable across a session's turns — that's what makes
+    /// it cacheable on the session in [`Self::compile_capsule_session`].
+    async fn build_capsule_frame(
+        &self,
+        ws: &str,
+        prompt_name: &str,
+        vars: &std::collections::BTreeMap<String, String>,
+        branch: Option<&str>,
+        max_tools: usize,
+    ) -> Result<(String, WorkspaceSummary, Vec<String>, i64)> {
+        // Two-tier brain: the system prompt is SHARED. A per-user workspace
+        // doesn't carry it, so source the prompt from this ws if present, else
+        // from the primary/shared workspace. Grounding + brief stay on `ws`
+        // (the user's own data) — that's the isolation boundary.
+        let user_has_prompt = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage.graph.prompt_latest_version(prompt_name)?.is_some()
+        };
+        let prompt_ws = if user_has_prompt {
+            ws.to_string()
+        } else {
+            self.primary_ws_name().unwrap_or_else(|| ws.to_string())
+        };
+        let prompt_version = {
+            let handle = self.get_workspace(&prompt_ws)?;
+            let storage = handle.storage.lock().await;
+            storage.graph.prompt_latest_version(prompt_name)?.unwrap_or(0)
+        };
+        let system = self.assemble_prompt(&prompt_ws, prompt_name, vars).await?;
+        let brief = self.get_workspace_brief_branched(ws, branch).await?;
+        // Tool routing keys on the query-input shape (constant across chat
+        // turns), so an empty hint yields the same ranking — frame-stable.
+        let tools = self.route_tools(ws, "", max_tools).await?;
+        Ok((system, brief, tools, prompt_version))
+    }
+
+    /// M4 — the per-turn query-DEPENDENT part: hybrid retrieval → grounded
+    /// claims + their provenance deps. The only work a warm-frame turn pays.
+    async fn ground_query(
+        &self,
+        ws: &str,
+        query: &str,
+        session_id: &str,
+        top_k: usize,
+    ) -> Result<(Vec<CapsuleClaimRef>, Vec<(String, String)>)> {
+        let retrieval = self
+            .hybrid_retrieve(
+                ws,
+                RetrievalRequest {
+                    query_text: query.to_string(),
+                    typed_predicates: vec![],
+                    session_id: session_id.to_string(),
+                    clearance: vec![thinkingroot_core::types::Sensitivity::Public],
+                    top_k,
+                    time_window: None,
+                    scoring_profile: ScoringProfile::default(),
+                    require_certificate: false,
+                    include_test_origin: false,
+                    include_quarantined: false,
+                    require_provenance_verified: false,
+                    now: None,
+                    scoped_claim_ids: None,
+                },
+                None,
+            )
+            .await?;
+        let mut grounded_claims = Vec::with_capacity(retrieval.hits.len());
+        let mut deps: Vec<(String, String)> = Vec::with_capacity(retrieval.hits.len());
+        for hit in &retrieval.hits {
+            grounded_claims.push(CapsuleClaimRef {
+                claim_id: hit.claim_id.clone(),
+                statement: hit.statement.clone(),
+                claim_type: hit.claim_type.clone(),
+                source_uri: hit.source_uri.clone(),
+            });
+            deps.push((hit.claim_id.clone(), "claim".to_string()));
+        }
+        Ok((grounded_claims, deps))
+    }
+
+    /// M4 — live streaming-branch compile: reuse the session's warm frame
+    /// (system+brief+tools) when it matches the active branch + prompt, so
+    /// the turn only pays for retrieval. On a miss it builds the frame and
+    /// caches it on the session. This is what makes the streaming branch
+    /// "live": after the first turn, every subsequent turn skips the
+    /// prompt-assembly + brief + tool-routing work. Invalidated by
+    /// [`SessionContext::invalidate_warm_frame`] on contribute.
+    pub async fn compile_capsule_session(
+        &self,
+        ws: &str,
+        sessions: &crate::intelligence::session::SessionStore,
+        session_id: &str,
+        spec: CapsuleSpec,
+    ) -> Result<CompiledCapsule> {
+        use thinkingroot_graph::capsule::classify_query;
+        let branch_ref = spec.branch.as_deref();
+        let query_class = classify_query(&spec.query);
+
+        // Current prompt version — a bump invalidates a warm frame.
+        let current_version = {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            storage.graph.prompt_latest_version(&spec.prompt_name)?.unwrap_or(0)
+        };
+
+        // Try the session warm frame.
+        let warm = {
+            let store = sessions.lock().await;
+            store.get(session_id).and_then(|s| s.warm_frame.clone()).filter(|f| {
+                f.branch.as_deref() == branch_ref
+                    && f.prompt_name == spec.prompt_name
+                    && f.prompt_version == current_version
+            })
+        };
+
+        let (system, brief, tools, frame_warm) = match warm {
+            Some(f) => {
+                let brief: WorkspaceSummary = serde_json::from_str(&f.brief_json)
+                    .map_err(|e| Error::Serialization(format!("warm brief: {e}")))?;
+                (f.system, brief, f.tools, true)
+            }
+            None => {
+                let (system, brief, tools, version) = self
+                    .build_capsule_frame(
+                        ws,
+                        &spec.prompt_name,
+                        &spec.vars,
+                        branch_ref,
+                        spec.max_tools,
+                    )
+                    .await?;
+                // Cache the frame on the session for the next turn.
+                let brief_json = serde_json::to_string(&brief)
+                    .map_err(|e| Error::Serialization(format!("frame brief: {e}")))?;
+                let frame = crate::intelligence::session::WarmFrame {
+                    branch: spec.branch.clone(),
+                    prompt_name: spec.prompt_name.clone(),
+                    prompt_version: version,
+                    system: system.clone(),
+                    brief_json,
+                    tools: tools.clone(),
+                };
+                let mut store = sessions.lock().await;
+                let s = store
+                    .entry(session_id.to_string())
+                    .or_insert_with(|| crate::intelligence::session::SessionContext::new(session_id, ws));
+                s.warm_frame = Some(frame);
+                (system, brief, tools, false)
+            }
+        };
+
+        // Per-turn: ground the query (the only work a warm turn pays).
+        let (grounded_claims, deps) =
+            self.ground_query(ws, &spec.query, session_id, spec.top_k).await?;
+        let _ = &deps; // session capsules are not persisted to the shared cache
+        let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
+        let branch_context = self.branch_context_for(ws, branch_ref).await;
+
+        Ok(CompiledCapsule {
+            system,
+            grounded_claims,
+            brief,
+            tools,
+            token_estimate,
+            query_class,
+            cache_hit: false,
+            frame_warm,
+            branch_context,
+        })
+    }
+
+    /// M4 — Slow-Thinker prefetch: warm the session's capsule frame ahead
+    /// of the first query (e.g. on session/branch open or while the user is
+    /// still typing) so the first turn is already frame-warm. Best-effort.
+    pub async fn prefetch_capsule_frame(
+        &self,
+        ws: &str,
+        sessions: &crate::intelligence::session::SessionStore,
+        session_id: &str,
+        prompt_name: &str,
+        vars: &std::collections::BTreeMap<String, String>,
+        branch: Option<&str>,
+        max_tools: usize,
+    ) -> Result<()> {
+        let (system, brief, tools, version) = self
+            .build_capsule_frame(ws, prompt_name, vars, branch, max_tools)
+            .await?;
+        let brief_json = serde_json::to_string(&brief)
+            .map_err(|e| Error::Serialization(format!("prefetch brief: {e}")))?;
+        let frame = crate::intelligence::session::WarmFrame {
+            branch: branch.map(str::to_string),
+            prompt_name: prompt_name.to_string(),
+            prompt_version: version,
+            system,
+            brief_json,
+            tools,
+        };
+        let mut store = sessions.lock().await;
+        let s = store
+            .entry(session_id.to_string())
+            .or_insert_with(|| crate::intelligence::session::SessionContext::new(session_id, ws));
+        s.warm_frame = Some(frame);
+        Ok(())
+    }
+
+    /// M4 — clear the warm capsule frame of every session whose frame was
+    /// built against `branch` (None = main). A contribute changes that
+    /// branch's brief/tools, so any session's cached frame for it is stale
+    /// — regardless of which session or connector wrote the claims. This is
+    /// why invalidation is branch-scoped, not attributed to the writer.
+    async fn invalidate_warm_frames_on_branch(
+        sessions: &crate::intelligence::session::SessionStore,
+        branch: Option<&str>,
+    ) {
+        let mut store = sessions.lock().await;
+        for s in store.values_mut() {
+            let matches = s
+                .warm_frame
+                .as_ref()
+                .map(|f| f.branch.as_deref() == branch)
+                .unwrap_or(false);
+            if matches {
+                s.invalidate_warm_frame();
+            }
+        }
+    }
+
+    /// Experience-routed tool selection — the "narrow 105 tools → k".
+    /// Ranks deployed Root Functions by their learned success on inputs
+    /// of this query's shape (reusing [`Self::route_functions`]), then
+    /// fills any remaining slots with external MCP tools. Returns at most
+    /// `k` tool names so the capsule carries a tight, relevant tool set
+    /// instead of every schema.
+    pub async fn route_tools(&self, ws: &str, query: &str, k: usize) -> Result<Vec<String>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut names: Vec<String> = Vec::new();
+        let ranked = self
+            .route_functions(ws, &serde_json::json!({ "query": query }))
+            .await
+            .unwrap_or_default();
+        for e in ranked {
+            if !names.contains(&e.function_name) {
+                names.push(e.function_name);
+            }
+            if names.len() >= k {
+                return Ok(names);
+            }
+        }
+        let registry = crate::mcp::external_registry::global().await;
+        for (tool_name, _desc) in registry.list_all_tools().await {
+            if !names.contains(&tool_name) {
+                names.push(tool_name);
+            }
+            if names.len() >= k {
+                break;
+            }
+        }
+        Ok(names)
     }
 
     // ─── Root Functions ─────────────────────────────────────────────
@@ -1984,6 +2434,8 @@ impl QueryEngine {
             .await
             .map_err(|e| Error::GraphStorage(format!("remount: {e}")))?;
         crate::mcp::sse::notify_tools_list_changed().await;
+        // M2 — reflect the new MCP surface as graph nodes (best-effort).
+        let _ = self.sync_mcp_nodes(ws).await;
         Ok(count)
     }
 
@@ -2001,6 +2453,123 @@ impl QueryEngine {
             crate::mcp::sse::notify_tools_list_changed().await;
         }
         Ok(removed)
+    }
+
+    /// M2 — sync MCP server + tool artifact nodes for `ws` into its graph
+    /// from the currently-loaded external registry (`mcp_server --exposes-->
+    /// mcp_tool`). Lets the Brain Graph + capsule see the MCP surface as
+    /// nodes. Best-effort; callers wrap in `let _ =`.
+    pub async fn sync_mcp_nodes(&self, ws: &str) -> Result<()> {
+        use std::collections::BTreeMap;
+        use thinkingroot_graph::artifact_nodes::{artifact_node_id, KIND_MCP_SERVER, KIND_MCP_TOOL};
+        let registry = crate::mcp::external_registry::global().await;
+        let tools = registry.list_all_tools().await;
+        let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (full, _desc) in &tools {
+            if let Some((server, _t)) = full.split_once("::") {
+                by_server.entry(server.to_string()).or_default().push(full.clone());
+            }
+        }
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        for (server, toolnames) in &by_server {
+            let edges: Vec<(String, String)> = toolnames
+                .iter()
+                .map(|t| ("exposes".to_string(), artifact_node_id(KIND_MCP_TOOL, t)))
+                .collect();
+            let _ = storage
+                .graph
+                .upsert_artifact_node(KIND_MCP_SERVER, server, 0, "mcp server", &edges);
+            for t in toolnames {
+                let _ = storage
+                    .graph
+                    .upsert_artifact_node(KIND_MCP_TOOL, t, 0, "mcp tool", &[]);
+            }
+        }
+        Ok(())
+    }
+
+    /// M2 — sync a `flow_def` artifact node + edges to the Root Function
+    /// (`runs`) and MCP-tool (`calls`) nodes its DAG references. Only the
+    /// structured `NodeType` variants yield edges (no guessing). Best-effort.
+    pub async fn sync_flow_node(
+        &self,
+        ws: &str,
+        def: &thinkingroot_flow::FlowDefinition,
+    ) -> Result<()> {
+        use thinkingroot_graph::artifact_nodes::{
+            artifact_node_id, KIND_FLOW, KIND_FUNCTION, KIND_MCP_TOOL,
+        };
+        let mut edges: Vec<(String, String)> = Vec::new();
+        for nodespec in def.nodes.values() {
+            match &nodespec.node_type {
+                thinkingroot_flow::NodeType::RootFunction { function, .. } => {
+                    edges.push(("runs".to_string(), artifact_node_id(KIND_FUNCTION, function)));
+                }
+                thinkingroot_flow::NodeType::McpTool { tool, .. } => {
+                    edges.push(("calls".to_string(), artifact_node_id(KIND_MCP_TOOL, tool)));
+                }
+                _ => {}
+            }
+        }
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let _ = storage.graph.upsert_artifact_node(
+            KIND_FLOW,
+            &def.id,
+            def.version as i64,
+            &def.description,
+            &edges,
+        );
+        Ok(())
+    }
+
+    /// M2 — list every operating-layer artifact node (prompts, functions,
+    /// flows, MCP servers/tools) with its outgoing edges, read straight from
+    /// the cognition graph (NOT the knowledge cache, which is reserved for
+    /// claims/entities). Backs `GET /ws/{ws}/artifacts` so the Console can
+    /// render the operating layer the brain runs on.
+    pub async fn list_operating_artifacts(&self, ws: &str) -> Result<Vec<ArtifactView>> {
+        use thinkingroot_graph::artifact_nodes::{
+            KIND_FLOW, KIND_FUNCTION, KIND_MCP_SERVER, KIND_MCP_TOOL, KIND_PROMPT,
+        };
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let mut out: Vec<ArtifactView> = Vec::new();
+        for kind in [KIND_PROMPT, KIND_FUNCTION, KIND_FLOW, KIND_MCP_SERVER, KIND_MCP_TOOL] {
+            for node in storage.graph.list_artifact_nodes(kind)? {
+                let edges = storage
+                    .graph
+                    .artifact_edges(kind, &node.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(relation, to_id)| ArtifactEdgeView { relation, to_id })
+                    .collect();
+                out.push(ArtifactView {
+                    id: node.id,
+                    name: node.name,
+                    kind: node.kind,
+                    description: node.description,
+                    edges,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The brain's view of its own **durable** branch topology — typed branch
+    /// nodes (status/parent/kind/timestamps), the projection synced from the
+    /// branch registry on each lifecycle event. Distinct from
+    /// [`Self::list_operating_artifacts`] because branch metadata is structured
+    /// (not a free-text description). Ephemeral `stream/*` branches are absent
+    /// by design.
+    pub async fn list_branch_nodes(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::artifact_nodes::BranchNode>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_branch_nodes()
     }
 
     /// List every Witness anchored to a specific source. Used by the
@@ -4037,6 +4606,24 @@ Rules: \
                 }
             }
 
+            // Evict this branch's cached capsules — a contribute changes
+            // what retrieval returns, and the new claim ids aren't in any
+            // existing capsule's deps (they're brand new), so dep-matching
+            // can't catch adds. Branch-scoped eviction is the correct,
+            // honest call: the next compile recomputes against fresh data.
+            // (Cache lives in the workspace main graph; branch is a column.)
+            {
+                let storage = handle.storage.lock().await;
+                if let Err(e) = storage.graph.invalidate_capsules_on_branch(branch_name) {
+                    tracing::warn!(
+                        "capsule invalidation (branch '{branch_name}') failed (non-fatal): {e}"
+                    );
+                }
+            }
+            // M4 — stale every session's warm frame for this branch so the
+            // next turn rebuilds brief/tools against the fresh claims.
+            Self::invalidate_warm_frames_on_branch(sessions, Some(branch_name)).await;
+
             return Ok(ContributeResult {
                 accepted_count: accepted_ids.len(),
                 accepted_ids,
@@ -4088,6 +4675,19 @@ Rules: \
             *handle.cache.write().await = new_cache;
         }
 
+        // Evict main-scoped capsules (branch == "") — a contribute to main
+        // changes retrieval results; the next compile recomputes.
+        if !accepted_ids.is_empty() {
+            {
+                let storage = handle.storage.lock().await;
+                if let Err(e) = storage.graph.invalidate_capsules_on_branch("") {
+                    tracing::warn!("capsule invalidation (main) failed (non-fatal): {e}");
+                }
+            }
+            // M4 — stale every session's main-scoped warm frame.
+            Self::invalidate_warm_frames_on_branch(sessions, None).await;
+        }
+
         // ── Turn calendar: record which claims were contributed this turn ────
         if !accepted_ids.is_empty() {
             let turn_number = {
@@ -4096,6 +4696,8 @@ Rules: \
                     crate::intelligence::session::SessionContext::new(session_id, ws)
                 });
                 session.turn_count += 1;
+                // M4 — main-path contribute also stales the warm frame.
+                session.invalidate_warm_frame();
                 session.turn_count
             };
             let storage = handle.storage.lock().await;
@@ -4430,6 +5032,18 @@ Rules: \
                 }
             }
 
+            // Evict this branch's cached capsules (see contribute_claims_as).
+            {
+                let storage = handle.storage.lock().await;
+                if let Err(e) = storage.graph.invalidate_capsules_on_branch(branch_name) {
+                    tracing::warn!(
+                        "capsule invalidation (branch '{branch_name}', bulk) failed (non-fatal): {e}"
+                    );
+                }
+            }
+            // M4 — stale every session's warm frame for this branch.
+            Self::invalidate_warm_frames_on_branch(sessions, Some(branch_name)).await;
+
             return Ok(ContributeResult {
                 accepted_count: accepted_ids.len(),
                 accepted_ids,
@@ -4482,6 +5096,18 @@ Rules: \
             *handle.cache.write().await = new_cache;
         }
 
+        // Evict main-scoped capsules (branch == "") after a bulk contribute.
+        if !accepted_ids.is_empty() {
+            {
+                let storage = handle.storage.lock().await;
+                if let Err(e) = storage.graph.invalidate_capsules_on_branch("") {
+                    tracing::warn!("capsule invalidation (main, bulk) failed (non-fatal): {e}");
+                }
+            }
+            // M4 — stale every session's main-scoped warm frame.
+            Self::invalidate_warm_frames_on_branch(sessions, None).await;
+        }
+
         // Turn calendar — record this connector batch as one logical turn.
         if !accepted_ids.is_empty() {
             let turn_number = {
@@ -4492,6 +5118,8 @@ Rules: \
                         crate::intelligence::session::SessionContext::new(session_id, ws)
                     });
                 session.turn_count += 1;
+                // M4 — bulk main-path contribute also stales the warm frame.
+                session.invalidate_warm_frame();
                 session.turn_count
             };
             let storage = handle.storage.lock().await;
@@ -4550,6 +5178,131 @@ Rules: \
         .await
     }
 
+    /// Multi-agent model: **spawn an agent = fork its own branch-brain.**
+    /// Creates a durable `agent/{agent_id}` branch off `parent` (default main),
+    /// `RequiresProposal`-gated so the agent's work can only reach the shared
+    /// brain through verify-before-merge. The fork is a ~1ms reflink (COW);
+    /// the branch is synced as an `active` graph node. The agent then works
+    /// against this branch via the branch-scoped capsule/recall/contribute.
+    pub async fn spawn_agent_branch(
+        &self,
+        ws: &str,
+        agent_id: &str,
+        parent: Option<&str>,
+    ) -> Result<String> {
+        let root = self.get_workspace(ws)?.root_path.clone();
+        let parent = parent.unwrap_or("main");
+        let branch = format!("agent/{agent_id}");
+        thinkingroot_branch::create_branch_full(
+            &root,
+            &branch,
+            parent,
+            Some(format!("agent branch-brain for '{agent_id}'")),
+            // Owner = the agent's Principal identity (raw id), so the agent can
+            // write its own branch (the owner short-circuit in
+            // `ensure_branch_permission`).
+            Some(agent_id.to_string()),
+            thinkingroot_core::BranchPermissions::default(),
+            thinkingroot_core::BranchKind::default(),
+            thinkingroot_core::MergePolicy::RequiresProposal {
+                min_reviewers: 0,
+                required_checks: vec!["health_score".to_string()],
+            },
+            None,
+        )
+        .await?;
+        let created = chrono::Utc::now().timestamp() as f64;
+        let _ = self
+            .sync_branch_created(&root, &branch, Some(parent), Some("agent"), created)
+            .await;
+        Ok(branch)
+    }
+
+    /// Multi-agent model: **finish an agent = gated merge-back of its branch.**
+    /// Opens a proposal `agent/{agent_id}` → main, runs the verify-before-merge
+    /// checks, and (when `auto_merge` and the gate says `Approved`) merges the
+    /// agent's learnings into the shared brain. The merge path flips the agent
+    /// branch node `active → merged`. Honest report: `merged` is true only if
+    /// the work actually reached main.
+    pub async fn finish_agent_branch(
+        &self,
+        ws: &str,
+        agent_id: &str,
+        min_reviewers: u8,
+        auto_merge: bool,
+    ) -> Result<AgentBranchReport> {
+        let root = self.get_workspace(ws)?.root_path.clone();
+        let branch = format!("agent/{agent_id}");
+        let mut report = AgentBranchReport {
+            agent_id: agent_id.to_string(),
+            branch: branch.clone(),
+            proposal_id: None,
+            proposal_status: None,
+            checks: Vec::new(),
+            merged: false,
+            note: String::new(),
+        };
+
+        let refs_dir = root.join(".thinkingroot-refs");
+        let required_checks = vec!["health_score".to_string()];
+        let proposal = thinkingroot_pr::open_proposal(
+            &refs_dir,
+            &branch,
+            None,
+            &format!("agent:{agent_id}"),
+            Some(format!("agent '{agent_id}' merge-back of branch-brain")),
+            min_reviewers,
+            required_checks,
+        )?;
+        report.proposal_id = Some(proposal.id.clone());
+
+        let proposal = self.run_proposal_checks(&root, &proposal.id).await?;
+        let mut latest: std::collections::HashMap<String, &thinkingroot_pr::CheckRun> =
+            std::collections::HashMap::new();
+        for c in &proposal.checks {
+            latest.insert(c.name.clone(), c);
+        }
+        report.checks = latest
+            .into_values()
+            .map(|c| (c.name.clone(), c.passed, c.detail.clone()))
+            .collect();
+        report.proposal_status = Some(format!("{:?}", proposal.status).to_lowercase());
+
+        if auto_merge && matches!(proposal.status, thinkingroot_pr::ProposalStatus::Approved) {
+            // System executes the verified merge on the agent's behalf: agents
+            // can't merge to main directly (architectural invariant), and the
+            // RequiresProposal + health_score gate is the real protection —
+            // same pattern as the promotion consolidation job.
+            match self
+                .merge_into_branch(
+                    &root,
+                    &branch,
+                    None,
+                    false,
+                    false,
+                    thinkingroot_core::MergedBy::System,
+                )
+                .await
+            {
+                Ok(_) => {
+                    report.merged = true;
+                    report.proposal_status = Some("merged".to_string());
+                    report.note =
+                        format!("agent '{agent_id}' merged into shared brain via proposal {}", proposal.id);
+                }
+                Err(e) => report.note = format!("merge blocked after approval: {e}"),
+            }
+        } else if auto_merge {
+            report.note = format!(
+                "agent branch gated ({}) — checks must pass before merge-back",
+                report.proposal_status.as_deref().unwrap_or("open")
+            );
+        } else {
+            report.note = format!("proposal {} left open for review", proposal.id);
+        }
+        Ok(report)
+    }
+
     pub async fn merge_into_branch(
         &self,
         root: &std::path::Path,
@@ -4569,6 +5322,454 @@ Rules: \
             None,
         )
         .await
+    }
+
+    /// Whether a branch is **durable** (worth a graph node) vs ephemeral /
+    /// internal. `stream/*` (one per MCP session, auto-GC'd) and `promotion/*`
+    /// (consolidation-internal staging) are excluded — node-ifying them would
+    /// be a write storm + clutter, for branches that vanish.
+    fn is_durable_branch(name: &str) -> bool {
+        !name.starts_with("stream/") && !name.starts_with("promotion/")
+    }
+
+    /// Write a branch node into the graph of the workspace rooted at `root`
+    /// (the brain that owns this branch). No-op if that workspace isn't mounted.
+    async fn write_branch_node_at(
+        &self,
+        root: &std::path::Path,
+        branch: &thinkingroot_graph::artifact_nodes::BranchNode,
+    ) -> Result<()> {
+        if let Some(h) = self.workspaces.values().find(|h| h.root_path == root) {
+            let storage = h.storage.lock().await;
+            storage.graph.upsert_branch_node(branch)?;
+        }
+        Ok(())
+    }
+
+    /// Sync a newly-created **durable** branch as an `active` graph node so the
+    /// brain can describe its own topology. Best-effort: callers wrap in
+    /// `let _ =` so a node-sync failure never fails branch creation.
+    pub async fn sync_branch_created(
+        &self,
+        root: &std::path::Path,
+        name: &str,
+        parent: Option<&str>,
+        kind: Option<&str>,
+        created_at: f64,
+    ) -> Result<()> {
+        use thinkingroot_graph::artifact_nodes::{BranchNode, BRANCH_STATUS_ACTIVE};
+        if !Self::is_durable_branch(name) {
+            return Ok(());
+        }
+        self.write_branch_node_at(
+            root,
+            &BranchNode {
+                name: name.to_string(),
+                status: BRANCH_STATUS_ACTIVE.to_string(),
+                parent: parent.map(str::to_string),
+                kind: kind.map(str::to_string),
+                created_at,
+                merged_at: None,
+            },
+        )
+        .await
+    }
+
+    /// Flip a branch node to `merged` (preserving its parent/kind/created_at).
+    /// No-op if the branch was never node-ified (ephemeral/internal), so the
+    /// brain never invents a node on merge — and never shows `active` after a
+    /// merge (honesty rule).
+    pub async fn sync_branch_merged(
+        &self,
+        root: &std::path::Path,
+        name: &str,
+        merged_at: f64,
+    ) -> Result<()> {
+        use thinkingroot_graph::artifact_nodes::BRANCH_STATUS_MERGED;
+        let Some(h) = self.workspaces.values().find(|h| h.root_path == root) else {
+            return Ok(());
+        };
+        let storage = h.storage.lock().await;
+        let existing = storage
+            .graph
+            .list_branch_nodes()?
+            .into_iter()
+            .find(|b| b.name == name);
+        if let Some(mut b) = existing {
+            b.status = BRANCH_STATUS_MERGED.to_string();
+            b.merged_at = Some(merged_at);
+            storage.graph.upsert_branch_node(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a branch node when its branch is deleted. No-op if not node-ified.
+    pub async fn sync_branch_removed(&self, root: &std::path::Path, name: &str) -> Result<()> {
+        use thinkingroot_graph::artifact_nodes::KIND_BRANCH;
+        if let Some(h) = self.workspaces.values().find(|h| h.root_path == root) {
+            let storage = h.storage.lock().await;
+            storage.graph.remove_artifact_node(KIND_BRANCH, name)?;
+        }
+        Ok(())
+    }
+
+    /// Read-only merge diff for `source_branch_name` into `target_branch`
+    /// (None ⇒ main) — the `health_score` check's basis. Computes the same
+    /// `KnowledgeDiff` (`merge_allowed` + `blocking_reasons`) the merge path
+    /// does, WITHOUT executing the merge.
+    pub async fn preview_merge_diff(
+        &self,
+        root: &std::path::Path,
+        source_branch_name: &str,
+        target_branch: Option<&str>,
+    ) -> Result<thinkingroot_core::KnowledgeDiff> {
+        use thinkingroot_branch::diff::compute_diff_into;
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_graph::graph::GraphStore;
+
+        let target_data_dir = resolve_data_dir(root, target_branch);
+        let source_data_dir = resolve_data_dir(root, Some(source_branch_name));
+        if !source_data_dir.exists() {
+            return Err(Error::EntityNotFound(format!(
+                "branch '{source_branch_name}' not found"
+            )));
+        }
+        let merge_cfg = match self.workspaces.values().find(|h| h.root_path == root) {
+            Some(h) => h.config.merge.clone(),
+            None => Config::load_merged(root)?.merge,
+        };
+        let target_graph = GraphStore::init(&target_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("target graph init failed: {e}")))?;
+        let source_graph = GraphStore::init(&source_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("source graph init failed: {e}")))?;
+        compute_diff_into(
+            &target_graph,
+            &source_graph,
+            source_branch_name,
+            target_branch,
+            merge_cfg.auto_resolve_threshold,
+            merge_cfg.max_health_drop,
+            merge_cfg.block_on_contradictions,
+        )
+    }
+
+    /// M3 — run a proposal's required checks daemon-side and record each
+    /// result via `thinkingroot_pr::record_check`, so `RequiresProposal`
+    /// branches actually gate on verification. Before this, `record_check`
+    /// was never called, so `required_checks` were dead metadata. The
+    /// proposal's `status` reaches `Approved` only once every required check
+    /// passes (and the reviewer count is met). Unknown check names are
+    /// recorded as **failed** (an honest, gated block) — never silently
+    /// skipped. Returns the updated proposal.
+    pub async fn run_proposal_checks(
+        &self,
+        root: &std::path::Path,
+        proposal_id: &str,
+    ) -> Result<thinkingroot_pr::KnowledgeProposal> {
+        let refs_dir = root.join(".thinkingroot-refs");
+        let proposal = thinkingroot_pr::read_proposal(&refs_dir, proposal_id)?
+            .ok_or_else(|| Error::EntityNotFound(format!("proposal '{proposal_id}' not found")))?;
+        if matches!(
+            proposal.status,
+            thinkingroot_pr::ProposalStatus::Merged | thinkingroot_pr::ProposalStatus::Closed
+        ) {
+            return Ok(proposal);
+        }
+        let source = proposal.source_branch.clone();
+        let target = proposal.target_branch.clone();
+        let names = if proposal.required_checks.is_empty() {
+            vec!["health_score".to_string()]
+        } else {
+            proposal.required_checks.clone()
+        };
+        let mut latest = proposal;
+        for name in names {
+            let (passed, detail) = match name.as_str() {
+                "health_score" => self.check_health_score(root, &source, target.as_deref()).await,
+                other => (
+                    false,
+                    Some(format!(
+                        "no daemon-side runner for required check '{other}' — merge stays gated"
+                    )),
+                ),
+            };
+            latest = thinkingroot_pr::record_check(&refs_dir, &latest.id, &name, passed, detail)?;
+        }
+        Ok(latest)
+    }
+
+    /// The `health_score` check: passes iff a read-only merge diff of the
+    /// source branch into its target is `merge_allowed` (health gate +
+    /// conflict/contradiction checks all clear).
+    async fn check_health_score(
+        &self,
+        root: &std::path::Path,
+        source: &str,
+        target: Option<&str>,
+    ) -> (bool, Option<String>) {
+        match self.preview_merge_diff(root, source, target).await {
+            Ok(diff) if diff.merge_allowed => (
+                true,
+                Some("merge_allowed: health gate + conflict checks passed".to_string()),
+            ),
+            Ok(diff) => (
+                false,
+                Some(format!("blocked: {}", diff.blocking_reasons.join("; "))),
+            ),
+            Err(e) => (false, Some(format!("diff computation failed: {e}"))),
+        }
+    }
+
+    /// #2 — Promotion consolidation. Mine **quorum'd, de-identified** patterns
+    /// from this project's per-user brains (`u_*` workspaces) and stage them
+    /// for **verify-before-merge** promotion into the shared brain.
+    ///
+    /// The flow stacks three independent safety layers (see
+    /// [`crate::consolidation`] for the privacy rationale):
+    /// 1. **k-anonymity** — only patterns recurring across ≥ `min_users`
+    ///    distinct users are eligible (poisoning-resistant: distinct users,
+    ///    never occurrences).
+    /// 2. **identifier scrubbing** — direct identifiers are redacted before a
+    ///    statement is even compared, so sub-quorum text never leaves a user
+    ///    workspace and quorum'd text leaves de-identified.
+    /// 3. **verify-before-merge** — the patterns are contributed to a
+    ///    `RequiresProposal` staging branch whose `health_score` check must
+    ///    pass before the merge into the shared brain is allowed (M3 gate).
+    ///
+    /// Ranges **only** over this project's own per-user workspaces — one daemon
+    /// serves one project, so cross-tenant promotion is structurally
+    /// impossible. The cloud gates this on the project's `promotion_enabled`
+    /// flag (the engine endpoint is privileged + reached only via the
+    /// provisioner, which checks the flag).
+    ///
+    /// Returns an honest [`ConsolidationReport`] — `merged` is true only if the
+    /// patterns actually reached the shared brain this pass.
+    pub async fn consolidate_to_shared(
+        &self,
+        spec: crate::consolidation::ConsolidationSpec,
+        sessions: &crate::intelligence::session::SessionStore,
+    ) -> Result<crate::consolidation::ConsolidationReport> {
+        use crate::consolidation::{ConsolidationReport, UserClaim, quorum_patterns};
+        use thinkingroot_graph::graph::GraphStore;
+
+        let spec = spec.sanitized();
+
+        // Resolve the shared (primary) brain + its on-disk root.
+        let shared_ws = self.primary_ws_name().ok_or_else(|| {
+            Error::Config("no shared workspace mounted to consolidate into".into())
+        })?;
+        let root = self.get_workspace(&shared_ws)?.root_path.clone();
+
+        // Per-user workspaces are siblings under `.thinkingroot-users/` (see
+        // `get_or_mount_user_ws`). Candidate users come from BOTH the currently
+        // mounted set and the on-disk dirs — deduped. We must NOT `GraphStore::init`
+        // a workspace that is already mounted: the embedded DB holds a single
+        // process lock, so a mounted workspace is read through its live handle;
+        // only unmounted ones are opened from disk (read-only).
+        let users_base = match root.parent() {
+            Some(p) => p.join(".thinkingroot-users"),
+            None => root.join(".thinkingroot-users"),
+        };
+
+        let mut candidates: std::collections::BTreeSet<String> = self
+            .workspaces
+            .keys()
+            .filter(|k| k.starts_with("u_"))
+            .cloned()
+            .collect();
+        if users_base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&users_base) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("u_")
+                        && entry.path().join(".thinkingroot").join("graph").exists()
+                    {
+                        candidates.insert(name);
+                    }
+                }
+            }
+        }
+
+        let mut user_claims: Vec<UserClaim> = Vec::new();
+        let mut users_scanned = 0usize;
+        for user in candidates {
+            // Read the claims, preferring the live mounted handle.
+            let rows = if let Some(handle) = self.workspaces.get(&user) {
+                let storage = handle.storage.lock().await;
+                match storage.graph.get_all_claims_with_sources() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(user = %user, error = %e, "consolidation: skip mounted user workspace (claim read failed)");
+                        continue;
+                    }
+                }
+            } else {
+                let graph_dir = users_base.join(&user).join(".thinkingroot").join("graph");
+                match GraphStore::init(&graph_dir) {
+                    Ok(g) => match g.get_all_claims_with_sources() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(user = %user, error = %e, "consolidation: skip user workspace (claim read failed)");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(user = %user, error = %e, "consolidation: skip unreadable user workspace");
+                        continue;
+                    }
+                }
+            };
+            users_scanned += 1;
+            for (_id, statement, claim_type, confidence, _uri, _event) in rows {
+                if confidence < spec.min_confidence || !spec.accepts_type(&claim_type) {
+                    continue;
+                }
+                user_claims.push(UserClaim {
+                    user: user.clone(),
+                    statement,
+                    claim_type,
+                    confidence,
+                });
+            }
+        }
+
+        let claims_examined = user_claims.len();
+        let patterns = quorum_patterns(&user_claims, &spec);
+
+        let mut report = ConsolidationReport {
+            shared_ws: shared_ws.clone(),
+            users_scanned,
+            claims_examined,
+            patterns_promoted: patterns.clone(),
+            staging_branch: None,
+            proposal_id: None,
+            proposal_status: None,
+            checks: Vec::new(),
+            merged: false,
+            note: String::new(),
+        };
+
+        if patterns.is_empty() {
+            report.note = format!(
+                "no patterns cleared the quorum gate (min_users={}, scanned {} users / {} claims)",
+                spec.min_users, users_scanned, claims_examined
+            );
+            return Ok(report);
+        }
+
+        // ── Stage on a RequiresProposal branch off the shared main ──────────
+        let branch_name = format!("promotion/{}", ulid::Ulid::new());
+        let required_checks = vec!["health_score".to_string()];
+        thinkingroot_branch::create_branch_full(
+            &root,
+            &branch_name,
+            "main",
+            Some(format!(
+                "promotion consolidation: {} de-identified pattern(s)",
+                patterns.len()
+            )),
+            Some("system:consolidation".to_string()),
+            thinkingroot_core::BranchPermissions::default(),
+            thinkingroot_core::BranchKind::default(),
+            thinkingroot_core::MergePolicy::RequiresProposal {
+                min_reviewers: spec.min_reviewers,
+                required_checks: required_checks.clone(),
+            },
+            None,
+        )
+        .await?;
+        report.staging_branch = Some(branch_name.clone());
+
+        // Contribute the de-identified patterns to the staging branch.
+        let agent_claims: Vec<AgentClaim> = patterns
+            .iter()
+            .map(|p| AgentClaim {
+                statement: p.statement.clone(),
+                claim_type: p.claim_type.clone(),
+                confidence: Some(p.mean_confidence),
+                entities: Vec::new(),
+            })
+            .collect();
+        let session_id = format!("consolidation:{branch_name}");
+        self.contribute_claims_as(
+            &shared_ws,
+            &session_id,
+            Some(&branch_name),
+            agent_claims,
+            sessions,
+            BranchActor::System,
+        )
+        .await?;
+
+        // ── Open a proposal (shared main is the target) + run M3 checks ─────
+        let refs_dir = root.join(".thinkingroot-refs");
+        let proposal = thinkingroot_pr::open_proposal(
+            &refs_dir,
+            &branch_name,
+            None,
+            "system:consolidation",
+            Some("automated promotion of quorum'd, de-identified per-user patterns".to_string()),
+            spec.min_reviewers,
+            required_checks,
+        )?;
+        report.proposal_id = Some(proposal.id.clone());
+
+        let proposal = self.run_proposal_checks(&root, &proposal.id).await?;
+        // Latest result per check name.
+        let mut latest: std::collections::HashMap<String, &thinkingroot_pr::CheckRun> =
+            std::collections::HashMap::new();
+        for c in &proposal.checks {
+            latest.insert(c.name.clone(), c);
+        }
+        report.checks = latest
+            .into_values()
+            .map(|c| (c.name.clone(), c.passed, c.detail.clone()))
+            .collect();
+        report.proposal_status = Some(format!("{:?}", proposal.status).to_lowercase());
+
+        // ── Optional auto-merge (only if the gate says Approved) ────────────
+        if spec.auto_merge
+            && matches!(proposal.status, thinkingroot_pr::ProposalStatus::Approved)
+        {
+            match self
+                .merge_into_branch(
+                    &root,
+                    &branch_name,
+                    None,
+                    false,
+                    false,
+                    thinkingroot_core::MergedBy::System,
+                )
+                .await
+            {
+                Ok(_) => {
+                    report.merged = true;
+                    report.proposal_status = Some("merged".to_string());
+                    report.note = format!(
+                        "promoted {} pattern(s) into '{}' via verified proposal {}",
+                        patterns.len(),
+                        shared_ws,
+                        proposal.id
+                    );
+                }
+                Err(e) => {
+                    report.note = format!("merge blocked after approval: {e}");
+                }
+            }
+        } else if spec.auto_merge {
+            report.note = format!(
+                "staged proposal {} is gated ({}) — checks must pass before promotion",
+                proposal.id,
+                report.proposal_status.as_deref().unwrap_or("open")
+            );
+        } else {
+            report.note = format!(
+                "staged proposal {} left open for review (auto_merge disabled)",
+                proposal.id
+            );
+        }
+
+        Ok(report)
     }
 
     /// T1.5 — cancellable variant of [`Self::merge_into_branch`].
@@ -4690,6 +5891,14 @@ Rules: \
                 .await;
         }
 
+        // Sync the source branch's node active → merged (no-op for ephemeral /
+        // internal branches and unmounted workspaces). Best-effort: a node-sync
+        // failure must not unwind a completed merge.
+        let merged_at = chrono::Utc::now().timestamp() as f64;
+        let _ = self
+            .sync_branch_merged(root, source_branch_name, merged_at)
+            .await;
+
         Ok(diff)
     }
 
@@ -4711,7 +5920,10 @@ Rules: \
         Self::ensure_branch_permission(&actor, branch_ref.as_ref(), "delete_branch")?;
         self.branch_engines.invalidate(root, branch_name).await;
         thinkingroot_branch::delete_branch(root, branch_name)
-            .map_err(|e| Error::GraphStorage(format!("delete_branch failed: {e}")))
+            .map_err(|e| Error::GraphStorage(format!("delete_branch failed: {e}")))?;
+        // Drop the branch's node (no-op if it was never node-ified). Best-effort.
+        let _ = self.sync_branch_removed(root, branch_name).await;
+        Ok(())
     }
 
     pub async fn rebase_branch(
@@ -5641,8 +6853,118 @@ mod source_kind_tests {
 // Intelligent serve layer types
 // ---------------------------------------------------------------------------
 
+/// Request for [`QueryEngine::compile_capsule`]. `query` is the user's
+/// turn text; `prompt_name` selects the system-prompt template; `vars`
+/// fills its `{{...}}`. `branch` scopes the brief (and, in M4, the live
+/// delta path). `top_k`/`max_tools` bound the grounded-claim and tool
+/// budgets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapsuleSpec {
+    pub prompt_name: String,
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
+    pub query: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default = "default_capsule_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_capsule_max_tools")]
+    pub max_tools: usize,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn default_capsule_top_k() -> usize {
+    8
+}
+
+fn default_capsule_max_tools() -> usize {
+    5
+}
+
+/// One grounded claim carried by a [`CompiledCapsule`] — a witness-backed
+/// fact the LLM may cite, kept lean (no full provenance bundle) for low
+/// token cost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleClaimRef {
+    pub claim_id: String,
+    pub statement: String,
+    pub claim_type: String,
+    pub source_uri: String,
+}
+
+/// The compiled context capsule fed to the LLM in place of raw state.
+/// Round-trips through `capsule_cache` as `capsule_json`, so every field
+/// is `Serialize + Deserialize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledCapsule {
+    pub system: String,
+    pub grounded_claims: Vec<CapsuleClaimRef>,
+    pub brief: WorkspaceSummary,
+    pub tools: Vec<String>,
+    pub token_estimate: usize,
+    pub query_class: String,
+    /// True when this capsule came from the warm cache (not recompiled).
+    #[serde(default)]
+    pub cache_hit: bool,
+    /// M4 — true when the query-independent frame (system+brief+tools) was
+    /// reused from the session warm-frame and only retrieval ran this turn.
+    #[serde(default)]
+    pub frame_warm: bool,
+    /// The branch this capsule was compiled on, for agent orientation
+    /// ("you're on `topic/x`, forked from `main`, status active"). `None` on
+    /// main / no branch. Lets a branch-as-agent-brain know its own context.
+    #[serde(default)]
+    pub branch_context: Option<BranchContext>,
+}
+
+/// Lightweight branch orientation carried in a [`CompiledCapsule`]. Durable
+/// branches resolve from their synced node (parent + status); ephemeral
+/// branches still get a minimal "you are here" so an agent on a stream branch
+/// knows where it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchContext {
+    pub name: String,
+    pub parent: Option<String>,
+    pub status: String,
+}
+
+/// Rough token estimate (chars/4 heuristic) used to prove the capsule is
+/// a fraction of raw context. Not a billing figure — an orientation one.
+fn estimate_capsule_tokens(
+    system: &str,
+    claims: &[CapsuleClaimRef],
+    tools: &[String],
+) -> usize {
+    let mut chars = system.len();
+    for c in claims {
+        chars += c.statement.len() + c.source_uri.len() + c.claim_type.len();
+    }
+    for t in tools {
+        chars += t.len();
+    }
+    chars / 4
+}
+
+/// One outgoing edge of an operating-layer artifact node (M2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactEdgeView {
+    pub relation: String,
+    pub to_id: String,
+}
+
+/// An operating-layer artifact node + its edges, for `GET /ws/{ws}/artifacts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactView {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub edges: Vec<ArtifactEdgeView>,
+}
+
 /// Token-efficient workspace summary for agent orientation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
     pub workspace: String,
     pub entity_count: usize,
@@ -5666,6 +6988,20 @@ pub struct AgentClaim {
 
 fn default_claim_type() -> String {
     "fact".to_string()
+}
+
+/// Outcome of an agent branch-brain merge-back ([`QueryEngine::finish_agent_branch`]).
+/// Honest: `merged` is true only if the agent's work actually reached the
+/// shared brain through the verify-before-merge gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentBranchReport {
+    pub agent_id: String,
+    pub branch: String,
+    pub proposal_id: Option<String>,
+    pub proposal_status: Option<String>,
+    pub checks: Vec<(String, bool, Option<String>)>,
+    pub merged: bool,
+    pub note: String,
 }
 
 /// Result of a `contribute_claims` call.

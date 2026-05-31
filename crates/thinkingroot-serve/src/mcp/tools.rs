@@ -1862,16 +1862,20 @@ pub async fn handle_call(
             let store = thinkingroot_flow::storage::FlowStore::new(workspace_root);
             let _ = app_state;
             match store.insert_flow_definition(definition) {
-                Ok(record) => mcp_text_result(
-                    id,
-                    &serde_json::json!({
-                        "flow_id": record.definition.id,
-                        "version": record.definition.version,
-                        "content_blake3": record.content_blake3,
-                        "created_at": record.created_at.to_rfc3339(),
-                        "updated_at": record.updated_at.to_rfc3339(),
-                    }),
-                ),
+                Ok(record) => {
+                    // M2 — sync the flow as a graph node + edges (best-effort).
+                    let _ = engine.sync_flow_node(ws, &record.definition).await;
+                    mcp_text_result(
+                        id,
+                        &serde_json::json!({
+                            "flow_id": record.definition.id,
+                            "version": record.definition.version,
+                            "content_blake3": record.content_blake3,
+                            "created_at": record.created_at.to_rfc3339(),
+                            "updated_at": record.updated_at.to_rfc3339(),
+                        }),
+                    )
+                }
                 Err(e) => JsonRpcResponse::error(
                     id,
                     -32603,
@@ -4144,22 +4148,31 @@ async fn handle_open_proposal(
         min_reviewers,
         required_checks,
     ) {
-        Ok(p) => JsonRpcResponse::success(
-            id,
-            serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!(
-                        "Proposal opened: {} (source={}, target={}, min_reviewers={})",
-                        p.id,
-                        p.source_branch,
-                        p.target_branch.as_deref().unwrap_or("main"),
-                        p.min_reviewers,
-                    )
-                }],
-                "proposal": p,
-            }),
-        ),
+        Ok(p) => {
+            // M3 — run required checks immediately so the proposal can reach
+            // Approved without a manual run-checks call (best-effort).
+            let p = match engine.workspace_root_path(ws) {
+                Some(root) => engine.run_proposal_checks(&root, &p.id).await.unwrap_or(p),
+                None => p,
+            };
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Proposal opened: {} (source={}, target={}, min_reviewers={}, status={:?})",
+                            p.id,
+                            p.source_branch,
+                            p.target_branch.as_deref().unwrap_or("main"),
+                            p.min_reviewers,
+                            p.status,
+                        )
+                    }],
+                    "proposal": p,
+                }),
+            )
+        }
         Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono;
 use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thinkingroot_core::types::{ContentHash, Entity, EntityType};
 use thinkingroot_core::{Error, Result};
 
@@ -1102,6 +1102,33 @@ impl GraphStore {
                 expect_json: String default '',
                 created_at: Float default 0.0
             }",
+            // ─── capsule_cache — a compiled CompiledCapsule keyed by a
+            //     BLAKE3 of (prompt@version, query_class, branch, vars).
+            //     `compile_capsule` reads this first; a hit is the warm,
+            //     low-latency path. `token_estimate` lets callers prove
+            //     the payload is a fraction of raw context.
+            ":create capsule_cache {
+                key: String
+                =>
+                capsule_json: String,
+                prompt_name: String default '',
+                prompt_version: Int default 0,
+                branch: String default '',
+                query_class: String default '',
+                token_estimate: Int default 0,
+                created_at: Float default 0.0
+            }",
+            // ─── capsule_deps — the provenance set of every cached
+            //     capsule: one row per (claim|witness|entity) the compile
+            //     read. `invalidate_capsules_for(object_ids)` joins on
+            //     `:by_object` to evict exactly the capsules a changed
+            //     fact invalidates — the witness-mesh cache key.
+            ":create capsule_deps {
+                key: String,
+                object_id: String
+                =>
+                object_kind: String default 'claim'
+            }",
         ];
 
         for stmt in &relations {
@@ -1231,6 +1258,12 @@ impl GraphStore {
             // supports the converse query (what does source A depend on).
             "::index create resolution_deps:by_from { from_source_id }",
             "::index create resolution_deps:by_to { to_source_id }",
+            // Capsule cache — `by_object` is the hot path for
+            // `invalidate_capsules_for`: given a changed object id, find
+            // every cached capsule that read it. `by_branch` supports
+            // dropping a whole branch's capsules on session teardown.
+            "::index create capsule_deps:by_object { object_id }",
+            "::index create capsule_cache:by_branch { branch }",
         ];
 
         for stmt in &indexes {
@@ -2318,10 +2351,19 @@ impl GraphStore {
             let entity_type = parse_entity_type(&dv_to_string(&row[2]));
             let description = dv_to_string(&row[3]);
 
+            // Operating-layer projection nodes (M2 artifacts + branch nodes)
+            // share the `entities` relation but use `"kind:name"` ids, not the
+            // ULID ids real knowledge entities carry. They are NOT knowledge —
+            // skip them here so entity resolution + the merge diff (which call
+            // this) never trip over a non-ULID id. They remain readable via
+            // their own typed paths (`list_artifact_nodes` / `list_branch_nodes`).
+            let parsed = match id.parse() {
+                Ok(eid) => eid,
+                Err(_) => continue,
+            };
+
             let mut entity = Entity::new(canonical_name, entity_type);
-            entity.id = id
-                .parse()
-                .map_err(|e| Error::GraphStorage(format!("invalid entity id '{id}': {e}")))?;
+            entity.id = parsed;
             entity.aliases = self.get_aliases_for_entity(&id)?;
             if !description.is_empty() {
                 entity.description = Some(description);
@@ -2905,6 +2947,9 @@ impl GraphStore {
         // Moat — causal invalidation: a removed claim can no longer ground
         // any learned function experience (best-effort; never fails removal).
         let _ = self.invalidate_experience_for_object("claim", claim_id);
+        // …and evict any cached capsule grounded on the removed claim, so the
+        // next compile can't serve a fact that no longer exists.
+        let _ = self.invalidate_capsules_for(&[claim_id.to_string()]);
         Ok(())
     }
 
@@ -2967,6 +3012,8 @@ impl GraphStore {
         // either (best-effort; never fails the insert).
         let _ = self.invalidate_experience_for_object("claim", claim_a);
         let _ = self.invalidate_experience_for_object("claim", claim_b);
+        // Evict capsules grounded on either now-contested claim.
+        let _ = self.invalidate_capsules_for(&[claim_a.to_string(), claim_b.to_string()]);
         Ok(())
     }
 
@@ -4777,6 +4824,9 @@ impl GraphStore {
         // Root Function experience learned from runs that cited it is decayed
         // (best-effort; never fails the supersede).
         let _ = self.invalidate_experience_for_object("claim", old_claim_id);
+        // Evict capsules grounded on the superseded claim so the next compile
+        // re-retrieves the current fact instead of serving the stale one.
+        let _ = self.invalidate_capsules_for(&[old_claim_id.to_string()]);
         Ok(())
     }
 
@@ -6074,7 +6124,7 @@ pub struct EntityContext {
 }
 
 /// Top entity by claim count — used for workspace overview.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopEntity {
     pub name: String,
     pub entity_type: String,

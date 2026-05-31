@@ -342,7 +342,12 @@ impl Default for ScoringProfile {
             w_test_origin_penalty: 0.05,
             recency_half_life_days: 180.0,
             require_rooted_only: false,
-            total_candidate_threshold: 100,
+            // Engage hybrid/vector retrieval as soon as the graph holds any
+            // claims. A cognition/memory DB starts small and grows slowly, so a
+            // high floor (was 100) left every fresh workspace stuck in
+            // datalog-only mode — semantic recall returned nothing until 100+
+            // claims accrued. 1 = "use vector whenever there is content".
+            total_candidate_threshold: 1,
             // Track 32 (2026-05-16) flipped this on by default — see field docstring.
             use_cross_encoder: true,
             cross_encoder_weight: 0.7,
@@ -568,7 +573,7 @@ mod tests {
         // 0.30 + 0.15·2 + 0.10·2 + 0.05·3 = 0.95. The 5% headroom is
         // intentional — penalty subtractions can never push fused below 0.
         assert!((sum - 0.95).abs() < 1e-5, "positive sum: {sum}");
-        assert_eq!(p.total_candidate_threshold, 100);
+        assert_eq!(p.total_candidate_threshold, 1);
         assert_eq!(p.recency_half_life_days, 180.0);
         assert!(!p.require_rooted_only);
     }

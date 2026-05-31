@@ -124,6 +124,41 @@ fn dv_f64(v: &DataValue) -> f64 {
     }
 }
 
+/// Scan a Root Function body for the structured `external::<server>::<tool>`
+/// MCP dispatch form and return `("calls", "mcp_tool:<server>::<tool>")`
+/// edges (deduped). Only the exact dispatch shape is matched — references
+/// with extra `::` segments or empty parts are skipped, so we never emit a
+/// fuzzy/incorrect edge. Used by `put_function` to wire M2 graph edges.
+fn extract_mcp_tool_edges(body: &str) -> Vec<(String, String)> {
+    use crate::artifact_nodes::{artifact_node_id, KIND_MCP_TOOL};
+    const MARKER: &str = "external::";
+    let bytes = body.as_bytes();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(MARKER) {
+        let start = from + rel + MARKER.len();
+        let mut end = start;
+        while end < bytes.len() {
+            let c = bytes[end];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b':' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let tok = &body[start..end];
+        if let Some((server, tool)) = tok.split_once("::") {
+            if !server.is_empty() && !tool.is_empty() && !tool.contains(':') {
+                seen.insert(format!("{server}::{tool}"));
+            }
+        }
+        from = (from + rel + MARKER.len()).max(end);
+    }
+    seen.into_iter()
+        .map(|st| ("calls".to_string(), artifact_node_id(KIND_MCP_TOOL, &st)))
+        .collect()
+}
+
 fn row_to_function(row: &[DataValue]) -> RootFunction {
     RootFunction {
         id: dv_str(&row[0]),
@@ -173,6 +208,19 @@ impl GraphStore {
             :put root_functions {id => name, body, language, version, created_at}"#,
             params,
         )?;
+
+        // M2 — sync a graph node + edges to any MCP tools this function
+        // wraps. We only emit an edge for the structured `external::<server>::<tool>`
+        // dispatch form (a reliable signal), never a fuzzy body guess.
+        // Best-effort: never fail the function write on a node-sync error.
+        let edges = extract_mcp_tool_edges(body);
+        let _ = self.upsert_artifact_node(
+            crate::artifact_nodes::KIND_FUNCTION,
+            name,
+            version,
+            &format!("root function ({lang})"),
+            &edges,
+        );
 
         Ok(RootFunction {
             id,

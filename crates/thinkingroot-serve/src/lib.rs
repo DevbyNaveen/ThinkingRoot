@@ -8,6 +8,7 @@
 pub mod agentmemory;
 pub mod backfill;
 pub mod branch_cache;
+pub mod consolidation;
 pub mod egress;
 pub mod engine;
 pub mod fingerprint;

@@ -930,6 +930,62 @@ fn fetch_claim_metadata(
             },
         );
     }
+
+    // ── Witness-substrate resolution (Phase 5 cutover) ──────────────────────
+    // Vector candidates are keyed by WITNESS id, and freshly-compiled prose
+    // lives in the `witnesses` relation — NOT `claims`. Without this, every
+    // vector candidate was dropped at the `claim_meta.get(..) => None` guard,
+    // so `search/hybrid` returned 0 hits even with a populated index (while
+    // `ask`, which reads `get_all_claims_with_sources`, worked). Resolve any
+    // candidate id NOT already satisfied by `claims` from `witnesses`,
+    // materialising the statement from the source bytes (same path as `ask`)
+    // and defaulting the Rooting/grounding columns the witness substrate
+    // doesn't carry. `claims` rows always win (legacy code claims stay exact).
+    let wrows = run_hybrid(
+        graph,
+        r#"?[id, witness_type, rule, source_id, byte_start, byte_end, content_blake3, sensitivity] :=
+            id in $cset,
+            *witnesses{id, witness_type, rule, source_id, byte_start, byte_end, content_blake3, sensitivity}"#,
+        {
+            let mut p = BTreeMap::new();
+            p.insert("cset".into(), claim_set.clone());
+            p
+        },
+    )?;
+    for r in wrows.rows {
+        if r.len() < 8 {
+            continue;
+        }
+        let id = cell_str(&r[0]);
+        if out.contains_key(&id) {
+            continue;
+        }
+        let witness_type = cell_str(&r[1]);
+        let rule = cell_str(&r[2]);
+        let source_id = cell_str(&r[3]);
+        let byte_start = cell_u64(&r[4]);
+        let byte_end = cell_u64(&r[5]);
+        let statement = graph
+            .materialize_statement(&source_id, byte_start, byte_end)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("[{witness_type}] via {rule} @{byte_start}..{byte_end}"));
+        out.insert(
+            id,
+            ClaimMeta {
+                statement,
+                claim_type: witness_type,
+                source_id,
+                byte_start,
+                byte_end,
+                content_blake3: cell_str(&r[6]),
+                sensitivity: parse_sensitivity(&cell_str(&r[7])),
+                admission_tier: AdmissionTier::from_str("attested"),
+                grounding_score: None,
+                grounding_method: parse_grounding_method(""),
+            },
+        );
+    }
     Ok(out)
 }
 
@@ -1941,10 +1997,10 @@ mod tests {
             predicates: vec![],
         };
         let profile = ScoringProfile::default();
-        // Default threshold is 100 post-Track-32 polish; pick a count
-        // well under it so the test stays meaningful if the default
-        // is tuned further down (50 single-file-workspace floor).
-        let s = plan_routing(&parsed, 25, &profile);
+        // Threshold lowered to 1 (2026-05-30) so semantic/vector recall engages
+        // on small, growing memories (a cognition DB starts near-empty). Only an
+        // EMPTY graph (count < 1) now forces datalog-only — so assert with 0.
+        let s = plan_routing(&parsed, 0, &profile);
         assert_eq!(s, RoutingShape::DatalogOnlyForced);
     }
 

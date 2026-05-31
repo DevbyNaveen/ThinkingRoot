@@ -643,6 +643,89 @@ impl McpToolHandler for PromoteFunction {
     }
 }
 
+/// Run a deployed Root Function by name and return its result. The other
+/// half of moat consumption: `route` ranks which function fits an input;
+/// `invoke_function` executes the chosen one. Durable — each call is
+/// journaled + run-logged, so a resumed run reuses its recorded steps
+/// instead of re-executing side effects. If the function suspends on
+/// `ctx.cognition.ask`, the result is a `{ _suspended, token, question }`
+/// marker the caller answers to resume. This is the agent-facing twin of
+/// the REST `POST /ws/{ws}/functions/{name}/invoke` path — same engine
+/// entrypoint (`invoke_function`), so behaviour (branch resolution, run
+/// log, experience update) is identical across transports.
+struct InvokeFunction;
+
+#[async_trait]
+impl McpToolHandler for InvokeFunction {
+    fn name(&self) -> &'static str {
+        "invoke_function"
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a deployed Root Function by name with a JSON input and return its result. Pair it \
+         with `route`: rank the candidates, then invoke the best one. Execution is durable \
+         (journaled + run-logged) and runs the function's `async (input, ctx) => { ... }` body in \
+         the secure sandbox with its secrets and LLM coprocessor. If the function pauses for a \
+         human/agent answer it returns `{ _suspended, token, question }` — answer that token to \
+         resume. Use this to USE a capability the project already has instead of re-deriving it."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Name of the deployed function to run." },
+                "input": { "description": "JSON passed to the function as `input` (any JSON; defaults to {})." }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn is_write(&self) -> bool {
+        // Functions can fetch (egress), touch secrets, and append a run-log
+        // row — treat every invocation as a write so it routes through the
+        // permissions gate like the other acquisition tools.
+        true
+    }
+
+    async fn handle(
+        &self,
+        args: Value,
+        ctx: &McpToolContext<'_>,
+    ) -> Result<Value, McpToolError> {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if name.is_empty() {
+            return Err(McpToolError::InvalidArgs("`name` is required".into()));
+        }
+        // `input` is optional — default to `{}` so zero-arg functions invoke
+        // cleanly without the caller having to pass an empty object.
+        let input = args.get("input").cloned().unwrap_or_else(|| json!({}));
+
+        let result = ctx
+            .engine
+            .invoke_function(ctx.workspace, name, &input)
+            .await
+            .map_err(McpToolError::Backend)?;
+
+        // Surface a cognition suspension as a first-class signal instead of
+        // burying the sentinel inside an opaque result blob.
+        if result.get("_suspended").and_then(|v| v.as_bool()) == Some(true) {
+            return Ok(json!({
+                "function": name,
+                "status": "suspended",
+                "suspended": result,
+                "note": "the function paused on ctx.cognition.ask; answer the returned token to resume it.",
+            }));
+        }
+
+        Ok(json!({
+            "function": name,
+            "status": "ok",
+            "result": result,
+        }))
+    }
+}
+
 /// Register every acquisition tool into the global `tool_trait`
 /// registry. Idempotent (duplicate names overwrite). Call sites mirror
 /// `operator_tools::register_all`: `rest::new_with_root` (SSE/HTTP) and
@@ -653,6 +736,7 @@ pub fn register_all() {
     register_tool(Arc::new(RootFunctionDefine));
     register_tool(Arc::new(FunctionTestDefine));
     register_tool(Arc::new(RouteFunction));
+    register_tool(Arc::new(InvokeFunction));
     register_tool(Arc::new(PromoteFunction));
 }
 

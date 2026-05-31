@@ -181,6 +181,21 @@ impl Config {
             inherit_key!(litellm);
             inherit_key!(custom);
             // Azure is strictly global now, no need to inherit_key for it.
+
+            // Top-level model SELECTION: an empty workspace value means "unset",
+            // so inherit the global default. A freshly-provisioned workspace
+            // writes a blank `[llm]` (default_provider = "", *_model = "") which
+            // would otherwise shadow the global platform model and leave the LLM
+            // unconfigured even though the provider block was inherited above.
+            if workspace.llm.default_provider.is_empty() {
+                workspace.llm.default_provider = global.llm.default_provider.clone();
+            }
+            if workspace.llm.extraction_model.is_empty() {
+                workspace.llm.extraction_model = global.llm.extraction_model.clone();
+            }
+            if workspace.llm.compilation_model.is_empty() {
+                workspace.llm.compilation_model = global.llm.compilation_model.clone();
+            }
         }
         workspace
     }

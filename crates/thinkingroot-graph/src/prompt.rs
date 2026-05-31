@@ -172,6 +172,17 @@ impl GraphStore {
             params,
         )?;
 
+        // M2 — sync a graph node so the Brain Graph + capsule can see this
+        // prompt as a first-class artifact. Best-effort: a node-sync failure
+        // must never fail the prompt write (the body is already durable).
+        let _ = self.upsert_artifact_node(
+            crate::artifact_nodes::KIND_PROMPT,
+            name,
+            version,
+            "compiled prompt",
+            &[],
+        );
+
         Ok(PromptTemplate {
             id,
             name: name.to_string(),
