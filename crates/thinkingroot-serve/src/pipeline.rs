@@ -1201,8 +1201,19 @@ async fn run_pipeline_inner(
         // (writing the chunk-join into the byte store) would
         // silently break verification rather than admit absence.
         use thinkingroot_graph::SourceByteStore;
+        // For transformed formats (PDF → extracted text) the parser set
+        // `anchored_text`: the witnesses' byte ranges index into THAT, not the
+        // raw binary file. Store it so materialization returns real text. For
+        // text-native formats (anchored_text == None) store the raw file bytes,
+        // which preserves witness-anchor re-hash verification.
+        let from_anchored: Option<Vec<u8>> =
+            doc.anchored_text.as_ref().map(|t| t.as_bytes().to_vec());
         let source_path = std::path::Path::new(&doc.uri);
-        match std::fs::read(source_path) {
+        let read_result = match from_anchored {
+            Some(bytes) => Ok(bytes),
+            None => std::fs::read(source_path),
+        };
+        match read_result {
             Ok(bytes) => {
                 byte_store
                     .put(doc.source_id, &doc.content_hash, &bytes)

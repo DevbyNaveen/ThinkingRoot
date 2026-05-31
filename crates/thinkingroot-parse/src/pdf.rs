@@ -40,10 +40,13 @@ pub fn parse(path: &Path) -> Result<DocumentIR> {
     }
 
     // PDF byte ranges refer to offsets within the EXTRACTED TEXT (not the
-    // original PDF binary). The v3 pack writer ships PDFs as a sidecar
-    // text file alongside the original; byte ranges resolve against the
-    // text version. Substring backfill walks the extracted text once.
+    // original PDF binary). Persist the extracted text as the source's
+    // `anchored_text` so the byte store holds IT (not the raw PDF bytes) and
+    // `materialize_statement` returns real text — not FlateDecode noise.
+    // Without this, witnesses anchored to text offsets resolve against the
+    // binary file and recall surfaces garbage.
     doc.fill_byte_ranges(&text);
+    doc.anchored_text = Some(text);
 
     Ok(doc)
 }

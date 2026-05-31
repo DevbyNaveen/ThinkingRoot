@@ -22,6 +22,14 @@ pub struct DocumentIR {
     /// covering the dropped byte so the byte-coverage audit passes.
     #[serde(default)]
     pub trailing_newline_normalised: bool,
+    /// For formats whose on-disk bytes are NOT the text the chunks/witnesses
+    /// anchor to (e.g. PDF: binary file → extracted text), the parser sets this
+    /// to the exact text its byte ranges index into. The byte store persists
+    /// THIS (not the raw file) so `materialize_statement` returns real text, not
+    /// binary noise. `None` for text-native formats (md/code/txt) where the raw
+    /// file bytes ARE the anchored content.
+    #[serde(default)]
+    pub anchored_text: Option<String>,
 }
 
 impl DocumentIR {
@@ -36,6 +44,7 @@ impl DocumentIR {
             chunks: Vec::new(),
             metadata: SourceMetadata::default(),
             trailing_newline_normalised: false,
+            anchored_text: None,
         }
     }
 
