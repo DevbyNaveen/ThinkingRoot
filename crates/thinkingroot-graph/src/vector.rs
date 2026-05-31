@@ -20,10 +20,14 @@ mod inner {
     };
     use thinkingroot_core::{Error, Result};
 
-    /// AllMiniLM-L6-v2 embedding dimensionality. Pinned here because
-    /// the on-disk `vectors.bin` schema bakes it in — changing it
-    /// invalidates every existing workspace's vector index.
-    const EMBED_DIM: usize = 384;
+    /// gte-modernbert-base embedding dimensionality. Upgraded from
+    /// AllMiniLM-L6-v2 (384) to lift semantic/paraphrase recall (the 2020
+    /// MiniLM was the measured bottleneck: paraphrase precision@3 = 0/4).
+    /// gte-modernbert-base is 768-dim, no query-prefix needed, and its
+    /// ModernBERT arch is already proven in-engine by the cross-encoder
+    /// reranker. Changing this invalidates existing vector indexes — call
+    /// `rebuild_vector_index` after deploying the new model bundle.
+    const EMBED_DIM: usize = 768;
 
     /// Vector storage backed by `ort_session::EmbeddingModel`. Stores
     /// embeddings in-memory with persistence to disk via the compact

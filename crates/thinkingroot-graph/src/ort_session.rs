@@ -30,10 +30,10 @@ mod inner {
         TruncationDirection, TruncationParams, TruncationStrategy,
     };
 
-    /// Default embedding tokenizer cap. Sentence-transformers
-    /// AllMiniLM-L6-v2 was trained at 256 tokens — going higher
-    /// degrades cosine quality without saving compute.
-    pub const EMBED_MAX_LEN: usize = 256;
+    /// Default embedding tokenizer cap. gte-modernbert-base supports long
+    /// context (up to 8192); 512 comfortably covers claim-sized statements
+    /// without truncation while bounding per-call memory/compute.
+    pub const EMBED_MAX_LEN: usize = 512;
 
     /// Default cross-encoder cap. ModernBERT supports 8192 but we
     /// cap at 1024 to stay inside the ~250 ms top-20 latency budget
@@ -110,9 +110,21 @@ mod inner {
     }
 
     fn build_session(path: &Path) -> Result<Session> {
+        // Optimization level is env-tunable. Level3 (full fusion) balloons
+        // load-time memory on large ModernBERT graphs (gte-modernbert embed +
+        // reranker) — observed OOM (exit 137) loading the 298MB model on a
+        // memory-constrained host, while the 22MB MiniLM loaded fine. Level1
+        // (basic) keeps inference correct with a far smaller load-time spike;
+        // override with TR_ORT_OPT_LEVEL=disable|1|2|3.
+        let opt = match std::env::var("TR_ORT_OPT_LEVEL").ok().as_deref() {
+            Some("3") => GraphOptimizationLevel::Level3,
+            Some("2") => GraphOptimizationLevel::Level2,
+            Some("disable") | Some("0") => GraphOptimizationLevel::Disable,
+            _ => GraphOptimizationLevel::Level1,
+        };
         Session::builder()
             .map_err(|e| Error::GraphStorage(format!("ort session builder failed: {e}")))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .with_optimization_level(opt)
             .map_err(|e| {
                 Error::GraphStorage(format!("ort optimization level failed: {e}"))
             })?
