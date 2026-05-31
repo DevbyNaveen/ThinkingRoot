@@ -1231,10 +1231,18 @@ async fn run_pipeline_inner(
     let structural_extractions = extraction.structural_extractions;
 
     let mut filtered_extraction = thinkingroot_extract::ExtractionOutput {
+        // Persist-boundary binary guard: drop any claim whose statement is not
+        // human-readable text (binary/PDF bytes ingested as a "claim"). This is
+        // the single write-point that catches every claim-creation path, so a
+        // binary file (e.g. a PDF) re-ingested on boot can no longer re-pollute
+        // the graph. Pairs with the recall-side filter + the embed-side skip.
         claims: extraction
             .claims
             .into_iter()
-            .filter(|c| truly_changed_ids.contains(&c.source))
+            .filter(|c| {
+                truly_changed_ids.contains(&c.source)
+                    && crate::intelligence::hybrid::is_probably_text(&c.statement)
+            })
             .collect(),
         entities: extraction.entities,
         relations: extraction

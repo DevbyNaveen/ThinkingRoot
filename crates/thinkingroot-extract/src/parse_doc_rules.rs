@@ -46,6 +46,32 @@ pub struct DocRuleOutput {
 /// Extract all documentation Witnesses for a chunk. Returns an empty
 /// vec for chunks that match no rule in this family (other adapters
 /// handle code / data / git / comment-claims).
+/// Heuristic: are these bytes human-readable text rather than binary noise?
+/// Rejects PDF/stream object markers and anything with a low printable-char
+/// ratio (control chars / UTF-8 replacement chars). Used to keep binary files
+/// (PDFs ingested as raw bytes) from polluting the witness mesh at ingest.
+pub fn bytes_are_probably_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains("FlateDecode") || t.contains("endstream") || t.contains("/Filter") {
+        return false;
+    }
+    let total = t.chars().count();
+    let printable = t
+        .chars()
+        .filter(|c| {
+            *c == '\n' || *c == '\t' || *c == '\r' || (!c.is_control() && *c != '\u{FFFD}')
+        })
+        .count();
+    (printable as f64 / total as f64) >= 0.85
+}
+
 pub fn extract_witnesses_from_chunk(
     chunk: &Chunk,
     source_bytes: &[u8],
@@ -62,6 +88,18 @@ pub fn extract_witnesses_from_chunk(
         || chunk.byte_start as usize >= source_bytes.len()
     {
         return out;
+    }
+
+    // Ingest-time binary guard: never emit witnesses for chunks whose bytes are
+    // not human-readable text (e.g. a PDF ingested as raw bytes → FlateDecode
+    // streams). Without this, binary files re-ingest on every compile/boot and
+    // pollute recall with byte-noise "claims". Deterministic, zero-LLM.
+    {
+        let end = (chunk.byte_end as usize).min(source_bytes.len());
+        let slice = &source_bytes[chunk.byte_start as usize..end];
+        if !bytes_are_probably_text(slice) {
+            return out;
+        }
     }
 
     // Per-chunk-type emission.
@@ -355,6 +393,25 @@ mod tests {
         c.byte_start = byte_start;
         c.byte_end = byte_end;
         c
+    }
+
+    #[test]
+    fn binary_guard_keeps_text_rejects_pdf_bytes() {
+        assert!(bytes_are_probably_text(b"The deployment uses blue-green rollout."));
+        assert!(bytes_are_probably_text(b"# Heading\n\nSome prose with code() and links."));
+        assert!(!bytes_are_probably_text(b"<</N 3\n/Filter /FlateDecode\n/Length 294>> stream"));
+        assert!(!bytes_are_probably_text(&[0x44, 0x00, 0x4f, 0x01, 0x5a, 0x1e, 0x00, 0x05, 0x1a, 0x63]));
+        assert!(!bytes_are_probably_text(b""));
+    }
+
+    #[test]
+    fn prose_chunk_of_binary_emits_no_witness() {
+        let source: &[u8] = &[0x25, 0x50, 0x44, 0x46, 0x00, 0x01, 0x02, 0x03, 0xff, 0xfe, 0x80, 0x81];
+        let chunk = chunk_at("\u{0}\u{1}\u{2}", ChunkType::Prose, 0, source.len() as u64);
+        let out = extract_witnesses_from_chunk(
+            &chunk, source, "blake", SourceId::new(), WorkspaceId::new(), Utc::now(),
+        );
+        assert!(out.witnesses.is_empty(), "binary chunk must emit zero witnesses");
     }
 
     #[test]
