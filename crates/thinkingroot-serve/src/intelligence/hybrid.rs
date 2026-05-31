@@ -387,19 +387,27 @@ fn parse_query(req: &RetrievalRequest) -> Result<ParsedQuery> {
 // ===========================================================================
 
 fn preflight_count(graph: &GraphStore) -> Result<usize> {
-    let rows = run_hybrid(
-        graph,
-        "?[count(id)] := *claims{id}",
-        BTreeMap::new(),
-    )?;
-    let count = rows
-        .rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.into_iter().next())
-        .map(|v| cell_i64(&v).max(0) as usize)
-        .unwrap_or(0);
-    Ok(count)
+    // Count the SEARCHABLE substrate, not just the legacy `claims` relation.
+    // Post Witness-Mesh cutover, structural content (e.g. PDF/doc text) lands as
+    // *witnesses* and is NOT dual-written to `*claims` — yet it IS embedded into
+    // the vector index (rebuild reads the witness bridge). Counting only
+    // `*claims` made workspaces with witness-only content report 0 candidates →
+    // routing forced datalog-only → the embedded witness vectors were never
+    // searched (PDF recall returned nothing). Count claims + witnesses so
+    // routing reflects what's actually embedded.
+    let count_rel = |rel: &str| -> Result<usize> {
+        let rows = run_hybrid(graph, rel, BTreeMap::new())?;
+        Ok(rows
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .map(|v| cell_i64(&v).max(0) as usize)
+            .unwrap_or(0))
+    };
+    let claims = count_rel("?[count(id)] := *claims{id}")?;
+    let witnesses = count_rel("?[count(id)] := *witnesses{id, created_at}")?;
+    Ok(claims + witnesses)
 }
 
 // ===========================================================================

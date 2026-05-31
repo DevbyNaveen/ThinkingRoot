@@ -4,16 +4,52 @@ use thinkingroot_core::ir::{Chunk, ChunkType, DocumentIR};
 use thinkingroot_core::types::*;
 use thinkingroot_core::{Error, Result};
 
+/// Extract PDF text with PyMuPDF (SOTA layout-aware extraction; clean spacing).
+/// Shells out to the bundled `python3` + `pymupdf`. Returns Err (so the caller
+/// falls back to pdf-extract) if python/pymupdf is absent or yields no text.
+fn extract_pymupdf(path: &Path) -> std::result::Result<String, String> {
+    // Page text joined by blank lines so the paragraph chunker splits cleanly.
+    const SCRIPT: &str = "import sys, pymupdf\n\
+doc = pymupdf.open(sys.argv[1])\n\
+parts = [page.get_text('text') for page in doc]\n\
+sys.stdout.write('\\n\\n'.join(parts))\n";
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn python3: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pymupdf exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.trim().is_empty() {
+        return Err("pymupdf produced no text".into());
+    }
+    Ok(text)
+}
+
 /// Parse a PDF file into a DocumentIR.
-/// Uses pdf-extract for text extraction, then chunks by paragraph boundaries.
+/// SOTA path: PyMuPDF (clean, layout-aware). Fallback: pure-Rust pdf-extract.
 pub fn parse(path: &Path) -> Result<DocumentIR> {
     let content = std::fs::read(path).map_err(|e| Error::io_path(path, e))?;
     let hash = ContentHash::from_bytes(&content);
 
-    let text = pdf_extract::extract_text_from_mem(&content).map_err(|e| Error::Parse {
-        source_path: path.to_path_buf(),
-        message: format!("PDF extraction failed: {e}"),
-    })?;
+    let text = match extract_pymupdf(path) {
+        Ok(t) => t,
+        Err(why) => {
+            tracing::warn!(target: "parse::pdf", uri = %path.display(), %why,
+                "PyMuPDF unavailable/failed; falling back to pdf-extract");
+            pdf_extract::extract_text_from_mem(&content).map_err(|e| Error::Parse {
+                source_path: path.to_path_buf(),
+                message: format!("PDF extraction failed (pymupdf: {why}; pdf-extract: {e})"),
+            })?
+        }
+    };
 
     let uri = format!("{}", path.display());
     let source_id = SourceId::new();
