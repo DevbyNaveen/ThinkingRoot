@@ -58,6 +58,33 @@ use super::hybrid_types::{
 // Public entry point
 // ===========================================================================
 
+/// Heuristic "is this a human-readable statement, not binary garbage?" guard.
+/// A bad ingest (e.g. a PDF materialised from raw source bytes) can persist
+/// claims whose `statement` is FlateDecode/binary noise; those must never
+/// surface as recall hits. Cheap + deterministic: reject empty, reject obvious
+/// PDF/stream markers, and reject low printable-character ratio.
+pub(crate) fn is_probably_text(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Obvious binary/PDF object markers.
+    if t.contains("FlateDecode") || t.contains("endstream") || t.contains("/Filter") {
+        return false;
+    }
+    if t.starts_with("<<") && t.contains('/') {
+        return false;
+    }
+    // Printable ratio: letters/digits/punct/space are fine; control chars and
+    // replacement/garbage chars are not. Newlines/tabs count as printable.
+    let total = t.chars().count();
+    let printable = t
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || *c == '\r' || (!c.is_control() && *c != '\u{FFFD}'))
+        .count();
+    (printable as f64 / total as f64) >= 0.85
+}
+
 /// Run the 9-layer Hybrid Retrieval pipeline. Acquires `GraphStore` and
 /// `SourceByteStore` once, holds them for the duration of the call, and
 /// releases the workspace mutex before any Datalog work runs.
@@ -222,6 +249,7 @@ pub async fn hybrid_retrieve(
         });
     }
 
+    let mut junk_dropped = 0usize;
     for (c, fused, breakdown) in scored {
         // Sensitivity gate (Layer 9 — applied per-hit so we accumulate
         // redactions even when later layers also drop the hit).
@@ -230,6 +258,15 @@ pub async fn hybrid_retrieve(
                 hidden_field: format!("claim:{}", c.claim_id),
                 required_clearance: c.sensitivity,
             });
+            continue;
+        }
+
+        // Junk gate — a statement that materialised to non-text (binary/PDF
+        // bytes from a bad ingest) must never surface as a recall hit. This is
+        // a defensive filter so existing index pollution is invisible without a
+        // destructive purge; the extraction-side guard stops new junk at ingest.
+        if !is_probably_text(&c.statement) {
+            junk_dropped += 1;
             continue;
         }
 
@@ -288,6 +325,12 @@ pub async fn hybrid_retrieve(
 
         // Build the hit
         hits.push(build_hit(c, fused, breakdown, bundle, hit_caveats));
+    }
+    if junk_dropped > 0 {
+        tracing::debug!(
+            junk_dropped,
+            "hybrid_retrieve: filtered non-text (binary/PDF) claims from results"
+        );
     }
 
     let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
@@ -2195,5 +2238,21 @@ mod tests {
     #[test]
     fn complexity_signal_returns_zero_when_metrics_absent() {
         assert_eq!(complexity_signal(None), 0.0);
+    }
+
+    #[test]
+    fn junk_guard_rejects_binary_keeps_text() {
+        // real human statements pass
+        assert!(is_probably_text(
+            "The deployment pipeline uses blue-green rollout with a five minute soak window"
+        ));
+        assert!(is_probably_text("Customer Acme Corp is on the enterprise plan"));
+        assert!(is_probably_text("graph TD\n    A[Frontend] --> B[API]"));
+        // binary / PDF garbage is rejected
+        assert!(!is_probably_text("<</N 3\n/Filter /FlateDecode\n/Length 294>> stream"));
+        assert!(!is_probably_text("D\u{0}O\u{1}Z\u{1e}\u{0}\u{5}\u{1a}c\u{6}8q\u{3}3"));
+        assert!(!is_probably_text("\u{FFFD}\u{FFFD}\u{FFFD}5\u{13}\u{FFFD}U\u{FFFD}bY"));
+        assert!(!is_probably_text("   "));
+        assert!(!is_probably_text(""));
     }
 }
