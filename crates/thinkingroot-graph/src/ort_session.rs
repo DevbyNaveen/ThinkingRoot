@@ -233,7 +233,33 @@ mod inner {
         /// This is the canonical sentence-transformers convention —
         /// CLS-only or last-token pooling would diverge from the
         /// fastembed wire shape and invalidate `vectors.bin`.
+        /// Embed a batch of texts, mean-pooled + L2-normalised. Processes in
+        /// bounded sub-batches (`TR_EMBED_BATCH`, default 16) so a single ONNX
+        /// inference tensor stays small regardless of the caller's batch size.
+        /// Without this, `rebuild_vector_index` padded a 512-item chunk to the
+        /// longest sequence and ran it as one `[512 × seq × 768]` tensor —
+        /// gigabytes for gte-modernbert — and OOM-killed the daemon (exit 137).
         pub fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let sub = std::env::var("TR_EMBED_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(16);
+            if texts.len() <= sub {
+                return self.embed_chunk(texts);
+            }
+            let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(sub) {
+                out.extend(self.embed_chunk(chunk)?);
+            }
+            Ok(out)
+        }
+
+        /// Embed a single bounded sub-batch in one ONNX inference call.
+        fn embed_chunk(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }

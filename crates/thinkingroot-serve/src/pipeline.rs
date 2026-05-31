@@ -2069,8 +2069,13 @@ pub fn rebuild_vector_index(storage: &mut StorageEngine) -> Result<(usize, usize
         })
         .collect();
 
+    // Skip embedding non-text (binary/PDF-byte) claims: they waste ONNX
+    // compute, bloat the index, and (being padded to the batch's longest
+    // sequence) drive the memory spike that OOM'd bulk rebuilds. The recall
+    // path filters them anyway; not embedding them is the upstream fix.
     let claim_items: Vec<(String, String, String)> = claims
         .iter()
+        .filter(|(_, statement, ..)| crate::intelligence::hybrid::is_probably_text(statement))
         .map(|(id, statement, ctype, conf, uri, _)| {
             (
                 format!("claim:{id}"),
