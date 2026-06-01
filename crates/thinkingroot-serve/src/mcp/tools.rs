@@ -197,8 +197,14 @@ fn annotate_defer_loading(tools: &mut serde_json::Value) {
     }
 }
 
-#[tracing::instrument(name = "mcp.tools.list", skip_all)]
-pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
+/// Build the FULL, unfiltered tool catalog (`{"tools":[…]}`): the inline
+/// built-in array + `tool_trait`-registered schemas + bridged external MCP
+/// tools, with the `defer_loading` annotation pass applied. This is the single
+/// source of truth. `handle_list` may apply a capability-router exposure filter
+/// on top; `tool_search` / `tool_invoke` always operate over THIS full set so
+/// progressive disclosure can reach every tool regardless of exposure mode.
+#[tracing::instrument(name = "mcp.tools.catalog", skip_all)]
+pub async fn build_tool_catalog() -> Value {
     let mut tools = serde_json::json!({
         "tools": [
             // ── Classic CRUD tools ────────────────────────────────────────
@@ -1120,6 +1126,18 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
                     "required": []
                 }
             },
+            {
+                "name": "tool_invoke",
+                "description": "Execute ANY workspace tool by name — including tools not currently in your advertised list (the long tail surfaced via `tool_search`). This is the capability-router execution bridge: in `meta` exposure mode only a small core is listed, so to run a discovered tool (e.g. `redact_pii`, `rebase_branch`, an external `server::tool`, or a deployed Root Function) call `tool_invoke` with its name + the arguments its schema specifies. Pattern: `tool_search('redact pii')` → read the descriptor → `tool_invoke(name='redact_pii', arguments={…})`. Cannot invoke a meta-tool (`tool_invoke`/`tool_search`).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name":      { "type": "string", "description": "The exact tool name to invoke, as returned by `tool_search` (e.g. 'redact_pii', 'rebase_branch', 'github::create_issue')." },
+                        "arguments": { "type": "object", "description": "The argument object for the target tool, matching its inputSchema. Pass {} if it takes none." }
+                    },
+                    "required": ["name"]
+                }
+            },
             // ── Phase D Wave 1 — System-power tools ──────────────────
             // These 10 tools operate on the user's filesystem and shell
             // OUTSIDE the workspace. Each is gated by the agent's
@@ -1354,6 +1372,65 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
             }
         }
     }
+    tools
+}
+
+/// Capability-router core: tools always advertised even in `meta` exposure
+/// mode. The memory hot-path (`ask`/`search`/`contribute`/`hybrid_retrieve`/
+/// `query_claims`) stays directly callable + prompt-cacheable; everything else
+/// is reached via `tool_search` (discover) + `tool_invoke` (execute). Keeping
+/// this set small is the whole point — it collapses ~80 schemas to ~8.
+pub const CAPABILITY_CORE_TOOLS: &[&str] = &[
+    "tool_search",
+    "tool_invoke",
+    "ask",
+    "search",
+    "contribute",
+    "hybrid_retrieve",
+    "query_claims",
+    "get_session_context",
+];
+
+/// MCP tool exposure mode, from `TR_MCP_TOOL_EXPOSURE` (`meta` | `full`).
+/// Default `full` for back-compat; `meta` enables the capability-router
+/// progressive-disclosure surface (the 49k→~2k token win). `subset` (dynamic
+/// top-k) requires engine/ws context not available here and lands with P2's
+/// `route_capabilities` on the context-carrying path.
+fn tool_exposure_mode() -> String {
+    std::env::var("TR_MCP_TOOL_EXPOSURE")
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "full".to_string())
+}
+
+/// In `meta` mode, retain only [`CAPABILITY_CORE_TOOLS`] in the advertised
+/// list. `tool_search` over the full catalog + `tool_invoke` re-dispatch keep
+/// every other tool reachable on demand (an LLM can only *call* a listed tool,
+/// so `tool_invoke(name,args)` is the bridge to the unlisted long tail).
+fn apply_tool_exposure_mode(tools: &mut Value, mode: &str) {
+    if mode != "meta" {
+        return;
+    }
+    let core: std::collections::HashSet<&str> = CAPABILITY_CORE_TOOLS.iter().copied().collect();
+    if let Some(arr) = tools.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        arr.retain(|t| {
+            t.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| core.contains(n))
+                .unwrap_or(false)
+        });
+    }
+}
+
+fn apply_tool_exposure(tools: &mut Value) {
+    apply_tool_exposure_mode(tools, &tool_exposure_mode());
+}
+
+#[tracing::instrument(name = "mcp.tools.list", skip_all)]
+pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
+    let mut tools = build_tool_catalog().await;
+    apply_tool_exposure(&mut tools);
     JsonRpcResponse::success(id, tools)
 }
 
@@ -1383,20 +1460,10 @@ pub async fn handle_tool_search(
         .map(|n| n.clamp(1, 100) as usize)
         .unwrap_or(20);
 
-    // Reuse the canonical list — same source of truth as the
-    // production tools/list endpoint, including the defer_loading
-    // annotation pass.
-    let full = handle_list(None).await;
-    let result = match full.result {
-        Some(v) => v,
-        None => {
-            return JsonRpcResponse::error(
-                id,
-                -32603,
-                "tool_search: tools/list returned no result".to_string(),
-            );
-        }
-    };
+    // Always search the FULL catalog (same source of truth as tools/list,
+    // including the defer_loading annotation pass) — NOT the exposure-filtered
+    // list — so progressive disclosure can surface every tool in `meta` mode.
+    let result = build_tool_catalog().await;
     let arr = result
         .get("tools")
         .and_then(|v| v.as_array())
@@ -3444,6 +3511,53 @@ pub async fn handle_call(
         // matching tool descriptors so the client can discover
         // `defer_loading: true` tools on demand without preloading.
         "tool_search" => handle_tool_search(id, &arguments).await,
+        // Capability-router execution bridge. Re-dispatches to ANY tool by
+        // name so `meta` exposure mode (which advertises only a small core)
+        // can still reach the full surface: an LLM can only *call* a listed
+        // tool, so this listed meta-tool forwards to the unlisted target.
+        "tool_invoke" => {
+            let inner_name = match arguments.get("name").and_then(|v| v.as_str()) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32602,
+                        "tool_invoke: missing required 'name' argument".to_string(),
+                    );
+                }
+            };
+            if inner_name == "tool_invoke" || inner_name == "tool_search" {
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("tool_invoke: refusing to invoke meta-tool '{inner_name}'"),
+                );
+            }
+            let mut inner_args = arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
+            // Carry the resolved workspace into the inner call if the caller
+            // didn't specify one, so default-ws behaviour matches a direct call.
+            if inner_args.get("workspace").is_none()
+                && let Some(obj) = inner_args.as_object_mut()
+            {
+                obj.insert("workspace".to_string(), Value::String(ws_owned.clone()));
+            }
+            let inner_params = serde_json::json!({ "name": inner_name, "arguments": inner_args });
+            Box::pin(handle_call(
+                id,
+                &inner_params,
+                engine,
+                default_ws,
+                session_id,
+                sessions,
+                engram_manager,
+                state,
+                cancel,
+            ))
+            .await
+        }
 
         // ── Workspace filesystem operations ──────────────────────────
         // Same primitives the desktop FileManager uses. Workspace root
@@ -5104,6 +5218,42 @@ mod observer_tool_listing_tests {
         assert!(
             names.contains(&"observe_turn"),
             "expected observe_turn tool to be advertised; got {names:?}"
+        );
+    }
+
+    // P1 capability-router: `meta` exposure mode collapses the full catalog
+    // (~80 tools) to the small core, while `tool_search`/`tool_invoke` keep the
+    // long tail reachable. This is the 49k→~2k token mechanism.
+    #[tokio::test]
+    async fn meta_exposure_collapses_catalog_to_core() {
+        let mut cat = super::build_tool_catalog().await;
+        let names_of = |v: &serde_json::Value| -> Vec<String> {
+            v.get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let full = names_of(&cat);
+        assert!(full.len() > 30, "full catalog should be the big list; got {}", full.len());
+        assert!(full.iter().any(|n| n == "tool_invoke"), "tool_invoke must be in catalog");
+        assert!(full.iter().any(|n| n == "tool_search"), "tool_search must be in catalog");
+
+        super::apply_tool_exposure_mode(&mut cat, "meta");
+        let meta = names_of(&cat);
+        assert!(
+            meta.len() <= super::CAPABILITY_CORE_TOOLS.len(),
+            "meta should collapse to <= core size; got {meta:?}"
+        );
+        for must in ["tool_search", "tool_invoke", "ask", "search"] {
+            assert!(meta.iter().any(|n| n == must), "meta must keep {must}; got {meta:?}");
+        }
+        assert!(
+            !meta.iter().any(|n| n == "rebase_branch"),
+            "meta must drop long-tail tools; got {meta:?}"
         );
     }
 

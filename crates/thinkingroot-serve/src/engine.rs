@@ -1885,36 +1885,83 @@ impl QueryEngine {
         }
     }
 
-    /// Experience-routed tool selection — the "narrow 105 tools → k".
-    /// Ranks deployed Root Functions by their learned success on inputs
-    /// of this query's shape (reusing [`Self::route_functions`]), then
-    /// fills any remaining slots with external MCP tools. Returns at most
-    /// `k` tool names so the capsule carries a tight, relevant tool set
-    /// instead of every schema.
+    /// Back-compat shim — delegates to the capability router. Historically this
+    /// ranked by experience/input-shape alone and ignored the query; it now
+    /// fuses SEMANTIC relevance (vector over embedded capability nodes) with the
+    /// learned Wilson experience score via [`Self::route_capabilities`].
     pub async fn route_tools(&self, ws: &str, query: &str, k: usize) -> Result<Vec<String>> {
+        self.route_capabilities(ws, None, query, k).await
+    }
+
+    /// Capability router (P2): the "narrow ~105 tools → k" decision. Ranks
+    /// deployed Root Functions + external MCP tools for an INTENT by fusing:
+    ///   1. semantic similarity — vector search over embedded capability nodes
+    ///      (so a brand-new function matches on meaning, zero experience needed);
+    ///   2. learned experience — multiplicative Wilson-score boost (so a function
+    ///      that has reliably served similar inputs ranks higher);
+    /// then fills any remaining slots from the MCP registry. Returns at most `k`
+    /// tool names. `_branch` is reserved for branch-scoped vector search.
+    pub async fn route_capabilities(
+        &self,
+        ws: &str,
+        _branch: Option<&str>,
+        intent: &str,
+        k: usize,
+    ) -> Result<Vec<String>> {
         if k == 0 {
             return Ok(Vec::new());
         }
-        let mut names: Vec<String> = Vec::new();
-        let ranked = self
-            .route_functions(ws, &serde_json::json!({ "query": query }))
-            .await
-            .unwrap_or_default();
-        for e in ranked {
-            if !names.contains(&e.function_name) {
-                names.push(e.function_name);
-            }
-            if names.len() >= k {
-                return Ok(names);
+        // 1. Semantic candidates over embedded capability nodes.
+        let mut scored: Vec<(String, f64)> = Vec::new();
+        if !intent.trim().is_empty() {
+            let handle = self.get_workspace(ws)?;
+            let mut storage = handle.storage.lock().await;
+            if let Ok(hits) = storage.vector.search(intent, k.saturating_mul(4).max(8)) {
+                for (_id, meta, sim) in hits {
+                    // metadata format: `capability|{kind}|{name}`
+                    if let Some(rest) = meta.strip_prefix("capability|")
+                        && let Some(name) = rest.rsplit('|').next()
+                    {
+                        scored.push((name.to_string(), sim as f64));
+                    }
+                }
             }
         }
-        let registry = crate::mcp::external_registry::global().await;
-        for (tool_name, _desc) in registry.list_all_tools().await {
-            if !names.contains(&tool_name) {
-                names.push(tool_name);
+        // 2. Experience boost (multiplicative). Experienced functions are
+        //    included even with no semantic hit (cold or shape-only intent).
+        let exp = self
+            .route_functions(ws, &serde_json::json!({ "query": intent }))
+            .await
+            .unwrap_or_default();
+        for e in &exp {
+            let boost = 1.0 + e.score();
+            if let Some(s) = scored.iter_mut().find(|(n, _)| *n == e.function_name) {
+                s.1 *= boost;
+            } else {
+                scored.push((e.function_name.clone(), 0.1 * boost));
+            }
+        }
+        // 3. Rank by fused score, dedup, take k.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut names: Vec<String> = Vec::new();
+        for (n, _) in scored {
+            if !names.contains(&n) {
+                names.push(n);
             }
             if names.len() >= k {
                 break;
+            }
+        }
+        // 4. Fill remaining slots from the external MCP registry.
+        if names.len() < k {
+            let registry = crate::mcp::external_registry::global().await;
+            for (tool_name, _desc) in registry.list_all_tools().await {
+                if !names.contains(&tool_name) {
+                    names.push(tool_name);
+                }
+                if names.len() >= k {
+                    break;
+                }
             }
         }
         Ok(names)
@@ -1934,8 +1981,20 @@ impl QueryEngine {
         language: &str,
     ) -> Result<thinkingroot_graph::root_function::RootFunction> {
         let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        storage.graph.put_function(name, body, language)
+        let mut storage = handle.storage.lock().await;
+        let row = storage.graph.put_function(name, body, language)?;
+        // P2 capability router: embed the function as a semantic capability node
+        // so `route_capabilities` can match it on INTENT (not just input shape /
+        // learned experience). Metadata `capability|root_function|{name}` lets the
+        // vector search filter capability candidates. Best-effort — a missing
+        // embedding model must not block a deploy.
+        let snippet: String = body.chars().take(400).collect();
+        let _ = storage.vector.upsert(
+            &format!("cap:root_function:{name}"),
+            &format!("{name} ({language}): {snippet}"),
+            &format!("capability|root_function|{name}"),
+        );
+        Ok(row)
     }
 
     /// Deploy a function version onto a specific branch's graph (e.g. a
