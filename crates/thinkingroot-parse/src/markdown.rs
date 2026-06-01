@@ -278,6 +278,20 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 table_current_row.push(table_cell_buf.trim().to_string());
                 table_cell_buf.clear();
             }
+            // Paragraph boundary. pulldown-cmark wraps each prose block in
+            // Start/End(Paragraph). Without re-inserting the blank-line
+            // separator here, consecutive paragraphs concatenate into ONE chunk
+            // with no gap ("…Tesla.User: I work…"), which (a) corrupts the prose
+            // and (b) makes the chunk text no longer a substring of the source —
+            // so `fill_byte_ranges`' substring search fails and the chunk keeps
+            // its sentinel `[0,0]` range, which the sentence-witness extractor
+            // treats as an empty span and drops. Mirror the source's blank line
+            // so the chunk stays source-faithful and byte-anchorable.
+            Event::End(TagEnd::Paragraph) => {
+                if !in_heading && !in_code_block && !in_table && !in_list {
+                    current_text.push_str("\n\n");
+                }
+            }
             Event::Text(text) => {
                 let text_str = text.to_string();
                 line_counter += text_str.matches('\n').count() as u32;
@@ -437,6 +451,42 @@ fn flush_prose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_paragraph_prose_is_source_faithful_and_anchored() {
+        // Regression (2026-06-01): paragraph boundaries were dropped, so
+        // consecutive paragraphs concatenated with no separator, the chunk text
+        // stopped being a source substring, fill_byte_ranges failed, and the
+        // sentence-witness extractor dropped everything (zero claims on every
+        // multi-paragraph / conversational doc — the core OpenClaw use case).
+        let content = "User: I drive a Tesla.\n\nUser: I work at Acme.\n\nUser: I like Rust.\n";
+        let doc = parse_markdown_content(Path::new("c.md"), content).unwrap();
+        let prose: Vec<_> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Prose)
+            .collect();
+        assert!(!prose.is_empty(), "expected at least one prose chunk");
+        for c in &prose {
+            // Real byte range, not the [0,0] sentinel.
+            assert!(
+                c.byte_end > c.byte_start,
+                "prose chunk has empty byte range: [{}..{}] {:?}",
+                c.byte_start,
+                c.byte_end,
+                c.content
+            );
+            // The slice the extractor will read must equal the chunk content.
+            let slice = &content[c.byte_start as usize..c.byte_end as usize];
+            assert_eq!(slice, c.content, "byte range does not map back to content");
+            // Paragraphs must not be jammed together.
+            assert!(
+                !c.content.contains("Tesla.User"),
+                "paragraphs concatenated without separator: {:?}",
+                c.content
+            );
+        }
+    }
 
     #[test]
     fn parse_simple_markdown() {
