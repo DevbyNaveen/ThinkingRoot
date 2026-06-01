@@ -180,6 +180,39 @@ mod inner {
             Ok(scores)
         }
 
+        /// Semantic search restricted to entries whose metadata starts with
+        /// `meta_prefix` (e.g. `"capability|"`). Unlike [`Self::search`], `top_k`
+        /// is taken over ONLY the matching subset — so a small set of capability
+        /// nodes is ranked among themselves and never crowded out of the result
+        /// by the (typically far more numerous) claim/entity vectors. This is the
+        /// capability-router's retrieval primitive (P2).
+        pub fn search_prefix(
+            &mut self,
+            query: &str,
+            top_k: usize,
+            meta_prefix: &str,
+        ) -> Result<Vec<(String, String, f32)>> {
+            if self.index.is_empty() {
+                return Ok(Vec::new());
+            }
+            let query_embedding = self.ensure_model()?.embed(&[query])?;
+            let query_vec = match query_embedding.into_iter().next() {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            };
+            let mut scores: Vec<(String, String, f32)> = self
+                .index
+                .iter()
+                .filter(|(_, (_, meta))| meta.starts_with(meta_prefix))
+                .map(|(id, (vec, meta))| {
+                    (id.clone(), meta.clone(), cosine_similarity(&query_vec, vec))
+                })
+                .collect();
+            scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(top_k);
+            Ok(scores)
+        }
+
         /// Persist the index to disk in compact binary format.
         ///
         /// Format: `TRVEC1\n` magic, then per-entry:
@@ -540,6 +573,15 @@ mod inner {
             _query: &str,
             _top_k: usize,
             _allowed: Option<&std::collections::HashSet<String>>,
+        ) -> Result<Vec<(String, String, f32)>> {
+            Ok(Vec::new())
+        }
+
+        pub fn search_prefix(
+            &mut self,
+            _query: &str,
+            _top_k: usize,
+            _meta_prefix: &str,
         ) -> Result<Vec<(String, String, f32)>> {
             Ok(Vec::new())
         }

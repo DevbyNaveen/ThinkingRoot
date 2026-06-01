@@ -1607,9 +1607,16 @@ impl QueryEngine {
             }
         }
 
-        // Cold path: build the query-independent frame + ground the query.
+        // Cold path: build the frame (intent-routed tools) + ground the query.
         let (system, brief, tools, _v) = self
-            .build_capsule_frame(ws, &spec.prompt_name, &spec.vars, branch_ref, spec.max_tools)
+            .build_capsule_frame(
+                ws,
+                &spec.prompt_name,
+                &spec.vars,
+                branch_ref,
+                spec.max_tools,
+                &spec.query,
+            )
             .await?;
         let session_id = spec
             .session_id
@@ -1666,6 +1673,10 @@ impl QueryEngine {
         vars: &std::collections::BTreeMap<String, String>,
         branch: Option<&str>,
         max_tools: usize,
+        // Intent hint for semantic tool routing. Empty string = no hint
+        // (warm-frame prefetch, before any query exists) → experience/shape
+        // ranking only, keeping the prewarmed frame query-independent.
+        route_intent: &str,
     ) -> Result<(String, WorkspaceSummary, Vec<String>, i64)> {
         // Two-tier brain: the system prompt is SHARED. A per-user workspace
         // doesn't carry it, so source the prompt from this ws if present, else
@@ -1688,9 +1699,11 @@ impl QueryEngine {
         };
         let system = self.assemble_prompt(&prompt_ws, prompt_name, vars).await?;
         let brief = self.get_workspace_brief_branched(ws, branch).await?;
-        // Tool routing keys on the query-input shape (constant across chat
-        // turns), so an empty hint yields the same ranking — frame-stable.
-        let tools = self.route_tools(ws, "", max_tools).await?;
+        // Capability router: rank tools by semantic relevance to the intent
+        // (fused with learned experience) when a hint is present; with an empty
+        // hint (prefetch) it falls back to experience/shape ranking, keeping a
+        // prewarmed frame query-independent.
+        let tools = self.route_capabilities(ws, branch, route_intent, max_tools).await?;
         Ok((system, brief, tools, prompt_version))
     }
 
@@ -1787,6 +1800,7 @@ impl QueryEngine {
                         &spec.vars,
                         branch_ref,
                         spec.max_tools,
+                        &spec.query,
                     )
                     .await?;
                 // Cache the frame on the session for the next turn.
@@ -1843,7 +1857,7 @@ impl QueryEngine {
         max_tools: usize,
     ) -> Result<()> {
         let (system, brief, tools, version) = self
-            .build_capsule_frame(ws, prompt_name, vars, branch, max_tools)
+            .build_capsule_frame(ws, prompt_name, vars, branch, max_tools, "")
             .await?;
         let brief_json = serde_json::to_string(&brief)
             .map_err(|e| Error::Serialization(format!("prefetch brief: {e}")))?;
@@ -1916,7 +1930,11 @@ impl QueryEngine {
         if !intent.trim().is_empty() {
             let handle = self.get_workspace(ws)?;
             let mut storage = handle.storage.lock().await;
-            if let Ok(hits) = storage.vector.search(intent, k.saturating_mul(4).max(8)) {
+            if let Ok(hits) =
+                storage
+                    .vector
+                    .search_prefix(intent, k.saturating_mul(4).max(8), "capability|")
+            {
                 for (_id, meta, sim) in hits {
                     // metadata format: `capability|{kind}|{name}`
                     if let Some(rest) = meta.strip_prefix("capability|")
@@ -1989,11 +2007,19 @@ impl QueryEngine {
         // vector search filter capability candidates. Best-effort — a missing
         // embedding model must not block a deploy.
         let snippet: String = body.chars().take(400).collect();
-        let _ = storage.vector.upsert(
-            &format!("cap:root_function:{name}"),
-            &format!("{name} ({language}): {snippet}"),
-            &format!("capability|root_function|{name}"),
-        );
+        if storage
+            .vector
+            .upsert(
+                &format!("cap:root_function:{name}"),
+                &format!("{name} ({language}): {snippet}"),
+                &format!("capability|root_function|{name}"),
+            )
+            .is_ok()
+        {
+            // Persist so the capability embedding survives daemon restart /
+            // respawn (upsert mutates the in-memory index only).
+            let _ = storage.vector.save();
+        }
         Ok(row)
     }
 
