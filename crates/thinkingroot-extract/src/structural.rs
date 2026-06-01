@@ -453,23 +453,40 @@ fn extract_heading(chunk: &Chunk, source_uri: &str) -> ExtractionResult {
         description: Some(format!("{container_name} contains section {heading_text}")),
         confidence: 0.99,
     };
-    let def_claim = ExtractedClaim {
-        statement: format!("{heading_text} is a section in {file_name}"),
-        claim_type: "definition".to_string(),
-        confidence: 0.99,
-        entities: vec![heading_text.clone(), file_name.clone()],
-        source_quote: None,
-        extraction_tier: ExtractionTier::Structural,
-        event_date: None,
-        source_path: source_uri.to_string(),
-        byte_start: chunk.byte_start,
-        byte_end: chunk.byte_end,
-        predicate: None,
-        ..Default::default()
+    // Heading → claim policy (Witness-Mesh recall-quality fix, 2026-06-01):
+    //
+    // The old code unconditionally emitted `"{heading} is a section in {file}"`
+    // as a confidence-0.99 claim for EVERY heading. That asserted document
+    // structure (true) but carried zero domain knowledge — "Additional Tips:",
+    // "Best Practices", "Meditation and sleep:" all became retrievable claims
+    // and crowded the vector index, diluting recall@k on real questions.
+    //
+    // We always keep the Entity(concept) + `contains` relation so the document
+    // hierarchy survives in the graph. We emit a CLAIM only when the heading is
+    // a genuine statement (has a finite verb, reads like a fact) — in which
+    // case the claim statement IS the heading text itself, not the hollow
+    // "is a section in" template. A bare label/heading produces structure only.
+    let claims = if crate::fact_quality::is_useful_fact(&heading_text) {
+        vec![ExtractedClaim {
+            statement: heading_text.clone(),
+            claim_type: "fact".to_string(),
+            confidence: 0.95,
+            entities: vec![heading_text.clone()],
+            source_quote: None,
+            extraction_tier: ExtractionTier::Structural,
+            event_date: None,
+            source_path: source_uri.to_string(),
+            byte_start: chunk.byte_start,
+            byte_end: chunk.byte_end,
+            predicate: None,
+            ..Default::default()
+        }]
+    } else {
+        Vec::new()
     };
 
     ExtractionResult {
-        claims: vec![def_claim],
+        claims,
         entities: vec![heading_entity, container_entity],
         relations: vec![contains_rel],
     }

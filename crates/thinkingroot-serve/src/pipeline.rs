@@ -717,6 +717,7 @@ async fn run_pipeline_inner(
             llm_calls: 0,
             cache_hits: 0,
             structural_extractions: 0,
+            chunks_without_extraction: 0,
             phase_timings: phase_timings.clone(),
             total_elapsed_ms,
         };
@@ -1116,6 +1117,9 @@ async fn run_pipeline_inner(
             llm_calls: 0,
             cache_hits,
             structural_extractions: extraction.structural_extractions,
+            chunks_without_extraction: extraction
+                .chunks_processed
+                .saturating_sub(cache_hits + extraction.structural_extractions),
             phase_timings: phase_timings.clone(),
             total_elapsed_ms,
         };
@@ -1794,6 +1798,9 @@ async fn run_pipeline_inner(
     let material_change_count = truly_changed.len() + deleted_sources.len();
     let should_synth_paper = matches!(branch, None | Some("main"))
         && (no_incremental || !paper_exists || material_change_count > PAPER_RESYNTH_CHANGE_FLOOR);
+    // Honest LLM-call accounting: extraction is fully mechanical, so the only
+    // place the compile invokes an LLM is the optional paper synthesis below.
+    let mut paper_llm_calls = 0usize;
     if should_synth_paper {
         progress_state.set_substep("synthesizing paper");
         let workspace_name: String = root_path
@@ -1849,6 +1856,8 @@ async fn run_pipeline_inner(
             )
             .map(|_| ()),
         };
+        // Count one LLM-backed synthesis pass iff the LLM path was taken.
+        paper_llm_calls = usize::from(llm_client.is_some());
         if let Err(e) = result {
             tracing::warn!(
                 target: "paper",
@@ -1899,10 +1908,14 @@ async fn run_pipeline_inner(
         structural_rows_emitted: phase_6_7_stats.structural_rows_emitted,
         structural_rows_cascaded: phase4_cascade_row_count,
         bytes_re_extracted: truly_changed.iter().map(|d| d.total_chars() as u64).sum(),
-        llm_calls: extraction_chunks_processed
-            .saturating_sub(cache_hits + structural_extractions),
+        // Genuine LLM calls = paper synthesis only (extraction is mechanical).
+        llm_calls: paper_llm_calls,
         cache_hits,
         structural_extractions,
+        // Chunks that produced no structural output (the value formerly
+        // mislabeled as `llm_calls`), now reported under an honest name.
+        chunks_without_extraction: extraction_chunks_processed
+            .saturating_sub(cache_hits + structural_extractions),
         phase_timings: phase_timings.clone(),
         total_elapsed_ms,
     };

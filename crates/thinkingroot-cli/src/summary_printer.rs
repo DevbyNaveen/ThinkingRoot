@@ -37,10 +37,10 @@ pub fn render(summary: &IncrementalSummary) -> String {
         format_bytes(summary.bytes_re_extracted),
     ));
     out.push_str(&format!(
-        "Extract    | {} LLM calls | {} cache hits | {} zero-LLM\n",
-        summary.llm_calls,
-        summary.cache_hits,
+        "Extract    | {} structural (mechanical) | {} no-op chunks | {} LLM calls (paper)\n",
         summary.structural_extractions,
+        summary.chunks_without_extraction,
+        summary.llm_calls,
     ));
 
     out.push_str(DIVIDER);

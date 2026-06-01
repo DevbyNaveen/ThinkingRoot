@@ -21,6 +21,7 @@ fn make_summary() -> IncrementalSummary {
         llm_calls: 4,
         cache_hits: 20,
         structural_extractions: 0,
+        chunks_without_extraction: 0,
         phase_timings,
         total_elapsed_ms: 843,
     }

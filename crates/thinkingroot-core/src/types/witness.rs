@@ -270,6 +270,16 @@ impl Witness {
         self
     }
 
+    /// Anchor this witness's validity to an EVENT time (when the asserted fact
+    /// became true) rather than the compile/ingestion time. Used by mechanical
+    /// temporal extraction so `/claims/as-of` and temporal-reasoning queries
+    /// resolve against the fact's real date. `created_at` (provenance) is left
+    /// unchanged — only the bitemporal `valid_from` moves.
+    pub fn with_valid_from(mut self, valid_from: DateTime<Utc>) -> Self {
+        self.valid_from = valid_from;
+        self
+    }
+
     /// True iff this Witness has any `WitnessRef` input (i.e. it
     /// composes other Witnesses rather than deriving purely from
     /// bytes).

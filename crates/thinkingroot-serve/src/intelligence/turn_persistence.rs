@@ -20,16 +20,23 @@
 //!    turns per session) can walk the conversation history without
 //!    re-parsing claim contents.
 //!
-//! This is the persistence half of auto-distill. A future ship can
-//! layer an LLM-summariser on top to replace the raw-truncate statement
-//! with extracted facts/decisions/preferences — the substrate change
-//! ships first so the downstream consumers (retrieval, UI) have a
-//! stable target.
+//! In addition to the turn-anchor claim (2), this path now runs the SAME
+//! mechanical witness-mesh extraction a batch compile uses (SRX-style
+//! segmentation + clause splitting + fact-quality gate + temporal anchoring,
+//! 2026-06-01) to distill the turn into atomic, speaker-attributed,
+//! temporally-anchored **fact** claims. This is multi-granularity indexing:
+//! the anchor serves turn-level recall ("what did we discuss earlier?") while
+//! the distilled facts serve fact-level recall ("what is my dog's name?") —
+//! and both are carried into `main` when the stream branch auto-merges. Zero
+//! LLM, byte-deterministic, consistent with the structural-only compile
+//! contract.
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use thinkingroot_core::{
     Claim, ClaimType, ContentHash, Error, Result, Source, SourceType, TrustLevel, WorkspaceId,
+    types::{ExtractionTier, SourceId},
 };
 use thinkingroot_graph::graph::GraphStore;
 
@@ -40,14 +47,115 @@ use thinkingroot_graph::graph::GraphStore;
 /// split a UTF-8 codepoint.
 const MAX_STATEMENT_CHARS: usize = 1024;
 
+/// Minimum length (chars) for an extracted atomic fact to be stored. The
+/// mechanical fact-quality gate already rejects fragments; this is a final
+/// floor against trivially short units.
+const MIN_FACT_CHARS: usize = 10;
+
 /// The result of a single successful turn persistence — exposed so
 /// callers and tests can verify the rows landed without re-querying.
 #[derive(Debug, Clone)]
 pub struct PersistedTurn {
     pub source_uri: String,
     pub source_id: String,
+    /// The turn-anchor claim (the `(question → answer)` digest) — kept for
+    /// turn-level recall ("what did we discuss earlier?").
     pub claim_id: String,
+    /// Atomic, speaker-attributed, temporally-anchored fact claims distilled
+    /// from this turn via the mechanical witness-mesh extraction (the
+    /// fact-level recall units). Empty when the turn carried no extractable
+    /// fact (e.g. "ok, thanks").
+    pub fact_claim_ids: Vec<String>,
     pub turn_number: u64,
+}
+
+/// Distill atomic fact claims from one speaker's text using the SAME mechanical
+/// extraction as a batch compile: SRX-style sentence segmentation + ClausIE-lite
+/// clause splitting + the fact-quality gate + temporal anchoring. Zero LLM.
+///
+/// Each fact is prefixed with the speaker (`"User: …"` / `"Assistant: …"`) for
+/// attribution + self-containment (the cheap-coreference move LongMemEval
+/// credits for preference recall), and its bitemporal `valid_from` / `event_date`
+/// is anchored to an in-text absolute date when present, else the turn time.
+fn extract_turn_facts(
+    text: &str,
+    speaker: &str,
+    source_id: SourceId,
+    workspace: WorkspaceId,
+    turn_time: DateTime<Utc>,
+) -> Vec<Claim> {
+    use thinkingroot_extract::{fact_quality, segment, temporal};
+
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for sent in segment::sentence_spans(text) {
+        for (s, e) in segment::clause_spans(text, sent) {
+            let unit = text[s..e].trim();
+            if unit.chars().count() < MIN_FACT_CHARS || !fact_quality::is_useful_fact(unit) {
+                continue;
+            }
+            let statement = format!("{speaker}: {unit}");
+            let event = temporal::extract_event_date(unit).unwrap_or(turn_time);
+            let mut claim = Claim::new(statement, ClaimType::Fact, source_id, workspace)
+                .with_extraction_tier(ExtractionTier::Structural)
+                .with_confidence(0.9)
+                .with_event_date(event);
+            // Anchor the bitemporal validity window to the event time so
+            // `/claims/as-of` + temporal-reasoning queries resolve correctly.
+            claim.valid_from = event;
+            out.push(claim);
+        }
+    }
+    out
+}
+
+/// Supersede older facts that the freshly-written facts update.
+///
+/// For each new fact carrying a mechanical [`supersession_key`], scan the
+/// branch's existing `Fact` claims for one with the SAME subject+attribute key
+/// but a DIFFERENT value, and mark it superseded (sets `valid_until` +
+/// `superseded_by`, invalidates dependent capsules/experience). New facts from
+/// this same turn are excluded so we only retire genuinely prior facts.
+///
+/// Reused at merge/consolidation time (C): pass the merging branch's facts as
+/// `new_facts` against the target workspace's graph to retire cross-session
+/// stale facts. Mechanical and high-precision by construction — the general
+/// (rephrased-contradiction) case is left to the query-time LLM reader.
+pub fn apply_write_supersession(
+    graph: &GraphStore,
+    new_facts: &[(String, String)],
+) -> Result<usize> {
+    use std::collections::HashSet;
+    use thinkingroot_extract::supersession::supersession_key;
+
+    let keyed: Vec<(&str, (String, String))> = new_facts
+        .iter()
+        .filter_map(|(id, stmt)| supersession_key(stmt).map(|k| (id.as_str(), k)))
+        .collect();
+    if keyed.is_empty() {
+        return Ok(0);
+    }
+    let new_ids: HashSet<&str> = new_facts.iter().map(|(id, _)| id.as_str()).collect();
+    let existing = graph.get_claims_by_type("Fact")?;
+
+    let mut superseded = 0usize;
+    for (new_id, (nkey, nval)) in &keyed {
+        for (eid, estmt, _src, _conf, _uri) in &existing {
+            if new_ids.contains(eid.as_str()) {
+                continue; // never supersede a fact written this turn
+            }
+            if let Some((ekey, eval)) = supersession_key(estmt) {
+                if &ekey == nkey && &eval != nval {
+                    graph.supersede_claim(eid, new_id)?;
+                    superseded += 1;
+                }
+            }
+        }
+    }
+    Ok(superseded)
 }
 
 /// Persist one completed chat turn onto a stream branch's graph.
@@ -114,22 +222,61 @@ pub async fn persist_chat_turn(
         combined
     };
 
-    let claim = Claim::new(statement, ClaimType::Fact, source_id, WorkspaceId::new());
+    let workspace = WorkspaceId::new();
+    let claim = Claim::new(statement, ClaimType::Fact, source_id, workspace);
     let claim_id = claim.id.to_string();
     graph.insert_claim(&claim)?;
     graph.link_claim_to_source(&claim_id, &source_id.to_string())?;
+
+    // Atomic fact distillation (2026-06-01): in addition to the turn-anchor
+    // claim above, run the SAME mechanical witness-mesh extraction a batch
+    // compile uses, so live conversation is stored as clean, retrievable,
+    // speaker-attributed, temporally-anchored facts — not just one blob. This
+    // is what closes the "streaming write is dumb" gap: the stream branch (and
+    // everything it later merges into main) now carries fact-level memory.
+    let now = chrono::Utc::now();
+    let mut fact_claim_ids: Vec<String> = Vec::new();
+    let mut all_ids: Vec<String> = vec![claim_id.clone()];
+    // (id, statement) of facts written this turn — fed to write-time
+    // supersession so a newer fact retires the older same-subject/attribute one.
+    let mut new_facts: Vec<(String, String)> = Vec::new();
+    for facts in [
+        extract_turn_facts(user_q, "User", source_id, workspace, now),
+        extract_turn_facts(assistant_a, "Assistant", source_id, workspace, now),
+    ] {
+        for fact in facts {
+            let fid = fact.id.to_string();
+            graph.insert_claim(&fact)?;
+            graph.link_claim_to_source(&fid, &source_id.to_string())?;
+            new_facts.push((fid.clone(), fact.statement.clone()));
+            fact_claim_ids.push(fid.clone());
+            all_ids.push(fid);
+        }
+    }
+
+    // Write-time supersession (B, 2026-06-01): retire older facts that this
+    // turn updates. Mechanical + high-precision (only clear "my X is Y" /
+    // "I live in / moved to …" patterns) so a still-true fact is never wrongly
+    // invalidated. Because a stream branch is forked from `main`, the candidate
+    // scan also sees prior-session facts merged into main — so this covers the
+    // cross-session knowledge-update case (C's mechanical half) too.
+    if let Err(e) = apply_write_supersession(&graph, &new_facts) {
+        tracing::warn!(error = %e, "supersession pass failed (non-fatal)");
+    }
 
     // Turn calendar entry: upserts on (session_id, turn_number) so a
     // caller retry with the same coordinates updates the claim_ids
     // list rather than failing. The agent_streaming turn-number
     // allocator is monotonic per session, so the typical caller never
     // hits the upsert path — it's defensive against client retries.
-    graph.record_turn(session_id, turn_number, &[claim_id.clone()])?;
+    // Binds the anchor AND every distilled fact claim to the turn.
+    graph.record_turn(session_id, turn_number, &all_ids)?;
 
     Ok(PersistedTurn {
         source_uri: uri,
         source_id: source_id.to_string(),
         claim_id,
+        fact_claim_ids,
         turn_number,
     })
 }
@@ -214,6 +361,90 @@ mod tests {
         assert!(
             persisted.source_uri.starts_with("mcp://agent/"),
             "URI must use the mcp://agent/ prefix so cleanup recognises it as agent work"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_chat_turn_distills_atomic_speaker_facts() {
+        let session_id = "persist-sess-facts";
+        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+
+        let persisted = persist_chat_turn(
+            &root,
+            &branch_name,
+            session_id,
+            1,
+            "I prefer aisle seats. My dog is named Rex.",
+            "The flight departs at noon. Aisle seats are reserved for you.",
+        )
+        .await
+        .expect("persist must succeed");
+
+        // The turn is no longer stored as a single blob — atomic facts are
+        // distilled beyond the turn-anchor claim.
+        assert!(
+            !persisted.fact_claim_ids.is_empty(),
+            "expected distilled fact claims beyond the turn anchor, got none"
+        );
+
+        let branch_dir =
+            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
+        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
+        let statements: Vec<String> = persisted
+            .fact_claim_ids
+            .iter()
+            .filter_map(|fid| graph.get_claim_by_id(fid).unwrap())
+            .map(|c| c.statement)
+            .collect();
+
+        // Speaker-attributed atomic facts from BOTH sides.
+        assert!(
+            statements
+                .iter()
+                .any(|s| s.starts_with("User:") && s.contains("aisle seats")),
+            "expected a User-attributed atomic fact, got: {statements:?}"
+        );
+        assert!(
+            statements.iter().any(|s| s.starts_with("Assistant:")),
+            "expected an Assistant-attributed atomic fact, got: {statements:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_chat_turn_supersedes_updated_fact() {
+        let session_id = "persist-sess-supersede";
+        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+
+        // Turn 1 establishes the fact.
+        persist_chat_turn(
+            &root,
+            &branch_name,
+            session_id,
+            1,
+            "My car is a Toyota.",
+            "Nice, Toyotas are reliable.",
+        )
+        .await
+        .expect("turn 1 must persist");
+
+        // Turn 2 updates it → the Toyota fact must be superseded by the Tesla fact.
+        persist_chat_turn(
+            &root,
+            &branch_name,
+            session_id,
+            2,
+            "My car is now a Tesla.",
+            "Congrats on the new Tesla.",
+        )
+        .await
+        .expect("turn 2 must persist");
+
+        let branch_dir =
+            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
+        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
+        assert!(
+            graph.count_superseded_claims().unwrap() >= 1,
+            "the older 'My car is a Toyota' fact should be superseded by the Tesla update"
         );
     }
 

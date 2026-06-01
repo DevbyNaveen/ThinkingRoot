@@ -7283,6 +7283,7 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sqlite",
  "tempfile",
  "thinkingroot-core",
  "thiserror 2.0.18",

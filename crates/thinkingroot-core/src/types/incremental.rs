@@ -34,9 +34,23 @@ pub struct IncrementalSummary {
 
     // Extraction work — every byte of every truly-changed source.
     #[serde(default)] pub bytes_re_extracted: u64,
+    // `llm_calls`: genuine LLM invocations made during this compile.
+    //
+    // HISTORY (2026-06-01 fix): claim extraction is FULLY MECHANICAL under the
+    // Witness Mesh — it consults no LLM. The pre-Witness-Mesh formula
+    // `chunks_processed - cache_hits - structural_extractions` was retained by
+    // accident and silently counted chunks that produced *no* structural output
+    // (e.g. empty/prose chunks), mislabeling them as "LLM calls" (a 940-session
+    // compile reported ~28k phantom calls). This field now counts only the LLM
+    // calls the pipeline actually makes — today that is the optional paper
+    // synthesis pass (0 when no LLM is configured / no resynth needed).
     #[serde(default)] pub llm_calls: usize,
     #[serde(default)] pub cache_hits: usize,
     #[serde(default)] pub structural_extractions: usize,
+    // Chunks the structural extractor examined that yielded no claim/entity/
+    // relation (the value formerly mislabeled as `llm_calls`). Surfaced so the
+    // "no-op chunk" signal stays visible under an honest name.
+    #[serde(default)] pub chunks_without_extraction: usize,
 
     // Per-phase wall-clock (stable string keys; see `PHASE_NAMES`).
     #[serde(default)] pub phase_timings: BTreeMap<String, u64>,

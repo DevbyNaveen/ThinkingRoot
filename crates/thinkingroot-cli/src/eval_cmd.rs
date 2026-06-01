@@ -66,6 +66,11 @@ fn deserialize_answer<'de, D: serde::Deserializer<'de>>(
 struct CategoryStats {
     correct: usize,
     total: usize,
+    /// Honest-mode (`--no-leak`) retrieval recall: was an answer-bearing claim
+    /// present in the top-k of retrieval scoped to the FULL haystack (NOT the
+    /// gold answer sessions)? Measures extraction+retrieval, not reader skill.
+    recall_at_10: usize,
+    recall_at_30: usize,
 }
 
 impl CategoryStats {
@@ -75,6 +80,12 @@ impl CategoryStats {
         } else {
             self.correct as f64 / self.total as f64 * 100.0
         }
+    }
+    fn recall10_pct(&self) -> f64 {
+        if self.total == 0 { 0.0 } else { self.recall_at_10 as f64 / self.total as f64 * 100.0 }
+    }
+    fn recall30_pct(&self) -> f64 {
+        if self.total == 0 { 0.0 } else { self.recall_at_30 as f64 / self.total as f64 * 100.0 }
     }
 }
 
@@ -139,6 +150,7 @@ pub async fn run_eval(
     category_filter: Option<&str>,
     judge_deployment: Option<&str>,
     rooting_mode: Option<&str>,
+    no_leak: bool,
 ) -> Result<()> {
     let dataset_str = std::fs::read_to_string(dataset_path)
         .with_context(|| format!("Cannot read dataset: {}", dataset_path.display()))?;
@@ -173,6 +185,15 @@ pub async fn run_eval(
     if questions.is_empty() {
         println!("  No questions to evaluate.");
         return Ok(());
+    }
+
+    if no_leak {
+        println!(
+            "  {} HONEST MODE (--no-leak): gold answer sessions are NOT injected; \
+             retrieval is scoped to the full haystack only. Reports retrieval recall \
+             + reader accuracy from retrieved evidence alone.",
+            style("●").green().bold()
+        );
     }
 
     let mut engine = QueryEngine::new();
@@ -313,6 +334,33 @@ pub async fn run_eval(
             })
             .collect();
 
+        // Honest-mode retrieval recall (--no-leak): retrieve scoped to the FULL
+        // haystack with answer_sids EMPTY (so neither the per-answer-session
+        // targeting in retrieve_claims nor the raw-answer injection fires), then
+        // measure whether an answer-bearing claim surfaced in the top-k. This is
+        // the true extraction+retrieval signal, independent of the LLM reader.
+        let (mut recall10, mut recall30) = (false, false);
+        if no_leak {
+            let no_answers: Vec<String> = Vec::new();
+            let hits = thinkingroot_serve::intelligence::retriever::retrieve_claims(
+                &engine,
+                "eval",
+                &q.question,
+                &q.category,
+                &allowed_sources,
+                &session_dates,
+                &no_answers,
+            )
+            .await;
+            let hit_in_answer = |k: usize| {
+                hits.iter().take(k).any(|h| {
+                    answer_sids.iter().any(|a| h.source_uri.contains(a.as_str()))
+                })
+            };
+            recall10 = hit_in_answer(10);
+            recall30 = hit_in_answer(30);
+        }
+
         // Use the production intelligence pipeline (same code that powers /ask endpoint).
         //
         // NOTE: this harness is the LongMemEval contract. We pass
@@ -321,6 +369,13 @@ pub async fn run_eval(
         // to the v0.9.0 prompt that scored 91.2 % on LME-500. Do not
         // switch on the persona registry, opt into history threading,
         // or pass identity here without re-running the full benchmark.
+        //
+        // Under `--no-leak` we pass answer_sids = EMPTY so the gold answer
+        // sessions are never injected raw — the reader must rely solely on
+        // what extraction+retrieval surfaced. This is the honest end-to-end
+        // accuracy (vs. the oracle-ceiling number the default path reports).
+        let empty_sids: Vec<String> = Vec::new();
+        let ask_answer_sids: &[String] = if no_leak { &empty_sids } else { &answer_sids };
         let ask_req = AskRequest {
             workspace: "eval",
             question: &q.question,
@@ -328,7 +383,7 @@ pub async fn run_eval(
             allowed_sources: &allowed_sources,
             question_date: &q.question_date,
             session_dates: &session_dates,
-            answer_sids: &answer_sids,
+            answer_sids: ask_answer_sids,
             sessions_dir: &sessions_dir,
             excluded_claim_ids: &excluded_claim_ids,
             chat: AskRequest::default_chat(),
@@ -351,6 +406,12 @@ pub async fn run_eval(
 
         let stats = category_stats.entry(q.category.clone()).or_default();
         stats.total += 1;
+        if recall10 {
+            stats.recall_at_10 += 1;
+        }
+        if recall30 {
+            stats.recall_at_30 += 1;
+        }
         if correct {
             stats.correct += 1;
             overall_correct += 1;
@@ -429,6 +490,34 @@ pub async fn run_eval(
         questions.len(),
         acc_style
     );
+
+    // Honest-mode retrieval recall (extraction+retrieval signal, no answer leak).
+    if no_leak {
+        let tot: usize = cats.iter().map(|(_, s)| s.total).sum();
+        let r10: usize = cats.iter().map(|(_, s)| s.recall_at_10).sum();
+        let r30: usize = cats.iter().map(|(_, s)| s.recall_at_30).sum();
+        println!("{}", style("─".repeat(60)).dim());
+        println!(
+            "{}",
+            style("Retrieval recall (no-leak — extraction+retrieval, not reader):").bold()
+        );
+        for (cat, s) in &cats {
+            println!(
+                "  {:>30}  recall@10 {:>5.1}%  recall@30 {:>5.1}%",
+                style(cat.as_str()).cyan(),
+                s.recall10_pct(),
+                s.recall30_pct()
+            );
+        }
+        let pct = |n: usize| if tot == 0 { 0.0 } else { n as f64 / tot as f64 * 100.0 };
+        println!(
+            "  {:>30}  recall@10 {:>5.1}%  recall@30 {:>5.1}%",
+            style("OVERALL").bold(),
+            pct(r10),
+            pct(r30)
+        );
+        println!("{}", style("─".repeat(60)).dim());
+    }
 
     if overall_acc >= 98.0 {
         println!(

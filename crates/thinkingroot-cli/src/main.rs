@@ -501,6 +501,12 @@ enum Commands {
         /// `off` as the ablation pair.
         #[arg(long, value_parser = ["on", "off", "advisory"])]
         rooting_mode: Option<String>,
+        /// Honest mode: do NOT inject the gold answer sessions (no oracle leak).
+        /// Retrieval is scoped to the full haystack only, and the reader sees
+        /// solely retrieved evidence. Reports retrieval recall@k + the true
+        /// end-to-end accuracy (vs. the default reading-ceiling number).
+        #[arg(long)]
+        no_leak: bool,
     },
     /// Render markdown artifacts (entity pages, architecture map,
     /// decision log, agent brief, runbook, health report) from the
@@ -2043,6 +2049,7 @@ async fn async_main() -> anyhow::Result<()> {
             category,
             judge_deployment,
             rooting_mode,
+            no_leak,
         }) => {
             eval_cmd::run_eval(
                 &dataset,
@@ -2051,6 +2058,7 @@ async fn async_main() -> anyhow::Result<()> {
                 category.as_deref(),
                 judge_deployment.as_deref(),
                 rooting_mode.as_deref(),
+                no_leak,
             )
             .await?;
         }

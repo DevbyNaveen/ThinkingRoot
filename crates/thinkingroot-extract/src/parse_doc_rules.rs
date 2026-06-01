@@ -268,9 +268,11 @@ fn push_chunk_witness(
     out.push(witness);
 }
 
-/// Minimum sentence length (bytes) to emit as its own witness — guards against
-/// emitting noise from abbreviations / stray punctuation.
-const MIN_SENTENCE_BYTES: usize = 16;
+/// Minimum unit length (bytes) to emit as its own witness. Kept low so short
+/// conversational facts ("My dog is Rex.") are not dropped — the mechanical
+/// fact-quality gate (finite verb / not a label) is now the real noise filter,
+/// not this blunt length floor.
+const MIN_SENTENCE_BYTES: usize = 12;
 
 /// Emit ONE `markdown::paragraph@v1` witness PER SENTENCE in a prose chunk,
 /// each anchored to its own byte sub-range. This is the granularity fix that
@@ -302,55 +304,55 @@ fn push_prose_sentence_witnesses(
     }
     let slice = &source_bytes[start..end];
 
-    // Collect (seg_start, seg_end) byte sub-ranges relative to `slice`.
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut seg_start = 0usize;
-    while seg_start < slice.len() && slice[seg_start].is_ascii_whitespace() {
-        seg_start += 1;
-    }
-    let mut i = seg_start;
-    while i < slice.len() {
-        let b = slice[i];
-        let is_term = b == b'.' || b == b'!' || b == b'?';
-        let at_boundary = is_term && (i + 1 >= slice.len() || slice[i + 1].is_ascii_whitespace());
-        if at_boundary {
-            let seg_end = i + 1; // include the terminator
-            if seg_end > seg_start {
-                spans.push((seg_start, seg_end));
-            }
-            let mut j = seg_end;
-            while j < slice.len() && slice[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            seg_start = j;
-            i = j;
-            continue;
+    // Decode the chunk's byte slice. On invalid UTF-8 we cannot run the
+    // SRX-style segmenter, so fall back to a single whole-chunk witness
+    // (never drop a claim on uncertainty).
+    let text = match std::str::from_utf8(slice) {
+        Ok(t) => t,
+        Err(_) => {
+            push_chunk_witness(
+                out, chunk, "markdown::paragraph@v1", "documents::paragraph",
+                source_bytes, file_blake3, source_id, workspace_id, now,
+            );
+            return;
         }
-        i += 1;
-    }
-    if seg_start < slice.len() {
-        spans.push((seg_start, slice.len()));
+    };
+
+    // Atomic-unit segmentation (2026-06-01): SRX-style sentence boundaries
+    // (abbreviation/decimal/initial/ellipsis-aware) then ClausIE-lite clause
+    // splitting so a compound sentence yields one retrievable unit per fact.
+    // Offsets are bytes relative to `slice`, preserving exact anchoring.
+    let mut units: Vec<(usize, usize)> = Vec::new();
+    for sent in crate::segment::sentence_spans(text) {
+        units.extend(crate::segment::clause_spans(text, sent));
     }
 
-    let kept: Vec<(usize, usize)> = spans
+    let kept: Vec<(usize, usize)> = units
         .into_iter()
         .filter(|(s, e)| e.saturating_sub(*s) >= MIN_SENTENCE_BYTES)
+        // Mechanical fact-quality gate: drop label/heading fragments that
+        // survive byte-length but carry no asserted fact ("Additional Tips:").
+        .filter(|(s, e)| crate::fact_quality::is_useful_fact(&text[*s..*e]))
         .collect();
 
-    // 0 or 1 substantive sentence → nothing gained by splitting; preserve the
-    // whole-chunk witness so the claim is never lost.
-    if kept.len() < 2 {
-        push_chunk_witness(
-            out,
-            chunk,
-            "markdown::paragraph@v1",
-            "documents::paragraph",
-            source_bytes,
-            file_blake3,
-            source_id,
-            workspace_id,
-            now,
-        );
+    // No substantive unit survived the gate. Fall back to a single whole-chunk
+    // witness so a real one-liner is never lost — UNLESS the whole chunk is
+    // itself a low-value fragment (a heading/label misrouted as prose), in
+    // which case emitting it would re-introduce the pollution we just filtered.
+    if kept.is_empty() {
+        if crate::fact_quality::is_useful_fact(text) {
+            push_chunk_witness(
+                out,
+                chunk,
+                "markdown::paragraph@v1",
+                "documents::paragraph",
+                source_bytes,
+                file_blake3,
+                source_id,
+                workspace_id,
+                now,
+            );
+        }
         return;
     }
 
@@ -365,7 +367,7 @@ fn push_prose_sentence_witnesses(
         let content_blake3 = blake3::hash(&source_bytes[start + s..start + e])
             .to_hex()
             .to_string();
-        out.push(Witness::new(
+        let mut witness = Witness::new(
             "markdown::paragraph@v1".to_string(),
             "documents::paragraph".to_string(),
             vec![WitnessInput::ByteRef {
@@ -380,7 +382,15 @@ fn push_prose_sentence_witnesses(
             Confidence::new(0.99),
             content_blake3,
             now,
-        ));
+        );
+        // Temporal anchoring (2026-06-01): if the unit states an absolute date
+        // ("On April 10, 2023 …"), anchor the witness's `valid_from` to that
+        // EVENT time so `/claims/as-of` + temporal-reasoning queries resolve
+        // against the fact's real date, not ingestion time. Mechanical, no LLM.
+        if let Some(event_date) = crate::temporal::extract_event_date(&text[s..e]) {
+            witness = witness.with_valid_from(event_date);
+        }
+        out.push(witness);
     }
 }
 
@@ -433,8 +443,9 @@ mod tests {
 
     #[test]
     fn prose_chunk_emits_paragraph_witness() {
-        let source = b"a paragraph\n";
-        let chunk = chunk_at("a paragraph", ChunkType::Prose, 0, 11);
+        // A real sentence (finite verb + terminal punctuation) must emit.
+        let source = b"The system stores facts.\n";
+        let chunk = chunk_at("The system stores facts.", ChunkType::Prose, 0, 24);
         let out = extract_witnesses_from_chunk(
             &chunk,
             source,
@@ -445,6 +456,56 @@ mod tests {
         );
         assert_eq!(out.witnesses.len(), 1);
         assert_eq!(out.witnesses[0].rule, "markdown::paragraph@v1");
+    }
+
+    #[test]
+    fn dated_prose_anchors_valid_from_to_event_date() {
+        use chrono::Datelike;
+        // A prose sentence stating an absolute date must anchor the witness's
+        // bitemporal `valid_from` to that EVENT date, not ingestion time.
+        let source = b"On 2023/04/10 I bought a new electric car.\n";
+        let chunk = chunk_at(
+            "On 2023/04/10 I bought a new electric car.",
+            ChunkType::Prose,
+            0,
+            42,
+        );
+        let out = extract_witnesses_from_chunk(
+            &chunk,
+            source,
+            "f",
+            SourceId::new(),
+            WorkspaceId::new(),
+            Utc::now(),
+        );
+        assert_eq!(out.witnesses.len(), 1);
+        let w = &out.witnesses[0];
+        assert_eq!(
+            (w.valid_from.year(), w.valid_from.month(), w.valid_from.day()),
+            (2023, 4, 10),
+            "valid_from should be anchored to the stated event date"
+        );
+    }
+
+    #[test]
+    fn prose_fragment_is_dropped() {
+        // Mechanical fact-quality gate (2026-06-01): a verbless, unpunctuated
+        // noun-phrase prose chunk carries no fact and must NOT become a witness.
+        let source = b"a paragraph\n";
+        let chunk = chunk_at("a paragraph", ChunkType::Prose, 0, 11);
+        let out = extract_witnesses_from_chunk(
+            &chunk,
+            source,
+            "f",
+            SourceId::new(),
+            WorkspaceId::new(),
+            Utc::now(),
+        );
+        assert!(
+            out.witnesses.is_empty(),
+            "expected fragment to be dropped, got {:?}",
+            out.witnesses.iter().map(|w| &w.rule).collect::<Vec<_>>()
+        );
     }
 
     #[test]

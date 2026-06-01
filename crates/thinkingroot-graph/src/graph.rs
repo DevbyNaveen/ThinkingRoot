@@ -267,6 +267,21 @@ impl GraphStore {
     /// Open or create a CozoDB database at the given path and initialize the schema.
     pub fn init(path: &Path) -> Result<Self> {
         let db_path = path.join("graph.db");
+
+        // Durably switch graph.db to WAL journal mode BEFORE cozo opens it.
+        // cozo-ce's sqlite backend opens a *pool* of connections with no
+        // pragmas; under a write burst (e.g. a large compile) the default
+        // rollback journal makes pooled reader/writer connections conflict →
+        // `database is locked` (observed compiling 940 LongMemEval sessions).
+        // WAL lets readers and the single writer proceed concurrently and is
+        // PERSISTENT in the file header, so every cozo connection inherits it.
+        // Best-effort: a failure here must not block opening the DB.
+        if let Ok(conn) = sqlite::open(&db_path) {
+            let _ = conn.execute("PRAGMA journal_mode=WAL;");
+            let _ = conn.execute("PRAGMA synchronous=NORMAL;");
+            let _ = conn.execute("PRAGMA busy_timeout=10000;");
+        }
+
         let db = DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
             .map_err(|e| Error::GraphStorage(format!("failed to open cozo db: {e}")))?;
 

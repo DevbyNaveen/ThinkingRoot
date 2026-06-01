@@ -36,6 +36,12 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 cozo = { workspace = true }
 blake3 = { workspace = true }
+# Direct sqlite handle (same version cozo-ce links) used ONLY to set the
+# durable journal mode (WAL) on graph.db at open, before cozo's pooled
+# connections attach. WAL persists in the file header so every cozo
+# connection inherits it, ending "database is locked" reader/writer
+# conflicts under write bursts (e.g. large compiles). No queries run here.
+sqlite = "0.36"
 
 # ONNX Runtime bindings — bundles the ORT prebuilt binaries so the
 # install one-liner ships a self-contained inference stack. Matches

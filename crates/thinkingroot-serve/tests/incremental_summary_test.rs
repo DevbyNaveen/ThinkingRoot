@@ -93,6 +93,7 @@ fn incremental_summary_serde_round_trip() {
         llm_calls: 12,
         cache_hits: 8,
         structural_extractions: 22,
+        chunks_without_extraction: 5,
         phase_timings: Default::default(),
         total_elapsed_ms: 4_321,
     };
