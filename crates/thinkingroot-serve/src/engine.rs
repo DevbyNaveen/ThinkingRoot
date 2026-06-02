@@ -5571,6 +5571,7 @@ Rules: \
         for name in names {
             let (passed, detail) = match name.as_str() {
                 "health_score" => self.check_health_score(root, &source, target.as_deref()).await,
+                "function_tests" => self.check_function_tests(root, &source).await,
                 other => (
                     false,
                     Some(format!(
@@ -5602,6 +5603,83 @@ Rules: \
                 Some(format!("blocked: {}", diff.blocking_reasons.join("; "))),
             ),
             Err(e) => (false, Some(format!("diff computation failed: {e}"))),
+        }
+    }
+
+    /// The `function_tests` check (P4): every fixture of every Root Function
+    /// deployed on the SOURCE branch must run and match its `expect_json`. This
+    /// is the gate that makes self-authored / promoted functions safe — a
+    /// function cannot reach the shared brain unless its own fixtures pass. The
+    /// function bodies are loaded from the source branch's own graph and run in
+    /// the deno isolate (no secrets/cognition — a hermetic check run). No
+    /// fixtures on the branch = nothing to gate (soft pass with a note).
+    async fn check_function_tests(
+        &self,
+        root: &std::path::Path,
+        source: &str,
+    ) -> (bool, Option<String>) {
+        use std::collections::{BTreeMap, HashMap};
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_graph::graph::GraphStore;
+        let dir = resolve_data_dir(root, Some(source));
+        if !dir.exists() {
+            return (false, Some(format!("branch '{source}' not found")));
+        }
+        let graph = match GraphStore::init(&dir.join("graph")) {
+            Ok(g) => g,
+            Err(e) => return (false, Some(format!("source graph init failed: {e}"))),
+        };
+        let funcs = match graph.list_functions() {
+            Ok(f) => f,
+            Err(e) => return (false, Some(format!("list_functions failed: {e}"))),
+        };
+        let mut total = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for f in &funcs {
+            for fx in graph.list_function_fixtures(&f.name).unwrap_or_default() {
+                total += 1;
+                let input: serde_json::Value =
+                    serde_json::from_str(&fx.input_json).unwrap_or(serde_json::Value::Null);
+                let expect: serde_json::Value =
+                    serde_json::from_str(&fx.expect_json).unwrap_or(serde_json::Value::Null);
+                let (outcome, _, _, _) = crate::root_function_runtime::run_js_journaled(
+                    &f.body,
+                    &input,
+                    &BTreeMap::new(),
+                    crate::root_function_runtime::FnCtxMeta::default(),
+                    None,
+                    HashMap::new(),
+                    10,
+                )
+                .await;
+                match outcome {
+                    crate::root_function_runtime::RunOutcome::Done(got) if got == expect => {}
+                    crate::root_function_runtime::RunOutcome::Done(got) => failures
+                        .push(format!("{}#{}: got {got} != expect {expect}", f.name, fx.fixture_id)),
+                    crate::root_function_runtime::RunOutcome::Suspended => failures.push(format!(
+                        "{}#{}: suspended (ctx.cognition unavailable in a check run)",
+                        f.name, fx.fixture_id
+                    )),
+                    crate::root_function_runtime::RunOutcome::Failed(e) => {
+                        failures.push(format!("{}#{}: error {e}", f.name, fx.fixture_id))
+                    }
+                }
+            }
+        }
+        if total == 0 {
+            (true, Some("no function fixtures on source branch — nothing to gate".to_string()))
+        } else if failures.is_empty() {
+            (true, Some(format!("{total} fixture(s) passed")))
+        } else {
+            (
+                false,
+                Some(format!(
+                    "{}/{} fixture(s) failed: {}",
+                    failures.len(),
+                    total,
+                    failures.join("; ")
+                )),
+            )
         }
     }
 
