@@ -177,7 +177,25 @@ pub async fn hybrid_retrieve(
     // ONNX bundle is staged at install time by install.sh / install.ps1
     // under `<dirs::cache_dir>/thinkingroot/models/rerank.{onnx,tokenizer.json}`.
     // No HF-Hub fetch at runtime (Track 32, 2026-05-16).
-    if req.scoring_profile.use_cross_encoder && scored.len() >= 2 {
+    // L1 — TIERED rerank gate. The cross-encoder costs ~1.1s on CPU vs ~4ms
+    // without it (measured 2026-06, this VM) — it is ~99% of recall latency. So
+    // only PAY it when the fused ranking is AMBIGUOUS: if the #1 fused score
+    // leads the runner-up by a confident margin, the order is already
+    // trustworthy and we skip the cross-encoder. Full quality is preserved on
+    // the hard (close-scored) cases; the common clear case stays at ~4ms.
+    // Margin tunable via TR_RERANK_MARGIN (fused scores are normalised to [0,1]).
+    let rerank_margin: f32 = std::env::var("TR_RERANK_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.15);
+    let top_gap = if scored.len() >= 2 {
+        scored[0].1 - scored[1].1
+    } else {
+        f32::INFINITY
+    };
+    let rerank_ambiguous = top_gap < rerank_margin;
+    if req.scoring_profile.use_cross_encoder && scored.len() >= 2 && rerank_ambiguous {
+        tracing::debug!(top_gap, rerank_margin, "tiered rerank: ambiguous → cross-encoder");
         let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
         let pool = &scored[..pool_size];
         let docs: Vec<&str> = pool.iter().map(|(c, _, _)| c.statement.as_str()).collect();

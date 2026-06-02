@@ -1727,7 +1727,18 @@ impl QueryEngine {
                     clearance: vec![thinkingroot_core::types::Sensitivity::Public],
                     top_k,
                     time_window: None,
-                    scoring_profile: ScoringProfile::default(),
+                    // L1 — the capsule grounds the agent on the hot path, so it
+                    // must be FAST. Measured: the cross-encoder is ~110ms/doc on
+                    // CPU (~1.1s for a pool) vs ~4ms without it, and it only
+                    // REORDERS already-relevant fused hits (the agent reads all
+                    // top_k anyway). So grounding skips the cross-encoder —
+                    // ~250x faster for a negligible ordering change. The public
+                    // /search/hybrid endpoint keeps tiered rerank for callers who
+                    // need best-ranked output.
+                    scoring_profile: ScoringProfile {
+                        use_cross_encoder: false,
+                        ..ScoringProfile::default()
+                    },
                     require_certificate: false,
                     include_test_origin: false,
                     include_quarantined: false,
