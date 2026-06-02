@@ -4972,6 +4972,31 @@ Rules: \
                                     Err(_) => {}
                                 }
                             }
+                            // Persist entity↔entity relations — the graph's
+                            // EDGES. Resolve both endpoints by name to ids
+                            // (entities were just upserted above), then link.
+                            // Relations below 0.3 confidence are discarded per
+                            // the extractor schema. Best-effort.
+                            for r in &result.relations {
+                                if r.confidence < 0.3 {
+                                    continue;
+                                }
+                                let (from, to) = (r.from_entity.trim(), r.to_entity.trim());
+                                if from.is_empty() || to.is_empty() {
+                                    continue;
+                                }
+                                if let (Ok(Some(fid)), Ok(Some(tid))) = (
+                                    graph.find_entity_id_by_name(from),
+                                    graph.find_entity_id_by_name(to),
+                                ) {
+                                    let _ = graph.link_entities(
+                                        &fid,
+                                        &tid,
+                                        &r.relation_type,
+                                        r.confidence,
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("extract_and_contribute: entity graph open failed: {e}");
