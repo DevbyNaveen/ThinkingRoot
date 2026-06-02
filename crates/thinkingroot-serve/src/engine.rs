@@ -1745,6 +1745,17 @@ impl QueryEngine {
         let mut grounded_claims = Vec::with_capacity(retrieval.hits.len());
         let mut deps: Vec<(String, String)> = Vec::with_capacity(retrieval.hits.len());
         for hit in &retrieval.hits {
+            // C1 — never ground the agent on a SUPERSEDED claim. Retrieval keeps
+            // superseded hits (annotated with a caveat) for transparency, but the
+            // capsule must surface only the live fact, so a consolidated "March ->
+            // June" supersession doesn't resurface the stale March claim.
+            if hit
+                .superseded_by_chain
+                .iter()
+                .any(|s| !s.is_empty() && s != &hit.claim_id)
+            {
+                continue;
+            }
             grounded_claims.push(CapsuleClaimRef {
                 claim_id: hit.claim_id.clone(),
                 statement: hit.statement.clone(),
@@ -5019,6 +5030,80 @@ Rules: \
         .await
     }
 
+    /// C1 — consolidation. Scans the durable (main) graph entity-by-entity and
+    /// uses the workspace LLM to detect SUPERSESSIONS within each entity's claim
+    /// cluster (a newer fact that replaces an older one about the SAME attribute
+    /// with a changed value), then applies `supersede_claim`. Off the hot path —
+    /// an on-demand job, not per-turn.
+    ///
+    /// Conservative by construction (wrongly superseding a valid claim is the
+    /// risk): only direct replacements are requested from the LLM; every
+    /// returned id is validated to be in the live cluster; already-superseded
+    /// claims are excluded; an LLM error on one entity skips that entity, never
+    /// aborts the pass.
+    pub async fn consolidate(&self, ws: &str, max_entities: usize) -> Result<ConsolidateReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot consolidate"
+            ))
+        })?;
+        let graph = self
+            .graph_store(ws)
+            .await
+            .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+        let entities = graph.get_all_entities()?;
+        let mut entities_scanned = 0usize;
+        let mut superseded = 0usize;
+        for (eid, ename, _etype) in entities.iter().take(max_entities) {
+            let raw = graph.get_claims_for_entity(eid)?;
+            // Keep only LIVE (non-superseded) claims, with timestamps.
+            let mut live: Vec<(String, String, i64)> = Vec::new();
+            for (cid, stmt, _ct) in &raw {
+                if let Ok(Some(c)) = graph.get_claim_by_id(cid) {
+                    if c.superseded_by.is_none() {
+                        live.push((cid.clone(), stmt.clone(), c.created_at.timestamp()));
+                    }
+                }
+            }
+            if live.len() < 2 {
+                continue;
+            }
+            entities_scanned += 1;
+            live.sort_by_key(|x| x.2); // oldest → newest
+            let mut listing = String::new();
+            for (cid, stmt, _) in &live {
+                listing.push_str(&format!("- id={cid}: {stmt}\n"));
+            }
+            let user = format!(
+                "Facts about \"{ename}\" (oldest first):\n{listing}\nReturn a JSON array of \
+                 objects {{\"old_id\":\"…\",\"new_id\":\"…\"}} for ONLY direct supersessions: a \
+                 newer fact that REPLACES an older one about the SAME attribute with a changed \
+                 value (e.g. a changed date, location, status, name). Do NOT include facts that \
+                 are merely related, additional, or about a different attribute. If unsure, omit \
+                 it. Return [] if there are none."
+            );
+            let resp = match llm.chat(CONSOLIDATION_SYSTEM, &user).await {
+                Ok(r) => r,
+                Err(_) => continue, // non-fatal per entity
+            };
+            let live_ids: std::collections::HashSet<&str> =
+                live.iter().map(|x| x.0.as_str()).collect();
+            for (old, new) in parse_supersede_pairs(&resp) {
+                if old != new
+                    && live_ids.contains(old.as_str())
+                    && live_ids.contains(new.as_str())
+                    && graph.supersede_claim(&old, &new).is_ok()
+                {
+                    superseded += 1;
+                }
+            }
+        }
+        Ok(ConsolidateReport {
+            entities_scanned,
+            superseded,
+        })
+    }
+
     #[tracing::instrument(
         name = "engine.contribute_bulk",
         skip(self, agent_claims, sessions),
@@ -7361,6 +7446,14 @@ pub struct ContributeResult {
     pub warnings: Vec<String>,
 }
 
+/// C1 — outcome of a [`QueryEngine::consolidate`] pass. Honest: `superseded`
+/// counts only claims actually marked superseded this pass.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsolidateReport {
+    pub entities_scanned: usize,
+    pub superseded: usize,
+}
+
 /// Parse a claim type string (case-insensitive) into a `ClaimType` enum.
 fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
     use thinkingroot_core::types::ClaimType;
@@ -7377,6 +7470,44 @@ fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
         "preference" => ClaimType::Preference,
         _ => ClaimType::Fact,
     }
+}
+
+/// System prompt for the C1 consolidation pass. Steers the model to act ONLY on
+/// direct replacements — the conservative bias that protects valid claims.
+const CONSOLIDATION_SYSTEM: &str = "You are a careful knowledge-base consolidator. \
+You are given facts about a single subject, each with an id, oldest first. Your ONLY \
+job is to find SUPERSESSIONS: a newer fact that directly replaces an older fact about \
+the SAME attribute with a changed value. Be conservative — when in doubt, do not flag. \
+Never merge facts about different attributes. Respond with ONLY a JSON array, no prose.";
+
+/// Parse `[{"old_id":"…","new_id":"…"}, …]` out of an LLM response (tolerant of
+/// surrounding prose / code fences). Returns the (old_id, new_id) pairs.
+fn parse_supersede_pairs(text: &str) -> Vec<(String, String)> {
+    let start = match text.find('[') {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let end = match text.rfind(']') {
+        Some(i) if i > start => i,
+        _ => return vec![],
+    };
+    let json = &text[start..=end];
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    parsed
+        .into_iter()
+        .filter_map(|v| {
+            let old = v.get("old_id").and_then(|x| x.as_str())?.to_string();
+            let new = v.get("new_id").and_then(|x| x.as_str())?.to_string();
+            if old.is_empty() || new.is_empty() {
+                None
+            } else {
+                Some((old, new))
+            }
+        })
+        .collect()
 }
 
 /// Map the LLM extractor's free-text entity-type string to a core `EntityType`.

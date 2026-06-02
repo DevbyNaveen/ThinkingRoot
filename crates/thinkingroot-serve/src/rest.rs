@@ -818,6 +818,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // verbatim "User said: …"). Branch goes in the body so the live
             // session captures into its `stream/{id}` quarantine.
             .route("/ws/{ws}/extract-contribute", post(extract_contribute_handler))
+            // C1 — on-demand consolidation: detect + apply supersessions within
+            // each entity's claim cluster (keeps the self-evolving graph clean).
+            .route("/ws/{ws}/consolidate", post(consolidate_claims_handler))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
             .route(
@@ -4362,6 +4365,33 @@ async fn extract_contribute_handler(
             "EXTRACT_CONTRIBUTE_FAILED",
             &e.to_string(),
         ),
+    }
+}
+
+/// C1 — request body for `POST /ws/{ws}/consolidate`. `max_entities` bounds the
+/// blast radius + LLM cost of a single pass (newest entities are cheap to skip).
+#[derive(Deserialize)]
+struct ConsolidateRequest {
+    #[serde(default = "default_max_entities")]
+    max_entities: usize,
+}
+fn default_max_entities() -> usize {
+    100
+}
+
+async fn consolidate_claims_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<ConsolidateRequest>>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let max_entities = body.map(|b| b.max_entities).unwrap_or_else(default_max_entities);
+    let engine = state.engine.read().await;
+    match engine.consolidate(&ws, max_entities).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => err_response(StatusCode::BAD_REQUEST, "CONSOLIDATE_FAILED", &e.to_string()),
     }
 }
 
