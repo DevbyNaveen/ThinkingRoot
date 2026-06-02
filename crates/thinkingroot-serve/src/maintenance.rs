@@ -500,9 +500,13 @@ async fn ensure_topic_branch(
         None, // owner: system
         BranchPermissions::default(),
         BranchKind::Feature,
+        // health_score gates graph health/conflicts; function_tests (P4) runs
+        // every Root Function's fixtures in the isolate so a JIT-authored
+        // function that flowed in via a stream branch cannot reach `main`
+        // unless its own tests pass — closing the self-authoring → verify loop.
         MergePolicy::RequiresProposal {
             min_reviewers: 0,
-            required_checks: vec!["health_score".to_string()],
+            required_checks: vec!["health_score".to_string(), "function_tests".to_string()],
         },
         None, // redaction
     )

@@ -444,9 +444,11 @@ impl McpToolHandler for RootFunctionDefine {
                 "branch": branch,
                 "quarantined": true,
                 "note": "validated as a callable and authored on your session branch \
-                         (quarantined). It reaches the project trunk when the branch merges \
-                         (health-gated today; a function-specific verification gate is on the \
-                         roadmap).",
+                         (quarantined). It reaches the project trunk only when the branch merges, \
+                         which is now gated by BOTH health_score AND function_tests — every \
+                         fixture you attach (via root_function_test) runs in the isolate and must \
+                         pass before this function can reach main. Add fixtures to make the gate \
+                         meaningful.",
             })),
             Err(_) => {
                 let deployed = ctx
