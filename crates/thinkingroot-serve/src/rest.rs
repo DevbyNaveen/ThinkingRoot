@@ -707,6 +707,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/prompts/{name}/assemble", post(assemble_prompt_handler))
             // ─── Compiled capsule (low-token, grounded context payload) ─
             .route("/ws/{ws}/capsule", post(compile_capsule_handler))
+            // ─── Capability router: rank tools/functions for an intent ──
+            .route("/ws/{ws}/route", post(route_handler))
             // ─── Operating-layer artifact nodes (prompts/functions/flows/MCP) ─
             .route("/ws/{ws}/artifact-nodes", get(list_artifact_nodes_handler))
             .route("/ws/{ws}/branch-nodes", get(list_branch_nodes_handler))
@@ -3077,6 +3079,41 @@ async fn get_health(State(state): State<Arc<AppState>>, Path(ws): Path<String>) 
     let engine = state.engine.read().await;
     match engine.health(&ws).await {
         Ok(result) => ok_response(result).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RouteRequest {
+    #[serde(default)]
+    query: String,
+    #[serde(default = "default_route_k")]
+    top_k: usize,
+    #[serde(default)]
+    branch: Option<String>,
+}
+fn default_route_k() -> usize {
+    10
+}
+
+/// `POST /api/v1/ws/{ws}/route` — capability router. Ranks deployed Root
+/// Functions + external MCP tools for an INTENT by fusing semantic similarity
+/// (embedded capability nodes) with the learned Wilson experience score.
+/// Powers the meta-tool discovery surface, the Console routing view, and
+/// `route-eval` (recall@k). Returns `{query, ranked: [tool_name, …]}`.
+async fn route_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<RouteRequest>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .route_capabilities(&ws, req.branch.as_deref(), &req.query, req.top_k)
+        .await
+    {
+        Ok(ranked) => {
+            ok_response(serde_json::json!({ "query": req.query, "ranked": ranked })).into_response()
+        }
         Err(e) => match_engine_error(e),
     }
 }
