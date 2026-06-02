@@ -4525,6 +4525,7 @@ async fn handle_hybrid_retrieve(
                     .unwrap_or(false),
                 now: None,
                 scoped_claim_ids: None,
+                branch: None,
             }
         }
     };
@@ -4722,6 +4723,7 @@ async fn handle_probe_engram(
             require_provenance_verified: false,
             now: None,
             scoped_claim_ids: Some(answer.claim_ids.clone()),
+            branch: None,
         };
         match engine.hybrid_retrieve(ws, req, None).await {
             Ok(resp) => {

@@ -58,6 +58,13 @@ pub struct RetrievalRequest {
     /// `None` = unscoped.
     #[serde(default)]
     pub scoped_claim_ids: Option<Vec<String>>,
+    /// Read-your-own-writes: when set, retrieval resolves the graph + vector
+    /// store from this branch (a CoW copy of main that also carries the live
+    /// session's contributed claims) instead of `main`. `None` = main. This is
+    /// what lets a live session recall what it just said *before* the
+    /// stream branch is merged — the streaming-branch fast path.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 fn default_clearance() -> Vec<Sensitivity> {

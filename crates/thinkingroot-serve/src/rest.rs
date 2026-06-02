@@ -813,6 +813,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/compile/stream", post(compile_stream))
+            // A2 — compiled-not-raw capture: extract atomic claims from a
+            // conversation turn/transcript and contribute them (vs storing
+            // verbatim "User said: …"). Branch goes in the body so the live
+            // session captures into its `stream/{id}` quarantine.
+            .route("/ws/{ws}/extract-contribute", post(extract_contribute_handler))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
             .route(
@@ -1613,6 +1618,7 @@ async fn probe_engram_handler(
             require_provenance_verified: false,
             now: None,
             scoped_claim_ids: Some(answer.claim_ids.clone()),
+            branch: None,
         };
         match engine.hybrid_retrieve(&ws, req, None).await {
             Ok(resp) => {
@@ -4289,6 +4295,71 @@ async fn contribute_bulk_handler(
         Err(e) => err_response(
             StatusCode::BAD_REQUEST,
             "CONTRIBUTE_BULK_FAILED",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// A2 — request body for `POST /ws/{ws}/extract-contribute`. `text` is the raw
+/// conversation turn (or transcript); the engine runs the LLM extractor over it
+/// and contributes the resulting atomic claims to `branch` (or main).
+#[derive(Deserialize)]
+struct ExtractContributeRequest {
+    text: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    connector_id: String,
+    install_id: String,
+    idempotency_key: String,
+}
+
+async fn extract_contribute_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<ExtractContributeRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let principal = crate::engine::Principal::Connector {
+        connector_id: body.connector_id.clone(),
+        install_id: body.install_id.clone(),
+    };
+    let session_id = body.session_id.unwrap_or_else(|| {
+        format!(
+            "connector:{}:{}:{}",
+            body.connector_id, body.install_id, body.idempotency_key
+        )
+    });
+    let branch_arg = match body.branch.as_deref() {
+        Some("main") | None => None,
+        Some(b) => Some(b),
+    };
+    let engine = state.engine.read().await;
+    match engine
+        .extract_and_contribute(
+            &ws,
+            &body.text,
+            branch_arg,
+            &session_id,
+            &state.sessions,
+            principal,
+            &body.idempotency_key,
+        )
+        .await
+    {
+        Ok(result) => {
+            drop(engine);
+            if let Some(b) = body.branch.as_deref() {
+                publish_latest_branch_event(&state, b).await;
+            }
+            ok_response(serde_json::json!(result)).into_response()
+        }
+        Err(e) => err_response(
+            StatusCode::BAD_REQUEST,
+            "EXTRACT_CONTRIBUTE_FAILED",
             &e.to_string(),
         ),
     }

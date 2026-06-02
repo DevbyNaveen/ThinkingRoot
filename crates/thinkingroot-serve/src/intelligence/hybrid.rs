@@ -102,10 +102,21 @@ pub async fn hybrid_retrieve(
     let now_dt = req.now.unwrap_or_else(Utc::now);
     req.now = Some(now_dt);
 
-    let graph = engine
-        .graph_store(ws)
-        .await
-        .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+    // Read-your-own-writes: when `req.branch` is set, run the whole pipeline
+    // against that branch's graph (a CoW copy of main that also carries the
+    // live session's contributed claims) instead of main. `None` = main.
+    let graph = match req.branch.as_deref() {
+        Some(b) => {
+            let root = engine
+                .workspace_root_path(ws)
+                .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+            engine.branch_engines().get_or_open(&root, b).await?.graph.clone()
+        }
+        None => engine
+            .graph_store(ws)
+            .await
+            .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?,
+    };
     let byte_store = engine.byte_store(ws);
 
     // ---- Layer 1: parse + DSL fold ----
@@ -471,14 +482,21 @@ async fn vector_recall(
     // fastembed (AllMiniLML6V2 384-dim cosine) via `engine.search_scoped`.
     // No HNSW index in CozoDB today; world-class part is the Datalog
     // fan-in and score fusion downstream.
-    let allowed: HashSet<String> = req
-        .scoped_claim_ids
-        .as_ref()
-        .map(|v| v.iter().cloned().collect())
-        .unwrap_or_default();
-    let result = engine
-        .search_scoped(ws, query, req.top_k * 4, &allowed)
-        .await?;
+    // Read-your-own-writes: when a branch is set, search that branch's vector
+    // index (main@fork + the live session's incrementally-embedded claims) via
+    // `search_branched`. The `scoped_claim_ids` filter doesn't apply on the
+    // branch path (capsule grounding never sets it); main keeps the filter.
+    let result = match req.branch.as_deref() {
+        Some(b) => engine.search_branched(ws, query, req.top_k * 4, Some(b)).await?,
+        None => {
+            let allowed: HashSet<String> = req
+                .scoped_claim_ids
+                .as_ref()
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+            engine.search_scoped(ws, query, req.top_k * 4, &allowed).await?
+        }
+    };
     Ok(result
         .claims
         .into_iter()
@@ -2038,6 +2056,7 @@ mod tests {
             require_provenance_verified: false,
             now: Some(now_fixed()),
             scoped_claim_ids: None,
+            branch: None,
         }
     }
 

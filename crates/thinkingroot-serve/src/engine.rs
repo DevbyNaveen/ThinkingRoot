@@ -1623,7 +1623,7 @@ impl QueryEngine {
             .clone()
             .unwrap_or_else(|| format!("capsule:{key}"));
         let (grounded_claims, deps) = self
-            .ground_query(ws, &spec.query, &session_id, spec.top_k)
+            .ground_query(ws, &spec.query, &session_id, spec.top_k, branch_ref)
             .await?;
         let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
         let branch_context = self.branch_context_for(ws, branch_ref).await;
@@ -1715,6 +1715,7 @@ impl QueryEngine {
         query: &str,
         session_id: &str,
         top_k: usize,
+        branch: Option<&str>,
     ) -> Result<(Vec<CapsuleClaimRef>, Vec<(String, String)>)> {
         let retrieval = self
             .hybrid_retrieve(
@@ -1733,6 +1734,10 @@ impl QueryEngine {
                     require_provenance_verified: false,
                     now: None,
                     scoped_claim_ids: None,
+                    // Read-your-own-writes: ground from the live session branch
+                    // (CoW copy of main + this session's contributed claims) so
+                    // the capsule cites what was just said before the merge.
+                    branch: branch.map(str::to_string),
                 },
                 None,
             )
@@ -1823,9 +1828,10 @@ impl QueryEngine {
             }
         };
 
-        // Per-turn: ground the query (the only work a warm turn pays).
+        // Per-turn: ground the query (the only work a warm turn pays). Ground
+        // from the session branch (read-your-own-writes) when one is set.
         let (grounded_claims, deps) =
-            self.ground_query(ws, &spec.query, session_id, spec.top_k).await?;
+            self.ground_query(ws, &spec.query, session_id, spec.top_k, branch_ref).await?;
         let _ = &deps; // session capsules are not persisted to the shared cache
         let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
         let branch_context = self.branch_context_for(ws, branch_ref).await;
@@ -4873,6 +4879,121 @@ Rules: \
     /// Returns the same [`ContributeResult`] shape as the non-bulk
     /// path; the `warnings` vector carries the `"replay: existing
     /// ingest"` notice when the call short-circuited.
+    /// A2 — compiled-not-raw capture. Runs the LLM extractor over `text` (a
+    /// conversation turn or session transcript), then contributes the
+    /// EXTRACTED, atomic, de-noised claims through the same idempotent
+    /// [`Self::contribute_bulk`] path. This turns verbatim "User said: …"
+    /// capture into compiled memory: multi-fact turns split into atomic claims,
+    /// and pleasantries/questions that yield no facts are dropped (the
+    /// extractor returns no claims → nothing stored). Non-fatal by contract:
+    /// callers treat an error as "skip capture this turn", never break the chat.
+    pub async fn extract_and_contribute(
+        &self,
+        ws: &str,
+        text: &str,
+        branch: Option<&str>,
+        session_id: &str,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+    ) -> Result<ContributeResult> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot compile-extract this turn"
+            ))
+        })?;
+        let result = llm.extract(text, "").await?;
+        let agent_claims: Vec<AgentClaim> = result
+            .claims
+            .into_iter()
+            .filter(|c| !c.statement.trim().is_empty())
+            .map(|c| AgentClaim {
+                statement: c.statement,
+                claim_type: if c.claim_type.trim().is_empty() {
+                    default_claim_type()
+                } else {
+                    c.claim_type
+                },
+                confidence: Some(c.confidence),
+                entities: c.entities,
+            })
+            .collect();
+        // Denoising is a feature: a turn with no extractable facts (e.g. a
+        // question or greeting) stores nothing rather than a raw claim.
+        if agent_claims.is_empty() {
+            return Ok(ContributeResult {
+                accepted_count: 0,
+                accepted_ids: vec![],
+                source_uri: String::new(),
+                warnings: vec!["no facts extracted from turn".to_string()],
+            });
+        }
+
+        // Entity-linking: upsert the extracted entities into the SAME target
+        // graph (branch or main) BEFORE contributing claims, so contribute_bulk's
+        // by-name linking (`find_entity_id_by_name`) resolves them and connects
+        // the claims into the graph instead of saving them unlinked. Canonical
+        // by name (find-then-insert) so a repeated entity is one node, not many.
+        // Best-effort: a failure here degrades to unlinked claims, never aborts
+        // the capture. Mirrors contribute_bulk's own `resolve_data_dir` +
+        // `GraphStore::init` access pattern on the branch dir.
+        if !result.entities.is_empty() {
+            if let Ok(handle) = self.get_workspace(ws) {
+                let data_dir = match branch {
+                    Some(b) => {
+                        thinkingroot_branch::snapshot::resolve_data_dir(&handle.root_path, Some(b))
+                    }
+                    None => handle.root_path.join(".thinkingroot"),
+                };
+                let graph_dir = data_dir.join("graph");
+                if graph_dir.exists() {
+                    match thinkingroot_graph::graph::GraphStore::init(&graph_dir) {
+                        Ok(graph) => {
+                            for e in &result.entities {
+                                let name = e.name.trim();
+                                if name.is_empty() {
+                                    continue;
+                                }
+                                match graph.find_entity_id_by_name(name) {
+                                    Ok(Some(_)) => {} // already a node — keep it canonical
+                                    Ok(None) => {
+                                        let mut ent = thinkingroot_core::Entity::new(
+                                            name,
+                                            parse_entity_type_str(&e.entity_type),
+                                        );
+                                        for a in &e.aliases {
+                                            ent = ent.with_alias(a.clone());
+                                        }
+                                        if let Some(d) = &e.description {
+                                            ent = ent.with_description(d.clone());
+                                        }
+                                        let _ = graph.insert_entity(&ent);
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("extract_and_contribute: entity graph open failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        self.contribute_bulk(
+            ws,
+            session_id,
+            branch,
+            agent_claims,
+            sessions,
+            principal,
+            idempotency_key,
+            false,
+        )
+        .await
+    }
+
     #[tracing::instrument(
         name = "engine.contribute_bulk",
         skip(self, agent_claims, sessions),
@@ -7230,6 +7351,28 @@ fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
         "architecture" => ClaimType::Architecture,
         "preference" => ClaimType::Preference,
         _ => ClaimType::Fact,
+    }
+}
+
+/// Map the LLM extractor's free-text entity-type string to a core `EntityType`.
+/// Unknown types fall back to `Concept` (the catch-all), so a novel label never
+/// drops the entity.
+fn parse_entity_type_str(s: &str) -> thinkingroot_core::types::EntityType {
+    use thinkingroot_core::types::EntityType;
+    match s.to_lowercase().as_str() {
+        "person" | "people" | "user" => EntityType::Person,
+        "system" => EntityType::System,
+        "service" => EntityType::Service,
+        "team" => EntityType::Team,
+        "api" => EntityType::Api,
+        "database" | "db" => EntityType::Database,
+        "library" | "framework" | "language" => EntityType::Library,
+        "file" => EntityType::File,
+        "module" | "package" => EntityType::Module,
+        "function" | "method" => EntityType::Function,
+        "config" | "configuration" => EntityType::Config,
+        "organization" | "org" | "company" | "startup" => EntityType::Organization,
+        _ => EntityType::Concept,
     }
 }
 
