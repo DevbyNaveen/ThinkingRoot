@@ -709,6 +709,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/capsule", post(compile_capsule_handler))
             // ─── Capability router: rank tools/functions for an intent ──
             .route("/ws/{ws}/route", post(route_handler))
+            // ─── Capability routing report (experience view for Console) ─
+            .route("/ws/{ws}/capability-routing", get(capability_routing_handler))
             // ─── Operating-layer artifact nodes (prompts/functions/flows/MCP) ─
             .route("/ws/{ws}/artifact-nodes", get(list_artifact_nodes_handler))
             .route("/ws/{ws}/branch-nodes", get(list_branch_nodes_handler))
@@ -3114,6 +3116,20 @@ async fn route_handler(
         Ok(ranked) => {
             ok_response(serde_json::json!({ "query": req.query, "ranked": ranked })).into_response()
         }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/capability-routing` — the routing/experience report:
+/// every deployed function + its learned experience (n_success/n_fail + Wilson
+/// score) grouped by input_class. Powers the Console routing view (P5).
+async fn capability_routing_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.capability_routing_report(&ws).await {
+        Ok(report) => ok_response(report).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

@@ -2251,6 +2251,45 @@ impl QueryEngine {
         Ok(out)
     }
 
+    /// Capability-routing report (P5): every deployed function with its learned
+    /// experience grouped by input_class (n_success / n_fail + Wilson score).
+    /// Functions with no experience yet appear with empty `classes`. Powers the
+    /// Console's routing/experience view — the window into "what routes where,
+    /// and how well it performs".
+    pub async fn capability_routing_report(&self, ws: &str) -> Result<serde_json::Value> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let funcs = storage.graph.list_functions()?;
+        let exp = storage.graph.list_all_experience()?;
+        let mut by_fn: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            std::collections::BTreeMap::new();
+        for (ic, e) in &exp {
+            by_fn.entry(e.function_name.clone()).or_default().push(serde_json::json!({
+                "input_class": ic,
+                "n_success": e.n_success,
+                "n_fail": e.n_fail,
+                "score": e.score(),
+            }));
+        }
+        let capabilities: Vec<serde_json::Value> = funcs
+            .iter()
+            .map(|f| {
+                let classes = by_fn.remove(&f.name).unwrap_or_default();
+                let runs: i64 = classes
+                    .iter()
+                    .map(|c| c["n_success"].as_i64().unwrap_or(0) + c["n_fail"].as_i64().unwrap_or(0))
+                    .sum();
+                serde_json::json!({
+                    "name": f.name,
+                    "version": f.version,
+                    "runs": runs,
+                    "classes": classes,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "capabilities": capabilities }))
+    }
+
     /// Core durable invocation, parameterised by `run_id` so a *resumed*
     /// run reuses the same id (and thus its journal). On a suspended
     /// `ctx.cognition.ask` it persists a pending request and returns a

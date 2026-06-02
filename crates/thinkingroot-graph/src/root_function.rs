@@ -537,6 +537,36 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Every recorded experience row `(input_class, function)` across all
+    /// classes — for the capability-routing report / Console view. Unordered;
+    /// the caller groups + sorts (by Wilson `score()`).
+    pub fn list_all_experience(&self) -> Result<Vec<(String, ExperienceEntry)>> {
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[input_class, function_name, weight, n_success, n_fail] := \
+                 *function_experience{input_class, function_name, weight, n_success, n_fail}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_all_experience: {e}")))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    dv_str(&r[0]),
+                    ExperienceEntry {
+                        function_name: dv_str(&r[1]),
+                        weight: dv_f64(&r[2]),
+                        n_success: dv_i64(&r[3]),
+                        n_fail: dv_i64(&r[4]),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Record that a run touched a graph object (claim/witness/entity),
     /// tagged with the `(input_class, function)` it ran under so a later
     /// change to that object can causally invalidate the experience.
