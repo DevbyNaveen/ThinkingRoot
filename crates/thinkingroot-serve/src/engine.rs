@@ -1792,7 +1792,8 @@ impl QueryEngine {
         session_id: &str,
         spec: CapsuleSpec,
     ) -> Result<CompiledCapsule> {
-        use thinkingroot_graph::capsule::classify_query;
+        use thinkingroot_graph::capsule::{capsule_key, classify_query, CapsuleCacheRow};
+        let t_start = std::time::Instant::now();
         let branch_ref = spec.branch.as_deref();
         let query_class = classify_query(&spec.query);
 
@@ -1802,6 +1803,33 @@ impl QueryEngine {
             let storage = handle.storage.lock().await;
             storage.graph.prompt_latest_version(&spec.prompt_name)?.unwrap_or(0)
         };
+
+        // L1 — exact-repeat capsule cache (the session path previously bypassed
+        // it, so cache_hit was always false). Serve a verbatim cached capsule for
+        // the SAME (prompt,version,branch,query,vars) in sub-ms, skipping frame +
+        // grounding. The full cross-encoder is irrelevant here.
+        let key = capsule_key(
+            &spec.prompt_name,
+            current_version,
+            branch_ref,
+            &spec.query,
+            &spec.vars,
+        );
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            if let Some(row) = storage.graph.capsule_cache_get(&key)? {
+                if let Ok(mut cap) = serde_json::from_str::<CompiledCapsule>(&row.capsule_json) {
+                    cap.cache_hit = true;
+                    tracing::info!(
+                        elapsed_ms = t_start.elapsed().as_millis() as u64,
+                        "capsule_session: CACHE HIT"
+                    );
+                    return Ok(cap);
+                }
+            }
+        }
+        let t_after_cache = std::time::Instant::now();
 
         // Try the session warm frame.
         let warm = {
@@ -1850,25 +1878,54 @@ impl QueryEngine {
             }
         };
 
+        let t_after_frame = std::time::Instant::now();
+
         // Per-turn: ground the query (the only work a warm turn pays). Ground
         // from the session branch (read-your-own-writes) when one is set.
         let (grounded_claims, deps) =
             self.ground_query(ws, &spec.query, session_id, spec.top_k, branch_ref).await?;
-        let _ = &deps; // session capsules are not persisted to the shared cache
+        let t_after_ground = std::time::Instant::now();
         let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
         let branch_context = self.branch_context_for(ws, branch_ref).await;
 
-        Ok(CompiledCapsule {
+        let capsule = CompiledCapsule {
             system,
             grounded_claims,
             brief,
             tools,
             token_estimate,
-            query_class,
+            query_class: query_class.clone(),
             cache_hit: false,
             frame_warm,
             branch_context,
-        })
+        };
+
+        // L1 — phase timing (find where the ms go) + persist for exact-repeat hits.
+        tracing::info!(
+            frame_warm,
+            cache_check_ms = t_after_cache.duration_since(t_start).as_millis() as u64,
+            frame_ms = t_after_frame.duration_since(t_after_cache).as_millis() as u64,
+            ground_ms = t_after_ground.duration_since(t_after_frame).as_millis() as u64,
+            finalize_ms = t_after_ground.elapsed().as_millis() as u64,
+            total_ms = t_start.elapsed().as_millis() as u64,
+            "capsule_session: phase timing"
+        );
+        if let Ok(capsule_json) = serde_json::to_string(&capsule) {
+            let row = CapsuleCacheRow {
+                key,
+                capsule_json,
+                prompt_name: spec.prompt_name.clone(),
+                prompt_version: current_version,
+                branch: branch_ref.unwrap_or("").to_string(),
+                query_class,
+                token_estimate: token_estimate as i64,
+                created_at: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+            };
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.capsule_cache_put(&row, &deps);
+        }
+        Ok(capsule)
     }
 
     /// M4 — Slow-Thinker prefetch: warm the session's capsule frame ahead
