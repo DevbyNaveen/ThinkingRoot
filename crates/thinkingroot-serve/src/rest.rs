@@ -413,6 +413,16 @@ impl AppState {
         self.workspace_root.read().await.clone()
     }
 
+    /// Best-effort display name for the active workspace (its mounted
+    /// directory name), or "main" when unknown. Used to stamp activity
+    /// events for the Console log.
+    pub async fn current_workspace_name(&self) -> String {
+        self.current_workspace_root()
+            .await
+            .and_then(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "main".into())
+    }
+
     /// Update the active workspace root.
     ///
     /// Stream A — called by `mount_workspace_handler` after a successful
