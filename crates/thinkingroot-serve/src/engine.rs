@@ -5017,69 +5017,62 @@ Rules: \
         // the capture. Mirrors contribute_bulk's own `resolve_data_dir` +
         // `GraphStore::init` access pattern on the branch dir.
         if !result.entities.is_empty() {
-            if let Ok(handle) = self.get_workspace(ws) {
-                let data_dir = match branch {
-                    Some(b) => {
-                        thinkingroot_branch::snapshot::resolve_data_dir(&handle.root_path, Some(b))
+            // Resolve the target graph via the SHARED cached handle — NOT a fresh
+            // GraphStore::init. A fresh init opened a SECOND RocksDB instance on a
+            // branch dir already held open by the branch-engine cache (from
+            // recall) → corruption ("file is not a database (code 26)") on the
+            // next access. branch_engines.get_or_open (branch) and the resident
+            // workspace store (main) return the single canonical handle.
+            let graph_opt: Option<thinkingroot_graph::graph::GraphStore> = match branch {
+                Some(b) => match self.workspace_root_path(ws) {
+                    Some(root) => self
+                        .branch_engines()
+                        .get_or_open(&root, b)
+                        .await
+                        .ok()
+                        .map(|h| h.graph.clone()),
+                    None => None,
+                },
+                None => self.graph_store(ws).await,
+            };
+            if let Some(graph) = graph_opt {
+                for e in &result.entities {
+                    let name = e.name.trim();
+                    if name.is_empty() {
+                        continue;
                     }
-                    None => handle.root_path.join(".thinkingroot"),
-                };
-                let graph_dir = data_dir.join("graph");
-                if graph_dir.exists() {
-                    match thinkingroot_graph::graph::GraphStore::init(&graph_dir) {
-                        Ok(graph) => {
-                            for e in &result.entities {
-                                let name = e.name.trim();
-                                if name.is_empty() {
-                                    continue;
-                                }
-                                match graph.find_entity_id_by_name(name) {
-                                    Ok(Some(_)) => {} // already a node — keep it canonical
-                                    Ok(None) => {
-                                        let mut ent = thinkingroot_core::Entity::new(
-                                            name,
-                                            parse_entity_type_str(&e.entity_type),
-                                        );
-                                        for a in &e.aliases {
-                                            ent = ent.with_alias(a.clone());
-                                        }
-                                        if let Some(d) = &e.description {
-                                            ent = ent.with_description(d.clone());
-                                        }
-                                        let _ = graph.insert_entity(&ent);
-                                    }
-                                    Err(_) => {}
-                                }
+                    match graph.find_entity_id_by_name(name) {
+                        Ok(Some(_)) => {} // already a node — keep it canonical
+                        Ok(None) => {
+                            let mut ent = thinkingroot_core::Entity::new(
+                                name,
+                                parse_entity_type_str(&e.entity_type),
+                            );
+                            for a in &e.aliases {
+                                ent = ent.with_alias(a.clone());
                             }
-                            // Persist entity↔entity relations — the graph's
-                            // EDGES. Resolve both endpoints by name to ids
-                            // (entities were just upserted above), then link.
-                            // Relations below 0.3 confidence are discarded per
-                            // the extractor schema. Best-effort.
-                            for r in &result.relations {
-                                if r.confidence < 0.3 {
-                                    continue;
-                                }
-                                let (from, to) = (r.from_entity.trim(), r.to_entity.trim());
-                                if from.is_empty() || to.is_empty() {
-                                    continue;
-                                }
-                                if let (Ok(Some(fid)), Ok(Some(tid))) = (
-                                    graph.find_entity_id_by_name(from),
-                                    graph.find_entity_id_by_name(to),
-                                ) {
-                                    let _ = graph.link_entities(
-                                        &fid,
-                                        &tid,
-                                        &r.relation_type,
-                                        r.confidence,
-                                    );
-                                }
+                            if let Some(d) = &e.description {
+                                ent = ent.with_description(d.clone());
                             }
+                            let _ = graph.insert_entity(&ent);
                         }
-                        Err(e) => {
-                            tracing::warn!("extract_and_contribute: entity graph open failed: {e}");
-                        }
+                        Err(_) => {}
+                    }
+                }
+                // Entity↔entity relations (the graph's EDGES): resolve both
+                // endpoints by name → ids, then link. <0.3 confidence discarded.
+                for r in &result.relations {
+                    if r.confidence < 0.3 {
+                        continue;
+                    }
+                    let (from, to) = (r.from_entity.trim(), r.to_entity.trim());
+                    if from.is_empty() || to.is_empty() {
+                        continue;
+                    }
+                    if let (Ok(Some(fid)), Ok(Some(tid))) =
+                        (graph.find_entity_id_by_name(from), graph.find_entity_id_by_name(to))
+                    {
+                        let _ = graph.link_entities(&fid, &tid, &r.relation_type, r.confidence);
                     }
                 }
             }
