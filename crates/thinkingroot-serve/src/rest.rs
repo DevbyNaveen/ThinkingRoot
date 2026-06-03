@@ -4726,29 +4726,32 @@ async fn stream_all_branch_events_handler(
 
 // ─── Unified activity log ────────────────────────────────────────────
 
-/// Live SSE tail of activity events for one workspace. Pairs with the
-/// `/activity` history endpoint (client backfills, then follows live).
+/// Live SSE tail of activity events. Pairs with the `/activity` history
+/// endpoint (client backfills, then follows live). A cloud engine serves
+/// one project, so we stream ALL events rather than filtering by the
+/// `{ws}` path segment — the segment is kept for API symmetry, and each
+/// event carries its own `ws` for display. (Filtering here would
+/// silently drop everything if the caller's workspace name didn't match
+/// the engine's mounted directory name — a honesty-rule trap.)
 async fn stream_activity_handler(
     State(state): State<Arc<AppState>>,
-    Path(ws): Path<String>,
+    Path(_ws): Path<String>,
 ) -> Response {
     use tokio_stream::StreamExt as _;
     use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
     let rx = state.activity_tx.subscribe();
-    let want_ws = ws;
-    let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
-        Ok(ev) if ev.ws == want_ws => {
+    let stream = BroadcastStream::new(rx).map(move |res| match res {
+        Ok(ev) => {
             let payload = serde_json::to_string(&ev).unwrap_or_default();
-            Some(Ok::<Event, std::convert::Infallible>(
+            Ok::<Event, std::convert::Infallible>(
                 Event::default().event("activity").data(payload),
-            ))
+            )
         }
-        Ok(_) => None, // other workspace — skip
         Err(BroadcastStreamRecvError::Lagged(n)) => {
             let payload = serde_json::json!({ "missed": n }).to_string();
-            Some(Ok(Event::default().event("lagged").data(payload)))
+            Ok(Event::default().event("lagged").data(payload))
         }
     });
 
