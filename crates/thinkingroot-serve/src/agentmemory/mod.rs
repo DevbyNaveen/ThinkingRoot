@@ -719,6 +719,7 @@ async fn smart_search_handler(
         require_provenance_verified: false,
         now: None,
         scoped_claim_ids: None,
+        branch: None,
     };
     let response = match engine_guard
         .hybrid_retrieve(&project, retrieval, /*cancel=*/ None)

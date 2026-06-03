@@ -1623,7 +1623,7 @@ impl QueryEngine {
             .clone()
             .unwrap_or_else(|| format!("capsule:{key}"));
         let (grounded_claims, deps) = self
-            .ground_query(ws, &spec.query, &session_id, spec.top_k)
+            .ground_query(ws, &spec.query, &session_id, spec.top_k, branch_ref)
             .await?;
         let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
         let branch_context = self.branch_context_for(ws, branch_ref).await;
@@ -1715,6 +1715,7 @@ impl QueryEngine {
         query: &str,
         session_id: &str,
         top_k: usize,
+        branch: Option<&str>,
     ) -> Result<(Vec<CapsuleClaimRef>, Vec<(String, String)>)> {
         let retrieval = self
             .hybrid_retrieve(
@@ -1726,13 +1727,28 @@ impl QueryEngine {
                     clearance: vec![thinkingroot_core::types::Sensitivity::Public],
                     top_k,
                     time_window: None,
-                    scoring_profile: ScoringProfile::default(),
+                    // L1 — the capsule grounds the agent on the hot path, so it
+                    // must be FAST. Measured: the cross-encoder is ~110ms/doc on
+                    // CPU (~1.1s for a pool) vs ~4ms without it, and it only
+                    // REORDERS already-relevant fused hits (the agent reads all
+                    // top_k anyway). So grounding skips the cross-encoder —
+                    // ~250x faster for a negligible ordering change. The public
+                    // /search/hybrid endpoint keeps tiered rerank for callers who
+                    // need best-ranked output.
+                    scoring_profile: ScoringProfile {
+                        use_cross_encoder: false,
+                        ..ScoringProfile::default()
+                    },
                     require_certificate: false,
                     include_test_origin: false,
                     include_quarantined: false,
                     require_provenance_verified: false,
                     now: None,
                     scoped_claim_ids: None,
+                    // Read-your-own-writes: ground from the live session branch
+                    // (CoW copy of main + this session's contributed claims) so
+                    // the capsule cites what was just said before the merge.
+                    branch: branch.map(str::to_string),
                 },
                 None,
             )
@@ -1740,6 +1756,17 @@ impl QueryEngine {
         let mut grounded_claims = Vec::with_capacity(retrieval.hits.len());
         let mut deps: Vec<(String, String)> = Vec::with_capacity(retrieval.hits.len());
         for hit in &retrieval.hits {
+            // C1 — never ground the agent on a SUPERSEDED claim. Retrieval keeps
+            // superseded hits (annotated with a caveat) for transparency, but the
+            // capsule must surface only the live fact, so a consolidated "March ->
+            // June" supersession doesn't resurface the stale March claim.
+            if hit
+                .superseded_by_chain
+                .iter()
+                .any(|s| !s.is_empty() && s != &hit.claim_id)
+            {
+                continue;
+            }
             grounded_claims.push(CapsuleClaimRef {
                 claim_id: hit.claim_id.clone(),
                 statement: hit.statement.clone(),
@@ -1765,7 +1792,8 @@ impl QueryEngine {
         session_id: &str,
         spec: CapsuleSpec,
     ) -> Result<CompiledCapsule> {
-        use thinkingroot_graph::capsule::classify_query;
+        use thinkingroot_graph::capsule::{capsule_key, classify_query, CapsuleCacheRow};
+        let t_start = std::time::Instant::now();
         let branch_ref = spec.branch.as_deref();
         let query_class = classify_query(&spec.query);
 
@@ -1775,6 +1803,33 @@ impl QueryEngine {
             let storage = handle.storage.lock().await;
             storage.graph.prompt_latest_version(&spec.prompt_name)?.unwrap_or(0)
         };
+
+        // L1 — exact-repeat capsule cache (the session path previously bypassed
+        // it, so cache_hit was always false). Serve a verbatim cached capsule for
+        // the SAME (prompt,version,branch,query,vars) in sub-ms, skipping frame +
+        // grounding. The full cross-encoder is irrelevant here.
+        let key = capsule_key(
+            &spec.prompt_name,
+            current_version,
+            branch_ref,
+            &spec.query,
+            &spec.vars,
+        );
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            if let Some(row) = storage.graph.capsule_cache_get(&key)? {
+                if let Ok(mut cap) = serde_json::from_str::<CompiledCapsule>(&row.capsule_json) {
+                    cap.cache_hit = true;
+                    tracing::info!(
+                        elapsed_ms = t_start.elapsed().as_millis() as u64,
+                        "capsule_session: CACHE HIT"
+                    );
+                    return Ok(cap);
+                }
+            }
+        }
+        let t_after_cache = std::time::Instant::now();
 
         // Try the session warm frame.
         let warm = {
@@ -1823,24 +1878,54 @@ impl QueryEngine {
             }
         };
 
-        // Per-turn: ground the query (the only work a warm turn pays).
+        let t_after_frame = std::time::Instant::now();
+
+        // Per-turn: ground the query (the only work a warm turn pays). Ground
+        // from the session branch (read-your-own-writes) when one is set.
         let (grounded_claims, deps) =
-            self.ground_query(ws, &spec.query, session_id, spec.top_k).await?;
-        let _ = &deps; // session capsules are not persisted to the shared cache
+            self.ground_query(ws, &spec.query, session_id, spec.top_k, branch_ref).await?;
+        let t_after_ground = std::time::Instant::now();
         let token_estimate = estimate_capsule_tokens(&system, &grounded_claims, &tools);
         let branch_context = self.branch_context_for(ws, branch_ref).await;
 
-        Ok(CompiledCapsule {
+        let capsule = CompiledCapsule {
             system,
             grounded_claims,
             brief,
             tools,
             token_estimate,
-            query_class,
+            query_class: query_class.clone(),
             cache_hit: false,
             frame_warm,
             branch_context,
-        })
+        };
+
+        // L1 — phase timing (find where the ms go) + persist for exact-repeat hits.
+        tracing::info!(
+            frame_warm,
+            cache_check_ms = t_after_cache.duration_since(t_start).as_millis() as u64,
+            frame_ms = t_after_frame.duration_since(t_after_cache).as_millis() as u64,
+            ground_ms = t_after_ground.duration_since(t_after_frame).as_millis() as u64,
+            finalize_ms = t_after_ground.elapsed().as_millis() as u64,
+            total_ms = t_start.elapsed().as_millis() as u64,
+            "capsule_session: phase timing"
+        );
+        if let Ok(capsule_json) = serde_json::to_string(&capsule) {
+            let row = CapsuleCacheRow {
+                key,
+                capsule_json,
+                prompt_name: spec.prompt_name.clone(),
+                prompt_version: current_version,
+                branch: branch_ref.unwrap_or("").to_string(),
+                query_class,
+                token_estimate: token_estimate as i64,
+                created_at: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+            };
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.capsule_cache_put(&row, &deps);
+        }
+        Ok(capsule)
     }
 
     /// M4 — Slow-Thinker prefetch: warm the session's capsule frame ahead
@@ -4873,6 +4958,213 @@ Rules: \
     /// Returns the same [`ContributeResult`] shape as the non-bulk
     /// path; the `warnings` vector carries the `"replay: existing
     /// ingest"` notice when the call short-circuited.
+    /// A2 — compiled-not-raw capture. Runs the LLM extractor over `text` (a
+    /// conversation turn or session transcript), then contributes the
+    /// EXTRACTED, atomic, de-noised claims through the same idempotent
+    /// [`Self::contribute_bulk`] path. This turns verbatim "User said: …"
+    /// capture into compiled memory: multi-fact turns split into atomic claims,
+    /// and pleasantries/questions that yield no facts are dropped (the
+    /// extractor returns no claims → nothing stored). Non-fatal by contract:
+    /// callers treat an error as "skip capture this turn", never break the chat.
+    pub async fn extract_and_contribute(
+        &self,
+        ws: &str,
+        text: &str,
+        branch: Option<&str>,
+        session_id: &str,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+    ) -> Result<ContributeResult> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot compile-extract this turn"
+            ))
+        })?;
+        let result = llm.extract(text, "").await?;
+        let agent_claims: Vec<AgentClaim> = result
+            .claims
+            .into_iter()
+            .filter(|c| !c.statement.trim().is_empty())
+            .map(|c| AgentClaim {
+                statement: c.statement,
+                claim_type: if c.claim_type.trim().is_empty() {
+                    default_claim_type()
+                } else {
+                    c.claim_type
+                },
+                confidence: Some(c.confidence),
+                entities: c.entities,
+            })
+            .collect();
+        // Denoising is a feature: a turn with no extractable facts (e.g. a
+        // question or greeting) stores nothing rather than a raw claim.
+        if agent_claims.is_empty() {
+            return Ok(ContributeResult {
+                accepted_count: 0,
+                accepted_ids: vec![],
+                source_uri: String::new(),
+                warnings: vec!["no facts extracted from turn".to_string()],
+            });
+        }
+
+        // Entity-linking: upsert the extracted entities into the SAME target
+        // graph (branch or main) BEFORE contributing claims, so contribute_bulk's
+        // by-name linking (`find_entity_id_by_name`) resolves them and connects
+        // the claims into the graph instead of saving them unlinked. Canonical
+        // by name (find-then-insert) so a repeated entity is one node, not many.
+        // Best-effort: a failure here degrades to unlinked claims, never aborts
+        // the capture. Mirrors contribute_bulk's own `resolve_data_dir` +
+        // `GraphStore::init` access pattern on the branch dir.
+        if !result.entities.is_empty() {
+            // Resolve the target graph via the SHARED cached handle — NOT a fresh
+            // GraphStore::init. A fresh init opened a SECOND RocksDB instance on a
+            // branch dir already held open by the branch-engine cache (from
+            // recall) → corruption ("file is not a database (code 26)") on the
+            // next access. branch_engines.get_or_open (branch) and the resident
+            // workspace store (main) return the single canonical handle.
+            let graph_opt: Option<thinkingroot_graph::graph::GraphStore> = match branch {
+                Some(b) => match self.workspace_root_path(ws) {
+                    Some(root) => self
+                        .branch_engines()
+                        .get_or_open(&root, b)
+                        .await
+                        .ok()
+                        .map(|h| h.graph.clone()),
+                    None => None,
+                },
+                None => self.graph_store(ws).await,
+            };
+            if let Some(graph) = graph_opt {
+                for e in &result.entities {
+                    let name = e.name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    match graph.find_entity_id_by_name(name) {
+                        Ok(Some(_)) => {} // already a node — keep it canonical
+                        Ok(None) => {
+                            let mut ent = thinkingroot_core::Entity::new(
+                                name,
+                                parse_entity_type_str(&e.entity_type),
+                            );
+                            for a in &e.aliases {
+                                ent = ent.with_alias(a.clone());
+                            }
+                            if let Some(d) = &e.description {
+                                ent = ent.with_description(d.clone());
+                            }
+                            let _ = graph.insert_entity(&ent);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                // Entity↔entity relations (the graph's EDGES): resolve both
+                // endpoints by name → ids, then link. <0.3 confidence discarded.
+                for r in &result.relations {
+                    if r.confidence < 0.3 {
+                        continue;
+                    }
+                    let (from, to) = (r.from_entity.trim(), r.to_entity.trim());
+                    if from.is_empty() || to.is_empty() {
+                        continue;
+                    }
+                    if let (Ok(Some(fid)), Ok(Some(tid))) =
+                        (graph.find_entity_id_by_name(from), graph.find_entity_id_by_name(to))
+                    {
+                        let _ = graph.link_entities(&fid, &tid, &r.relation_type, r.confidence);
+                    }
+                }
+            }
+        }
+
+        self.contribute_bulk(
+            ws,
+            session_id,
+            branch,
+            agent_claims,
+            sessions,
+            principal,
+            idempotency_key,
+            false,
+        )
+        .await
+    }
+
+    /// C1 — consolidation. Scans the durable (main) graph entity-by-entity and
+    /// uses the workspace LLM to detect SUPERSESSIONS within each entity's claim
+    /// cluster (a newer fact that replaces an older one about the SAME attribute
+    /// with a changed value), then applies `supersede_claim`. Off the hot path —
+    /// an on-demand job, not per-turn.
+    ///
+    /// Conservative by construction (wrongly superseding a valid claim is the
+    /// risk): only direct replacements are requested from the LLM; every
+    /// returned id is validated to be in the live cluster; already-superseded
+    /// claims are excluded; an LLM error on one entity skips that entity, never
+    /// aborts the pass.
+    pub async fn consolidate(&self, ws: &str, max_entities: usize) -> Result<ConsolidateReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot consolidate"
+            ))
+        })?;
+        let graph = self
+            .graph_store(ws)
+            .await
+            .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+        let entities = graph.get_all_entities()?;
+        let mut entities_scanned = 0usize;
+        let mut superseded = 0usize;
+        for (eid, ename, _etype) in entities.iter().take(max_entities) {
+            let raw = graph.get_claims_for_entity(eid)?;
+            // Keep only LIVE (non-superseded) claims, with timestamps.
+            let mut live: Vec<(String, String, i64)> = Vec::new();
+            for (cid, stmt, _ct) in &raw {
+                if let Ok(Some(c)) = graph.get_claim_by_id(cid) {
+                    if c.superseded_by.is_none() {
+                        live.push((cid.clone(), stmt.clone(), c.created_at.timestamp()));
+                    }
+                }
+            }
+            if live.len() < 2 {
+                continue;
+            }
+            entities_scanned += 1;
+            live.sort_by_key(|x| x.2); // oldest → newest
+            let mut listing = String::new();
+            for (cid, stmt, _) in &live {
+                listing.push_str(&format!("- id={cid}: {stmt}\n"));
+            }
+            let user = format!(
+                "Facts about \"{ename}\" (oldest first):\n{listing}\nReturn a JSON array of \
+                 objects {{\"old_id\":\"…\",\"new_id\":\"…\"}} for ONLY direct supersessions: a \
+                 newer fact that REPLACES an older one about the SAME attribute with a changed \
+                 value (e.g. a changed date, location, status, name). Do NOT include facts that \
+                 are merely related, additional, or about a different attribute. If unsure, omit \
+                 it. Return [] if there are none."
+            );
+            let resp = match llm.chat(CONSOLIDATION_SYSTEM, &user).await {
+                Ok(r) => r,
+                Err(_) => continue, // non-fatal per entity
+            };
+            let live_ids: std::collections::HashSet<&str> =
+                live.iter().map(|x| x.0.as_str()).collect();
+            for (old, new) in parse_supersede_pairs(&resp) {
+                if old != new
+                    && live_ids.contains(old.as_str())
+                    && live_ids.contains(new.as_str())
+                    && graph.supersede_claim(&old, &new).is_ok()
+                {
+                    superseded += 1;
+                }
+            }
+        }
+        Ok(ConsolidateReport {
+            entities_scanned,
+            superseded,
+        })
+    }
+
     #[tracing::instrument(
         name = "engine.contribute_bulk",
         skip(self, agent_claims, sessions),
@@ -7215,6 +7507,14 @@ pub struct ContributeResult {
     pub warnings: Vec<String>,
 }
 
+/// C1 — outcome of a [`QueryEngine::consolidate`] pass. Honest: `superseded`
+/// counts only claims actually marked superseded this pass.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsolidateReport {
+    pub entities_scanned: usize,
+    pub superseded: usize,
+}
+
 /// Parse a claim type string (case-insensitive) into a `ClaimType` enum.
 fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
     use thinkingroot_core::types::ClaimType;
@@ -7230,6 +7530,66 @@ fn parse_claim_type_str(s: &str) -> thinkingroot_core::types::ClaimType {
         "architecture" => ClaimType::Architecture,
         "preference" => ClaimType::Preference,
         _ => ClaimType::Fact,
+    }
+}
+
+/// System prompt for the C1 consolidation pass. Steers the model to act ONLY on
+/// direct replacements — the conservative bias that protects valid claims.
+const CONSOLIDATION_SYSTEM: &str = "You are a careful knowledge-base consolidator. \
+You are given facts about a single subject, each with an id, oldest first. Your ONLY \
+job is to find SUPERSESSIONS: a newer fact that directly replaces an older fact about \
+the SAME attribute with a changed value. Be conservative — when in doubt, do not flag. \
+Never merge facts about different attributes. Respond with ONLY a JSON array, no prose.";
+
+/// Parse `[{"old_id":"…","new_id":"…"}, …]` out of an LLM response (tolerant of
+/// surrounding prose / code fences). Returns the (old_id, new_id) pairs.
+fn parse_supersede_pairs(text: &str) -> Vec<(String, String)> {
+    let start = match text.find('[') {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let end = match text.rfind(']') {
+        Some(i) if i > start => i,
+        _ => return vec![],
+    };
+    let json = &text[start..=end];
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    parsed
+        .into_iter()
+        .filter_map(|v| {
+            let old = v.get("old_id").and_then(|x| x.as_str())?.to_string();
+            let new = v.get("new_id").and_then(|x| x.as_str())?.to_string();
+            if old.is_empty() || new.is_empty() {
+                None
+            } else {
+                Some((old, new))
+            }
+        })
+        .collect()
+}
+
+/// Map the LLM extractor's free-text entity-type string to a core `EntityType`.
+/// Unknown types fall back to `Concept` (the catch-all), so a novel label never
+/// drops the entity.
+fn parse_entity_type_str(s: &str) -> thinkingroot_core::types::EntityType {
+    use thinkingroot_core::types::EntityType;
+    match s.to_lowercase().as_str() {
+        "person" | "people" | "user" => EntityType::Person,
+        "system" => EntityType::System,
+        "service" => EntityType::Service,
+        "team" => EntityType::Team,
+        "api" => EntityType::Api,
+        "database" | "db" => EntityType::Database,
+        "library" | "framework" | "language" => EntityType::Library,
+        "file" => EntityType::File,
+        "module" | "package" => EntityType::Module,
+        "function" | "method" => EntityType::Function,
+        "config" | "configuration" => EntityType::Config,
+        "organization" | "org" | "company" | "startup" => EntityType::Organization,
+        _ => EntityType::Concept,
     }
 }
 

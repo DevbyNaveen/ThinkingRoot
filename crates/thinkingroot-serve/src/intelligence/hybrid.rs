@@ -102,10 +102,21 @@ pub async fn hybrid_retrieve(
     let now_dt = req.now.unwrap_or_else(Utc::now);
     req.now = Some(now_dt);
 
-    let graph = engine
-        .graph_store(ws)
-        .await
-        .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+    // Read-your-own-writes: when `req.branch` is set, run the whole pipeline
+    // against that branch's graph (a CoW copy of main that also carries the
+    // live session's contributed claims) instead of main. `None` = main.
+    let graph = match req.branch.as_deref() {
+        Some(b) => {
+            let root = engine
+                .workspace_root_path(ws)
+                .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?;
+            engine.branch_engines().get_or_open(&root, b).await?.graph.clone()
+        }
+        None => engine
+            .graph_store(ws)
+            .await
+            .ok_or_else(|| Error::GraphStorage(format!("workspace not mounted: {ws}")))?,
+    };
     let byte_store = engine.byte_store(ws);
 
     // ---- Layer 1: parse + DSL fold ----
@@ -166,7 +177,25 @@ pub async fn hybrid_retrieve(
     // ONNX bundle is staged at install time by install.sh / install.ps1
     // under `<dirs::cache_dir>/thinkingroot/models/rerank.{onnx,tokenizer.json}`.
     // No HF-Hub fetch at runtime (Track 32, 2026-05-16).
-    if req.scoring_profile.use_cross_encoder && scored.len() >= 2 {
+    // L1 — TIERED rerank gate. The cross-encoder costs ~1.1s on CPU vs ~4ms
+    // without it (measured 2026-06, this VM) — it is ~99% of recall latency. So
+    // only PAY it when the fused ranking is AMBIGUOUS: if the #1 fused score
+    // leads the runner-up by a confident margin, the order is already
+    // trustworthy and we skip the cross-encoder. Full quality is preserved on
+    // the hard (close-scored) cases; the common clear case stays at ~4ms.
+    // Margin tunable via TR_RERANK_MARGIN (fused scores are normalised to [0,1]).
+    let rerank_margin: f32 = std::env::var("TR_RERANK_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.15);
+    let top_gap = if scored.len() >= 2 {
+        scored[0].1 - scored[1].1
+    } else {
+        f32::INFINITY
+    };
+    let rerank_ambiguous = top_gap < rerank_margin;
+    if req.scoring_profile.use_cross_encoder && scored.len() >= 2 && rerank_ambiguous {
+        tracing::debug!(top_gap, rerank_margin, "tiered rerank: ambiguous → cross-encoder");
         let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
         let pool = &scored[..pool_size];
         let docs: Vec<&str> = pool.iter().map(|(c, _, _)| c.statement.as_str()).collect();
@@ -471,14 +500,21 @@ async fn vector_recall(
     // fastembed (AllMiniLML6V2 384-dim cosine) via `engine.search_scoped`.
     // No HNSW index in CozoDB today; world-class part is the Datalog
     // fan-in and score fusion downstream.
-    let allowed: HashSet<String> = req
-        .scoped_claim_ids
-        .as_ref()
-        .map(|v| v.iter().cloned().collect())
-        .unwrap_or_default();
-    let result = engine
-        .search_scoped(ws, query, req.top_k * 4, &allowed)
-        .await?;
+    // Read-your-own-writes: when a branch is set, search that branch's vector
+    // index (main@fork + the live session's incrementally-embedded claims) via
+    // `search_branched`. The `scoped_claim_ids` filter doesn't apply on the
+    // branch path (capsule grounding never sets it); main keeps the filter.
+    let result = match req.branch.as_deref() {
+        Some(b) => engine.search_branched(ws, query, req.top_k * 4, Some(b)).await?,
+        None => {
+            let allowed: HashSet<String> = req
+                .scoped_claim_ids
+                .as_ref()
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+            engine.search_scoped(ws, query, req.top_k * 4, &allowed).await?
+        }
+    };
     Ok(result
         .claims
         .into_iter()
@@ -2038,6 +2074,7 @@ mod tests {
             require_provenance_verified: false,
             now: Some(now_fixed()),
             scoped_claim_ids: None,
+            branch: None,
         }
     }
 
