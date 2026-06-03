@@ -3599,6 +3599,17 @@ pub(crate) async fn run_unified_compile(
         )
         .await;
 
+    state
+        .publish_activity(
+            crate::activity::ActivityEvent::new(
+                status_name.clone(),
+                crate::activity::ActivityClass::Ingest,
+                "compile.started",
+                "compile started",
+            ),
+        )
+        .await;
+
     // Sidecar forwarder: intercepts pipeline events so the
     // `workspace_status` actor sees live `CompilePhase` updates AND
     // the caller's `progress_tx` keeps receiving the unchanged event
@@ -3636,9 +3647,41 @@ pub(crate) async fn run_unified_compile(
     let status_name_for_fwd = status_name.clone();
     let root_path_for_fwd = req.root_path.clone();
     let caller_tx = progress_tx;
+    let state_for_fwd = state.clone();
+    let ws_name_for_fwd = status_name.clone();
     let forwarder = tokio::spawn(async move {
         let mut last_phase: Option<&'static str> = None;
         while let Some(ev) = forwarder_rx.recv().await {
+            // Mirror meaningful ingest milestones onto the activity bus
+            // (not every per-chunk tick — only the summary events).
+            match &ev {
+                ProgressEvent::ExtractionComplete { claims, entities, .. } => {
+                    state_for_fwd
+                        .publish_activity(
+                            crate::activity::ActivityEvent::new(
+                                ws_name_for_fwd.clone(),
+                                crate::activity::ActivityClass::Ingest,
+                                "claims.added",
+                                format!("+{claims} claims · {entities} entities"),
+                            )
+                            .with_detail(
+                                serde_json::json!({ "claims": claims, "entities": entities }),
+                            ),
+                        )
+                        .await;
+                }
+                ProgressEvent::IncrementalDone { .. } => {
+                    state_for_fwd
+                        .publish_activity(crate::activity::ActivityEvent::new(
+                            ws_name_for_fwd.clone(),
+                            crate::activity::ActivityClass::Ingest,
+                            "compile.done",
+                            "compile finished",
+                        ))
+                        .await;
+                }
+                _ => {}
+            }
             if let Some(phase) = phase_token_from_event(&ev) {
                 if last_phase != Some(phase) {
                     workspace_status
