@@ -2019,9 +2019,46 @@ async fn invoke_function_handler(
     Json(payload): Json<InvokeFunctionBody>,
 ) -> Response {
     let engine = state.engine.read().await;
+    state
+        .publish_activity(
+            crate::activity::ActivityEvent::new(
+                ws.clone(),
+                crate::activity::ActivityClass::Function,
+                "fn.invoked",
+                format!("invoke {name}"),
+            )
+            .with_detail(serde_json::json!({ "function": name })),
+        )
+        .await;
     match engine.invoke_function(&ws, &name, &payload.input).await {
-        Ok(v) => ok_response(serde_json::json!({ "result": v })).into_response(),
-        Err(e) => match_engine_error(e),
+        Ok(v) => {
+            state
+                .publish_activity(
+                    crate::activity::ActivityEvent::new(
+                        ws.clone(),
+                        crate::activity::ActivityClass::Function,
+                        "fn.result",
+                        format!("{name} · ok"),
+                    )
+                    .with_detail(serde_json::json!({ "function": name })),
+                )
+                .await;
+            ok_response(serde_json::json!({ "result": v })).into_response()
+        }
+        Err(e) => {
+            state
+                .publish_activity(
+                    crate::activity::ActivityEvent::new(
+                        ws.clone(),
+                        crate::activity::ActivityClass::Error,
+                        "fn.error",
+                        format!("{name} · {e}"),
+                    )
+                    .with_detail(serde_json::json!({ "function": name })),
+                )
+                .await;
+            match_engine_error(e)
+        }
     }
 }
 
@@ -6372,6 +6409,25 @@ async fn ask_handler(
     };
 
     let result = ask(&engine, llm, &req).await;
+
+    state
+        .publish_activity(
+            crate::activity::ActivityEvent::new(
+                ws.clone(),
+                crate::activity::ActivityClass::Retrieval,
+                "ask.grounded",
+                format!(
+                    "\"{}\" → {} claims",
+                    crate::activity::truncate(&body.question, 48),
+                    result.claims_used
+                ),
+            )
+            .with_detail(serde_json::json!({
+                "claims": result.claims_used,
+                "category": result.category,
+            })),
+        )
+        .await;
 
     ok_response(AskResponseBody {
         answer: result.answer,
