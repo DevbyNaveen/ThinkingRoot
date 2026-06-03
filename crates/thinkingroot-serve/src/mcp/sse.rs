@@ -141,6 +141,7 @@ async fn handle_sse(
             user_agent: user_agent.clone(),
         }
     };
+    let principal_label = crate::activity::principal_label(&principal);
     crate::mcp::telemetry::record_session_opened(
         &state.mcp_session_telemetry,
         session_id.clone(),
@@ -148,6 +149,18 @@ async fn handle_sse(
         principal,
     )
     .await;
+    state
+        .publish_activity(
+            crate::activity::ActivityEvent::new(
+                state.current_workspace_name().await,
+                crate::activity::ActivityClass::Connection,
+                "mcp.connected",
+                format!("{principal_label} connected"),
+            )
+            .with_session(Some(session_id.clone()))
+            .with_principal(Some(principal_label)),
+        )
+        .await;
 
     // Queue the endpoint URL — MCP clients use this to discover the POST address.
     let endpoint_url = format!("/mcp?sessionId={session_id}");
@@ -170,10 +183,22 @@ async fn handle_sse(
         let session_id = session_id.clone();
         let sessions = state.mcp_sessions.clone();
         let telemetry = state.mcp_session_telemetry.clone();
+        let state_for_activity = state.clone();
         let tx_watch = tx.clone();
         tokio::spawn(async move {
             tx_watch.closed().await;
             sessions.lock().await.remove(&session_id);
+            state_for_activity
+                .publish_activity(
+                    crate::activity::ActivityEvent::new(
+                        state_for_activity.current_workspace_name().await,
+                        crate::activity::ActivityClass::Connection,
+                        "mcp.disconnected",
+                        format!("session {session_id} disconnected"),
+                    )
+                    .with_session(Some(session_id.clone())),
+                )
+                .await;
             // Phase 3 — persist the final telemetry snapshot to
             // `mcp-sessions.jsonl` and drop the live entry. The
             // reaper firing means the receiver was dropped (clean
@@ -663,6 +688,7 @@ async fn handle_post(
             &session_id,
         )
         .await;
+        let ws_name = state.current_workspace_name().await;
         if let Some(err) = response.error.as_ref() {
             crate::mcp::telemetry::record_error(
                 &state.mcp_session_telemetry,
@@ -672,6 +698,31 @@ async fn handle_post(
                 err.message.clone(),
             )
             .await;
+            state
+                .publish_activity(
+                    crate::activity::ActivityEvent::new(
+                        ws_name,
+                        crate::activity::ActivityClass::Error,
+                        "mcp.error",
+                        format!("{tool_name}: {}", err.message),
+                    )
+                    .with_session(Some(session_id.clone()))
+                    .with_detail(serde_json::json!({ "tool": tool_name, "code": err.code })),
+                )
+                .await;
+        } else {
+            state
+                .publish_activity(
+                    crate::activity::ActivityEvent::new(
+                        ws_name,
+                        crate::activity::ActivityClass::Connection,
+                        "mcp.tool_call",
+                        format!("tool · {tool_name}"),
+                    )
+                    .with_session(Some(session_id.clone()))
+                    .with_detail(serde_json::json!({ "tool": tool_name })),
+                )
+                .await;
         }
     }
 
