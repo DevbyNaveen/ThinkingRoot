@@ -5,6 +5,7 @@
 // probe_engram, list_engrams, expire_engram).
 #![recursion_limit = "256"]
 
+pub mod activity;
 pub mod agentmemory;
 pub mod backfill;
 pub mod branch_cache;
