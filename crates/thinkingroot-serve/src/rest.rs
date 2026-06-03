@@ -111,6 +111,12 @@ pub struct AppState {
     /// `/head` + `/branches`. Merged into `/branch-events/stream` as
     /// `event: head_changed` alongside `branch_event`.
     pub head_change_tx: broadcast::Sender<String>,
+    /// Unified activity bus. Every subsystem publishes an
+    /// `ActivityEvent` here; `/api/v1/ws/{ws}/activity/stream`
+    /// subscribes. Capacity 512: the aggregate sees every subsystem's
+    /// traffic; slow consumers surface as `lagged` SSE events rather
+    /// than blocking publishers. Mirrors `branch_event_aggregate`.
+    pub activity_tx: broadcast::Sender<crate::activity::ActivityEvent>,
     /// T1.5 — in-flight merge `CancellationToken`s keyed by merge id
     /// (a ULID generated at handler entry).  `POST /merges/{id}/cancel`
     /// looks up and trips the matching token; the merge phase-boundary
@@ -278,6 +284,7 @@ impl AppState {
                 branch_event_hub: Arc::new(RwLock::new(HashMap::new())),
                 branch_event_aggregate: broadcast::channel(256).0,
                 head_change_tx: broadcast::channel(64).0,
+                activity_tx: broadcast::channel(512).0,
                 active_merges: Arc::new(RwLock::new(HashMap::new())),
                 mcp_pending_calls: Arc::new(RwLock::new(HashMap::new())),
                 mcp_pending_sampling: Arc::new(RwLock::new(HashMap::new())),
@@ -431,6 +438,22 @@ impl AppState {
         map.entry(branch.to_string())
             .or_insert_with(|| broadcast::channel(64).0)
             .clone()
+    }
+
+    /// Publish an activity event to the live stream and durably append
+    /// it to the workspace volume. `send()` errors only when there are
+    /// zero subscribers — harmless. The durable append runs in a spawned
+    /// task (best-effort) so publishers never block on disk; it writes
+    /// under the workspace root (the mounted volume), NOT config_dir, so
+    /// history survives container respawns.
+    pub fn publish_activity(self: &Arc<Self>, event: crate::activity::ActivityEvent) {
+        let _ = self.activity_tx.send(event.clone());
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Some(root) = state.current_workspace_root().await {
+                let _ = crate::activity::append_event(&root, &event);
+            }
+        });
     }
 }
 
@@ -813,6 +836,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/compile/stream", post(compile_stream))
+            // Unified project activity log: live SSE tail + durable history
+            // + connected-MCP roster. Powers the Console "Activity" tab.
+            .route("/ws/{ws}/activity/stream", get(stream_activity_handler))
+            .route("/ws/{ws}/activity", get(list_activity_handler))
+            .route("/mcp/sessions", get(list_mcp_sessions_handler))
             // A2 — compiled-not-raw capture: extract atomic claims from a
             // conversation turn/transcript and contribute them (vs storing
             // verbatim "User said: …"). Branch goes in the body so the live
@@ -4662,6 +4690,74 @@ async fn stream_all_branch_events_handler(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+// ─── Unified activity log ────────────────────────────────────────────
+
+/// Live SSE tail of activity events for one workspace. Pairs with the
+/// `/activity` history endpoint (client backfills, then follows live).
+async fn stream_activity_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    use tokio_stream::StreamExt as _;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    let rx = state.activity_tx.subscribe();
+    let want_ws = ws;
+    let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
+        Ok(ev) if ev.ws == want_ws => {
+            let payload = serde_json::to_string(&ev).unwrap_or_default();
+            Some(Ok::<Event, std::convert::Infallible>(
+                Event::default().event("activity").data(payload),
+            ))
+        }
+        Ok(_) => None, // other workspace — skip
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            let payload = serde_json::json!({ "missed": n }).to_string();
+            Some(Ok(Event::default().event("lagged").data(payload)))
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityQuery {
+    limit: Option<usize>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Durable activity history for one workspace, newest-window last.
+/// Honest empty array when there is no log yet (not a 500/404 surface).
+async fn list_activity_handler(
+    State(state): State<Arc<AppState>>,
+    Path(_ws): Path<String>,
+    Query(q): Query<ActivityQuery>,
+) -> Response {
+    let Some(root) = state.current_workspace_root().await else {
+        return ok_response(serde_json::json!([])).into_response();
+    };
+    let limit = q.limit.unwrap_or(200).min(1000);
+    match crate::activity::read_recent(&root, limit, q.before) {
+        Ok(evs) => ok_response(serde_json::json!(evs)).into_response(),
+        Err(_) => ok_response(serde_json::json!([])).into_response(),
+    }
+}
+
+/// Live roster of connected MCP sessions, read from in-memory telemetry.
+/// Empty array when nothing is connected (honest empty state).
+async fn list_mcp_sessions_handler(State(state): State<Arc<AppState>>) -> Response {
+    let map = state.mcp_session_telemetry.read().await;
+    let sessions: Vec<_> = map.values().cloned().collect();
+    ok_response(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
 // ─── T1.2: Branch stats ──────────────────────────────────────────────
