@@ -442,18 +442,17 @@ impl AppState {
 
     /// Publish an activity event to the live stream and durably append
     /// it to the workspace volume. `send()` errors only when there are
-    /// zero subscribers — harmless. The durable append runs in a spawned
-    /// task (best-effort) so publishers never block on disk; it writes
-    /// under the workspace root (the mounted volume), NOT config_dir, so
-    /// history survives container respawns.
-    pub fn publish_activity(self: &Arc<Self>, event: crate::activity::ActivityEvent) {
+    /// zero subscribers — harmless. The durable append runs on the
+    /// blocking pool (best-effort, fire-and-forget) so publishers never
+    /// block on disk; it writes under the workspace root (the mounted
+    /// volume), NOT config_dir, so history survives container respawns.
+    pub async fn publish_activity(&self, event: crate::activity::ActivityEvent) {
         let _ = self.activity_tx.send(event.clone());
-        let state = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Some(root) = state.current_workspace_root().await {
+        if let Some(root) = self.current_workspace_root().await {
+            tokio::task::spawn_blocking(move || {
                 let _ = crate::activity::append_event(&root, &event);
-            }
-        });
+            });
+        }
     }
 }
 
@@ -513,6 +512,39 @@ pub async fn publish_latest_branch_event(state: &AppState, branch: &str) {
     };
     let tx = state.branch_event_sender(branch).await;
     let _ = tx.send(event.clone());
+    // Mirror onto the unified activity bus so the Console Activity tab
+    // shows branch ops alongside everything else. Read by reference
+    // before the aggregate send below moves `event`.
+    {
+        use thinkingroot_core::BranchEvent::*;
+        let (kind, actor) = match &event {
+            Created { actor, .. } => ("branch.created", actor.clone()),
+            Merged { actor, .. } => ("branch.merged", actor.clone()),
+            Abandoned { actor, .. } => ("branch.abandoned", actor.clone()),
+            RedactionUpdated { actor, .. } => ("branch.redaction", actor.clone()),
+            PermissionsUpdated { actor, .. } => ("branch.permissions", actor.clone()),
+            ContributeBulk { actor, count, .. } => {
+                let _ = count;
+                ("branch.contribute", actor.clone())
+            }
+        };
+        let ws_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "main".into());
+        state
+            .publish_activity(
+                crate::activity::ActivityEvent::new(
+                    ws_name,
+                    crate::activity::ActivityClass::Branch,
+                    kind,
+                    format!("{branch}"),
+                )
+                .with_principal(Some(actor))
+                .with_detail(serde_json::json!({ "branch": branch })),
+            )
+            .await;
+    }
     // Task 15: also fan into the aggregate channel so the
     // `/branch-events/stream` subscriber sees every branch's events
     // without N per-branch connections. send() returns Err only when
