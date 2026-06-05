@@ -137,6 +137,10 @@ pub async fn hybrid_retrieve(
 
     // ---- Layer 4: candidate merger ----
     let merged = merge_candidates(vector_hits, datalog_ids, shape, req.top_k * 2, &req);
+    // ---- Layer 4.5: GraphRAG expansion (multi-hop entity traversal) ----
+    // If the query names an entity, pull in claims reachable only through the
+    // entity graph — facts that vector/keyword recall miss. Additive + bounded.
+    let merged = expand_via_graph(&graph, merged, &parsed, &req);
     check_cancel(&cancel)?;
 
     // ---- Layer 5: structural enricher ----
@@ -729,6 +733,91 @@ fn merge_candidates(
     let mut seen: HashSet<String> = HashSet::new();
     out.retain(|c| seen.insert(c.claim_id.clone()));
     out
+}
+
+// GraphRAG fan-out bounds. A pathological hub entity could otherwise spread to
+// `MAX_FRONTIER` (1024) neighbours, each costing one `get_claims_for_entity`
+// query — so we fetch claims only for the strongest seeds and cap how many
+// graph-neighbour claims we inject. These keep the added latency bounded
+// regardless of graph shape; the fuse-score pass then ranks them honestly.
+const GRAPH_EXPANSION_SEED_CAP: usize = 64;
+const GRAPH_EXPANSION_CLAIM_CAP: usize = 128;
+
+/// Layer 4.5 — GraphRAG expansion. When the query names a resolvable entity,
+/// walk `entity_relations` from it (spreading activation, multi-hop) and add
+/// the reached entities' claims as extra candidates, so retrieval can surface a
+/// fact that is connected to the query's subject by a relation chain but is not
+/// vector- or keyword-similar to the query text.
+///
+/// Returns `merged` unchanged (a true no-op) when: graph expansion is disabled,
+/// the query names no entity, the name doesn't resolve to an entity id, or the
+/// seed has no neighbours. Injected candidates carry a deliberately small seed
+/// relevance (`intensity * graph_expansion_weight`) and are de-duped against the
+/// existing set, so this can only *add* recall — it never reorders or removes a
+/// direct hit before the fuse-score stage does its normal ranking.
+fn expand_via_graph(
+    graph: &GraphStore,
+    mut merged: Vec<Candidate>,
+    parsed: &ParsedQuery,
+    req: &RetrievalRequest,
+) -> Vec<Candidate> {
+    let p = &req.scoring_profile;
+    if !p.enable_graph_expansion {
+        return merged;
+    }
+    // Seed = the entity the query is about (same heuristic the planner uses).
+    let Some(name) = crate::intelligence::planner::extract_entity_name(&parsed.query_text, &None)
+    else {
+        return merged;
+    };
+    let seed_id = match graph.find_entity_id_by_name(&name) {
+        Ok(Some(id)) => id,
+        _ => return merged, // unresolved name → nothing to seed
+    };
+    let ripples = match thinkingroot_graph::spreading_activation::spread(
+        graph,
+        &seed_id,
+        p.graph_expansion_hops,
+        p.graph_expansion_decay,
+    ) {
+        Ok(r) => r,
+        Err(_) => return merged,
+    };
+
+    // Don't duplicate or downgrade a claim that direct recall already found.
+    let mut seen: HashSet<String> = merged.iter().map(|c| c.claim_id.clone()).collect();
+    // Strongest activation first, and only fetch claims for the top seeds so a
+    // hub entity can't trigger thousands of queries.
+    let mut ripples = ripples;
+    ripples.sort_by(|a, b| {
+        b.intensity
+            .partial_cmp(&a.intensity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut added = 0usize;
+    for ripple in ripples.into_iter().take(GRAPH_EXPANSION_SEED_CAP) {
+        if added >= GRAPH_EXPANSION_CLAIM_CAP {
+            break;
+        }
+        let claims = match graph.get_claims_for_entity(&ripple.entity_id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (claim_id, _statement, _claim_type) in claims {
+            if seen.insert(claim_id.clone()) {
+                merged.push(Candidate {
+                    claim_id,
+                    vector_relevance: (ripple.intensity as f32) * p.graph_expansion_weight,
+                });
+                added += 1;
+                if added >= GRAPH_EXPANSION_CLAIM_CAP {
+                    break;
+                }
+            }
+        }
+    }
+    merged
 }
 
 // ===========================================================================
@@ -2124,6 +2213,63 @@ mod tests {
         };
         let s = plan_routing(&parsed, 1000, &ScoringProfile::default());
         assert_eq!(s, RoutingShape::Interleaved);
+    }
+
+    #[test]
+    fn graph_expansion_surfaces_a_multi_hop_neighbour_claim() {
+        use cozo::DbInstance;
+        use thinkingroot_core::types::{Entity, EntityType, SourceId};
+        use thinkingroot_core::{Claim, ClaimType, WorkspaceId};
+
+        // In-memory graph with one edge: AuthService —calls→ PaymentService.
+        let db = DbInstance::new("mem", "", "").unwrap();
+        let graph = GraphStore::from_db_for_testing(db);
+        graph.init_for_testing().unwrap();
+
+        let auth = Entity::new("AuthService", EntityType::Service);
+        let pay = Entity::new("PaymentService", EntityType::Service);
+        graph.insert_entity(&auth).unwrap();
+        graph.insert_entity(&pay).unwrap();
+        graph
+            .link_entities(&auth.id.to_string(), &pay.id.to_string(), "calls", 1.0)
+            .unwrap();
+
+        // A claim about the *neighbour* PaymentService — vector/keyword recall of
+        // a query about AuthService would not find it; only graph traversal can.
+        let claim = Claim::new(
+            "PaymentService is owned by the billing team",
+            ClaimType::Fact,
+            SourceId::new(),
+            WorkspaceId::new(),
+        );
+        let claim_id = claim.id.to_string();
+        graph.insert_claim(&claim).unwrap();
+        graph
+            .link_claim_to_entity(&claim_id, &pay.id.to_string())
+            .unwrap();
+
+        // Direct recall returned nothing (empty `merged`); the query names AuthService.
+        let parsed = ParsedQuery {
+            query_text: "who owns the services AuthService depends on".into(),
+            predicates: vec![],
+        };
+        let out = expand_via_graph(&graph, vec![], &parsed, &req());
+        assert!(
+            out.iter().any(|c| c.claim_id == claim_id),
+            "expected the PaymentService claim, reachable via the AuthService→PaymentService edge"
+        );
+
+        // Disabled → strict no-op.
+        let mut off = req();
+        off.scoring_profile.enable_graph_expansion = false;
+        assert!(expand_via_graph(&graph, vec![], &parsed, &off).is_empty());
+
+        // A query naming no entity → no seed → no-op even when enabled.
+        let no_entity = ParsedQuery {
+            query_text: "how does the system work".into(),
+            predicates: vec![],
+        };
+        assert!(expand_via_graph(&graph, vec![], &no_entity, &req()).is_empty());
     }
 
     #[test]

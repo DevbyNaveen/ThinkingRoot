@@ -125,7 +125,11 @@ pub fn plan_query(query: &str, session: &SessionContext) -> QueryPlan {
 /// 2. PascalCase / UPPER_CASE word: `AuthService` or `AUTH_SERVICE`
 /// 3. snake_case identifier: `auth_service`
 /// 4. Session focus entity (fallback — entity agent last investigated)
-fn extract_entity_name(query: &str, focus: &Option<String>) -> Option<String> {
+///
+/// `pub(crate)` so the hybrid-retrieval GraphRAG step can reuse the exact same
+/// query→entity heuristic to pick a spreading-activation seed (one source of
+/// truth for "what entity is this query about").
+pub(crate) fn extract_entity_name(query: &str, focus: &Option<String>) -> Option<String> {
     // 1. Quoted name.
     if let Some(start) = query.find('"')
         && let Some(end) = query[start + 1..].find('"')

@@ -328,10 +328,46 @@ pub struct ScoringProfile {
     /// Ignored when `use_cross_encoder = false`.
     #[serde(default = "default_cross_encoder_weight")]
     pub cross_encoder_weight: f32,
+    /// GraphRAG — when the query names an entity, expand the candidate set by a
+    /// multi-hop spreading-activation traversal of `entity_relations`, so
+    /// retrieval surfaces facts reachable only through a relation chain (e.g.
+    /// "who owns the service that AuthService calls?") rather than vector or
+    /// keyword similarity alone. **Additive only**: graph-neighbour claims are
+    /// injected with a reduced seed relevance (`intensity * weight`) and then
+    /// run through the same fuse-score + rerank pipeline, so a weak neighbour
+    /// can never displace a direct hit. A true no-op when the query names no
+    /// resolvable entity (most semantic queries), which is why it defaults on.
+    #[serde(default = "default_enable_graph_expansion")]
+    pub enable_graph_expansion: bool,
+    /// Max relation hops from the seed entity (capped at 8 inside `spread`).
+    /// 2 = direct neighbours plus their neighbours; the ACT-R bound is 3.
+    #[serde(default = "default_graph_expansion_hops")]
+    pub graph_expansion_hops: u8,
+    /// Per-hop activation decay; a graph candidate's injected vector relevance
+    /// is `decay^hop * graph_expansion_weight`.
+    #[serde(default = "default_graph_expansion_decay")]
+    pub graph_expansion_decay: f64,
+    /// Scales a graph-expanded candidate's injected vector relevance. Kept well
+    /// below 1.0 so a 1-hop neighbour ranks below a direct semantic hit.
+    #[serde(default = "default_graph_expansion_weight")]
+    pub graph_expansion_weight: f32,
 }
 
 fn default_cross_encoder_weight() -> f32 {
     0.7
+}
+
+fn default_enable_graph_expansion() -> bool {
+    true
+}
+fn default_graph_expansion_hops() -> u8 {
+    2
+}
+fn default_graph_expansion_decay() -> f64 {
+    0.5
+}
+fn default_graph_expansion_weight() -> f32 {
+    0.25
 }
 
 impl Default for ScoringProfile {
@@ -358,6 +394,12 @@ impl Default for ScoringProfile {
             // Track 32 (2026-05-16) flipped this on by default — see field docstring.
             use_cross_encoder: true,
             cross_encoder_weight: 0.7,
+            // GraphRAG default-on — no-op unless the query names a resolvable
+            // entity; additive and bounded (see field docstrings + expand_via_graph).
+            enable_graph_expansion: true,
+            graph_expansion_hops: 2,
+            graph_expansion_decay: 0.5,
+            graph_expansion_weight: 0.25,
         }
     }
 }

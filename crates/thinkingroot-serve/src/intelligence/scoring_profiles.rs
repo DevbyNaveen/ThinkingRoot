@@ -33,6 +33,10 @@ impl ScoringProfile {
             // is a free win on accuracy.
             use_cross_encoder: true,
             cross_encoder_weight: base.cross_encoder_weight,
+            enable_graph_expansion: base.enable_graph_expansion,
+            graph_expansion_hops: base.graph_expansion_hops,
+            graph_expansion_decay: base.graph_expansion_decay,
+            graph_expansion_weight: base.graph_expansion_weight,
         }
     }
 
