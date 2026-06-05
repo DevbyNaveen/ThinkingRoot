@@ -6986,6 +6986,10 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     let conversation_id_for_persist = conversation_id.clone();
     let user_question_for_persist = body.question.clone();
     let sessions_for_persist = state.sessions.clone();
+    // Shared branch-engine cache so the post-Done turn persist writes through the
+    // SAME resident handle the retrieval path uses (no second cozo instance →
+    // no branch-graph corruption). Captured up-front: cheap Arc clone.
+    let branch_cache_for_persist = state.engine.read().await.branch_engines_arc();
 
     tracing::info!(
         target: "chat_turn",
@@ -7467,6 +7471,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                 if let Some(active_branch) = active_branch_opt {
                     if turn_n > 0 {
                         match crate::intelligence::turn_persistence::persist_chat_turn(
+                            &branch_cache_for_persist,
                             &workspace_root_for_persist,
                             &active_branch,
                             &conversation_id_for_persist,

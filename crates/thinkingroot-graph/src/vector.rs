@@ -236,8 +236,21 @@ mod inner {
                 }
             }
 
-            // Atomic write: write to temp file then rename.
-            let tmp = self.persist_path.with_extension("bin.tmp");
+            // Atomic write: write to a UNIQUE temp file then rename. The temp
+            // name carries pid + a process-global sequence so two concurrent
+            // savers (e.g. a branch contribute + a turn-persist upsert) never
+            // write to the same `vectors.bin.tmp` and clobber each other's
+            // partially-written temp before rename. (NOTE: the final rename is
+            // still last-writer-wins — a true lost-update guard needs a per-branch
+            // write lock / shared cached vector handle; tracked as the remaining
+            // half of the branch-vector race. This fixes the torn-temp corruption,
+            // the worst outcome; a lost embedding is recoverable by recompile.)
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = self
+                .persist_path
+                .with_extension(format!("bin.tmp.{}.{seq}", std::process::id()));
             std::fs::write(&tmp, &buf).map_err(|e| Error::io_path(&tmp, e))?;
             std::fs::rename(&tmp, &self.persist_path)
                 .map_err(|e| Error::io_path(&self.persist_path, e))?;

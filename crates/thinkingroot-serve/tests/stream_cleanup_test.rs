@@ -409,6 +409,7 @@ async fn persisted_chat_turns_propagate_to_topic_on_auto_merge() {
     // Phase A (auto-merge stream → topic). If the merge ever drops
     // synthetic agent-contributed sources, this test catches it
     // before it reaches a release.
+    use thinkingroot_serve::branch_cache::BranchEngineCache;
     use thinkingroot_serve::intelligence::turn_persistence::persist_chat_turn;
 
     let dir = tempdir().unwrap();
@@ -419,8 +420,13 @@ async fn persisted_chat_turns_propagate_to_topic_on_auto_merge() {
     let stream_name =
         make_stream_branch_with_policy(&root, session_id, MergePolicy::AutoOnSessionEnd).await;
 
+    // Single shared branch-engine cache — the same resident-handle path the
+    // REST handler uses (no second cozo instance on the stream branch).
+    let cache = BranchEngineCache::default_cache();
+
     // Three completed chat turns on this session.
     persist_chat_turn(
+        &cache,
         &root,
         &stream_name,
         session_id,
@@ -431,6 +437,7 @@ async fn persisted_chat_turns_propagate_to_topic_on_auto_merge() {
     .await
     .unwrap();
     persist_chat_turn(
+        &cache,
         &root,
         &stream_name,
         session_id,
@@ -441,6 +448,7 @@ async fn persisted_chat_turns_propagate_to_topic_on_auto_merge() {
     .await
     .unwrap();
     persist_chat_turn(
+        &cache,
         &root,
         &stream_name,
         session_id,

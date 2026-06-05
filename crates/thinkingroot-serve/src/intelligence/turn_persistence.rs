@@ -40,6 +40,8 @@ use thinkingroot_core::{
 };
 use thinkingroot_graph::graph::GraphStore;
 
+use crate::branch_cache::BranchEngineCache;
+
 /// Soft cap on the claim's `statement` field. Long enough to carry the
 /// retrieval-relevant gist of a typical chat turn (question + a few
 /// sentences of answer); short enough that the graph stays compact
@@ -174,6 +176,7 @@ pub fn apply_write_supersession(
 /// Returns the IDs of the rows written so tests + callers can verify
 /// without re-querying.
 pub async fn persist_chat_turn(
+    branch_cache: &BranchEngineCache,
     workspace_root: &Path,
     branch_name: &str,
     session_id: &str,
@@ -190,10 +193,15 @@ pub async fn persist_chat_turn(
         ));
     }
 
-    let dir = thinkingroot_branch::snapshot::resolve_data_dir(workspace_root, Some(branch_name));
-    let graph_dir = dir.join("graph");
-    let graph = GraphStore::init(&graph_dir)
-        .map_err(|e| Error::GraphStorage(format!("open branch graph: {e}")))?;
+    // Use the SHARED cached branch handle. Opening a fresh `GraphStore` here
+    // (the old behaviour) put a SECOND cozo/SQLite instance on a branch graph
+    // that the live retrieval path (`hybrid_retrieve` / `search_branched`)
+    // already holds open via this same cache — two independent connection pools
+    // on one file → "file is not a database (code 26)" corruption, which then
+    // auto-merges into `main`. One resident handle per branch is the
+    // `BranchEngineCache` invariant; route every write through it.
+    let handle = branch_cache.get_or_open(workspace_root, branch_name).await?;
+    let graph = &handle.graph;
 
     let content = format!("Q: {user_q}\n\nA: {assistant_a}");
     let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
@@ -223,10 +231,23 @@ pub async fn persist_chat_turn(
     };
 
     let workspace = WorkspaceId::new();
+    let statement_for_vec = statement.clone();
     let claim = Claim::new(statement, ClaimType::Fact, source_id, workspace);
     let claim_id = claim.id.to_string();
     graph.insert_claim(&claim)?;
     graph.link_claim_to_source(&claim_id, &source_id.to_string())?;
+
+    // #10 (recall SOTA) — collect (vec_id, text, metadata) for the anchor + every
+    // distilled fact so we can upsert them into the branch VECTOR index below.
+    // Without this the turn lived only in the graph and was INVISIBLE to
+    // vector/hybrid retrieval until a full `compile --branch` — the measured
+    // "fact stated mid-conversation is unsearchable until recompile" gap. Metadata
+    // format mirrors the contribute path: `claim|{id}|{ctype}|{conf}|{uri}`.
+    let mut vec_items: Vec<(String, String, String)> = vec![(
+        format!("claim:{claim_id}"),
+        statement_for_vec,
+        format!("claim|{claim_id}|Fact|0.7|{uri}"),
+    )];
 
     // Atomic fact distillation (2026-06-01): in addition to the turn-anchor
     // claim above, run the SAME mechanical witness-mesh extraction a batch
@@ -249,6 +270,11 @@ pub async fn persist_chat_turn(
             graph.insert_claim(&fact)?;
             graph.link_claim_to_source(&fid, &source_id.to_string())?;
             new_facts.push((fid.clone(), fact.statement.clone()));
+            vec_items.push((
+                format!("claim:{fid}"),
+                fact.statement.clone(),
+                format!("claim|{fid}|Fact|0.7|{uri}"),
+            ));
             fact_claim_ids.push(fid.clone());
             all_ids.push(fid);
         }
@@ -260,7 +286,7 @@ pub async fn persist_chat_turn(
     // invalidated. Because a stream branch is forked from `main`, the candidate
     // scan also sees prior-session facts merged into main — so this covers the
     // cross-session knowledge-update case (C's mechanical half) too.
-    if let Err(e) = apply_write_supersession(&graph, &new_facts) {
+    if let Err(e) = apply_write_supersession(graph, &new_facts) {
         tracing::warn!(error = %e, "supersession pass failed (non-fatal)");
     }
 
@@ -271,6 +297,34 @@ pub async fn persist_chat_turn(
     // hits the upsert path — it's defensive against client retries.
     // Binds the anchor AND every distilled fact claim to the turn.
     graph.record_turn(session_id, turn_number, &all_ids)?;
+
+    // #10 — upsert the anchor + distilled facts into the branch vector index so
+    // the NEXT turn's hybrid/vector retrieval can surface them by MEANING (not
+    // just lexical graph match) WITHOUT a recompile. Non-fatal, mirroring the
+    // contribute path: the graph write above is already durable, so a vector
+    // failure (e.g. model bundle missing in a unit test) only degrades recall
+    // until the next compile — it must never fail the turn.
+    let branch_data_dir =
+        thinkingroot_branch::snapshot::resolve_data_dir(workspace_root, Some(branch_name));
+    match thinkingroot_graph::vector::VectorStore::init(&branch_data_dir).await {
+        Ok(mut vstore) => {
+            if let Err(e) = vstore.upsert_batch(&vec_items) {
+                tracing::warn!(
+                    error = %e,
+                    "turn-persist: vector upsert failed — facts are in the graph but invisible \
+                     to semantic retrieval until the next `compile --branch`"
+                );
+            } else if let Err(e) = vstore.save() {
+                tracing::warn!(
+                    error = %e,
+                    "turn-persist: vector index save failed — embeddings are in-memory only"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "turn-persist: branch vector store unavailable");
+        }
+    }
 
     Ok(PersistedTurn {
         source_uri: uri,
@@ -288,11 +342,12 @@ mod tests {
     use thinkingroot_core::{BranchKind, BranchPermissions, MergePolicy};
 
     /// Stand up a fresh workspace + a stream branch ready to receive
-    /// turn writes. Mirrors the seed pattern used by
-    /// `tests/stream_cleanup_test.rs` but kept private here so the
-    /// unit tests have a stable scaffold independent of the
-    /// integration tests.
-    async fn seed_stream_branch(session_id: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    /// turn writes, plus a `BranchEngineCache` so the test drives writes
+    /// AND reads through the SAME resident handle the production path uses
+    /// (also exercising the corruption fix — no second cozo instance).
+    async fn seed_stream_branch(
+        session_id: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, String, BranchEngineCache) {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
@@ -319,15 +374,16 @@ mod tests {
         .await
         .unwrap();
 
-        (dir, root, branch_name)
+        (dir, root, branch_name, BranchEngineCache::default_cache())
     }
 
     #[tokio::test]
     async fn persist_chat_turn_writes_source_claim_and_turn_calendar() {
         let session_id = "persist-sess-1";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         let persisted = persist_chat_turn(
+            &cache,
             &root,
             &branch_name,
             session_id,
@@ -338,11 +394,10 @@ mod tests {
         .await
         .expect("persist must succeed");
 
-        // Verify the source row exists with the expected URI shape.
-        let branch_dir =
-            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
-        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
-        let sources = graph.get_all_sources().unwrap();
+        // Verify the source row exists with the expected URI shape — read via
+        // the SAME cached handle (single resident cozo instance).
+        let handle = cache.get_or_open(&root, &branch_name).await.unwrap();
+        let sources = handle.graph.get_all_sources().unwrap();
         assert!(
             sources.iter().any(|(_, uri, _, _)| uri == &persisted.source_uri),
             "source must be inserted with expected URI. got: {sources:?}"
@@ -367,9 +422,10 @@ mod tests {
     #[tokio::test]
     async fn persist_chat_turn_distills_atomic_speaker_facts() {
         let session_id = "persist-sess-facts";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         let persisted = persist_chat_turn(
+            &cache,
             &root,
             &branch_name,
             session_id,
@@ -387,13 +443,11 @@ mod tests {
             "expected distilled fact claims beyond the turn anchor, got none"
         );
 
-        let branch_dir =
-            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
-        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
+        let handle = cache.get_or_open(&root, &branch_name).await.unwrap();
         let statements: Vec<String> = persisted
             .fact_claim_ids
             .iter()
-            .filter_map(|fid| graph.get_claim_by_id(fid).unwrap())
+            .filter_map(|fid| handle.graph.get_claim_by_id(fid).unwrap())
             .map(|c| c.statement)
             .collect();
 
@@ -413,10 +467,11 @@ mod tests {
     #[tokio::test]
     async fn persist_chat_turn_supersedes_updated_fact() {
         let session_id = "persist-sess-supersede";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         // Turn 1 establishes the fact.
         persist_chat_turn(
+            &cache,
             &root,
             &branch_name,
             session_id,
@@ -429,6 +484,7 @@ mod tests {
 
         // Turn 2 updates it → the Toyota fact must be superseded by the Tesla fact.
         persist_chat_turn(
+            &cache,
             &root,
             &branch_name,
             session_id,
@@ -439,11 +495,9 @@ mod tests {
         .await
         .expect("turn 2 must persist");
 
-        let branch_dir =
-            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
-        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
+        let handle = cache.get_or_open(&root, &branch_name).await.unwrap();
         assert!(
-            graph.count_superseded_claims().unwrap() >= 1,
+            handle.graph.count_superseded_claims().unwrap() >= 1,
             "the older 'My car is a Toyota' fact should be superseded by the Tesla update"
         );
     }
@@ -451,13 +505,14 @@ mod tests {
     #[tokio::test]
     async fn persist_chat_turn_truncates_long_statement_on_char_boundary() {
         let session_id = "persist-sess-long";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         // 3000 multi-byte UTF-8 chars — exceeds the 1024 char cap
         // and would corrupt the graph if truncation cut on byte
         // boundaries instead of char boundaries.
         let long_q: String = "你".repeat(3000);
         let persisted = persist_chat_turn(
+            &cache,
             &root,
             &branch_name,
             session_id,
@@ -470,10 +525,9 @@ mod tests {
 
         // Pull the claim back and verify statement is valid UTF-8
         // and capped at MAX_STATEMENT_CHARS + the ellipsis marker.
-        let branch_dir =
-            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
-        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
-        let claim = graph
+        let handle = cache.get_or_open(&root, &branch_name).await.unwrap();
+        let claim = handle
+            .graph
             .get_claim_by_id(&persisted.claim_id)
             .unwrap()
             .expect("claim must be readable after persist");
@@ -495,10 +549,10 @@ mod tests {
     #[tokio::test]
     async fn persist_chat_turn_rejects_fully_empty_input() {
         let session_id = "persist-sess-empty";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         let result =
-            persist_chat_turn(&root, &branch_name, session_id, 1, "   ", "\n\t").await;
+            persist_chat_turn(&cache, &root, &branch_name, session_id, 1, "   ", "\n\t").await;
         assert!(
             result.is_err(),
             "fully-empty turn must be rejected — there's no signal to persist"
@@ -508,22 +562,20 @@ mod tests {
     #[tokio::test]
     async fn persist_chat_turn_records_turn_calendar_binding() {
         let session_id = "persist-sess-cal";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
-        let p1 = persist_chat_turn(&root, &branch_name, session_id, 1, "Q1", "A1")
+        let p1 = persist_chat_turn(&cache, &root, &branch_name, session_id, 1, "Q1", "A1")
             .await
             .unwrap();
-        let p2 = persist_chat_turn(&root, &branch_name, session_id, 2, "Q2", "A2")
+        let p2 = persist_chat_turn(&cache, &root, &branch_name, session_id, 2, "Q2", "A2")
             .await
             .unwrap();
-        let p3 = persist_chat_turn(&root, &branch_name, session_id, 3, "Q3", "A3")
+        let p3 = persist_chat_turn(&cache, &root, &branch_name, session_id, 3, "Q3", "A3")
             .await
             .unwrap();
 
-        let branch_dir =
-            thinkingroot_branch::snapshot::resolve_data_dir(&root, Some(&branch_name));
-        let graph = GraphStore::init(&branch_dir.join("graph")).unwrap();
-        let turns = graph.query_turns_for_session(session_id).unwrap();
+        let handle = cache.get_or_open(&root, &branch_name).await.unwrap();
+        let turns = handle.graph.query_turns_for_session(session_id).unwrap();
 
         assert_eq!(
             turns.len(),
@@ -548,16 +600,16 @@ mod tests {
         // received a thumbs-up emoji is still a turn) — full-empty
         // is what we reject. Both directions tested.
         let session_id = "persist-sess-half";
-        let (_dir, root, branch_name) = seed_stream_branch(session_id).await;
+        let (_dir, root, branch_name, cache) = seed_stream_branch(session_id).await;
 
         assert!(
-            persist_chat_turn(&root, &branch_name, session_id, 1, "only user", "")
+            persist_chat_turn(&cache, &root, &branch_name, session_id, 1, "only user", "")
                 .await
                 .is_ok(),
             "user-only turn must be allowed"
         );
         assert!(
-            persist_chat_turn(&root, &branch_name, session_id, 2, "", "only assistant")
+            persist_chat_turn(&cache, &root, &branch_name, session_id, 2, "", "only assistant")
                 .await
                 .is_ok(),
             "assistant-only turn must be allowed"
