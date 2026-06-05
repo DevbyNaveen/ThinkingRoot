@@ -1128,10 +1128,33 @@ async fn well_known_mcp_handler() -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Process-global "embed + rerank ONNX models are resident" flag, for an
+/// honest `/readyz`. Set true by warm-on-boot (`serve.rs`) once the models
+/// are loaded. When `TR_WARM_ON_BOOT=1`, `/readyz` stays 503 until this
+/// flips — so the cloud provisioner only checkpoints an engine whose models
+/// are already in RAM (warm-snapshot cold-start SOTA). When warm-on-boot is
+/// off, readiness keeps its original workspace-only meaning.
+static MODELS_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the embed + rerank models as loaded. Called by warm-on-boot after
+/// the models are resident; flips `/readyz` to ready.
+pub fn set_models_warm() {
+    MODELS_WARM.store(true, std::sync::atomic::Ordering::Release);
+}
+
 async fn readyz_handler(State(state): State<Arc<AppState>>) -> Response {
-    // Readiness = engine's workspace registry can be read without error.
+    // Readiness = engine's workspace registry can be read without error,
+    // AND (when warm-on-boot is required) the ONNX models are resident.
     // Distinguishes "warming up" from "serving traffic". Cheap; suitable
     // for a 1-second probe cadence.
+    let warm_required = std::env::var("TR_WARM_ON_BOOT").as_deref() == Ok("1");
+    if warm_required && !MODELS_WARM.load(std::sync::atomic::Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not-ready: models warming\n",
+        )
+            .into_response();
+    }
     let engine = state.engine.read().await;
     match engine.list_workspaces().await {
         Ok(_) => (StatusCode::OK, "ready\n").into_response(),

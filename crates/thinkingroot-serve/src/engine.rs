@@ -6947,6 +6947,39 @@ Rules: \
         Ok(stats)
     }
 
+    /// Force the embed + rerank ONNX models into RAM for `ws`. Called at
+    /// startup (serve.rs, gated by `TR_WARM_ON_BOOT=1`) so the FIRST real
+    /// query is fast and any idle-checkpoint captures an already-warm
+    /// memory image — the cloud cold-start SOTA path (see CLAUDE.md
+    /// "Recall / ingest / cold-start status"). Without this, both models
+    /// lazy-load on first use (~7 s; `vector.rs::ensure_model`,
+    /// `rerank.rs` `CrossEncoder`). Best-effort: an error is returned so
+    /// the caller can log it, but the daemon still serves (lazy fallback).
+    pub async fn warm_models(&self, ws: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage_arc = Arc::clone(&handle.storage);
+        let ws_path = self
+            .workspace_root_path(ws)
+            .unwrap_or_else(std::env::temp_dir);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Embed model — a dummy non-empty embed loads + caches the
+            // ONNX session (an empty slice would no-op).
+            {
+                let mut storage = storage_arc.blocking_lock();
+                storage.vector.embed_texts(&["warm"])?;
+            }
+            // Rerank model — `CrossEncoder` lazy-loads on the first
+            // non-empty rerank (an empty docs slice early-returns without
+            // loading), so pass one dummy doc.
+            let reranker = thinkingroot_graph::rerank::CrossEncoder::new(&ws_path)?;
+            reranker.rerank("warm", &["warm"])?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Config(format!("warm_models task panicked: {e}")))??;
+        Ok(())
+    }
+
     /// Return `(provider, model)` when the named workspace has a usable
     /// LLM client attached, or `None` when the workspace is unmounted
     /// or its config did not yield a working client.

@@ -9,7 +9,7 @@ use thinkingroot_branch::snapshot::resolve_data_dir;
 use thinkingroot_core::WorkspaceRegistry;
 use thinkingroot_core::cortex;
 use thinkingroot_serve::engine::QueryEngine;
-use thinkingroot_serve::rest::{AppState, build_router_opts};
+use thinkingroot_serve::rest::{AppState, build_router_opts, set_models_warm};
 
 use crate::cortex_client;
 
@@ -434,6 +434,37 @@ pub async fn run_serve(
         state.live_sync.clone(),
     );
 
+    // Warm-on-boot (cloud cold-start SOTA): front-load the embed + rerank
+    // ONNX models so the FIRST real query is fast and any idle-checkpoint
+    // captures an already-warm memory image. Opt-in via TR_WARM_ON_BOOT=1
+    // (the cloud provisioner sets it; desktop/CLI users skip the ~7 s cost
+    // and keep lazy-loading). Runs before the accept loop so /livez and
+    // /readyz only go green once models are resident — the provisioner then
+    // checkpoints a guaranteed-warm engine.
+    if std::env::var("TR_WARM_ON_BOOT").as_deref() == Ok("1") {
+        let warm_started = std::time::Instant::now();
+        {
+            let eng = state.engine.read().await;
+            for (ws_name, _path, _ws_port) in &resolved_paths {
+                match eng.warm_models(ws_name).await {
+                    Ok(()) => {
+                        tracing::info!(workspace = %ws_name, "warm-on-boot: models loaded")
+                    }
+                    Err(e) => tracing::warn!(
+                        workspace = %ws_name,
+                        error = %e,
+                        "warm-on-boot failed (will lazy-load on first use)"
+                    ),
+                }
+            }
+        }
+        set_models_warm();
+        tracing::info!(
+            elapsed_ms = warm_started.elapsed().as_millis() as u64,
+            "warm-on-boot complete"
+        );
+    }
+
     let router = build_router_opts(state, !no_rest, !no_mcp);
 
     let serve_result = axum::serve(listener, router)
@@ -749,6 +780,37 @@ async fn run_serve_with_listener(
         state.clone(),
         state.live_sync.clone(),
     );
+
+    // Warm-on-boot (cloud cold-start SOTA): front-load the embed + rerank
+    // ONNX models so the FIRST real query is fast and any idle-checkpoint
+    // captures an already-warm memory image. Opt-in via TR_WARM_ON_BOOT=1
+    // (the cloud provisioner sets it; desktop/CLI users skip the ~7 s cost
+    // and keep lazy-loading). Runs before the accept loop so /livez and
+    // /readyz only go green once models are resident — the provisioner then
+    // checkpoints a guaranteed-warm engine.
+    if std::env::var("TR_WARM_ON_BOOT").as_deref() == Ok("1") {
+        let warm_started = std::time::Instant::now();
+        {
+            let eng = state.engine.read().await;
+            for (ws_name, _path, _ws_port) in &resolved_paths {
+                match eng.warm_models(ws_name).await {
+                    Ok(()) => {
+                        tracing::info!(workspace = %ws_name, "warm-on-boot: models loaded")
+                    }
+                    Err(e) => tracing::warn!(
+                        workspace = %ws_name,
+                        error = %e,
+                        "warm-on-boot failed (will lazy-load on first use)"
+                    ),
+                }
+            }
+        }
+        set_models_warm();
+        tracing::info!(
+            elapsed_ms = warm_started.elapsed().as_millis() as u64,
+            "warm-on-boot complete"
+        );
+    }
 
     let router = build_router_opts(state, !no_rest, !no_mcp);
 
