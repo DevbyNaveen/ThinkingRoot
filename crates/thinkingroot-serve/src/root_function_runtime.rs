@@ -304,11 +304,24 @@ mod fetch_ext {
                 "egress blocked: host '{host}' is not in this project's TR_OUTBOUND_ALLOWLIST"
             )));
         }
+        // SSRF guard: reject hosts that are — or resolve to — an internal/private
+        // IP (loopback, RFC-1918, link-local incl. 169.254.169.254 cloud
+        // metadata, ULA). Stops an allowlisted-but-internal target.
+        if let Err(why) = crate::egress::vet_outbound_host(&host).await {
+            return Err(JsErrorBox::generic(format!("egress blocked: {why}")));
+        }
 
         let method = req.method.unwrap_or_else(|| "GET".to_string());
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| JsErrorBox::type_error(format!("invalid HTTP method `{method}`")))?;
-        let client = reqwest::Client::new();
+        // Follow NO redirects: a 3xx from an allowlisted host could otherwise
+        // bounce the request onto an internal IP (the egress + SSRF checks only
+        // vetted the ORIGINAL host). The function author handles redirects
+        // explicitly, and each explicit fetch is re-vetted.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| JsErrorBox::generic(format!("build http client: {e}")))?;
         let mut rb = client.request(m, &req.url);
         for (k, v) in &req.headers {
             rb = rb.header(k, v);
