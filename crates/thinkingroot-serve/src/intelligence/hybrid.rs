@@ -716,16 +716,54 @@ fn merge_candidates(
             })
             .collect(),
         RoutingShape::Interleaved => {
+            // UNION with rank boost (was: intersection). When a query carries
+            // BOTH semantic text and datalog predicates, intersecting dropped
+            // every strong vector hit that didn't also satisfy a predicate —
+            // silently losing recall (#13). Instead union both channels and let
+            // an item present in BOTH outrank single-channel items: the
+            // agreement is a positive signal, so it gets cap-ordering priority
+            // (a reciprocal-rank-fusion-style boost) while the stored
+            // `vector_relevance` is left untouched so the downstream 11-component
+            // fuse-score keeps its calibrated semantics.
+            const BOTH_CHANNEL_BOOST: f32 = 0.5;
             let dl: HashSet<String> = datalog_ids;
-            vector_hits
-                .into_iter()
-                .filter(|(id, _)| in_scope(id) && dl.contains(id))
-                .take(cap)
-                .map(|(claim_id, r)| Candidate {
-                    claim_id,
-                    vector_relevance: r,
-                })
-                .collect()
+            let mut seen: HashSet<String> = HashSet::new();
+            // (candidate, cap-ordering key) — key folds in the agreement boost.
+            let mut ranked: Vec<(Candidate, f32)> = Vec::new();
+            for (claim_id, r) in vector_hits.into_iter().filter(|(id, _)| in_scope(id)) {
+                if !seen.insert(claim_id.clone()) {
+                    continue;
+                }
+                let order_key = if dl.contains(&claim_id) {
+                    r + BOTH_CHANNEL_BOOST
+                } else {
+                    r
+                };
+                ranked.push((
+                    Candidate {
+                        claim_id,
+                        vector_relevance: r,
+                    },
+                    order_key,
+                ));
+            }
+            // Datalog-only hits (no vector score) still surface — a predicate
+            // match with no semantic signal is real recall — but rank below
+            // scored hits via a 0.0 ordering key.
+            for claim_id in dl.into_iter().filter(|id| in_scope(id)) {
+                if seen.insert(claim_id.clone()) {
+                    ranked.push((
+                        Candidate {
+                            claim_id,
+                            vector_relevance: 0.0,
+                        },
+                        0.0,
+                    ));
+                }
+            }
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.truncate(cap);
+            ranked.into_iter().map(|(c, _)| c).collect()
         }
     };
     // Stable de-dupe by claim_id (keeps highest vector relevance first because
@@ -2216,6 +2254,43 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_unions_channels_and_keeps_vector_only_hits() {
+        // Vector channel returns v_only (strong) + both; datalog returns both +
+        // dl_only. Old behaviour (intersection) would keep ONLY `both`.
+        let vector_hits = vec![
+            ("v_high".to_string(), 0.95), // strong vector-only hit
+            ("both".to_string(), 0.4),    // in both channels
+            ("v_low".to_string(), 0.4),   // vector-only, same raw as `both`
+        ];
+        let datalog_ids: HashSet<String> =
+            ["both".to_string(), "dl_only".to_string()].into_iter().collect();
+
+        let out = merge_candidates(
+            vector_hits,
+            datalog_ids,
+            RoutingShape::Interleaved,
+            10,
+            &req(),
+        );
+        let ids: Vec<&str> = out.iter().map(|c| c.claim_id.as_str()).collect();
+
+        // Union: all four survive (the old intersection kept ONLY `both`).
+        for id in ["v_high", "both", "v_low", "dl_only"] {
+            assert!(ids.contains(&id), "union must retain {id}");
+        }
+        // Strong vector-only hit stays on top.
+        assert_eq!(ids[0], "v_high");
+        // Agreement boost lifts `both` above an equal-raw vector-only hit.
+        let pos = |id: &str| ids.iter().position(|x| *x == id).unwrap();
+        assert!(pos("both") < pos("v_low"), "both-channel agreement should outrank equal-raw vector-only");
+        // Datalog-only (no vector signal) ranks last.
+        assert_eq!(*ids.last().unwrap(), "dl_only");
+        // Stored vector_relevance stays calibrated (boost is ordering-only).
+        let both = out.iter().find(|c| c.claim_id == "both").unwrap();
+        assert!((both.vector_relevance - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
     fn graph_expansion_surfaces_a_multi_hop_neighbour_claim() {
         use cozo::DbInstance;
         use thinkingroot_core::types::{Entity, EntityType, SourceId};
@@ -2380,13 +2455,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_candidates_interleaved_intersects() {
+    fn merge_candidates_interleaved_unions_with_boost() {
+        // Was `_intersects` (kept only b, c). Interleaved now UNIONS both
+        // channels (#13) and boosts both-channel agreement for cap ordering, so
+        // the vector-only hit `a` is retained — just ranked after the
+        // boosted both-channel hits b, c.
         let v = vec![("a".into(), 0.9), ("b".into(), 0.8), ("c".into(), 0.7)];
         let dl: HashSet<String> = ["b", "c"].iter().map(|s| s.to_string()).collect();
         let r = req();
         let merged = merge_candidates(v, dl, RoutingShape::Interleaved, 100, &r);
         let ids: Vec<String> = merged.iter().map(|c| c.claim_id.clone()).collect();
-        assert_eq!(ids, vec!["b", "c"]);
+        assert_eq!(ids, vec!["b", "c", "a"]);
     }
 
     #[test]
