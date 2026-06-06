@@ -883,6 +883,14 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/activity/stream", get(stream_activity_handler))
             .route("/ws/{ws}/activity", get(list_activity_handler))
             .route("/mcp/sessions", get(list_mcp_sessions_handler))
+            // A2 — compiled-not-raw capture: extract atomic claims from a
+            // conversation turn/transcript and contribute them (vs storing
+            // verbatim "User said: …"). Branch goes in the body so the live
+            // session captures into its `stream/{id}` quarantine.
+            .route("/ws/{ws}/extract-contribute", post(extract_contribute_handler))
+            // C1 — on-demand consolidation: detect + apply supersessions within
+            // each entity's claim cluster (keeps the self-evolving graph clean).
+            .route("/ws/{ws}/consolidate", post(consolidate_claims_handler))
             .route("/ws/{ws}/verify", post(verify_ws))
             // Branch endpoints
             .route(
