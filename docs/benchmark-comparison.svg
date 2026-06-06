@@ -1,0 +1,91 @@
+<svg width="920" height="445" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+
+  <!-- Background -->
+  <rect width="920" height="440" fill="#ffffff" rx="10"/>
+
+  <!-- Title -->
+  <text x="460" y="36" text-anchor="middle" font-size="17" font-weight="700" fill="#111827">Knowledge Retrieval Latency — ThinkingRoot vs AI Memory Systems</text>
+  <text x="460" y="57" text-anchor="middle" font-size="12" fill="#6b7280">Log scale · lower is better · measured at 50K entities / 200K claims · in-process embed</text>
+
+  <!-- Chart background -->
+  <rect x="190" y="75" width="680" height="265" fill="#f9fafb" rx="4" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- Vertical grid lines (one per log decade) -->
+  <line x1="190" y1="75" x2="190" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="266" y1="75" x2="266" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="341" y1="75" x2="341" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="417" y1="75" x2="417" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="492" y1="75" x2="492" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="568" y1="75" x2="568" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="643" y1="75" x2="643" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="719" y1="75" x2="719" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="794" y1="75" x2="794" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="870" y1="75" x2="870" y2="340" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- 10ms target line (highlighted) -->
+  <line x1="719" y1="75" x2="719" y2="340" stroke="#3b82f6" stroke-width="2" stroke-dasharray="5,4"/>
+  <rect x="721" y="76" width="68" height="18" fill="#eff6ff" rx="3"/>
+  <text x="755" y="89" text-anchor="middle" font-size="10" font-weight="600" fill="#2563eb">10ms target</text>
+
+  <!-- ═══ ROW 0: ThinkingRoot (63 ns) — width=136 ═══ -->
+  <rect x="190" y="87" width="136" height="28" fill="#16a34a" rx="3"/>
+  <!-- shine -->
+  <rect x="190" y="87" width="136" height="8" fill="#22c55e" rx="3" opacity="0.5"/>
+  <text x="185" y="106" text-anchor="end" font-size="13" font-weight="700" fill="#111827">ThinkingRoot</text>
+  <text x="331" y="106" font-size="12" font-weight="700" fill="#15803d">  63 ns  ✓</text>
+
+  <!-- ═══ ROW 1: Redis (100 µs = 10^5 ns) — width=378 ═══ -->
+  <rect x="190" y="130" width="378" height="28" fill="#f59e0b" rx="3"/>
+  <rect x="190" y="130" width="378" height="8" fill="#fbbf24" rx="3" opacity="0.5"/>
+  <text x="185" y="149" text-anchor="end" font-size="13" fill="#374151">Redis</text>
+  <text x="573" y="149" font-size="12" fill="#92400e">  100 µs</text>
+
+  <!-- ═══ ROW 2: FalkorDB (36 ms = 3.6×10^7 ns) — width=570 ═══ -->
+  <rect x="190" y="173" width="570" height="28" fill="#f97316" rx="3"/>
+  <rect x="190" y="173" width="570" height="8" fill="#fb923c" rx="3" opacity="0.5"/>
+  <text x="185" y="192" text-anchor="end" font-size="13" fill="#374151">FalkorDB</text>
+  <text x="765" y="192" font-size="12" fill="#c2410c">  36 ms (p50)</text>
+
+  <!-- ═══ ROW 3: SuperMemory.ai (50 ms) — width=581 ═══ -->
+  <rect x="190" y="216" width="581" height="28" fill="#ef4444" rx="3"/>
+  <rect x="190" y="216" width="581" height="8" fill="#f87171" rx="3" opacity="0.5"/>
+  <text x="185" y="235" text-anchor="end" font-size="13" fill="#374151">SuperMemory.ai</text>
+  <text x="776" y="235" font-size="12" fill="#b91c1c">  50 ms (p95)</text>
+
+  <!-- ═══ ROW 4: Zep (119 ms) — width=610 ═══ -->
+  <rect x="190" y="259" width="610" height="28" fill="#dc2626" rx="3"/>
+  <rect x="190" y="259" width="610" height="8" fill="#ef4444" rx="3" opacity="0.5"/>
+  <text x="185" y="278" text-anchor="end" font-size="13" fill="#374151">Zep</text>
+  <text x="805" y="278" font-size="12" fill="#991b1b">  119 ms (best)</text>
+
+  <!-- ═══ ROW 5: Graphiti (500 ms) — width=657 ═══ -->
+  <rect x="190" y="302" width="657" height="28" fill="#991b1b" rx="3"/>
+  <rect x="190" y="302" width="657" height="8" fill="#dc2626" rx="3" opacity="0.5"/>
+  <text x="185" y="321" text-anchor="end" font-size="13" fill="#374151">Graphiti</text>
+  <text x="852" y="321" font-size="12" fill="#7f1d1d">  ~500 ms</text>
+
+  <!-- X-axis tick labels -->
+  <text x="190" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">1 ns</text>
+  <text x="266" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">10 ns</text>
+  <text x="341" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">100 ns</text>
+  <text x="417" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">1 µs</text>
+  <text x="492" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">10 µs</text>
+  <text x="568" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">100 µs</text>
+  <text x="643" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">1 ms</text>
+  <text x="719" y="358" text-anchor="middle" font-size="10" fill="#3b82f6" font-weight="600">10 ms</text>
+  <text x="794" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">100 ms</text>
+  <text x="870" y="358" text-anchor="middle" font-size="10" fill="#9ca3af">1 s</text>
+
+  <!-- Axis label -->
+  <text x="530" y="381" text-anchor="middle" font-size="11" fill="#6b7280">Latency (log scale) — lower is better</text>
+
+  <!-- Speedup callout box -->
+  <rect x="192" y="78" width="200" height="40" fill="#f0fdf4" rx="4" stroke="#86efac" stroke-width="1"/>
+  <text x="202" y="93" font-size="10" font-weight="600" fill="#15803d">ThinkingRoot is:</text>
+  <text x="202" y="109" font-size="10" fill="#15803d">1,900,000× faster than Zep · 793,000× faster than SuperMemory</text>
+
+  <!-- Footer -->
+  <text x="460" y="410" text-anchor="middle" font-size="10" fill="#d1d5db">ThinkingRoot v0.9.0 · Criterion benchmarks · in-process embed · release build · Apple Silicon · competitors: published benchmarks</text>
+  <text x="460" y="425" text-anchor="middle" font-size="10" fill="#9ca3af">For HTTP/REST latency (same methodology as competitors) see benchmark-http-comparison.svg — ThinkingRoot REST API p95 = 6.15ms</text>
+
+</svg>

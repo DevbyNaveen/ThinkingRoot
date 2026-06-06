@@ -1,0 +1,81 @@
+<svg width="920" height="420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+
+  <!-- Background -->
+  <rect width="920" height="420" fill="#ffffff" rx="10"/>
+
+  <!-- Title -->
+  <text x="460" y="36" text-anchor="middle" font-size="17" font-weight="700" fill="#111827">Knowledge Retrieval Latency (HTTP API) — ThinkingRoot vs AI Memory Systems</text>
+  <text x="460" y="57" text-anchor="middle" font-size="12" fill="#6b7280">Log scale · lower is better · k6 load test · real TCP/HTTP · p95 · 50–200 concurrent VUs · Apple Silicon M-series</text>
+
+  <!-- Chart background (5 rows: y=75..315) -->
+  <rect x="190" y="75" width="680" height="245" fill="#f9fafb" rx="4" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- Vertical grid lines — scale: 10µs(190) 100µs(303) 1ms(417) 10ms(530) 100ms(643) 1s(757) 10s(870) -->
+  <line x1="190" y1="75" x2="190" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="303" y1="75" x2="303" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="417" y1="75" x2="417" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="530" y1="75" x2="530" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="643" y1="75" x2="643" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="757" y1="75" x2="757" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+  <line x1="870" y1="75" x2="870" y2="320" stroke="#e5e7eb" stroke-width="1"/>
+
+  <!-- 10ms target line (highlighted) -->
+  <line x1="530" y1="75" x2="530" y2="320" stroke="#3b82f6" stroke-width="2" stroke-dasharray="5,4"/>
+  <rect x="532" y="76" width="68" height="18" fill="#eff6ff" rx="3"/>
+  <text x="566" y="89" text-anchor="middle" font-size="10" font-weight="600" fill="#2563eb">10ms target</text>
+
+  <!-- ═══ ROW 0: ThinkingRoot (6.15ms p95, HTTP) — width=316 ═══ -->
+  <rect x="190" y="87" width="316" height="28" fill="#16a34a" rx="3"/>
+  <rect x="190" y="87" width="316" height="8" fill="#22c55e" rx="3" opacity="0.5"/>
+  <text x="185" y="106" text-anchor="end" font-size="13" font-weight="700" fill="#111827">ThinkingRoot</text>
+  <text x="511" y="106" font-size="12" font-weight="700" fill="#15803d">  6.15ms p95  ✓</text>
+
+  <!-- ═══ ROW 1: FalkorDB (36ms p50) — width=403 ═══ -->
+  <rect x="190" y="130" width="403" height="28" fill="#f97316" rx="3"/>
+  <rect x="190" y="130" width="403" height="8" fill="#fb923c" rx="3" opacity="0.5"/>
+  <text x="185" y="149" text-anchor="end" font-size="13" fill="#374151">FalkorDB</text>
+  <text x="598" y="149" font-size="12" fill="#c2410c">  36ms (p50)</text>
+
+  <!-- ═══ ROW 2: SuperMemory.ai (50ms p95) — width=419 ═══ -->
+  <rect x="190" y="173" width="419" height="28" fill="#ef4444" rx="3"/>
+  <rect x="190" y="173" width="419" height="8" fill="#f87171" rx="3" opacity="0.5"/>
+  <text x="185" y="192" text-anchor="end" font-size="13" fill="#374151">SuperMemory.ai</text>
+  <text x="614" y="192" font-size="12" fill="#b91c1c">  50ms (p95)</text>
+
+  <!-- ═══ ROW 3: Zep (119ms best) — width=462 ═══ -->
+  <rect x="190" y="216" width="462" height="28" fill="#dc2626" rx="3"/>
+  <rect x="190" y="216" width="462" height="8" fill="#ef4444" rx="3" opacity="0.5"/>
+  <text x="185" y="235" text-anchor="end" font-size="13" fill="#374151">Zep</text>
+  <text x="657" y="235" font-size="12" fill="#991b1b">  119ms (best)</text>
+
+  <!-- ═══ ROW 4: Graphiti (~500ms) — width=533 ═══ -->
+  <rect x="190" y="259" width="533" height="28" fill="#991b1b" rx="3"/>
+  <rect x="190" y="259" width="533" height="8" fill="#dc2626" rx="3" opacity="0.5"/>
+  <text x="185" y="278" text-anchor="end" font-size="13" fill="#374151">Graphiti</text>
+  <text x="728" y="278" font-size="12" fill="#7f1d1d">  ~500ms</text>
+
+  <!-- X-axis tick labels -->
+  <text x="190" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">10 µs</text>
+  <text x="303" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">100 µs</text>
+  <text x="417" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">1 ms</text>
+  <text x="530" y="338" text-anchor="middle" font-size="10" fill="#3b82f6" font-weight="600">10 ms</text>
+  <text x="643" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">100 ms</text>
+  <text x="757" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">1 s</text>
+  <text x="870" y="338" text-anchor="middle" font-size="10" fill="#9ca3af">10 s</text>
+
+  <!-- Axis label -->
+  <text x="530" y="358" text-anchor="middle" font-size="11" fill="#6b7280">Latency (log scale) — lower is better</text>
+
+  <!-- Speedup callout box -->
+  <rect x="192" y="78" width="290" height="40" fill="#f0fdf4" rx="4" stroke="#86efac" stroke-width="1"/>
+  <text x="202" y="93" font-size="10" font-weight="600" fill="#15803d">ThinkingRoot is (HTTP, p95):</text>
+  <text x="202" y="109" font-size="10" fill="#15803d">5.9× faster than FalkorDB · 8.1× faster than SuperMemory · 19× faster than Zep</text>
+
+  <!-- Methodology note -->
+  <rect x="192" y="305" width="676" height="14" fill="none"/>
+  <text x="460" y="315" text-anchor="middle" font-size="9.5" fill="#6b7280">ThinkingRoot: k6 v1.7.1 · 117K search reqs · 144K mixed reqs · 0 errors · same HTTP methodology as competitors</text>
+
+  <!-- Footer -->
+  <text x="460" y="395" text-anchor="middle" font-size="10" fill="#d1d5db">ThinkingRoot v0.9.0 · Criterion + k6 benchmarks · release build · Apple Silicon · competitors: published benchmarks</text>
+
+</svg>
