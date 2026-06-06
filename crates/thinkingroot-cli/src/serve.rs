@@ -445,7 +445,10 @@ pub async fn run_serve(
         let warm_started = std::time::Instant::now();
         {
             let eng = state.engine.read().await;
-            for (ws_name, _path, _ws_port) in &resolved_paths {
+            for ws_entry in &resolved_paths {
+                // First tuple element is the workspace name in both the
+                // bound-port (2-tuple) and standard (3-tuple) serve paths.
+                let ws_name = &ws_entry.0;
                 match eng.warm_models(ws_name).await {
                     Ok(()) => {
                         tracing::info!(workspace = %ws_name, "warm-on-boot: models loaded")
@@ -792,7 +795,10 @@ async fn run_serve_with_listener(
         let warm_started = std::time::Instant::now();
         {
             let eng = state.engine.read().await;
-            for (ws_name, _path, _ws_port) in &resolved_paths {
+            for ws_entry in &resolved_paths {
+                // First tuple element is the workspace name in both the
+                // bound-port (2-tuple) and standard (3-tuple) serve paths.
+                let ws_name = &ws_entry.0;
                 match eng.warm_models(ws_name).await {
                     Ok(()) => {
                         tracing::info!(workspace = %ws_name, "warm-on-boot: models loaded")
