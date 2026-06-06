@@ -461,7 +461,13 @@ pub async fn run_serve(
                 }
             }
         }
-        set_models_warm();
+        // Only flip /readyz to ready if we actually warmed a workspace's
+        // models. The cloud daemon boots with zero workspaces (mounted later
+        // over REST), so leave the flag false here — warm-on-mount sets it
+        // once those models load, keeping /readyz honest.
+        if !resolved_paths.is_empty() {
+            set_models_warm();
+        }
         tracing::info!(
             elapsed_ms = warm_started.elapsed().as_millis() as u64,
             "warm-on-boot complete"
@@ -811,7 +817,13 @@ async fn run_serve_with_listener(
                 }
             }
         }
-        set_models_warm();
+        // Only flip /readyz to ready if we actually warmed a workspace's
+        // models. The cloud daemon boots with zero workspaces (mounted later
+        // over REST), so leave the flag false here — warm-on-mount sets it
+        // once those models load, keeping /readyz honest.
+        if !resolved_paths.is_empty() {
+            set_models_warm();
+        }
         tracing::info!(
             elapsed_ms = warm_started.elapsed().as_millis() as u64,
             "warm-on-boot complete"
