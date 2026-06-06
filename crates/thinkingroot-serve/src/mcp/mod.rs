@@ -484,7 +484,7 @@ pub async fn dispatch(
         "resources/read" => {
             resources::handle_read(id, &request.params, engine, default_workspace).await
         }
-        "tools/list" => tools::handle_list(id).await,
+        "tools/list" => tools::handle_list_for_ws(id, engine, default_workspace).await,
         "tools/call" => {
             maybe_auto_create_branch(
                 &request.params,

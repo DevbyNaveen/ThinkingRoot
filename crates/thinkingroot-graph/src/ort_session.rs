@@ -4,8 +4,13 @@
 // (Track 32, 2026-05-16). Two model kinds:
 //
 //   - `EmbeddingModel`     — sentence-transformer-style; mean-pool
-//                            + L2-normalise; default `AllMiniLM-L6-v2`
-//                            384-dim, 256-token context.
+//                            + L2-normalise; default now
+//                            `gte-modernbert-base` 768-dim, 512-token
+//                            context (EMBED_DIM=768, EMBED_MAX_LEN=512 in
+//                            `vector.rs`). Upgraded from AllMiniLM-L6-v2
+//                            (384-dim) — the 2020 MiniLM was the measured
+//                            paraphrase-recall bottleneck (precision@3
+//                            0/4 → 4/4 after the swap).
 //   - `CrossEncoderModel`  — pair-encoded reranker; sigmoid logits;
 //                            default `gte-reranker-modernbert-base`
 //                            (149M, 8192-token context).

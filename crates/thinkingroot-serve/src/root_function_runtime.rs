@@ -115,10 +115,11 @@ pub async fn run_js(
     llm: Option<Arc<LlmClient>>,
     timeout_secs: u64,
 ) -> RunResult {
-    // Convenience: no journal preload, recorded steps + pending discarded.
-    // The durable path (`invoke_function`) uses `run_js_journaled`.
+    // Convenience: no journal preload, recorded steps + pending discarded,
+    // and no co-located capabilities (ctx.memory/etc. error honestly).
+    // The durable path (`invoke_function`) uses `run_js_journaled` with caps.
     let (outcome, _steps, _pending, _cites) =
-        run_js_journaled(body, input, env, ctx, llm, HashMap::new(), timeout_secs).await;
+        run_js_journaled(body, input, env, ctx, llm, HashMap::new(), timeout_secs, None).await;
     match outcome {
         RunOutcome::Done(v) => Ok(v),
         RunOutcome::Suspended => {
@@ -142,6 +143,7 @@ pub async fn run_js_journaled(
     llm: Option<Arc<LlmClient>>,
     steps: HashMap<String, String>,
     timeout_secs: u64,
+    caps: Option<Arc<crate::engine::FnCapabilities>>,
 ) -> (RunOutcome, Vec<(String, String)>, Vec<PendingReq>, Vec<String>) {
     let body = body.to_string();
     let input_json = match serde_json::to_string(input) {
@@ -171,7 +173,10 @@ pub async fn run_js_journaled(
         };
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            execute_in_isolate(&body, &input_json, &env_json, ctx, llm, steps, timeout_secs).await
+            execute_in_isolate(
+                &body, &input_json, &env_json, ctx, llm, steps, timeout_secs, caps,
+            )
+            .await
         })
     });
 
@@ -383,6 +388,11 @@ mod host_ext {
         /// The workspace LLM client, when one is configured. `None` means
         /// no bring-your-own-key oracle is available for this project.
         pub llm: Option<Arc<LlmClient>>,
+        /// Co-located capabilities (cognition graph / prompt / branch / MCP),
+        /// confined to this run's own workspace + capability-gated. `None` on
+        /// the convenience/test path (`run_js`) — ctx.memory/etc. then error
+        /// honestly rather than touching a graph that isn't bound.
+        pub caps: Option<Arc<crate::engine::FnCapabilities>>,
         /// Previously-journaled steps (`step_key -> result_json`) for this
         /// run — non-empty only on a resumed/replayed run.
         pub steps: HashMap<String, String>,
@@ -491,6 +501,196 @@ mod host_ext {
         Ok(AskResult { answer, oracle_source: "byo_key".to_string() })
     }
 
+    fn default_recall_k() -> u32 {
+        8
+    }
+    fn default_claim_type() -> String {
+        "fact".to_string()
+    }
+    fn default_confidence() -> f64 {
+        0.7
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct RecallReq {
+        pub query: String,
+        #[serde(default = "default_recall_k")]
+        pub k: u32,
+    }
+
+    /// Async op behind `ctx.memory.recall(query, k)` — semantic recall over
+    /// the run's OWN workspace (per-user isolation = the workspace boundary).
+    /// Co-located: no network hop, the graph lives in-process.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_memory_recall(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: RecallReq,
+    ) -> Result<Vec<crate::engine::RecallHit>, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.memory is unavailable: this run is not bound to a workspace \
+                 (the durable invoke path provides it)",
+            ));
+        };
+        caps.recall(&req.query, req.k as usize)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("memory.recall failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct RememberReq {
+        pub statement: String,
+        #[serde(default = "default_claim_type")]
+        pub claim_type: String,
+        #[serde(default = "default_confidence")]
+        pub confidence: f64,
+        /// Per-run call sequence — the deterministic-idempotency anchor so a
+        /// crash-resume replay re-writes the SAME claim id (a no-op `:put`).
+        pub seq: f64,
+    }
+
+    /// Async op behind `ctx.memory.remember(fact, opts)` — persist a claim
+    /// into the run's own workspace graph + vector index (idempotent on
+    /// replay via the deterministic claim id). Returns the claim id.
+    #[op2(async(lazy))]
+    #[string]
+    pub async fn op_tr_memory_remember(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: RememberReq,
+    ) -> Result<String, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.memory is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.remember(&req.statement, &req.claim_type, req.confidence, req.seq as u64)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("memory.remember failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct PromptReq {
+        pub name: String,
+        #[serde(default)]
+        pub vars: std::collections::BTreeMap<String, String>,
+    }
+
+    /// Async op behind `ctx.prompt(name, vars)` — assemble a versioned,
+    /// compiled prompt template grounded in this workspace.
+    #[op2(async(lazy))]
+    #[string]
+    pub async fn op_tr_prompt(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: PromptReq,
+    ) -> Result<String, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.prompt is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.assemble_prompt(&req.name, &req.vars)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("prompt assemble failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct BranchForkReq {
+        pub name: String,
+        #[serde(default)]
+        pub parent: Option<String>,
+    }
+
+    /// Async op behind `ctx.branch.fork(name, parent?)`.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_branch_fork(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: BranchForkReq,
+    ) -> Result<crate::engine::BranchForkResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.branch is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.branch_fork(&req.name, req.parent.as_deref())
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("branch.fork failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct BranchMergeReq {
+        pub source: String,
+        #[serde(default)]
+        pub target: Option<String>,
+    }
+
+    /// Async op behind `ctx.branch.merge(source, target?)`.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_branch_merge(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: BranchMergeReq,
+    ) -> Result<crate::engine::BranchMergeResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.branch is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.branch_merge(&req.source, req.target.as_deref())
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("branch.merge failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct McpCallReq {
+        pub tool: String,
+        #[serde(default)]
+        pub args: serde_json::Value,
+    }
+
+    /// Async op behind `ctx.mcp.call(tool, args)` — invoke a tool on a
+    /// project-configured external MCP server (the second half of two-way MCP).
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_mcp_call(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: McpCallReq,
+    ) -> Result<crate::mcp::client::McpToolResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.mcp is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.mcp_call(&req.tool, req.args)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("mcp.call failed: {e}")))
+    }
+
     #[derive(serde::Deserialize)]
     pub struct StepKeyReq {
         pub key: String,
@@ -569,14 +769,112 @@ mod host_ext {
         }
     }
 
+    #[derive(serde::Deserialize)]
+    pub struct AcquireReq {
+        pub name: String,
+        #[serde(default)]
+        pub description: String,
+        /// Explicit body — when set, skip LLM authoring and deploy this.
+        #[serde(default)]
+        pub body: String,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct AcquireResult {
+        pub name: String,
+        pub body: String,
+        /// True if the body was LLM-authored (vs. supplied).
+        pub authored: bool,
+    }
+
+    /// Strip markdown fences / a stray `export default` from an authored body.
+    fn sanitize_fn_body(raw: &str) -> String {
+        let mut s = raw.trim();
+        if let Some(start) = s.find("```") {
+            // take the content of the first fenced block, if any
+            let after = &s[start + 3..];
+            // drop an optional language tag on the same line
+            let after = after.splitn(2, '\n').nth(1).unwrap_or(after);
+            if let Some(end) = after.find("```") {
+                s = after[..end].trim();
+            }
+        }
+        s.strip_prefix("export default")
+            .map(str::trim)
+            .unwrap_or(s)
+            .to_string()
+    }
+
+    /// Async op behind `ctx.acquire(spec)` — self-extension. Author a function
+    /// body (LLM, tools-blind) from a description, or take a supplied body, and
+    /// deploy it (versioned) into this run's OWN workspace. The function can
+    /// then invoke it via `ctx.mcp.call("function::<name>", input)`.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_acquire(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: AcquireReq,
+    ) -> Result<AcquireResult, JsErrorBox> {
+        let AcquireReq { name, description, body } = req;
+        if name.trim().is_empty() {
+            return Err(JsErrorBox::generic("ctx.acquire: name is required"));
+        }
+        // Clone the Arcs out before any await (never hold the OpState borrow).
+        let (llm, caps) = {
+            let s = state.borrow();
+            let h = s.borrow::<FnHostState>();
+            (h.llm.clone(), h.caps.clone())
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.acquire is unavailable: this run is not bound to a workspace",
+            ));
+        };
+
+        let mut authored = false;
+        let body = if !body.trim().is_empty() {
+            body
+        } else {
+            let Some(client) = llm else {
+                return Err(JsErrorBox::generic(
+                    "ctx.acquire needs an LLM to author a body (no provider configured) — \
+                     pass an explicit `body` instead",
+                ));
+            };
+            authored = true;
+            let system = "You are a code generator. Output ONLY the JavaScript body of a \
+                          ThinkingRoot Root Function shaped EXACTLY as \
+                          `async (input, ctx) => { /* ... */ }`. You may use \
+                          ctx.memory.recall(q), ctx.memory.remember(s), and ctx.llm.ask(q). \
+                          Return raw code only — no markdown fences, no prose, no export.";
+            let raw = client
+                .chat(system, &description)
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("ctx.acquire authoring failed: {e}")))?;
+            sanitize_fn_body(&raw)
+        };
+
+        caps.acquire(&name, &body, "js")
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("ctx.acquire deploy failed: {e}")))?;
+        Ok(AcquireResult { name, body, authored })
+    }
+
     pub fn extension() -> Extension {
         const OPS: &[OpDecl] = &[
             op_tr_ctx(),
             op_tr_llm_ask(),
+            op_tr_memory_recall(),
+            op_tr_memory_remember(),
+            op_tr_prompt(),
+            op_tr_branch_fork(),
+            op_tr_branch_merge(),
+            op_tr_mcp_call(),
             op_tr_step_lookup(),
             op_tr_step_record(),
             op_tr_cognition_request(),
             op_tr_cite(),
+            op_tr_acquire(),
         ];
         Extension {
             name: "tr_host",
@@ -627,16 +925,63 @@ globalThis.__tr_buildCtx = (input, env) => {
   ctx.version = meta.version;
   ctx.attempt = meta.attempt;
   ctx.sessionId = meta.sessionId ?? null;
+  // Per-run sequence for journaled async ops (llm / memory). Stable across
+  // replay because durable control flow is deterministic — so the Nth
+  // llm.ask / recall / remember always gets the same journal key.
+  let __opSeq = 0;
   ctx.llm = {
     // Tools-blind coprocessor: ask the connected/configured model one
     // question. `context` is any JSON-serialisable value (optional).
+    // JOURNALED: a replayed/resumed run returns the recorded answer and does
+    // NOT re-call the model (determinism + no double-spend on resume).
     ask: async (question, context) => {
-      const r = await Deno.core.ops.op_tr_llm_ask({
-        question: String(question),
-        context_json: context === undefined || context === null ? "" : JSON.stringify(context),
+      return await ctx.step(`__llm__${__opSeq++}`, async () => {
+        const r = await Deno.core.ops.op_tr_llm_ask({
+          question: String(question),
+          context_json: context === undefined || context === null ? "" : JSON.stringify(context),
+        });
+        return r.answer;
       });
-      return r.answer;
     },
+  };
+  // ctx.memory: co-located recall/remember over THIS run's own workspace
+  // (per-user isolation IS the workspace boundary). `recall` is a journaled
+  // READ — a replay returns the recorded hits and does not re-query. `remember`
+  // is an idempotent WRITE — the claim id is deterministic in (run, seq, fact),
+  // so a crash-resume replay re-writes the SAME id (a no-op `:put`), giving
+  // exactly-once for the effect even if the step journal didn't persist.
+  ctx.memory = {
+    recall: async (query, k) => {
+      return await ctx.step(`__recall__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_memory_recall({
+          query: String(query),
+          k: (k === undefined || k === null) ? 8 : k,
+        }));
+    },
+    remember: async (fact, opts) => {
+      const seq = __opSeq++;
+      return await ctx.step(`__remember__${seq}`, async () =>
+        await Deno.core.ops.op_tr_memory_remember({
+          statement: String(fact),
+          claim_type: (opts && opts.type) ? String(opts.type) : "fact",
+          confidence: (opts && typeof opts.confidence === 'number') ? opts.confidence : 0.7,
+          seq: seq,
+        }));
+    },
+  };
+  // ctx.acquire(spec): self-extension. Author (LLM, tools-blind) or take a
+  // supplied body, and deploy a new function into THIS workspace at runtime.
+  // Then invoke it via ctx.mcp.call("function::" + name, input). JOURNALED via
+  // ctx.step so a replay reuses the recorded result (no re-author on resume).
+  // spec: { name, description?, body? } or a bare string (used as name+desc).
+  ctx.acquire = async (spec) => {
+    const s = (typeof spec === "string") ? { name: spec, description: spec } : (spec || {});
+    return await ctx.step(`__acquire__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_acquire({
+        name: String(s.name || ""),
+        description: String(s.description || s.name || ""),
+        body: s.body ? String(s.body) : "",
+      }));
   };
   // ctx.step(name, fn): durable memoization. On a resumed run the recorded
   // result is returned and `fn` is NOT re-executed; otherwise `fn` runs and
@@ -684,6 +1029,48 @@ globalThis.__tr_buildCtx = (input, env) => {
       json: async () => JSON.parse(j.body),
     };
   };
+  // ctx.prompt(name, vars): assemble a compiled, versioned prompt grounded in
+  // this workspace. Journaled read (replay returns the recorded text).
+  ctx.prompt = async (name, vars) => {
+    return await ctx.step(`__prompt__${__opSeq++}`, async () => {
+      const v = {};
+      if (vars && typeof vars === 'object') {
+        for (const k of Object.keys(vars)) v[k] = String(vars[k]);
+      }
+      return await Deno.core.ops.op_tr_prompt({ name: String(name), vars: v });
+    });
+  };
+  // ctx.branch: isolated graph experiments / A-B. fork is idempotent (the
+  // branch name is the key); merge is an effect — both journaled so a resume
+  // does not re-run them.
+  ctx.branch = {
+    fork: async (name, parent) => {
+      return await ctx.step(`__branchfork__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_branch_fork({
+          name: String(name),
+          parent: (parent === undefined || parent === null) ? null : String(parent),
+        }));
+    },
+    merge: async (source, target) => {
+      return await ctx.step(`__branchmerge__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_branch_merge({
+          source: String(source),
+          target: (target === undefined || target === null) ? null : String(target),
+        }));
+    },
+  };
+  // ctx.mcp.call(tool, args): invoke a project-configured external MCP server
+  // tool (e.g. "sendgrid::send"). Journaled (replay returns the recorded
+  // result and does NOT re-call the external tool — no double side-effect).
+  ctx.mcp = {
+    call: async (tool, args) => {
+      return await ctx.step(`__mcp__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_mcp_call({
+          tool: String(tool),
+          args: (args === undefined || args === null) ? {} : args,
+        }));
+    },
+  };
   // ctx.cognition.ask(question): tools-blind, durable human/agent-in-the-loop.
   // On replay the journaled answer is returned; otherwise the run registers a
   // pending request and suspends (throws the sentinel the host turns into a
@@ -716,6 +1103,7 @@ async fn execute_in_isolate(
     llm: Option<Arc<LlmClient>>,
     steps: HashMap<String, String>,
     timeout_secs: u64,
+    caps: Option<Arc<crate::engine::FnCapabilities>>,
 ) -> (RunOutcome, Vec<(String, String)>, Vec<PendingReq>, Vec<String>) {
     use deno_core::{JsRuntime, RuntimeOptions, v8};
 
@@ -742,6 +1130,7 @@ async fn execute_in_isolate(
     runtime.op_state().borrow_mut().put(host_ext::FnHostState {
         meta: ctx,
         llm,
+        caps,
         steps,
         new_steps: Vec::new(),
         new_pending: Vec::new(),
@@ -851,6 +1240,7 @@ pub async fn run_js_journaled(
     _llm: Option<Arc<LlmClient>>,
     _steps: HashMap<String, String>,
     _timeout_secs: u64,
+    _caps: Option<Arc<crate::engine::FnCapabilities>>,
 ) -> (RunOutcome, Vec<(String, String)>, Vec<PendingReq>, Vec<String>) {
     (
         RunOutcome::Failed(

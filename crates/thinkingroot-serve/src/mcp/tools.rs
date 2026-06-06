@@ -1434,6 +1434,47 @@ pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(id, tools)
 }
 
+/// Workspace-aware `tools/list`: the global catalog PLUS this workspace's
+/// deployed Root Functions advertised as `function::<name>` MCP tools. Two-way
+/// MCP — a function can both CALL MCP tools (`ctx.mcp.call`) AND be called as
+/// one by any agent. Used by the live MCP dispatch path; the bare
+/// [`handle_list`] (catalog only) remains for the context-free callers
+/// (REST catalog dump, bridge, tests).
+#[tracing::instrument(name = "mcp.tools.list.ws", skip_all)]
+pub async fn handle_list_for_ws(
+    id: Option<Value>,
+    engine: &QueryEngine,
+    default_ws: Option<&str>,
+) -> JsonRpcResponse {
+    let mut tools = build_tool_catalog().await;
+    if let Some(ws) = default_ws
+        && let Ok(funcs) = engine.list_functions(ws).await
+        && let Some(arr) = tools.get_mut("tools").and_then(|v| v.as_array_mut())
+    {
+        for f in funcs {
+            arr.push(serde_json::json!({
+                "name": format!("function::{}", f.name),
+                "description": format!(
+                    "[root function] {} (v{}) — a durable, co-located function deployed \
+                     to this workspace. Pass its argument object under `input`.",
+                    f.name, f.version
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "object",
+                            "description": "Argument object passed to the function as `input`."
+                        }
+                    }
+                }
+            }));
+        }
+    }
+    apply_tool_exposure(&mut tools);
+    JsonRpcResponse::success(id, tools)
+}
+
 /// Phase ε.1 — `tool_search` handler.
 ///
 /// Returns matching tool descriptors. Independent of `handle_list`'s
@@ -3590,6 +3631,27 @@ pub async fn handle_call(
         "clipboard_write" => handle_clipboard_write(id, &arguments).await,
         "open_in_default" => handle_open_in_default(id, &arguments).await,
         "trash"           => handle_trash(id, &arguments).await,
+
+        // ── Root Functions exposed as MCP tools ───────────────────
+        // `function::<name>` routes to the deployed Root Function in
+        // this workspace — the second half of two-way MCP (a function
+        // can call MCP tools AND be called as one). The function runs
+        // through the same durable `invoke_function` path, so it gets
+        // co-located ctx.memory/prompt/branch/mcp + journaling. The
+        // arg object is taken from `input` (or the whole args object).
+        other if other.starts_with("function::") => {
+            let fname = other.trim_start_matches("function::");
+            let input = arguments
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| arguments.clone());
+            match engine.invoke_function(ws, fname, &input).await {
+                Ok(v) => mcp_text_result(id, &v),
+                Err(e) => {
+                    JsonRpcResponse::error(id, -32603, format!("function::{fname}: {e}"))
+                }
+            }
+        }
 
         // ── Phase E.5 (2026-05-17) — external MCP fall-through ─────
         // Names containing `::` are routed to the external MCP

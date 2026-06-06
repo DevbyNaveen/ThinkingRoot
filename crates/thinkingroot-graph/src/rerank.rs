@@ -89,8 +89,11 @@ mod inner {
         ///
         /// **Latency** (top-20 on M-series CPU, gte-modernbert FP16):
         ///   - ~150-250 ms warm
-        ///   - +2-3 s cold first load (ORT session creation), hidden
-        ///     behind warm-on-boot in `serve.rs` post-Phase-B
+        ///   - +2-3 s cold first load (ORT session creation). NOTE: this
+        ///     is NOT yet hidden — warm-on-boot in `serve.rs` is still
+        ///     unimplemented (verified 2026-06-05), so the FIRST rerank
+        ///     after daemon start pays this cold cost. TODO: pre-warm with
+        ///     a dummy `rerank()` after `mount_workspaces_into_engine()`.
         ///
         /// Returns an empty `Vec` when `documents` is empty (saves the
         /// model-load cost on no-op calls).

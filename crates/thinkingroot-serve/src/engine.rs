@@ -746,6 +746,7 @@ impl Principal {
 // Internal workspace handle
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct WorkspaceHandle {
     name: String,
     root_path: PathBuf,
@@ -758,6 +759,346 @@ struct WorkspaceHandle {
     config: Config,
     /// LLM client for ReAct synthesis — None if provider is not configured.
     llm: Option<Arc<thinkingroot_llm::llm::LlmClient>>,
+}
+
+// ---------------------------------------------------------------------------
+// Root Function capabilities (co-located compute over the cognition graph)
+// ---------------------------------------------------------------------------
+
+/// Which co-located capabilities a Root Function run may exercise. Capture
+/// of the cognition graph happens through a *cloned* [`WorkspaceHandle`], so
+/// every op is confined to the function's own (per-user `u_*`) workspace —
+/// there is no path to another user's namespace or another project. The
+/// `mcp`/`fetch`-style egress capabilities are gated separately (default
+/// deny) because they cross the trust boundary; the graph capabilities are
+/// default-allow because they only touch the caller's own brain.
+#[derive(Debug, Clone, Copy)]
+pub struct CapSet {
+    pub can_recall: bool,
+    pub can_remember: bool,
+    pub can_prompt: bool,
+    pub can_branch: bool,
+    pub can_mcp: bool,
+    /// `ctx.acquire` — deploy a new function version into the run's own
+    /// workspace (self-extension). A graph write on the caller's own brain,
+    /// so default-on like remember.
+    pub can_acquire: bool,
+}
+
+impl CapSet {
+    /// Default for a function running in its own workspace: graph ops on,
+    /// outbound MCP off (egress is opt-in, like `fetch`). M4 wires this to
+    /// per-function metadata.
+    pub fn default_own_workspace() -> Self {
+        Self {
+            can_recall: true,
+            can_remember: true,
+            can_prompt: true,
+            can_branch: true,
+            // The external-MCP registry is the real gate (only project-owner
+            // configured servers are reachable), so this can default on.
+            can_mcp: true,
+            // Self-extension is a graph write on the run's own workspace.
+            can_acquire: true,
+        }
+    }
+}
+
+/// One recalled claim, JSON-serialisable for the isolate boundary.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecallHit {
+    pub id: String,
+    pub statement: String,
+    pub score: f32,
+    pub source_uri: String,
+}
+
+/// The narrow, capability-gated facade threaded into a Root Function's
+/// isolate (as `Arc<FnCapabilities>` in `FnHostState`). It holds a *cloned*
+/// `WorkspaceHandle` (cheap — Arcs inside) so ops recall/remember/assemble
+/// against the cognition graph **without re-locking the engine**, plus the
+/// resolved workspace name + this run's id (for deterministic, idempotent
+/// `remember` ids). Branch/MCP fields are added in later milestones.
+pub struct FnCapabilities {
+    handle: WorkspaceHandle,
+    /// Workspace root on disk — backs branch ops (M2).
+    pub(crate) root_path: PathBuf,
+    /// Resolved workspace (the per-user `u_*` namespace) this run is bound to.
+    pub(crate) ws: String,
+    /// This run's id — the deterministic-idempotency anchor for `remember`.
+    run_id: String,
+    /// External MCP registry — backs `ctx.mcp.call` (M3). The registry itself
+    /// is the real gate: a function can only reach servers the PROJECT OWNER
+    /// configured (`mcp-servers.toml`).
+    mcp: Arc<crate::mcp::external_registry::ExternalMcpRegistry>,
+    caps: CapSet,
+}
+
+impl FnCapabilities {
+    pub fn new(
+        handle: WorkspaceHandle,
+        ws: String,
+        run_id: String,
+        mcp: Arc<crate::mcp::external_registry::ExternalMcpRegistry>,
+        caps: CapSet,
+    ) -> Self {
+        let root_path = handle.root_path.clone();
+        Self { handle, root_path, ws, run_id, mcp, caps }
+    }
+
+    /// `ctx.memory.recall(query, k)` — semantic recall scoped to this run's
+    /// own workspace (per-user isolation is the workspace boundary itself).
+    pub async fn recall(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'memory.recall' is not granted to this function".to_string(),
+            ));
+        }
+        let k = k.clamp(1, 100);
+        let empty = std::collections::HashSet::new();
+        let res = QueryEngine::search_scoped_on(&self.handle, query, k, &empty).await?;
+        Ok(res
+            .claims
+            .into_iter()
+            .map(|c| RecallHit {
+                id: c.id,
+                statement: c.statement,
+                score: c.relevance,
+                source_uri: c.source_uri,
+            })
+            .collect())
+    }
+
+    /// `ctx.memory.remember(fact, opts)` — persist a claim into this run's
+    /// workspace graph + vector index so it is recallable. The claim id is
+    /// **deterministic** in `(run_id, seq, statement)`, so a crash *after*
+    /// the write but *before* the step journal persists replays to the SAME
+    /// id — `insert_claim`/vector `upsert` are `:put`/upsert, so the replay
+    /// is a no-op rather than a duplicate (exactly-once for the effect).
+    pub async fn remember(
+        &self,
+        statement: &str,
+        claim_type: &str,
+        confidence: f64,
+        seq: u64,
+    ) -> Result<String> {
+        use thinkingroot_core::types::{ContentHash, SourceType, TrustLevel};
+
+        if !self.caps.can_remember {
+            return Err(Error::Config(
+                "capability 'memory.remember' is not granted to this function".to_string(),
+            ));
+        }
+        if statement.trim().is_empty() {
+            return Err(Error::Config("memory.remember: empty fact".to_string()));
+        }
+
+        // Deterministic claim id: blake3(run_id|seq|statement) → u128 → Ulid.
+        let key = format!("{}|{}|{}", self.run_id, seq, statement);
+        let digest = blake3::hash(key.as_bytes());
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&digest.as_bytes()[..16]);
+        let det = ulid::Ulid::from(u128::from_le_bytes(b));
+        let claim_id = thinkingroot_core::types::ClaimId::from_ulid(det);
+
+        let source_uri = format!("rootfn://{}/{}", self.handle.name, self.run_id);
+        let source = thinkingroot_core::Source::new(source_uri.clone(), SourceType::ChatMessage)
+            .with_trust(TrustLevel::Untrusted)
+            .with_hash(ContentHash(format!("rootfn-{}-{}", self.run_id, seq)));
+
+        let mut claim = thinkingroot_core::Claim::new(
+            statement.to_string(),
+            parse_claim_type_str(claim_type),
+            source.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        )
+        .with_confidence(confidence.clamp(0.0, 1.0))
+        .with_extraction_tier(thinkingroot_core::types::ExtractionTier::AgentInferred);
+        claim.id = claim_id; // force determinism (idempotent on replay)
+
+        let ctype = claim_type.to_string();
+        let conf = confidence.clamp(0.0, 1.0);
+        {
+            let mut storage = self.handle.storage.lock().await;
+            storage.graph.insert_source(&source)?;
+            storage.graph.insert_claim(&claim)?;
+            storage
+                .graph
+                .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())?;
+            // Vector-index the claim so semantic recall finds it without a
+            // recompile (mirrors the contribute_claims write path). ONNX
+            // embedding is sync; on the isolate's current-thread runtime
+            // `run_blocking` runs it inline (no block_in_place panic).
+            let meta = format!("claim|{}|{}|{}|{}", claim.id, ctype, conf, source_uri);
+            let vkey = format!("claim:{}", claim.id);
+            let stmt = statement.to_string();
+            // Non-fatal (honesty contract, mirrors contribute_claims): the graph
+            // write is already durable. A missing/uninitialised embedder degrades
+            // *semantic* recall to keyword recall — it must not fail the write.
+            if let Err(e) = run_blocking(|| storage.vector.upsert(&vkey, &stmt, &meta)) {
+                tracing::warn!(
+                    "remember: vector upsert failed (claim durable; semantic recall degraded \
+                     to keyword until reindex): {e}"
+                );
+            }
+            // Reload the read cache while holding storage so no write slips in
+            // between the CozoDB write and the cache refresh — otherwise a
+            // subsequent recall in the same run would miss the just-written
+            // claim (the honesty contract).
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph)
+                .map_err(|e| Error::GraphStorage(format!("remember: cache reload failed: {e}")))?;
+            *self.handle.cache.write().await = new_cache;
+        }
+        Ok(claim.id.to_string())
+    }
+
+    /// `ctx.prompt(name, vars)` — assemble a compiled prompt template (M2).
+    pub async fn assemble_prompt(
+        &self,
+        name: &str,
+        vars: &std::collections::BTreeMap<String, String>,
+    ) -> Result<String> {
+        if !self.caps.can_prompt {
+            return Err(Error::Config(
+                "capability 'prompt' is not granted to this function".to_string(),
+            ));
+        }
+        let storage = self.handle.storage.lock().await;
+        storage.graph.assemble_prompt(name, vars)
+    }
+
+    /// `ctx.branch.fork(name, parent?)` — create an isolated branch of this
+    /// workspace's cognition graph (for safe experiments / A-B). Branch ops
+    /// are free functions over `root_path` — no engine lock involved.
+    /// Idempotent-ish: the branch name is the natural key.
+    pub async fn branch_fork(&self, name: &str, parent: Option<&str>) -> Result<BranchForkResult> {
+        if !self.caps.can_branch {
+            return Err(Error::Config(
+                "capability 'branch' is not granted to this function".to_string(),
+            ));
+        }
+        let parent = parent.unwrap_or("main");
+        // If the branch already exists (replay/resume), return it instead of
+        // erroring — keeps `ctx.branch.fork` idempotent across re-execution.
+        if let Ok(branches) = thinkingroot_branch::list_branches(&self.root_path)
+            && let Some(b) = branches.iter().find(|b| b.name == name)
+        {
+            return Ok(BranchForkResult {
+                name: b.name.clone(),
+                slug: b.slug.clone(),
+                parent: b.parent.clone(),
+            });
+        }
+        let b = thinkingroot_branch::create_branch(
+            &self.root_path,
+            name,
+            parent,
+            Some(format!("forked by root function (run {})", self.run_id)),
+        )
+        .await
+        .map_err(|e| Error::Config(format!("branch.fork failed: {e}")))?;
+        Ok(BranchForkResult { name: b.name, slug: b.slug, parent: b.parent })
+    }
+
+    /// `ctx.branch.merge(source, target?)` — merge a branch into the target
+    /// (default `main`). Returns a summary of what merged + what needs review.
+    pub async fn branch_merge(
+        &self,
+        source: &str,
+        target: Option<&str>,
+    ) -> Result<BranchMergeResult> {
+        if !self.caps.can_branch {
+            return Err(Error::Config(
+                "capability 'branch' is not granted to this function".to_string(),
+            ));
+        }
+        let target = target.unwrap_or("main");
+        let merged_by = thinkingroot_core::types::MergedBy::Agent {
+            agent_id: format!("rootfn:{}", self.run_id),
+        };
+        let diff = thinkingroot_branch::merge_into(
+            &self.root_path,
+            source,
+            target,
+            merged_by,
+            false, // force
+            false, // propagate_deletions
+        )
+        .await
+        .map_err(|e| Error::Config(format!("branch.merge failed: {e}")))?;
+        Ok(BranchMergeResult {
+            from_branch: diff.from_branch,
+            to_branch: diff.to_branch,
+            new_claims: diff.new_claims.len() as u64,
+            new_entities: diff.new_entities.len() as u64,
+            auto_resolved: diff.auto_resolved.len() as u64,
+            needs_review: diff.needs_review.len() as u64,
+        })
+    }
+
+    /// `ctx.mcp.call(tool, args)` — invoke a tool on a project-configured
+    /// external MCP server (e.g. `"sendgrid::send"`). The registry is the
+    /// gate: only servers the project owner installed are reachable; an
+    /// unknown tool returns an honest "not found" error.
+    pub async fn mcp_call(
+        &self,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<crate::mcp::client::McpToolResult> {
+        if !self.caps.can_mcp {
+            return Err(Error::Config(
+                "capability 'mcp.call' is not granted to this function".to_string(),
+            ));
+        }
+        match self.mcp.dispatch(tool, args).await {
+            Some(Ok(r)) => Ok(r),
+            Some(Err(e)) => Err(Error::Config(format!("mcp.call '{tool}' failed: {e}"))),
+            None => Err(Error::Config(format!(
+                "mcp.call: tool '{tool}' not found — no configured external MCP server \
+                 provides it (install one via the Console / mcp_server_install first)"
+            ))),
+        }
+    }
+
+    /// `ctx.acquire(spec)` host side — deploy a new (versioned) function into
+    /// THIS run's own workspace. Co-located self-extension: a function grows
+    /// the brain a new capability at runtime, then can invoke it via
+    /// `ctx.mcp.call("function::<name>", input)` (the two-way MCP path). The
+    /// new version never clobbers prior ones (`{name}@{version}`), so this is
+    /// safe to roll back. Confined to the caller's own workspace by the handle.
+    pub async fn acquire(&self, name: &str, body: &str, language: &str) -> Result<String> {
+        if !self.caps.can_acquire {
+            return Err(Error::Config(
+                "capability 'acquire' is not granted to this function".to_string(),
+            ));
+        }
+        if name.trim().is_empty() {
+            return Err(Error::Config("ctx.acquire: name is required".to_string()));
+        }
+        let lang = if language.trim().is_empty() { "js" } else { language };
+        let storage = self.handle.storage.lock().await;
+        let f = storage.graph.put_function(name, body, lang)?;
+        Ok(f.id)
+    }
+}
+
+/// Result of `ctx.branch.fork`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchForkResult {
+    pub name: String,
+    pub slug: String,
+    pub parent: String,
+}
+
+/// Result of `ctx.branch.merge` — a token-cheap summary for the function.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchMergeResult {
+    pub from_branch: String,
+    pub to_branch: String,
+    pub new_claims: u64,
+    pub new_entities: u64,
+    pub auto_resolved: u64,
+    pub needs_review: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,14 +1648,28 @@ impl QueryEngine {
             .ok_or_else(|| {
                 Error::Config("no primary workspace mounted to anchor per-user workspaces".into())
             })?;
+        // Prefer a SIBLING of the workspace root (keeps per-user brains out of
+        // the shared source tree) — this is what local dev gets, where the
+        // workspace root has a writable parent.
         let base = match anchor.parent() {
             Some(p) => p.join(".thinkingroot-users"),
             None => anchor.join(".thinkingroot-users"),
         };
-        let root = base.join(ws);
-        let data_dir = root.join(".thinkingroot");
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| Error::Config(format!("create per-user workspace dir for '{ws}': {e}")))?;
+        let primary = base.join(ws);
+        let root = if std::fs::create_dir_all(primary.join(".thinkingroot")).is_ok() {
+            primary
+        } else {
+            // Cloud: the workspace root IS the mounted data volume (e.g.
+            // `/workspace`), whose parent (`/`) isn't writable by the engine
+            // uid. Fall back to a writable dot-dir UNDER the volume. It's a
+            // dot-dir, so it stays out of source ingestion and the orphan
+            // watcher (which only watches `.thinkingroot/`).
+            let alt = anchor.join(".thinkingroot-users").join(ws);
+            std::fs::create_dir_all(alt.join(".thinkingroot")).map_err(|e| {
+                Error::Config(format!("create per-user workspace dir for '{ws}': {e}"))
+            })?;
+            alt
+        };
         self.mount(ws.to_string(), root).await
     }
 
@@ -2449,9 +2804,32 @@ impl QueryEngine {
                 .into_iter()
                 .collect()
         };
+        // Co-located capabilities: capture a CLONE of this workspace's handle
+        // (cheap — Arcs inside) so the isolate's ctx.memory/ctx.prompt/etc. ops
+        // reach the cognition graph WITHOUT re-locking the engine during the
+        // run (avoids the writer-queue deadlock when a workspace mounts mid-run)
+        // and stays confined to this (per-user) workspace.
+        let caps = {
+            let handle = self.get_workspace(ws)?.clone();
+            let mcp = crate::mcp::external_registry::global().await;
+            std::sync::Arc::new(FnCapabilities::new(
+                handle,
+                ws.to_string(),
+                run_id.to_string(),
+                mcp,
+                CapSet::default_own_workspace(),
+            ))
+        };
         let (outcome, new_steps, new_pending, new_cites) =
             crate::root_function_runtime::run_js_journaled(
-                &func.body, input, &env, ctx_meta, llm, prior_steps, 30,
+                &func.body,
+                input,
+                &env,
+                ctx_meta,
+                llm,
+                prior_steps,
+                30,
+                Some(caps),
             )
             .await;
         let finished_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
@@ -3833,7 +4211,20 @@ side referenced. Strict rules:\n\
         allowed_source_ids: &HashSet<String>,
     ) -> Result<SearchResult> {
         let handle = self.get_workspace(ws)?;
+        Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await
+    }
 
+    /// Handle-based core of [`Self::search_scoped`] — operates directly on a
+    /// `WorkspaceHandle` so a *captured* handle (e.g. a Root Function's
+    /// [`FnCapabilities`]) can recall over the cognition graph without
+    /// re-acquiring the engine `RwLock` mid-run (which would risk the
+    /// writer-queue deadlock when a workspace mounts during a function run).
+    pub(crate) async fn search_scoped_on(
+        handle: &WorkspaceHandle,
+        query: &str,
+        top_k: usize,
+        allowed_source_ids: &HashSet<String>,
+    ) -> Result<SearchResult> {
         // Phase 1: Scoped vector search.
         // Empty allowed_source_ids means "no session scope" — treat as unscoped (all sources).
         let scope = if allowed_source_ids.is_empty() {
@@ -5981,6 +6372,10 @@ Rules: \
                     None,
                     HashMap::new(),
                     10,
+                    // Fixture checks run against a sandboxed branch graph (not a
+                    // mounted workspace) — ctx.memory/etc. are intentionally
+                    // unavailable here, same as ctx.cognition (see below).
+                    None,
                 )
                 .await;
                 match outcome {
