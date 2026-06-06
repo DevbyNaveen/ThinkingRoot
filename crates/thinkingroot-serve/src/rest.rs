@@ -1384,6 +1384,33 @@ async fn mount_workspace_handler(
 
     drop(engine);
 
+    // Warm-on-mount (cloud cold-start SOTA): the cloud daemon boots with NO
+    // workspaces and the provisioner mounts over REST here, so the startup
+    // warm-on-boot loop had nothing to warm. Trigger model warm-up now, off
+    // the response path, so the first real query is fast and an idle
+    // checkpoint captures already-resident ONNX models. Opt-in via
+    // TR_WARM_ON_BOOT=1; flips `/readyz` to ready once the models are loaded.
+    if std::env::var("TR_WARM_ON_BOOT").as_deref() == Ok("1") {
+        let engine_arc = state.engine.clone();
+        let ws = name.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match engine_arc.read().await.warm_models(&ws).await {
+                Ok(()) => {
+                    set_models_warm();
+                    tracing::info!(
+                        workspace = %ws,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "warm-on-mount: models loaded"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(workspace = %ws, error = %e, "warm-on-mount failed")
+                }
+            }
+        });
+    }
+
     // Slice 0 — push live counts into the actor. The state machine
     // moves to `MountState::Mounted` and `SubstrateState::Populated`
     // (or `Empty` when claim_count == 0). All views read from the
