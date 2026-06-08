@@ -18,6 +18,7 @@ pub mod source_store;
 pub mod storage;
 pub mod structural_inserts;
 pub mod summaries;
+pub mod vector_quant;
 pub mod vector;
 pub mod witness_inserts;
 
