@@ -1345,6 +1345,15 @@ pub async fn build_tool_catalog() -> Value {
         ]
     });
     if let Some(arr) = tools.get_mut("tools") {
+        // ── Compiled Workspace query tools (E2–E4). Appended via push()
+        // rather than inlined into the literal above: the `json!` array was
+        // already near the macro recursion limit, and this matches how
+        // tool_trait + external tools are appended below.
+        if let Some(arr_mut) = arr.as_array_mut() {
+            for schema in compiled_workspace_tool_schemas() {
+                arr_mut.push(schema);
+            }
+        }
         annotate_defer_loading(arr);
         // Phase E.6 (2026-05-17) — append any tools registered via the
         // `mcp::tool_trait` registry. The hardcoded 64 above stay as-is
@@ -1373,6 +1382,67 @@ pub async fn build_tool_catalog() -> Value {
         }
     }
     tools
+}
+
+/// The Compiled Workspace query tools (E2–E4), each as its own small `json!`
+/// value so the schemas can be `push`ed onto the catalog without growing the
+/// (already near-recursion-limit) inline `tools/list` literal.
+fn compiled_workspace_tool_schemas() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "name": "repo_map",
+            "description": "PageRank-ranked, token-budgeted file→symbol map of the compiled codebase — the cheap way to orient in an unfamiliar repo instead of reading files. Returns a compact `tree` (file→symbols) plus ranked symbols. Pass `query` to bias the ranking toward a topic. Cheap (no LLM). Use BEFORE reading source when answering 'where/how is X structured'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace":     { "type": "string", "description": "Workspace name." },
+                    "budget_tokens": { "type": "integer", "description": "Approx token budget for the tree (default 1024)." },
+                    "query":         { "type": "string", "description": "Optional — bias ranking toward symbols matching this." }
+                },
+                "required": ["workspace"]
+            }
+        }),
+        serde_json::json!({
+            "name": "code_search_entity",
+            "description": "Find code entities (functions/types) whose symbol matches a keyword. Returns byte-anchored hits (claim_id + file + byte span), exact matches first. Use to locate a symbol before `code_traverse` or `retrieve_entity`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "description": "Workspace name." },
+                    "keyword":   { "type": "string", "description": "Symbol substring to match." }
+                },
+                "required": ["workspace", "keyword"]
+            }
+        }),
+        serde_json::json!({
+            "name": "code_traverse",
+            "description": "Walk the code graph from a symbol (or claim id). 'What calls X' = {symbol:'X', direction:'in', edge_kinds:['calls']}; 'impact of changing X' = same. 'What does X call' = direction:'out'. Returns reached nodes with depth + reaching edge + file:byte. Cheap, deterministic, cycle-safe.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace":  { "type": "string", "description": "Workspace name." },
+                    "symbol":     { "type": "string", "description": "Start symbol (resolved to its best-matching claim)." },
+                    "claim_id":   { "type": "string", "description": "Start claim id (overrides symbol)." },
+                    "direction":  { "type": "string", "enum": ["out", "in", "both"], "description": "out=callees, in=callers (default out)." },
+                    "hops":       { "type": "integer", "description": "Max hops (default 3, capped 16)." },
+                    "edge_kinds": { "type": "array", "items": { "type": "string", "enum": ["calls", "imported_by", "contains"] }, "description": "Edge kinds to follow (default [calls])." }
+                },
+                "required": ["workspace"]
+            }
+        }),
+        serde_json::json!({
+            "name": "summaries",
+            "description": "Read the hierarchical summary ladder (function→file→repo altitude) of the compiled workspace. Read at altitude='repo' first for a one-line overview, then drill to 'file'. Returns summary nodes with their child ids. Requires summaries to have been built (compile with emit_summaries, or POST /summaries/build).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "description": "Workspace name." },
+                    "altitude":  { "type": "string", "enum": ["function", "file", "repo"], "description": "Optional altitude filter." }
+                },
+                "required": ["workspace"]
+            }
+        }),
+    ]
 }
 
 /// Capability-router core: tools always advertised even in `meta` exposure
@@ -2536,6 +2606,103 @@ pub async fn handle_call(
             Ok(result) => mcp_text_result(id, &result),
             Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
         },
+
+        // ── Compiled Workspace query tools (E2–E4) ───────────────────────
+        "repo_map" => {
+            let budget_tokens = arguments
+                .get("budget_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(1024);
+            let query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let req = crate::intelligence::repo_map::RepoMapRequest { budget_tokens, query };
+            match engine.repo_map(ws, &req).await {
+                Ok(result) => mcp_text_result(id, &result),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "code_search_entity" => {
+            let keyword = match arguments.get("keyword").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return JsonRpcResponse::error(id, -32602, "Missing 'keyword'".to_string()),
+            };
+            match engine.search_entity(ws, keyword).await {
+                Ok(hits) => mcp_text_result(id, &serde_json::json!({ "entities": hits })),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "code_traverse" => {
+            use thinkingroot_graph::codegraph::{EdgeKind, TraversalDirection};
+            let direction = match arguments.get("direction").and_then(|v| v.as_str()) {
+                Some("in") => TraversalDirection::In,
+                Some("both") => TraversalDirection::Both,
+                _ => TraversalDirection::Out,
+            };
+            let hops = arguments
+                .get("hops")
+                .and_then(|v| v.as_u64())
+                .map(|n| (n as u32).min(16))
+                .unwrap_or(3);
+            let edge_kinds: Vec<EdgeKind> = arguments
+                .get("edge_kinds")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| match e.as_str() {
+                            Some("imported_by") => Some(EdgeKind::ImportedBy),
+                            Some("contains") => Some(EdgeKind::Contains),
+                            Some("calls") => Some(EdgeKind::Calls),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| vec![EdgeKind::Calls]);
+            // Resolve start node: explicit claim_id wins, else best symbol match.
+            let start_id = match arguments.get("claim_id").and_then(|v| v.as_str()) {
+                Some(cid) if !cid.is_empty() => cid.to_string(),
+                _ => {
+                    let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                    if symbol.is_empty() {
+                        return mcp_text_result(
+                            id,
+                            &serde_json::json!({ "nodes": [], "start": null }),
+                        );
+                    }
+                    match engine.search_entity(ws, symbol).await {
+                        Ok(hits) => match hits.into_iter().next() {
+                            Some(h) => h.claim_id,
+                            None => {
+                                return mcp_text_result(
+                                    id,
+                                    &serde_json::json!({ "nodes": [], "start": null }),
+                                );
+                            }
+                        },
+                        Err(e) => return JsonRpcResponse::error(id, -32603, e.to_string()),
+                    }
+                }
+            };
+            match engine.traverse_graph(ws, &start_id, direction, hops, &edge_kinds).await {
+                Ok(nodes) => {
+                    mcp_text_result(id, &serde_json::json!({ "nodes": nodes, "start": start_id }))
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
+
+        "summaries" => {
+            let altitude = arguments.get("altitude").and_then(|v| v.as_str());
+            match engine.get_summaries(ws, altitude).await {
+                Ok(nodes) => mcp_text_result(id, &serde_json::json!({ "summaries": nodes })),
+                Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            }
+        }
 
         // ── KVC branch tools ─────────────────────────────────────────────
         "create_branch" => {
@@ -5319,6 +5486,49 @@ mod observer_tool_listing_tests {
             !meta.iter().any(|n| n == "rebase_branch"),
             "meta must drop long-tail tools; got {meta:?}"
         );
+    }
+
+    // C2: the Compiled Workspace query tools (E2–E4) are advertised in the
+    // catalog so the gateway's proxy_mcp forwards them to MCP clients.
+    #[tokio::test]
+    async fn compiled_workspace_tools_are_advertised() {
+        let cat = super::build_tool_catalog().await;
+        let names: Vec<String> = cat
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for must in ["repo_map", "code_search_entity", "code_traverse", "summaries"] {
+            assert!(
+                names.iter().any(|n| n == must),
+                "C2: `{must}` must be advertised in tools/list; got {names:?}"
+            );
+        }
+        // Each declares `workspace` required (gateway routes by it).
+        let by_name: std::collections::HashMap<&str, &serde_json::Value> = cat
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|n| (n, t)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tool in ["repo_map", "code_search_entity", "code_traverse", "summaries"] {
+            let req = by_name[tool]
+                .get("inputSchema")
+                .and_then(|s| s.get("required"))
+                .and_then(|r| r.as_array())
+                .expect("required array");
+            assert!(
+                req.iter().any(|v| v.as_str() == Some("workspace")),
+                "{tool} must require workspace"
+            );
+        }
     }
 
     #[tokio::test]
