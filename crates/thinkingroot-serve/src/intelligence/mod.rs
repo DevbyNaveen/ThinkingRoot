@@ -8,6 +8,7 @@ pub mod byte_span;
 pub mod citation_markers;
 pub mod citations;
 pub mod compressor;
+pub mod repo_map;
 pub mod diff_cert;
 pub mod dsl;
 pub mod engram;

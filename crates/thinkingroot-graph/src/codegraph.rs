@@ -172,6 +172,34 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Every symbol-bearing code-def claim (FunctionDef/TypeDef) — the
+    /// repo-map node set (E3). Empty workspace → empty Vec.
+    pub fn list_code_entities(&self) -> Result<Vec<EntityHit>> {
+        let rows = self
+            .query(
+                "?[id, symbol, claim_type, source_path, byte_start, byte_end] := \
+                 *claims{id, symbol, claim_type, source_path, byte_start, byte_end}, \
+                 symbol != ''",
+                Default::default(),
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_code_entities: {e}")))?;
+        let mut out = Vec::with_capacity(rows.rows.len());
+        for row in &rows.rows {
+            if row.len() < 6 {
+                continue;
+            }
+            out.push(EntityHit {
+                claim_id: dv_str(&row[0]),
+                symbol: dv_str(&row[1]),
+                claim_type: dv_str(&row[2]),
+                source_path: dv_str(&row[3]),
+                byte_start: dv_u64(&row[4]),
+                byte_end: dv_u64(&row[5]),
+            });
+        }
+        Ok(out)
+    }
+
     /// Full byte-anchored detail of one entity by claim id. Unknown id →
     /// `None` (honesty rule: absence, never a fabricated row).
     pub fn retrieve_entity(&self, claim_id: &str) -> Result<Option<EntityDetail>> {

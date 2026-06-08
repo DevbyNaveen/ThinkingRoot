@@ -689,6 +689,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/code/search-entity", get(code_search_entity_handler))
             .route("/ws/{ws}/code/entity/{id}", get(code_retrieve_entity_handler))
             .route("/ws/{ws}/code/traverse", post(code_traverse_handler))
+            .route("/ws/{ws}/repo-map", post(repo_map_handler))
             .route("/ws/{ws}/claims", get(list_claims))
             .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
             // Witness Mesh — new substrate read endpoints. Lives
@@ -2640,6 +2641,43 @@ async fn code_traverse_handler(
         Ok(nodes) => {
             ok_response(serde_json::json!({ "nodes": nodes, "start": start_id })).into_response()
         }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+fn default_repo_budget() -> usize {
+    1024
+}
+
+#[derive(Deserialize)]
+struct RepoMapQuery {
+    #[serde(default = "default_repo_budget")]
+    budget: usize,
+}
+
+#[derive(Deserialize, Default)]
+struct RepoMapBody {
+    /// Overrides `?budget=` when present.
+    #[serde(default)]
+    budget_tokens: Option<usize>,
+    /// Optional query — biases PageRank personalization toward matches.
+    #[serde(default)]
+    query: Option<String>,
+}
+
+async fn repo_map_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(q): Query<RepoMapQuery>,
+    Json(body): Json<RepoMapBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let req = crate::intelligence::repo_map::RepoMapRequest {
+        budget_tokens: body.budget_tokens.unwrap_or(q.budget),
+        query: body.query,
+    };
+    match engine.repo_map(&ws, &req).await {
+        Ok(map) => ok_response(map).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
