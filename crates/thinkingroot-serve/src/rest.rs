@@ -6499,6 +6499,12 @@ struct AskResponseBody {
     answer: String,
     claims_used: usize,
     category: String,
+    /// Verified, byte-anchored citations (mechanical citation gate).
+    citations: Vec<crate::intelligence::citations::Citation>,
+    /// Fraction of emitted `[claim:<id>]` markers that verified, in [0,1].
+    answer_confidence: f32,
+    /// True when the answer was refused (all citations were fabricated).
+    refused: bool,
 }
 
 async fn ask_handler(
@@ -6600,6 +6606,26 @@ async fn ask_handler(
 
     let result = ask(&engine, llm, &req).await;
 
+    // ── Mechanical citation gate ────────────────────────────────────
+    // Verify every `[claim:<id>]` marker against the grounding set the
+    // model was actually shown; strip fabricated provenance; refuse the
+    // answer outright if EVERY citation was fabricated. Inert (no-op)
+    // when the answer carries no markers — preserving the Memory /
+    // LongMemEval persona wire behaviour.
+    let gate =
+        crate::intelligence::citations::verify_citations(&engine, &ws, &result.answer, &result.grounding)
+            .await;
+
+    let category = result.category.clone();
+    let (answer, claims_used) = if gate.refused {
+        (
+            "I don't have enough verified information to answer that.".to_string(),
+            0,
+        )
+    } else {
+        (result.answer, result.claims_used)
+    };
+
     state
         .publish_activity(
             crate::activity::ActivityEvent::new(
@@ -6607,22 +6633,29 @@ async fn ask_handler(
                 crate::activity::ActivityClass::Retrieval,
                 "ask.grounded",
                 format!(
-                    "\"{}\" → {} claims",
+                    "\"{}\" → {} claims, {} cited",
                     crate::activity::truncate(&body.question, 48),
-                    result.claims_used
+                    claims_used,
+                    gate.citations.len()
                 ),
             )
             .with_detail(serde_json::json!({
-                "claims": result.claims_used,
-                "category": result.category,
+                "claims": claims_used,
+                "category": category,
+                "cited": gate.citations.len(),
+                "stripped": gate.stripped.len(),
+                "refused": gate.refused,
             })),
         )
         .await;
 
     ok_response(AskResponseBody {
-        answer: result.answer,
-        claims_used: result.claims_used,
-        category: result.category,
+        answer,
+        claims_used,
+        category,
+        citations: gate.citations,
+        answer_confidence: gate.answer_confidence,
+        refused: gate.refused,
     })
     .into_response()
 }
@@ -6770,7 +6803,7 @@ async fn ask_stream_handler(
                     Event::default().event("final").data(final_payload.to_string())
                 );
             }
-            StreamingAnswer::Stream { mut stream, claims_used, category } => {
+            StreamingAnswer::Stream { mut stream, claims_used, category, grounding } => {
                 let meta = serde_json::json!({
                     "claims_used": claims_used,
                     "category": category,
@@ -6779,10 +6812,15 @@ async fn ask_stream_handler(
                     Event::default().event("meta").data(meta.to_string())
                 );
                 let mut truncated = false;
+                // Accumulate the streamed answer so the citation gate can
+                // verify its `[claim:<id>]` markers once the full text is
+                // assembled (markers only resolve over the complete reply).
+                let mut answer_acc = String::new();
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(chunk) => {
                             if !chunk.text.is_empty() {
+                                answer_acc.push_str(&chunk.text);
                                 let payload =
                                     serde_json::json!({ "text": chunk.text });
                                 yield Ok(
@@ -6807,6 +6845,23 @@ async fn ask_stream_handler(
                         }
                     }
                 }
+                // Mechanical citation gate (sync core — the engine handle
+                // was released before the stream opened). Emitted as a
+                // terminal `citation` event before `final`; the wire order
+                // is meta → token* → citation → final.
+                let gate = crate::intelligence::citations::verify_citations_sync(
+                    &answer_acc,
+                    &grounding,
+                );
+                let citation_payload = serde_json::json!({
+                    "citations": gate.citations,
+                    "stripped": gate.stripped,
+                    "answer_confidence": gate.answer_confidence,
+                    "refused": gate.refused,
+                });
+                yield Ok(
+                    Event::default().event("citation").data(citation_payload.to_string())
+                );
                 let final_payload = serde_json::json!({
                     "claims_used": claims_used,
                     "category": category,

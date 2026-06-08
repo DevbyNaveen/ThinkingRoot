@@ -660,6 +660,10 @@ pub struct AskResponse {
     pub answer: String,
     pub claims_used: usize,
     pub category: String,
+    /// The retrieved claims actually shown to the model — the grounding
+    /// set the citation gate verifies `[claim:<id>]` markers against.
+    /// Empty for the chitchat / no-retrieval paths.
+    pub grounding: Vec<crate::engine::ClaimSearchHit>,
 }
 
 /// Run the full hybrid retrieval + synthesis pipeline.
@@ -707,6 +711,7 @@ pub async fn ask(
             answer: "I don't have enough information to answer that.".to_string(),
             claims_used: 0,
             category: req.category.to_string(),
+            grounding: Vec::new(),
         };
     }
 
@@ -715,6 +720,7 @@ pub async fn ask(
             answer: claims[0].statement.clone(),
             claims_used,
             category: req.category.to_string(),
+            grounding: claims,
         };
     };
 
@@ -723,6 +729,7 @@ pub async fn ask(
         answer,
         claims_used,
         category: req.category.to_string(),
+        grounding: claims,
     }
 }
 
@@ -749,6 +756,10 @@ pub enum StreamingAnswer {
         stream: ChatStream,
         claims_used: usize,
         category: String,
+        /// The retrieved claims shown to the model — the grounding set the
+        /// SSE handler verifies streamed `[claim:<id>]` markers against at
+        /// stream end before emitting the `citation` event.
+        grounding: Vec<crate::engine::ClaimSearchHit>,
     },
 }
 
@@ -805,6 +816,7 @@ pub async fn ask_streaming(
             stream,
             claims_used,
             category,
+            grounding: claims,
         },
         Err(e) => {
             // Connect-time failure — fall back to the highest-confidence
@@ -1053,6 +1065,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
             answer: chitchat_fallback(req.question),
             claims_used: 0,
             category,
+            grounding: Vec::new(),
         };
     };
 
@@ -1069,6 +1082,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
             answer,
             claims_used: 0,
             category,
+            grounding: Vec::new(),
         },
         Ok(Err(e)) => {
             tracing::warn!("synthesizer: chitchat LLM error: {e}");
@@ -1076,6 +1090,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 answer: chitchat_fallback(req.question),
                 claims_used: 0,
                 category,
+                grounding: Vec::new(),
             }
         }
         Err(_) => {
@@ -1084,6 +1099,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 answer: chitchat_fallback(req.question),
                 claims_used: 0,
                 category,
+                grounding: Vec::new(),
             }
         }
     }
@@ -1112,6 +1128,7 @@ async fn chitchat_streaming(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -
             stream,
             claims_used: 0,
             category,
+            grounding: Vec::new(),
         },
         Err(e) => {
             tracing::warn!("synthesizer: chitchat chat_stream open failed: {e}");

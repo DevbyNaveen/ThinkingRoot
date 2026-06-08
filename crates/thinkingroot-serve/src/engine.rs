@@ -3334,6 +3334,22 @@ impl QueryEngine {
         storage.graph.get_witness(id)
     }
 
+    /// Resolve a citation's "claim id" (a witness id in the Witness-Mesh
+    /// substrate) to its byte-anchored source span(s). The citation gate
+    /// (`intelligence::citations`) calls this to enrich a verified
+    /// `[claim:<id>]` marker with a byte-precise, source-anchored pointer.
+    /// Returns an empty Vec for an unknown id — absence is honest, not an
+    /// error.
+    pub async fn get_witnesses_for_claim(
+        &self,
+        ws: &str,
+        claim_id: &str,
+    ) -> Result<Vec<thinkingroot_graph::witness_inserts::ResolvedCitationSpan>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_witnesses_for_claim(claim_id)
+    }
+
     /// Count the witnesses table for a workspace. Used by the
     /// migration-status REST surface and by tests verifying that
     /// `root compile` populated the new substrate.

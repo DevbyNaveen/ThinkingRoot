@@ -34,6 +34,21 @@ use crate::graph::GraphStore;
 /// budgeting for combined-graph operations is predictable.
 const CHUNK: usize = 500;
 
+/// A citation's resolved byte anchor — the witness span(s) a claim/witness
+/// id derives from, joined to its source URI. Returned by
+/// [`GraphStore::get_witnesses_for_claim`] so the citation gate can hand the
+/// UI a byte-precise, source-anchored pointer (`file` + `[start,end)` +
+/// `content_blake3` for tamper-evident verification).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCitationSpan {
+    pub source_id: String,
+    pub source_uri: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub content_blake3: String,
+    pub symbol: Option<String>,
+}
+
 fn s(value: impl Into<String>) -> DataValue {
     DataValue::Str(value.into().into())
 }
@@ -544,6 +559,69 @@ impl GraphStore {
             return Ok(None);
         }
         parse_witness_row(&result.rows[0]).map(Some)
+    }
+
+    /// Resolve a "claim id" (which IS a witness id in the Witness-Mesh
+    /// substrate) to its byte-anchored source span(s), joined to the
+    /// source URI. Used by the citation gate to turn a verified
+    /// `[claim:<id>]` marker into a byte-precise, source-anchored
+    /// pointer the UI can highlight + verify against `content_blake3`.
+    ///
+    /// Returns an empty Vec when the id is unknown — honesty rule:
+    /// absence is an empty list, never a fabricated span.
+    pub fn get_witnesses_for_claim(&self, claim_id: &str) -> Result<Vec<ResolvedCitationSpan>> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), s(claim_id.to_string()));
+        // Bind the witness id to a capture var (`wid`) then constrain it,
+        // matching `get_witness`'s `$param`-on-column avoidance. The
+        // `source_id` variable is shared across the `witnesses` and
+        // `sources` atoms, so Datalog unifies them — a natural join that
+        // yields the source URI alongside the denormalised byte anchor.
+        let result = self
+            .query(
+                "?[source_id, uri, byte_start, byte_end, content_blake3, symbol] := \
+                  *witnesses{id: wid, source_id, byte_start, byte_end, content_blake3, symbol}, \
+                  wid = $cid, \
+                  *sources{id: source_id, uri}",
+                params,
+            )
+            .map_err(|e| {
+                Error::GraphStorage(format!("get_witnesses_for_claim({claim_id}): {e}"))
+            })?;
+
+        fn dv_str(v: &DataValue) -> String {
+            match v {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            }
+        }
+        fn dv_u64(v: &DataValue) -> u64 {
+            match v {
+                DataValue::Num(Num::Int(i)) => (*i).max(0) as u64,
+                DataValue::Num(Num::Float(f)) => f.max(0.0) as u64,
+                _ => 0,
+            }
+        }
+
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if row.len() < 6 {
+                continue;
+            }
+            let symbol = match &row[5] {
+                DataValue::Str(s) if !s.is_empty() => Some(s.to_string()),
+                _ => None,
+            };
+            out.push(ResolvedCitationSpan {
+                source_id: dv_str(&row[0]),
+                source_uri: dv_str(&row[1]),
+                byte_start: dv_u64(&row[2]),
+                byte_end: dv_u64(&row[3]),
+                content_blake3: dv_str(&row[4]),
+                symbol,
+            });
+        }
+        Ok(out)
     }
 
     /// List Witnesses scoped to a workspace, optionally capped at

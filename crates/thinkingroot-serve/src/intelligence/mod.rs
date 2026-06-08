@@ -6,6 +6,7 @@ pub mod augmenter;
 pub mod builtin_tools;
 pub mod byte_span;
 pub mod citation_markers;
+pub mod citations;
 pub mod compressor;
 pub mod diff_cert;
 pub mod dsl;
