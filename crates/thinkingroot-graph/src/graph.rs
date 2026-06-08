@@ -698,6 +698,21 @@ impl GraphStore {
                 content_blake3: String
             }",
 
+            // §4.1b code_imports — import/use edges. from_source imports
+            // import_path; to_source + is_external resolved lazily at
+            // traversal time (suffix-match against sources.uri).
+            ":create code_imports {
+                id: String
+                =>
+                from_source: String,
+                import_path: String,
+                to_source: String default '',
+                is_external: Bool default false,
+                byte_start: Int,
+                byte_end: Int,
+                content_blake3: String
+            }",
+
             // §4.2 doc_tags — structured documentation annotations
             // (@param/@returns/@throws/@deprecated/@see) emitted by the
             // doctags.rs parser into ChunkMetadata.doc_tags.
@@ -1230,6 +1245,9 @@ impl GraphStore {
             "::index create function_calls:by_callee_name { callee_name }",
             "::index create function_calls:by_callee_id { callee_claim_id }",
             "::index create function_calls:by_source { source_id }",
+            "::index create code_imports:by_from { from_source }",
+            "::index create code_imports:by_to { to_source }",
+            "::index create code_imports:by_path { import_path }",
             "::index create doc_tags:by_claim { claim_id }",
             "::index create doc_tags:by_kind { kind }",
             "::index create doc_tags:by_source { source_id }",

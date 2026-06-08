@@ -59,6 +59,25 @@ pub struct CodeLink {
     pub content_blake3: String,
 }
 
+/// §4.3b code_imports — one row per import/use statement. `to_source` +
+/// `is_external` are resolved lazily (suffix-match against `sources.uri`) at
+/// traversal time; the persisted row carries the raw `import_path` string and
+/// its byte anchor. `from_source` is the owning (importing) source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeImport {
+    pub id: String,
+    pub from_source: String,
+    pub import_path: String,
+    /// Resolved at traversal time (empty until a suffix-match resolves it).
+    pub to_source: String,
+    /// True when the import path resolves outside the workspace (best-effort
+    /// heuristic at emit; refined at traversal).
+    pub is_external: bool,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub content_blake3: String,
+}
+
 /// §4.4 code_signatures — function/type shape row. Keyed on `claim_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeSignature {

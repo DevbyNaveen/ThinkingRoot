@@ -1,6 +1,7 @@
 pub mod aep_queries;
 pub mod artifact_nodes;
 pub mod capsule;
+pub mod codegraph;
 pub mod cognition_inserts;
 pub mod cognition_merge;
 pub mod graph;

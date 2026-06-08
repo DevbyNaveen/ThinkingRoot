@@ -22,9 +22,9 @@ use thinkingroot_core::{Error, Result, SourceId};
 
 use crate::graph::GraphStore;
 use crate::rows::{
-    CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow, DocTagRow,
-    FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk, SourceAnnotation,
-    SourceReference, TestAnnotation,
+    CodeImport, CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow,
+    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
+    SourceAnnotation, SourceReference, TestAnnotation,
 };
 
 const CHUNK: usize = 500;
@@ -170,6 +170,35 @@ impl GraphStore {
             self.query(
                 "?[id, source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3] <- $rows \
                  :put code_links {id => source_id, chunk_id, url, link_text, is_internal, target_source_id, byte_start, byte_end, content_blake3}",
+                params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// §4.1b batch-insert for code_imports. Keyed on `id`.
+    pub fn insert_code_imports_batch(&self, rows: &[CodeImport]) -> Result<()> {
+        for chunk in rows.chunks(CHUNK) {
+            let payload: Vec<DataValue> = chunk
+                .iter()
+                .map(|r| {
+                    DataValue::List(vec![
+                        s(&r.id),
+                        s(&r.from_source),
+                        s(&r.import_path),
+                        s(&r.to_source),
+                        b(r.is_external),
+                        i(r.byte_start as i64),
+                        i(r.byte_end as i64),
+                        s(&r.content_blake3),
+                    ])
+                })
+                .collect();
+            let mut params = BTreeMap::new();
+            params.insert("rows".into(), DataValue::List(payload));
+            self.query(
+                "?[id, from_source, import_path, to_source, is_external, byte_start, byte_end, content_blake3] <- $rows \
+                 :put code_imports {id => from_source, import_path, to_source, is_external, byte_start, byte_end, content_blake3}",
                 params,
             )?;
         }
@@ -1375,6 +1404,7 @@ impl GraphStore {
 const STRUCTURAL_COVERAGE_SCRIPT: &str = r#"
     covered[source_id, byte_start, byte_end] := *claims{source_id, byte_start, byte_end}
     covered[source_id, byte_start, byte_end] := *function_calls{source_id, byte_start, byte_end}
+    covered[source_id, byte_start, byte_end] := *code_imports{from_source: source_id, byte_start, byte_end}
     covered[source_id, byte_start, byte_end] := *doc_tags{source_id, byte_start, byte_end}
     covered[source_id, byte_start, byte_end] := *code_links{source_id, byte_start, byte_end}
     covered[source_id, byte_start, byte_end] := *code_signatures{source_id, byte_start, byte_end}

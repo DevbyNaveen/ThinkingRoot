@@ -17,6 +17,7 @@ pub struct StructuralTableSpec {
 
 pub const STRUCTURAL_TABLES: &[StructuralTableSpec] = &[
     StructuralTableSpec { name: "function_calls",     source_id_column: "source_id" },
+    StructuralTableSpec { name: "code_imports",        source_id_column: "from_source" },
     StructuralTableSpec { name: "headings",           source_id_column: "source_id" },
     StructuralTableSpec { name: "doc_tags",           source_id_column: "source_id" },
     StructuralTableSpec { name: "code_links",         source_id_column: "source_id" },
@@ -118,8 +119,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn structural_tables_count_is_16() {
-        assert_eq!(STRUCTURAL_TABLES.len(), 16);
+    fn structural_tables_count_is_17() {
+        assert_eq!(STRUCTURAL_TABLES.len(), 17);
     }
 
     #[test]

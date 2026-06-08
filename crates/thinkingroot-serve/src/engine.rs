@@ -3350,6 +3350,59 @@ impl QueryEngine {
         storage.graph.get_witnesses_for_claim(claim_id)
     }
 
+    // ─── E2: code-graph traversal API ───────────────────────────────
+
+    /// Find code entities (FunctionDef/TypeDef) whose symbol contains
+    /// `keyword`. See [`thinkingroot_graph::codegraph::GraphStore::search_entity`].
+    pub async fn search_entity(
+        &self,
+        ws: &str,
+        keyword: &str,
+    ) -> Result<Vec<thinkingroot_graph::codegraph::EntityHit>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.search_entity(keyword)
+    }
+
+    /// Full byte-anchored detail of one entity by claim id. Unknown id → None.
+    pub async fn retrieve_entity(
+        &self,
+        ws: &str,
+        claim_id: &str,
+    ) -> Result<Option<thinkingroot_graph::codegraph::EntityDetail>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.retrieve_entity(claim_id)
+    }
+
+    /// Bounded BFS over the code graph from a start claim id.
+    pub async fn traverse_graph(
+        &self,
+        ws: &str,
+        start_claim_id: &str,
+        dir: thinkingroot_graph::codegraph::TraversalDirection,
+        max_hops: u32,
+        edge_kinds: &[thinkingroot_graph::codegraph::EdgeKind],
+    ) -> Result<Vec<thinkingroot_graph::codegraph::TraversedNode>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage
+            .graph
+            .traverse_graph(start_claim_id, dir, max_hops, edge_kinds)
+    }
+
+    /// Reverse-call transitive closure (blast radius) for a claim id.
+    pub async fn impact(
+        &self,
+        ws: &str,
+        claim_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<thinkingroot_graph::codegraph::TraversedNode>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.impact(claim_id, max_hops)
+    }
+
     /// Count the witnesses table for a workspace. Used by the
     /// migration-status REST surface and by tests verifying that
     /// `root compile` populated the new substrate.

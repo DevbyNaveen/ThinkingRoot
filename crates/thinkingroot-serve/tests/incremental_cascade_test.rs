@@ -552,12 +552,12 @@ fn file_delete_cascades_code_metrics() {
 }
 
 #[test]
-fn all_16_tables_have_cascade_entry() {
+fn all_17_tables_have_cascade_entry() {
     use thinkingroot_core::STRUCTURAL_TABLES;
     assert_eq!(
         STRUCTURAL_TABLES.len(),
-        16,
-        "registry must list exactly 16 tables"
+        17,
+        "registry must list exactly 17 tables"
     );
     for spec in STRUCTURAL_TABLES {
         assert!(!spec.name.is_empty());

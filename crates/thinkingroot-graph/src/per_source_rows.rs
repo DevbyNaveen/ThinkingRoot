@@ -59,8 +59,8 @@ use thinkingroot_core::{Error, Result};
 
 use crate::graph::GraphStore;
 use crate::rows::{
-    CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow, DocTagRow,
-    FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
+    CodeImport, CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow,
+    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
     SourceAnnotation, SourceReference, TestAnnotation,
 };
 
@@ -72,6 +72,7 @@ use crate::rows::{
 #[derive(Debug, Default, Clone)]
 pub struct PerSourceRows {
     pub function_calls: Vec<FunctionCall>,
+    pub code_imports: Vec<CodeImport>,
     pub headings: Vec<HeadingRow>,
     pub doc_tags: Vec<DocTagRow>,
     pub code_links: Vec<CodeLink>,
@@ -100,6 +101,7 @@ impl PerSourceRows {
     /// sources they never touched in this compile.
     pub fn is_empty(&self) -> bool {
         self.function_calls.is_empty()
+            && self.code_imports.is_empty()
             && self.headings.is_empty()
             && self.doc_tags.is_empty()
             && self.code_links.is_empty()
@@ -125,6 +127,9 @@ impl PerSourceRows {
     pub fn append_put_scripts(&self, tx: &MultiTransaction) -> Result<()> {
         if !self.function_calls.is_empty() {
             run_put(tx, function_calls_put_spec(&self.function_calls))?;
+        }
+        if !self.code_imports.is_empty() {
+            run_put(tx, code_imports_put_spec(&self.code_imports))?;
         }
         if !self.headings.is_empty() {
             run_put(tx, headings_put_spec(&self.headings))?;
@@ -398,6 +403,29 @@ fn function_calls_put_spec(rows: &[FunctionCall]) -> PutSpec {
     put_spec(
         "?[id, caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3] <- $rows \
          :put function_calls {id => caller_claim_id, callee_name, callee_claim_id, source_id, byte_start, byte_end, content_blake3}",
+        payload,
+    )
+}
+
+fn code_imports_put_spec(rows: &[CodeImport]) -> PutSpec {
+    let payload: Vec<DataValue> = rows
+        .iter()
+        .map(|r| {
+            DataValue::List(vec![
+                s(&r.id),
+                s(&r.from_source),
+                s(&r.import_path),
+                s(&r.to_source),
+                b(r.is_external),
+                i(r.byte_start as i64),
+                i(r.byte_end as i64),
+                s(&r.content_blake3),
+            ])
+        })
+        .collect();
+    put_spec(
+        "?[id, from_source, import_path, to_source, is_external, byte_start, byte_end, content_blake3] <- $rows \
+         :put code_imports {id => from_source, import_path, to_source, is_external, byte_start, byte_end, content_blake3}",
         payload,
     )
 }

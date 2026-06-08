@@ -686,6 +686,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/entities", get(list_entities))
             .route("/ws/{ws}/entities/{name}", get(get_entity))
+            .route("/ws/{ws}/code/search-entity", get(code_search_entity_handler))
+            .route("/ws/{ws}/code/entity/{id}", get(code_retrieve_entity_handler))
+            .route("/ws/{ws}/code/traverse", post(code_traverse_handler))
             .route("/ws/{ws}/claims", get(list_claims))
             .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
             // Witness Mesh — new substrate read endpoints. Lives
@@ -2540,6 +2543,102 @@ async fn list_witnesses_handler(
                 }
             }
             ok_response(witnesses).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ── E2: code-graph traversal API ─────────────────────────────────
+
+#[derive(Deserialize)]
+struct CodeSearchEntityParams {
+    keyword: String,
+}
+
+async fn code_search_entity_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<CodeSearchEntityParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.search_entity(&ws, &params.keyword).await {
+        Ok(entities) => ok_response(serde_json::json!({ "entities": entities })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn code_retrieve_entity_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.retrieve_entity(&ws, &id).await {
+        // 404=empty, honesty rule: unknown id returns {"entity": null}, not 500.
+        Ok(Some(detail)) => ok_response(detail).into_response(),
+        Ok(None) => ok_response(serde_json::json!({ "entity": null })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+fn default_traverse_direction() -> thinkingroot_graph::codegraph::TraversalDirection {
+    thinkingroot_graph::codegraph::TraversalDirection::Out
+}
+fn default_traverse_hops() -> u32 {
+    3
+}
+fn default_traverse_edge_kinds() -> Vec<thinkingroot_graph::codegraph::EdgeKind> {
+    vec![thinkingroot_graph::codegraph::EdgeKind::Calls]
+}
+
+#[derive(Deserialize)]
+struct CodeTraverseBody {
+    /// Start by symbol name (resolved to its best-matching claim id) …
+    #[serde(default)]
+    symbol: Option<String>,
+    /// … or directly by claim id (takes precedence over `symbol`).
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default = "default_traverse_direction")]
+    direction: thinkingroot_graph::codegraph::TraversalDirection,
+    #[serde(default = "default_traverse_hops")]
+    hops: u32,
+    #[serde(default = "default_traverse_edge_kinds")]
+    edge_kinds: Vec<thinkingroot_graph::codegraph::EdgeKind>,
+}
+
+async fn code_traverse_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<CodeTraverseBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    // Resolve the start node: explicit claim_id wins; otherwise resolve the
+    // symbol to its best match. Unknown symbol → empty result (honesty).
+    let start_id = match body.claim_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            let Some(symbol) = body.symbol.as_ref().filter(|s| !s.is_empty()) else {
+                return ok_response(serde_json::json!({ "nodes": [], "start": null })).into_response();
+            };
+            match engine.search_entity(&ws, symbol).await {
+                Ok(hits) => match hits.into_iter().next() {
+                    Some(h) => h.claim_id,
+                    None => {
+                        return ok_response(serde_json::json!({ "nodes": [], "start": null }))
+                            .into_response();
+                    }
+                },
+                Err(e) => return match_engine_error(e),
+            }
+        }
+    };
+    let hops = body.hops.min(16); // bound the walk
+    match engine
+        .traverse_graph(&ws, &start_id, body.direction, hops, &body.edge_kinds)
+        .await
+    {
+        Ok(nodes) => {
+            ok_response(serde_json::json!({ "nodes": nodes, "start": start_id })).into_response()
         }
         Err(e) => match_engine_error(e),
     }

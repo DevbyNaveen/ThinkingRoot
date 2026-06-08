@@ -37,8 +37,8 @@ use thinkingroot_core::ir::{Chunk, ChunkType, DocumentIR};
 use thinkingroot_core::types::{ContentHash, SourceId};
 use thinkingroot_extract::ExtractionOutput;
 use thinkingroot_graph::rows::{
-    CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow, DocTagRow,
-    FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
+    CodeImport, CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow,
+    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
     SourceAnnotation, TestAnnotation,
 };
 use thinkingroot_graph::Blake3Cache;
@@ -89,6 +89,7 @@ impl Phase67Stats {
 #[derive(Default)]
 struct PerTableBuckets {
     function_calls: Vec<FunctionCall>,
+    code_imports: Vec<CodeImport>,
     doc_tags: Vec<DocTagRow>,
     code_links: Vec<CodeLink>,
     code_signatures: Vec<CodeSignature>,
@@ -377,6 +378,9 @@ fn phase_6_7_per_source(
     for r in &buckets.function_calls {
         covered.push((r.byte_start, r.byte_end));
     }
+    for r in &buckets.code_imports {
+        covered.push((r.byte_start, r.byte_end));
+    }
     for r in &buckets.doc_tags {
         covered.push((r.byte_start, r.byte_end));
     }
@@ -477,6 +481,7 @@ fn phase_6_7_per_source(
 fn drain_buckets_to_per_source_rows(buckets: &mut PerTableBuckets) -> PerSourceRows {
     PerSourceRows {
         function_calls: std::mem::take(&mut buckets.function_calls),
+        code_imports: std::mem::take(&mut buckets.code_imports),
         doc_tags: std::mem::take(&mut buckets.doc_tags),
         code_links: std::mem::take(&mut buckets.code_links),
         code_signatures: std::mem::take(&mut buckets.code_signatures),
@@ -503,6 +508,7 @@ fn drain_buckets_to_per_source_rows(buckets: &mut PerTableBuckets) -> PerSourceR
 /// so the counts always reflect what is durably written.
 fn record_per_source_counts(stats: &mut Phase67Stats, rows: &PerSourceRows) {
     stats.record("function_calls", rows.function_calls.len());
+    stats.record("code_imports", rows.code_imports.len());
     stats.record("doc_tags", rows.doc_tags.len());
     stats.record("code_links", rows.code_links.len());
     stats.record("code_signatures", rows.code_signatures.len());
@@ -667,12 +673,18 @@ fn dispatch_chunk(
         ChunkType::DataRow => {
             emit_data_row(chunk, source_id, cache, buckets);
         }
-        // List, Table, Import, ManifestDependency — no per-table emitter
-        // here; they fall through to chunks_residual when no claim covers
-        // their byte range. Import + ManifestDependency claims are emitted
-        // by the structural extractor at Phase 2 and carry their
-        // byte ranges, so the residual fallback rarely fires for them.
-        ChunkType::List | ChunkType::Table | ChunkType::Import | ChunkType::ManifestDependency => {}
+        // Import — emit a code_imports edge (E2). The raw import path is
+        // parsed from the chunk text; to_source/is_external are resolved
+        // lazily at traversal time.
+        ChunkType::Import => {
+            emit_code_imports(chunk, source_id, cache, buckets);
+        }
+        // List, Table, ManifestDependency — no per-table emitter here; they
+        // fall through to chunks_residual when no claim covers their byte
+        // range. ManifestDependency claims are emitted by the structural
+        // extractor at Phase 2 and carry their byte ranges, so the residual
+        // fallback rarely fires for them.
+        ChunkType::List | ChunkType::Table | ChunkType::ManifestDependency => {}
     }
     let _ = (doc, bytes); // reserved for future emitters that need the full byte slice
 }
@@ -882,6 +894,93 @@ fn emit_code_links(
             content_blake3: blake3_str.clone(),
         });
     }
+}
+
+/// Emit a `code_imports` row for an Import chunk. The raw import-path string
+/// is parsed from the chunk text with a language-agnostic heuristic;
+/// `to_source` / `is_external` are left for lazy resolution at traversal time.
+fn emit_code_imports(
+    chunk: &Chunk,
+    source_id: &str,
+    cache: &mut Blake3Cache,
+    buckets: &mut PerTableBuckets,
+) {
+    let import_path = extract_import_path(&chunk.content);
+    if import_path.is_empty() {
+        return;
+    }
+    let blake3_str = cache.get(chunk.byte_start, chunk.byte_end).to_string();
+    let id = stable_row_id(
+        "code_imports",
+        source_id,
+        chunk.byte_start,
+        chunk.byte_end,
+        &import_path,
+    );
+    buckets.code_imports.push(CodeImport {
+        id,
+        from_source: source_id.to_string(),
+        import_path,
+        to_source: String::new(),
+        is_external: false,
+        byte_start: chunk.byte_start,
+        byte_end: chunk.byte_end,
+        content_blake3: blake3_str,
+    });
+}
+
+/// Parse the module/path string from a raw import/use statement across the
+/// supported languages. Handles quoted paths (JS/TS/Go/C `"x"` / `<x>`),
+/// `from X import Y` (Python → `X`), and dotted/`::` paths (Rust/Java/C#).
+/// Returns an empty string when nothing usable parses (caller skips the row).
+fn extract_import_path(content: &str) -> String {
+    let line = content
+        .trim()
+        .trim_start_matches("#")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    // Quoted or angle-bracketed path (JS/TS `from "x"`, Go `"x"`, C `<x>`).
+    if let Some(start) = line.find(['"', '\'']) {
+        let quote = line.as_bytes()[start] as char;
+        if let Some(end_rel) = line[start + 1..].find(quote) {
+            let inner = &line[start + 1..start + 1 + end_rel];
+            if !inner.trim().is_empty() {
+                return inner.trim().to_string();
+            }
+        }
+    }
+    if let Some(start) = line.find('<') {
+        if let Some(end_rel) = line[start + 1..].find('>') {
+            let inner = &line[start + 1..start + 1 + end_rel];
+            if !inner.trim().is_empty() {
+                return inner.trim().to_string();
+            }
+        }
+    }
+    // Python `from X import Y` → module X.
+    let lower = line.to_lowercase();
+    if lower.starts_with("from ") {
+        let after = &line[5..];
+        if let Some(idx) = after.to_lowercase().find(" import ") {
+            return after[..idx].trim().to_string();
+        }
+    }
+    // Strip a leading keyword (use / import / using / include / namespace).
+    let rest = line
+        .strip_prefix("use ")
+        .or_else(|| line.strip_prefix("import "))
+        .or_else(|| line.strip_prefix("using "))
+        .or_else(|| line.strip_prefix("include "))
+        .or_else(|| line.strip_prefix("namespace "))
+        .unwrap_or(line)
+        .trim();
+    // Take the first path-shaped token (dotted, ::-scoped, or slashed).
+    let token = rest
+        .split([' ', '\t', '{', '(', ',', '*'])
+        .find(|t| !t.is_empty())
+        .unwrap_or("");
+    token.trim_matches(|c: char| c == '"' || c == '\'').to_string()
 }
 
 fn emit_config_entry(
