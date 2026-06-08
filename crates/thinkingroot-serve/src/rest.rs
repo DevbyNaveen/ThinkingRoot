@@ -774,6 +774,12 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/capsule", post(compile_capsule_handler))
             // ─── Capability router: rank tools/functions for an intent ──
             .route("/ws/{ws}/route", post(route_handler))
+            .route("/ws/{ws}/route-tools", post(route_tools_handler))
+            .route("/ws/{ws}/sleep", post(sleep_handler))
+            .route("/ws/{ws}/age", get(age_handler))
+            .route("/ws/{ws}/drives", get(drives_handler))
+            .route("/ws/{ws}/bequeath", post(bequeath_handler))
+            .route("/ws/{ws}/inherit", post(inherit_handler))
             // ─── Capability routing report (experience view for Console) ─
             .route("/ws/{ws}/capability-routing", get(capability_routing_handler))
             // ─── Operating-layer artifact nodes (prompts/functions/flows/MCP) ─
@@ -3286,6 +3292,141 @@ async fn route_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct RouteToolsRequest {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    tools: Vec<RouteToolDesc>,
+    #[serde(default = "default_route_k")]
+    top_k: usize,
+}
+#[derive(Deserialize)]
+struct RouteToolDesc {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// `POST /api/v1/ws/{ws}/route-tools` — A2 tool-list gating primitive. Ranks an
+/// ARBITRARY caller-supplied tool catalog (`tools: [{name, description}]`) by
+/// semantic relevance to `query`, returning the top-k tool names. The host (e.g.
+/// MrGuy) uses this to shrink the model's VISIBLE tool list per turn — the token
+/// win. Fail-open in the engine (returns the first k if the embedder is down).
+async fn route_tools_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<RouteToolsRequest>,
+) -> Response {
+    let tools: Vec<(String, String)> =
+        req.tools.into_iter().map(|t| (t.name, t.description)).collect();
+    let engine = state.engine.read().await;
+    match engine.rank_tool_catalog(&ws, &req.query, tools, req.top_k).await {
+        Ok(ranked) => ok_response(serde_json::json!({ "ranked": ranked })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/sleep` — B5 consolidation ("the being rests, wakes wiser"):
+/// resolve unresolved contradictions by superseding the older/less-confident claim,
+/// so recall returns the surviving truth. Returns `{ contradictions_resolved,
+/// claims_superseded }`. Idempotent; safe to schedule nightly.
+#[derive(Deserialize, Default)]
+struct SleepRequest {
+    /// Expire active claims created before this epoch-seconds whose confidence is
+    /// below `confidence_floor` (old low-value noise). Omit to skip stale-expiry.
+    #[serde(default)]
+    stale_before_epoch: Option<f64>,
+    /// Confidence floor for stale-expiry (default 0.5).
+    #[serde(default)]
+    confidence_floor: Option<f64>,
+}
+
+async fn sleep_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<SleepRequest>>,
+) -> Response {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let conf_floor = req.confidence_floor.unwrap_or(0.5);
+    let engine = state.engine.read().await;
+    match engine
+        .sleep_consolidate(&ws, req.stale_before_epoch, conf_floor)
+        .await
+    {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/age` — P2 honest developmental age: verified capability
+/// mass + knowledge + reconciliations → a coarse life stage.
+async fn age_handler(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    let engine = state.engine.read().await;
+    match engine.developmental_age(&ws).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/drives` — P3 behavioral drives: curiosity/exploration vs
+/// frontier-focus, derived from measured maturity.
+async fn drives_handler(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    let engine = state.engine.read().await;
+    match engine.drives(&ws).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+fn default_legacy_min_conf() -> f64 {
+    0.7
+}
+fn default_true_legacy() -> bool {
+    true
+}
+#[derive(Deserialize)]
+struct BequeathRequest {
+    #[serde(default = "default_legacy_min_conf")]
+    min_confidence: f64,
+    #[serde(default = "default_true_legacy")]
+    only_verified: bool,
+}
+
+/// `POST /api/v1/ws/{ws}/bequeath` — P4: produce the being's verified inheritance
+/// (genome + high-confidence knowledge).
+async fn bequeath_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<BequeathRequest>>,
+) -> Response {
+    let req = body.map(|b| b.0).unwrap_or(BequeathRequest {
+        min_confidence: 0.7,
+        only_verified: true,
+    });
+    let engine = state.engine.read().await;
+    match engine
+        .bequeath(&ws, req.min_confidence, req.only_verified)
+        .await
+    {
+        Ok(bundle) => ok_response(serde_json::json!(bundle)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/inherit` — P4: inherit a legacy bundle into this successor.
+async fn inherit_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(bundle): Json<crate::engine::LegacyBundle>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.inherit(&ws, bundle).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
 /// `GET /api/v1/ws/{ws}/capability-routing` — the routing/experience report:
 /// every deployed function + its learned experience (n_success/n_fail + Wilson
 /// score) grouped by input_class. Powers the Console routing view (P5).
@@ -5537,16 +5678,15 @@ async fn open_proposal_handler(
         Ok(d) => d,
         Err(resp) => return resp,
     };
-    let author = match request_user(&headers) {
-        Some(u) => u,
-        None => {
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                "MISSING_PRINCIPAL",
-                "X-TR-User header is required to open a proposal",
-            );
-        }
-    };
+    // Author principal. Prefer the per-end-user `X-TR-User` header when present;
+    // otherwise fall back to a stable machine principal ("sdk") so SDK/agent-driven
+    // proposals on a SHARED (main) branch work. The cloud gateway's per-user
+    // leak-guard confines ANY `X-TR-User` request to that user's `u_*` namespace,
+    // so a proposal targeting a main-workspace branch must NOT depend on the header.
+    // Safe for verify-before-merge: the author is excluded from the approval count
+    // regardless (verifier-outside-write-scope), so a defaulted author cannot
+    // self-approve, and objective `required_checks` still gate the merge.
+    let author = request_user(&headers).unwrap_or_else(|| "sdk".to_string());
 
     let (default_min, default_checks) =
         proposal_policy_defaults(&refs_dir, &branch);

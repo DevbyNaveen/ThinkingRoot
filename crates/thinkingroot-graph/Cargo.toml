@@ -50,6 +50,7 @@ sqlite = "0.36"
 ort = { version = "=2.0.0-rc.11", optional = true, default-features = false, features = ["download-binaries", "tls-rustls", "ndarray", "std"] }
 # Hugging Face tokenizers in Rust — same major as fastembed used.
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+instant-distance = "0.6.1"
 
 [dev-dependencies]
 tempfile = "3"

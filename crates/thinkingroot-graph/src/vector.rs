@@ -19,6 +19,22 @@ mod inner {
         default_embed_paths, EmbeddingModel as OrtEmbeddingModel, EMBED_MAX_LEN,
     };
     use thinkingroot_core::{Error, Result};
+    use instant_distance::{Builder, HnswMap, Point, Search};
+
+    /// ANN index point: a stored embedding. Distance = cosine distance, so HNSW
+    /// nearest-neighbours match cosine-similarity ranking.
+    #[derive(Clone, Debug)]
+    struct EmbPoint(Vec<f32>);
+    impl Point for EmbPoint {
+        fn distance(&self, other: &Self) -> f32 {
+            1.0 - cosine_similarity(&self.0, &other.0)
+        }
+    }
+
+    /// Below this many vectors, exact brute-force is faster than building/querying
+    /// an HNSW (and stays exact). At/above it, the UNFILTERED search uses ANN +
+    /// exact re-rank of candidates. Scoped/filtered searches always stay exact.
+    const ANN_THRESHOLD: usize = 1024;
 
     /// gte-modernbert-base embedding dimensionality. Upgraded from
     /// AllMiniLM-L6-v2 (384) to lift semantic/paraphrase recall (the 2020
@@ -43,6 +59,10 @@ mod inner {
         /// Map from ID → (embedding vector, metadata string).
         index: HashMap<String, (Vec<f32>, String)>,
         persist_path: std::path::PathBuf,
+        /// Lazily-(re)built HNSW over `index` for sublinear unfiltered search.
+        ann: Option<HnswMap<EmbPoint, String>>,
+        /// `index` mutated since `ann` was built → rebuild on next ANN search.
+        ann_dirty: bool,
     }
 
     impl VectorStore {
@@ -71,6 +91,8 @@ mod inner {
                 model: None,
                 index,
                 persist_path,
+                ann: None,
+                ann_dirty: true,
             })
         }
 
@@ -96,6 +118,7 @@ mod inner {
                 self.index
                     .insert(id.to_string(), (vec, metadata.to_string()));
             }
+            self.ann_dirty = true;
             Ok(())
         }
 
@@ -117,6 +140,7 @@ mod inner {
                 count += 1;
             }
 
+            self.ann_dirty = true;
             Ok(count)
         }
 
@@ -151,6 +175,13 @@ mod inner {
                 Some(v) => v,
                 None => return Ok(Vec::new()),
             };
+
+            // ANN fast path: unfiltered search over a large index → sublinear HNSW
+            // + exact re-rank. Scoped/filtered searches stay exact brute-force
+            // (they operate on bounded per-user subsets).
+            if allowed_source_uris.is_none() && self.index.len() >= ANN_THRESHOLD {
+                return Ok(self.search_vec_ann(&query_vec, top_k));
+            }
 
             let mut scores: Vec<(String, String, f32)> = self
                 .index
@@ -265,6 +296,7 @@ mod inner {
 
         pub fn reset(&mut self) {
             self.index.clear();
+            self.ann_dirty = true;
         }
 
         /// Remove specific entries by ID. O(ids.len()).
@@ -272,6 +304,7 @@ mod inner {
             for id in ids {
                 self.index.remove(*id);
             }
+            self.ann_dirty = true;
         }
 
         /// Snapshot of all currently-indexed ids. Used by
@@ -300,6 +333,7 @@ mod inner {
             for (id, vec, meta) in items {
                 self.index.insert(id, (vec, meta));
             }
+            self.ann_dirty = true;
             Ok(count)
         }
 
@@ -326,6 +360,71 @@ mod inner {
             scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             scores.truncate(top_k);
             scores
+        }
+
+        /// (Re)build the HNSW from `index` if stale. O(n log n), amortised across
+        /// the many reads between writes.
+        fn ensure_ann(&mut self) {
+            if self.ann.is_some() && !self.ann_dirty {
+                return;
+            }
+            let mut points = Vec::with_capacity(self.index.len());
+            let mut values = Vec::with_capacity(self.index.len());
+            for (id, (vec, _meta)) in &self.index {
+                points.push(EmbPoint(vec.clone()));
+                values.push(id.clone());
+            }
+            self.ann = Some(Builder::default().build(points, values));
+            self.ann_dirty = false;
+        }
+
+        /// ANN nearest-neighbour search by a pre-computed query vector, then EXACT
+        /// re-rank of the over-fetched candidates — so the returned order matches
+        /// brute-force cosine (recovers recall lost to ANN approximation).
+        fn search_vec_ann(&mut self, query_vec: &[f32], top_k: usize) -> Vec<(String, String, f32)> {
+            if top_k == 0 || self.index.is_empty() {
+                return Vec::new();
+            }
+            self.ensure_ann();
+            let overfetch = (top_k * 4).max(top_k);
+            let candidate_ids: Vec<String> = {
+                let map = match self.ann.as_ref() {
+                    Some(m) => m,
+                    None => return Vec::new(),
+                };
+                let q = EmbPoint(query_vec.to_vec());
+                let mut search = Search::default();
+                map.search(&q, &mut search)
+                    .take(overfetch)
+                    .map(|item| item.value.clone())
+                    .collect()
+            };
+            let mut scored: Vec<(String, String, f32)> = candidate_ids
+                .iter()
+                .filter_map(|id| {
+                    self.index.get(id).map(|(vec, meta)| {
+                        (id.clone(), meta.clone(), cosine_similarity(query_vec, vec))
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(top_k);
+            scored
+        }
+
+        /// Search by a pre-computed vector using the ANN fast path above
+        /// `ANN_THRESHOLD`, else exact brute-force. Same result contract as
+        /// [`Self::search_by_vector`]; sublinear at scale.
+        pub fn search_by_vector_fast(
+            &mut self,
+            query_vec: &[f32],
+            top_k: usize,
+        ) -> Vec<(String, String, f32)> {
+            if self.index.len() >= ANN_THRESHOLD {
+                self.search_vec_ann(query_vec, top_k)
+            } else {
+                self.search_by_vector(query_vec, top_k)
+            }
         }
 
         /// Borrow the stored embedding for a given id, if present.

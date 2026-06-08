@@ -171,6 +171,95 @@ pub struct ContradictionInfo {
     pub status: String,
 }
 
+/// Result of a `sleep` (consolidation) pass — the being "rests and wakes wiser":
+/// unresolved contradictions are resolved by superseding the older/less-confident
+/// claim, so recall returns the surviving truth.
+#[derive(Debug, Clone, Serialize)]
+pub struct SleepReport {
+    /// Contradictions resolved this pass (loser superseded, contradiction cleared).
+    pub contradictions_resolved: usize,
+    /// Claims superseded by contradiction resolution.
+    pub claims_superseded: usize,
+    /// Old, low-confidence claims expired (dropped from active recall) — only when
+    /// a stale cutoff was requested; 0 otherwise.
+    pub stale_expired: usize,
+}
+
+/// P2 — the being's HONEST developmental age. Every field is a real measured
+/// signal; `developmental_age` is a function of verified capability + knowledge +
+/// reconciliations, NOT wall-clock uptime (the research keystone: "age = verified
+/// capability + consolidated wisdom − senescence").
+#[derive(Debug, Clone, Serialize)]
+pub struct AgeReport {
+    /// Distinct capabilities (functions) with ≥1 successful invocation.
+    pub verified_capabilities: usize,
+    /// All deployed capabilities (functions), verified or not.
+    pub total_capabilities: usize,
+    /// Σ Wilson lower-bound success score across all learned (class, function)
+    /// experience — the "verified capability mass".
+    pub capability_score: f64,
+    /// Claims the brain currently holds.
+    pub claims: usize,
+    /// Claims superseded by resolution (corrections made — wisdom from sleep).
+    pub superseded_claims: usize,
+    /// Honest composite = capability_score + ln(1+claims) + 0.1·superseded.
+    pub developmental_age: f64,
+    /// Coarse life stage derived from developmental_age + verified capabilities.
+    pub stage: String,
+}
+
+/// P3 — the being's DRIVES: its behavioral posture, derived from measured maturity.
+/// Curiosity decays as the being accumulates verified capability + knowledge (the
+/// research curiosity-decay arc: young explores everywhere, mature focuses on
+/// frontiers) — grounded in real state, NOT a wall-clock timer.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrivesReport {
+    pub stage: String,
+    /// [0,1] — appetite to explore/learn. High when immature, low when mature.
+    pub curiosity: f64,
+    /// [0,1] — how readily the being should explore/forge new capabilities.
+    pub exploration_rate: f64,
+    /// [0,1] — focus on frontier/novel gaps (= 1 − curiosity).
+    pub frontier_focus: f64,
+    /// Human-readable behavioral guidance for this stage.
+    pub recommendation: String,
+}
+
+/// P4 — one verified capability in a [`LegacyBundle`] (the genome unit).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LegacyCapability {
+    pub name: String,
+    pub body: String,
+    pub language: String,
+}
+
+/// P4 — one high-confidence knowledge item in a [`LegacyBundle`].
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LegacyClaim {
+    pub statement: String,
+    pub confidence: f64,
+}
+
+/// P4 — a being's VERIFIED inheritance (the world-first): the genome it passes to a
+/// successor on death/handoff. Only VERIFIED capabilities + HIGH-CONFIDENCE
+/// knowledge — never the raw, error-carrying memory stream. A successor that
+/// inherits this provably starts from confirmed skills, not a memory dump.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LegacyBundle {
+    pub capabilities: Vec<LegacyCapability>,
+    pub knowledge: Vec<LegacyClaim>,
+    pub forebear_stage: String,
+    pub forebear_age: f64,
+}
+
+/// P4 — result of inheriting a [`LegacyBundle`] into a successor workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct InheritReport {
+    pub capabilities_inherited: usize,
+    pub knowledge_inherited: usize,
+    pub forebear_stage: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub entities: Vec<EntitySearchHit>,
@@ -1893,6 +1982,53 @@ impl QueryEngine {
         storage.graph.assemble_prompt(name, vars)
     }
 
+    /// A2 — rank an ARBITRARY tool catalog by semantic relevance to a query,
+    /// using the workspace embedder. Unlike `route` (which ranks deployed Root
+    /// Functions), this ranks any `{name, description}` list the caller supplies,
+    /// so a host (e.g. MrGuy) can shrink the model's VISIBLE tool list to the
+    /// top-k relevant tools per turn — the real token win. Fail-open: if the
+    /// embedder is unavailable it returns the first k unchanged (never hides all).
+    pub async fn rank_tool_catalog(
+        &self,
+        ws: &str,
+        query: &str,
+        tools: Vec<(String, String)>,
+        top_k: usize,
+    ) -> Result<Vec<String>> {
+        if tools.is_empty() {
+            return Ok(Vec::new());
+        }
+        let k = top_k.max(1);
+        let names: Vec<String> = tools.iter().map(|(n, _)| n.clone()).collect();
+        let handle = self.get_workspace(ws)?;
+        let mut storage = handle.storage.lock().await;
+        let mut texts: Vec<String> = Vec::with_capacity(tools.len() + 1);
+        texts.push(query.to_string());
+        for (name, desc) in &tools {
+            texts.push(format!("{name}: {desc}"));
+        }
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let embs = match run_blocking(|| storage.vector.embed_texts(&refs)) {
+            Ok(e) if e.len() == texts.len() => e,
+            _ => return Ok(names.into_iter().take(k).collect()),
+        };
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+        };
+        let q = &embs[0];
+        let mut scored: Vec<(f32, String)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (cos(q, &embs[i + 1]), n.clone()))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(_, n)| n).collect())
+    }
+
     /// Compile a witness-grounded **context capsule** for one turn: the
     /// assembled system prompt + top-k grounded claims + workspace brief
     /// + experience-routed tools. This is the low-token, fast path that
@@ -2047,12 +2183,23 @@ impl QueryEngine {
         } else {
             self.primary_ws_name().unwrap_or_else(|| ws.to_string())
         };
-        let prompt_version = {
+        let prompt_deployed = {
             let handle = self.get_workspace(&prompt_ws)?;
             let storage = handle.storage.lock().await;
-            storage.graph.prompt_latest_version(prompt_name)?.unwrap_or(0)
+            storage.graph.prompt_latest_version(prompt_name)?
         };
-        let system = self.assemble_prompt(&prompt_ws, prompt_name, vars).await?;
+        let prompt_version = prompt_deployed.unwrap_or(0);
+        // Default-template fallback: a fresh workspace has no compiled prompt
+        // deployed, so the capsule would otherwise 500 ("prompt template not
+        // found"). Ship a minimal default system frame so the compiled-context
+        // path works out-of-box; deploying a prompt of this name overrides it.
+        let system = if prompt_deployed.is_some() {
+            self.assemble_prompt(&prompt_ws, prompt_name, vars).await?
+        } else {
+            "You are a helpful assistant grounded in the user's cognition graph. \
+             Use the provided memories and routed tools when relevant; never fabricate."
+                .to_string()
+        };
         let brief = self.get_workspace_brief_branched(ws, branch).await?;
         // Capability router: rank tools by semantic relevance to the intent
         // (fused with learned experience) when a hint is present; with an empty
@@ -4357,6 +4504,258 @@ side referenced. Strict rules:\n\
             .collect())
     }
 
+    /// B5 / "sleep" — a consolidation pass that turns experience into wisdom:
+    /// resolve unresolved contradictions by **superseding the older/less-confident
+    /// claim** (keep the more recent, more confident truth), then clear the
+    /// contradiction. Superseding runs the engine's causal-invalidation + capsule
+    /// eviction, so the next recall returns the surviving claim, not the stale one.
+    /// Idempotent + safe to schedule nightly. (Stale-fact expiry + downscaling are
+    /// the B5.2 follow-on; contradiction resolution is the headline "wakes wiser".)
+    pub async fn sleep_consolidate(
+        &self,
+        ws: &str,
+        stale_before: Option<f64>,
+        conf_floor: f64,
+    ) -> Result<SleepReport> {
+        let handle = self.get_workspace(ws)?;
+
+        // Phase 1 — decide supersessions from unresolved contradictions (read cache).
+        // Survivor = newer event_date, tie-broken by higher confidence.
+        let mut decisions: Vec<(String, String, String)> = Vec::new(); // (loser, winner, contradiction_id)
+        {
+            let cache = handle.cache.read().await;
+            for c in cache
+                .all_contradictions()
+                .iter()
+                .filter(|c| c.status == "Detected")
+            {
+                if let (Some(a), Some(b)) =
+                    (cache.claim_by_id(&c.claim_a), cache.claim_by_id(&c.claim_b))
+                {
+                    let a_key = (a.event_date.unwrap_or(0.0), a.confidence);
+                    let b_key = (b.event_date.unwrap_or(0.0), b.confidence);
+                    let (winner, loser) = if a_key >= b_key {
+                        (a.id.clone(), b.id.clone())
+                    } else {
+                        (b.id.clone(), a.id.clone())
+                    };
+                    decisions.push((loser, winner, c.id.clone()));
+                }
+            }
+        }
+
+        // Phase 2 — apply under the storage lock, then reload the read cache so the
+        // next recall in this process sees the resolution (honesty contract).
+        let mut superseded = 0usize;
+        let mut stale_expired = 0usize;
+        if !decisions.is_empty() || stale_before.is_some() {
+            let storage = handle.storage.lock().await;
+            for (loser, winner, cid) in &decisions {
+                if storage.graph.supersede_claim(loser, winner).is_ok() {
+                    superseded += 1;
+                    let _ = storage.graph.resolve_contradiction(cid);
+                }
+            }
+            // B5.2 — expire old, low-confidence claims (opt-in via a cutoff).
+            if let Some(cutoff) = stale_before {
+                stale_expired = storage
+                    .graph
+                    .expire_stale_claims(cutoff, conf_floor)
+                    .unwrap_or(0);
+            }
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph)
+                .map_err(|e| Error::GraphStorage(format!("sleep: cache reload failed: {e}")))?;
+            *handle.cache.write().await = new_cache;
+        }
+
+        Ok(SleepReport {
+            contradictions_resolved: superseded,
+            claims_superseded: superseded,
+            stale_expired,
+        })
+    }
+
+    /// P2 — the being's HONEST developmental age (see [`AgeReport`]): verified
+    /// capability mass (Σ Wilson over learned experience) + knowledge breadth +
+    /// reconciliations, mapped to a coarse life stage. Pure counts, no embedder.
+    pub async fn developmental_age(&self, ws: &str) -> Result<AgeReport> {
+        let handle = self.get_workspace(ws)?;
+        let claims = {
+            let cache = handle.cache.read().await;
+            cache.counts().1
+        };
+        let storage = handle.storage.lock().await;
+        let total_capabilities = storage.graph.list_functions()?.len();
+        let exp = storage.graph.list_all_experience()?;
+        let mut capability_score = 0.0_f64;
+        let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_class, e) in &exp {
+            capability_score += e.score();
+            if e.n_success >= 1 {
+                verified.insert(e.function_name.clone());
+            }
+        }
+        let superseded_claims = storage.graph.count_superseded_claims()?;
+        drop(storage);
+
+        let verified_capabilities = verified.len();
+        let developmental_age =
+            capability_score + (1.0 + claims as f64).ln() + 0.1 * superseded_claims as f64;
+        let stage = if verified_capabilities == 0 && claims < 5 {
+            "infant"
+        } else if developmental_age < 3.0 {
+            "adolescent"
+        } else if developmental_age < 8.0 {
+            "adult"
+        } else {
+            "elder"
+        }
+        .to_string();
+
+        Ok(AgeReport {
+            verified_capabilities,
+            total_capabilities,
+            capability_score,
+            claims,
+            superseded_claims,
+            developmental_age,
+            stage,
+        })
+    }
+
+    /// P3 — the being's DRIVES (see [`DrivesReport`]): curiosity decays as measured
+    /// maturity (verified capability + breadth + knowledge) rises, shifting the
+    /// being from "explore + forge widely" (infant) to "exploit; forge only at
+    /// verified frontier gaps" (elder). Derived from [`Self::developmental_age`].
+    pub async fn drives(&self, ws: &str) -> Result<DrivesReport> {
+        let age = self.developmental_age(ws).await?;
+        let maturity = 0.3 * age.capability_score
+            + 0.3 * age.total_capabilities as f64
+            + 0.2 * (1.0 + age.claims as f64).ln();
+        let curiosity = 1.0 / (1.0 + maturity); // (0,1], decays as maturity rises
+        let frontier_focus = 1.0 - curiosity;
+        let recommendation = match age.stage.as_str() {
+            "infant" => "explore widely; forge readily — everything is new",
+            "adolescent" => "explore broadly; forge to fill frequent gaps",
+            "adult" => "balance explore/exploit; forge selectively at real gaps",
+            _ => "exploit mastered skills; forge only at verified frontier gaps",
+        }
+        .to_string();
+        Ok(DrivesReport {
+            stage: age.stage,
+            curiosity,
+            exploration_rate: curiosity,
+            frontier_focus,
+            recommendation,
+        })
+    }
+
+    /// P4 — bequeath this being's VERIFIED inheritance: capabilities (the genome)
+    /// and high-confidence knowledge. With `only_verified`, capabilities are limited
+    /// to functions with ≥1 successful invocation (proven skills). Knowledge is
+    /// limited to claims at or above `min_confidence` — never the raw memory stream.
+    pub async fn bequeath(
+        &self,
+        ws: &str,
+        min_confidence: f64,
+        only_verified: bool,
+    ) -> Result<LegacyBundle> {
+        let age = self.developmental_age(ws).await?;
+        let handle = self.get_workspace(ws)?;
+        let capabilities = {
+            let storage = handle.storage.lock().await;
+            let verified: std::collections::BTreeSet<String> = storage
+                .graph
+                .list_all_experience()?
+                .into_iter()
+                .filter(|(_c, e)| e.n_success >= 1)
+                .map(|(_c, e)| e.function_name)
+                .collect();
+            storage
+                .graph
+                .list_functions()?
+                .into_iter()
+                .filter(|f| !only_verified || verified.contains(&f.name))
+                .map(|f| LegacyCapability {
+                    name: f.name,
+                    body: f.body,
+                    language: f.language,
+                })
+                .collect::<Vec<_>>()
+        };
+        let knowledge = {
+            let cache = handle.cache.read().await;
+            cache
+                .all_claims()
+                .filter(|c| c.confidence >= min_confidence)
+                .map(|c| LegacyClaim {
+                    statement: c.statement.clone(),
+                    confidence: c.confidence,
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(LegacyBundle {
+            capabilities,
+            knowledge,
+            forebear_stage: age.stage,
+            forebear_age: age.developmental_age,
+        })
+    }
+
+    /// P4 — inherit a [`LegacyBundle`] into this (successor) workspace: deploy the
+    /// forebear's verified capabilities and seed its high-confidence knowledge, so
+    /// the successor provably starts from confirmed skills. Reloads the read cache.
+    pub async fn inherit(&self, ws: &str, bundle: LegacyBundle) -> Result<InheritReport> {
+        let handle = self.get_workspace(ws)?;
+        let mut capabilities_inherited = 0usize;
+        let mut knowledge_inherited = 0usize;
+        {
+            let storage = handle.storage.lock().await;
+            for c in &bundle.capabilities {
+                if storage
+                    .graph
+                    .put_function(&c.name, &c.body, &c.language)
+                    .is_ok()
+                {
+                    capabilities_inherited += 1;
+                }
+            }
+            if !bundle.knowledge.is_empty() {
+                let source = thinkingroot_core::Source::new(
+                    "legacy://inheritance".into(),
+                    thinkingroot_core::SourceType::Document,
+                );
+                let source_id = source.id;
+                let _ = storage.graph.insert_source(&source);
+                let wsid = thinkingroot_core::WorkspaceId::new();
+                for k in &bundle.knowledge {
+                    let claim = thinkingroot_core::Claim::new(
+                        &k.statement,
+                        thinkingroot_core::ClaimType::Fact,
+                        source_id,
+                        wsid,
+                    )
+                    .with_confidence(k.confidence);
+                    let cid = claim.id.to_string();
+                    if storage.graph.insert_claim(&claim).is_ok() {
+                        let _ = storage
+                            .graph
+                            .link_claim_to_source(&cid, &source_id.to_string());
+                        knowledge_inherited += 1;
+                    }
+                }
+            }
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph)
+                .map_err(|e| Error::GraphStorage(format!("inherit: cache reload failed: {e}")))?;
+            *handle.cache.write().await = new_cache;
+        }
+        Ok(InheritReport {
+            capabilities_inherited,
+            knowledge_inherited,
+            forebear_stage: bundle.forebear_stage,
+        })
+    }
+
     /// Alias for `health()` — delegates to the same verification logic.
     pub async fn verify(&self, ws: &str) -> Result<VerificationResult> {
         self.health(ws).await
@@ -5861,11 +6260,46 @@ Rules: \
 
         // Main path.
         let accepted_ids;
-        let warnings;
+        let mut warnings;
         {
-            let storage = handle.storage.lock().await;
+            let mut storage = handle.storage.lock().await;
             (accepted_ids, warnings) =
                 Self::write_agent_claims_to_graph(&storage.graph, &source, &agent_claims)?;
+
+            // B3 — instant recall: embed the contributed claims into the main
+            // vector index NOW (mirrors the branch path + ctx.memory.remember),
+            // so `.scope().store` is immediately recallable without a recompile.
+            // Non-fatal (honesty contract): the graph write is already durable; a
+            // missing/uninit embedder degrades semantic recall to keyword.
+            if !accepted_ids.is_empty() {
+                let items: Vec<(String, String, String)> = agent_claims
+                    .iter()
+                    .zip(accepted_ids.iter())
+                    .map(|(ac, id)| {
+                        let ctype = &ac.claim_type;
+                        let conf = ac.confidence.unwrap_or(0.7);
+                        (
+                            format!("claim:{id}"),
+                            ac.statement.clone(),
+                            format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                        )
+                    })
+                    .collect();
+                let vwarn = run_blocking(|| {
+                    let mut out = Vec::new();
+                    if let Err(e) = storage.vector.upsert_batch(&items) {
+                        out.push(format!(
+                            "main vector index degraded: bulk upsert of {} embeddings failed \
+                             ({e}) — hybrid retrieval will miss these claims until `root compile`",
+                            items.len()
+                        ));
+                    } else if let Err(e) = storage.vector.save() {
+                        out.push(format!("main vector index save failed ({e})"));
+                    }
+                    out
+                });
+                warnings.extend(vwarn);
+            }
 
             // Skip per-claim rooting in backfill mode — the
             // rooting batch verdict still fires once at the end of

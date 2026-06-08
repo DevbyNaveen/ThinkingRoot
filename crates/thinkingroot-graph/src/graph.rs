@@ -4845,6 +4845,49 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Resolve a contradiction by removing its row — called during a sleep pass
+    /// after the losing claim has been superseded, so it no longer surfaces as
+    /// an unresolved contradiction. Idempotent (`:rm` of an absent key is a no-op).
+    pub fn resolve_contradiction(&self, contradiction_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(contradiction_id.into()));
+        self.query(
+            r#"?[id] <- [[$cid]] :rm contradictions {id}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// B5.2 — expire (deactivate) ACTIVE claims older than `cutoff_ts` whose
+    /// confidence is below `conf_floor` (old low-value noise). Sets `valid_until`
+    /// = now, so they're dropped from active recall (`is_active`) but kept for
+    /// audit. Only touches claims with NO existing temporal row, so it never
+    /// disturbs high-confidence facts or already-superseded/expired claims, and is
+    /// idempotent (an expired claim gains a temporal row → excluded next pass).
+    /// Returns the number of claims newly expired.
+    pub fn expire_stale_claims(&self, cutoff_ts: f64, conf_floor: f64) -> Result<usize> {
+        let mut params = BTreeMap::new();
+        params.insert("cutoff".into(), DataValue::Num(Num::Float(cutoff_ts)));
+        params.insert("floor".into(), DataValue::Num(Num::Float(conf_floor)));
+        let result = self
+            .db
+            .run_script(
+                r#"?[id] := *claims{id, confidence, created_at},
+                    created_at < $cutoff,
+                    confidence < $floor,
+                    not *claim_temporal{claim_id: id}"#,
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("expire_stale_claims query: {e}")))?;
+        let ids: Vec<String> = result.rows.iter().map(|r| dv_to_string(&r[0])).collect();
+        let now = chrono::Utc::now().timestamp() as f64;
+        for id in &ids {
+            self.set_claim_temporal(id, 0.0, now, "")?;
+        }
+        Ok(ids.len())
+    }
+
     /// Count superseded (expired) claims.
     pub fn count_superseded_claims(&self) -> Result<usize> {
         let result = self.query_read(
