@@ -38,6 +38,7 @@ async fn compile(root: &PathBuf) -> thinkingroot_core::Result<()> {
             no_rooting: true,
             skip_byte_audit: true,
             no_incremental: false,
+            emit_summaries: false,
         },
     )
     .await

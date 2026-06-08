@@ -713,6 +713,20 @@ impl GraphStore {
                 content_blake3: String
             }",
 
+            // E4 summary_nodes — hierarchical altitude summaries
+            // (function→file→repo). Derived, NOT a byte-coverage structural
+            // table → not in STRUCTURAL_TABLES; rebuilt wholesale per compile.
+            ":create summary_nodes {
+                id: String
+                =>
+                altitude: String,
+                target_id: String,
+                summary: String,
+                child_ids_json: String default '[]',
+                source_uri: String default '',
+                created_at: Float default 0.0
+            }",
+
             // §4.2 doc_tags — structured documentation annotations
             // (@param/@returns/@throws/@deprecated/@see) emitted by the
             // doctags.rs parser into ChunkMetadata.doc_tags.
@@ -1248,6 +1262,8 @@ impl GraphStore {
             "::index create code_imports:by_from { from_source }",
             "::index create code_imports:by_to { to_source }",
             "::index create code_imports:by_path { import_path }",
+            "::index create summary_nodes:by_altitude { altitude }",
+            "::index create summary_nodes:by_target { target_id }",
             "::index create doc_tags:by_claim { claim_id }",
             "::index create doc_tags:by_kind { kind }",
             "::index create doc_tags:by_source { source_id }",

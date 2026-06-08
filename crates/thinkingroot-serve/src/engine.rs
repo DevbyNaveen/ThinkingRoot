@@ -3486,6 +3486,31 @@ impl QueryEngine {
         })
     }
 
+    /// E4 — read the hierarchical summary ladder, optionally one altitude.
+    pub async fn get_summaries(
+        &self,
+        ws: &str,
+        altitude: Option<&str>,
+    ) -> Result<Vec<thinkingroot_graph::summaries::SummaryNode>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_summary_nodes(altitude)
+    }
+
+    /// E4 — (re)build the deterministic summary ladder for a workspace.
+    /// Returns the number of summary nodes written. A standalone trigger so
+    /// callers can build summaries without a full recompile (the pipeline's
+    /// `emit_summaries` flag folds the same build into a compile run).
+    pub async fn build_summaries(&self, ws: &str) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.build_summaries(now)
+    }
+
     /// Count the witnesses table for a workspace. Used by the
     /// migration-status REST surface and by tests verifying that
     /// `root compile` populated the new substrate.

@@ -89,6 +89,7 @@ async fn compile_once(root: &PathBuf) -> thinkingroot_core::Result<PipelineResul
             no_rooting: true,
             skip_byte_audit: true,
             no_incremental: false,
+            emit_summaries: false,
         },
     )
     .await

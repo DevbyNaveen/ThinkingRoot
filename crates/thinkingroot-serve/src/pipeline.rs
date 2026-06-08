@@ -448,6 +448,10 @@ pub struct PipelineOptions {
     /// equality.  Use when the workspace is in a known-bad state and a
     /// guaranteed full rebuild is wanted without nuking `.thinkingroot/`.
     pub no_incremental: bool,
+    /// E4: build the hierarchical summary ladder (function→file→repo) after
+    /// the structural phases. Default `false` — the 91.2% retrieval path is
+    /// untouched unless a caller opts in.
+    pub emit_summaries: bool,
 }
 
 impl Default for PipelineOptions {
@@ -457,6 +461,7 @@ impl Default for PipelineOptions {
             no_rooting: false,
             skip_byte_audit: false,
             no_incremental: false,
+            emit_summaries: false,
         }
     }
 }
@@ -494,7 +499,8 @@ async fn run_pipeline_inner(
     progress: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
     options: PipelineOptions,
 ) -> Result<PipelineResult> {
-    let PipelineOptions { cancel, no_rooting, skip_byte_audit, no_incremental } = options;
+    let PipelineOptions { cancel, no_rooting, skip_byte_audit, no_incremental, emit_summaries } =
+        options;
     // Helper macro — every long-running phase boundary checks this so
     // Stop / Ctrl-C never has to wait for the next batch to finish.
     macro_rules! bail_if_cancelled {
@@ -1738,6 +1744,23 @@ async fn run_pipeline_inner(
         );
     }
     mark_phase!("audit");
+
+    // ─── E4: Hierarchical summary nodes (opt-in, default off) ───
+    // Deterministic function→file→repo ladder over the code graph. Folded
+    // into the audit budget (sub-millisecond on real workspaces). Non-fatal:
+    // a failure means summaries are stale, not that the compile produced bad
+    // data (honesty rule §6 — warn, never silently fail or fabricate).
+    if emit_summaries {
+        progress_state.set_substep("building summaries");
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        match storage.graph.build_summaries(now_ts) {
+            Ok(n) => tracing::info!(summary_nodes = n, "E4 summary ladder built"),
+            Err(e) => tracing::warn!(target: "summaries", error = %e, "summary build failed; summaries may be stale"),
+        }
+    }
 
     // ─── Phase 10: Workspace README synthesis ───
     // Deterministic from substrate; folded into the "audit" phase

@@ -690,6 +690,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/code/entity/{id}", get(code_retrieve_entity_handler))
             .route("/ws/{ws}/code/traverse", post(code_traverse_handler))
             .route("/ws/{ws}/repo-map", post(repo_map_handler))
+            .route("/ws/{ws}/summaries", get(summaries_handler))
+            .route("/ws/{ws}/summaries/build", post(summaries_build_handler))
             .route("/ws/{ws}/claims", get(list_claims))
             .route("/ws/{ws}/claims/rooted", get(list_rooted_claims_handler))
             // Witness Mesh — new substrate read endpoints. Lives
@@ -2682,6 +2684,36 @@ async fn repo_map_handler(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct SummariesParams {
+    /// Optional altitude filter: function | file | repo.
+    #[serde(default)]
+    altitude: Option<String>,
+}
+
+async fn summaries_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(params): Query<SummariesParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_summaries(&ws, params.altitude.as_deref()).await {
+        Ok(nodes) => ok_response(serde_json::json!({ "summaries": nodes })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn summaries_build_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.build_summaries(&ws).await {
+        Ok(count) => ok_response(serde_json::json!({ "summary_nodes": count })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
 async fn get_witness_handler(
     State(state): State<Arc<AppState>>,
     Path((ws, id)): Path<(String, String)>,
@@ -4084,6 +4116,7 @@ pub(crate) async fn run_unified_compile(
             no_rooting: req.no_rooting,
             skip_byte_audit: false,
             no_incremental: false,
+            emit_summaries: false,
         },
     )
     .await;
