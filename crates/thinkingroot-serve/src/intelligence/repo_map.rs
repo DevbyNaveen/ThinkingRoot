@@ -176,6 +176,61 @@ pub fn to_tree(mut symbols: Vec<RankedSymbol>, budget_tokens: usize) -> (String,
     (tree, admitted)
 }
 
+/// Build a repo-map directly from a `GraphStore` (no engine/workspace lookup).
+/// Shared by `QueryEngine::repo_map` (REST/MCP) and `FnCapabilities::ws_repo_map`
+/// (the Root Function `ctx.workspace` surface). Empty graph → empty map.
+pub fn build_repo_map(
+    graph: &thinkingroot_graph::graph::GraphStore,
+    budget_tokens: usize,
+    query: Option<&str>,
+) -> thinkingroot_core::Result<RepoMap> {
+    let entities = graph.list_code_entities()?;
+    if entities.is_empty() {
+        return Ok(RepoMap { tree: String::new(), symbols: Vec::new(), total_symbols: 0 });
+    }
+    let mut idx: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, e) in entities.iter().enumerate() {
+        idx.insert(e.claim_id.clone(), i);
+    }
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for call in graph.list_resolved_function_calls()? {
+        if let (Some(&u), Some(&v)) =
+            (idx.get(&call.caller_claim_id), idx.get(&call.callee_claim_id))
+        {
+            edges.push((u, v));
+        }
+    }
+    let personalization: Option<Vec<f32>> = match query {
+        Some(q) if !q.trim().is_empty() => {
+            let hits = graph.search_entity(q)?;
+            let mut p = vec![0.0_f32; entities.len()];
+            for h in &hits {
+                if let Some(&i) = idx.get(&h.claim_id) {
+                    p[i] = 1.0;
+                }
+            }
+            if p.iter().any(|&x| x > 0.0) { Some(p) } else { None }
+        }
+        _ => None,
+    };
+    let ranks = pagerank(entities.len(), &edges, personalization.as_deref(), 0.85, 30, 1e-6);
+    let symbols: Vec<RankedSymbol> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| RankedSymbol {
+            claim_id: e.claim_id.clone(),
+            symbol: e.symbol.clone(),
+            source_path: e.source_path.clone(),
+            byte_start: e.byte_start,
+            byte_end: e.byte_end,
+            rank: ranks.get(i).copied().unwrap_or(0.0),
+        })
+        .collect();
+    let total_symbols = symbols.len();
+    let (tree, included) = to_tree(symbols, budget_tokens);
+    Ok(RepoMap { tree, symbols: included, total_symbols })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

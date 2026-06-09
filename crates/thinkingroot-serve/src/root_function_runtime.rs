@@ -542,6 +542,120 @@ mod host_ext {
             .map_err(|e| JsErrorBox::generic(format!("memory.recall failed: {e}")))
     }
 
+    // ── ctx.workspace ops (read-only code-graph over the run's workspace) ──
+    use thinkingroot_graph::codegraph::{EdgeKind, EntityHit, TraversalDirection, TraversedNode};
+
+    #[derive(serde::Deserialize)]
+    pub struct WsSearchReq {
+        pub keyword: String,
+    }
+
+    /// `ctx.workspace.search(keyword)` — code entities by symbol.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_workspace_search(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: WsSearchReq,
+    ) -> Result<Vec<EntityHit>, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.workspace is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.ws_search_entity(&req.keyword)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("workspace.search failed: {e}")))
+    }
+
+    fn default_ws_dir() -> TraversalDirection {
+        TraversalDirection::Out
+    }
+    fn default_ws_hops() -> u32 {
+        3
+    }
+    fn default_ws_edges() -> Vec<EdgeKind> {
+        vec![EdgeKind::Calls]
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct WsTraverseReq {
+        #[serde(default)]
+        pub symbol: Option<String>,
+        #[serde(default)]
+        pub claim_id: Option<String>,
+        #[serde(default = "default_ws_dir")]
+        pub direction: TraversalDirection,
+        #[serde(default = "default_ws_hops")]
+        pub hops: u32,
+        #[serde(default = "default_ws_edges")]
+        pub edge_kinds: Vec<EdgeKind>,
+    }
+
+    /// `ctx.workspace.traverse(opts)` — walk the code graph.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_workspace_traverse(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: WsTraverseReq,
+    ) -> Result<Vec<TraversedNode>, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.workspace is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        let (start, by_id) = match req.claim_id {
+            Some(c) if !c.is_empty() => (c, true),
+            _ => (req.symbol.unwrap_or_default(), false),
+        };
+        if start.is_empty() {
+            return Ok(Vec::new());
+        }
+        caps.ws_traverse(&start, by_id, req.direction, req.hops, &req.edge_kinds)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("workspace.traverse failed: {e}")))
+    }
+
+    fn default_ws_budget() -> u32 {
+        1024
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct WsRepoMapReq {
+        #[serde(default = "default_ws_budget")]
+        pub budget_tokens: u32,
+        #[serde(default)]
+        pub query: Option<String>,
+    }
+
+    /// `ctx.workspace.repoMap(opts)` — PageRank repo-map of the compiled code.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_workspace_repo_map(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: WsRepoMapReq,
+    ) -> Result<crate::intelligence::repo_map::RepoMap, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.workspace is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.ws_repo_map(req.budget_tokens as usize, req.query.as_deref())
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("workspace.repoMap failed: {e}")))
+    }
+
     #[derive(serde::Deserialize)]
     pub struct RememberReq {
         pub statement: String,
@@ -866,6 +980,9 @@ mod host_ext {
             op_tr_llm_ask(),
             op_tr_memory_recall(),
             op_tr_memory_remember(),
+            op_tr_workspace_search(),
+            op_tr_workspace_traverse(),
+            op_tr_workspace_repo_map(),
             op_tr_prompt(),
             op_tr_branch_fork(),
             op_tr_branch_merge(),
@@ -966,6 +1083,34 @@ globalThis.__tr_buildCtx = (input, env) => {
           claim_type: (opts && opts.type) ? String(opts.type) : "fact",
           confidence: (opts && typeof opts.confidence === 'number') ? opts.confidence : 0.7,
           seq: seq,
+        }));
+    },
+  };
+  // ctx.workspace: durable compute over the COMPILED workspace (the code
+  // graph + claims this run's workspace was compiled into). Read-only,
+  // journaled via ctx.step so a crash-resume replay returns the recorded
+  // result instead of re-querying — exactly-once for the observed effect.
+  ctx.workspace = {
+    search: async (keyword) =>
+      await ctx.step(`__ws_search__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_workspace_search({ keyword: String(keyword) })),
+    traverse: async (opts) => {
+      const o = opts || {};
+      return await ctx.step(`__ws_traverse__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_workspace_traverse({
+          symbol: o.symbol ? String(o.symbol) : undefined,
+          claim_id: o.claimId ? String(o.claimId) : undefined,
+          direction: o.direction || "out",
+          hops: (typeof o.hops === "number") ? o.hops : 3,
+          edge_kinds: Array.isArray(o.edgeKinds) ? o.edgeKinds : ["calls"],
+        }));
+    },
+    repoMap: async (opts) => {
+      const o = opts || {};
+      return await ctx.step(`__ws_repomap__${__opSeq++}`, async () =>
+        await Deno.core.ops.op_tr_workspace_repo_map({
+          budget_tokens: (typeof o.budgetTokens === "number") ? o.budgetTokens : 1024,
+          query: o.query ? String(o.query) : undefined,
         }));
     },
   };

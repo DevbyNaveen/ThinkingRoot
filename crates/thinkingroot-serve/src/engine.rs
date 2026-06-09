@@ -958,6 +958,68 @@ impl FnCapabilities {
             .collect())
     }
 
+    // ── ctx.workspace — durable compute over the COMPILED workspace ──
+    // Read-only code-graph queries against the run's own captured workspace
+    // handle (no network hop). Gated on `can_recall` (same read-only graph
+    // surface as memory.recall). The graph is fixed for the run, so these are
+    // deterministic on replay — no journaling needed (mirrors recall).
+
+    /// `ctx.workspace.search(keyword)` — code entities by symbol.
+    pub async fn ws_search_entity(
+        &self,
+        keyword: &str,
+    ) -> Result<Vec<thinkingroot_graph::codegraph::EntityHit>> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'workspace' is not granted to this function".to_string(),
+            ));
+        }
+        let storage = self.handle.storage.lock().await;
+        storage.graph.search_entity(keyword)
+    }
+
+    /// `ctx.workspace.traverse(...)` — walk the code graph from a symbol (or
+    /// claim id). Unknown symbol → empty (honest).
+    pub async fn ws_traverse(
+        &self,
+        start: &str,
+        by_claim_id: bool,
+        dir: thinkingroot_graph::codegraph::TraversalDirection,
+        hops: u32,
+        edges: &[thinkingroot_graph::codegraph::EdgeKind],
+    ) -> Result<Vec<thinkingroot_graph::codegraph::TraversedNode>> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'workspace' is not granted to this function".to_string(),
+            ));
+        }
+        let storage = self.handle.storage.lock().await;
+        let start_id = if by_claim_id {
+            start.to_string()
+        } else {
+            match storage.graph.search_entity(start)?.into_iter().next() {
+                Some(h) => h.claim_id,
+                None => return Ok(Vec::new()),
+            }
+        };
+        storage.graph.traverse_graph(&start_id, dir, hops.min(16), edges)
+    }
+
+    /// `ctx.workspace.repoMap(budget, query)` — PageRank repo-map.
+    pub async fn ws_repo_map(
+        &self,
+        budget_tokens: usize,
+        query: Option<&str>,
+    ) -> Result<crate::intelligence::repo_map::RepoMap> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'workspace' is not granted to this function".to_string(),
+            ));
+        }
+        let storage = self.handle.storage.lock().await;
+        crate::intelligence::repo_map::build_repo_map(&storage.graph, budget_tokens, query)
+    }
+
     /// `ctx.memory.remember(fact, opts)` — persist a claim into this run's
     /// workspace graph + vector index so it is recallable. The claim id is
     /// **deterministic** in `(run_id, seq, statement)`, so a crash *after*
@@ -3412,78 +3474,13 @@ impl QueryEngine {
         ws: &str,
         req: &crate::intelligence::repo_map::RepoMapRequest,
     ) -> Result<crate::intelligence::repo_map::RepoMap> {
-        use crate::intelligence::repo_map::{pagerank, to_tree, RankedSymbol, RepoMap};
-
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        let graph = &storage.graph;
-
-        let entities = graph.list_code_entities()?;
-        if entities.is_empty() {
-            return Ok(RepoMap {
-                tree: String::new(),
-                symbols: Vec::new(),
-                total_symbols: 0,
-            });
-        }
-
-        // Node index: claim_id → idx.
-        let mut idx: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-        for (i, e) in entities.iter().enumerate() {
-            idx.insert(e.claim_id.clone(), i);
-        }
-
-        // Edges from resolved function calls.
-        let mut edges: Vec<(usize, usize)> = Vec::new();
-        for call in graph.list_resolved_function_calls()? {
-            if let (Some(&u), Some(&v)) =
-                (idx.get(&call.caller_claim_id), idx.get(&call.callee_claim_id))
-            {
-                edges.push((u, v));
-            }
-        }
-
-        // Personalization: seed on symbols matching the query.
-        let personalization: Option<Vec<f32>> = match req.query.as_ref() {
-            Some(q) if !q.trim().is_empty() => {
-                let hits = graph.search_entity(q)?;
-                let mut p = vec![0.0_f32; entities.len()];
-                for h in &hits {
-                    if let Some(&i) = idx.get(&h.claim_id) {
-                        p[i] = 1.0;
-                    }
-                }
-                if p.iter().any(|&x| x > 0.0) {
-                    Some(p)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        let ranks = pagerank(entities.len(), &edges, personalization.as_deref(), 0.85, 30, 1e-6);
-
-        let symbols: Vec<RankedSymbol> = entities
-            .iter()
-            .enumerate()
-            .map(|(i, e)| RankedSymbol {
-                claim_id: e.claim_id.clone(),
-                symbol: e.symbol.clone(),
-                source_path: e.source_path.clone(),
-                byte_start: e.byte_start,
-                byte_end: e.byte_end,
-                rank: ranks.get(i).copied().unwrap_or(0.0),
-            })
-            .collect();
-
-        let total_symbols = symbols.len();
-        let (tree, included) = to_tree(symbols, req.budget_tokens);
-        Ok(RepoMap {
-            tree,
-            symbols: included,
-            total_symbols,
-        })
+        crate::intelligence::repo_map::build_repo_map(
+            &storage.graph,
+            req.budget_tokens,
+            req.query.as_deref(),
+        )
     }
 
     /// E4 — read the hierarchical summary ladder, optionally one altitude.

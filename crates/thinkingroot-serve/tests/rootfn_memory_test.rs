@@ -168,3 +168,30 @@ async fn ctx_memory_is_bound_to_the_workspace() {
         }
     }
 }
+
+/// ctx.workspace (durable compute over the COMPILED workspace) is wired into
+/// the isolate and bound to the run's workspace. These are pure code-graph
+/// queries (no ONNX), so an uncompiled workspace returns honest-empty results
+/// — but the ops must be REACHED + bound (not "ctx.workspace is unavailable").
+#[tokio::test]
+async fn ctx_workspace_is_bound_and_queryable() {
+    let (engine, _root, _dir) = engine_with_ws("acme").await;
+    const EXPLORE: &str = r#"async (i, ctx) => {
+        const ents = await ctx.workspace.search("anything");
+        const map  = await ctx.workspace.repoMap({ budgetTokens: 500 });
+        const tr   = await ctx.workspace.traverse({ symbol: "nope", direction: "in", edgeKinds: ["calls"] });
+        return { entities: ents.length, total_symbols: map.total_symbols, tree_len: map.tree.length, nodes: tr.length };
+    }"#;
+    engine.put_function("acme", "explore", EXPLORE, "js").await.unwrap();
+
+    let v = engine
+        .invoke_function("acme", "explore", &serde_json::json!({}))
+        .await
+        .expect("ctx.workspace ops must be reached + bound (empty workspace → empty, not error)");
+
+    // Uncompiled workspace → honest empties (the ops ran; nothing to find).
+    assert_eq!(v["entities"], 0, "no code compiled → no entities");
+    assert_eq!(v["total_symbols"], 0, "no code compiled → empty repo-map");
+    assert_eq!(v["tree_len"], 0, "empty repo-map tree");
+    assert_eq!(v["nodes"], 0, "unknown symbol → no traversal nodes");
+}
