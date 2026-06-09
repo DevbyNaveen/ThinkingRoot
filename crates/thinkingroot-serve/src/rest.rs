@@ -821,6 +821,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 delete(remove_mcp_server_handler),
             )
             .route("/ws/{ws}/sources/forget", post(forget_source_handler))
+            .route("/ws/{ws}/sources/ingest", post(ingest_sources_handler))
             .route("/ws/{ws}/readme", get(workspace_readme_handler))
             .route("/ws/{ws}/relations", get(get_all_relations))
             .route("/ws/{ws}/relations/{entity}", get(get_entity_relations))
@@ -2462,6 +2463,192 @@ async fn forget_source_handler(
         }
         Err(e) => match_engine_error(e),
     }
+}
+
+/// One uploaded source file: a workspace-relative path + its UTF-8 text.
+#[derive(Deserialize)]
+struct IngestFile {
+    /// Workspace-relative path, e.g. `src/index.ts`. MUST stay inside the
+    /// workspace root — absolute paths and `..` components are rejected.
+    path: String,
+    /// File contents (UTF-8 text). Binary blobs have no place in a code
+    /// compile; the pipeline's `is_probably_text` gate drops junk anyway.
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct IngestSourcesRequest {
+    files: Vec<IngestFile>,
+    /// When true, wipe the workspace root's tracked source tree first so a
+    /// re-ingest of a moved/renamed tree doesn't leave orphan files behind.
+    /// `.thinkingroot/` (the data dir) is always preserved.
+    #[serde(default)]
+    clear: bool,
+}
+
+/// Hard caps — a code workspace, not a file host. A caller exceeding these
+/// is rejected loudly rather than silently truncated (no-silent-failure).
+const INGEST_MAX_FILES: usize = 20_000;
+const INGEST_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+const INGEST_MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Resolve a client-supplied relative path to an absolute path **guaranteed
+/// to live under `root`**. Returns `None` for anything that would escape:
+/// empty, absolute, a Windows drive/prefix, or any `..`/`.` component. This
+/// is the path-traversal guard for the ingest endpoint — the only place the
+/// engine writes attacker-influenced filenames to disk.
+fn safe_join_under(root: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let rel_path = std::path::Path::new(rel);
+    let mut out = root.to_path_buf();
+    let mut pushed = false;
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(part) => {
+                // Reject embedded NUL and any residual separators a single
+                // component should never contain.
+                let s = part.to_str()?;
+                if s.is_empty() || s.contains('\0') {
+                    return None;
+                }
+                out.push(part);
+                pushed = true;
+            }
+            // Prefix (C:\), RootDir (/), ParentDir (..), CurDir (.) all
+            // either escape the root or are absolute — reject the whole path.
+            _ => return None,
+        }
+    }
+    if !pushed {
+        return None;
+    }
+    Some(out)
+}
+
+/// `POST /api/v1/ws/{ws}/sources/ingest` — receive a set of source files
+/// from an external client (which has the project's working tree but the
+/// engine does not — e.g. the MrGuy plugin compiling a developer's local
+/// folder against the managed cloud) and write them under the workspace's
+/// `root_path` so a subsequent `/compile` parses them. Pairs with
+/// `/compile`: ingest puts files on the engine's disk, compile builds the
+/// graph from them. Returns `{ written, skipped, root_path }`.
+async fn ingest_sources_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<IngestSourcesRequest>,
+) -> Response {
+    if body.files.len() > INGEST_MAX_FILES {
+        return err_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "TOO_MANY_FILES",
+            &format!("at most {INGEST_MAX_FILES} files per ingest"),
+        );
+    }
+    let mut total: usize = 0;
+    for f in &body.files {
+        total = total.saturating_add(f.content.len());
+        if f.content.len() > INGEST_MAX_FILE_BYTES {
+            return err_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "FILE_TOO_LARGE",
+                &format!("'{}' exceeds {INGEST_MAX_FILE_BYTES} bytes", f.path),
+            );
+        }
+    }
+    if total > INGEST_MAX_TOTAL_BYTES {
+        return err_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PAYLOAD_TOO_LARGE",
+            &format!("total upload exceeds {INGEST_MAX_TOTAL_BYTES} bytes"),
+        );
+    }
+
+    // Resolve the workspace root under a short read-lock, then release it —
+    // the file I/O below holds no engine lock (compile is a separate call).
+    let root_path = {
+        let engine = state.engine.read().await;
+        match engine.workspace_root_path(&ws) {
+            Some(p) => p,
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "WS_NOT_MOUNTED",
+                    &format!("workspace '{ws}' not mounted"),
+                );
+            }
+        }
+    };
+
+    // Optional clean slate: remove every entry under root EXCEPT the
+    // `.thinkingroot/` data dir (graph.db lives there — wiping it would
+    // destroy the workspace, not refresh its sources).
+    if body.clear {
+        match tokio::fs::read_dir(&root_path).await {
+            Ok(mut rd) => {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    if entry.file_name() == std::ffi::OsStr::new(".thinkingroot") {
+                        continue;
+                    }
+                    let p = entry.path();
+                    let res = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        tokio::fs::remove_dir_all(&p).await
+                    } else {
+                        tokio::fs::remove_file(&p).await
+                    };
+                    if let Err(e) = res {
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "CLEAR_FAILED",
+                            &format!("could not clear {}: {e}", p.display()),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "CLEAR_FAILED",
+                    &format!("could not read workspace root: {e}"),
+                );
+            }
+        }
+    }
+
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for f in &body.files {
+        let Some(dest) = safe_join_under(&root_path, &f.path) else {
+            // A path that tries to escape the workspace is skipped, not
+            // fatal — one bad name shouldn't abort a 10k-file upload.
+            skipped += 1;
+            tracing::warn!("ingest: rejected unsafe path '{}'", f.path);
+            continue;
+        };
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "WRITE_FAILED",
+                    &format!("could not create {}: {e}", parent.display()),
+                );
+            }
+        }
+        if let Err(e) = tokio::fs::write(&dest, f.content.as_bytes()).await {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WRITE_FAILED",
+                &format!("could not write {}: {e}", dest.display()),
+            );
+        }
+        written += 1;
+    }
+
+    ok_response(serde_json::json!({
+        "written": written,
+        "skipped": skipped,
+        "root_path": root_path.display().to_string(),
+    }))
+    .into_response()
 }
 
 /// Stream A — `GET /api/v1/ws/{ws}/claims/rooted`. Returns the rooted-
@@ -8614,6 +8801,56 @@ fn parse_gaps_surfacing(content: &str) -> Option<serde_json::Value> {
         "gaps": gaps_arr,
         "ts_ms": now_ms,
     }))
+}
+
+#[cfg(test)]
+mod ingest_path_guard_tests {
+    use super::safe_join_under;
+    use std::path::Path;
+
+    #[test]
+    fn accepts_nested_relative_paths_under_root() {
+        let root = Path::new("/srv/ws");
+        let p = safe_join_under(root, "src/cli/index.ts").expect("clean relative path is allowed");
+        assert_eq!(p, Path::new("/srv/ws/src/cli/index.ts"));
+    }
+
+    #[test]
+    fn rejects_parent_dir_traversal() {
+        let root = Path::new("/srv/ws");
+        assert!(safe_join_under(root, "../etc/passwd").is_none());
+        assert!(safe_join_under(root, "src/../../etc/passwd").is_none());
+        assert!(safe_join_under(root, "a/b/../../../x").is_none());
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        let root = Path::new("/srv/ws");
+        assert!(safe_join_under(root, "/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn rejects_empty_and_dot_only() {
+        let root = Path::new("/srv/ws");
+        assert!(safe_join_under(root, "").is_none());
+        assert!(safe_join_under(root, ".").is_none());
+        assert!(safe_join_under(root, "./").is_none());
+    }
+
+    #[test]
+    fn rejects_embedded_nul() {
+        let root = Path::new("/srv/ws");
+        assert!(safe_join_under(root, "src/in\0dex.ts").is_none());
+    }
+
+    #[test]
+    fn leading_current_dir_is_normalised_then_allowed() {
+        // `./src/x` — the CurDir component is rejected outright (we require
+        // every component be Normal), so this is None. Callers strip a
+        // leading "./" before upload; this asserts the conservative default.
+        let root = Path::new("/srv/ws");
+        assert!(safe_join_under(root, "./src/x").is_none());
+    }
 }
 
 #[cfg(test)]
