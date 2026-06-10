@@ -406,6 +406,12 @@ pub async fn run_serve(
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_integrity_snapshots(root.clone()));
 
+    // Learning-signal retention: prune unbounded append-only signal tables
+    // (retrieval_usage / verify verdicts). Default 90d; TR_SIGNAL_RETENTION_DAYS=0 off.
+    let _signal_retention_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_signal_retention(root.clone()));
+
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
@@ -773,6 +779,12 @@ async fn run_serve_with_listener(
     let _integrity_handle = workspace_root
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_integrity_snapshots(root.clone()));
+
+    // Learning-signal retention: prune unbounded append-only signal tables
+    // (retrieval_usage / verify verdicts). Default 90d; TR_SIGNAL_RETENTION_DAYS=0 off.
+    let _signal_retention_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_signal_retention(root.clone()));
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();

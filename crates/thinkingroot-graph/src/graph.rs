@@ -6927,6 +6927,64 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Retention prune for the append-only learning-signal tables
+    /// (`retrieval_usage`, `function_verify_verdicts`). Both grow one row per
+    /// query-hit / verify-case and have no natural GC — at production volume
+    /// they would exhaust disk. This removes rows older than `cutoff_ts`
+    /// (epoch seconds). The idle learn-to-rank trainer runs far more often
+    /// than any sane retention window, so pruning old rows loses no live
+    /// training signal. Returns `(usage_removed, verdicts_removed)`.
+    pub fn prune_learning_signal(&self, cutoff_ts: f64) -> Result<(usize, usize)> {
+        let mut params = BTreeMap::new();
+        params.insert("cut".into(), DataValue::Num(Num::Float(cutoff_ts)));
+
+        // Count then remove, per table, so the caller gets an honest tally.
+        let count_usage = self
+            .raw_db()
+            .run_script(
+                "?[query_blake3, claim_id, ts] := \
+                 *retrieval_usage{query_blake3, claim_id, ts}, ts < $cut",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("count old retrieval_usage: {e}")))?
+            .rows
+            .len();
+        if count_usage > 0 {
+            self.db
+                .run_script(
+                    "?[query_blake3, claim_id, ts] := \
+                     *retrieval_usage{query_blake3, claim_id, ts}, ts < $cut \
+                     :rm retrieval_usage {query_blake3, claim_id, ts}",
+                    params.clone(),
+                    ScriptMutability::Mutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("prune retrieval_usage: {e}")))?;
+        }
+
+        let count_verdicts = self
+            .raw_db()
+            .run_script(
+                "?[name, at, seq] := *function_verify_verdicts{name, at, seq}, at < $cut",
+                params.clone(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("count old verdicts: {e}")))?
+            .rows
+            .len();
+        if count_verdicts > 0 {
+            self.db
+                .run_script(
+                    "?[name, at, seq] := *function_verify_verdicts{name, at, seq}, at < $cut \
+                     :rm function_verify_verdicts {name, at, seq}",
+                    params,
+                    ScriptMutability::Mutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("prune verdicts: {e}")))?;
+        }
+        Ok((count_usage, count_verdicts))
+    }
+
     /// Filter dangling claim references out of the turns calendar.
     ///
     /// `turns.claim_ids` is a JSON-encoded `Vec<String>` because the
@@ -7482,6 +7540,27 @@ mod tests {
 
         // Empty name rejected.
         assert!(store.set_function_caps("  ", "{}").is_err());
+    }
+
+    #[test]
+    fn prune_learning_signal_removes_only_old_rows() {
+        let store = mem_store();
+        // Old usage row (ts well in the past) + verdict; record_* stamp NOW.
+        store
+            .record_retrieval_usage("s", "q", false, &[("c1".into(), 0, 0.9, true)])
+            .unwrap();
+        store.record_verify_verdict("f", "obj[a]", true, "").unwrap();
+        // Nothing older than 1 hour ago → no-op prune.
+        let recent_cutoff = chrono::Utc::now().timestamp() as f64 - 3600.0;
+        assert_eq!(store.prune_learning_signal(recent_cutoff).unwrap(), (0, 0));
+        // Both tables still hold their rows.
+        assert_eq!(store.scan_retrieval_usage(0.0, 100).unwrap().len(), 1);
+        assert_eq!(store.list_verify_verdicts("f", 10).unwrap().len(), 1);
+        // A future cutoff prunes everything (rows are older than "now+1h").
+        let future_cutoff = chrono::Utc::now().timestamp() as f64 + 3600.0;
+        assert_eq!(store.prune_learning_signal(future_cutoff).unwrap(), (1, 1));
+        assert!(store.scan_retrieval_usage(0.0, 100).unwrap().is_empty());
+        assert!(store.list_verify_verdicts("f", 10).unwrap().is_empty());
     }
 
     #[test]

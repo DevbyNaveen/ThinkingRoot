@@ -287,6 +287,58 @@ fn validate_sqlite_structure(path: &std::path::Path) -> Result<(), thinkingroot_
     Ok(())
 }
 
+/// Retention prune for the append-only learning-signal tables. Default ON
+/// with a generous window — unbounded growth is a real disk-exhaustion risk
+/// at query volume, and the (future) idle trainer runs far inside any sane
+/// window. `TR_SIGNAL_RETENTION_DAYS=0` disables; default 90 days.
+struct SignalRetentionTask {
+    workspace_root: PathBuf,
+    retention_days: f64,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for SignalRetentionTask {
+    fn name(&self) -> &'static str {
+        "signal_retention"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let graph_dir = self.workspace_root.join(".thinkingroot").join("graph");
+        if !graph_dir.exists() {
+            return Ok(());
+        }
+        let cutoff = (chrono::Utc::now().timestamp() as f64) - self.retention_days * 86_400.0;
+        let graph = thinkingroot_graph::graph::GraphStore::init(&graph_dir)?;
+        let (usage, verdicts) = graph.prune_learning_signal(cutoff)?;
+        if usage > 0 || verdicts > 0 {
+            tracing::info!(usage, verdicts, "signal retention pruned old rows");
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the learning-signal retention task. No-op handle when retention is
+/// disabled (`TR_SIGNAL_RETENTION_DAYS=0`).
+pub fn spawn_signal_retention(workspace_root: PathBuf) -> JoinHandle<()> {
+    let retention_days = std::env::var("TR_SIGNAL_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(90.0);
+    if retention_days <= 0.0 {
+        return tokio::spawn(async {});
+    }
+    let task: Arc<dyn PeriodicTask> = Arc::new(SignalRetentionTask {
+        workspace_root,
+        retention_days,
+        // Daily is plenty for a 90-day window.
+        interval: Duration::from_secs(86_400),
+    });
+    spawn_periodic_task(task)
+}
+
 struct IntegritySnapshotTask {
     workspace_root: PathBuf,
     retain: usize,
