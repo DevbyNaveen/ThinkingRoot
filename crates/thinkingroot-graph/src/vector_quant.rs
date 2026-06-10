@@ -133,6 +133,29 @@ pub fn search_rescore(
     scored
 }
 
+/// Late-interaction MaxSim (ColBERT-style) over int8 doc tokens: for each
+/// query token, take the max cosine against the document's token vectors;
+/// average over query tokens. In [-1, 1] for L2-normalised inputs (in
+/// practice [0, 1] for real text). Returns 0 when either side is empty —
+/// an honest "no signal", never NaN.
+pub fn max_sim(query_tokens: &[Vec<f32>], doc_tokens: &[QuantizedVec]) -> f32 {
+    if query_tokens.is_empty() || doc_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut total = 0.0_f32;
+    for q in query_tokens {
+        let mut best = f32::NEG_INFINITY;
+        for d in doc_tokens {
+            let s = cosine_query_to_i8(q, d);
+            if s > best {
+                best = s;
+            }
+        }
+        total += best;
+    }
+    total / query_tokens.len() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +237,35 @@ mod tests {
         let i8_ids: Vec<&String> = i8_top.iter().map(|(id, _)| id).collect();
 
         assert_eq!(f32_top, i8_ids, "int8 rescore top-10 must match f32 top-10");
+    }
+
+    #[test]
+    fn max_sim_ranks_token_overlap_above_disjoint() {
+        // Doc A shares tokens with the query; doc B is built from different
+        // seeds (near-orthogonal in expectation). MaxSim must rank A > B,
+        // and an exact token-set match must score ~1.
+        let dim = 128;
+        let q: Vec<Vec<f32>> = (0..4)
+            .map(|i| {
+                let v = vec_of(100 + i, dim);
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.into_iter().map(|x| x / n).collect()
+            })
+            .collect();
+        let doc_same: Vec<QuantizedVec> = q.iter().map(|v| quantize_i8(v)).collect();
+        let doc_other: Vec<QuantizedVec> =
+            (0..4).map(|i| quantize_i8(&vec_of(900 + i, dim))).collect();
+
+        let s_same = max_sim(&q, &doc_same);
+        let s_other = max_sim(&q, &doc_other);
+        assert!(s_same > 0.99, "identical token set must score ~1, got {s_same}");
+        assert!(
+            s_same > s_other + 0.3,
+            "overlapping doc must clearly outrank disjoint doc ({s_same} vs {s_other})"
+        );
+        // Empty sides are an honest zero.
+        assert_eq!(max_sim(&[], &doc_same), 0.0);
+        assert_eq!(max_sim(&q, &[]), 0.0);
     }
 
     #[test]

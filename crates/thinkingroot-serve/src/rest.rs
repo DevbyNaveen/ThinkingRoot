@@ -6973,6 +6973,32 @@ async fn ask_handler(
         crate::intelligence::citations::verify_citations(&engine, &ws, &result.answer, &result.grounding)
             .await;
 
+    // ── Usage signal (NOW item 4) ───────────────────────────────────
+    // Persist shown-vs-cited per grounding hit — the citation gate
+    // computed this and previously discarded it. Feeds the per-project
+    // learn-to-rank trainer + restated-fraction metric. Non-fatal:
+    // losing a training row must never fail an answer.
+    if !result.grounding.is_empty() {
+        let cited_ids: HashSet<&str> =
+            gate.citations.iter().map(|c| c.claim_id.as_str()).collect();
+        let hits: Vec<(String, usize, f32, bool)> = result
+            .grounding
+            .iter()
+            .enumerate()
+            .map(|(rank, h)| {
+                (h.id.clone(), rank, h.relevance, cited_ids.contains(h.id.as_str()))
+            })
+            .collect();
+        if let Some(graph) = engine.graph_store(&ws).await {
+            let session = body.conversation_id.clone().unwrap_or_default();
+            if let Err(e) =
+                graph.record_retrieval_usage(&session, &body.question, gate.refused, &hits)
+            {
+                tracing::warn!("usage-signal record failed (non-fatal): {e}");
+            }
+        }
+    }
+
     let category = result.category.clone();
     let (answer, claims_used) = if gate.refused {
         (
@@ -7135,6 +7161,14 @@ async fn ask_stream_handler(
     let outcome = ask_streaming(&engine, llm, &req).await;
     drop(engine);
 
+    // Move-captured by the SSE generator for usage-signal logging after the
+    // citation gate runs (the engine read-guard above is already released;
+    // the generator re-acquires it briefly post-stream).
+    let usage_state = state.clone();
+    let usage_ws = ws.clone();
+    let usage_question = body.question.clone();
+    let usage_session = body.conversation_id.clone().unwrap_or_default();
+
     let stream = async_stream::stream! {
         match outcome {
             StreamingAnswer::Static { answer, claims_used, category } => {
@@ -7210,6 +7244,32 @@ async fn ask_stream_handler(
                     &answer_acc,
                     &grounding,
                 );
+                // Usage signal (NOW item 4) — same shown-vs-cited logging as
+                // the one-shot path. The tokens already streamed; this runs
+                // between the last token and the `citation` frame and is
+                // non-fatal (a lost training row never breaks the stream).
+                if !grounding.is_empty() {
+                    let cited_ids: HashSet<&str> =
+                        gate.citations.iter().map(|c| c.claim_id.as_str()).collect();
+                    let hits: Vec<(String, usize, f32, bool)> = grounding
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, h)| {
+                            (h.id.clone(), rank, h.relevance, cited_ids.contains(h.id.as_str()))
+                        })
+                        .collect();
+                    let engine = usage_state.engine.read().await;
+                    if let Some(graph) = engine.graph_store(&usage_ws).await {
+                        if let Err(e) = graph.record_retrieval_usage(
+                            &usage_session,
+                            &usage_question,
+                            gate.refused,
+                            &hits,
+                        ) {
+                            tracing::warn!("usage-signal record failed (non-fatal): {e}");
+                        }
+                    }
+                }
                 let citation_payload = serde_json::json!({
                     "citations": gate.citations,
                     "stripped": gate.stripped,

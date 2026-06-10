@@ -18,16 +18,22 @@ mod inner {
     use crate::ort_session::{
         default_embed_paths, EmbeddingModel as OrtEmbeddingModel, EMBED_MAX_LEN,
     };
+    use crate::vector_quant::{
+        cosine_i8, cosine_query_to_i8, dequantize, max_sim, quantize_i8, QuantizedVec,
+    };
     use thinkingroot_core::{Error, Result};
     use instant_distance::{Builder, HnswMap, Point, Search};
 
-    /// ANN index point: a stored embedding. Distance = cosine distance, so HNSW
-    /// nearest-neighbours match cosine-similarity ranking.
+    /// ANN index point: a stored embedding in int8-quantized form (E5 wiring).
+    /// Distance = cosine distance over the integer dot product, so HNSW
+    /// nearest-neighbours match cosine-similarity ranking; the exact rescore
+    /// pass in `search_vec_ann` then removes residual quantization noise.
+    /// Quantized points keep the HNSW graph ~4× smaller in RAM than f32.
     #[derive(Clone, Debug)]
-    struct EmbPoint(Vec<f32>);
+    struct EmbPoint(QuantizedVec);
     impl Point for EmbPoint {
         fn distance(&self, other: &Self) -> f32 {
-            1.0 - cosine_similarity(&self.0, &other.0)
+            1.0 - cosine_i8(&self.0, &other.0)
         }
     }
 
@@ -35,6 +41,21 @@ mod inner {
     /// an HNSW (and stays exact). At/above it, the UNFILTERED search uses ANN +
     /// exact re-rank of candidates. Scoped/filtered searches always stay exact.
     const ANN_THRESHOLD: usize = 1024;
+
+    /// Late-interaction (MaxSim) tier: max token vectors stored per document.
+    /// Claims are short statements (typically 10–40 tokens); 48 covers them
+    /// while bounding the per-claim token-index cost to ~48 × ~(dim + 8) B.
+    const MAX_LI_TOKENS: usize = 48;
+
+    /// The late-interaction tier is OFF until the Azure eval gate
+    /// (`scripts/eval_gate.sh`, LongMemEval ≥ 91.2%) proves it. When off:
+    /// no token vectors are captured at write, `tokens.bin` is not grown,
+    /// and `max_sim_rerank` returns empty (caller treats as no-signal).
+    fn late_interaction_enabled() -> bool {
+        std::env::var("TR_LATE_INTERACTION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
 
     /// gte-modernbert-base embedding dimensionality. Upgraded from
     /// AllMiniLM-L6-v2 (384) to lift semantic/paraphrase recall (the 2020
@@ -46,9 +67,13 @@ mod inner {
     const EMBED_DIM: usize = 768;
 
     /// Vector storage backed by `ort_session::EmbeddingModel`. Stores
-    /// embeddings in-memory with persistence to disk via the compact
-    /// `TRVEC1` binary format. Supports cosine similarity search for
-    /// semantic queries.
+    /// embeddings in-memory in **int8-quantized form** (E5: ~776 B/vector vs
+    /// 3 KB f32 — ≈4× RAM + disk reduction) with persistence via the compact
+    /// `TRVEC2` binary format (`TRVEC1` f32 indexes migrate transparently on
+    /// load). All similarity scoring goes through the exact dequantized
+    /// cosine (`vector_quant::cosine_query_to_i8`), whose ranking is proven
+    /// to match f32 top-k in `vector_quant`'s tests; the ANN path follows the
+    /// coarse(int8-HNSW)→exact-rescore contract of `vector_quant::search_rescore`.
     ///
     /// The ONNX model is loaded **lazily** on first use so that opening
     /// a workspace stays instant — ORT session creation is slow even
@@ -56,9 +81,15 @@ mod inner {
     pub struct VectorStore {
         /// `None` until first embed/search call; populated on demand.
         model: Option<OrtEmbeddingModel>,
-        /// Map from ID → (embedding vector, metadata string).
-        index: HashMap<String, (Vec<f32>, String)>,
+        /// Map from ID → (int8-quantized embedding, metadata string).
+        index: HashMap<String, (QuantizedVec, String)>,
+        /// Late-interaction token vectors per ID (int8, ≤ MAX_LI_TOKENS each).
+        /// Populated only when `TR_LATE_INTERACTION` is on; persisted to a
+        /// sibling `tokens.bin` (TRTOK1). Entries here are a strict subset of
+        /// `index` ids — MaxSim silently skips ids with no token entry.
+        tokens: HashMap<String, Vec<QuantizedVec>>,
         persist_path: std::path::PathBuf,
+        tokens_path: std::path::PathBuf,
         /// Lazily-(re)built HNSW over `index` for sublinear unfiltered search.
         ann: Option<HnswMap<EmbPoint, String>>,
         /// `index` mutated since `ann` was built → rebuild on next ANN search.
@@ -80,17 +111,22 @@ mod inner {
         /// fetch at runtime.
         pub async fn init(path: &Path) -> Result<Self> {
             let persist_path = path.join("vectors.bin");
+            let tokens_path = path.join("tokens.bin");
             let index = Self::load_index(&persist_path);
+            let tokens = Self::load_tokens(&tokens_path);
 
             tracing::info!(
-                "vector store ready ({} cached embeddings, model deferred)",
-                index.len()
+                "vector store ready ({} cached embeddings, {} token-vector docs, model deferred)",
+                index.len(),
+                tokens.len()
             );
 
             Ok(Self {
                 model: None,
                 index,
+                tokens,
                 persist_path,
+                tokens_path,
                 ann: None,
                 ann_dirty: true,
             })
@@ -110,13 +146,22 @@ mod inner {
             Ok(self.model.as_mut().expect("just-loaded"))
         }
 
-        /// Embed and store a text with an ID and metadata string.
+        /// Embed and store a text with an ID and metadata string. With the
+        /// late-interaction flag on, the same forward pass also captures the
+        /// per-token vectors (zero extra inference).
         pub fn upsert(&mut self, id: &str, text: &str, metadata: &str) -> Result<()> {
-            let embeddings = self.ensure_model()?.embed(&[text])?;
+            let li_cap = late_interaction_enabled().then_some(MAX_LI_TOKENS);
+            let embeddings = self.ensure_model()?.embed_with_tokens(&[text], li_cap)?;
 
-            if let Some(vec) = embeddings.into_iter().next() {
+            if let Some((vec, toks)) = embeddings.into_iter().next() {
                 self.index
-                    .insert(id.to_string(), (vec, metadata.to_string()));
+                    .insert(id.to_string(), (quantize_i8(&vec), metadata.to_string()));
+                if !toks.is_empty() {
+                    self.tokens.insert(
+                        id.to_string(),
+                        toks.iter().map(|t| quantize_i8(t)).collect(),
+                    );
+                }
             }
             self.ann_dirty = true;
             Ok(())
@@ -131,12 +176,20 @@ mod inner {
                 return Ok(0);
             }
 
+            let li_cap = late_interaction_enabled().then_some(MAX_LI_TOKENS);
             let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
-            let embeddings = self.ensure_model()?.embed(&texts)?;
+            let embeddings = self.ensure_model()?.embed_with_tokens(&texts, li_cap)?;
 
             let mut count = 0;
-            for (embedding, (id, _, metadata)) in embeddings.into_iter().zip(items.iter()) {
-                self.index.insert(id.clone(), (embedding, metadata.clone()));
+            for ((embedding, toks), (id, _, metadata)) in
+                embeddings.into_iter().zip(items.iter())
+            {
+                self.index
+                    .insert(id.clone(), (quantize_i8(&embedding), metadata.clone()));
+                if !toks.is_empty() {
+                    self.tokens
+                        .insert(id.clone(), toks.iter().map(|t| quantize_i8(t)).collect());
+                }
                 count += 1;
             }
 
@@ -200,7 +253,11 @@ mod inner {
                     true
                 })
                 .map(|(id, (vec, meta))| {
-                    let sim = cosine_similarity(&query_vec, vec);
+                    // Exact dequantized cosine — the same scorer as the
+                    // rescore phase of `vector_quant::search_rescore`, so the
+                    // brute-force path IS the exact pass (no coarse phase
+                    // needed below the ANN threshold).
+                    let sim = cosine_query_to_i8(&query_vec, vec);
                     (id.clone(), meta.clone(), sim)
                 })
                 .collect();
@@ -236,7 +293,7 @@ mod inner {
                 .iter()
                 .filter(|(_, (_, meta))| meta.starts_with(meta_prefix))
                 .map(|(id, (vec, meta))| {
-                    (id.clone(), meta.clone(), cosine_similarity(&query_vec, vec))
+                    (id.clone(), meta.clone(), cosine_query_to_i8(&query_vec, vec))
                 })
                 .collect();
             scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -246,25 +303,27 @@ mod inner {
 
         /// Persist the index to disk in compact binary format.
         ///
-        /// Format: `TRVEC1\n` magic, then per-entry:
-        ///   [u32 id_len][id bytes][u32 meta_len][meta bytes][u32 dims][f32 × dims]
-        /// All integers little-endian. This is ~4× smaller than JSON and loads
-        /// without a temporary allocation spike.
+        /// Format (E5): `TRVEC2\n` magic, then per-entry:
+        ///   [u32 id_len][id bytes][u32 meta_len][meta bytes]
+        ///   [u32 dims][f32 scale][f32 norm][i8 × dims]
+        /// All integers little-endian. int8 codes make this ~4× smaller on
+        /// disk than the f32 `TRVEC1` format, which `load_index` still reads
+        /// (quantizing transparently — next save migrates the file).
         pub fn save(&self) -> Result<()> {
-            let mut buf = Vec::with_capacity(self.index.len() * 400);
-            buf.extend_from_slice(b"TRVEC1\n");
+            let mut buf = Vec::with_capacity(self.index.len() * 900);
+            buf.extend_from_slice(b"TRVEC2\n");
 
-            for (id, (vec, meta)) in &self.index {
+            for (id, (qvec, meta)) in &self.index {
                 let id_b = id.as_bytes();
                 let meta_b = meta.as_bytes();
                 buf.extend_from_slice(&(id_b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(id_b);
                 buf.extend_from_slice(&(meta_b.len() as u32).to_le_bytes());
                 buf.extend_from_slice(meta_b);
-                buf.extend_from_slice(&(vec.len() as u32).to_le_bytes());
-                for f in vec {
-                    buf.extend_from_slice(&f.to_le_bytes());
-                }
+                buf.extend_from_slice(&(qvec.codes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&qvec.scale.to_le_bytes());
+                buf.extend_from_slice(&qvec.norm.to_le_bytes());
+                buf.extend(qvec.codes.iter().map(|&c| c as u8));
             }
 
             // Atomic write: write to a UNIQUE temp file then rename. The temp
@@ -291,11 +350,41 @@ mod inner {
                 self.index.len(),
                 buf.len()
             );
+
+            // Late-interaction token index — sibling file, same atomic
+            // pattern. Skipped entirely while empty AND absent on disk (the
+            // common flag-off case costs nothing); written when non-empty so
+            // captured tokens survive restarts, and rewritten-when-present so
+            // removals/reset propagate to disk instead of resurrecting.
+            if !self.tokens.is_empty() || self.tokens_path.exists() {
+                let mut tbuf = Vec::with_capacity(self.tokens.len() * 4096 + 8);
+                tbuf.extend_from_slice(b"TRTOK1\n");
+                for (id, toks) in &self.tokens {
+                    let id_b = id.as_bytes();
+                    tbuf.extend_from_slice(&(id_b.len() as u32).to_le_bytes());
+                    tbuf.extend_from_slice(id_b);
+                    tbuf.extend_from_slice(&(toks.len() as u32).to_le_bytes());
+                    for q in toks {
+                        tbuf.extend_from_slice(&(q.codes.len() as u32).to_le_bytes());
+                        tbuf.extend_from_slice(&q.scale.to_le_bytes());
+                        tbuf.extend_from_slice(&q.norm.to_le_bytes());
+                        tbuf.extend(q.codes.iter().map(|&c| c as u8));
+                    }
+                }
+                let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let ttmp = self
+                    .tokens_path
+                    .with_extension(format!("bin.tmp.{}.{seq}", std::process::id()));
+                std::fs::write(&ttmp, &tbuf).map_err(|e| Error::io_path(&ttmp, e))?;
+                std::fs::rename(&ttmp, &self.tokens_path)
+                    .map_err(|e| Error::io_path(&self.tokens_path, e))?;
+            }
             Ok(())
         }
 
         pub fn reset(&mut self) {
             self.index.clear();
+            self.tokens.clear();
             self.ann_dirty = true;
         }
 
@@ -303,6 +392,7 @@ mod inner {
         pub fn remove_by_ids(&mut self, ids: &[&str]) {
             for id in ids {
                 self.index.remove(*id);
+                self.tokens.remove(*id);
             }
             self.ann_dirty = true;
         }
@@ -314,12 +404,16 @@ mod inner {
             self.index.keys().cloned().collect()
         }
 
-        /// Return all stored (id, vector, metadata) triples.
-        /// Used during merge to copy branch embeddings into main.
+        /// Return all stored (id, vector, metadata) triples, dequantized to
+        /// f32. Used during merge to copy branch embeddings into main. The
+        /// dequantize→re-quantize round-trip through `upsert_raw_batch` is
+        /// EXACT (dequantized values sit on the quantization grid and the
+        /// max-abs element is preserved, so codes reproduce identically) —
+        /// merges never accumulate drift.
         pub fn all_items(&self) -> Vec<(String, Vec<f32>, String)> {
             self.index
                 .iter()
-                .map(|(id, (vec, meta))| (id.clone(), vec.clone(), meta.clone()))
+                .map(|(id, (qvec, meta))| (id.clone(), dequantize(qvec), meta.clone()))
                 .collect()
         }
 
@@ -331,10 +425,69 @@ mod inner {
         ) -> Result<usize> {
             let count = items.len();
             for (id, vec, meta) in items {
-                self.index.insert(id, (vec, meta));
+                self.index.insert(id, (quantize_i8(&vec), meta));
             }
             self.ann_dirty = true;
             Ok(count)
+        }
+
+        /// All late-interaction token entries (id → quantized token vectors).
+        /// Used during merge to copy branch token indexes into main, exactly
+        /// like `all_items` for pooled vectors. int8 codes pass through
+        /// losslessly (no dequantize/requantize round trip).
+        pub fn all_token_items(&self) -> Vec<(String, Vec<QuantizedVec>)> {
+            self.tokens
+                .iter()
+                .map(|(id, toks)| (id.clone(), toks.clone()))
+                .collect()
+        }
+
+        /// Insert pre-computed token vectors directly — the merge-import
+        /// counterpart of `upsert_raw_batch` for the late-interaction index.
+        pub fn upsert_raw_token_batch(
+            &mut self,
+            items: Vec<(String, Vec<QuantizedVec>)>,
+        ) -> usize {
+            let count = items.len();
+            for (id, toks) in items {
+                self.tokens.insert(id, toks);
+            }
+            count
+        }
+
+        /// Late-interaction (MaxSim) rerank over a candidate id set. Embeds
+        /// the query ONCE with token capture, then scores each candidate that
+        /// has a token entry; candidates without one are simply absent from
+        /// the result (the caller must treat absence as "no signal", never
+        /// as a zero score). Returns an empty vec when the tier is disabled
+        /// or the token index is empty — the honest no-op.
+        pub fn max_sim_rerank(
+            &mut self,
+            query: &str,
+            candidate_ids: &[String],
+        ) -> Result<Vec<(String, f32)>> {
+            if !late_interaction_enabled() || self.tokens.is_empty() || candidate_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let has_any = candidate_ids.iter().any(|id| self.tokens.contains_key(id));
+            if !has_any {
+                return Ok(Vec::new());
+            }
+            let mut embedded = self
+                .ensure_model()?
+                .embed_with_tokens(&[query], Some(MAX_LI_TOKENS))?;
+            let query_tokens = match embedded.pop() {
+                Some((_, toks)) if !toks.is_empty() => toks,
+                _ => return Ok(Vec::new()),
+            };
+            Ok(candidate_ids
+                .iter()
+                .filter_map(|id| {
+                    self.tokens
+                        .get(id)
+                        .map(|doc| (id.clone(), max_sim(&query_tokens, doc)))
+                })
+                .collect())
         }
 
         /// Search using a pre-computed query embedding (no model inference).
@@ -353,7 +506,7 @@ mod inner {
                 .index
                 .iter()
                 .map(|(id, (vec, meta))| {
-                    let sim = cosine_similarity(query_vec, vec);
+                    let sim = cosine_query_to_i8(query_vec, vec);
                     (id.clone(), meta.clone(), sim)
                 })
                 .collect();
@@ -370,8 +523,8 @@ mod inner {
             }
             let mut points = Vec::with_capacity(self.index.len());
             let mut values = Vec::with_capacity(self.index.len());
-            for (id, (vec, _meta)) in &self.index {
-                points.push(EmbPoint(vec.clone()));
+            for (id, (qvec, _meta)) in &self.index {
+                points.push(EmbPoint(qvec.clone()));
                 values.push(id.clone());
             }
             self.ann = Some(Builder::default().build(points, values));
@@ -379,20 +532,23 @@ mod inner {
         }
 
         /// ANN nearest-neighbour search by a pre-computed query vector, then EXACT
-        /// re-rank of the over-fetched candidates — so the returned order matches
-        /// brute-force cosine (recovers recall lost to ANN approximation).
+        /// re-rank of the over-fetched candidates — the coarse→rescore contract
+        /// of `vector_quant::search_rescore` applied at HNSW scale: phase 1 is
+        /// the int8 HNSW walk, phase 2 the exact dequantized cosine. Overfetch
+        /// matches `search_rescore`'s `max(top_k·4, 64)` so quantization noise
+        /// in the coarse phase cannot evict a true top-k candidate.
         fn search_vec_ann(&mut self, query_vec: &[f32], top_k: usize) -> Vec<(String, String, f32)> {
             if top_k == 0 || self.index.is_empty() {
                 return Vec::new();
             }
             self.ensure_ann();
-            let overfetch = (top_k * 4).max(top_k);
+            let overfetch = (top_k * 4).max(64);
             let candidate_ids: Vec<String> = {
                 let map = match self.ann.as_ref() {
                     Some(m) => m,
                     None => return Vec::new(),
                 };
-                let q = EmbPoint(query_vec.to_vec());
+                let q = EmbPoint(quantize_i8(query_vec));
                 let mut search = Search::default();
                 map.search(&q, &mut search)
                     .take(overfetch)
@@ -403,7 +559,7 @@ mod inner {
                 .iter()
                 .filter_map(|id| {
                     self.index.get(id).map(|(vec, meta)| {
-                        (id.clone(), meta.clone(), cosine_similarity(query_vec, vec))
+                        (id.clone(), meta.clone(), cosine_query_to_i8(query_vec, vec))
                     })
                 })
                 .collect();
@@ -427,9 +583,10 @@ mod inner {
             }
         }
 
-        /// Borrow the stored embedding for a given id, if present.
-        pub fn get_embedding(&self, id: &str) -> Option<&[f32]> {
-            self.index.get(id).map(|(vec, _)| vec.as_slice())
+        /// The stored embedding for a given id, dequantized to f32. Owned
+        /// (not a borrow) since the store keeps int8 codes, not f32.
+        pub fn get_embedding(&self, id: &str) -> Option<Vec<f32>> {
+            self.index.get(id).map(|(qvec, _)| dequantize(qvec))
         }
 
         /// Number of stored embeddings.
@@ -476,8 +633,7 @@ mod inner {
                 }
             }
 
-            let first_vec = &self.index.values().next().unwrap().0;
-            let dims = first_vec.len();
+            let dims = self.index.values().next().unwrap().0.codes.len();
 
             let mut rng = Lcg::new(42);
             let mut base_x = vec![0.0; dims];
@@ -517,7 +673,8 @@ mod inner {
             let mut min_y = f32::MAX;
             let mut max_y = f32::MIN;
 
-            for (id, (vec, _)) in &self.index {
+            for (id, (qvec, _)) in &self.index {
+                let vec = dequantize(qvec);
                 let mut x = 0.0;
                 let mut y = 0.0;
                 for i in 0..dims {
@@ -546,15 +703,24 @@ mod inner {
             results
         }
 
-        fn load_index(path: &Path) -> HashMap<String, (Vec<f32>, String)> {
+        fn load_index(path: &Path) -> HashMap<String, (QuantizedVec, String)> {
             let bytes = match std::fs::read(path) {
                 Ok(b) => b,
                 Err(_) => return HashMap::new(),
             };
 
-            // Try new binary format first.
+            // Native int8 format.
+            if bytes.starts_with(b"TRVEC2\n") {
+                return Self::load_index_binary_v2(&bytes[7..]);
+            }
+
+            // f32 TRVEC1 — quantize transparently; next save writes TRVEC2.
             if bytes.starts_with(b"TRVEC1\n") {
-                return Self::load_index_binary(&bytes[7..]);
+                tracing::info!("vectors.bin: f32 TRVEC1 detected, quantizing to int8 (migrates on next save)");
+                return Self::load_index_binary_v1(&bytes[7..])
+                    .into_iter()
+                    .map(|(id, (vec, meta))| (id, (quantize_i8(&vec), meta)))
+                    .collect();
             }
 
             // Legacy JSON fallback — migrate transparently.
@@ -567,26 +733,97 @@ mod inner {
                 }
             };
             data.into_iter()
-                .map(|(id, vec, meta)| (id, (vec, meta)))
+                .map(|(id, vec, meta)| (id, (quantize_i8(&vec), meta)))
                 .collect()
         }
 
-        fn load_index_binary(mut data: &[u8]) -> HashMap<String, (Vec<f32>, String)> {
+        /// Shared header reader for both binary formats: id + metadata.
+        /// Returns `None` at end-of-buffer or on corruption (truncated read).
+        fn read_entry_header(data: &mut &[u8]) -> Option<(String, String)> {
+            let id_len = Self::read_u32(data)? as usize;
+            if data.len() < id_len {
+                return None;
+            }
+            let id = std::str::from_utf8(&data[..id_len]).ok()?.to_string();
+            *data = &data[id_len..];
+
+            let meta_len = Self::read_u32(data)? as usize;
+            if data.len() < meta_len {
+                return None;
+            }
+            let meta = std::str::from_utf8(&data[..meta_len]).ok()?.to_string();
+            *data = &data[meta_len..];
+            Some((id, meta))
+        }
+
+        fn read_u32(buf: &mut &[u8]) -> Option<u32> {
             use std::convert::TryInto;
+            if buf.len() < 4 {
+                return None;
+            }
+            let v = u32::from_le_bytes(buf[..4].try_into().ok()?);
+            *buf = &buf[4..];
+            Some(v)
+        }
 
+        fn read_f32(buf: &mut &[u8]) -> Option<f32> {
+            use std::convert::TryInto;
+            if buf.len() < 4 {
+                return None;
+            }
+            let v = f32::from_le_bytes(buf[..4].try_into().ok()?);
+            *buf = &buf[4..];
+            Some(v)
+        }
+
+        /// TRVEC2 (int8) entry body: [u32 dims][f32 scale][f32 norm][i8 × dims].
+        fn load_index_binary_v2(mut data: &[u8]) -> HashMap<String, (QuantizedVec, String)> {
             let mut map = HashMap::new();
-
-            let read_u32 = |buf: &mut &[u8]| -> Option<u32> {
-                if buf.len() < 4 {
-                    return None;
-                }
-                let v = u32::from_le_bytes(buf[..4].try_into().ok()?);
-                *buf = &buf[4..];
-                Some(v)
-            };
-
             loop {
-                let id_len = match read_u32(&mut data) {
+                let (id, meta) = match Self::read_entry_header(&mut data) {
+                    Some(h) => h,
+                    None => break,
+                };
+                let dims = match Self::read_u32(&mut data) {
+                    Some(n) => n as usize,
+                    None => break,
+                };
+                let scale = match Self::read_f32(&mut data) {
+                    Some(v) => v,
+                    None => break,
+                };
+                let norm = match Self::read_f32(&mut data) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if data.len() < dims {
+                    break;
+                }
+                let codes: Vec<i8> = data[..dims].iter().map(|&b| b as i8).collect();
+                data = &data[dims..];
+                map.insert(id, (QuantizedVec { codes, scale, norm }, meta));
+            }
+            map
+        }
+
+        /// Load the TRTOK1 late-interaction token index. Entry layout:
+        /// [u32 id_len][id][u32 n_tokens] then per token
+        /// [u32 dims][f32 scale][f32 norm][i8 × dims]. Missing file or any
+        /// corruption truncates honestly to what parsed (same contract as
+        /// the vector index loaders).
+        fn load_tokens(path: &Path) -> HashMap<String, Vec<QuantizedVec>> {
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => return HashMap::new(),
+            };
+            if !bytes.starts_with(b"TRTOK1\n") {
+                tracing::warn!("tokens.bin: unknown format, ignoring");
+                return HashMap::new();
+            }
+            let mut data = &bytes[7..];
+            let mut map = HashMap::new();
+            'outer: loop {
+                let id_len = match Self::read_u32(&mut data) {
                     Some(n) => n as usize,
                     None => break,
                 };
@@ -598,21 +835,46 @@ mod inner {
                     Err(_) => break,
                 };
                 data = &data[id_len..];
-
-                let meta_len = match read_u32(&mut data) {
+                let n_tokens = match Self::read_u32(&mut data) {
                     Some(n) => n as usize,
                     None => break,
                 };
-                if data.len() < meta_len {
-                    break;
+                let mut toks = Vec::with_capacity(n_tokens.min(MAX_LI_TOKENS));
+                for _ in 0..n_tokens {
+                    let dims = match Self::read_u32(&mut data) {
+                        Some(n) => n as usize,
+                        None => break 'outer,
+                    };
+                    let scale = match Self::read_f32(&mut data) {
+                        Some(v) => v,
+                        None => break 'outer,
+                    };
+                    let norm = match Self::read_f32(&mut data) {
+                        Some(v) => v,
+                        None => break 'outer,
+                    };
+                    if data.len() < dims {
+                        break 'outer;
+                    }
+                    let codes: Vec<i8> = data[..dims].iter().map(|&b| b as i8).collect();
+                    data = &data[dims..];
+                    toks.push(QuantizedVec { codes, scale, norm });
                 }
-                let meta = match std::str::from_utf8(&data[..meta_len]) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => break,
-                };
-                data = &data[meta_len..];
+                map.insert(id, toks);
+            }
+            map
+        }
 
-                let dims = match read_u32(&mut data) {
+        /// TRVEC1 (f32) entry body: [u32 dims][f32 × dims].
+        fn load_index_binary_v1(mut data: &[u8]) -> HashMap<String, (Vec<f32>, String)> {
+            use std::convert::TryInto;
+            let mut map = HashMap::new();
+            loop {
+                let (id, meta) = match Self::read_entry_header(&mut data) {
+                    Some(h) => h,
+                    None => break,
+                };
+                let dims = match Self::read_u32(&mut data) {
                     Some(n) => n as usize,
                     None => break,
                 };
@@ -627,11 +889,13 @@ mod inner {
 
                 map.insert(id, (vec, meta));
             }
-
             map
         }
     }
 
+    /// f32×f32 cosine — retained for tests/diagnostics; the store itself now
+    /// scores via `vector_quant::cosine_query_to_i8` (int8 storage).
+    #[allow(dead_code)]
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -729,7 +993,26 @@ mod inner {
             Vec::new()
         }
 
-        pub fn get_embedding(&self, _id: &str) -> Option<&[f32]> {
+        pub fn all_token_items(&self) -> Vec<(String, Vec<crate::vector_quant::QuantizedVec>)> {
+            Vec::new()
+        }
+
+        pub fn upsert_raw_token_batch(
+            &mut self,
+            _items: Vec<(String, Vec<crate::vector_quant::QuantizedVec>)>,
+        ) -> usize {
+            0
+        }
+
+        pub fn max_sim_rerank(
+            &mut self,
+            _query: &str,
+            _candidate_ids: &[String],
+        ) -> Result<Vec<(String, f32)>> {
+            Ok(Vec::new())
+        }
+
+        pub fn get_embedding(&self, _id: &str) -> Option<Vec<f32>> {
             None
         }
 
@@ -783,6 +1066,115 @@ mod tests {
     #[test]
     fn index_ids_method_exists_on_real_store() {
         let _: fn(&VectorStore) -> Vec<String> = VectorStore::index_ids;
+    }
+
+    /// TRVEC2 persistence round-trip + TRVEC1 migration, model-free (raw
+    /// vectors only — never touches the ONNX bundle, so it runs everywhere).
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn trvec2_roundtrip_and_trvec1_migration() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Deterministic pseudo-vectors (same scheme as vector_quant tests).
+        let vec_of = |seed: u32, dim: usize| -> Vec<f32> {
+            let mut s = seed.wrapping_mul(2654435761).wrapping_add(1);
+            (0..dim)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((s >> 8) & 0xffff) as f32 / 32768.0 - 1.0
+                })
+                .collect()
+        };
+
+        // 1. Fresh store → raw upsert → save: file must be TRVEC2.
+        let mut store = VectorStore::init(dir.path()).await.unwrap();
+        let items: Vec<(String, Vec<f32>, String)> =
+            (0..20).map(|i| (format!("c{i}"), vec_of(i, 64), format!("m{i}"))).collect();
+        store.upsert_raw_batch(items.clone()).unwrap();
+        store.save().unwrap();
+        let bytes = std::fs::read(dir.path().join("vectors.bin")).unwrap();
+        assert!(bytes.starts_with(b"TRVEC2\n"), "save must write TRVEC2");
+
+        // 2. Reload → search order must match the pre-save store exactly.
+        let q = vec_of(777, 64);
+        let before: Vec<String> =
+            store.search_by_vector(&q, 5).into_iter().map(|(id, _, _)| id).collect();
+        let reloaded = VectorStore::init(dir.path()).await.unwrap();
+        assert_eq!(reloaded.len(), 20);
+        let after: Vec<String> =
+            reloaded.search_by_vector(&q, 5).into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(before, after, "TRVEC2 round-trip must preserve ranking");
+        // Metadata survives too.
+        assert_eq!(reloaded.get_embedding("c3").unwrap().len(), 64);
+
+        // 3. Hand-write a TRVEC1 (f32) file → load must quantize transparently
+        //    and rank identically to quantizing the same vectors in memory.
+        let v1_dir = tempfile::tempdir().unwrap();
+        let mut buf = b"TRVEC1\n".to_vec();
+        for (id, vec, meta) in &items {
+            buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id.as_bytes());
+            buf.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+            buf.extend_from_slice(meta.as_bytes());
+            buf.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+            for f in vec {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        std::fs::write(v1_dir.path().join("vectors.bin"), &buf).unwrap();
+        let migrated = VectorStore::init(v1_dir.path()).await.unwrap();
+        assert_eq!(migrated.len(), 20, "TRVEC1 entries must all load");
+        let migrated_top: Vec<String> =
+            migrated.search_by_vector(&q, 5).into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(before, migrated_top, "TRVEC1 migration must preserve ranking");
+        // And its next save upgrades the file format.
+        migrated.save().unwrap();
+        let migrated_bytes = std::fs::read(v1_dir.path().join("vectors.bin")).unwrap();
+        assert!(migrated_bytes.starts_with(b"TRVEC2\n"), "TRVEC1 must migrate to TRVEC2 on save");
+    }
+
+    /// TRTOK1 token-index persistence round-trip, model-free (raw quantized
+    /// tokens injected via the merge-import API).
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn trtok1_token_index_roundtrip() {
+        use crate::vector_quant::quantize_i8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = VectorStore::init(dir.path()).await.unwrap();
+
+        // No tokens, no file: the flag-off path must not create tokens.bin.
+        store.save().unwrap();
+        assert!(
+            !dir.path().join("tokens.bin").exists(),
+            "empty token index must not create tokens.bin"
+        );
+
+        let toks_a = vec![quantize_i8(&[0.1, 0.9, -0.3]), quantize_i8(&[0.5, 0.5, 0.5])];
+        let toks_b = vec![quantize_i8(&[1.0, 0.0, 0.0])];
+        let n = store.upsert_raw_token_batch(vec![
+            ("claim:a".into(), toks_a.clone()),
+            ("claim:b".into(), toks_b.clone()),
+        ]);
+        assert_eq!(n, 2);
+        store.save().unwrap();
+        assert!(dir.path().join("tokens.bin").exists());
+
+        let reloaded = VectorStore::init(dir.path()).await.unwrap();
+        let mut items = reloaded.all_token_items();
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ("claim:a".to_string(), toks_a));
+        assert_eq!(items[1], ("claim:b".to_string(), toks_b));
+
+        // remove_by_ids drops the token entry too, and save propagates the
+        // removal to disk instead of resurrecting it on next load.
+        let mut reloaded = reloaded;
+        reloaded.remove_by_ids(&["claim:a"]);
+        reloaded.save().unwrap();
+        let again = VectorStore::init(dir.path()).await.unwrap();
+        assert_eq!(again.all_token_items().len(), 1);
+        assert_eq!(again.all_token_items()[0].0, "claim:b");
     }
 
     #[cfg(feature = "vector")]

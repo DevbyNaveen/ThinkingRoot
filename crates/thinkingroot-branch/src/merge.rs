@@ -254,6 +254,13 @@ async fn apply_branch_diff(
                      state)"
                 ))
             })?;
+            // Late-interaction token vectors ride along (lossless int8 copy).
+            // Empty when the tier is off — a free no-op.
+            let token_items = source_vec.all_token_items();
+            if !token_items.is_empty() {
+                let tn = target_vec.upsert_raw_token_batch(token_items);
+                tracing::info!("merge: reconciled {tn} branch token-vector docs");
+            }
             target_vec.save().map_err(|e| {
                 Error::VectorStorage(format!(
                     "merge: failed to persist target vector store after upserting {n} \

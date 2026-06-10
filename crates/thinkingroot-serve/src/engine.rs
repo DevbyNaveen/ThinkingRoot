@@ -4535,6 +4535,29 @@ side referenced. Strict rules:\n\
         Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await
     }
 
+    /// Late-interaction (MaxSim) scores for a candidate claim-id set — the
+    /// Layer 6.4 tier in hybrid retrieval (NOW item 5). Takes BARE claim ids
+    /// (the `claims` table form); the `claim:` vector-index key convention is
+    /// applied and stripped here. Empty result = no signal (tier disabled,
+    /// no token index, or no candidate has token vectors) — callers keep the
+    /// fused order.
+    pub async fn late_interaction_scores(
+        &self,
+        ws: &str,
+        query: &str,
+        candidate_ids: &[String],
+    ) -> Result<Vec<(String, f32)>> {
+        let handle = self.get_workspace(ws)?;
+        let keys: Vec<String> = candidate_ids.iter().map(|id| format!("claim:{id}")).collect();
+        let mut storage = handle.storage.lock().await;
+        // block_in_place: embeds the query (ONNX) when the tier is active.
+        let scored = run_blocking(|| storage.vector.max_sim_rerank(query, &keys))?;
+        Ok(scored
+            .into_iter()
+            .map(|(key, s)| (key.strip_prefix("claim:").unwrap_or(&key).to_string(), s))
+            .collect())
+    }
+
     /// Handle-based core of [`Self::search_scoped`] — operates directly on a
     /// `WorkspaceHandle` so a *captured* handle (e.g. a Root Function's
     /// [`FnCapabilities`]) can recall over the cognition graph without
@@ -5807,11 +5830,47 @@ Rules: \
 
         // No active branch — write to main graph, then reload cache.
         let accepted_ids;
-        let warnings;
+        let mut warnings;
         {
-            let storage = handle.storage.lock().await;
+            let mut storage = handle.storage.lock().await;
             (accepted_ids, warnings) =
                 Self::write_agent_claims_to_graph(&storage.graph, &source, &agent_claims)?;
+
+            // B3 — instant recall (main path): embed contributed claims into
+            // the main vector index NOW, mirroring the branch path above and
+            // contribute_bulk's main path, so a plain MCP/REST `contribute`
+            // is immediately semantically recallable without a recompile.
+            // Non-fatal (honesty contract): the graph write is already
+            // durable; embed failure degrades recall to keyword and says so.
+            if !accepted_ids.is_empty() {
+                let items: Vec<(String, String, String)> = agent_claims
+                    .iter()
+                    .zip(accepted_ids.iter())
+                    .map(|(ac, id)| {
+                        let ctype = &ac.claim_type;
+                        let conf = ac.confidence.unwrap_or(0.7);
+                        (
+                            format!("claim:{id}"),
+                            ac.statement.clone(),
+                            format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                        )
+                    })
+                    .collect();
+                let vwarn = run_blocking(|| {
+                    let mut out = Vec::new();
+                    if let Err(e) = storage.vector.upsert_batch(&items) {
+                        out.push(format!(
+                            "main vector index degraded: upsert of {} embeddings failed \
+                             ({e}) — hybrid retrieval will miss these claims until `root compile`",
+                            items.len()
+                        ));
+                    } else if let Err(e) = storage.vector.save() {
+                        out.push(format!("main vector index save failed ({e})"));
+                    }
+                    out
+                });
+                warnings.extend(vwarn);
+            }
 
             // ── Rooting advisory pass — DELETED in Witness Mesh cutover ──
             //

@@ -592,6 +592,26 @@ impl GraphStore {
                 claim_ids: String default '[]',
                 timestamp: Float default 0.0
             }",
+            // Usage signal (NOW item 4) — append-only log of which retrieved
+            // claims were SHOWN per query and which the model actually CITED.
+            // This is the training seed for the per-project learn-to-rank loop
+            // (and feeds consolidation ordering + the restated-fraction
+            // metric). One row per (query event × grounding hit); `ts` in the
+            // key keeps repeat queries distinct. `query_blake3` is the BLAKE3
+            // hex of the raw query text (compact join key); the raw text is
+            // kept too — it stays inside this tenant's own graph.
+            ":create retrieval_usage {
+                query_blake3: String,
+                claim_id: String,
+                ts: Float
+                =>
+                session_id: String default '',
+                query: String default '',
+                rank: Int default 0,
+                relevance: Float default 0.0,
+                cited: Bool default false,
+                refused: Bool default false
+            }",
             // Rooting — append-only log of every trial run against a claim.
             // One row per probe battery execution (not per probe). A single claim
             // can have many verdicts over time (initial trial + re-rooting sweeps).
@@ -6724,6 +6744,121 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Usage signal (NOW item 4) — persist which retrieved claims were shown
+    /// for one query event and which the model actually cited. One call per
+    /// answered query; one row per grounding hit. Append-only: repeat queries
+    /// get fresh rows via the `ts` key component. This is the seed the
+    /// per-project learn-to-rank trainer reads — until 2026-06 the citation
+    /// gate computed exactly this and discarded it.
+    ///
+    /// `hits`: (claim_id, rank, relevance, cited).
+    pub fn record_retrieval_usage(
+        &self,
+        session_id: &str,
+        query: &str,
+        refused: bool,
+        hits: &[(String, usize, f32, bool)],
+    ) -> Result<()> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let ts = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let query_blake3 = blake3::hash(query.as_bytes()).to_hex().to_string();
+
+        let rows: Vec<DataValue> = hits
+            .iter()
+            .map(|(claim_id, rank, relevance, cited)| {
+                DataValue::List(vec![
+                    DataValue::Str(query_blake3.as_str().into()),
+                    DataValue::Str(claim_id.as_str().into()),
+                    DataValue::Num(Num::Float(ts)),
+                    DataValue::Str(session_id.into()),
+                    DataValue::Str(query.into()),
+                    DataValue::Num(Num::Int(*rank as i64)),
+                    DataValue::Num(Num::Float(*relevance as f64)),
+                    DataValue::Bool(*cited),
+                    DataValue::Bool(refused),
+                ])
+            })
+            .collect();
+
+        let mut params = BTreeMap::new();
+        params.insert("rows".into(), DataValue::List(rows));
+
+        self.db
+            .run_script(
+                "?[query_blake3, claim_id, ts, session_id, query, rank, relevance, cited, refused] \
+                 <- $rows \
+                 :put retrieval_usage { query_blake3, claim_id, ts => session_id, query, rank, \
+                 relevance, cited, refused }",
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("record_retrieval_usage failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Read back usage-signal rows newer than `since_ts` (epoch seconds),
+    /// oldest-first, capped at `limit`. The idle batch trainer's scan
+    /// primitive; also powers the restated-fraction metric.
+    ///
+    /// Returns (query_blake3, claim_id, ts, session_id, query, rank,
+    /// relevance, cited, refused).
+    #[allow(clippy::type_complexity)]
+    pub fn scan_retrieval_usage(
+        &self,
+        since_ts: f64,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String, String, i64, f64, bool, bool)>> {
+        let mut params = BTreeMap::new();
+        params.insert("since".into(), DataValue::Num(Num::Float(since_ts)));
+        params.insert("lim".into(), DataValue::Num(Num::Int(limit as i64)));
+
+        let result = self
+            .db
+            .run_script(
+                "?[query_blake3, claim_id, ts, session_id, query, rank, relevance, cited, refused] := \
+                 *retrieval_usage{query_blake3, claim_id, ts, session_id, query, rank, relevance, \
+                 cited, refused}, ts > $since \
+                 :order ts \
+                 :limit $lim",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("scan_retrieval_usage failed: {e}")))?;
+
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            let f = |v: &DataValue| -> f64 {
+                match v {
+                    DataValue::Num(Num::Float(x)) => *x,
+                    DataValue::Num(Num::Int(n)) => *n as f64,
+                    _ => 0.0,
+                }
+            };
+            let i = |v: &DataValue| -> i64 {
+                match v {
+                    DataValue::Num(Num::Int(n)) => *n,
+                    DataValue::Num(Num::Float(x)) => *x as i64,
+                    _ => 0,
+                }
+            };
+            let b = |v: &DataValue| matches!(v, DataValue::Bool(true));
+            out.push((
+                dv_to_string(&row[0]),
+                dv_to_string(&row[1]),
+                f(&row[2]),
+                dv_to_string(&row[3]),
+                dv_to_string(&row[4]),
+                i(&row[5]),
+                f(&row[6]),
+                b(&row[7]),
+                b(&row[8]),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Filter dangling claim references out of the turns calendar.
     ///
     /// `turns.claim_ids` is a JSON-encoded `Vec<String>` because the
@@ -7228,6 +7363,57 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn retrieval_usage_records_and_scans_back() {
+        let store = mem_store();
+
+        // One query event: 3 hits shown, ranks 0..2, only the first cited.
+        store
+            .record_retrieval_usage(
+                "sess-1",
+                "where does the pipeline persist claims?",
+                false,
+                &[
+                    ("claim:a".to_string(), 0, 0.91, true),
+                    ("claim:b".to_string(), 1, 0.62, false),
+                    ("claim:c".to_string(), 2, 0.40, false),
+                ],
+            )
+            .expect("record usage");
+
+        let rows = store.scan_retrieval_usage(0.0, 100).expect("scan usage");
+        assert_eq!(rows.len(), 3, "one row per shown hit");
+
+        // All rows share the query hash + raw query + session.
+        let qh = blake3::hash(b"where does the pipeline persist claims?")
+            .to_hex()
+            .to_string();
+        for (query_blake3, _, ts, session_id, query, _, _, _, refused) in &rows {
+            assert_eq!(query_blake3, &qh);
+            assert_eq!(session_id, "sess-1");
+            assert_eq!(query, "where does the pipeline persist claims?");
+            assert!(*ts > 0.0);
+            assert!(!refused);
+        }
+        // The cited flag survives per-hit.
+        let cited: Vec<(&str, bool)> = rows
+            .iter()
+            .map(|(_, cid, _, _, _, _, _, c, _)| (cid.as_str(), *c))
+            .collect();
+        assert!(cited.contains(&("claim:a", true)));
+        assert!(cited.contains(&("claim:b", false)));
+        assert!(cited.contains(&("claim:c", false)));
+
+        // since_ts filter: nothing newer than far-future.
+        let later = store.scan_retrieval_usage(9.0e12, 100).expect("scan empty");
+        assert!(later.is_empty(), "since_ts beyond all rows returns empty");
+
+        // Empty hits = no-op, never an error.
+        store
+            .record_retrieval_usage("sess-1", "q", false, &[])
+            .expect("empty hits ok");
     }
 
     #[test]

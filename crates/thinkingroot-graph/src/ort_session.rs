@@ -245,6 +245,26 @@ mod inner {
         /// longest sequence and ran it as one `[512 × seq × 768]` tensor —
         /// gigabytes for gte-modernbert — and OOM-killed the daemon (exit 137).
         pub fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(self
+                .embed_with_tokens(texts, None)?
+                .into_iter()
+                .map(|(pooled, _)| pooled)
+                .collect())
+        }
+
+        /// Embed a batch, returning BOTH the mean-pooled sentence vector and
+        /// (when `max_tokens` is `Some`) the per-token hidden-state vectors —
+        /// the late-interaction (MaxSim) substrate. Token vectors come from
+        /// the SAME forward pass as the pooled vector (the model outputs
+        /// `last_hidden_state`; pooling happens here in Rust), so requesting
+        /// them adds zero inference cost. Each token vector is L2-normalised;
+        /// only attention-masked positions are kept, truncated to
+        /// `max_tokens`. With `max_tokens = None` the token list is empty.
+        pub fn embed_with_tokens(
+            &mut self,
+            texts: &[&str],
+            max_tokens: Option<usize>,
+        ) -> Result<Vec<(Vec<f32>, Vec<Vec<f32>>)>> {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -254,17 +274,21 @@ mod inner {
                 .filter(|n| *n > 0)
                 .unwrap_or(16);
             if texts.len() <= sub {
-                return self.embed_chunk(texts);
+                return self.embed_chunk(texts, max_tokens);
             }
-            let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            let mut out = Vec::with_capacity(texts.len());
             for chunk in texts.chunks(sub) {
-                out.extend(self.embed_chunk(chunk)?);
+                out.extend(self.embed_chunk(chunk, max_tokens)?);
             }
             Ok(out)
         }
 
         /// Embed a single bounded sub-batch in one ONNX inference call.
-        fn embed_chunk(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        fn embed_chunk(
+            &mut self,
+            texts: &[&str],
+            max_tokens: Option<usize>,
+        ) -> Result<Vec<(Vec<f32>, Vec<Vec<f32>>)>> {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
@@ -371,11 +395,14 @@ mod inner {
                 )));
             }
 
-            // Mean-pool with attention mask, then L2-normalise.
-            let mut out: Vec<Vec<f32>> = Vec::with_capacity(b);
+            // Mean-pool with attention mask, then L2-normalise. When token
+            // vectors were requested, also collect the per-position hidden
+            // states (masked positions only, capped, each L2-normalised).
+            let mut out: Vec<(Vec<f32>, Vec<Vec<f32>>)> = Vec::with_capacity(b);
             for i in 0..b {
                 let mut pooled = vec![0.0_f32; d];
                 let mut count = 0.0_f32;
+                let mut tokens: Vec<Vec<f32>> = Vec::new();
                 for j in 0..t {
                     let m = attention_mask[i * seq + j];
                     if m > 0 {
@@ -383,6 +410,20 @@ mod inner {
                             pooled[k] += data[i * t * d + j * d + k];
                         }
                         count += 1.0;
+                        if let Some(cap) = max_tokens
+                            && tokens.len() < cap
+                        {
+                            let mut tv: Vec<f32> =
+                                data[i * t * d + j * d..i * t * d + j * d + d].to_vec();
+                            let tnorm: f32 = tv.iter().map(|v| v * v).sum::<f32>().sqrt();
+                            if tnorm > 0.0 {
+                                let inv = 1.0 / tnorm;
+                                for v in tv.iter_mut() {
+                                    *v *= inv;
+                                }
+                            }
+                            tokens.push(tv);
+                        }
                     }
                 }
                 if count > 0.0 {
@@ -398,7 +439,7 @@ mod inner {
                         *v *= inv;
                     }
                 }
-                out.push(pooled);
+                out.push((pooled, tokens));
             }
             Ok(out)
         }

@@ -164,6 +164,51 @@ pub async fn hybrid_retrieve(
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // ---- Layer 6.2: content dedup (NOW item 3) ----
+    // The same span of text ingested from multiple sources produces distinct
+    // claim ids with IDENTICAL `content_blake3` (= BLAKE3 of the witnessed
+    // span bytes — see graph.rs claims schema). Keep only the highest-fused
+    // copy per hash so duplicates can't inflate the candidate pool, crowd
+    // top_k, or burn cross-encoder slots. Runs after the sort so "first seen"
+    // = "best scored"; rows with an empty hash (pre-migration) are never
+    // collapsed.
+    let before_dedup = scored.len();
+    dedup_scored_by_content(&mut scored);
+    let content_dupes_dropped = (before_dedup - scored.len()) as u32;
+    if content_dupes_dropped > 0 {
+        tracing::debug!(content_dupes_dropped, "content dedup collapsed duplicate-span claims");
+    }
+
+    // ---- Layer 6.4: late-interaction MaxSim tier (flag-gated, NOW item 5) ----
+    // ColBERT-style: per-token query vectors against write-time doc token
+    // vectors (captured int8 in the same embed forward pass), blended into
+    // the fused order BEFORE the cross-encoder margin gate below — a
+    // MaxSim-disambiguated top gap can skip the ~1.1s CE entirely. Token
+    // coverage is partial by design (only claims written while the flag was
+    // on); uncovered candidates keep their fused score untouched. Default
+    // OFF via TR_LATE_INTERACTION until the Azure eval gate proves recall.
+    // Branch-scoped queries skip the tier (token index lives on main).
+    if late_interaction_flag_on() && req.branch.is_none() && scored.len() >= 2 {
+        let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
+        let ids: Vec<String> = scored[..pool_size]
+            .iter()
+            .map(|(c, _, _)| c.claim_id.clone())
+            .collect();
+        match engine.late_interaction_scores(ws, &req.query_text, &ids).await {
+            Ok(li) if !li.is_empty() => {
+                let w: f32 = std::env::var("TR_LI_WEIGHT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.5);
+                apply_late_interaction(&mut scored[..pool_size], &li, w);
+            }
+            Ok(_) => {} // no token coverage — honest no-op
+            Err(e) => {
+                tracing::warn!(error = %e, "late-interaction tier failed; keeping fused order");
+            }
+        }
+    }
+
     // ---- Layer 6.5: SOTA cross-encoder rerank (opt-in, lever 1) ----
     //
     // Re-orders the top `req.top_k * 2` survivors of fuse_score by
@@ -771,6 +816,60 @@ fn merge_candidates(
     let mut seen: HashSet<String> = HashSet::new();
     out.retain(|c| seen.insert(c.claim_id.clone()));
     out
+}
+
+/// Layer 6.4 flag — read once per query; keeps the flag-off path at literal
+/// zero cost (no storage lock, no engine call).
+fn late_interaction_flag_on() -> bool {
+    std::env::var("TR_LATE_INTERACTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Layer 6.4 core — blend MaxSim scores into the fused pool and re-sort it.
+/// `li` carries (claim_id, max_sim) ONLY for token-covered candidates; the
+/// rest keep their fused score unchanged (absence = no signal, never a zero).
+/// MaxSim is min-max normalised over the covered set so the blend with the
+/// [0,1] fused score is dimensionally honest (same convention as the CE
+/// blend below). Pure — unit-tested without an engine.
+fn apply_late_interaction(
+    pool: &mut [(EnrichedCandidate, f32, ScoreBreakdown)],
+    li: &[(String, f32)],
+    weight: f32,
+) {
+    if li.is_empty() || pool.len() < 2 {
+        return;
+    }
+    let (mn, mx) = li
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), (_, s)| {
+            (mn.min(*s), mx.max(*s))
+        });
+    let range = (mx - mn).max(1e-6);
+    let by_id: HashMap<&str, f32> = li.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+    let w = weight.clamp(0.0, 1.0);
+    for (cand, score, _) in pool.iter_mut() {
+        if let Some(raw) = by_id.get(cand.claim_id.as_str()) {
+            let li_norm = (raw - mn) / range;
+            *score = w * li_norm + (1.0 - w) * *score;
+        }
+    }
+    pool.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+}
+
+/// Layer 6.2 — collapse claims that witness the SAME content bytes. Input must
+/// be sorted descending by fused score; retains the first (= best) row per
+/// non-empty `primary_blake3`. Empty hashes (rows from before the
+/// content_blake3 migration) are kept unconditionally — we never guess that
+/// two unhashed rows are duplicates.
+fn dedup_scored_by_content(scored: &mut Vec<(EnrichedCandidate, f32, ScoreBreakdown)>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    scored.retain(|(c, _, _)| {
+        if c.primary_blake3.is_empty() {
+            return true;
+        }
+        seen.insert(c.primary_blake3.clone())
+    });
 }
 
 // GraphRAG fan-out bounds. A pathological hub entity could otherwise spread to
@@ -2184,6 +2283,92 @@ mod tests {
             cluster_gaps: vec![],
             enrichment_byte_spans: vec![],
         }
+    }
+
+    #[test]
+    fn late_interaction_blend_reorders_covered_candidates_only() {
+        let zero_breakdown = || ScoreBreakdown {
+            vector: 0.0,
+            admission: 0.0,
+            trial: 0.0,
+            source_authority: 0.0,
+            recency: 0.0,
+            freshness_penalty: 0.0,
+            complexity: 0.0,
+            marker: 0.0,
+            gap_proximity: 0.0,
+            contradiction_penalty: 0.0,
+            test_origin_penalty: 0.0,
+            fused: 0.0,
+            cross_encoder: None,
+        };
+        let mk = |id: &str, fused: f32| {
+            let mut c = empty_candidate();
+            c.claim_id = id.into();
+            (c, fused, zero_breakdown())
+        };
+        // Fused order: a > b > c. MaxSim strongly prefers c over a; b has NO
+        // token coverage and must keep its fused score untouched.
+        let mut pool = vec![mk("a", 0.60), mk("b", 0.55), mk("c", 0.50)];
+        let li = vec![("a".to_string(), 0.10), ("c".to_string(), 0.95)];
+        apply_late_interaction(&mut pool, &li, 0.5);
+
+        let scores: HashMap<String, f32> =
+            pool.iter().map(|(c, s, _)| (c.claim_id.clone(), *s)).collect();
+        // b untouched (no signal ≠ zero signal).
+        assert!((scores["b"] - 0.55).abs() < 1e-6, "uncovered candidate must keep fused score");
+        // c: li_norm = 1.0 → 0.5*1.0 + 0.5*0.50 = 0.75 → now ranked first.
+        assert!((scores["c"] - 0.75).abs() < 1e-6);
+        // a: li_norm = 0.0 → 0.5*0.0 + 0.5*0.60 = 0.30 → now ranked last.
+        assert!((scores["a"] - 0.30).abs() < 1e-6);
+        let order: Vec<&str> = pool.iter().map(|(c, _, _)| c.claim_id.as_str()).collect();
+        assert_eq!(order, vec!["c", "b", "a"], "pool must be re-sorted after blend");
+
+        // Empty li / tiny pool are no-ops.
+        let mut single = vec![mk("x", 0.4)];
+        apply_late_interaction(&mut single, &li, 0.5);
+        assert!((single[0].1 - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn content_dedup_keeps_best_scored_copy_per_hash() {
+        let zero_breakdown = || ScoreBreakdown {
+            vector: 0.0,
+            admission: 0.0,
+            trial: 0.0,
+            source_authority: 0.0,
+            recency: 0.0,
+            freshness_penalty: 0.0,
+            complexity: 0.0,
+            marker: 0.0,
+            gap_proximity: 0.0,
+            contradiction_penalty: 0.0,
+            test_origin_penalty: 0.0,
+            fused: 0.0,
+            cross_encoder: None,
+        };
+        let mk = |id: &str, hash: &str, score: f32| {
+            let mut c = empty_candidate();
+            c.claim_id = id.into();
+            c.primary_blake3 = hash.into();
+            (c, score, zero_breakdown())
+        };
+        // Descending by fused score, as the call site guarantees post-sort.
+        let mut scored = vec![
+            mk("best-dup", "hashA", 0.9),
+            mk("unhashed-1", "", 0.8),
+            mk("worse-dup", "hashA", 0.7),
+            mk("other", "hashB", 0.6),
+            mk("unhashed-2", "", 0.5),
+            mk("worst-dup", "hashA", 0.4),
+        ];
+        dedup_scored_by_content(&mut scored);
+        let ids: Vec<&str> = scored.iter().map(|(c, _, _)| c.claim_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["best-dup", "unhashed-1", "other", "unhashed-2"],
+            "keep the best copy per content hash; never collapse empty hashes"
+        );
     }
 
     fn req() -> RetrievalRequest {

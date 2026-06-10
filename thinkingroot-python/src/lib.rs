@@ -248,6 +248,7 @@ impl Engine {
             require_provenance_verified: require_provenance_verified.unwrap_or(false),
             now: None,
             scoped_claim_ids: None,
+            branch: None,
         };
         let result = self
             .rt
@@ -435,6 +436,7 @@ impl Engine {
                 require_provenance_verified: false,
                 now: None,
                 scoped_claim_ids: Some(answer.claim_ids.clone()),
+                branch: None,
             };
             if let Ok(resp) = self
                 .rt

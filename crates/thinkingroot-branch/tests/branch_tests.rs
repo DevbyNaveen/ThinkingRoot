@@ -584,7 +584,7 @@ async fn requires_proposal_merge_succeeds_with_approved_proposal() {
     use thinkingroot_graph::graph::GraphStore;
     use thinkingroot_pr::{
         find_approved_proposal, list_proposals, mark_proposal_merged, open_proposal,
-        review_proposal, ProposalStatus, ReviewDecision,
+        record_check, review_proposal, ProposalStatus, ReviewDecision,
     };
 
     let dir = tempdir().unwrap();
@@ -659,7 +659,7 @@ async fn requires_proposal_merge_succeeds_with_approved_proposal() {
     .expect("open proposal");
     review_proposal(&refs_dir, &proposal.id, "bob", ReviewDecision::Approve, None)
         .expect("first approve");
-    let approved = review_proposal(
+    let two_approves = review_proposal(
         &refs_dir,
         &proposal.id,
         "carol",
@@ -667,9 +667,25 @@ async fn requires_proposal_merge_succeeds_with_approved_proposal() {
         None,
     )
     .expect("second approve");
+    // required_checks are a REAL gate now (recompute_status enforces a
+    // latest passing run per named check) — two approves alone must NOT
+    // advance the proposal while `health_score` has never run.
+    assert!(
+        matches!(two_approves.status, ProposalStatus::Open),
+        "with required_checks unmet, two approves must keep status Open, got {:?}",
+        two_approves.status
+    );
+    let approved = record_check(
+        &refs_dir,
+        &proposal.id,
+        "health_score",
+        true,
+        Some("health 0.97 >= floor".into()),
+    )
+    .expect("record passing required check");
     assert!(
         matches!(approved.status, ProposalStatus::Approved),
-        "two distinct approves must advance status to Approved, got {:?}",
+        "two distinct approves + passing required check must advance to Approved, got {:?}",
         approved.status
     );
 
@@ -988,13 +1004,15 @@ async fn merge_fails_loud_on_vector_save_error() {
         "branch vectors.bin must exist for the reconciliation gate to fire"
     );
 
-    // Poison the target's save path: pre-create vectors.bin.tmp as a
+    // Poison the target's save path: pre-create vectors.bin itself as a
     // directory so VectorStore::save()'s atomic `write tmp + rename`
-    // step fails on the write (cannot open a directory for write).
+    // step fails on the RENAME (renaming a file onto an existing
+    // directory is ENOTDIR/EISDIR). The tmp file can't be poisoned any
+    // more — save() now uses a unique pid+seq tmp name (torn-temp fix).
     // Pre-fix the merge would log a warn and return Ok.  Post-fix it
     // must return Err(Error::VectorStorage).
-    let target_tmp_path = main_data.join("vectors.bin.tmp");
-    std::fs::create_dir_all(&target_tmp_path).expect("poison target vectors.bin.tmp");
+    let target_bin_path = main_data.join("vectors.bin");
+    std::fs::create_dir_all(&target_bin_path).expect("poison target vectors.bin");
 
     // Empty diff with merge_allowed=true so the policy gate passes and
     // graph mutation steps are no-ops; the only work apply_branch_diff
@@ -1106,8 +1124,11 @@ async fn failed_merge_leaves_intent_and_recovers() {
     }
 
     // Poison the target vector save path AFTER snapshot would be taken.
-    std::fs::create_dir_all(main_data.join("vectors.bin.tmp"))
-        .expect("poison target vectors.bin.tmp");
+    // vectors.bin as a DIRECTORY makes save()'s final rename fail (the
+    // unique pid+seq tmp name means the old tmp-file poison no longer
+    // intercepts the write).
+    std::fs::create_dir_all(main_data.join("vectors.bin"))
+        .expect("poison target vectors.bin");
 
     let diff = KnowledgeDiff {
         from_branch: "feature/recover".into(),
@@ -1163,7 +1184,7 @@ async fn failed_merge_leaves_intent_and_recovers() {
 
     // 4. Clear the poison so recovery's `std::fs::copy` over graph.db
     //    can succeed (otherwise the test would re-fail at recovery).
-    std::fs::remove_dir_all(main_data.join("vectors.bin.tmp")).ok();
+    std::fs::remove_dir_all(main_data.join("vectors.bin")).ok();
 
     // 5. Recovery must roll back and clear the intent.
     let report = recover_orphan_merges(root).expect("recovery must succeed");

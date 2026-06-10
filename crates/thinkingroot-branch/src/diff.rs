@@ -716,7 +716,7 @@ pub fn apply_vector_contradiction_pass(
             continue;
         };
 
-        let neighbours = target_vec.search_by_vector(query_vec, VECTOR_CONTRADICTION_TOP_K);
+        let neighbours = target_vec.search_by_vector(&query_vec, VECTOR_CONTRADICTION_TOP_K);
         for (target_id, _, sim) in neighbours {
             if sim < cosine_threshold {
                 continue;
