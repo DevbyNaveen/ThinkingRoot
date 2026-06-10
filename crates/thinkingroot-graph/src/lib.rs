@@ -1,4 +1,5 @@
 pub mod aep_queries;
+pub mod answer_cache;
 pub mod artifact_nodes;
 pub mod capsule;
 pub mod codegraph;

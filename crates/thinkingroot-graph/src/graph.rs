@@ -1248,6 +1248,24 @@ impl GraphStore {
                 =>
                 object_kind: String default 'claim'
             }",
+            // Provenance-aware answer cache (§5 input #4). Same shape as the
+            // capsule cache: a keyed answer payload + the provenance set it
+            // depends on, so a claim change causally evicts exactly the
+            // answers that read it (graph supersession = safe invalidation).
+            ":create answer_cache {
+                key: String
+                =>
+                answer_json: String,
+                query: String default '',
+                branch: String default '',
+                created_at: Float default 0.0
+            }",
+            ":create answer_cache_deps {
+                key: String,
+                object_id: String
+                =>
+                object_kind: String default 'claim'
+            }",
         ];
 
         for stmt in &relations {
@@ -3114,6 +3132,7 @@ impl GraphStore {
         // …and evict any cached capsule grounded on the removed claim, so the
         // next compile can't serve a fact that no longer exists.
         let _ = self.invalidate_capsules_for(&[claim_id.to_string()]);
+        let _ = self.invalidate_answers_for(&[claim_id.to_string()]);
         Ok(())
     }
 
@@ -3220,6 +3239,7 @@ impl GraphStore {
         let _ = self.invalidate_experience_for_object("claim", claim_b);
         // Evict capsules grounded on either now-contested claim.
         let _ = self.invalidate_capsules_for(&[claim_a.to_string(), claim_b.to_string()]);
+        let _ = self.invalidate_answers_for(&[claim_a.to_string(), claim_b.to_string()]);
         Ok(())
     }
 
@@ -5033,6 +5053,7 @@ impl GraphStore {
         // Evict capsules grounded on the superseded claim so the next compile
         // re-retrieves the current fact instead of serving the stale one.
         let _ = self.invalidate_capsules_for(&[old_claim_id.to_string()]);
+        let _ = self.invalidate_answers_for(&[old_claim_id.to_string()]);
         Ok(())
     }
 

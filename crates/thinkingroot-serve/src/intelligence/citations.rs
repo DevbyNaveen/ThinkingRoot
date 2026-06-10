@@ -36,7 +36,7 @@ use crate::engine::{ClaimSearchHit, QueryEngine};
 /// `content_blake3` means the id verified by membership but no witness
 /// byte-span resolved (source-granular citation) — still honest, just
 /// coarser.
-#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Citation {
     pub claim_id: String,
     pub source_uri: String,

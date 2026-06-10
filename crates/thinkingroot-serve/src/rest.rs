@@ -6956,7 +6956,7 @@ fn decode_history(payload: &[ChatTurnPayload]) -> Vec<crate::intelligence::synth
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct AskResponseBody {
     answer: String,
     claims_used: usize,
@@ -6972,6 +6972,10 @@ struct AskResponseBody {
     /// hydration is off or nothing was rendered. Feeds the Savings Meter.
     #[serde(default)]
     hydrated_output_tokens_saved: usize,
+    /// §5 input #4 — true when this whole answer was served from the
+    /// provenance-aware answer cache (no LLM call). Feeds the Savings Meter.
+    #[serde(default)]
+    from_cache: bool,
 }
 
 /// §3 #6 retry flag — give a refused answer one more synthesis pass before
@@ -6988,6 +6992,23 @@ fn hydrate_answers_on() -> bool {
     std::env::var("TR_HYDRATE_ANSWERS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// §5 input #4 flag — serve repeated questions from the provenance-aware
+/// answer cache. OFF by default (it changes answered behaviour + carries a
+/// bounded staleness window). `TR_ANSWER_CACHE_TTL_SECS` (default 3600) caps
+/// how old a cached answer may be before it's treated as a miss.
+fn answer_cache_on() -> bool {
+    std::env::var("TR_ANSWER_CACHE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+fn answer_cache_ttl_secs() -> f64 {
+    std::env::var("TR_ANSWER_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|t| *t > 0.0)
+        .unwrap_or(3600.0)
 }
 
 async fn ask_handler(
@@ -7086,6 +7107,29 @@ async fn ask_handler(
         today: Some(&today),
         history: &history,
     };
+
+    // ── §5 input #4 — provenance-aware answer cache (read) ──────────
+    // Serve a repeated question from cache when fresh within TTL. Causal
+    // invalidation (claim supersession/removal evicts the answer) means a hit
+    // can only be stale within the TTL window, never built on a changed fact.
+    let answer_key =
+        thinkingroot_graph::answer_cache::answer_cache_key(None, &body.question);
+    if answer_cache_on() {
+        if let Some(graph) = engine.graph_store(&ws).await {
+            if let Ok(Some(row)) = graph.answer_cache_get(&answer_key) {
+                let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                if now - row.created_at <= answer_cache_ttl_secs() {
+                    if let Ok(mut cached) =
+                        serde_json::from_str::<AskResponseBody>(&row.answer_json)
+                    {
+                        cached.from_cache = true;
+                        tracing::debug!("answer cache hit");
+                        return ok_response(cached).into_response();
+                    }
+                }
+            }
+        }
+    }
 
     // Keep a handle for the §3 #6 retry pass (Arc clone is cheap).
     let llm_retry = llm.clone();
@@ -7205,7 +7249,7 @@ async fn ask_handler(
         )
         .await;
 
-    ok_response(AskResponseBody {
+    let resp_body = AskResponseBody {
         answer,
         claims_used,
         category,
@@ -7213,8 +7257,37 @@ async fn ask_handler(
         answer_confidence: gate.answer_confidence,
         refused: gate.refused,
         hydrated_output_tokens_saved,
-    })
-    .into_response()
+        from_cache: false,
+    };
+
+    // ── §5 input #4 — answer cache (write) ──────────────────────────
+    // Store verified answers keyed by the question, with the grounding claim
+    // ids as the provenance set so a later claim change evicts exactly this
+    // answer. Never cache a refusal. Best-effort: a cache write must not fail
+    // the response.
+    if answer_cache_on() && !resp_body.refused && !result.grounding.is_empty() {
+        if let Some(graph) = engine.graph_store(&ws).await {
+            if let Ok(json) = serde_json::to_string(&resp_body) {
+                let deps: Vec<(String, String)> = result
+                    .grounding
+                    .iter()
+                    .map(|h| (h.id.clone(), "claim".to_string()))
+                    .collect();
+                let row = thinkingroot_graph::answer_cache::AnswerCacheRow {
+                    key: answer_key,
+                    answer_json: json,
+                    query: body.question.clone(),
+                    branch: String::new(),
+                    created_at: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                };
+                if let Err(e) = graph.answer_cache_put(&row, &deps) {
+                    tracing::warn!(error = %e, "answer cache write failed (non-fatal)");
+                }
+            }
+        }
+    }
+
+    ok_response(resp_body).into_response()
 }
 
 // ─── Streaming Ask (SSE) ─────────────────────────────────────
