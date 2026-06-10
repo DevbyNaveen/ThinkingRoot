@@ -805,6 +805,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/functions/{name}/caps",
                 get(get_function_caps_handler).put(set_function_caps_handler),
             )
+            .route(
+                "/ws/{ws}/functions/{name}/verdict",
+                post(function_verdict_handler),
+            )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
             .route(
@@ -2100,6 +2104,36 @@ async fn set_function_caps_handler(
     let engine = state.engine.read().await;
     match engine.set_function_caps(&ws, &name, caps).await {
         Ok(()) => ok_response(serde_json::json!({ "caps": caps, "explicit": true })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct VerdictBody {
+    #[serde(default)]
+    input: serde_json::Value,
+    passed: bool,
+    #[serde(default)]
+    detail: String,
+}
+
+/// A6 — record a verification verdict (forge test-case outcome) for a
+/// function. Corrects the router's learned experience: a run that completed
+/// with the WRONG answer was over-credited by the invoke path; the failed
+/// verdict applies the missing negative evidence. Verdicts persist durably
+/// (the idle trainer + Console read them).
+async fn function_verdict_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(body): Json<VerdictBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .record_function_verdict(&ws, &name, &body.input, body.passed, &body.detail)
+        .await
+    {
+        Ok(()) => ok_response(serde_json::json!({ "recorded": true, "passed": body.passed }))
+            .into_response(),
         Err(e) => match_engine_error(e),
     }
 }

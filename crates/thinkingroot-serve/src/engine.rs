@@ -2830,6 +2830,40 @@ impl QueryEngine {
         storage.graph.get_function(name)
     }
 
+    /// A6 — record a verification verdict for one forge test case and CORRECT
+    /// the router's learned experience. The invoke that produced the output
+    /// already counted as a success if the run merely *completed* — so a run
+    /// that completed with the WRONG answer is over-credited. A failed
+    /// verdict applies the missing negative bump; a passed verdict adds no
+    /// extra positive (the invoke already credited it) — only the durable
+    /// verdict row, which the idle trainer and the Console read.
+    pub async fn record_function_verdict(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        passed: bool,
+        detail: &str,
+    ) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let input_class = Self::input_class_for(name, input);
+        let storage = handle.storage.lock().await;
+        if storage.graph.get_function(name)?.is_none() {
+            return Err(Error::EntityNotFound(format!(
+                "root function '{name}' is not deployed"
+            )));
+        }
+        storage
+            .graph
+            .record_verify_verdict(name, &input_class, passed, detail)?;
+        if !passed {
+            storage
+                .graph
+                .bump_function_experience(&input_class, name, false)?;
+        }
+        Ok(())
+    }
+
     /// A1 — store the capability grant set for a function. Requires the
     /// function to exist (granting caps to a non-deployed name is a typo
     /// until proven otherwise).

@@ -1087,6 +1087,21 @@ impl GraphStore {
                 version: Int default 1,
                 created_at: Float default 0.0
             }",
+            // A6 — durable verification verdicts. One row per forge/verify
+            // test case: did the function's OUTPUT match the expectation?
+            // This is the signal the run-log cannot carry (a run that
+            // completes with the WRONG answer records status 'ok'); the
+            // router's experience store is corrected from these rows, and the
+            // idle trainer reads them. Append-only via the `at` key.
+            ":create function_verify_verdicts {
+                name: String,
+                at: Float,
+                seq: Int
+                =>
+                input_class: String default '',
+                passed: Bool default false,
+                detail: String default ''
+            }",
             // A1 — per-function capability grants (security). Keyed by function
             // NAME (caps apply across versions; a redeploy never silently
             // re-escalates). `caps_json` is the serialised engine CapSet; a
@@ -7376,6 +7391,30 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn verify_verdicts_record_and_list_newest_first() {
+        let store = mem_store();
+        assert!(store.list_verify_verdicts("f", 10).unwrap().is_empty());
+
+        store
+            .record_verify_verdict("f", "obj[a]", true, "")
+            .expect("record pass");
+        store
+            .record_verify_verdict("f", "obj[a]", false, "expected 4, got 5")
+            .expect("record fail");
+
+        let rows = store.list_verify_verdicts("f", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first → the failure (recorded second) leads.
+        assert!(!rows[0].2, "newest verdict (the failure) must lead");
+        assert_eq!(rows[0].3, "expected 4, got 5");
+        assert!(rows[1].2);
+        // Cap respected.
+        assert_eq!(store.list_verify_verdicts("f", 1).unwrap().len(), 1);
+        // Empty name rejected.
+        assert!(store.record_verify_verdict(" ", "c", true, "").is_err());
     }
 
     #[test]

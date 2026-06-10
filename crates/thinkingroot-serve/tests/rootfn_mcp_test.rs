@@ -128,6 +128,67 @@ async fn stored_capset_gates_the_invoke_path() {
     );
 }
 
+/// A6 — a failed verification verdict corrects the router's learned
+/// experience. A function that COMPLETES but answers wrong is over-credited
+/// by the invoke path (status 'ok' → positive evidence); recording the
+/// failed verdict applies the missing negative bump, and the verdict row
+/// persists durably for the trainer.
+#[tokio::test]
+async fn failed_verdict_corrects_router_experience() {
+    let (engine, root, _dir) = engine_with_ws("acme").await;
+    // Completes fine — but (per the test expectation) the answer is WRONG.
+    engine
+        .put_function("acme", "adder", "(i, ctx) => i.a + i.a", "js")
+        .await
+        .unwrap();
+
+    let input = serde_json::json!({ "a": 2, "b": 3 });
+    // Invoke completes → the run path credits (class, adder) with a success.
+    engine.invoke_function("acme", "adder", &input).await.unwrap();
+
+    // The verify layer catches the wrong answer and reports the verdict.
+    engine
+        .record_function_verdict("acme", "adder", &input, false, "expected 5, got 4")
+        .await
+        .unwrap();
+
+    // The durable verdict row exists, and the experience now carries the
+    // corrective failure alongside the invoke's completion-success.
+    let graph_dir = root.join(".thinkingroot").join("graph");
+    let graph = GraphStore::init(&graph_dir).unwrap();
+    let verdicts = graph.list_verify_verdicts("adder", 10).unwrap();
+    assert_eq!(verdicts.len(), 1, "verdict must persist");
+    assert!(!verdicts[0].2);
+    assert_eq!(verdicts[0].3, "expected 5, got 4");
+
+    let report = engine.capability_routing_report("acme").await.unwrap();
+    let adder = report["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "adder")
+        .cloned()
+        .expect("adder appears in the routing report");
+    let class_row = adder["classes"]
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .expect("experience row exists for the invoke's input class");
+    assert_eq!(class_row["n_success"], 1, "invoke completion credited once");
+    assert_eq!(
+        class_row["n_fail"], 1,
+        "failed verdict must add the corrective negative"
+    );
+
+    // Verdicts on an undeployed function are rejected.
+    assert!(
+        engine
+            .record_function_verdict("acme", "ghost", &input, true, "")
+            .await
+            .is_err()
+    );
+}
+
 /// Self-extension: a running function deploys a NEW function at runtime via
 /// `ctx.acquire` (supplied body — model-independent), and that function is then
 /// invocable and correct. This is the engine-side spine for JIT/self-improving

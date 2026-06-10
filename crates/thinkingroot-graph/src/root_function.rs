@@ -232,6 +232,82 @@ impl GraphStore {
         })
     }
 
+    /// A6 — persist one verification verdict (forge test case outcome).
+    /// `passed` is the EXPECTATION match, not mere run completion.
+    pub fn record_verify_verdict(
+        &self,
+        name: &str,
+        input_class: &str,
+        passed: bool,
+        detail: &str,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Template("function name must be non-empty".into()));
+        }
+        let at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        // A forge runs many test cases back-to-back within one millisecond —
+        // a (name, at) key would silently overwrite siblings. The process-
+        // global sequence disambiguates; across restarts `at` differs.
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static VERDICT_SEQ: AtomicI64 = AtomicI64::new(0);
+        let seq = VERDICT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("at".into(), DataValue::Num(Num::Float(at)));
+        params.insert("seq".into(), DataValue::Num(Num::Int(seq)));
+        params.insert("ic".into(), DataValue::Str(input_class.into()));
+        params.insert("passed".into(), DataValue::Bool(passed));
+        params.insert("detail".into(), DataValue::Str(detail.into()));
+        self.query(
+            "?[name, at, seq, input_class, passed, detail] <- \
+             [[$name, $at, $seq, $ic, $passed, $detail]] \
+             :put function_verify_verdicts {name, at, seq => input_class, passed, detail}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// A6 — verdicts for a function, newest-first, capped. Returns
+    /// `(at, input_class, passed, detail)`.
+    pub fn list_verify_verdicts(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<(f64, String, bool, String)>> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("lim".into(), DataValue::Num(Num::Int(limit as i64)));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[at, seq, input_class, passed, detail] := \
+                 *function_verify_verdicts{name: $name, at, seq, input_class, passed, detail} \
+                 :order -at, -seq \
+                 :limit $lim",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_verify_verdicts: {e}")))?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                let at = match &r[0] {
+                    DataValue::Num(Num::Float(f)) => *f,
+                    DataValue::Num(Num::Int(n)) => *n as f64,
+                    _ => 0.0,
+                };
+                // r[1] is the disambiguating seq — not surfaced.
+                (
+                    at,
+                    dv_str(&r[2]),
+                    matches!(&r[3], DataValue::Bool(true)),
+                    dv_str(&r[4]),
+                )
+            })
+            .collect())
+    }
+
     /// A1 — set the capability grants for a function (by NAME — caps survive
     /// redeploys; a new version never silently re-escalates). `caps_json` is
     /// the engine's serialised CapSet; storage treats it as opaque.
