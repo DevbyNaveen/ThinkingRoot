@@ -191,6 +191,46 @@ pub async fn hybrid_retrieve(
         tracing::debug!(content_dupes_dropped, "content dedup collapsed duplicate-span claims");
     }
 
+    // ---- Layer 6.3: learned-prior nudge (NEXT item 10, flag-gated) ----
+    // The per-tenant learn-to-rank signal the static cross-encoder cannot
+    // see: which memories actually get CITED across many queries. The idle
+    // trainer (`maintenance::spawn_retrieval_prior_trainer`) rolls
+    // `retrieval_usage` into per-claim `claim_usefulness` (Wilson lower bound
+    // of citation rate). Here we give proven-useful claims a small, bounded,
+    // POSITIVE boost — untrained/absent claims are left exactly neutral
+    // (never penalised), so an untrained tenant ranks identically to today.
+    // OFF by default (TR_LEARNED_PRIOR) until the Azure eval gate proves it
+    // helps; flag-off is a literal no-op on the calibrated blend, and the
+    // trainer is gated on the same switch (no priors accumulate while dark).
+    if learned_prior_flag_on() && !scored.is_empty() {
+        let pool_size = (req.top_k * 2).max(req.top_k).min(scored.len());
+        let ids: Vec<String> = scored[..pool_size]
+            .iter()
+            .map(|(c, _, _)| c.claim_id.clone())
+            .collect();
+        match graph.get_claim_usefulness(&ids) {
+            Ok(priors) if !priors.is_empty() => {
+                let w: f32 = std::env::var("TR_LEARNED_PRIOR_WEIGHT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.15);
+                for (c, s, _) in scored[..pool_size].iter_mut() {
+                    if let Some(prior) = priors.get(&c.claim_id) {
+                        // prior ∈ [0,1]; boost only, bounded by w.
+                        *s *= 1.0 + w * prior.clamp(0.0, 1.0);
+                    }
+                }
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            Ok(_) => {} // no learned priors yet — honest no-op
+            Err(e) => {
+                tracing::warn!(error = %e, "learned-prior lookup failed; keeping fused order");
+            }
+        }
+    }
+
     // ---- Layer 6.4: late-interaction MaxSim tier (flag-gated, NOW item 5) ----
     // ColBERT-style: per-token query vectors against write-time doc token
     // vectors (captured int8 in the same embed forward pass), blended into
@@ -939,6 +979,15 @@ fn trust_class_factor(class: TrustClass) -> f32 {
 /// zero cost (no storage lock, no engine call).
 fn late_interaction_flag_on() -> bool {
     std::env::var("TR_LATE_INTERACTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Layer 6.3 flag — the learned per-tenant retrieval prior. OFF until the
+/// eval gate proves it; read once per query so the flag-off path costs a
+/// single env lookup and never touches the graph.
+fn learned_prior_flag_on() -> bool {
+    std::env::var("TR_LEARNED_PRIOR")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

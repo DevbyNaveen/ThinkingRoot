@@ -412,6 +412,12 @@ pub async fn run_serve(
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_signal_retention(root.clone()));
 
+    // Idle learn-to-rank trainer (item 10): fold retrieval-usage signal into
+    // per-claim usefulness priors. No-op handle unless TR_LEARNED_PRIOR=1.
+    let _retrieval_prior_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_retrieval_prior_trainer(root.clone()));
+
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
@@ -785,6 +791,12 @@ async fn run_serve_with_listener(
     let _signal_retention_handle = workspace_root
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_signal_retention(root.clone()));
+
+    // Idle learn-to-rank trainer (item 10): fold retrieval-usage signal into
+    // per-claim usefulness priors. No-op handle unless TR_LEARNED_PRIOR=1.
+    let _retrieval_prior_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_retrieval_prior_trainer(root.clone()));
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();

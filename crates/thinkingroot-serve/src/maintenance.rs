@@ -391,6 +391,73 @@ pub fn spawn_integrity_snapshots(workspace_root: PathBuf) -> JoinHandle<()> {
     spawn_periodic_task(task)
 }
 
+/// Idle learn-to-rank trainer (NEXT item 10). Periodically folds new
+/// `retrieval_usage` rows into the per-claim `claim_usefulness` priors. Pure
+/// CPU counting — no model, no GPU. The serving blend (`TR_LEARNED_PRIOR`)
+/// consumes the priors; training alone changes no retrieval result.
+struct RetrievalPriorTrainerTask {
+    workspace_root: PathBuf,
+    batch: usize,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for RetrievalPriorTrainerTask {
+    fn name(&self) -> &'static str {
+        "retrieval_prior_trainer"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let graph_dir = self.workspace_root.join(".thinkingroot").join("graph");
+        if !graph_dir.exists() {
+            return Ok(());
+        }
+        let batch = self.batch;
+        let dir = graph_dir.clone();
+        // CozoDB work is sync — keep it off the async core.
+        let (scanned, updated) = tokio::task::spawn_blocking(move || {
+            let graph = thinkingroot_graph::graph::GraphStore::init(&dir)?;
+            graph.train_retrieval_prior(batch)
+        })
+        .await
+        .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("trainer join: {e}")))??;
+        if scanned > 0 {
+            tracing::info!(scanned, updated, "retrieval-prior trainer folded usage signal");
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the idle learn-to-rank trainer. Gated on `TR_LEARNED_PRIOR` (the
+/// same switch that enables the serving blend) so it is a true no-op until
+/// the learned prior is turned on after eval — when off, neither trainer nor
+/// serving touches anything. `TR_LEARNED_PRIOR_BATCH` (default 50000) caps
+/// rows per pass; `TR_LEARNED_PRIOR_SECS` (default 600) sets cadence.
+pub fn spawn_retrieval_prior_trainer(workspace_root: PathBuf) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_LEARNED_PRIOR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let batch = std::env::var("TR_LEARNED_PRIOR_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000usize);
+    let interval_secs = std::env::var("TR_LEARNED_PRIOR_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(RetrievalPriorTrainerTask {
+        workspace_root,
+        batch,
+        interval: Duration::from_secs(interval_secs.max(30)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Single cleanup pass. Exposed for tests.
 ///
 /// When `branch_engines` is provided, the cache is invalidated before each

@@ -612,6 +612,33 @@ impl GraphStore {
                 cited: Bool default false,
                 refused: Bool default false
             }",
+            // Learned retrieval prior (NEXT item 10) — the rolled-up,
+            // per-claim usefulness the idle learn-to-rank trainer derives
+            // from `retrieval_usage`. `shown`/`cited` are lifetime counters;
+            // `score` is the Wilson lower bound of cited/shown (a *confident*
+            // citation rate — a claim cited 8/10 outranks one cited 1/1). The
+            // serving blend (gated `TR_LEARNED_PRIOR`) nudges fused scores by
+            // this. Bounded: one row per claim, not per query. This is the
+            // signal the static cross-encoder structurally cannot see — it
+            // only ever sees query↔doc text, never which memories prove
+            // useful across many queries.
+            ":create claim_usefulness {
+                claim_id: String
+                =>
+                shown: Int default 0,
+                cited: Int default 0,
+                score: Float default 0.0,
+                updated_ts: Float default 0.0
+            }",
+            // Incremental-trainer watermark kv. `key` is the trainer name
+            // (e.g. 'retrieval_prior'); `ts` is the max `retrieval_usage.ts`
+            // already folded in, so each batch scans only new rows. Starts at
+            // 0 → the first run after enabling backfills all retained signal.
+            ":create learning_watermark {
+                key: String
+                =>
+                ts: Float default 0.0
+            }",
             // Rooting — append-only log of every trial run against a claim.
             // One row per probe battery execution (not per probe). A single claim
             // can have many verdicts over time (initial trial + re-rooting sweeps).
@@ -6985,6 +7012,206 @@ impl GraphStore {
         Ok((count_usage, count_verdicts))
     }
 
+    /// Wilson lower bound (95%) of `cited/shown` — a *confident* citation
+    /// rate. Mirrors `ExperienceEntry::score` (the capability router) so the
+    /// two learned surfaces use the same statistic: more evidence ranks
+    /// higher, and a high rate on thin evidence is discounted. Zero when the
+    /// claim has never been shown.
+    fn wilson_lower_bound(success: i64, total: i64) -> f64 {
+        if total <= 0 {
+            return 0.0;
+        }
+        let n = total as f64;
+        let p = success as f64 / n;
+        let z = 1.96_f64;
+        let z2 = z * z;
+        let centre = p + z2 / (2.0 * n);
+        let margin = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt();
+        ((centre - margin) / (1.0 + z2 / n)).max(0.0)
+    }
+
+    /// Read the incremental-trainer watermark for `key` (max signal `ts`
+    /// already folded in). 0.0 when the trainer has never run.
+    fn learning_watermark(&self, key: &str) -> Result<f64> {
+        let mut params = BTreeMap::new();
+        params.insert("k".into(), DataValue::Str(key.into()));
+        let result = self
+            .raw_db()
+            .run_script(
+                "?[ts] := *learning_watermark{key: $k, ts}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("read learning_watermark: {e}")))?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|r| match r.first() {
+                Some(DataValue::Num(Num::Float(x))) => Some(*x),
+                Some(DataValue::Num(Num::Int(n))) => Some(*n as f64),
+                _ => None,
+            })
+            .unwrap_or(0.0))
+    }
+
+    fn set_learning_watermark(&self, key: &str, ts: f64) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("k".into(), DataValue::Str(key.into()));
+        params.insert("ts".into(), DataValue::Num(Num::Float(ts)));
+        self.db
+            .run_script(
+                "?[key, ts] <- [[$k, $ts]] :put learning_watermark {key => ts}",
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("set learning_watermark: {e}")))?;
+        Ok(())
+    }
+
+    /// Idle learn-to-rank trainer (NEXT item 10). Folds new `retrieval_usage`
+    /// rows into the per-claim `claim_usefulness` priors: every shown hit
+    /// increments `shown`, every cited hit increments `cited`, and `score` is
+    /// recomputed as the Wilson lower bound of `cited/shown`. Incremental via
+    /// the `retrieval_prior` watermark — each pass scans only rows newer than
+    /// the last, so it is cheap to run often. Counters accumulate across
+    /// passes (lifetime usefulness), never reset.
+    ///
+    /// CPU-only, no model, no GPU: pure counting. The serving blend
+    /// (`TR_LEARNED_PRIOR`) is what consumes the result; running the trainer
+    /// has zero retrieval effect on its own. Returns
+    /// `(rows_scanned, claims_updated)`.
+    ///
+    /// Caveat (honest): the watermark advances to the max `ts` folded in and
+    /// the next pass scans `ts > watermark` (strict). If a single batch
+    /// boundary falls *within* a cluster of rows sharing one millisecond
+    /// `ts`, the unprocessed remainder of that millisecond is skipped next
+    /// pass. Use a `batch` large enough to drain a run in one pass (the
+    /// maintenance trainer does) — then the only same-ms rows ever dropped
+    /// are ones already counted. Over thousands of events a usefulness prior
+    /// is unaffected; the signal table itself is never mutated.
+    pub fn train_retrieval_prior(&self, batch: usize) -> Result<(usize, usize)> {
+        let watermark = self.learning_watermark("retrieval_prior")?;
+        // scan_retrieval_usage returns rows with ts STRICTLY greater than the
+        // argument, oldest-first — exactly the incremental window we want.
+        let rows = self.scan_retrieval_usage(watermark, batch.max(1))?;
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+
+        // Aggregate this batch per claim: (delta_shown, delta_cited).
+        let mut deltas: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+        let mut max_ts = watermark;
+        for (_qb, claim_id, ts, _sess, _q, _rank, _rel, cited, _refused) in &rows {
+            let e = deltas.entry(claim_id.clone()).or_insert((0, 0));
+            e.0 += 1;
+            if *cited {
+                e.1 += 1;
+            }
+            if *ts > max_ts {
+                max_ts = *ts;
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut updated = 0usize;
+        for (claim_id, (d_shown, d_cited)) in &deltas {
+            // Merge with existing lifetime counters.
+            let (prev_shown, prev_cited) = self.claim_usefulness_counts(claim_id)?;
+            let shown = prev_shown + d_shown;
+            let cited = prev_cited + d_cited;
+            let score = Self::wilson_lower_bound(cited, shown);
+
+            let mut params = BTreeMap::new();
+            params.insert("cid".into(), DataValue::Str(claim_id.as_str().into()));
+            params.insert("shown".into(), DataValue::Num(Num::Int(shown)));
+            params.insert("cited".into(), DataValue::Num(Num::Int(cited)));
+            params.insert("score".into(), DataValue::Num(Num::Float(score)));
+            params.insert("ts".into(), DataValue::Num(Num::Float(now)));
+            self.db
+                .run_script(
+                    "?[claim_id, shown, cited, score, updated_ts] <- \
+                     [[$cid, $shown, $cited, $score, $ts]] \
+                     :put claim_usefulness {claim_id => shown, cited, score, updated_ts}",
+                    params,
+                    ScriptMutability::Mutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("put claim_usefulness: {e}")))?;
+            updated += 1;
+        }
+
+        self.set_learning_watermark("retrieval_prior", max_ts)?;
+        Ok((rows.len(), updated))
+    }
+
+    /// Existing lifetime `(shown, cited)` for a claim (0,0 if untrained).
+    fn claim_usefulness_counts(&self, claim_id: &str) -> Result<(i64, i64)> {
+        let mut params = BTreeMap::new();
+        params.insert("cid".into(), DataValue::Str(claim_id.into()));
+        let result = self
+            .raw_db()
+            .run_script(
+                "?[shown, cited] := *claim_usefulness{claim_id: $cid, shown, cited}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("read claim_usefulness: {e}")))?;
+        Ok(result
+            .rows
+            .first()
+            .map(|r| {
+                let i = |v: &DataValue| match v {
+                    DataValue::Num(Num::Int(n)) => *n,
+                    DataValue::Num(Num::Float(x)) => *x as i64,
+                    _ => 0,
+                };
+                (i(&r[0]), i(&r[1]))
+            })
+            .unwrap_or((0, 0)))
+    }
+
+    /// Learned usefulness `score` (Wilson lower bound of citation rate, in
+    /// `[0,1]`) for each requested claim. Claims with no learned prior are
+    /// omitted from the map — the serving blend treats a missing entry as
+    /// neutral (no nudge), so an untrained tenant ranks exactly as today.
+    pub fn get_claim_usefulness(
+        &self,
+        claim_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f32>> {
+        let mut out = std::collections::HashMap::new();
+        if claim_ids.is_empty() {
+            return Ok(out);
+        }
+        // Inline-relation join (the codebase's batch-by-id idiom): bind the
+        // requested ids as a single-column relation, then join the prior
+        // table against it. Each `$ids` row is a 1-element list.
+        let rows: Vec<DataValue> = claim_ids
+            .iter()
+            .map(|c| DataValue::List(vec![DataValue::Str(c.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("ids".into(), DataValue::List(rows));
+        let result = self
+            .raw_db()
+            .run_script(
+                "candidate[cid] <- $ids \
+                 ?[claim_id, score] := candidate[claim_id], \
+                   *claim_usefulness{claim_id, score}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_claim_usefulness: {e}")))?;
+        for row in &result.rows {
+            let cid = dv_to_string(&row[0]);
+            let score = match &row[1] {
+                DataValue::Num(Num::Float(x)) => *x as f32,
+                DataValue::Num(Num::Int(n)) => *n as f32,
+                _ => 0.0,
+            };
+            out.insert(cid, score);
+        }
+        Ok(out)
+    }
+
     /// Filter dangling claim references out of the turns calendar.
     ///
     /// `turns.claim_ids` is a JSON-encoded `Vec<String>` because the
@@ -7612,6 +7839,84 @@ mod tests {
         store
             .record_retrieval_usage("sess-1", "q", false, &[])
             .expect("empty hits ok");
+    }
+
+    #[test]
+    fn train_retrieval_prior_learns_per_claim_usefulness() {
+        let store = mem_store();
+
+        // claim:a is cited every time it is shown; claim:b never is.
+        // Distinct query text per event so each lands on its own PK (the
+        // (query_blake3, claim_id, ts) key would otherwise collapse rows
+        // recorded within the same millisecond).
+        for i in 0..6 {
+            store
+                .record_retrieval_usage(
+                    "sess",
+                    &format!("q{i}"),
+                    false,
+                    &[
+                        ("claim:a".into(), 0, 0.8, true),
+                        ("claim:b".into(), 1, 0.7, false),
+                    ],
+                )
+                .unwrap();
+        }
+
+        // First pass folds in all rows.
+        let (scanned, updated) = store.train_retrieval_prior(10_000).unwrap();
+        assert_eq!(scanned, 12, "6 events × 2 hits");
+        assert_eq!(updated, 2, "two distinct claims");
+
+        let scores = store
+            .get_claim_usefulness(&["claim:a".into(), "claim:b".into()])
+            .unwrap();
+        let a = *scores.get("claim:a").expect("a learned");
+        let b = *scores.get("claim:b").expect("b learned");
+        assert!(a > b, "always-cited claim outranks never-cited ({a} vs {b})");
+        assert!(a > 0.0 && b == 0.0, "cited rate 6/6 > 0, 0/6 == 0");
+
+        // Incremental: a second pass with no new signal scans nothing and
+        // does not double-count (counters stay lifetime-correct).
+        let (scanned2, updated2) = store.train_retrieval_prior(10_000).unwrap();
+        assert_eq!((scanned2, updated2), (0, 0), "watermark gates re-scan");
+
+        // New signal after the watermark flips claim:b's fortunes.
+        for i in 0..6 {
+            store
+                .record_retrieval_usage(
+                    "sess",
+                    &format!("flip{i}"),
+                    false,
+                    &[("claim:b".into(), 0, 0.7, true)],
+                )
+                .unwrap();
+        }
+        let (scanned3, _) = store.train_retrieval_prior(10_000).unwrap();
+        assert_eq!(scanned3, 6, "only the new rows");
+        let b2 = *store
+            .get_claim_usefulness(&["claim:b".into()])
+            .unwrap()
+            .get("claim:b")
+            .unwrap();
+        assert!(b2 > b, "b improved after being cited ({b2} > {b})");
+    }
+
+    #[test]
+    fn get_claim_usefulness_omits_untrained_claims() {
+        let store = mem_store();
+        store
+            .record_retrieval_usage("s", "q", false, &[("claim:x".into(), 0, 0.9, true)])
+            .unwrap();
+        store.train_retrieval_prior(10_000).unwrap();
+        // Untrained claim id is absent (neutral), trained one is present.
+        let scores = store
+            .get_claim_usefulness(&["claim:x".into(), "claim:never".into()])
+            .unwrap();
+        assert!(scores.contains_key("claim:x"));
+        assert!(!scores.contains_key("claim:never"));
+        // Empty request is a clean empty map, never an error.
+        assert!(store.get_claim_usefulness(&[]).unwrap().is_empty());
     }
 
     #[test]
