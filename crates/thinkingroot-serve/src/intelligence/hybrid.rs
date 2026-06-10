@@ -1192,6 +1192,36 @@ fn enrich_candidates(
             enrichment_byte_spans: spans,
         });
     }
+
+    // ── A7-SECURITY ⑦: trust inheritance (depth-1) ──────────────────────
+    // A DERIVED claim is only as trustworthy as its weakest source: poison
+    // cannot launder itself to a higher trust class by being re-stored or
+    // summarised. We batch-fetch the source URIs of every derivation parent
+    // (one query, only when any candidate has parents), classify them, and
+    // demote each child to the weakest of {own, parents}. Depth-1 by design:
+    // each generation was demoted at ITS enrich pass, so multi-hop laundering
+    // still cannot climb (a child of a demoted child stays at/below it when
+    // that parent appears; the bounded fetch keeps recall latency flat).
+    let parent_ids: Vec<String> = out
+        .iter()
+        .flat_map(|c| c.derivation_parents.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !parent_ids.is_empty() {
+        let parent_set = dv_str_list(&parent_ids);
+        let (parent_auth_by_claim, _, _) = fetch_source_authority(graph, &parent_set)?;
+        let weaker = |a: TrustClass, b: TrustClass| {
+            if trust_class_factor(b) < trust_class_factor(a) { b } else { a }
+        };
+        for c in out.iter_mut() {
+            for pid in &c.derivation_parents {
+                if let Some((_, puri)) = parent_auth_by_claim.get(pid) {
+                    c.trust_class = weaker(c.trust_class, TrustClass::from_uri(puri));
+                }
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -2540,6 +2570,48 @@ mod tests {
         // Stored vector_relevance stays calibrated (boost is ordering-only).
         let both = out.iter().find(|c| c.claim_id == "both").unwrap();
         assert!((both.vector_relevance - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trust_inheritance_demotes_child_to_weakest_parent() {
+        use cozo::DbInstance;
+        use thinkingroot_core::types::{SourceId, SourceType};
+        use thinkingroot_core::{Claim, ClaimType, Source, WorkspaceId};
+
+        let db = DbInstance::new("mem", "", "").unwrap();
+        let graph = GraphStore::from_db_for_testing(db);
+        graph.init_for_testing().unwrap();
+
+        // Parent claim from a FETCHED-WEB source (attacker-reachable channel).
+        let web_src = Source::new("https://evil.example.com/page".to_string(), SourceType::WebPage);
+        graph.insert_source(&web_src).unwrap();
+        let parent = Claim::new("widget X is great", ClaimType::Fact, web_src.id, WorkspaceId::new());
+        let parent_id = parent.id.to_string();
+        graph.insert_claim(&parent).unwrap();
+        graph.link_claim_to_source(&parent_id, &web_src.id.to_string()).unwrap();
+
+        // Child claim derived from it, re-stored under an OWNER source — the
+        // laundering attempt: web content trying to climb to owner trust.
+        let own_src = Source::new("file:///notes/summary.md".to_string(), SourceType::Document);
+        graph.insert_source(&own_src).unwrap();
+        let child = Claim::new("summary: widget X is great", ClaimType::Fact, own_src.id, WorkspaceId::new());
+        let child_id = child.id.to_string();
+        graph.insert_claim(&child).unwrap();
+        graph.link_claim_to_source(&child_id, &own_src.id.to_string()).unwrap();
+        graph.insert_derivation_edge(&parent_id, &child_id, "summarise").unwrap();
+
+        let enriched = enrich_candidates(
+            &graph,
+            vec![Candidate { claim_id: child_id.clone(), vector_relevance: 0.9 }],
+            &req(),
+        )
+        .expect("enrich");
+        let c = enriched.iter().find(|c| c.claim_id == child_id).expect("child enriched");
+        assert_eq!(
+            c.trust_class,
+            TrustClass::FetchedWeb,
+            "child re-stored under an owner source must inherit the parent's weaker web class"
+        );
     }
 
     #[test]
