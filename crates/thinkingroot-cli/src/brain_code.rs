@@ -151,6 +151,115 @@ fn read_dir_files(dir: &Path, ext: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Defensive field extraction — try several common key names for a body.
+fn pick_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `root brain pull` (§10 / 25b, slice 2a) — export the LIVE brain (prompts +
+/// functions) from a running engine into `./brain/`. Talks to the daemon over
+/// REST (the engine owns graph.db; the CLI never opens it directly). Lists each
+/// kind, fetches each item's body per-name (the list may omit bodies), and
+/// writes the folder via [`write_brain`].
+pub async fn run_pull(
+    conn: &thinkingroot_core::cortex::EngineConnection,
+    root: &Path,
+    _branch: Option<&str>,
+) -> Result<()> {
+    use crate::cortex_remote;
+    let ws = cortex_remote::ensure_mounted_remote(conn, root)
+        .await
+        .context("mount workspace")?;
+
+    // Prompts: list names, then fetch each body.
+    let mut prompts = Vec::new();
+    if let Ok(list) = cortex_remote::get_json(conn, &format!("/api/v1/ws/{ws}/prompts")).await {
+        for item in list.as_array().cloned().unwrap_or_default() {
+            let Some(name) = pick_str(&item, &["name"]) else { continue };
+            let body = pick_str(&item, &["template_text", "text", "body"]);
+            let body = match body {
+                Some(b) => b,
+                None => {
+                    let one = cortex_remote::get_json(
+                        conn,
+                        &format!("/api/v1/ws/{ws}/prompts/{}", urlencode(&name)),
+                    )
+                    .await
+                    .ok();
+                    one.as_ref()
+                        .and_then(|o| pick_str(o, &["template_text", "text", "body"]))
+                        .unwrap_or_default()
+                }
+            };
+            prompts.push((name, body));
+        }
+    }
+
+    // Functions: list names, then fetch each body.
+    let mut functions = Vec::new();
+    if let Ok(list) = cortex_remote::get_json(conn, &format!("/api/v1/ws/{ws}/functions")).await {
+        for item in list.as_array().cloned().unwrap_or_default() {
+            let Some(name) = pick_str(&item, &["name"]) else { continue };
+            let body = match pick_str(&item, &["body"]) {
+                Some(b) => b,
+                None => {
+                    let one = cortex_remote::get_json(
+                        conn,
+                        &format!("/api/v1/ws/{ws}/functions/{}", urlencode(&name)),
+                    )
+                    .await
+                    .ok();
+                    one.as_ref()
+                        .and_then(|o| pick_str(o, &["body"]))
+                        .unwrap_or_default()
+                }
+            };
+            functions.push((name, body));
+        }
+    }
+
+    let brain = BrainCode {
+        manifest: BrainManifest {
+            name: ws.clone(),
+            version: String::new(),
+            base_brain: String::new(),
+        },
+        prompts,
+        functions,
+        routes: Vec::new(),
+        sources: Vec::new(),
+    };
+    write_brain(root, &brain)?;
+    println!(
+        "pulled {} prompt(s), {} function(s) from '{ws}' -> {}/{BRAIN_DIR}/",
+        brain.prompts.len(),
+        brain.functions.len(),
+        root.display()
+    );
+    Ok(())
+}
+
+/// Minimal percent-encoding for a path segment (names are already
+/// safe_stem-class but a space/`/` would break the URL).
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +318,23 @@ mod tests {
         let back = read_brain(tmp.path()).unwrap();
         assert!(back.routes.is_empty());
         assert!(back.sources.is_empty());
+    }
+
+    #[test]
+    fn pick_str_tries_keys_in_order() {
+        let v = serde_json::json!({"template_text": "hi", "body": "x"});
+        assert_eq!(pick_str(&v, &["template_text", "body"]).as_deref(), Some("hi"));
+        assert_eq!(pick_str(&v, &["missing", "body"]).as_deref(), Some("x"));
+        assert_eq!(pick_str(&v, &["nope"]), None);
+        // Empty string is skipped (treated as absent).
+        let e = serde_json::json!({"name": ""});
+        assert_eq!(pick_str(&e, &["name"]), None);
+    }
+
+    #[test]
+    fn urlencode_escapes_unsafe_chars() {
+        assert_eq!(urlencode("simple-name_1.2"), "simple-name_1.2");
+        assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
     }
 
     #[test]

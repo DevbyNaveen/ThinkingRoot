@@ -870,6 +870,14 @@ enum Commands {
         json: bool,
     },
 
+    /// Brain-as-Code — sync a brain to/from a git-versionable `./brain/`
+    /// source folder (prompts, functions, routes). The OSS distribution
+    /// convention; `pull` exports the live brain to disk.
+    Brain {
+        #[command(subcommand)]
+        action: BrainAction,
+    },
+
     /// Hybrid retrieve — vector recall fused with 11-component score
     /// across the typed Datalog substrate, with per-row BLAKE3 verification.
     Retrieve {
@@ -1017,6 +1025,19 @@ enum SecretsAction {
     List,
     /// Remove a secret.
     Unset { name: String },
+}
+
+#[derive(Subcommand)]
+enum BrainAction {
+    /// Export the live brain (prompts + functions) to `./brain/`.
+    Pull {
+        /// Path to the workspace (defaults to current dir).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Branch to scope against (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2300,6 +2321,12 @@ async fn async_main() -> anyhow::Result<()> {
             let conn = require_remote(in_process_flag).await?;
             brain_cmd::run_brief(&conn, &path, branch.as_deref(), json).await?;
         }
+        Some(Commands::Brain { action }) => match action {
+            BrainAction::Pull { path, branch } => {
+                let conn = require_remote(in_process_flag).await?;
+                brain_code::run_pull(&conn, &path, branch.as_deref()).await?;
+            }
+        },
         Some(Commands::Investigate {
             entity,
             path,
