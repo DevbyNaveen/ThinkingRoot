@@ -182,6 +182,77 @@ pub fn integrity_snapshot_once(
     Ok(snap)
 }
 
+/// A7-SECURITY ⑥ (restore side) — list pristine integrity snapshots,
+/// newest-first, as `(path, unix_millis)`. The millis are parsed from the
+/// `graph.db.integrity-{digits}` name (the same value `_once` wrote), so no
+/// extra stat() and the order is exact. `.torn`/foreign files are excluded.
+pub fn list_integrity_snapshots(
+    workspace_root: &std::path::Path,
+) -> Result<Vec<(PathBuf, i64)>, thinkingroot_core::Error> {
+    use thinkingroot_core::Error;
+    let dir = workspace_root.join(".thinkingroot").join("graph").join("integrity");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(PathBuf, i64)> = std::fs::read_dir(&dir)
+        .map_err(|e| Error::io_path(&dir, e))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            let stamp = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("graph.db.integrity-"))
+                .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|r| r.parse::<i64>().ok())?;
+            p.is_file().then_some((p, stamp))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+    Ok(out)
+}
+
+/// A7-SECURITY ⑥ (restore side) — roll the main graph back to a known-good
+/// integrity snapshot. **Offline/maintenance operation**: the engine must
+/// NOT be serving this workspace (it holds the SQLite file open; swapping it
+/// underneath a live engine corrupts in-flight reads). This is enforced
+/// operationally via the runbook, not in code — the CLI path runs before the
+/// daemon binds. Steps: validate the chosen snapshot structurally → back up
+/// the CURRENT graph.db as `graph.db.pre-restore-{ts}` (so a wrong rollback
+/// is itself reversible) → atomically swap the snapshot into place. Vectors
+/// are NOT restored (derivable by recompile); the caller should
+/// `root compile` after to rebuild the index against the restored graph.
+pub fn restore_integrity_snapshot(
+    workspace_root: &std::path::Path,
+    snapshot: &std::path::Path,
+) -> Result<PathBuf, thinkingroot_core::Error> {
+    use thinkingroot_core::Error;
+    if !snapshot.exists() {
+        return Err(Error::GraphStorage(format!(
+            "restore: snapshot not found: {}",
+            snapshot.display()
+        )));
+    }
+    // Refuse a structurally-bad snapshot — restoring garbage over good data
+    // is the one outcome worse than not restoring.
+    validate_sqlite_structure(snapshot)?;
+
+    let graph_db = workspace_root.join(".thinkingroot").join("graph").join("graph.db");
+    // Back up the current graph first (reversible rollback).
+    if graph_db.exists() {
+        let ts = chrono::Utc::now().timestamp_millis();
+        let backup = graph_db.with_file_name(format!("graph.db.pre-restore-{ts}"));
+        std::fs::copy(&graph_db, &backup).map_err(|e| Error::io_path(&backup, e))?;
+        tracing::info!(backup = %backup.display(), "restore: backed up current graph");
+    }
+    // Atomic swap via a temp in the same dir + rename.
+    let tmp = graph_db.with_extension("db.restore-tmp");
+    std::fs::copy(snapshot, &tmp).map_err(|e| Error::io_path(&tmp, e))?;
+    std::fs::rename(&tmp, &graph_db).map_err(|e| Error::io_path(&graph_db, e))?;
+    tracing::info!(from = %snapshot.display(), "restore: graph rolled back to snapshot");
+    Ok(graph_db)
+}
+
 /// Panic-free structural validation of a SQLite file: the 16-byte magic,
 /// a sane declared page size (power of two in [512, 65536]), and a file
 /// size that is an exact multiple of it (SQLite files always are — a
@@ -763,5 +834,51 @@ mod integrity_snapshot_tests {
         let res = integrity_snapshot_once(root, 5);
         assert!(res.is_err(), "corrupt copy must fail validation");
         assert_eq!(count(&integrity_dir), before, "no pristine snapshot from a torn copy");
+    }
+
+    #[test]
+    fn list_and_restore_rolls_back_with_reversible_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let graph_dir = root.join(".thinkingroot").join("graph");
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        thinkingroot_graph::graph::GraphStore::init(&graph_dir).expect("init graph");
+        let graph_db = graph_dir.join("graph.db");
+
+        // Take a known-good snapshot, then mutate the live graph so we can
+        // prove the restore actually changed bytes back.
+        let good = std::fs::read(&graph_db).unwrap();
+        let snap = integrity_snapshot_once(root, 5).expect("snapshot");
+        std::fs::write(&graph_db, b"corrupted-by-poison-or-bug").unwrap();
+
+        // list surfaces the pristine snapshot.
+        let snaps = list_integrity_snapshots(root).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].0, snap);
+
+        // Restore rolls graph.db back to the snapshot bytes...
+        restore_integrity_snapshot(root, &snap).expect("restore");
+        assert_eq!(std::fs::read(&graph_db).unwrap(), good, "graph must match the snapshot");
+
+        // ...and the pre-restore state is preserved (reversible).
+        let pre = std::fs::read_dir(&graph_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("graph.db.pre-restore-"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(pre, 1, "current graph must be backed up before swap");
+
+        // Restoring a structurally-bad file is refused (never overwrites good
+        // data with garbage).
+        let junk = graph_dir.join("graph.db.integrity-9999999999999");
+        std::fs::write(&junk, b"not sqlite").unwrap();
+        assert!(restore_integrity_snapshot(root, &junk).is_err());
+        // Missing snapshot is an honest error, not a panic.
+        assert!(restore_integrity_snapshot(root, &graph_dir.join("nope")).is_err());
     }
 }
