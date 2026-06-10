@@ -2503,6 +2503,46 @@ impl GraphStore {
             .collect())
     }
 
+    /// Query-expansion source: every entity that HAS at least one alias,
+    /// returned as a synonym group `[canonical_name, alias1, alias2, …]`.
+    /// One query per side (entities, aliases) + an in-Rust join — bounded by
+    /// the entity count, computed only when expansion is enabled. Entities
+    /// with no aliases (the vast majority) are excluded — they add nothing to
+    /// expand. Operating-layer projection nodes (non-ULID `kind:name` ids)
+    /// are skipped, matching `get_entities_with_aliases`.
+    pub fn get_alias_groups(&self) -> Result<Vec<Vec<String>>> {
+        let mut by_entity: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (eid, alias) in self.get_all_entity_aliases()? {
+            by_entity.entry(eid).or_default().push(alias);
+        }
+        if by_entity.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = self.query_read(
+            "?[id, canonical_name] := *entities{id, canonical_name}",
+        )?;
+        let mut out = Vec::with_capacity(by_entity.len());
+        for row in &names.rows {
+            let id = dv_to_string(&row[0]);
+            if id.parse::<thinkingroot_core::EntityId>().is_err() {
+                continue; // skip operating-layer projection nodes
+            }
+            if let Some(aliases) = by_entity.remove(&id) {
+                let mut group = Vec::with_capacity(aliases.len() + 1);
+                let name = dv_to_string(&row[1]);
+                if !name.is_empty() {
+                    group.push(name);
+                }
+                group.extend(aliases);
+                if group.len() >= 2 {
+                    out.push(group);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Bulk-load all claim→entity edges in one query — used by the in-memory cache loader.
     /// Returns `(claim_id, entity_id)` pairs for every row in `claim_entity_edges`.
     pub fn get_all_claim_entity_edges(&self) -> Result<Vec<(String, String)>> {

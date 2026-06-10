@@ -539,7 +539,24 @@ async fn run_recall(
     let needs_datalog = !parsed.predicates.is_empty();
 
     let vector = if needs_vector {
-        vector_recall(engine, ws, &parsed.query_text, req).await?
+        // Query expansion (next-wave NOW, flag-gated): when the query names a
+        // known entity by one surface form, append that entity's OTHER forms
+        // (canonical name + aliases) so "AWS" also recalls claims phrased
+        // "Amazon Web Services". Deterministic, model-free — uses the graph's
+        // own alias groups. OFF by default (TR_QUERY_EXPANSION): appending
+        // tokens perturbs the embedding, so the bounded dilution is eval-tuned
+        // before it ships on; flag-off is a literal no-op.
+        let query = if query_expansion_flag_on() {
+            match graph.get_alias_groups() {
+                Ok(groups) if !groups.is_empty() => {
+                    expand_query_with_aliases(&parsed.query_text, &groups)
+                }
+                _ => parsed.query_text.clone(),
+            }
+        } else {
+            parsed.query_text.clone()
+        };
+        vector_recall(engine, ws, &query, req).await?
     } else {
         Vec::new()
     };
@@ -549,6 +566,69 @@ async fn run_recall(
         HashSet::new()
     };
     Ok((vector, datalog))
+}
+
+/// Query-expansion flag (next-wave NOW) — OFF until the dilution/precision
+/// tradeoff is eval-tuned; flag-off is a literal no-op.
+fn query_expansion_flag_on() -> bool {
+    std::env::var("TR_QUERY_EXPANSION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Pure alias expansion. For each synonym group, if ANY surface form occurs
+/// in the query (case-insensitive, word-ish boundary), append the group's
+/// OTHER forms that aren't already present. Bounded: at most
+/// `MAX_EXPANSION_TERMS` appended overall (excess shifts the embedding more
+/// than it helps); deterministic order (group order, then form order) so the
+/// expanded string — and thus the embedding — is stable across runs.
+fn expand_query_with_aliases(query: &str, groups: &[Vec<String>]) -> String {
+    const MAX_EXPANSION_TERMS: usize = 6;
+    let lower = query.to_lowercase();
+    // Substring match on a lowercased query is the cheap, dependency-free
+    // gate; bounded by a word-ish boundary check to avoid "cat" matching
+    // "category".
+    let contains_form = |form: &str| -> bool {
+        let f = form.to_lowercase();
+        if f.is_empty() {
+            return false;
+        }
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(&f) {
+            let start = from + pos;
+            let end = start + f.len();
+            let before_ok = start == 0
+                || !lower.as_bytes()[start - 1].is_ascii_alphanumeric();
+            let after_ok =
+                end == lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    };
+
+    let mut additions: Vec<String> = Vec::new();
+    for group in groups {
+        if additions.len() >= MAX_EXPANSION_TERMS {
+            break;
+        }
+        if group.iter().any(|f| contains_form(f)) {
+            for form in group {
+                if additions.len() >= MAX_EXPANSION_TERMS {
+                    break;
+                }
+                if !contains_form(form) && !additions.iter().any(|a| a.eq_ignore_ascii_case(form)) {
+                    additions.push(form.clone());
+                }
+            }
+        }
+    }
+    if additions.is_empty() {
+        return query.to_string();
+    }
+    format!("{query} {}", additions.join(" "))
 }
 
 async fn vector_recall(
@@ -2355,6 +2435,46 @@ mod tests {
             cluster_gaps: vec![],
             enrichment_byte_spans: vec![],
         }
+    }
+
+    #[test]
+    fn query_expansion_appends_other_surface_forms_bounded() {
+        let groups = vec![
+            vec!["Amazon Web Services".to_string(), "AWS".to_string()],
+            vec!["PostgreSQL".to_string(), "Postgres".to_string(), "pg".to_string()],
+            vec!["Kubernetes".to_string(), "k8s".to_string()],
+        ];
+
+        // Matching one form pulls in the sibling form.
+        let out = expand_query_with_aliases("how do we deploy on AWS?", &groups);
+        assert!(out.contains("Amazon Web Services"), "alias must expand to canonical: {out}");
+        assert!(out.starts_with("how do we deploy on AWS?"), "original query preserved");
+        assert!(!out.contains("Kubernetes"), "unrelated group not appended");
+
+        // No match → unchanged.
+        assert_eq!(
+            expand_query_with_aliases("what is the weather", &groups),
+            "what is the weather"
+        );
+
+        // Word boundary: "pg" must not match inside "upgrade".
+        assert_eq!(
+            expand_query_with_aliases("plan the upgrade", &groups),
+            "plan the upgrade"
+        );
+
+        // Already-present forms are not duplicated.
+        let both = expand_query_with_aliases("AWS and Amazon Web Services", &groups);
+        assert_eq!(both, "AWS and Amazon Web Services", "no dup when both forms present");
+
+        // Bound: many matching groups cannot append more than the cap.
+        let big: Vec<Vec<String>> = (0..20)
+            .map(|i| vec![format!("term{i}"), format!("syn{i}a"), format!("syn{i}b")])
+            .collect();
+        let q = (0..20).map(|i| format!("term{i}")).collect::<Vec<_>>().join(" ");
+        let expanded = expand_query_with_aliases(&q, &big);
+        let appended = expanded[q.len()..].split_whitespace().count();
+        assert!(appended <= 6, "expansion must be bounded, appended {appended}");
     }
 
     #[test]
