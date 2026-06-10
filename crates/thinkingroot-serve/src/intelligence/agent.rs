@@ -243,6 +243,14 @@ pub enum AgentEvent {
     AcquisitionAttempt { rung: String, outcome: String },
 }
 
+/// A3 dark flag (`TR_AUTO_JIT_ACQUIRE`, default OFF): when set, a classified
+/// CAPABILITY gap triggers automatic self-extension (author + deploy a Root
+/// Function via the validated `root_function` tool) instead of only appending
+/// an advisory hint. Off → behaviour is byte-for-byte the prior hint path.
+fn auto_jit_acquire_enabled() -> bool {
+    matches!(std::env::var("TR_AUTO_JIT_ACQUIRE").as_deref(), Ok("1") | Ok("true"))
+}
+
 /// True iff a tool result represents a genuine *execution* failure — the
 /// tool ran and errored — as opposed to an approval-gate rejection
 /// (`"user declined: …"`) or a client cancellation
@@ -791,7 +799,7 @@ impl Agent {
                     // turn knows which mechanism to reach for.
                     if !jit_attempted && results.iter().any(is_execution_error) {
                         jit_attempted = true;
-                        if let Some(hint) = self.run_jit_diagnosis(&calls, &results, sink).await {
+                        if let Some(hint) = self.run_jit_diagnosis(&calls, &results, sink, &cancel).await {
                             if let Some(r) = results.iter_mut().find(|r| is_execution_error(r)) {
                                 r.content.push_str("\n\n[JIT] ");
                                 r.content.push_str(&hint);
@@ -899,6 +907,7 @@ impl Agent {
         calls: &[ToolCall],
         results: &[ToolResult],
         sink: &mut EventSink<'_>,
+        cancel: &CancellationToken,
     ) -> Option<String> {
         use crate::intelligence::jit;
 
@@ -926,6 +935,28 @@ impl Agent {
             },
         )
         .await;
+
+        // A3 — auto self-extend (dark, default OFF via TR_AUTO_JIT_ACQUIRE).
+        // On a CAPABILITY gap, walk the DeployRootFunction rung
+        // automatically: author a Root Function for the gap and deploy it
+        // through the validated, quarantined `root_function` tool path, so
+        // the model's next turn has a real new capability rather than just
+        // a hint. Strictly best-effort — any failure falls through to the
+        // advisory hint below (never breaks the run).
+        if kind == jit::GapKind::Capability && auto_jit_acquire_enabled() {
+            if let Some(outcome) = self.auto_acquire(&situation, sink, cancel).await {
+                self.emit(
+                    sink,
+                    AgentEvent::AcquisitionAttempt {
+                        rung: jit::AcquisitionRung::DeployRootFunction.as_str().to_string(),
+                        outcome: outcome.clone(),
+                    },
+                )
+                .await;
+                return Some(outcome);
+            }
+        }
+
         let (rung, outcome) = jit::acquisition_hint(kind);
         self.emit(
             sink,
@@ -936,6 +967,50 @@ impl Agent {
         )
         .await;
         Some(outcome)
+    }
+
+    /// A3 — author + deploy a Root Function to fill a capability gap via the
+    /// existing validated `root_function` tool (so deploy-time body
+    /// validation, the approval gate, and session-branch quarantine all
+    /// apply — auto-acquire is NOT a bypass). Returns an outcome string
+    /// describing the deployed capability, or `None` on any failure
+    /// (authoring, missing tool, deploy error) so the caller falls back to
+    /// the advisory hint.
+    async fn auto_acquire(
+        &self,
+        situation: &str,
+        sink: &mut EventSink<'_>,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        use crate::intelligence::jit;
+
+        let (name, body) = match jit::author_capability(self.llm.as_ref(), situation).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("jit auto-acquire: authoring failed: {e}");
+                return None;
+            }
+        };
+        // Deploy through the normal tool path (validation + approval +
+        // quarantine). If `root_function` isn't in this agent's registry,
+        // dispatch returns an error result and we fall back to the hint.
+        let call = ToolCall {
+            id: "jit-auto-acquire".to_string(),
+            name: "root_function".to_string(),
+            input: serde_json::json!({ "name": name, "body": body }),
+        };
+        let results = self.dispatch_calls(std::slice::from_ref(&call), sink, cancel).await;
+        let r = results.into_iter().next()?;
+        if r.is_error {
+            tracing::warn!("jit auto-acquire: deploy failed: {}", r.content);
+            return None;
+        }
+        Some(format!(
+            "auto-acquired capability `{name}`: a Root Function was authored and deployed \
+             (validated + quarantined on your session branch). Invoke `{name}` to proceed. \
+             Deploy result: {}",
+            r.content
+        ))
     }
 
     /// Dispatch one batch of tool calls. Each call:
@@ -1735,6 +1810,137 @@ mod tests {
             run.final_text().as_deref(),
             Some("Got it — leaving the graph as-is.")
         );
+    }
+
+    // A3 helpers: a registry with a failing tool (triggers the JIT capability
+    // gap) + a recording `root_function` deploy tool. Returns the captured
+    // root_function inputs handle so the test can assert what was deployed.
+    fn a3_registry() -> (ToolRegistry, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let registry = ToolRegistry::new()
+            .register_write(
+                fixture_tool("send_email"),
+                Arc::new(CapturingHandler {
+                    name: "send_email",
+                    captured: Arc::new(Mutex::new(Vec::new())),
+                    reply: "smtp connection refused".to_string(),
+                    is_error: true,
+                }),
+            )
+            .register_write(
+                fixture_tool("root_function"),
+                Arc::new(CapturingHandler {
+                    name: "root_function",
+                    captured: captured.clone(),
+                    reply: r#"{"deployed":"emailer","version":1,"quarantined":true}"#.to_string(),
+                    is_error: false,
+                }),
+            );
+        (registry, captured)
+    }
+
+    /// A3: the TR_AUTO_JIT_ACQUIRE flag gates auto self-extension. Both
+    /// phases run in ONE test so they can't race on the shared env var.
+    #[tokio::test]
+    async fn auto_jit_acquire_gated_by_flag() {
+        // ── Phase 1: flag ON → author + deploy a Root Function ──
+        let (registry, captured) = a3_registry();
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "send_email".to_string(),
+                    input: json!({ "to": "a@b.c" }),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            // classify_gap → capability
+            ToolUseResponse::Text {
+                text: "capability — the agent lacks an email-sending tool".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+            // author_capability → JSON {name, body}
+            ToolUseResponse::Text {
+                text: r#"{"name":"emailer","body":"async (input, ctx) => ({ sent: true })"}"#
+                    .to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+            // final text — model proceeds with its new capability
+            ToolUseResponse::Text {
+                text: "Acquired an emailer; done.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        // SAFETY (edition 2024): no other test reads TR_AUTO_JIT_ACQUIRE or
+        // scripts a capability classification, so toggling it here is isolated.
+        unsafe { std::env::set_var("TR_AUTO_JIT_ACQUIRE", "1") };
+        let agent = Agent::new(llm, registry, Arc::new(AutoApprove));
+        let run = run_to_completion(
+            &agent,
+            AgentRequest {
+                system: "sys".to_string(),
+                system_refresher: None,
+                history: vec![ChatMessage::user("email the customer")],
+                tool_choice: ToolChoice::Auto,
+            },
+        )
+        .await;
+        unsafe { std::env::remove_var("TR_AUTO_JIT_ACQUIRE") };
+
+        {
+            let cap = captured.lock().unwrap();
+            assert_eq!(cap.len(), 1, "auto-acquire deployed exactly one function");
+            assert_eq!(cap[0]["name"], json!("emailer"));
+            assert!(
+                cap[0]["body"].as_str().unwrap().contains("async (input, ctx)"),
+                "deployed the LLM-authored body via the real tool path"
+            );
+        }
+        assert_eq!(run.final_text().as_deref(), Some("Acquired an emailer; done."));
+        assert!(run.tool_calls_executed().contains(&"root_function"));
+
+        // ── Phase 2: flag OFF → only the advisory hint, no deploy ──
+        let (registry2, captured2) = a3_registry();
+        let llm2 = Arc::new(ScriptedLlm::new(vec![
+            ToolUseResponse::ToolCalls {
+                calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "send_email".to_string(),
+                    input: json!({ "to": "a@b.c" }),
+                }],
+                text_preamble: String::new(),
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "capability — lacks an email tool".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+            ToolUseResponse::Text {
+                text: "I can't send email yet.".to_string(),
+                truncated: false,
+                limits: empty_limits(),
+            },
+        ]));
+        unsafe { std::env::remove_var("TR_AUTO_JIT_ACQUIRE") };
+        let agent2 = Agent::new(llm2, registry2, Arc::new(AutoApprove));
+        let run2 = run_to_completion(
+            &agent2,
+            AgentRequest {
+                system: "sys".to_string(),
+                system_refresher: None,
+                history: vec![ChatMessage::user("email the customer")],
+                tool_choice: ToolChoice::Auto,
+            },
+        )
+        .await;
+        assert!(captured2.lock().unwrap().is_empty(), "no auto-deploy when flag is off");
+        assert!(!run2.tool_calls_executed().contains(&"root_function"));
+        assert_eq!(run2.final_text().as_deref(), Some("I can't send email yet."));
     }
 
     #[tokio::test]

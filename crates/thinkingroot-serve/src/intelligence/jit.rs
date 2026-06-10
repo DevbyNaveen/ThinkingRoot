@@ -28,7 +28,7 @@
 //! (no new unbounded loop). Cross-ref the cloud roadmap +
 //! `../thinkingroot/docs/2026-05-25-jit-capability-acquisition-brainstorm.md`.
 
-use thinkingroot_core::Result;
+use thinkingroot_core::{Error, Result};
 use thinkingroot_llm::llm::{ChatMessage, ToolChoice, ToolUseResponse};
 
 use crate::intelligence::agent::LlmBackend;
@@ -181,9 +181,82 @@ pub fn acquisition_hint(kind: GapKind) -> (AcquisitionRung, String) {
     (rung, outcome)
 }
 
+/// System prompt for the DeployRootFunction rung's auto-author step (A3).
+/// Forces a pure-JSON `{name, body}` so the agent loop can deploy the
+/// authored function through the validated `root_function` tool path.
+const AUTHOR_SYSTEM: &str = "You are a capability author inside a self-extending AI agent. \
+The agent hit a CAPABILITY gap — it lacks a tool to make progress. Author ONE Root Function that \
+fills the gap. A Root Function is deterministic JavaScript that evaluates to a callable \
+`async (input, ctx) => { ... }`. `ctx` offers ctx.env (secrets), ctx.llm.ask(question, context) (a \
+tools-blind model coprocessor), ctx.memory.recall/remember, and ctx.step(name, fn). \
+Respond with ONLY a single JSON object and nothing else: \
+{\"name\": \"snake_case_name\", \"body\": \"async (input, ctx) => { /* ... */ }\"}. \
+No prose, no markdown fences.";
+
+/// A3 — author a Root Function (name + body) to fill a capability gap via
+/// the agent's LLM. The agent loop then deploys it through the validated,
+/// quarantined `root_function` tool path. Returns `(name, body)`; `Err`
+/// when no usable pair can be parsed (the caller falls back to the advisory
+/// hint — auto-acquire is strictly best-effort and never breaks a run).
+pub async fn author_capability(llm: &dyn LlmBackend, situation: &str) -> Result<(String, String)> {
+    let messages = [ChatMessage::user(situation)];
+    let response = llm
+        .chat_with_tools(AUTHOR_SYSTEM, &messages, &[], &ToolChoice::Auto)
+        .await?;
+    let text = match response {
+        ToolUseResponse::Text { text, .. } => text,
+        ToolUseResponse::ToolCalls { text_preamble, .. } => text_preamble,
+    };
+    parse_authored_capability(&text)
+}
+
+/// Extract `{name, body}` from a model response, tolerant of surrounding
+/// prose / markdown fences (takes the outermost `{ … }` span). Pure +
+/// unit-tested. `Err` if the span is missing or either field is empty.
+pub fn parse_authored_capability(text: &str) -> Result<(String, String)> {
+    let (s, e) = match (text.find('{'), text.rfind('}')) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => {
+            return Err(Error::Config("jit author: no JSON object in response".to_string()));
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&text[s..=e])
+        .map_err(|err| Error::Config(format!("jit author: JSON parse failed: {err}")))?;
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if name.is_empty() || body.is_empty() {
+        return Err(Error::Config("jit author: response missing name or body".to_string()));
+    }
+    Ok((name, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_parser_extracts_name_and_body() {
+        // Clean JSON.
+        let (n, b) = parse_authored_capability(
+            r#"{"name": "send_invoice", "body": "async (input, ctx) => ({ ok: true })"}"#,
+        )
+        .unwrap();
+        assert_eq!(n, "send_invoice");
+        assert!(b.contains("async (input, ctx)"));
+
+        // Tolerant of surrounding prose + markdown fences.
+        let wrapped = "Sure! Here is the function:\n```json\n{\"name\":\"x\",\"body\":\"async (i,ctx)=>1\"}\n```\nHope that helps.";
+        let (n2, b2) = parse_authored_capability(wrapped).unwrap();
+        assert_eq!(n2, "x");
+        assert_eq!(b2, "async (i,ctx)=>1");
+    }
+
+    #[test]
+    fn author_parser_rejects_unusable_responses() {
+        assert!(parse_authored_capability("no json here").is_err());
+        assert!(parse_authored_capability(r#"{"name": "", "body": "x"}"#).is_err());
+        assert!(parse_authored_capability(r#"{"name": "x"}"#).is_err(), "missing body");
+    }
 
     #[test]
     fn parses_each_class() {
