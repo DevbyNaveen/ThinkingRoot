@@ -815,6 +815,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // Learned retrieval prior (item 10) — read-only learning window.
+            .route(
+                "/ws/{ws}/learning/retrieval-prior",
+                get(retrieval_prior_handler),
+            )
             .route(
                 "/ws/{ws}/cognition/{token}/answer",
                 post(answer_cognition_handler),
@@ -2130,6 +2135,20 @@ async fn function_verdicts_handler(
 ) -> Response {
     let engine = state.engine.read().await;
     match engine.function_verdicts(&ws, &name, 50).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// GET /ws/{ws}/learning/retrieval-prior — the per-tenant learn-to-rank
+/// window: whether the learned prior is enabled, how many claims have an
+/// accumulated usefulness, and the top ones by Wilson-scored citation rate.
+async fn retrieval_prior_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.retrieval_prior_summary(&ws, 20).await {
         Ok(v) => ok_response(v).into_response(),
         Err(e) => match_engine_error(e),
     }

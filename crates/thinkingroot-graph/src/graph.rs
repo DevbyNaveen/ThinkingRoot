@@ -7212,6 +7212,63 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Observability for the learned retrieval prior: the count of claims with
+    /// a learned usefulness, plus the top `limit` by score (most-proven-useful
+    /// first), each as `(claim_id, shown, cited, score)`. Powers the Console's
+    /// "the Mind is learning" view — the visible proof the per-tenant signal
+    /// is accumulating. Read-only; never mutates.
+    #[allow(clippy::type_complexity)]
+    pub fn retrieval_prior_summary(
+        &self,
+        limit: usize,
+    ) -> Result<(usize, Vec<(String, i64, i64, f64)>)> {
+        let total = self
+            .raw_db()
+            .run_script(
+                "?[claim_id] := *claim_usefulness{claim_id}",
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("count claim_usefulness: {e}")))?
+            .rows
+            .len();
+
+        let mut params = BTreeMap::new();
+        params.insert("lim".into(), DataValue::Num(Num::Int(limit.max(1) as i64)));
+        let result = self
+            .raw_db()
+            .run_script(
+                "?[claim_id, shown, cited, score] := \
+                 *claim_usefulness{claim_id, shown, cited, score} \
+                 :order -score \
+                 :limit $lim",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("top claim_usefulness: {e}")))?;
+
+        let i = |v: &DataValue| -> i64 {
+            match v {
+                DataValue::Num(Num::Int(n)) => *n,
+                DataValue::Num(Num::Float(x)) => *x as i64,
+                _ => 0,
+            }
+        };
+        let f = |v: &DataValue| -> f64 {
+            match v {
+                DataValue::Num(Num::Float(x)) => *x,
+                DataValue::Num(Num::Int(n)) => *n as f64,
+                _ => 0.0,
+            }
+        };
+        let top = result
+            .rows
+            .iter()
+            .map(|r| (dv_to_string(&r[0]), i(&r[1]), i(&r[2]), f(&r[3])))
+            .collect();
+        Ok((total, top))
+    }
+
     /// Filter dangling claim references out of the turns calendar.
     ///
     /// `turns.claim_ids` is a JSON-encoded `Vec<String>` because the
@@ -7900,6 +7957,12 @@ mod tests {
             .get("claim:b")
             .unwrap();
         assert!(b2 > b, "b improved after being cited ({b2} > {b})");
+
+        // Observability summary: both claims trained, ordered by score desc.
+        let (total, top) = store.retrieval_prior_summary(10).unwrap();
+        assert_eq!(total, 2, "two claims have a learned prior");
+        assert_eq!(top.len(), 2);
+        assert!(top[0].3 >= top[1].3, "top is ordered by score descending");
     }
 
     #[test]

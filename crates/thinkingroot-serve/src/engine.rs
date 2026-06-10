@@ -2890,6 +2890,38 @@ impl QueryEngine {
         Ok(serde_json::json!({ "verdicts": out }))
     }
 
+    /// Learned-prior observability (item 10): the count of claims with a
+    /// learned usefulness and the top-N by score. Read-only window onto the
+    /// per-tenant learn-to-rank signal for the Console.
+    pub async fn retrieval_prior_summary(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let (total, top) = storage.graph.retrieval_prior_summary(limit)?;
+        let enabled = std::env::var("TR_LEARNED_PRIOR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let out: Vec<serde_json::Value> = top
+            .into_iter()
+            .map(|(claim_id, shown, cited, score)| {
+                serde_json::json!({
+                    "claim_id": claim_id,
+                    "shown": shown,
+                    "cited": cited,
+                    "score": score,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "enabled": enabled,
+            "trained_claims": total,
+            "top": out,
+        }))
+    }
+
     /// A1 — store the capability grant set for a function. Requires the
     /// function to exist (granting caps to a non-deployed name is a typo
     /// until proven otherwise).
