@@ -92,6 +92,55 @@ impl TrustLevel {
     }
 }
 
+/// A7-SECURITY ① — the ORIGIN CHANNEL a piece of knowledge entered through.
+/// Orthogonal to [`TrustLevel`] (a quality/verification judgement): the
+/// trust class answers *who could have authored this bytes-wise*, which is
+/// what memory-poisoning defenses key on — a fluent, high-quality poison
+/// record sails through quality gates but cannot fake its entry channel.
+///
+/// Derivable from the engine's canonical source-URI conventions, so it is
+/// retroactively available for every existing claim with zero migration:
+///   file:// / git*       → OwnerSource      (compiled by the workspace owner)
+///   mcp://agent/…        → AuthenticatedUser (a keyed session's chat turns)
+///   connector://…        → ToolOutput        (keyed connector ingest)
+///   rootfn://…           → AgentGenerated    (a function's own writes)
+///   http:// / https://   → FetchedWeb        (anyone on the internet)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustClass {
+    OwnerSource,
+    AuthenticatedUser,
+    ToolOutput,
+    AgentGenerated,
+    FetchedWeb,
+    Unknown,
+}
+
+impl TrustClass {
+    /// Classify a source URI by the engine's canonical channel prefixes.
+    /// Unrecognised schemes are `Unknown` — never silently promoted.
+    pub fn from_uri(uri: &str) -> Self {
+        let u = uri.trim();
+        if u.starts_with("file://") || u.starts_with("git://") || u.starts_with("git+") {
+            Self::OwnerSource
+        } else if u.starts_with("mcp://agent/") {
+            Self::AuthenticatedUser
+        } else if u.starts_with("connector://") {
+            Self::ToolOutput
+        } else if u.starts_with("rootfn://") {
+            Self::AgentGenerated
+        } else if u.starts_with("http://") || u.starts_with("https://") {
+            Self::FetchedWeb
+        } else if !u.is_empty() && !u.contains("://") {
+            // Bare relative paths are how the compile pipeline records
+            // owner-tree files (e.g. `src/lib.rs`).
+            Self::OwnerSource
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
 /// BLAKE3 content hash for change detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentHash(pub String);

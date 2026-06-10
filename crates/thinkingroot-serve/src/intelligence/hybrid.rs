@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use cozo::{DataValue, NamedRows, Num};
-use thinkingroot_core::types::{AdmissionTier, GroundingMethod, Sensitivity, TrustLevel};
+use thinkingroot_core::types::{AdmissionTier, GroundingMethod, Sensitivity, TrustClass, TrustLevel};
 use thinkingroot_core::{Error, Result};
 use thinkingroot_graph::graph::GraphStore;
 use thinkingroot_graph::hybrid_queries::{
@@ -160,6 +160,18 @@ pub async fn hybrid_retrieve(
         }
         if let Some((s, b)) = fuse_score(&c, &req.scoring_profile, now_dt, &req) {
             scored.push((c, s, b));
+        }
+    }
+    // ---- Layer 6.1: trust-aware scoring (A7-SECURITY ②, flag-gated) ----
+    // Demote low-trust ORIGIN CHANNELS (fetched-web, agent-generated) relative
+    // to owner/keyed channels. This is the retrieval half of the poisoning
+    // defense: a fluent poison record passes quality gates but cannot fake
+    // its entry channel. OFF by default (TR_TRUST_SCORING) — the factors
+    // below are eval-tuned on LongMemEval before this flips on; flag-off is
+    // a literal no-op on the calibrated 11-component blend.
+    if trust_scoring_flag_on() {
+        for (c, s, _) in scored.iter_mut() {
+            *s *= trust_class_factor(c.trust_class);
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -818,6 +830,31 @@ fn merge_candidates(
     out
 }
 
+/// Layer 6.1 flag (A7-SECURITY ②) — trust-aware scoring is OFF until the
+/// demotion factors are eval-tuned (any reweighting perturbs the calibrated
+/// LongMemEval blend, so it ships dark like the late-interaction tier).
+fn trust_scoring_flag_on() -> bool {
+    std::env::var("TR_TRUST_SCORING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A7-SECURITY ② — per-channel demotion factors. PLACEHOLDERS pending the
+/// eval run (the ORDERING is the security design; the magnitudes are tuned):
+/// owner/keyed channels are never demoted; agent-generated and fetched-web —
+/// the channels an attacker can actually reach — are. Unknown sits between:
+/// unrecognised provenance is never promoted to full trust.
+fn trust_class_factor(class: TrustClass) -> f32 {
+    match class {
+        TrustClass::OwnerSource => 1.0,
+        TrustClass::AuthenticatedUser => 1.0,
+        TrustClass::ToolOutput => 0.95,
+        TrustClass::Unknown => 0.9,
+        TrustClass::AgentGenerated => 0.85,
+        TrustClass::FetchedWeb => 0.75,
+    }
+}
+
 /// Layer 6.4 flag — read once per query; keeps the flag-off path at literal
 /// zero cost (no storage lock, no engine call).
 fn late_interaction_flag_on() -> bool {
@@ -981,6 +1018,9 @@ struct EnrichedCandidate {
     derivation_parents: Vec<String>,
     derivation_root: Option<String>,
     source_authority: TrustLevel,
+    /// A7-SECURITY ① — the origin CHANNEL, derived from the canonical source
+    /// URI at enrich time (zero migration; retroactive on all existing data).
+    trust_class: TrustClass,
     source_uri: String,
     source_blake3s: Vec<String>,
     trial_scores: Option<TrialScores>,
@@ -1132,6 +1172,7 @@ fn enrich_candidates(
             derivation_parents: dparents,
             derivation_root: droot,
             source_authority: auth,
+            trust_class: TrustClass::from_uri(&uri),
             source_uri: uri,
             source_blake3s: blake3s,
             trial_scores: ts,
@@ -2265,6 +2306,7 @@ mod tests {
             derivation_parents: vec![],
             derivation_root: None,
             source_authority: TrustLevel::Trusted,
+            trust_class: TrustClass::Unknown,
             source_uri: "u".into(),
             source_blake3s: vec![],
             trial_scores: None,
@@ -2283,6 +2325,31 @@ mod tests {
             cluster_gaps: vec![],
             enrichment_byte_spans: vec![],
         }
+    }
+
+    #[test]
+    fn trust_class_derivation_and_factor_ordering() {
+        // Derivation pins the canonical channel prefixes (A7-SECURITY ①).
+        assert_eq!(TrustClass::from_uri("file:///docs/spec.md"), TrustClass::OwnerSource);
+        assert_eq!(TrustClass::from_uri("src/lib.rs"), TrustClass::OwnerSource);
+        assert_eq!(TrustClass::from_uri("/workspace/src/lib.rs"), TrustClass::OwnerSource);
+        assert_eq!(TrustClass::from_uri("mcp://agent/sess-1"), TrustClass::AuthenticatedUser);
+        assert_eq!(TrustClass::from_uri("connector://gh/i1/key"), TrustClass::ToolOutput);
+        assert_eq!(TrustClass::from_uri("rootfn://main/run-9"), TrustClass::AgentGenerated);
+        assert_eq!(TrustClass::from_uri("https://example.com/x"), TrustClass::FetchedWeb);
+        assert_eq!(TrustClass::from_uri("weird://thing"), TrustClass::Unknown);
+        assert_eq!(TrustClass::from_uri(""), TrustClass::Unknown);
+
+        // Factor ORDERING is the security contract: attacker-reachable
+        // channels are demoted below owner/keyed ones; Unknown never reaches
+        // full trust. (Magnitudes are eval-tuned; flag default OFF.)
+        let f = trust_class_factor;
+        assert_eq!(f(TrustClass::OwnerSource), 1.0);
+        assert_eq!(f(TrustClass::AuthenticatedUser), 1.0);
+        assert!(f(TrustClass::ToolOutput) < 1.0);
+        assert!(f(TrustClass::Unknown) < f(TrustClass::ToolOutput));
+        assert!(f(TrustClass::AgentGenerated) < f(TrustClass::Unknown));
+        assert!(f(TrustClass::FetchedWeb) < f(TrustClass::AgentGenerated));
     }
 
     #[test]
