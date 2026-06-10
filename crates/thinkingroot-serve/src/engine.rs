@@ -861,7 +861,13 @@ struct WorkspaceHandle {
 /// `mcp`/`fetch`-style egress capabilities are gated separately (default
 /// deny) because they cross the trust boundary; the graph capabilities are
 /// default-allow because they only touch the caller's own brain.
-#[derive(Debug, Clone, Copy)]
+/// Serde contract (A1): a STORED grant set is restrictive — any capability
+/// missing from the stored JSON deserialises to `false` (deny), so a partial
+/// grant document can only narrow, never widen. An ABSENT row falls back to
+/// [`CapSet::default_own_workspace`] at the invoke site (unrestricted
+/// functions keep today's behaviour).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CapSet {
     pub can_recall: bool,
     pub can_remember: bool,
@@ -890,6 +896,19 @@ impl CapSet {
             // Self-extension is a graph write on the run's own workspace.
             can_acquire: true,
         }
+    }
+
+    /// Parse a stored grant document. `None` on malformed JSON — the caller
+    /// must then FAIL CLOSED for that invoke (a corrupt grant must never
+    /// silently restore all-caps).
+    pub fn from_json(s: &str) -> Option<Self> {
+        serde_json::from_str(s).ok()
+    }
+
+    /// All-deny — the fail-closed grant used when a stored caps document
+    /// exists but cannot be parsed.
+    pub fn deny_all() -> Self {
+        Self::default()
     }
 }
 
@@ -2811,6 +2830,38 @@ impl QueryEngine {
         storage.graph.get_function(name)
     }
 
+    /// A1 — store the capability grant set for a function. Requires the
+    /// function to exist (granting caps to a non-deployed name is a typo
+    /// until proven otherwise).
+    pub async fn set_function_caps(&self, ws: &str, name: &str, caps: CapSet) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        if storage.graph.get_function(name)?.is_none() {
+            return Err(Error::EntityNotFound(format!(
+                "root function '{name}' is not deployed — deploy it before setting capabilities"
+            )));
+        }
+        let json = serde_json::to_string(&caps)
+            .map_err(|e| Error::Serialization(format!("serialise CapSet: {e}")))?;
+        storage.graph.set_function_caps(name, &json)
+    }
+
+    /// A1 — the effective capability grants for a function: the stored set
+    /// when present (malformed → all-deny, same fail-closed rule as invoke),
+    /// else the unrestricted default. The bool is `true` when a stored
+    /// (explicit) grant exists.
+    pub async fn get_function_caps(&self, ws: &str, name: &str) -> Result<(CapSet, bool)> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        Ok(match storage.graph.get_function_caps(name)? {
+            Some(json) => (
+                CapSet::from_json(&json).unwrap_or_else(CapSet::deny_all),
+                true,
+            ),
+            None => (CapSet::default_own_workspace(), false),
+        })
+    }
+
     /// Latest version of every distinct function.
     pub async fn list_functions(
         &self,
@@ -3021,12 +3072,37 @@ impl QueryEngine {
         let caps = {
             let handle = self.get_workspace(ws)?.clone();
             let mcp = crate::mcp::external_registry::global().await;
+            // A1 — per-function capability grants. Absent row → the all-on
+            // default (unrestricted functions behave exactly as before).
+            // Present-but-malformed row → DENY ALL (fail closed: a corrupt
+            // grant must never silently restore full capabilities).
+            let cap_set = {
+                let storage = handle.storage.lock().await;
+                match storage.graph.get_function_caps(name) {
+                    Ok(Some(json)) => CapSet::from_json(&json).unwrap_or_else(|| {
+                        tracing::warn!(
+                            function = name,
+                            "malformed stored CapSet — failing closed (all capabilities denied)"
+                        );
+                        CapSet::deny_all()
+                    }),
+                    Ok(None) => CapSet::default_own_workspace(),
+                    Err(e) => {
+                        tracing::warn!(
+                            function = name,
+                            error = %e,
+                            "CapSet lookup failed — failing closed for this invoke"
+                        );
+                        CapSet::deny_all()
+                    }
+                }
+            };
             std::sync::Arc::new(FnCapabilities::new(
                 handle,
                 ws.to_string(),
                 run_id.to_string(),
                 mcp,
-                CapSet::default_own_workspace(),
+                cap_set,
             ))
         };
         let (outcome, new_steps, new_pending, new_cites) =
@@ -8704,6 +8780,54 @@ fn cached_claim_to_info(c: &CachedClaim) -> ClaimInfo {
         confidence: c.confidence,
         source_uri: c.source_uri.clone(),
         event_date: c.event_date,
+    }
+}
+
+#[cfg(test)]
+mod capset_tests {
+    use super::*;
+
+    // A1 serde contract: a stored grant can only NARROW. Any capability
+    // missing from the document is deny; malformed JSON is None (the invoke
+    // site then fails closed to deny_all).
+    #[test]
+    fn capset_partial_document_denies_missing_capabilities() {
+        let caps = CapSet::from_json(r#"{"can_recall": true, "can_prompt": true}"#).unwrap();
+        assert!(caps.can_recall);
+        assert!(caps.can_prompt);
+        assert!(!caps.can_remember);
+        assert!(!caps.can_branch);
+        assert!(!caps.can_mcp);
+        assert!(!caps.can_acquire);
+    }
+
+    #[test]
+    fn capset_malformed_json_is_none_and_deny_all_is_all_false() {
+        assert!(CapSet::from_json("{not json").is_none());
+        let d = CapSet::deny_all();
+        assert!(
+            !d.can_recall
+                && !d.can_remember
+                && !d.can_prompt
+                && !d.can_branch
+                && !d.can_mcp
+                && !d.can_acquire
+        );
+    }
+
+    #[test]
+    fn capset_default_grant_round_trips_through_json() {
+        let full = CapSet::default_own_workspace();
+        let json = serde_json::to_string(&full).unwrap();
+        let back = CapSet::from_json(&json).unwrap();
+        assert!(
+            back.can_recall
+                && back.can_remember
+                && back.can_prompt
+                && back.can_branch
+                && back.can_mcp
+                && back.can_acquire
+        );
     }
 }
 

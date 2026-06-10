@@ -83,6 +83,51 @@ async fn ctx_mcp_call_unknown_tool_errors_honestly() {
     );
 }
 
+/// A1 — stored per-function capability grants gate the invoke path. The same
+/// function flips from "reaches the MCP registry" (unrestricted default) to
+/// an honest capability denial once a stored grant omits `can_mcp` — proving
+/// the invoke site loads the stored CapSet and that a grant can only narrow.
+#[tokio::test]
+async fn stored_capset_gates_the_invoke_path() {
+    let (engine, _root, _dir) = engine_with_ws("acme").await;
+    const F: &str = r#"async (i, ctx) => await ctx.mcp.call("ghost::send", { to: "x" })"#;
+    engine.put_function("acme", "caller", F, "js").await.unwrap();
+
+    // Unrestricted default: the call passes the cap gate and dies at the
+    // registry with the honest "not found".
+    let err = engine
+        .invoke_function("acme", "caller", &serde_json::json!({}))
+        .await
+        .expect_err("unknown tool must error");
+    assert!(
+        err.to_string().contains("not found"),
+        "default grant must reach the registry, got: {err}"
+    );
+
+    // Narrow the grant: everything EXCEPT mcp (omitted → deny by contract).
+    let caps = thinkingroot_serve::engine::CapSet::from_json(
+        r#"{"can_recall":true,"can_remember":true,"can_prompt":true,"can_branch":true,"can_acquire":true}"#,
+    )
+    .expect("valid grant document");
+    engine.set_function_caps("acme", "caller", caps).await.unwrap();
+
+    let err = engine
+        .invoke_function("acme", "caller", &serde_json::json!({}))
+        .await
+        .expect_err("denied capability must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not granted"),
+        "expected a capability denial after narrowing the grant, got: {msg}"
+    );
+
+    // Granting caps to an undeployed function is rejected (typo guard).
+    assert!(
+        engine.set_function_caps("acme", "ghost-fn", caps).await.is_err(),
+        "caps on a non-deployed function must be rejected"
+    );
+}
+
 /// Self-extension: a running function deploys a NEW function at runtime via
 /// `ctx.acquire` (supplied body — model-independent), and that function is then
 /// invocable and correct. This is the engine-side spine for JIT/self-improving

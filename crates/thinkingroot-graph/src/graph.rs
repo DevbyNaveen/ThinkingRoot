@@ -1087,6 +1087,19 @@ impl GraphStore {
                 version: Int default 1,
                 created_at: Float default 0.0
             }",
+            // A1 — per-function capability grants (security). Keyed by function
+            // NAME (caps apply across versions; a redeploy never silently
+            // re-escalates). `caps_json` is the serialised engine CapSet; a
+            // missing row = the engine's default_own_workspace() grants, so
+            // existing functions keep today's behaviour until restricted.
+            // A separate relation (not a root_functions column) so existing
+            // workspaces pick it up via create_schema with zero migration.
+            ":create root_function_caps {
+                name: String
+                =>
+                caps_json: String default '',
+                updated_at: Float default 0.0
+            }",
             // ─── root_function_runs — one row per invocation, for the
             //     Console Functions tab's run log + the CLI `invoke`
             //     output. `status` is 'ok' | 'error'. PK is the run id.
@@ -7363,6 +7376,33 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn function_caps_set_get_roundtrip_and_absent_is_none() {
+        let store = mem_store();
+        // Absent → None (caller falls back to the default grant set).
+        assert_eq!(store.get_function_caps("greeter").unwrap(), None);
+
+        store
+            .set_function_caps("greeter", r#"{"can_recall":true}"#)
+            .expect("set caps");
+        assert_eq!(
+            store.get_function_caps("greeter").unwrap().as_deref(),
+            Some(r#"{"can_recall":true}"#)
+        );
+
+        // Overwrite (rotation) wins.
+        store
+            .set_function_caps("greeter", r#"{"can_recall":false}"#)
+            .expect("rotate caps");
+        assert_eq!(
+            store.get_function_caps("greeter").unwrap().as_deref(),
+            Some(r#"{"can_recall":false}"#)
+        );
+
+        // Empty name rejected.
+        assert!(store.set_function_caps("  ", "{}").is_err());
     }
 
     #[test]

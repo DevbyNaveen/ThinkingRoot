@@ -801,6 +801,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 get(list_functions_handler).put(put_function_handler),
             )
             .route("/ws/{ws}/functions/{name}", get(get_function_handler))
+            .route(
+                "/ws/{ws}/functions/{name}/caps",
+                get(get_function_caps_handler).put(set_function_caps_handler),
+            )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
             .route(
@@ -2066,6 +2070,36 @@ async fn get_function_handler(
             "not_found",
             &format!("root function '{name}' not found"),
         ),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// A1 — read the effective capability grants for a function. `explicit` is
+/// `true` when a stored grant exists (else the unrestricted default is shown).
+async fn get_function_caps_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_function_caps(&ws, &name).await {
+        Ok((caps, explicit)) => {
+            ok_response(serde_json::json!({ "caps": caps, "explicit": explicit })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// A1 — set the capability grants for a function. The body is the full
+/// CapSet document; any capability omitted deserialises to `false` (a grant
+/// can only narrow, never silently widen — see CapSet's serde contract).
+async fn set_function_caps_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(caps): Json<crate::engine::CapSet>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.set_function_caps(&ws, &name, caps).await {
+        Ok(()) => ok_response(serde_json::json!({ "caps": caps, "explicit": true })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

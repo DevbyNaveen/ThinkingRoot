@@ -232,6 +232,46 @@ impl GraphStore {
         })
     }
 
+    /// A1 — set the capability grants for a function (by NAME — caps survive
+    /// redeploys; a new version never silently re-escalates). `caps_json` is
+    /// the engine's serialised CapSet; storage treats it as opaque.
+    pub fn set_function_caps(&self, name: &str, caps_json: &str) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Template("function name must be non-empty".into()));
+        }
+        let updated_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("caps".into(), DataValue::Str(caps_json.into()));
+        params.insert("at".into(), DataValue::Num(Num::Float(updated_at)));
+        self.query(
+            "?[name, caps_json, updated_at] <- [[$name, $caps, $at]] \
+             :put root_function_caps {name => caps_json, updated_at}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// A1 — the stored capability grants for a function, or `None` when never
+    /// restricted (caller falls back to the engine default grant set).
+    pub fn get_function_caps(&self, name: &str) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[caps_json] := *root_function_caps{name: $name, caps_json}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_function_caps: {e}")))?;
+        Ok(rows
+            .rows
+            .first()
+            .map(|r| dv_str(&r[0]))
+            .filter(|s| !s.is_empty()))
+    }
+
     pub fn function_latest_version(&self, name: &str) -> Result<Option<i64>> {
         let mut params = BTreeMap::new();
         params.insert("name".into(), DataValue::Str(name.into()));
