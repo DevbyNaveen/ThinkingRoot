@@ -1049,11 +1049,48 @@ pub fn render_system_reminder(identity: &WorkspaceIdentity, today: Option<&str>)
 fn render_history_block(history: &[ChatTurn]) -> String {
     let mut out =
         String::from("## CONVERSATION HISTORY (recent turns — treat as memory, do not restart)\n");
-    for turn in history {
+
+    // §5 input #5 — context compaction on long runs. When enabled, keep the
+    // most-recent turns within a token budget and elide the older middle
+    // (marked, so the model knows context was dropped, not restarted). OFF by
+    // default → byte-identical to the prior block; only conversational-persona
+    // turns ever reach here.
+    let (slice, dropped) = if history_compaction_on() {
+        let from = crate::intelligence::compaction::history_keep_from(
+            history,
+            history_compaction_budget(),
+        );
+        (&history[from..], from)
+    } else {
+        (history, 0)
+    };
+    if dropped > 0 {
+        out.push_str(&format!(
+            "[… {dropped} earlier turn(s) elided to fit context …]\n"
+        ));
+    }
+    for turn in slice {
         out.push_str(&format!("[{}]: {}\n", turn.role.as_str(), turn.content));
     }
     out.push('\n');
     out
+}
+
+/// §5 input #5 flag — compact long conversation history. OFF by default so the
+/// rendered block is byte-identical to before until explicitly enabled.
+fn history_compaction_on() -> bool {
+    std::env::var("TR_COMPACT_HISTORY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Token budget for the kept history suffix (default 4000).
+fn history_compaction_budget() -> usize {
+    std::env::var("TR_HISTORY_BUDGET_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|b| *b > 0)
+        .unwrap_or(4000)
 }
 
 /// Whether to render a conversation-history block on this request.
