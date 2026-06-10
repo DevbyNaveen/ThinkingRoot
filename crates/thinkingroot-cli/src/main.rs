@@ -1038,6 +1038,15 @@ enum BrainAction {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Apply a `./brain/` folder to the live brain (deploy prompts + functions).
+    Push {
+        /// Path to the workspace (defaults to current dir).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Branch to scope against (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2325,6 +2334,10 @@ async fn async_main() -> anyhow::Result<()> {
             BrainAction::Pull { path, branch } => {
                 let conn = require_remote(in_process_flag).await?;
                 brain_code::run_pull(&conn, &path, branch.as_deref()).await?;
+            }
+            BrainAction::Push { path, branch } => {
+                let conn = require_remote(in_process_flag).await?;
+                brain_code::run_push(&conn, &path, branch.as_deref()).await?;
             }
         },
         Some(Commands::Investigate {

@@ -247,6 +247,23 @@ pub async fn post_json(
     decode_envelope(resp).await
 }
 
+/// PUT a daemon endpoint with a JSON body. Same envelope decoding as
+/// [`post_json`]. Used by `root brain push` to deploy prompts/functions.
+pub async fn put_json(
+    conn: &EngineConnection,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!("{}{path}", base_url(conn)?);
+    let client = client(UNARY_TIMEOUT)?;
+    let resp = with_reconnect(conn, "PUT", || async {
+        client.put(&url).json(body).send().await?.error_for_status()
+    })
+    .await
+    .with_context(|| format!("PUT {url}"))?;
+    decode_envelope(resp).await
+}
+
 /// DELETE a daemon endpoint. Returns the `data` field value.
 pub async fn delete_json(
     conn: &EngineConnection,

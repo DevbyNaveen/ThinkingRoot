@@ -246,6 +246,57 @@ pub async fn run_pull(
     Ok(())
 }
 
+/// `root brain push` (§10 / 25b, slice 2b) — apply a `./brain/` folder to a
+/// running engine: deploy each prompt + function over REST. The inverse of
+/// [`run_pull`]. Each deploy is a versioned PUT (the engine bumps the version),
+/// so re-pushing is safe. Best-effort per item — one failure is reported but
+/// does not abort the rest.
+pub async fn run_push(
+    conn: &thinkingroot_core::cortex::EngineConnection,
+    root: &Path,
+    _branch: Option<&str>,
+) -> Result<()> {
+    use crate::cortex_remote;
+    let brain = read_brain(root).context("read ./brain (run `root brain pull` first?)")?;
+    let ws = cortex_remote::ensure_mounted_remote(conn, root)
+        .await
+        .context("mount workspace")?;
+
+    let mut ok_p = 0usize;
+    let mut ok_f = 0usize;
+    let mut failed = 0usize;
+
+    for (name, body) in &brain.prompts {
+        let payload = serde_json::json!({ "name": name, "template_text": body });
+        match cortex_remote::put_json(conn, &format!("/api/v1/ws/{ws}/prompts"), &payload).await {
+            Ok(_) => ok_p += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("  prompt '{name}' failed: {e}");
+            }
+        }
+    }
+    for (name, body) in &brain.functions {
+        let payload = serde_json::json!({ "name": name, "body": body, "language": "js" });
+        match cortex_remote::put_json(conn, &format!("/api/v1/ws/{ws}/functions"), &payload).await {
+            Ok(_) => ok_f += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("  function '{name}' failed: {e}");
+            }
+        }
+    }
+
+    println!(
+        "pushed {ok_p} prompt(s), {ok_f} function(s) to '{ws}'{}",
+        if failed > 0 { format!(" ({failed} failed)") } else { String::new() }
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} item(s) failed to deploy");
+    }
+    Ok(())
+}
+
 /// Minimal percent-encoding for a path segment (names are already
 /// safe_stem-class but a space/`/` would break the URL).
 fn urlencode(s: &str) -> String {
