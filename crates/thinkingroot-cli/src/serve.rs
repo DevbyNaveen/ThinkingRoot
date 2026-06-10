@@ -400,6 +400,12 @@ pub async fn run_serve(
         None
     };
 
+    // A7-SECURITY ⑥ — periodic integrity snapshots of the main graph
+    // (rollback-to-known-good). No-op handle unless TR_INTEGRITY_SNAPSHOTS=1.
+    let _integrity_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_integrity_snapshots(root.clone()));
+
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
@@ -761,6 +767,12 @@ async fn run_serve_with_listener(
     } else {
         None
     };
+
+    // A7-SECURITY ⑥ — periodic integrity snapshots of the main graph
+    // (rollback-to-known-good). No-op handle unless TR_INTEGRITY_SNAPSHOTS=1.
+    let _integrity_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_integrity_snapshots(root.clone()));
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();

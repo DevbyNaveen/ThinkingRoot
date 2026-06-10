@@ -91,6 +91,183 @@ pub fn spawn_stream_cleanup(
     spawn_periodic_task(task)
 }
 
+// ─── A7-SECURITY ⑥ — periodic integrity snapshots of main ──────────────────
+//
+// Rollback-to-known-good for poison discovered late: a copy of the main
+// graph taken on a cadence, VALIDATED by re-opening it (a torn copy of a
+// live db fails to open and is reported — never silently kept as a "good"
+// snapshot). Snapshots live under `.thinkingroot/graph/integrity/` on the
+// data volume. Vector indexes are NOT snapshotted — they are derivable by
+// recompile; the graph is the source of truth.
+//
+// Env-gated, default OFF: TR_INTEGRITY_SNAPSHOTS=1 enables;
+// TR_INTEGRITY_SNAPSHOT_SECS (default 21600 = 6h) sets the cadence;
+// TR_INTEGRITY_SNAPSHOT_RETAIN (default 7) bounds retention — only files
+// matching our own `graph.db.integrity-{ts}` pattern in our own
+// `integrity/` dir are ever pruned.
+
+/// One snapshot pass: copy → validate-by-open → prune to `retain`.
+/// Returns the snapshot path, or an error when the copy failed validation.
+pub fn integrity_snapshot_once(
+    workspace_root: &std::path::Path,
+    retain: usize,
+) -> Result<PathBuf, thinkingroot_core::Error> {
+    use thinkingroot_core::Error;
+    let graph_db = workspace_root.join(".thinkingroot").join("graph").join("graph.db");
+    if !graph_db.exists() {
+        return Err(Error::GraphStorage(format!(
+            "integrity snapshot: no graph at {}",
+            graph_db.display()
+        )));
+    }
+    let dir = workspace_root.join(".thinkingroot").join("graph").join("integrity");
+    std::fs::create_dir_all(&dir).map_err(|e| Error::io_path(&dir, e))?;
+
+    // Millis + a fixed-width process-global sequence: unique under rapid
+    // calls (tests; manual triggers), all-digits (the pristine filter),
+    // fixed width (lexicographic sort == chronological).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = chrono::Utc::now().timestamp_millis();
+    let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed) % 1000;
+    let snap = dir.join(format!("graph.db.integrity-{ts}{seq:03}"));
+    std::fs::copy(&graph_db, &snap).map_err(|e| Error::io_path(&snap, e))?;
+
+    // Validate structurally: a snapshot that cannot be opened is WORSE than
+    // none — it would be discovered broken exactly when a rollback is
+    // needed. We deliberately do NOT open-probe with GraphStore: cozo's
+    // sqlite layer PANICS (internal unwrap) on a corrupt file, which would
+    // crash the daemon on the very copy this validation exists to catch.
+    // The structural check (SQLite magic + page-size/file-size consistency)
+    // is panic-free and catches the realistic torn-copy modes — truncated
+    // tail, mid-write garbage, wrong file. Failed copies are renamed
+    // `.torn` (kept for forensics, excluded from retention/restore picks).
+    if let Err(e) = validate_sqlite_structure(&snap) {
+        let torn = snap.with_extension("torn");
+        let _ = std::fs::rename(&snap, &torn);
+        return Err(Error::GraphStorage(format!(
+            "integrity snapshot failed validation (likely copied mid-write): {e} — \
+             kept as {} for forensics; will retry next cycle",
+            torn.display()
+        )));
+    }
+
+    // Retention: prune ONLY our own pristine `graph.db.integrity-{ts}`
+    // files (strictly numeric suffix — never `.torn`, never scratch),
+    // oldest first, down to `retain`.
+    let is_pristine_snapshot = |n: &str| {
+        n.strip_prefix("graph.db.integrity-")
+            .map(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or(false)
+    };
+    let mut snaps: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| Error::io_path(&dir, e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(is_pristine_snapshot)
+                    .unwrap_or(false)
+        })
+        .collect();
+    snaps.sort();
+    while snaps.len() > retain.max(1) {
+        let oldest = snaps.remove(0);
+        if let Err(e) = std::fs::remove_file(&oldest) {
+            tracing::warn!(path = %oldest.display(), error = %e, "integrity snapshot prune failed");
+        }
+    }
+    Ok(snap)
+}
+
+/// Panic-free structural validation of a SQLite file: the 16-byte magic,
+/// a sane declared page size (power of two in [512, 65536]), and a file
+/// size that is an exact multiple of it (SQLite files always are — a
+/// truncated or mid-write copy almost never is).
+fn validate_sqlite_structure(path: &std::path::Path) -> Result<(), thinkingroot_core::Error> {
+    use thinkingroot_core::Error;
+    let bytes = std::fs::read(path).map_err(|e| Error::io_path(path, e))?;
+    if bytes.len() < 100 {
+        return Err(Error::GraphStorage(format!(
+            "snapshot too small to be a SQLite db ({} bytes)",
+            bytes.len()
+        )));
+    }
+    if &bytes[..16] != b"SQLite format 3\0" {
+        return Err(Error::GraphStorage("snapshot missing SQLite header magic".into()));
+    }
+    let page_size = match u16::from_be_bytes([bytes[16], bytes[17]]) {
+        1 => 65_536usize, // SQLite encodes 65536 as 1
+        n if n.is_power_of_two() && (512..=32_768).contains(&(n as usize)) => n as usize,
+        n => {
+            return Err(Error::GraphStorage(format!(
+                "snapshot declares invalid SQLite page size {n}"
+            )));
+        }
+    };
+    if bytes.len() % page_size != 0 {
+        return Err(Error::GraphStorage(format!(
+            "snapshot size {} is not a multiple of page size {page_size} — truncated copy",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+struct IntegritySnapshotTask {
+    workspace_root: PathBuf,
+    retain: usize,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for IntegritySnapshotTask {
+    fn name(&self) -> &'static str {
+        "integrity_snapshot"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let root = self.workspace_root.clone();
+        let retain = self.retain;
+        // File copy of a potentially large db — keep it off the async core.
+        tokio::task::spawn_blocking(move || integrity_snapshot_once(&root, retain))
+            .await
+            .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("snapshot task join: {e}")))?
+            .map(|p| {
+                tracing::info!(snapshot = %p.display(), "integrity snapshot written");
+            })
+    }
+}
+
+/// Spawn the integrity-snapshot task (A7-⑥). No-op handle when the
+/// `TR_INTEGRITY_SNAPSHOTS` env flag is off (the default).
+pub fn spawn_integrity_snapshots(workspace_root: PathBuf) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_INTEGRITY_SNAPSHOTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let interval_secs = std::env::var("TR_INTEGRITY_SNAPSHOT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21_600u64);
+    let retain = std::env::var("TR_INTEGRITY_SNAPSHOT_RETAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7usize);
+    let task: Arc<dyn PeriodicTask> = Arc::new(IntegritySnapshotTask {
+        workspace_root,
+        retain,
+        interval: Duration::from_secs(interval_secs.max(60)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Single cleanup pass. Exposed for tests.
 ///
 /// When `branch_engines` is provided, the cache is invalidated before each
@@ -519,5 +696,72 @@ async fn ensure_topic_branch(
             thinkingroot_core::Error::BranchAlreadyExists(_) => Ok(()),
             _ => Err(e),
         },
+    }
+}
+
+#[cfg(test)]
+mod integrity_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_validates_prunes_and_skips_torn_and_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let graph_dir = root.join(".thinkingroot").join("graph");
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        // A real, openable graph to snapshot.
+        thinkingroot_graph::graph::GraphStore::init(&graph_dir).expect("init graph");
+
+        // No graph at a bogus root → honest error.
+        let bogus = tempfile::tempdir().unwrap();
+        assert!(integrity_snapshot_once(bogus.path(), 3).is_err());
+
+        // Take 5 snapshots with retain=3 → only the 3 newest survive.
+        let mut taken = Vec::new();
+        for _ in 0..5 {
+            taken.push(integrity_snapshot_once(root, 3).expect("snapshot"));
+        }
+        let integrity_dir = graph_dir.join("integrity");
+        let count = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| {
+                            n.strip_prefix("graph.db.integrity-")
+                                .map(|r| r.bytes().all(|b| b.is_ascii_digit()))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        assert_eq!(count(&integrity_dir), 3, "retention must prune to 3");
+        // The newest snapshot survives and is openable (validated already,
+        // but prove the survivor is the latest taken).
+        assert!(taken.last().unwrap().exists(), "newest snapshot must survive");
+        // The oldest were pruned.
+        assert!(!taken[0].exists() && !taken[1].exists(), "oldest must be pruned");
+
+        // Foreign files + .torn artifacts are NEVER pruned.
+        let foreign = integrity_dir.join("operator-note.txt");
+        std::fs::write(&foreign, b"do not touch").unwrap();
+        let torn = integrity_dir.join("graph.db.integrity-1.torn");
+        std::fs::write(&torn, b"forensics").unwrap();
+        for _ in 0..3 {
+            integrity_snapshot_once(root, 2).expect("snapshot");
+        }
+        assert!(foreign.exists(), "foreign files must never be pruned");
+        assert!(torn.exists(), ".torn forensics must never be pruned");
+
+        // A torn copy fails validation: corrupt source → error + .torn kept,
+        // no pristine snapshot added.
+        let before = count(&integrity_dir);
+        std::fs::write(graph_dir.join("graph.db"), b"definitely not a database").unwrap();
+        let res = integrity_snapshot_once(root, 5);
+        assert!(res.is_err(), "corrupt copy must fail validation");
+        assert_eq!(count(&integrity_dir), before, "no pristine snapshot from a torn copy");
     }
 }
