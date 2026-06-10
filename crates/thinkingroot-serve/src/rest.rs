@@ -6967,12 +6967,25 @@ struct AskResponseBody {
     answer_confidence: f32,
     /// True when the answer was refused (all citations were fabricated).
     refused: bool,
+    /// §5 output stack #1 — output tokens the model did NOT generate because
+    /// the engine hydrated `[claim:id]` markers from the graph. 0 when
+    /// hydration is off or nothing was rendered. Feeds the Savings Meter.
+    #[serde(default)]
+    hydrated_output_tokens_saved: usize,
 }
 
 /// §3 #6 retry flag — give a refused answer one more synthesis pass before
 /// abstaining. OFF until eval measures answered-vs-refused; read per request.
 fn answer_retry_on() -> bool {
     std::env::var("TR_ANSWER_RETRY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// §5 output-stack #1 flag — render `[claim:id]` skeletons into verbatim cited
+/// prose engine-side. OFF by default; pairs with a skeleton-emitting prompt.
+fn hydrate_answers_on() -> bool {
+    std::env::var("TR_HYDRATE_ANSWERS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -7143,7 +7156,7 @@ async fn ask_handler(
     }
 
     let category = result.category.clone();
-    let (answer, claims_used) = if gate.refused {
+    let (mut answer, claims_used) = if gate.refused {
         (
             "I don't have enough verified information to answer that.".to_string(),
             0,
@@ -7151,6 +7164,23 @@ async fn ask_handler(
     } else {
         (result.answer, result.claims_used)
     };
+
+    // ── §5 output stack #1 — Hydrated Answers ───────────────────────
+    // Render `[claim:id]` skeleton markers into verbatim cited prose from the
+    // grounding set (text the model didn't have to generate). Double-render-
+    // safe (a statement already present is never re-inserted), so it is inert
+    // on a normal verbose answer. Gated TR_HYDRATE_ANSWERS.
+    let mut hydrated_output_tokens_saved = 0usize;
+    if !gate.refused && hydrate_answers_on() && !result.grounding.is_empty() {
+        let pairs: Vec<(String, String)> = result
+            .grounding
+            .iter()
+            .map(|h| (h.id.clone(), h.statement.clone()))
+            .collect();
+        let h = crate::intelligence::hydration::hydrate_answer(&answer, &pairs);
+        answer = h.text;
+        hydrated_output_tokens_saved = h.output_tokens_saved;
+    }
 
     state
         .publish_activity(
@@ -7182,6 +7212,7 @@ async fn ask_handler(
         citations: gate.citations,
         answer_confidence: gate.answer_confidence,
         refused: gate.refused,
+        hydrated_output_tokens_saved,
     })
     .into_response()
 }

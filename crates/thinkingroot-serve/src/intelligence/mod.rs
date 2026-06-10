@@ -17,6 +17,7 @@ pub mod jit;
 pub mod environment;
 pub mod hybrid;
 pub mod hybrid_types;
+pub mod hydration;
 pub mod identity;
 pub mod intent;
 pub mod mcp_bridge;
