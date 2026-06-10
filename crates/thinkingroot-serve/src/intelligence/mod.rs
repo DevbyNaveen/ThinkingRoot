@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod aggregation;
 pub mod agent;
 pub mod agent_streaming;
 pub mod approval;

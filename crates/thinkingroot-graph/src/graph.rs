@@ -3146,6 +3146,48 @@ impl GraphStore {
             .collect())
     }
 
+    /// Aggregation route (§3 #4) — the EXACT count/list of claims about a
+    /// subject, resolved through the entity graph. Each whitespace word in
+    /// `keyword` (length > 2) is resolved against entity canonical names; the
+    /// union of those entities' claims is the answer set (deduped by claim id).
+    ///
+    /// Returns `(entities_resolved, claims)`. `entities_resolved == 0` means
+    /// the subject matched no entity — the caller must fall through to the
+    /// normal reader and NOT report a count (reporting 0 there would be a
+    /// fabricated answer). When `entities_resolved > 0`, `claims.len()` is the
+    /// exact, complete count — not a top-k sample. `claims` is `(id, statement)`.
+    pub fn aggregate_claims_for_keyword(
+        &self,
+        keyword: &str,
+    ) -> Result<(usize, Vec<(String, String)>)> {
+        // Resolve the subject to entities (union over the keyword's words).
+        let mut entity_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for word in keyword.split_whitespace() {
+            if word.chars().filter(|c| c.is_alphanumeric()).count() <= 2 {
+                continue; // skip glue / too-short tokens
+            }
+            for (id, _name, _ty) in self.search_entities(word)? {
+                entity_ids.insert(id);
+            }
+        }
+        if entity_ids.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        // Union the entities' claims, deduped by claim id (a claim mentioning
+        // two matched entities must be counted once).
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut claims: Vec<(String, String)> = Vec::new();
+        for eid in &entity_ids {
+            for (cid, statement, _ctype) in self.get_claims_for_entity(eid)? {
+                if seen.insert(cid.clone()) {
+                    claims.push((cid, statement));
+                }
+            }
+        }
+        Ok((entity_ids.len(), claims))
+    }
+
     /// Insert a contradiction.
     pub fn insert_contradiction(
         &self,
@@ -7980,6 +8022,59 @@ mod tests {
         assert!(!scores.contains_key("claim:never"));
         // Empty request is a clean empty map, never an error.
         assert!(store.get_claim_usefulness(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aggregate_claims_for_keyword_counts_exactly() {
+        let store = mem_store();
+        let src = thinkingroot_core::Source::new(
+            "test://agg.md".into(),
+            thinkingroot_core::types::SourceType::File,
+        );
+        store.insert_source(&src).unwrap();
+
+        let acme =
+            thinkingroot_core::Entity::new("Acme", thinkingroot_core::types::EntityType::Organization);
+        let other =
+            thinkingroot_core::Entity::new("Other", thinkingroot_core::types::EntityType::Organization);
+        store.insert_entity(&acme).unwrap();
+        store.insert_entity(&other).unwrap();
+
+        // 3 claims about Acme, 1 about Other.
+        for i in 0..3 {
+            let c = thinkingroot_core::Claim::new(
+                &format!("Acme fact {i}"),
+                thinkingroot_core::types::ClaimType::Fact,
+                src.id,
+                thinkingroot_core::types::WorkspaceId::new(),
+            );
+            store.insert_claim(&c).unwrap();
+            store
+                .link_claim_to_entity(&c.id.to_string(), &acme.id.to_string())
+                .unwrap();
+        }
+        let c = thinkingroot_core::Claim::new(
+            "Other fact",
+            thinkingroot_core::types::ClaimType::Fact,
+            src.id,
+            thinkingroot_core::types::WorkspaceId::new(),
+        );
+        store.insert_claim(&c).unwrap();
+        store
+            .link_claim_to_entity(&c.id.to_string(), &other.id.to_string())
+            .unwrap();
+
+        // Exact count for a resolved subject.
+        let (resolved, claims) = store.aggregate_claims_for_keyword("acme").unwrap();
+        assert_eq!(resolved, 1, "one entity matched 'acme'");
+        assert_eq!(claims.len(), 3, "exactly its 3 claims, not a top-k sample");
+
+        // Unresolved subject → (0, empty): caller must fall through, never
+        // report a fabricated count.
+        let (none_resolved, none_claims) =
+            store.aggregate_claims_for_keyword("nonexistent").unwrap();
+        assert_eq!(none_resolved, 0);
+        assert!(none_claims.is_empty());
     }
 
     #[test]

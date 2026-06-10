@@ -674,6 +674,85 @@ pub struct AskResponse {
 /// when the user message is an unambiguous greeting / ack / closing AND
 /// the persona is not `Memory`. The Memory persona always retrieves so
 /// the LongMemEval bench numbers stay reproducible.
+/// Aggregation route flag (§3 #4). OFF until the eval gate measures the
+/// count/list category — read once per ask; flag-off is a single env lookup.
+fn aggregation_route_on() -> bool {
+    std::env::var("TR_AGGREGATION_ROUTE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Try to answer a count/list question with an EXACT graph aggregate. Returns
+/// `None` (caller falls through to the reader) when the question is not an
+/// aggregate, has no extractable subject, the graph is unavailable, or the
+/// subject resolves to no entity — never a fabricated number.
+async fn try_aggregation_answer(
+    engine: &crate::engine::QueryEngine,
+    req: &AskRequest<'_>,
+) -> Option<AskResponse> {
+    use crate::intelligence::aggregation::{classify_aggregation, extract_subject, AggregationKind};
+
+    let kind = classify_aggregation(req.question)?;
+    let subject = extract_subject(req.question, kind)?;
+    let graph = engine.graph_store(req.workspace).await?;
+    let (entities_resolved, claims) = graph.aggregate_claims_for_keyword(&subject).ok()?;
+    if entities_resolved == 0 {
+        return None; // unresolved subject → honest fall-through
+    }
+
+    // Build grounding so the citation gate verifies the markers we emit.
+    let grounding: Vec<crate::engine::ClaimSearchHit> = claims
+        .iter()
+        .map(|(id, statement)| crate::engine::ClaimSearchHit {
+            id: id.clone(),
+            statement: statement.clone(),
+            claim_type: String::new(),
+            confidence: 1.0,
+            source_uri: String::new(),
+            relevance: 1.0,
+        })
+        .collect();
+
+    let answer = match kind {
+        AggregationKind::Count => {
+            // Cite a few representative memories so the count is grounded.
+            let cited = claims
+                .iter()
+                .take(5)
+                .map(|(id, _)| format!("[claim:{id}]"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if claims.is_empty() {
+                format!("You have 0 memories about \"{subject}\".")
+            } else {
+                format!(
+                    "You have {} memories about \"{subject}\". {cited}",
+                    claims.len()
+                )
+            }
+        }
+        AggregationKind::List => {
+            let lines = claims
+                .iter()
+                .take(50)
+                .map(|(id, st)| format!("- {st} [claim:{id}]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{} memories about \"{subject}\":\n{lines}",
+                claims.len()
+            )
+        }
+    };
+
+    Some(AskResponse {
+        answer,
+        claims_used: claims.len(),
+        category: req.category.to_string(),
+        grounding,
+    })
+}
+
 pub async fn ask(
     engine: &crate::engine::QueryEngine,
     llm: Option<Arc<LlmClient>>,
@@ -681,6 +760,17 @@ pub async fn ask(
 ) -> AskResponse {
     if should_skip_retrieval(req) {
         return chitchat_answer(llm, req).await;
+    }
+
+    // Aggregation route (§3 #4) — count/list questions answered EXACTLY from
+    // the graph organ instead of a probabilistic read of top-k snippets. Gated
+    // on TR_AGGREGATION_ROUTE so the LongMemEval prompt path stays byte-
+    // identical when off. Honest fall-through: if the subject resolves to no
+    // entity we do NOT fabricate a count — we drop to the normal reader below.
+    if aggregation_route_on() {
+        if let Some(agg) = try_aggregation_answer(engine, req).await {
+            return agg;
+        }
     }
 
     use crate::intelligence::retriever::retrieve_claims;
