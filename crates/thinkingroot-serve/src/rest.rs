@@ -2179,6 +2179,14 @@ async fn function_verdict_handler(
 struct InvokeFunctionBody {
     #[serde(default)]
     input: serde_json::Value,
+    /// A2 — branch-scoped invoke: route this run's `memory.remember`
+    /// writes to this branch (forked from main if absent) instead of main.
+    #[serde(default)]
+    target_branch: Option<String>,
+    /// A2 — run on a fresh ephemeral branch that is abandoned after the run
+    /// (a true dry run: side effects happen in isolation, then vanish).
+    #[serde(default)]
+    dry_run: bool,
 }
 
 async fn invoke_function_handler(
@@ -2198,7 +2206,16 @@ async fn invoke_function_handler(
             .with_detail(serde_json::json!({ "function": name })),
         )
         .await;
-    match engine.invoke_function(&ws, &name, &payload.input).await {
+    let invoke_result = if payload.target_branch.is_some() || payload.dry_run {
+        let opts = crate::engine::InvokeBranchOpts {
+            target_branch: payload.target_branch.clone(),
+            dry_run: payload.dry_run,
+        };
+        engine.invoke_function_with_opts(&ws, &name, &payload.input, opts).await
+    } else {
+        engine.invoke_function(&ws, &name, &payload.input).await
+    };
+    match invoke_result {
         Ok(v) => {
             state
                 .publish_activity(

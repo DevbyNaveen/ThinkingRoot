@@ -940,6 +940,25 @@ pub struct FnCapabilities {
     /// configured (`mcp-servers.toml`).
     mcp: Arc<crate::mcp::external_registry::ExternalMcpRegistry>,
     caps: CapSet,
+    /// A2 — branch-scoped invoke. When set, `memory.remember` writes its
+    /// claim into THIS branch's graph (a copy-on-write clone of main at
+    /// fork) instead of main, so a function's cognitive side effects are
+    /// quarantined for verify-before-keep (forge) and dreaming. `None` =
+    /// write to main (the default; fully backward compatible).
+    target_branch: Option<String>,
+}
+
+/// A2 — options for a branch-scoped Root Function invocation.
+/// `default()` (no branch, no dry-run) reproduces the original invoke
+/// behavior exactly.
+#[derive(Debug, Clone, Default)]
+pub struct InvokeBranchOpts {
+    /// Route this run's `memory.remember` writes to this branch (forked
+    /// from main if absent). The caller later merges or abandons it.
+    pub target_branch: Option<String>,
+    /// Run on a fresh ephemeral branch that is abandoned after the run —
+    /// a true dry run (side effects happen in isolation, then vanish).
+    pub dry_run: bool,
 }
 
 impl FnCapabilities {
@@ -951,7 +970,14 @@ impl FnCapabilities {
         caps: CapSet,
     ) -> Self {
         let root_path = handle.root_path.clone();
-        Self { handle, root_path, ws, run_id, mcp, caps }
+        Self { handle, root_path, ws, run_id, mcp, caps, target_branch: None }
+    }
+
+    /// A2 — route `memory.remember` writes to `branch`'s graph instead of
+    /// main. Builder so the (long) `new` call sites stay unchanged.
+    pub fn with_target_branch(mut self, branch: Option<String>) -> Self {
+        self.target_branch = branch;
+        self
     }
 
     /// `ctx.memory.recall(query, k)` — semantic recall scoped to this run's
@@ -1088,6 +1114,32 @@ impl FnCapabilities {
 
         let ctype = claim_type.to_string();
         let conf = confidence.clamp(0.0, 1.0);
+
+        // ── A2: branch-scoped write ──────────────────────────────────────
+        // When this run is branch-scoped, the claim lands on the branch's
+        // own `graph.db` (a CoW clone of main at fork) — NOT the mounted
+        // main storage, and NOT the main read cache. This is the engine's
+        // own branch-write path (identical to `contribute_bulk(branch=…)`):
+        // open the branch graph directly via `resolve_data_dir`. Vector
+        // indexing is deferred to compile/merge (same as contribute-bulk),
+        // so semantic recall of these claims is keyword/graph-only until
+        // the branch is compiled or merged — the graph write itself is
+        // durable and immediately recallable by traversal. We do NOT touch
+        // the main cache, so a concurrent main read never sees branch state.
+        if let Some(branch) = self.target_branch.as_deref() {
+            let branch_graph_dir =
+                thinkingroot_branch::snapshot::resolve_data_dir(&self.root_path, Some(branch))
+                    .join("graph");
+            let bg = thinkingroot_graph::graph::GraphStore::init(&branch_graph_dir)
+                .map_err(|e| Error::GraphStorage(format!("remember(branch={branch}): {e}")))?;
+            bg.insert_source(&source)?;
+            bg.insert_claim(&claim)?;
+            bg.link_claim_to_source(&claim.id.to_string(), &source.id.to_string())?;
+            let _ = ctype; // (parity with main path; branch write is graph-only)
+            let _ = conf;
+            return Ok(claim.id.to_string());
+        }
+
         {
             let mut storage = self.handle.storage.lock().await;
             storage.graph.insert_source(&source)?;
@@ -2990,6 +3042,26 @@ impl QueryEngine {
         self.run_function_with_id(ws, name, input, &run_id).await
     }
 
+    /// A2 — branch-scoped invoke. Same as `invoke_function` but the run's
+    /// `memory.remember` writes are quarantined to a branch:
+    ///   - `opts.target_branch = Some(b)` → writes land on branch `b`
+    ///     (forked from main if absent); the caller later merges or abandons.
+    ///   - `opts.dry_run = true` → writes land on a fresh ephemeral branch
+    ///     that is **abandoned after the run** (a true dry run: side effects
+    ///     happen in isolation, then vanish). Returns the output with
+    ///     `_branch` / `_dry_run` markers describing where writes went.
+    /// Backward compatible: `InvokeBranchOpts::default()` == plain invoke.
+    pub async fn invoke_function_with_opts(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        opts: InvokeBranchOpts,
+    ) -> Result<serde_json::Value> {
+        let run_id = ulid::Ulid::new().to_string();
+        self.run_function_with_id_opts(ws, name, input, &run_id, opts).await
+    }
+
     /// Function-INDEPENDENT shape of an input (top-level key set / scalar
     /// kind). The basis for routing: functions are comparable only across a
     /// shared, name-free class. Heuristic v1 (an LLM classifier is the upgrade).
@@ -3094,8 +3166,56 @@ impl QueryEngine {
         input: &serde_json::Value,
         run_id: &str,
     ) -> Result<serde_json::Value> {
+        self.run_function_with_id_opts(ws, name, input, run_id, InvokeBranchOpts::default())
+            .await
+    }
+
+    /// Branch-scoped variant of [`run_function_with_id`]. See
+    /// [`Self::invoke_function_with_opts`] for the branch semantics. With
+    /// `InvokeBranchOpts::default()` it is byte-for-byte the old behavior.
+    pub async fn run_function_with_id_opts(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        run_id: &str,
+        opts: InvokeBranchOpts,
+    ) -> Result<serde_json::Value> {
         use crate::root_function_runtime::RunOutcome;
         use thinkingroot_graph::root_function::{PendingRequest, RootFunctionRun};
+
+        // ── A2: resolve & prepare the write-target branch (if any) ────────
+        // dry_run with no explicit branch → a fresh ephemeral branch named
+        // for this run. Either way, fork it from main if it does not exist
+        // yet so the branch graph dir is present before the first remember.
+        let target_branch: Option<String> = if let Some(b) = opts.target_branch.clone() {
+            Some(b)
+        } else if opts.dry_run {
+            Some(format!("dryrun/{run_id}"))
+        } else {
+            None
+        };
+        if let Some(branch) = target_branch.as_deref() {
+            let handle = self.get_workspace(ws)?;
+            let exists = thinkingroot_branch::list_branches(&handle.root_path)
+                .map(|bs| bs.iter().any(|b| b.name == branch))
+                .unwrap_or(false);
+            if !exists {
+                thinkingroot_branch::create_branch(
+                    &handle.root_path,
+                    branch,
+                    "main",
+                    Some(format!(
+                        "{} branch for root function '{}' (run {})",
+                        if opts.dry_run { "ephemeral dry-run" } else { "scoped" },
+                        name,
+                        run_id
+                    )),
+                )
+                .await
+                .map_err(|e| Error::Config(format!("branch-scoped invoke: fork failed: {e}")))?;
+            }
+        }
 
         let func = self
             .get_function(ws, name)
@@ -3189,13 +3309,10 @@ impl QueryEngine {
                     }
                 }
             };
-            std::sync::Arc::new(FnCapabilities::new(
-                handle,
-                ws.to_string(),
-                run_id.to_string(),
-                mcp,
-                cap_set,
-            ))
+            std::sync::Arc::new(
+                FnCapabilities::new(handle, ws.to_string(), run_id.to_string(), mcp, cap_set)
+                    .with_target_branch(target_branch.clone()),
+            )
         };
         let (outcome, new_steps, new_pending, new_cites) =
             crate::root_function_runtime::run_js_journaled(
@@ -3301,6 +3418,44 @@ impl QueryEngine {
                     "read",
                 );
             }
+        }
+
+        // ── A2: branch teardown + result markers ──────────────────────────
+        if let Some(branch) = target_branch.as_deref() {
+            let handle = self.get_workspace(ws)?;
+            // Honest "what landed on the branch" = the diff this branch would
+            // contribute back to main (best-effort; 0 if the diff can't be
+            // computed). Computed BEFORE any dry-run cleanup.
+            let claims_written = thinkingroot_branch::dry_run_merge_into(
+                &handle.root_path,
+                branch,
+                "main",
+                false,
+            )
+            .await
+            .map(|d| d.new_claims.len())
+            .unwrap_or(0);
+
+            if opts.dry_run {
+                // True dry run: discard the ephemeral branch and its writes.
+                // Best-effort — a failed cleanup must not fail an
+                // already-completed invocation.
+                if let Err(e) = thinkingroot_branch::delete_branch(&handle.root_path, branch) {
+                    tracing::warn!(branch, error = %e, "dry-run: ephemeral branch cleanup failed");
+                }
+            }
+
+            // Annotate the result (objects only — scalars/arrays are returned
+            // verbatim so a function's output contract is never reshaped).
+            return match ret {
+                Ok(serde_json::Value::Object(mut map)) => {
+                    map.insert("_branch".into(), serde_json::json!(branch));
+                    map.insert("_dry_run".into(), serde_json::json!(opts.dry_run));
+                    map.insert("_claims_written".into(), serde_json::json!(claims_written));
+                    Ok(serde_json::Value::Object(map))
+                }
+                other => other,
+            };
         }
 
         ret
