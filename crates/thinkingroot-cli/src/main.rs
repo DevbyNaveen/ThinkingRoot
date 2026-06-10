@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use thinkingroot_cli::summary_printer;
 
 mod brain_cmd;
+mod brain_code;
 mod branch_cmd;
 mod branch_data_cmd;
 mod branch_extras_cmd;
