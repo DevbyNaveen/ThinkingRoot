@@ -98,6 +98,34 @@ pub async fn retrieve_claims(
         }
     }
 
+    // Phase 4: conditional second retrieval pass (§3 #5). When the scoped
+    // passes above came back WEAK (too few hits, or the best hit is only
+    // weakly relevant) AND the call was scoped to a haystack, widen ONCE with
+    // an unscoped broad search and merge the new hits. Bounded to a single
+    // extra round. Gated `TR_SECOND_PASS` (default OFF) — when off this is a
+    // literal no-op, so the LongMemEval scoped-retrieval contract is unchanged.
+    if second_pass_on()
+        && !allowed_sources.is_empty()
+        && needs_second_pass(&claims, second_pass_min_claims(), second_pass_min_relevance())
+    {
+        let unscoped = HashSet::new();
+        if let Ok(result) = engine
+            .search_scoped(workspace, question, primary_top_k, &unscoped)
+            .await
+        {
+            let before = claims.len();
+            for hit in result.claims {
+                if seen.insert(hit.id.clone()) {
+                    claims.push(hit);
+                }
+            }
+            tracing::debug!(
+                added = claims.len() - before,
+                "second retrieval pass widened a weak scoped result"
+            );
+        }
+    }
+
     // Sort: knowledge-update by session recency (prevents stale values),
     // all others by vector relevance score.
     match category {
@@ -146,6 +174,42 @@ fn per_session_top_k(category: &str) -> usize {
         "multi-session" | "single-session-assistant" => 80,
         _ => 50,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conditional second pass (§3 #5)
+// ---------------------------------------------------------------------------
+
+fn second_pass_on() -> bool {
+    std::env::var("TR_SECOND_PASS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+fn second_pass_min_claims() -> usize {
+    std::env::var("TR_SECOND_PASS_MIN_CLAIMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+fn second_pass_min_relevance() -> f32 {
+    std::env::var("TR_SECOND_PASS_MIN_REL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.3)
+}
+
+/// A scoped retrieval is "weak" (worth a second, wider pass) when it returned
+/// fewer than `min_claims` hits, or its single best hit is only weakly
+/// relevant (`< min_relevance`). Pure — unit-tested without an engine.
+fn needs_second_pass(claims: &[ClaimSearchHit], min_claims: usize, min_relevance: f32) -> bool {
+    if claims.len() < min_claims {
+        return true;
+    }
+    let top = claims
+        .iter()
+        .map(|c| c.relevance)
+        .fold(f32::MIN, f32::max);
+    top < min_relevance
 }
 
 // ---------------------------------------------------------------------------
@@ -294,5 +358,30 @@ mod tests {
         let qs = expand_query_static("Test question", "multi-session");
         let orig_count = qs.iter().filter(|q| *q == "Test question").count();
         assert_eq!(orig_count, 1);
+    }
+
+    fn hit(relevance: f32) -> ClaimSearchHit {
+        ClaimSearchHit {
+            id: "c".into(),
+            statement: "s".into(),
+            claim_type: "fact".into(),
+            confidence: 1.0,
+            source_uri: "u".into(),
+            relevance,
+        }
+    }
+
+    #[test]
+    fn needs_second_pass_triggers_on_weak_results() {
+        // Too few hits → second pass, regardless of relevance.
+        assert!(needs_second_pass(&[hit(0.9), hit(0.9)], 5, 0.3));
+        assert!(needs_second_pass(&[], 5, 0.3));
+        // Enough hits but the best is weakly relevant → second pass.
+        let weak: Vec<_> = (0..6).map(|_| hit(0.1)).collect();
+        assert!(needs_second_pass(&weak, 5, 0.3));
+        // Enough hits AND a strongly-relevant top hit → no second pass.
+        let mut strong: Vec<_> = (0..5).map(|_| hit(0.1)).collect();
+        strong.push(hit(0.8));
+        assert!(!needs_second_pass(&strong, 5, 0.3));
     }
 }
