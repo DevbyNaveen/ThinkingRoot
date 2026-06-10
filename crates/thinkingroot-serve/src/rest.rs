@@ -6969,6 +6969,14 @@ struct AskResponseBody {
     refused: bool,
 }
 
+/// §3 #6 retry flag — give a refused answer one more synthesis pass before
+/// abstaining. OFF until eval measures answered-vs-refused; read per request.
+fn answer_retry_on() -> bool {
+    std::env::var("TR_ANSWER_RETRY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 async fn ask_handler(
     State(state): State<Arc<AppState>>,
     Path(ws): Path<String>,
@@ -7066,7 +7074,9 @@ async fn ask_handler(
         history: &history,
     };
 
-    let result = ask(&engine, llm, &req).await;
+    // Keep a handle for the §3 #6 retry pass (Arc clone is cheap).
+    let llm_retry = llm.clone();
+    let mut result = ask(&engine, llm, &req).await;
 
     // ── Mechanical citation gate ────────────────────────────────────
     // Verify every `[claim:<id>]` marker against the grounding set the
@@ -7074,9 +7084,37 @@ async fn ask_handler(
     // answer outright if EVERY citation was fabricated. Inert (no-op)
     // when the answer carries no markers — preserving the Memory /
     // LongMemEval persona wire behaviour.
-    let gate =
+    let mut gate =
         crate::intelligence::citations::verify_citations(&engine, &ws, &result.answer, &result.grounding)
             .await;
+
+    // ── §3 #6 — verification + abstention with one retry ─────────────
+    // "verified or silent." When the first synthesis failed the gate (every
+    // citation fabricated) but we DID retrieve grounding and have an LLM, give
+    // the model exactly ONE more pass before abstaining — a re-synthesis over
+    // the same grounding usually cites correctly. Keep the retry only if it
+    // actually verifies; otherwise we fall through to the honest non-answer.
+    // Gated TR_ANSWER_RETRY (default OFF) so the LongMemEval library path is
+    // untouched.
+    if gate.refused
+        && answer_retry_on()
+        && llm_retry.is_some()
+        && !result.grounding.is_empty()
+    {
+        let retry = ask(&engine, llm_retry, &req).await;
+        let retry_gate = crate::intelligence::citations::verify_citations(
+            &engine,
+            &ws,
+            &retry.answer,
+            &retry.grounding,
+        )
+        .await;
+        if !retry_gate.refused {
+            tracing::info!("answer retry recovered a verified answer after first-pass refusal");
+            result = retry;
+            gate = retry_gate;
+        }
+    }
 
     // ── Usage signal (NOW item 4) ───────────────────────────────────
     // Persist shown-vs-cited per grounding hit — the citation gate

@@ -170,6 +170,37 @@ pub async fn verify_citations(
     finalize(citations, stripped)
 }
 
+/// Optional stricter abstention bar (§3 #6 "verified or silent"). When
+/// `TR_VERIFY_MIN_CONFIDENCE` is a float in (0,1], abstain whenever the
+/// verified fraction is below it — not only when EVERY citation is fabricated.
+/// Unset / out-of-range → `None` → the default all-fabricated rule, so the
+/// LongMemEval wire contract is unchanged.
+fn verify_min_confidence() -> Option<f32> {
+    std::env::var("TR_VERIFY_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|m| *m > 0.0 && *m <= 1.0)
+}
+
+/// Pure abstention decision — extracted so the policy is unit-testable without
+/// touching the environment. With `min_confidence = None` the rule is the
+/// original "refuse only when markers were emitted but none verified". With a
+/// threshold, refuse whenever the verified fraction is below it.
+fn decide_refused(
+    total: usize,
+    verified_count: usize,
+    answer_confidence: f32,
+    min_confidence: Option<f32>,
+) -> bool {
+    if total == 0 {
+        return false; // no markers → inert gate, never a refusal
+    }
+    match min_confidence {
+        Some(min) => answer_confidence < min,
+        None => verified_count == 0,
+    }
+}
+
 /// Compute `answer_confidence` + `refused` from the verified/stripped split.
 fn finalize(citations: Vec<Citation>, stripped: Vec<String>) -> CitationOutcome {
     let total = citations.len() + stripped.len();
@@ -182,8 +213,12 @@ fn finalize(citations: Vec<Citation>, stripped: Vec<String>) -> CitationOutcome 
         let verified_sum: f32 = citations.iter().map(|c| c.confidence).sum();
         verified_sum / total as f32
     };
-    // Markers were emitted (total > 0) but none verified → refuse.
-    let refused = citations.is_empty() && total > 0;
+    let refused = decide_refused(
+        total,
+        citations.len(),
+        answer_confidence,
+        verify_min_confidence(),
+    );
     CitationOutcome {
         citations,
         stripped,
@@ -205,6 +240,25 @@ mod tests {
             source_uri: uri.to_string(),
             relevance: 0.8,
         }
+    }
+
+    #[test]
+    fn decide_refused_default_rule_only_when_all_fabricated() {
+        // No min threshold: refuse iff markers emitted but none verified.
+        assert!(decide_refused(3, 0, 0.0, None), "all fabricated → refuse");
+        assert!(!decide_refused(3, 1, 0.33, None), "one verified → keep");
+        assert!(!decide_refused(0, 0, 0.0, None), "no markers → inert");
+    }
+
+    #[test]
+    fn decide_refused_threshold_abstains_below_bar() {
+        // §3 #6 strict bar at 0.5: a half-fabricated answer abstains even
+        // though one citation verified.
+        assert!(decide_refused(4, 2, 0.5 - 0.01, Some(0.5)), "below bar → refuse");
+        assert!(!decide_refused(4, 4, 1.0, Some(0.5)), "fully verified → keep");
+        assert!(!decide_refused(4, 3, 0.75, Some(0.5)), "above bar → keep");
+        // Threshold never refuses a markerless (inert) answer.
+        assert!(!decide_refused(0, 0, 0.0, Some(0.9)));
     }
 
     #[test]
