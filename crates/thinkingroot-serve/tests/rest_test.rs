@@ -66,6 +66,67 @@ async fn workspace_readme_unmounted_returns_404() {
     assert_eq!(json["error"]["code"], "WORKSPACE_NOT_MOUNTED");
 }
 
+// ─── §6 multimodal: caption-image endpoint ───────────────────
+
+async fn mounted_app(ws: &str) -> axum::Router {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".thinkingroot")).unwrap();
+    // Leak the tempdir so it outlives the test (the engine holds the path).
+    std::mem::forget(tmp);
+    let mut engine = QueryEngine::new();
+    engine.mount(ws.to_string(), root).await.unwrap();
+    build_router(AppState::new(engine, None))
+}
+
+#[tokio::test]
+async fn caption_image_rejects_bad_base64() {
+    let app = mounted_app("test-ws").await;
+    let body = serde_json::json!({ "image_base64": "!!! not base64 !!!" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ws/test-ws/caption-image")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["error"]["code"], "BAD_IMAGE_BASE64");
+}
+
+#[tokio::test]
+async fn caption_image_garbage_bytes_fail_honestly() {
+    // Valid base64, but the bytes aren't a real image. Whether the workspace
+    // has no vision LLM (-> "no LLM configured") or one that rejects the bytes
+    // (-> provider invalid-image error), the contract is the same: an honest
+    // CAPTION_IMAGE_FAILED with NO fabricated claim — never a success envelope.
+    let app = mounted_app("test-ws").await;
+    let body = serde_json::json!({ "image_base64": "aGVsbG8=", "media_type": "image/png" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ws/test-ws/caption-image")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["ok"], false, "garbage image must not yield a success envelope");
+    assert_eq!(json["error"]["code"], "CAPTION_IMAGE_FAILED");
+    assert!(json.get("contribute").is_none(), "no claims fabricated from garbage");
+}
+
 #[tokio::test]
 async fn workspace_readme_returns_disk_content_when_mounted() {
     use thinkingroot_serve::engine::QueryEngine;

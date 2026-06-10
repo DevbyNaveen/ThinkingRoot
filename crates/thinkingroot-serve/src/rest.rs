@@ -918,6 +918,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // verbatim "User said: …"). Branch goes in the body so the live
             // session captures into its `stream/{id}` quarantine.
             .route("/ws/{ws}/extract-contribute", post(extract_contribute_handler))
+            .route("/ws/{ws}/caption-image", post(caption_image_handler))
             // C1 — on-demand consolidation: detect + apply supersessions within
             // each entity's claim cluster (keeps the self-evolving graph clean).
             .route("/ws/{ws}/consolidate", post(consolidate_claims_handler))
@@ -5185,6 +5186,98 @@ async fn extract_contribute_handler(
             "EXTRACT_CONTRIBUTE_FAILED",
             &e.to_string(),
         ),
+    }
+}
+
+/// §6 — request body for `POST /ws/{ws}/caption-image`. The image rides as
+/// base64 (a `data:…;base64,` prefix is tolerated); `media_type` is its MIME
+/// type. `connector_id`/`install_id`/`idempotency_key` scope the contribute
+/// (same idempotency model as extract-contribute; default key = image hash).
+#[derive(Deserialize)]
+struct CaptionImageRequest {
+    image_base64: String,
+    #[serde(default = "default_image_media_type")]
+    media_type: String,
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    connector_id: Option<String>,
+    #[serde(default)]
+    install_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+fn default_image_media_type() -> String {
+    "image/jpeg".to_string()
+}
+
+/// §6 multimodal — caption an image with the workspace vision LLM and
+/// contribute the resulting claims (caption-then-extract). Honest on failure:
+/// bad base64, no LLM, or a non-vision provider returns an error, never a
+/// fabricated claim.
+async fn caption_image_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<CaptionImageRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    // Tolerate a data-URL prefix; decode to raw bytes.
+    let raw_b64 = body
+        .image_base64
+        .split_once(";base64,")
+        .map(|(_, b)| b)
+        .unwrap_or(&body.image_base64);
+    let bytes = {
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(raw_b64.trim().as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                return err_response(StatusCode::BAD_REQUEST, "BAD_IMAGE_BASE64", &e.to_string());
+            }
+        }
+    };
+    let principal = crate::engine::Principal::Connector {
+        connector_id: body.connector_id.clone().unwrap_or_else(|| "vision".to_string()),
+        install_id: body.install_id.clone().unwrap_or_else(|| "default".to_string()),
+    };
+    let branch_arg = match body.branch.as_deref() {
+        Some("main") | None => None,
+        Some(b) => Some(b),
+    };
+    let idem = body.idempotency_key.clone().unwrap_or_default();
+    let engine = state.engine.read().await;
+    match engine
+        .caption_and_contribute(
+            &ws,
+            &bytes,
+            &body.media_type,
+            body.instruction.as_deref(),
+            branch_arg,
+            &state.sessions,
+            principal,
+            &idem,
+        )
+        .await
+    {
+        Ok((caption, result, sha)) => {
+            drop(engine);
+            if let Some(b) = body.branch.as_deref() {
+                publish_latest_branch_event(&state, b).await;
+            }
+            ok_response(serde_json::json!({
+                "caption": caption,
+                "image_sha256": sha,
+                "contribute": result,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            err_response(StatusCode::BAD_REQUEST, "CAPTION_IMAGE_FAILED", &e.to_string())
+        }
     }
 }
 

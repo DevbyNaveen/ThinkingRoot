@@ -6437,6 +6437,74 @@ Rules: \
         .await
     }
 
+    /// §6 multimodal (Phase 1) — caption an image with the workspace's vision
+    /// LLM, then run the caption through the EXISTING extraction pipeline so
+    /// an image's factual content becomes canonical text claims (text claims
+    /// canonical; visual embeddings are a later recall-only index). No new
+    /// models — uses the customer's configured (Azure) vision-capable model,
+    /// exactly like `ctx.llm`.
+    ///
+    /// Visual provenance: the claims attach to a source derived from the
+    /// image's content hash (`image:<blake3>`), so every claim traces back to
+    /// the exact image bytes it was read from. (Structured bbox/`SourceMetadata`
+    /// provenance is the documented follow-up.)
+    ///
+    /// Returns `(caption, contribute_result, image_sha256)`. Empty/garbage
+    /// input or an LLM without vision support surfaces an honest error — never
+    /// a fabricated claim.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn caption_and_contribute(
+        &self,
+        ws: &str,
+        image_bytes: &[u8],
+        media_type: &str,
+        instruction: Option<&str>,
+        branch: Option<&str>,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+    ) -> Result<(String, ContributeResult, String)> {
+        if image_bytes.is_empty() {
+            return Err(Error::Config("caption_and_contribute: empty image".into()));
+        }
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot caption images"
+            ))
+        })?;
+
+        let sha = blake3::hash(image_bytes).to_hex().to_string();
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(image_bytes)
+        };
+        let instr = instruction.unwrap_or(
+            "Describe this image's factual content in clear declarative sentences for knowledge \
+             extraction. Transcribe any visible text verbatim.",
+        );
+
+        let caption = llm.caption_image(instr, &b64, media_type).await?;
+        if caption.trim().is_empty() {
+            return Err(Error::Config(
+                "vision LLM returned an empty caption (no extractable content)".into(),
+            ));
+        }
+
+        // Provenance: source id derives from the image hash, so claims are
+        // traceable to the exact bytes. Idempotency is keyed on the image
+        // (re-ingesting the same image is a no-op via contribute_bulk).
+        let session_id = format!("image:{sha}");
+        let idem = if idempotency_key.is_empty() {
+            format!("image:{sha}")
+        } else {
+            idempotency_key.to_string()
+        };
+        let result = self
+            .extract_and_contribute(ws, &caption, branch, &session_id, sessions, principal, &idem)
+            .await?;
+        Ok((caption, result, sha))
+    }
+
     /// C1 — consolidation. Scans the durable (main) graph entity-by-entity and
     /// uses the workspace LLM to detect SUPERSESSIONS within each entity's claim
     /// cluster (a newer fact that replaces an older one about the SAME attribute
