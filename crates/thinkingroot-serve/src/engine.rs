@@ -2864,6 +2864,32 @@ impl QueryEngine {
         Ok(())
     }
 
+    /// A6 — the recent verification verdicts for a function, newest-first.
+    /// Returns JSON rows `{at, input_class, passed, detail}` for the Console
+    /// learning view. Empty when the function was never verified.
+    pub async fn function_verdicts(
+        &self,
+        ws: &str,
+        name: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let rows = storage.graph.list_verify_verdicts(name, limit)?;
+        let out: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(at, input_class, passed, detail)| {
+                serde_json::json!({
+                    "at": at,
+                    "input_class": input_class,
+                    "passed": passed,
+                    "detail": detail,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "verdicts": out }))
+    }
+
     /// A1 — store the capability grant set for a function. Requires the
     /// function to exist (granting caps to a non-deployed name is a typo
     /// until proven otherwise).

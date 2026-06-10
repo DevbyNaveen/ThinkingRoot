@@ -809,6 +809,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/functions/{name}/verdict",
                 post(function_verdict_handler),
             )
+            .route(
+                "/ws/{ws}/functions/{name}/verdicts",
+                get(function_verdicts_handler),
+            )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
             .route(
@@ -2115,6 +2119,20 @@ struct VerdictBody {
     passed: bool,
     #[serde(default)]
     detail: String,
+}
+
+/// A6 — read recent verification verdicts for a function (newest-first).
+/// Powers the Console learning view: shows where a function was caught
+/// answering wrong even though the run completed.
+async fn function_verdicts_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.function_verdicts(&ws, &name, 50).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
 }
 
 /// A6 — record a verification verdict (forge test-case outcome) for a
