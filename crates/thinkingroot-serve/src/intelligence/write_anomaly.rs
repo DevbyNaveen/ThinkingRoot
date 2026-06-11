@@ -94,6 +94,42 @@ pub fn detect_write_anomaly(
     AnomalyReport { anomalous: !cluster.is_empty(), cluster, mean_pairwise_sim }
 }
 
+/// §11 A7-SEC ③ — use-time consensus (A-MemGuard). Among a recalled cohort,
+/// find the claims that DON'T corroborate the consensus. When a MAJORITY of the
+/// cohort is mutually similar (a consensus topic exists), a claim similar to
+/// (almost) none of them is an outlier — the signature of context-activated
+/// poison that rode a trigger query into the result set. The caller demotes
+/// flagged-AND-low-trust claims (legit rare-but-true facts from trusted sources
+/// are kept).
+///
+/// Conservative by construction: if there is NO majority consensus (a genuinely
+/// diverse recall), it flags NOTHING — diversity is normal, only an isolated
+/// dissenter amid a clear majority is suspect. Operates on PRE-FETCHED stored
+/// vectors (no embedding) so it is latency-safe for the read path.
+pub fn consensus_outliers(embeddings: &[Vec<f32>], sim_threshold: f32) -> Vec<usize> {
+    let n = embeddings.len();
+    if n < 4 {
+        return Vec::new(); // too small for a meaningful consensus
+    }
+    let mut near: Vec<usize> = vec![0; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cosine(&embeddings[i], &embeddings[j]) >= sim_threshold {
+                near[i] += 1;
+                near[j] += 1;
+            }
+        }
+    }
+    // Largest mutually-similar group ≈ max near-count + 1. Require it to be a
+    // strict majority before trusting it as "the consensus".
+    let consensus = near.iter().copied().max().unwrap_or(0) + 1;
+    if consensus * 2 <= n {
+        return Vec::new(); // no majority consensus → diverse recall, flag nothing
+    }
+    // Outliers: corroborated by nobody while a majority consensus exists.
+    (0..n).filter(|&i| near[i] == 0).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +186,35 @@ mod tests {
         let r = detect_write_anomaly(&[vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]], 0.97, 3);
         assert!(!r.anomalous);
         assert!(r.mean_pairwise_sim.is_finite());
+    }
+
+    // ── ③ use-time consensus ──────────────────────────────────────────
+
+    #[test]
+    fn consensus_flags_the_lone_dissenter_amid_a_majority() {
+        // 4 claims about the same topic (the consensus) + 1 unrelated poison.
+        let mut emb: Vec<Vec<f32>> = (0..4).map(|i| axis(8, 0, 0.001 * i as f32)).collect();
+        emb.push(axis(8, 5, 0.0)); // isolated outlier
+        let out = consensus_outliers(&emb, 0.9);
+        assert_eq!(out, vec![4], "the lone unrelated claim is the consensus outlier");
+    }
+
+    #[test]
+    fn consensus_flags_nothing_when_recall_is_diverse() {
+        // No majority consensus — 5 distinct claims. Diversity is normal.
+        let emb: Vec<Vec<f32>> = (0..5).map(|k| axis(8, k, 0.0)).collect();
+        assert!(consensus_outliers(&emb, 0.9).is_empty());
+    }
+
+    #[test]
+    fn consensus_flags_nothing_when_all_corroborate() {
+        let emb: Vec<Vec<f32>> = (0..5).map(|i| axis(8, 0, 0.001 * i as f32)).collect();
+        assert!(consensus_outliers(&emb, 0.9).is_empty());
+    }
+
+    #[test]
+    fn consensus_needs_a_cohort() {
+        let emb = vec![axis(8, 0, 0.0), axis(8, 0, 0.001), axis(8, 5, 0.0)];
+        assert!(consensus_outliers(&emb, 0.9).is_empty(), "n<4 → no consensus call");
     }
 }
