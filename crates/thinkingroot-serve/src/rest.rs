@@ -919,6 +919,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // session captures into its `stream/{id}` quarantine.
             .route("/ws/{ws}/extract-contribute", post(extract_contribute_handler))
             .route("/ws/{ws}/caption-image", post(caption_image_handler))
+            .route("/ws/{ws}/ingest-transcript", post(ingest_transcript_handler))
             // C1 — on-demand consolidation: detect + apply supersessions within
             // each entity's claim cluster (keeps the self-evolving graph clean).
             .route("/ws/{ws}/consolidate", post(consolidate_claims_handler))
@@ -5278,6 +5279,81 @@ async fn caption_image_handler(
         Err(e) => {
             err_response(StatusCode::BAD_REQUEST, "CAPTION_IMAGE_FAILED", &e.to_string())
         }
+    }
+}
+
+/// §6 P2 — request body for `POST /ws/{ws}/ingest-transcript`. Audio "claims
+/// with ears": a (speaker/time-segmented) transcript becomes speaker-stamped
+/// claims through the existing extraction pipeline, with audio provenance. ASR
+/// is the caller's (their Whisper / meeting tool); we own the cognition.
+/// `audio_sha256` (the caller's audio blob hash) anchors provenance; absent →
+/// derived from the transcript text.
+#[derive(Deserialize)]
+struct IngestTranscriptRequest {
+    segments: Vec<crate::intelligence::transcript::TranscriptSegment>,
+    #[serde(default)]
+    audio_sha256: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    connector_id: Option<String>,
+    #[serde(default)]
+    install_id: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+async fn ingest_transcript_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<IngestTranscriptRequest>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let doc = crate::intelligence::transcript::format_transcript(&body.segments);
+    if doc.trim().is_empty() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "EMPTY_TRANSCRIPT",
+            "no non-empty transcript segments",
+        );
+    }
+    // Provenance: claims trace to audio://<sha>. Caller's audio hash if given,
+    // else the transcript's own hash (still a stable, queryable anchor).
+    let sha = body
+        .audio_sha256
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| blake3::hash(doc.as_bytes()).to_hex().to_string());
+    let principal = crate::engine::Principal::Connector {
+        connector_id: body.connector_id.clone().unwrap_or_else(|| "audio".to_string()),
+        install_id: body.install_id.clone().unwrap_or_else(|| "default".to_string()),
+    };
+    let branch_arg = match body.branch.as_deref() {
+        Some("main") | None => None,
+        Some(b) => Some(b),
+    };
+    let session_id = format!("audio:{sha}");
+    let idem = body
+        .idempotency_key
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("audio:{sha}"));
+    let engine = state.engine.read().await;
+    match engine
+        .extract_and_contribute(&ws, &doc, branch_arg, &session_id, &state.sessions, principal, &idem)
+        .await
+    {
+        Ok(result) => {
+            drop(engine);
+            if let Some(b) = body.branch.as_deref() {
+                publish_latest_branch_event(&state, b).await;
+            }
+            ok_response(serde_json::json!({ "audio_sha256": sha, "contribute": result }))
+                .into_response()
+        }
+        Err(e) => err_response(StatusCode::BAD_REQUEST, "INGEST_TRANSCRIPT_FAILED", &e.to_string()),
     }
 }
 
