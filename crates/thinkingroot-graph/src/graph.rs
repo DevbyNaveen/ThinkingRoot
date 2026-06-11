@@ -639,6 +639,23 @@ impl GraphStore {
                 =>
                 ts: Float default 0.0
             }",
+            // Living Engram (Build 1) — usage-learned associative edges.
+            // Strengthened when two claims are co-cited in a VERIFIED-GOOD
+            // answer (Hebbian "fire together, wire together"); decayed toward a
+            // non-zero floor when unused by the idle `living_edges_decay` job.
+            // Undirected: stored once with from_claim < to_claim (lexicographic).
+            // `weight` is the Oja-bounded strength in [0, w_max]; `last_used`
+            // the last co-citation ts; `count` the lifetime co-citation events.
+            // Feeds associative (spreading-activation) recall. Gated
+            // TR_LIVING_EDGES — no row is ever written while the flag is off.
+            ":create assoc_edges {
+                from_claim: String,
+                to_claim: String
+                =>
+                weight: Float default 0.0,
+                last_used: Float default 0.0,
+                count: Int default 0
+            }",
             // Rooting — append-only log of every trial run against a claim.
             // One row per probe battery execution (not per probe). A single claim
             // can have many verdicts over time (initial trial + re-rooting sweeps).
@@ -6956,6 +6973,241 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Living Engram (Build 1) — reinforce associative edges from a
+    /// verified-good answer's co-citations. `pairs` are `(claim_a, claim_b)`
+    /// cited together; `quality` ∈ (0,1] scales the increment. Oja-bounded so
+    /// weights self-limit at `w_max` (kills rich-get-richer / runaway feedback):
+    /// `w ← w + η·q·(w_max − w)`. Undirected: each pair is canonicalised
+    /// (from < to) and deduped. Returns the number of edges touched. Caller
+    /// gates this on `TR_LIVING_EDGES`; nothing is written when off.
+    pub fn record_co_citation(
+        &self,
+        pairs: &[(String, String)],
+        quality: f64,
+        ts: f64,
+    ) -> Result<usize> {
+        // η (learning rate) and w_max (saturation) — the Oja-bounded increment
+        // `w + η·q·(w_max − w)` approaches but never exceeds w_max, so a single
+        // event can never spike an edge and repeated co-citation has diminishing
+        // returns. Conservative defaults; eval-tunable later.
+        const ETA: f64 = 0.3;
+        const W_MAX: f64 = 1.0;
+
+        // Canonicalise (undirected) + dedup.
+        let mut set: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for (a, b) in pairs {
+            if a == b {
+                continue;
+            }
+            if a < b {
+                set.insert((a.clone(), b.clone()));
+            } else {
+                set.insert((b.clone(), a.clone()));
+            }
+        }
+        if set.is_empty() {
+            return Ok(0);
+        }
+        let q = quality.clamp(0.0, 1.0);
+        if q == 0.0 {
+            return Ok(0);
+        }
+
+        // Read current (weight, count) for these pairs (missing → 0,0).
+        let cand: Vec<DataValue> = set
+            .iter()
+            .map(|(f, t)| {
+                DataValue::List(vec![
+                    DataValue::Str(f.as_str().into()),
+                    DataValue::Str(t.as_str().into()),
+                ])
+            })
+            .collect();
+        let mut rparams = BTreeMap::new();
+        rparams.insert("pairs".into(), DataValue::List(cand));
+        let existing = self
+            .db
+            .run_script(
+                "candidate[f, t] <- $pairs \
+                 ?[from_claim, to_claim, weight, count] := candidate[from_claim, to_claim], \
+                   *assoc_edges{from_claim, to_claim, weight, count}",
+                rparams,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("record_co_citation read: {e}")))?;
+        let mut cur: std::collections::HashMap<(String, String), (f64, i64)> =
+            std::collections::HashMap::new();
+        for r in &existing.rows {
+            let f = dv_to_string(&r[0]);
+            let t = dv_to_string(&r[1]);
+            let w = match &r[2] {
+                DataValue::Num(Num::Float(x)) => *x,
+                DataValue::Num(Num::Int(n)) => *n as f64,
+                _ => 0.0,
+            };
+            let c = match &r[3] {
+                DataValue::Num(Num::Int(n)) => *n,
+                DataValue::Num(Num::Float(x)) => *x as i64,
+                _ => 0,
+            };
+            cur.insert((f, t), (w, c));
+        }
+
+        // Oja-bounded increment + upsert.
+        let put_rows: Vec<DataValue> = set
+            .iter()
+            .map(|(f, t)| {
+                let (w, c) = cur.get(&(f.clone(), t.clone())).copied().unwrap_or((0.0, 0));
+                let w2 = (w + ETA * q * (W_MAX - w)).clamp(0.0, W_MAX);
+                DataValue::List(vec![
+                    DataValue::Str(f.as_str().into()),
+                    DataValue::Str(t.as_str().into()),
+                    DataValue::Num(Num::Float(w2)),
+                    DataValue::Num(Num::Float(ts)),
+                    DataValue::Num(Num::Int(c + 1)),
+                ])
+            })
+            .collect();
+        let n = put_rows.len();
+        let mut wparams = BTreeMap::new();
+        wparams.insert("rows".into(), DataValue::List(put_rows));
+        self.db
+            .run_script(
+                "?[from_claim, to_claim, weight, last_used, count] <- $rows \
+                 :put assoc_edges { from_claim, to_claim => weight, last_used, count }",
+                wparams,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("record_co_citation write: {e}")))?;
+        Ok(n)
+    }
+
+    /// Living Engram (Build 1) — periodic decay of associative edges toward a
+    /// non-zero floor: `w ← floor + (w − floor)·factor`. `factor` ∈ (0,1) per
+    /// run; `floor` keeps a dormant edge recoverable (never reaches zero, so a
+    /// long-unused association springs back the instant it is co-cited again).
+    /// Only edges above `floor` are rewritten. Returns the number decayed.
+    /// Driven by the idle `living_edges_decay` task (`TR_LIVING_EDGES`).
+    pub fn decay_assoc_edges(&self, factor: f64, floor: f64) -> Result<usize> {
+        let factor = factor.clamp(0.0, 1.0);
+        let floor = floor.clamp(0.0, 1.0);
+        let mut rparams = BTreeMap::new();
+        rparams.insert("floor".into(), DataValue::Num(Num::Float(floor)));
+        let all = self
+            .db
+            .run_script(
+                "?[from_claim, to_claim, weight, last_used, count] := \
+                   *assoc_edges{from_claim, to_claim, weight, last_used, count}, weight > $floor",
+                rparams,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("decay_assoc_edges read: {e}")))?;
+        if all.rows.is_empty() {
+            return Ok(0);
+        }
+        let put_rows: Vec<DataValue> = all
+            .rows
+            .iter()
+            .map(|r| {
+                let f = dv_to_string(&r[0]);
+                let t = dv_to_string(&r[1]);
+                let w = match &r[2] {
+                    DataValue::Num(Num::Float(x)) => *x,
+                    DataValue::Num(Num::Int(n)) => *n as f64,
+                    _ => 0.0,
+                };
+                let lu = match &r[3] {
+                    DataValue::Num(Num::Float(x)) => *x,
+                    _ => 0.0,
+                };
+                let c = match &r[4] {
+                    DataValue::Num(Num::Int(n)) => *n,
+                    _ => 0,
+                };
+                let w2 = floor + (w - floor) * factor;
+                DataValue::List(vec![
+                    DataValue::Str(f.as_str().into()),
+                    DataValue::Str(t.as_str().into()),
+                    DataValue::Num(Num::Float(w2)),
+                    DataValue::Num(Num::Float(lu)),
+                    DataValue::Num(Num::Int(c)),
+                ])
+            })
+            .collect();
+        let n = put_rows.len();
+        let mut wparams = BTreeMap::new();
+        wparams.insert("rows".into(), DataValue::List(put_rows));
+        self.db
+            .run_script(
+                "?[from_claim, to_claim, weight, last_used, count] <- $rows \
+                 :put assoc_edges { from_claim, to_claim => weight, last_used, count }",
+                wparams,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("decay_assoc_edges write: {e}")))?;
+        Ok(n)
+    }
+
+    /// Living Engram (Build 2) — associative neighbours of the seed claims via
+    /// the learned `assoc_edges` (undirected). Returns `(neighbour_claim_id,
+    /// weight)` for edges with weight ≥ `min_weight`, best-weight-first, capped
+    /// at `cap`; the seeds themselves are excluded. Empty when the feature has
+    /// never written an edge — so an untrained tenant's recall is unchanged.
+    pub fn get_assoc_neighbors(
+        &self,
+        seed_ids: &[String],
+        min_weight: f64,
+        cap: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        if seed_ids.is_empty() || cap == 0 {
+            return Ok(vec![]);
+        }
+        let seeds: Vec<DataValue> = seed_ids
+            .iter()
+            .map(|c| DataValue::List(vec![DataValue::Str(c.as_str().into())]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("seeds".into(), DataValue::List(seeds));
+        params.insert("minw".into(), DataValue::Num(Num::Float(min_weight)));
+        // Undirected: a seed can be on either side of an edge. Two rules union
+        // the neighbour reached from each side; `not seed[other]` drops seeds.
+        let result = self
+            .db
+            .run_script(
+                "seed[c] <- $seeds \
+                 nbr[other, weight] := seed[s], \
+                   *assoc_edges{from_claim: s, to_claim: other, weight}, weight >= $minw \
+                 nbr[other, weight] := seed[s], \
+                   *assoc_edges{from_claim: other, to_claim: s, weight}, weight >= $minw \
+                 ?[other, weight] := nbr[other, weight], not seed[other]",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_assoc_neighbors: {e}")))?;
+        // Keep the max weight across seeds reaching each neighbour.
+        let mut out: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for r in &result.rows {
+            let id = dv_to_string(&r[0]);
+            let w = match &r[1] {
+                DataValue::Num(Num::Float(x)) => *x as f32,
+                DataValue::Num(Num::Int(n)) => *n as f32,
+                _ => 0.0,
+            };
+            out.entry(id)
+                .and_modify(|e| {
+                    if w > *e {
+                        *e = w
+                    }
+                })
+                .or_insert(w);
+        }
+        let mut v: Vec<(String, f32)> = out.into_iter().collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(cap);
+        Ok(v)
+    }
+
     /// Read back usage-signal rows newer than `since_ts` (epoch seconds),
     /// oldest-first, capped at `limit`. The idle batch trainer's scan
     /// primitive; also powers the restated-fraction metric.
@@ -8043,6 +8295,84 @@ mod tests {
         assert!(!scores.contains_key("claim:never"));
         // Empty request is a clean empty map, never an error.
         assert!(store.get_claim_usefulness(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn living_edges_reinforce_decay_and_recall() {
+        let store = mem_store();
+
+        // Co-cite (a,b) and (a,c) in a verified-good answer (q=1.0). Pass (b,a)
+        // un-canonicalised to prove undirected canonicalisation.
+        let n = store
+            .record_co_citation(
+                &[
+                    ("claim:b".into(), "claim:a".into()),
+                    ("claim:a".into(), "claim:c".into()),
+                ],
+                1.0,
+                1000.0,
+            )
+            .unwrap();
+        assert_eq!(n, 2, "two distinct undirected pairs");
+
+        // Self-pairs and duplicates collapse to nothing extra.
+        assert_eq!(
+            store
+                .record_co_citation(&[("claim:a".into(), "claim:a".into())], 1.0, 1000.0)
+                .unwrap(),
+            0,
+            "self-pair is skipped"
+        );
+
+        // Recall from seed a returns b and c (not a itself).
+        let nbrs = store.get_assoc_neighbors(&["claim:a".into()], 0.0, 10).unwrap();
+        let ids: std::collections::HashSet<&str> = nbrs.iter().map(|(i, _)| i.as_str()).collect();
+        assert!(ids.contains("claim:b") && ids.contains("claim:c"), "a reaches b and c");
+        assert!(!ids.contains("claim:a"), "seed excluded from its own neighbours");
+        let w_after_one = nbrs[0].1;
+        assert!(w_after_one > 0.0 && w_after_one < 1.0, "Oja-bounded: 0 < w < w_max");
+
+        // Reinforce (a,b) again — weight rises but stays bounded < w_max.
+        store
+            .record_co_citation(&[("claim:a".into(), "claim:b".into())], 1.0, 1001.0)
+            .unwrap();
+        let w_ab = store
+            .get_assoc_neighbors(&["claim:b".into()], 0.0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|(i, _)| i == "claim:a")
+            .map(|(_, w)| w)
+            .expect("b reaches a (undirected)");
+        assert!(w_ab > w_after_one, "second co-citation strengthened the edge");
+        assert!(w_ab < 1.0, "never reaches w_max");
+
+        // Decay toward a floor: weights drop but never below the floor.
+        let floor = 0.05;
+        let decayed = store.decay_assoc_edges(0.5, floor).unwrap();
+        assert!(decayed >= 2, "all above-floor edges decayed");
+        let after = store.get_assoc_neighbors(&["claim:a".into()], 0.0, 10).unwrap();
+        let floor_f32 = floor as f32;
+        for (_, w) in &after {
+            assert!(*w >= floor_f32, "decayed weight never below floor ({w} >= {floor_f32})");
+            assert!(*w < w_ab, "decay reduced weight");
+        }
+
+        // min_weight gate filters: nothing this strong survives a 0.99 cut.
+        assert!(
+            store
+                .get_assoc_neighbors(&["claim:a".into()], 0.99, 10)
+                .unwrap()
+                .is_empty(),
+            "min_weight gate excludes weak edges"
+        );
+
+        // Untrained seed → empty (untrained tenant unchanged).
+        assert!(
+            store
+                .get_assoc_neighbors(&["claim:zzz".into()], 0.0, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

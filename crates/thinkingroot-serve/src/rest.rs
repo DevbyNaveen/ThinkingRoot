@@ -7445,6 +7445,36 @@ async fn ask_handler(
             {
                 tracing::warn!("usage-signal record failed (non-fatal): {e}");
             }
+            // Living Engram (Build 1) — reinforce associative edges from this
+            // verified-good answer's co-citations (same gate as the streaming
+            // path). TR_LIVING_EDGES; NOT refused; ≥2 distinct cited claims.
+            let living_edges = std::env::var("TR_LIVING_EDGES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if living_edges && !gate.refused {
+                let mut cited: Vec<String> = cited_ids.iter().map(|s| s.to_string()).collect();
+                cited.sort();
+                cited.dedup();
+                if cited.len() >= 2 {
+                    let mut pairs: Vec<(String, String)> = Vec::new();
+                    for i in 0..cited.len() {
+                        for j in (i + 1)..cited.len() {
+                            pairs.push((cited[i].clone(), cited[j].clone()));
+                        }
+                    }
+                    let q = {
+                        let c = gate.answer_confidence as f64;
+                        if c > 0.0 { c.min(1.0) } else { 1.0 }
+                    };
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    if let Err(e) = graph.record_co_citation(&pairs, q, ts) {
+                        tracing::warn!("living-edges record failed (non-fatal): {e}");
+                    }
+                }
+            }
         }
     }
 
@@ -7763,6 +7793,38 @@ async fn ask_stream_handler(
                             &hits,
                         ) {
                             tracing::warn!("usage-signal record failed (non-fatal): {e}");
+                        }
+                        // Living Engram (Build 1) — reinforce associative edges
+                        // from this verified-good answer's co-citations. Gated
+                        // TR_LIVING_EDGES; only when NOT refused and ≥2 distinct
+                        // claims were cited (an edge needs two ends). Non-fatal.
+                        let living_edges = std::env::var("TR_LIVING_EDGES")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if living_edges && !gate.refused {
+                            let mut cited: Vec<String> =
+                                cited_ids.iter().map(|s| s.to_string()).collect();
+                            cited.sort();
+                            cited.dedup();
+                            if cited.len() >= 2 {
+                                let mut pairs: Vec<(String, String)> = Vec::new();
+                                for i in 0..cited.len() {
+                                    for j in (i + 1)..cited.len() {
+                                        pairs.push((cited[i].clone(), cited[j].clone()));
+                                    }
+                                }
+                                let q = {
+                                    let c = gate.answer_confidence as f64;
+                                    if c > 0.0 { c.min(1.0) } else { 1.0 }
+                                };
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs_f64())
+                                    .unwrap_or(0.0);
+                                if let Err(e) = graph.record_co_citation(&pairs, q, ts) {
+                                    tracing::warn!("living-edges record failed (non-fatal): {e}");
+                                }
+                            }
                         }
                     }
                 }

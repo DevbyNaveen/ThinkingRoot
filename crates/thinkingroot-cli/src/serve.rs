@@ -424,6 +424,12 @@ pub async fn run_serve(
     let _keep_warm_handle =
         thinkingroot_serve::maintenance::spawn_keep_warm(state.engine.clone());
 
+    // Living Engram (Build 1): idle decay of usage-learned associative edges.
+    // No-op handle unless TR_LIVING_EDGES=1.
+    let _living_edges_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_living_edges_decay(root.clone()));
+
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
@@ -809,6 +815,12 @@ async fn run_serve_with_listener(
     // TR_LLM_KEEPWARM (cloud provisioner sets =1); a literal no-op otherwise.
     let _keep_warm_handle =
         thinkingroot_serve::maintenance::spawn_keep_warm(state.engine.clone());
+
+    // Living Engram (Build 1): idle decay of usage-learned associative edges.
+    // No-op handle unless TR_LIVING_EDGES=1.
+    let _living_edges_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_living_edges_decay(root.clone()));
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();
