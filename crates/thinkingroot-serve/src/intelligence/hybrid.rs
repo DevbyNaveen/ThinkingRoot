@@ -413,6 +413,25 @@ pub async fn hybrid_retrieve(
         });
     }
 
+    // ---- Layer 6.6: attractor abstain gate (Build 3) ----
+    // Pattern-completion's honesty half. Read the top-2 final scores (sorted
+    // desc) BEFORE the hit loop consumes `scored`: a weak best match or a
+    // no-clear-winner result emits a result-level LowConfidence caveat the
+    // synthesizer can act on. Never drops or reorders a hit. Gated
+    // TR_ATTRACTOR_ABSTAIN — a no-op (and zero env reads beyond the flag) off.
+    if attractor_abstain_on() && !scored.is_empty() {
+        let top = scored[0].1;
+        let runner = scored.get(1).map(|s| s.1).unwrap_or(0.0);
+        let floor = attractor_conf_floor();
+        let ambiguous = scored.len() >= 2 && (top - runner) < attractor_min_gap();
+        if top < floor || ambiguous {
+            redactions.push(RetrievalCaveat::LowConfidence {
+                measured: top,
+                threshold: floor,
+            });
+        }
+    }
+
     let mut junk_dropped = 0usize;
     for (c, fused, breakdown) in scored {
         // Sensitivity gate (Layer 9 — applied per-hit so we accumulate
@@ -1094,6 +1113,29 @@ const ASSOC_SEED_CAP: usize = 8;
 const ASSOC_CLAIM_CAP: usize = 32;
 const ASSOC_MIN_WEIGHT: f64 = 0.1;
 const ASSOC_EXPANSION_WEIGHT: f32 = 0.3;
+
+// Living Engram (Build 3) — attractor-recall abstain gate. When ON, a weak best
+// match (top score < floor) or a no-clear-winner result (top−runner < min_gap,
+// the Hopfield spurious-minimum regime) surfaces a LowConfidence caveat so the
+// answer can abstain instead of confidently stitching an ambiguous result.
+// OFF by default; thresholds eval-tuned (fused scores are unnormalised).
+fn attractor_abstain_on() -> bool {
+    std::env::var("TR_ATTRACTOR_ABSTAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+fn attractor_conf_floor() -> f32 {
+    std::env::var("TR_ATTRACTOR_CONF_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.15)
+}
+fn attractor_min_gap() -> f32 {
+    std::env::var("TR_ATTRACTOR_MIN_GAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.05)
+}
 
 /// Layer 4.5 — GraphRAG expansion. When the query names a resolvable entity,
 /// walk `entity_relations` from it (spreading activation, multi-hop) and add
