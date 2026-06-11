@@ -70,6 +70,38 @@ pub fn format_transcript(segments: &[TranscriptSegment]) -> String {
     out
 }
 
+/// Structured, queryable per-segment provenance URI for an audio claim:
+/// `audio://<sha>?t_start=..&t_end=..&speaker=..` (only present fields are
+/// included). So every claim extracted from a segment traces to its exact
+/// audio span + speaker — supersession and citation work at the utterance
+/// level, not just the whole file. The speaker value is kept URI-safe and
+/// queryable (spaces → `_`; reserved `&=?#/` → `-`). Pure + testable.
+pub fn segment_source_uri(audio_sha: &str, seg: &TranscriptSegment) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(a) = seg.t_start {
+        params.push(format!("t_start={a:.2}"));
+    }
+    if let Some(b) = seg.t_end {
+        params.push(format!("t_end={b:.2}"));
+    }
+    if let Some(sp) = seg.speaker.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let safe: String = sp
+            .chars()
+            .map(|c| match c {
+                ' ' => '_',
+                '&' | '=' | '?' | '#' | '/' => '-',
+                c => c,
+            })
+            .collect();
+        params.push(format!("speaker={safe}"));
+    }
+    if params.is_empty() {
+        format!("audio://{audio_sha}")
+    } else {
+        format!("audio://{audio_sha}?{}", params.join("&"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +145,23 @@ mod tests {
     fn skips_blank_segments_and_empty_input() {
         assert_eq!(format_transcript(&[]), "");
         assert_eq!(format_transcript(&[seg("   ", Some("X"), Some(1.0), Some(2.0))]), "");
+    }
+
+    #[test]
+    fn segment_source_uri_is_structured_and_queryable() {
+        let s = seg("x", Some("Alice"), Some(12.5), Some(18.0));
+        assert_eq!(
+            segment_source_uri("abc123", &s),
+            "audio://abc123?t_start=12.50&t_end=18.00&speaker=Alice"
+        );
+        // missing fields drop out; bare file anchor when nothing structured
+        assert_eq!(
+            segment_source_uri("abc123", &seg("x", None, None, None)),
+            "audio://abc123"
+        );
+        assert_eq!(
+            segment_source_uri("abc123", &seg("x", Some("Dr. O'Neil & Co"), Some(1.0), None)),
+            "audio://abc123?t_start=1.00&speaker=Dr._O'Neil_-_Co"
+        );
     }
 }

@@ -5404,8 +5404,21 @@ async fn ingest_transcript_handler(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("audio:{sha}"));
     let engine = state.engine.read().await;
+    // Structured ingest: each segment's claims get a per-utterance
+    // `audio://<sha>?t_start=..&t_end=..&speaker=..` provenance URI (queryable
+    // span + speaker), not just inline tags in one flattened doc. `doc` above
+    // still gates the empty-transcript check + the fallback content hash.
     match engine
-        .extract_and_contribute(&ws, &doc, branch_arg, &session_id, &state.sessions, principal, &idem)
+        .ingest_transcript_structured(
+            &ws,
+            &body.segments,
+            &sha,
+            branch_arg,
+            &session_id,
+            &state.sessions,
+            principal,
+            &idem,
+        )
         .await
     {
         Ok(result) => {

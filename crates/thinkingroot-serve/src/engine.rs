@@ -6692,6 +6692,99 @@ Rules: \
         Ok((caption, result, sha))
     }
 
+    /// §6 P2 — structured audio ingest. Contributes each transcript segment's
+    /// claims under a per-segment, queryable `audio://<sha>?t_start=..&t_end=..&
+    /// speaker=..` provenance URI (via [`segment_source_uri`]), so every audio
+    /// claim traces to its exact utterance span + speaker — supersession and
+    /// citation work at utterance granularity, not just the whole file.
+    ///
+    /// One extract call per non-empty segment (so a claim's provenance is the
+    /// segment it came from). Uses the explicit-source contribute path —
+    /// `contribute_bulk`, the shared write path, is untouched. Entity-graph
+    /// linking (which `extract_and_contribute` does on the flattened doc) is the
+    /// documented follow-up; claims are stored, searchable, and carry structured
+    /// provenance now.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ingest_transcript_structured(
+        &self,
+        ws: &str,
+        segments: &[crate::intelligence::transcript::TranscriptSegment],
+        audio_sha: &str,
+        branch: Option<&str>,
+        session_id: &str,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+    ) -> Result<ContributeResult> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot ingest transcript"
+            ))
+        })?;
+        let _ = idempotency_key; // per-segment session keys carry idempotency
+        let mut accepted_count = 0usize;
+        let mut accepted_ids: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut saw_text = false;
+        for (i, seg) in segments.iter().enumerate() {
+            let text = seg.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            saw_text = true;
+            let result = llm.extract(text, "").await?;
+            let agent_claims: Vec<AgentClaim> = result
+                .claims
+                .into_iter()
+                .filter(|c| !c.statement.trim().is_empty())
+                .map(|c| AgentClaim {
+                    statement: c.statement,
+                    claim_type: if c.claim_type.trim().is_empty() {
+                        default_claim_type()
+                    } else {
+                        c.claim_type
+                    },
+                    confidence: Some(c.confidence),
+                    entities: c.entities,
+                })
+                .collect();
+            if agent_claims.is_empty() {
+                continue;
+            }
+            let source_uri =
+                crate::intelligence::transcript::segment_source_uri(audio_sha, seg);
+            // A per-segment session id so idempotency + any session bookkeeping
+            // are unique per utterance (re-ingesting the same audio is a no-op).
+            let seg_session = format!("{session_id}#{i}");
+            let r = self
+                .contribute_with_source_override(
+                    ws,
+                    &seg_session,
+                    branch,
+                    agent_claims,
+                    sessions,
+                    principal.clone(),
+                    source_uri,
+                    false,
+                )
+                .await?;
+            accepted_count += r.accepted_count;
+            accepted_ids.extend(r.accepted_ids);
+            warnings.extend(r.warnings);
+        }
+        if !saw_text {
+            return Err(Error::Config(
+                "no non-empty transcript segments".into(),
+            ));
+        }
+        Ok(ContributeResult {
+            accepted_count,
+            accepted_ids,
+            source_uri: format!("audio://{audio_sha}"),
+            warnings,
+        })
+    }
+
     /// C1 — consolidation. Scans the durable (main) graph entity-by-entity and
     /// uses the workspace LLM to detect SUPERSESSIONS within each entity's claim
     /// cluster (a newer fact that replaces an older one about the SAME attribute
