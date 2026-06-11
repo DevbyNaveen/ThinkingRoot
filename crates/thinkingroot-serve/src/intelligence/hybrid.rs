@@ -517,6 +517,15 @@ pub async fn hybrid_retrieve(
     }
 
     let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+    // §8 — the read-path latency signal, emitted at INFO so it ships to the
+    // OTLP collector (OpenObserve) for the <100ms dashboard. One structured
+    // event per retrieval: total ms, hit count, and the routing shape taken.
+    tracing::info!(
+        elapsed_ms,
+        hits = hits.len(),
+        routing_shape = ?shape,
+        "retrieval_complete"
+    );
     Ok(HybridResponse {
         hits,
         redactions,
