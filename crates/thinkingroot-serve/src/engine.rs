@@ -6923,6 +6923,38 @@ Rules: \
                     out
                 });
                 warnings.extend(vwarn);
+
+                // §11 A7-SEC ⑤ — write-time anomaly detection (AgentPoison
+                // defense), opt-in via TR_WRITE_ANOMALY. Poison injections
+                // cluster tightly in embedding space; flag a tight cluster in
+                // this batch as a memory-poisoning signal (warn-only — never
+                // blocks the write, so a false positive can't lose data; pairs
+                // with trust-aware retrieval ② which can demote flagged tiers).
+                if std::env::var("TR_WRITE_ANOMALY").map(|v| v == "1" || v == "true").unwrap_or(false)
+                    && agent_claims.len() >= 3
+                {
+                    let stmts: Vec<&str> =
+                        agent_claims.iter().map(|c| c.statement.as_str()).collect();
+                    if let Ok(embs) = run_blocking(|| storage.vector.embed_texts(&stmts)) {
+                        let rep = crate::intelligence::write_anomaly::detect_write_anomaly(
+                            &embs, 0.97, 3,
+                        );
+                        if rep.anomalous {
+                            tracing::warn!(
+                                source = %source_uri,
+                                cluster = rep.cluster.len(),
+                                mean_sim = rep.mean_pairwise_sim,
+                                "A7-SEC write anomaly: tight embedding cluster (possible poison)"
+                            );
+                            warnings.push(format!(
+                                "write-anomaly: {} of {} claims form a tight embedding cluster \
+                                 (possible memory-poisoning injection) — flagged for review",
+                                rep.cluster.len(),
+                                agent_claims.len()
+                            ));
+                        }
+                    }
+                }
             }
 
             // Skip per-claim rooting in backfill mode — the
