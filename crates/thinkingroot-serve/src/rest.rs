@@ -783,6 +783,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/route-tools", post(route_tools_handler))
             .route("/ws/{ws}/sleep", post(sleep_handler))
             .route("/ws/{ws}/dream", post(dream_handler))
+            .route("/ws/{ws}/predict", post(predict_handler))
             .route("/ws/{ws}/age", get(age_handler))
             .route("/ws/{ws}/drives", get(drives_handler))
             .route("/ws/{ws}/bequeath", post(bequeath_handler))
@@ -3871,6 +3872,31 @@ async fn dream_handler(
         .dream(&ws, req.max_claims, req.max_insights, req.auto_merge, &state.sessions)
         .await
     {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/predict` — §1 the `predict` verb: "what happens next",
+/// grounded ONLY in recalled claims via the workspace LLM, falsifier-gated
+/// (verified-or-silent; refuses when there's no basis or no grounded citation).
+#[derive(Deserialize)]
+struct PredictRequest {
+    question: String,
+    #[serde(default = "default_predict_top_k")]
+    top_k: usize,
+}
+fn default_predict_top_k() -> usize {
+    12
+}
+
+async fn predict_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<PredictRequest>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.predict(&ws, &body.question, body.top_k).await {
         Ok(report) => ok_response(serde_json::json!(report)).into_response(),
         Err(e) => match_engine_error(e),
     }

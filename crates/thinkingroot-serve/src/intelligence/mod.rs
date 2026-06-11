@@ -13,6 +13,7 @@ pub mod compressor;
 pub mod write_anomaly;
 pub mod transcript;
 pub mod dream;
+pub mod predict;
 pub mod repo_map;
 pub mod diff_cert;
 pub mod dsl;

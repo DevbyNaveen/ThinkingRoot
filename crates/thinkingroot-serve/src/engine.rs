@@ -199,6 +199,23 @@ pub struct DreamReport {
     pub note: String,
 }
 
+/// §1 — outcome of a grounded `predict` ("what happens next"). Verified-or-
+/// silent: `refused` when there's no basis or no grounded citation.
+#[derive(Debug, Clone, Serialize)]
+pub struct PredictReport {
+    /// The grounded prediction text (with inline `[claim:id]` citations), or
+    /// empty when refused.
+    pub prediction: String,
+    /// Model-stated confidence 0..=1 (0 when refused).
+    pub confidence: f64,
+    /// Recalled claim ids the prediction is grounded in (the falsifier set).
+    pub citations: Vec<String>,
+    /// True when the prediction was withheld (no evidence / no grounded cite).
+    pub refused: bool,
+    /// Honest note.
+    pub note: String,
+}
+
 /// P2 — the being's HONEST developmental age. Every field is a real measured
 /// signal; `developmental_age` is a function of verified capability + knowledge +
 /// reconciliations, NOT wall-clock uptime (the research keystone: "age = verified
@@ -5212,6 +5229,56 @@ side referenced. Strict rules:\n\
             } else {
                 "insights kept on the dream branch (review before merge)".to_string()
             },
+        })
+    }
+
+    /// §1 — the `predict` verb ("what happens next"), grounded + falsifier-gated.
+    /// Recall claims relevant to the question, ask the WORKSPACE LLM (customer's
+    /// model — NOT the excluded generative adapter) to infer the next outcome
+    /// ONLY from those claims, then enforce verified-or-silent: refuse when
+    /// there's no relevant memory, the model declines, or the prediction cites
+    /// no recalled claim (the falsifier gate). Never prophesies unbacked.
+    pub async fn predict(&self, ws: &str, question: &str, top_k: usize) -> Result<PredictReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!("workspace '{ws}' has no LLM configured — cannot predict"))
+        })?;
+        let empty = std::collections::HashSet::new();
+        let res = self.search_scoped(ws, question, top_k.clamp(1, 50), &empty).await?;
+        let claims: Vec<(String, String)> =
+            res.claims.iter().map(|c| (c.id.clone(), c.statement.clone())).collect();
+        let refused = |note: &str| PredictReport {
+            prediction: String::new(),
+            confidence: 0.0,
+            citations: vec![],
+            refused: true,
+            note: note.to_string(),
+        };
+        if claims.is_empty() {
+            return Ok(refused("no relevant memory to predict from"));
+        }
+
+        let prompt = crate::intelligence::predict::build_predict_prompt(question, &claims);
+        let out = llm.chat(crate::intelligence::predict::PREDICT_SYSTEM, &prompt).await?;
+        if crate::intelligence::predict::is_refusal(&out) {
+            return Ok(refused("insufficient evidence to predict"));
+        }
+        // Falsifier gate: the prediction must cite a RECALLED claim.
+        let recalled: std::collections::HashSet<&str> =
+            claims.iter().map(|(id, _)| id.as_str()).collect();
+        let grounded: Vec<String> = crate::intelligence::citations::parse_all_markers(&out)
+            .into_iter()
+            .filter(|id| recalled.contains(id.as_str()))
+            .collect();
+        if grounded.is_empty() {
+            return Ok(refused("prediction had no grounded citation — withheld"));
+        }
+        let confidence = crate::intelligence::predict::parse_confidence(&out).unwrap_or(0.5);
+        Ok(PredictReport {
+            prediction: out.trim().to_string(),
+            confidence,
+            citations: grounded,
+            refused: false,
+            note: "grounded prediction".to_string(),
         })
     }
 
