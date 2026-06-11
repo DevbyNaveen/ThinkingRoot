@@ -130,6 +130,22 @@ pub fn consensus_outliers(embeddings: &[Vec<f32>], sim_threshold: f32) -> Vec<us
     (0..n).filter(|&i| near[i] == 0).collect()
 }
 
+/// §11 A7-SEC ③ wiring helper — which recalled candidates to DEMOTE: the
+/// consensus outliers that are ALSO low-trust. `embeddings[i]` and
+/// `low_trust[i]` describe the same candidate `i`. A legit rare-but-true fact
+/// from a trusted source is an outlier but NOT low-trust, so it is kept; only a
+/// low-trust dissenter (the poison signature) is demoted. Pure + tested.
+pub fn consensus_demotions(
+    embeddings: &[Vec<f32>],
+    low_trust: &[bool],
+    sim_threshold: f32,
+) -> Vec<usize> {
+    consensus_outliers(embeddings, sim_threshold)
+        .into_iter()
+        .filter(|&i| low_trust.get(i).copied().unwrap_or(false))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +232,18 @@ mod tests {
     fn consensus_needs_a_cohort() {
         let emb = vec![axis(8, 0, 0.0), axis(8, 0, 0.001), axis(8, 5, 0.0)];
         assert!(consensus_outliers(&emb, 0.9).is_empty(), "n<4 → no consensus call");
+    }
+
+    #[test]
+    fn consensus_demotion_only_targets_low_trust_outliers() {
+        // 4 consensus + 1 outlier (index 4).
+        let mut emb: Vec<Vec<f32>> = (0..4).map(|i| axis(8, 0, 0.001 * i as f32)).collect();
+        emb.push(axis(8, 5, 0.0));
+        // Outlier is HIGH-trust → kept (legit rare fact).
+        let high_trust = vec![false, false, false, false, false];
+        assert!(consensus_demotions(&emb, &high_trust, 0.9).is_empty());
+        // Outlier is LOW-trust → demoted (poison signature).
+        let low_trust = vec![false, false, false, false, true];
+        assert_eq!(consensus_demotions(&emb, &low_trust, 0.9), vec![4]);
     }
 }

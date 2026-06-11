@@ -174,6 +174,35 @@ pub async fn hybrid_retrieve(
             *s *= trust_class_factor(c.trust_class);
         }
     }
+    // ---- Layer 6.1b: use-time consensus demotion (A7-SEC ③, flag-gated) ----
+    // A-MemGuard: among the recalled cohort, demote a LOW-TRUST claim that
+    // corroborates NO consensus (the signature of context-activated poison that
+    // rode a trigger query in). Uses STORED int8 vectors (no re-embed) so the
+    // read path stays within the 100ms budget; legit rare-but-true facts from
+    // trusted channels are outliers too but kept (only low-trust ones demote).
+    // OFF by default (TR_CONSENSUS).
+    if consensus_flag_on() && scored.len() >= 4 {
+        let ids: Vec<String> = scored.iter().map(|(c, _, _)| c.claim_id.clone()).collect();
+        let embs = engine.get_claim_embeddings(ws, &ids).await;
+        let mut idx_map: Vec<usize> = Vec::new();
+        let mut vecs: Vec<Vec<f32>> = Vec::new();
+        let mut low_trust: Vec<bool> = Vec::new();
+        for (i, e) in embs.into_iter().enumerate() {
+            if let Some(v) = e {
+                idx_map.push(i);
+                vecs.push(v);
+                low_trust.push(trust_class_factor(scored[i].0.trust_class) < 1.0);
+            }
+        }
+        let demote =
+            crate::intelligence::write_anomaly::consensus_demotions(&vecs, &low_trust, 0.85);
+        if !demote.is_empty() {
+            tracing::debug!(demoted = demote.len(), "A7-SEC consensus: demoted low-trust outliers");
+            for pos in demote {
+                scored[idx_map[pos]].1 *= 0.5;
+            }
+        }
+    }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // ---- Layer 6.2: content dedup (NOW item 3) ----
@@ -955,6 +984,13 @@ fn merge_candidates(
 /// LongMemEval blend, so it ships dark like the late-interaction tier).
 fn trust_scoring_flag_on() -> bool {
     std::env::var("TR_TRUST_SCORING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// A7-SEC ③ use-time consensus demotion (flag-gated, default off).
+fn consensus_flag_on() -> bool {
+    std::env::var("TR_CONSENSUS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

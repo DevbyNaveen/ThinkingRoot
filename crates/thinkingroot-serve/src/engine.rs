@@ -8350,6 +8350,20 @@ Rules: \
         self.workspaces.get(ws).and_then(|h| h.llm.clone())
     }
 
+    /// A7-SEC ③ — fetch the STORED embedding for each claim id (vector key
+    /// `claim:{id}`) from the workspace vector index. Read-only and NO embedding
+    /// is computed (latency-safe for the read path); `None` for a claim with no
+    /// stored vector or an unmounted workspace.
+    pub async fn get_claim_embeddings(&self, ws: &str, ids: &[String]) -> Vec<Option<Vec<f32>>> {
+        let Some(handle) = self.workspaces.get(ws) else {
+            return vec![None; ids.len()];
+        };
+        let storage = handle.storage.lock().await;
+        ids.iter()
+            .map(|id| storage.vector.get_embedding(&format!("claim:{id}")))
+            .collect()
+    }
+
     /// Return the `StreamsConfig` for a workspace (controls auto_session_branch, etc.).
     pub fn workspace_streams_config(
         &self,
