@@ -4886,7 +4886,22 @@ side referenced. Strict rules:\n\
         allowed_source_ids: &HashSet<String>,
     ) -> Result<SearchResult> {
         let handle = self.get_workspace(ws)?;
-        Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await
+        let start = std::time::Instant::now();
+        let result = Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await;
+        // §8 — read-path latency for the <100ms dashboard. `search_scoped` is the
+        // choke point the /ask retriever (`intelligence::retriever`) actually
+        // calls (the MCP `hybrid_retrieve` tool emits its own event separately).
+        // One structured event per scoped retrieval: total ms + hit counts.
+        let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+        if let Ok(r) = &result {
+            tracing::info!(
+                elapsed_ms,
+                claims = r.claims.len(),
+                entities = r.entities.len(),
+                "retrieval_complete"
+            );
+        }
+        result
     }
 
     /// Late-interaction (MaxSim) scores for a candidate claim-id set — the
