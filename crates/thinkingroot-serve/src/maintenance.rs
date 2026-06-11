@@ -458,6 +458,87 @@ pub fn spawn_retrieval_prior_trainer(workspace_root: PathBuf) -> JoinHandle<()> 
     spawn_periodic_task(task)
 }
 
+/// LLM keep-warm pinger — the `/ask` cold-start fix (#1 launch blocker).
+///
+/// The FIRST Azure `gpt-4.1-mini` request after idle pays a ~30-80s
+/// cold-connection/routing stall (measured): the engine warms its ONNX embed +
+/// rerank on boot/mount, but the LLM HTTPS connection goes cold during any gap,
+/// and a CRIU restore freezes/kills the existing connection entirely. A cold
+/// first `/ask` then hangs to the synthesizer timeout and the front-door proxy
+/// disconnects. This task keeps the route + connection warm so the user's `/ask`
+/// is never the cold call: it fires a tiny `llm.chat` probe per mounted
+/// workspace on a fixed cadence.
+struct KeepWarmTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for KeepWarmTask {
+    fn name(&self) -> &'static str {
+        "llm_keep_warm"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        // Clone each mounted workspace's LLM client out under a SHORT read lock,
+        // then drop the lock before any network call. Never hold the engine lock
+        // across a multi-second probe — it would block mounts/writes for the
+        // whole process.
+        let clients: Vec<(String, Arc<thinkingroot_llm::llm::LlmClient>)> = {
+            let eng = self.engine.read().await;
+            eng.mounted_workspace_names()
+                .into_iter()
+                .filter_map(|ws| eng.workspace_llm(&ws).map(|c| (ws, c)))
+                .collect()
+        };
+        if clients.is_empty() {
+            return Ok(());
+        }
+        for (ws, llm) in clients {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(20),
+                llm.chat("You are a warm-up probe.", "Reply with: ok"),
+            )
+            .await;
+            match probe {
+                Ok(Ok(_)) => tracing::debug!(ws = %ws, "keep-warm: LLM connection kept warm"),
+                Ok(Err(e)) => tracing::warn!(ws = %ws, "keep-warm: probe error: {e}"),
+                Err(_) => {
+                    tracing::warn!(ws = %ws, "keep-warm: probe timed out (connection was cold)")
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the LLM keep-warm pinger. Gated on `TR_LLM_KEEPWARM` (the cloud
+/// provisioner sets `=1`); OFF by default so desktop/CLI users never pay
+/// periodic LLM tokens. `TR_LLM_KEEPWARM_SECS` (default 45) sets the cadence —
+/// kept below the typical idle window so the connection never goes cold during
+/// an active session.
+pub fn spawn_keep_warm(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_LLM_KEEPWARM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let interval_secs = std::env::var("TR_LLM_KEEPWARM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(KeepWarmTask {
+        engine,
+        interval: Duration::from_secs(interval_secs.max(10)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Single cleanup pass. Exposed for tests.
 ///
 /// When `branch_engines` is provided, the cache is invalidated before each

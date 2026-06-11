@@ -8537,6 +8537,14 @@ Rules: \
         self.workspaces.get(ws).and_then(|h| h.llm.clone())
     }
 
+    /// Names of all currently-mounted workspaces. Cheap (just the map keys) —
+    /// used by the LLM keep-warm pinger (`maintenance::spawn_keep_warm`) to
+    /// enumerate which workspaces to probe without taking the heavier
+    /// `list_workspaces` path (which computes per-workspace counts).
+    pub fn mounted_workspace_names(&self) -> Vec<String> {
+        self.workspaces.keys().cloned().collect()
+    }
+
     /// A7-SEC ③ — fetch the STORED embedding for each claim id (vector key
     /// `claim:{id}`) from the workspace vector index. Read-only and NO embedding
     /// is computed (latency-safe for the read path); `None` for a claim with no
