@@ -185,6 +185,20 @@ pub struct SleepReport {
     pub stale_expired: usize,
 }
 
+/// §11 #26 — outcome of a Night Shift dream pass (generative abstraction in a
+/// quarantined branch, verify-before-merge).
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamReport {
+    /// Insight/playbook claims synthesized this pass.
+    pub insights: usize,
+    /// The quarantined dream branch they were written to (empty if none).
+    pub branch: String,
+    /// Whether the dream was merged into main (else kept on the branch for review).
+    pub merged: bool,
+    /// Honest note (why nothing dreamed, what was kept/discarded).
+    pub note: String,
+}
+
 /// P2 — the being's HONEST developmental age. Every field is a real measured
 /// signal; `developmental_age` is a function of verified capability + knowledge +
 /// reconciliations, NOT wall-clock uptime (the research keystone: "age = verified
@@ -5092,6 +5106,112 @@ side referenced. Strict rules:\n\
             contradictions_resolved: superseded,
             claims_superseded: superseded,
             stale_expired,
+        })
+    }
+
+    /// §11 #26 — Night Shift DREAM: generative abstraction. Synthesize
+    /// higher-level insights/playbooks from existing claims using the
+    /// workspace's OWN LLM (customer's model — not a new neural model), write
+    /// them to a QUARANTINED dream branch (A2 isolation), then verify-before-
+    /// merge into main (`auto_merge`) or leave them on the branch for review.
+    /// The novel part vs opaque consumer "dreaming": branch-quarantined +
+    /// merge-gated + provenance-tracked (`dream://`). Honest: too-few-claims or
+    /// no-insight passes return a no-op report, never fabricated rows.
+    pub async fn dream(
+        &self,
+        ws: &str,
+        max_claims: usize,
+        max_insights: usize,
+        auto_merge: bool,
+        sessions: &crate::intelligence::session::SessionStore,
+    ) -> Result<DreamReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!("workspace '{ws}' has no LLM configured — cannot dream"))
+        })?;
+        let handle = self.get_workspace(ws)?;
+        let root = handle.root_path.clone();
+
+        // Sample claim statements from the read cache (cheap; the dream
+        // abstracts over what's already there).
+        let claims: Vec<String> = {
+            let cache = handle.cache.read().await;
+            cache
+                .all_claims()
+                .filter(|c| !c.statement.trim().is_empty())
+                .take(max_claims.clamp(1, 200))
+                .map(|c| c.statement.clone())
+                .collect()
+        };
+        if claims.len() < 3 {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "not enough claims to dream over (need ≥3)".to_string(),
+            });
+        }
+
+        // Generative abstraction via the workspace LLM.
+        let prompt = crate::intelligence::dream::build_dream_prompt(&claims);
+        let out = llm.chat(crate::intelligence::dream::DREAM_SYSTEM, &prompt).await?;
+        let insights =
+            crate::intelligence::dream::parse_dream_insights(&out, max_insights.clamp(1, 20));
+        if insights.is_empty() {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "no insights synthesized this pass".to_string(),
+            });
+        }
+
+        // Quarantined dream branch (A2 isolation).
+        let branch = format!("dream/{}", ulid::Ulid::new());
+        thinkingroot_branch::create_branch(
+            &root,
+            &branch,
+            "main",
+            Some("night-shift dream — quarantined generative abstraction".to_string()),
+        )
+        .await
+        .map_err(|e| Error::Config(format!("dream: fork failed: {e}")))?;
+
+        // Write the insights to the dream branch (quarantined), tagged as
+        // dream-derived so provenance is honest.
+        let agent_claims: Vec<AgentClaim> = insights
+            .iter()
+            .map(|s| AgentClaim {
+                statement: s.clone(),
+                claim_type: "insight".to_string(),
+                confidence: Some(0.6),
+                entities: vec![],
+            })
+            .collect();
+        let idem = format!("dream:{branch}");
+        let principal =
+            Principal::Connector { connector_id: "dream".to_string(), install_id: "night".to_string() };
+        self.contribute_bulk(ws, &idem, Some(&branch), agent_claims, sessions, principal, &idem, false)
+            .await?;
+
+        // Verify-before-merge: merge the dream into main (kept) or leave it for
+        // review (discard = the branch simply isn't merged).
+        let merged = if auto_merge {
+            let merged_by =
+                thinkingroot_core::MergedBy::Agent { agent_id: format!("dream:{branch}") };
+            self.merge_branch(&root, &branch, false, false, merged_by).await.is_ok()
+        } else {
+            false
+        };
+
+        Ok(DreamReport {
+            insights: insights.len(),
+            branch,
+            merged,
+            note: if merged {
+                "insights merged into main".to_string()
+            } else {
+                "insights kept on the dream branch (review before merge)".to_string()
+            },
         })
     }
 

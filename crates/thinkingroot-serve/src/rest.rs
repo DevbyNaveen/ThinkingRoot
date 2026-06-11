@@ -782,6 +782,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/route", post(route_handler))
             .route("/ws/{ws}/route-tools", post(route_tools_handler))
             .route("/ws/{ws}/sleep", post(sleep_handler))
+            .route("/ws/{ws}/dream", post(dream_handler))
             .route("/ws/{ws}/age", get(age_handler))
             .route("/ws/{ws}/drives", get(drives_handler))
             .route("/ws/{ws}/bequeath", post(bequeath_handler))
@@ -3832,6 +3833,42 @@ async fn sleep_handler(
     let engine = state.engine.read().await;
     match engine
         .sleep_consolidate(&ws, req.stale_before_epoch, conf_floor)
+        .await
+    {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/dream` — §11 #26 Night Shift dreaming: synthesize
+/// higher-level insights/playbooks from existing claims via the workspace LLM,
+/// quarantined to a dream branch, verify-before-merge. `auto_merge` merges kept
+/// insights into main; otherwise they stay on the branch for review.
+#[derive(Deserialize, Default)]
+struct DreamRequest {
+    #[serde(default = "default_dream_max_claims")]
+    max_claims: usize,
+    #[serde(default = "default_dream_max_insights")]
+    max_insights: usize,
+    #[serde(default)]
+    auto_merge: bool,
+}
+fn default_dream_max_claims() -> usize {
+    50
+}
+fn default_dream_max_insights() -> usize {
+    5
+}
+
+async fn dream_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<DreamRequest>>,
+) -> Response {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let engine = state.engine.read().await;
+    match engine
+        .dream(&ws, req.max_claims, req.max_insights, req.auto_merge, &state.sessions)
         .await
     {
         Ok(report) => ok_response(serde_json::json!(report)).into_response(),
