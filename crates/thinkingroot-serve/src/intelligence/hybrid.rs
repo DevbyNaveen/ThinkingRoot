@@ -141,6 +141,11 @@ pub async fn hybrid_retrieve(
     // If the query names an entity, pull in claims reachable only through the
     // entity graph — facts that vector/keyword recall miss. Additive + bounded.
     let merged = expand_via_graph(&graph, merged, &parsed, &req);
+    // ---- Layer 4.5b: Living Engram associative recall (Build 2) ----
+    // Seed from the strongest DIRECT hits and pull in their usage-learned
+    // co-citation neighbours via `assoc_edges` — fires on ANY query (no entity
+    // name needed). Additive + bounded + gated TR_LIVING_EDGES.
+    let merged = expand_via_assoc_edges(&graph, merged);
     check_cancel(&cancel)?;
 
     // ---- Layer 5: structural enricher ----
@@ -1082,6 +1087,14 @@ fn dedup_scored_by_content(scored: &mut Vec<(EnrichedCandidate, f32, ScoreBreakd
 const GRAPH_EXPANSION_SEED_CAP: usize = 64;
 const GRAPH_EXPANSION_CLAIM_CAP: usize = 128;
 
+// Living Engram (Build 2) — associative-recall caps. Seed from the top direct
+// hits; inject a bounded number of usage-learned neighbours, attenuated so they
+// never outrank a direct hit before fuse-scoring.
+const ASSOC_SEED_CAP: usize = 8;
+const ASSOC_CLAIM_CAP: usize = 32;
+const ASSOC_MIN_WEIGHT: f64 = 0.1;
+const ASSOC_EXPANSION_WEIGHT: f32 = 0.3;
+
 /// Layer 4.5 — GraphRAG expansion. When the query names a resolvable entity,
 /// walk `entity_relations` from it (spreading activation, multi-hop) and add
 /// the reached entities' claims as extra candidates, so retrieval can surface a
@@ -1154,6 +1167,52 @@ fn expand_via_graph(
                     break;
                 }
             }
+        }
+    }
+    merged
+}
+
+/// Layer 4.5b — Living Engram associative recall (Build 2). Unlike
+/// `expand_via_graph` (which needs the query to NAME an entity), this seeds from
+/// the strongest DIRECT hits already in the candidate pool and pulls in their
+/// usage-learned co-citation neighbours via `assoc_edges` — so "fire-together"
+/// memories surface on ANY query. Additive only (injected candidates carry an
+/// attenuated relevance so they never displace a direct hit before fuse-score)
+/// and gated `TR_LIVING_EDGES`. A no-op when the tenant has no learned edges, so
+/// an untrained tenant's recall is byte-identical to today.
+fn expand_via_assoc_edges(graph: &GraphStore, mut merged: Vec<Candidate>) -> Vec<Candidate> {
+    let on = std::env::var("TR_LIVING_EDGES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !on || merged.is_empty() {
+        return merged;
+    }
+    // Seed from the strongest direct hits.
+    let mut by_rel: Vec<&Candidate> = merged.iter().collect();
+    by_rel.sort_by(|a, b| {
+        b.vector_relevance
+            .partial_cmp(&a.vector_relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let seeds: Vec<String> = by_rel
+        .iter()
+        .take(ASSOC_SEED_CAP)
+        .map(|c| c.claim_id.clone())
+        .collect();
+    let neighbors = match graph.get_assoc_neighbors(&seeds, ASSOC_MIN_WEIGHT, ASSOC_CLAIM_CAP) {
+        Ok(n) => n,
+        Err(_) => return merged,
+    };
+    if neighbors.is_empty() {
+        return merged;
+    }
+    let mut seen: HashSet<String> = merged.iter().map(|c| c.claim_id.clone()).collect();
+    for (claim_id, weight) in neighbors {
+        if seen.insert(claim_id.clone()) {
+            merged.push(Candidate {
+                claim_id,
+                vector_relevance: weight * ASSOC_EXPANSION_WEIGHT,
+            });
         }
     }
     merged
