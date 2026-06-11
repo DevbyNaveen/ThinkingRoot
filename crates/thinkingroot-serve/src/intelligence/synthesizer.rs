@@ -930,18 +930,27 @@ pub async fn ask_streaming(
 async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest<'_>) -> String {
     let system_prompt = build_system_prompt(req.chat);
     let user_msg = build_user_message(claims, req);
-    let fut = llm.chat(system_prompt, &user_msg);
-    match tokio::time::timeout(Duration::from_secs(120), fut).await {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(e)) => {
-            tracing::warn!("synthesizer: LLM error: {e}");
-            claims[0].statement.clone()
-        }
-        Err(_) => {
-            tracing::warn!("synthesizer: LLM timeout — using best claim");
-            claims[0].statement.clone()
+    // The FIRST Azure request after idle pays a ~30s cold-connection/routing
+    // stall; the next hits the warm connection and returns in ~1s (measured).
+    // So we make TWO attempts at 40s each: a cold first attempt fails fast and
+    // the retry transparently succeeds — keeping the worst case (~80s) under the
+    // front-door proxy timeout instead of hanging at the old single 120s and
+    // disconnecting. Only if BOTH attempts fail do we fall back to the best
+    // grounded claim (honest: a real stored claim, never a fabricated answer).
+    for attempt in 0..2 {
+        match tokio::time::timeout(
+            Duration::from_secs(40),
+            llm.chat(system_prompt, &user_msg),
+        )
+        .await
+        {
+            Ok(Ok(answer)) => return answer,
+            Ok(Err(e)) => tracing::warn!("synthesizer: LLM error (attempt {attempt}): {e}"),
+            Err(_) => tracing::warn!("synthesizer: LLM timeout (attempt {attempt})"),
         }
     }
+    tracing::warn!("synthesizer: LLM unavailable after retries — using best claim");
+    claims[0].statement.clone()
 }
 
 // ---------------------------------------------------------------------------

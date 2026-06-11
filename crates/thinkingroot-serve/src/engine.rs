@@ -8663,6 +8663,24 @@ Rules: \
         })
         .await
         .map_err(|e| Error::Config(format!("warm_models task panicked: {e}")))??;
+
+        // Warm the LLM HTTPS connection too. The FIRST Azure request after idle
+        // pays a ~30s cold-connection/routing stall (measured); paying it HERE
+        // (boot / warm-on-mount) keeps it off the user's first `/ask`, which
+        // otherwise hangs to the synthesizer timeout and the proxy disconnects.
+        // Best-effort: a failed/slow probe must never block the mount.
+        if let Some(llm) = self.workspace_llm(ws) {
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(40),
+                llm.chat("You are a warm-up probe.", "Reply with: ok"),
+            )
+            .await;
+            match probe {
+                Ok(Ok(_)) => tracing::info!(ws, "warm_models: LLM connection warmed"),
+                Ok(Err(e)) => tracing::warn!(ws, "warm_models: LLM warm probe error: {e}"),
+                Err(_) => tracing::warn!(ws, "warm_models: LLM warm probe timed out (cold)"),
+            }
+        }
         Ok(())
     }
 
