@@ -223,6 +223,23 @@ pub fn requires_max_completion_tokens(name: &str) -> bool {
         || lower.starts_with("o4")
 }
 
+/// Output-token cap for the simple Q&A `chat()` path (ask synthesis, dream,
+/// predict, consolidation, react, root-function `ctx.llm`). Distinct from
+/// `model_max_output_tokens` (the model CAPABILITY, which also drives extraction
+/// batch sizing and must stay high). Azure estimates a request's TPM cost as
+/// `prompt + max_tokens`, so advertising the full 32k capability on every short
+/// answer made ~7 asks/min exhaust the 250k-TPM deployment → throttling →
+/// requests hang to the timeout → the front-door proxy disconnects. An answer
+/// never needs 32k tokens; 4k (~3000 words) is ample and keeps the TPM estimate
+/// honest. Extraction is untouched (it uses `chat_with_tools`, not `chat`).
+pub const CHAT_ANSWER_MAX_TOKENS: i32 = 4_096;
+
+/// The per-request output cap for a `chat()` answer: the smaller of the model's
+/// capability and [`CHAT_ANSWER_MAX_TOKENS`].
+pub fn chat_answer_cap(model_capability: i32) -> i32 {
+    model_capability.min(CHAT_ANSWER_MAX_TOKENS)
+}
+
 pub fn model_max_output_tokens(model: &str) -> i32 {
     let m = model.to_lowercase();
 
@@ -1134,6 +1151,10 @@ impl AzureProvider {
         // by model / deployment name so existing GPT-4.x callers are
         // unchanged.
         let uses_new_param = self.uses_new_completion_param;
+        // Cap the answer size (not the model capability) so a short Q&A doesn't
+        // advertise the full 32k against Azure's TPM estimate and throttle the
+        // deployment — see `chat_answer_cap`.
+        let answer_cap = chat_answer_cap(self.max_output_tokens);
         let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
@@ -1142,9 +1163,9 @@ impl AzureProvider {
             "temperature": 0.1,
         });
         if uses_new_param {
-            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+            body["max_completion_tokens"] = serde_json::json!(answer_cap);
         } else {
-            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+            body["max_tokens"] = serde_json::json!(answer_cap);
         }
 
         let resp = self
