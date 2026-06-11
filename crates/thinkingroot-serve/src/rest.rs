@@ -7470,8 +7470,13 @@ async fn ask_handler(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0);
-                    if let Err(e) = graph.record_co_citation(&pairs, q, ts) {
-                        tracing::warn!("living-edges record failed (non-fatal): {e}");
+                    match graph.record_co_citation(&pairs, q, ts) {
+                        Ok(n) => {
+                            tracing::info!(pairs = n, "living-edges: reinforced co-citation edges")
+                        }
+                        Err(e) => {
+                            tracing::warn!("living-edges record failed (non-fatal): {e}")
+                        }
                     }
                 }
             }
@@ -7821,8 +7826,14 @@ async fn ask_stream_handler(
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs_f64())
                                     .unwrap_or(0.0);
-                                if let Err(e) = graph.record_co_citation(&pairs, q, ts) {
-                                    tracing::warn!("living-edges record failed (non-fatal): {e}");
+                                match graph.record_co_citation(&pairs, q, ts) {
+                                    Ok(n) => tracing::info!(
+                                        pairs = n,
+                                        "living-edges: reinforced co-citation edges"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        "living-edges record failed (non-fatal): {e}"
+                                    ),
                                 }
                             }
                         }
