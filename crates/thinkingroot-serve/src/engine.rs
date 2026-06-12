@@ -1750,14 +1750,28 @@ impl QueryEngine {
                 cache.entity_count()
             );
         }
-        let llm = match thinkingroot_llm::llm::LlmClient::new(&config.llm).await {
-            Ok(client) => {
-                tracing::debug!("LLM client initialised for workspace '{name}'");
-                Some(Arc::new(client))
-            }
-            Err(e) => {
-                tracing::debug!("LLM not configured for workspace '{name}' (non-fatal): {e}");
-                None
+        // Reuse the already-warm LLM client across remounts (e.g. the
+        // post-compile cache reload). The client is a stateless HTTP wrapper
+        // keyed only on provider config — it does not depend on the compiled
+        // graph — so rebuilding it on every remount just discards a warm Azure
+        // connection and forces the next /ask (especially /ask/stream) to pay a
+        // cold reconnect, which is the dominant cause of the first-request
+        // stall and the streaming "single claim" fallback. Provider/config
+        // changes arrive via a fresh container spawn, not a remount, so keeping
+        // the existing client here is safe.
+        let llm = if let Some(existing) = self.workspaces.get(&name).and_then(|h| h.llm.clone()) {
+            tracing::debug!("LLM client reused (warm) for workspace '{name}' on remount");
+            Some(existing)
+        } else {
+            match thinkingroot_llm::llm::LlmClient::new(&config.llm).await {
+                Ok(client) => {
+                    tracing::debug!("LLM client initialised for workspace '{name}'");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::debug!("LLM not configured for workspace '{name}' (non-fatal): {e}");
+                    None
+                }
             }
         };
 
