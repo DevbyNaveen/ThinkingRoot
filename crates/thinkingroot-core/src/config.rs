@@ -474,7 +474,14 @@ pub struct CompilationConfig {
 }
 
 fn default_auto_sync_enabled() -> bool {
-    true
+    // Default OFF. Auto-sync recompiles on any workspace-tree write — but a
+    // compile itself writes into the workspace (schema migrations, vectors.bin
+    // re-quantization, structural persist), which the watcher then sees as a
+    // "source change", recompiling again → a self-sustaining loop (observed in
+    // cloud: ~2 compiles/sec with no user activity, flooding the activity log).
+    // Live-sync is an opt-in convenience (`auto_sync = true` in `[compilation]`),
+    // not a safe default. Explicit `root compile` / `--watch` are unaffected.
+    false
 }
 
 impl Default for CompilationConfig {

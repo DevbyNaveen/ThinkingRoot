@@ -337,9 +337,11 @@ mod tests {
     use thinkingroot_core::config::CompilationConfig;
 
     #[test]
-    fn compilation_config_defaults_auto_sync_on() {
+    fn compilation_config_defaults_auto_sync_off() {
+        // Auto-sync defaults OFF — it self-loops in the cloud (compile writes
+        // into the watched workspace → watcher recompiles → ∞). Opt in explicitly.
         let c = CompilationConfig::default();
-        assert!(c.auto_sync);
+        assert!(!c.auto_sync);
         assert_eq!(
             c.effective_auto_sync_debounce_ms(200),
             200,
