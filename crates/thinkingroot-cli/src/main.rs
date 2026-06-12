@@ -3058,6 +3058,7 @@ async fn run_query_llm(path: &PathBuf, query: &str, date: Option<&str>) -> anyho
         identity: identity_owned.as_ref(),
         today: Some(&today_iso),
         history: thinkingroot_serve::intelligence::synthesizer::NO_HISTORY,
+        persona_override: None,
     };
 
     let spinner_msg = format!(

@@ -390,6 +390,7 @@ pub async fn run_eval(
             identity: None,
             today: None,
             history: thinkingroot_serve::intelligence::synthesizer::NO_HISTORY,
+            persona_override: None,
         };
         let response = ask(&engine, synthesis_llm.clone(), &ask_req).await;
         let predicted = response.answer;
