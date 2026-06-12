@@ -458,6 +458,161 @@ pub fn spawn_retrieval_prior_trainer(workspace_root: PathBuf) -> JoinHandle<()> 
     spawn_periodic_task(task)
 }
 
+/// LLM keep-warm pinger — the `/ask` cold-start fix (#1 launch blocker).
+///
+/// The FIRST Azure `gpt-4.1-mini` request after idle pays a ~30-80s
+/// cold-connection/routing stall (measured): the engine warms its ONNX embed +
+/// rerank on boot/mount, but the LLM HTTPS connection goes cold during any gap,
+/// and a CRIU restore freezes/kills the existing connection entirely. A cold
+/// first `/ask` then hangs to the synthesizer timeout and the front-door proxy
+/// disconnects. This task keeps the route + connection warm so the user's `/ask`
+/// is never the cold call: it fires a tiny `llm.chat` probe per mounted
+/// workspace on a fixed cadence.
+struct KeepWarmTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for KeepWarmTask {
+    fn name(&self) -> &'static str {
+        "llm_keep_warm"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        // Clone each mounted workspace's LLM client out under a SHORT read lock,
+        // then drop the lock before any network call. Never hold the engine lock
+        // across a multi-second probe — it would block mounts/writes for the
+        // whole process.
+        let clients: Vec<(String, Arc<thinkingroot_llm::llm::LlmClient>)> = {
+            let eng = self.engine.read().await;
+            eng.mounted_workspace_names()
+                .into_iter()
+                .filter_map(|ws| eng.workspace_llm(&ws).map(|c| (ws, c)))
+                .collect()
+        };
+        if clients.is_empty() {
+            return Ok(());
+        }
+        for (ws, llm) in clients {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(20),
+                llm.chat("You are a warm-up probe.", "Reply with: ok"),
+            )
+            .await;
+            match probe {
+                Ok(Ok(_)) => tracing::debug!(ws = %ws, "keep-warm: LLM connection kept warm"),
+                Ok(Err(e)) => tracing::warn!(ws = %ws, "keep-warm: probe error: {e}"),
+                Err(_) => {
+                    tracing::warn!(ws = %ws, "keep-warm: probe timed out (connection was cold)")
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the LLM keep-warm pinger. Gated on `TR_LLM_KEEPWARM` (the cloud
+/// provisioner sets `=1`); OFF by default so desktop/CLI users never pay
+/// periodic LLM tokens. `TR_LLM_KEEPWARM_SECS` (default 45) sets the cadence —
+/// kept below the typical idle window so the connection never goes cold during
+/// an active session.
+pub fn spawn_keep_warm(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_LLM_KEEPWARM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let interval_secs = std::env::var("TR_LLM_KEEPWARM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(KeepWarmTask {
+        engine,
+        interval: Duration::from_secs(interval_secs.max(10)),
+    });
+    spawn_periodic_task(task)
+}
+
+/// Living Engram (Build 1) — idle decay of usage-learned associative edges.
+/// Multiplicatively pulls every edge toward a non-zero floor each run
+/// (`w ← floor + (w − floor)·factor`), so unused associations fade while a
+/// dormant edge stays recoverable. Reinforcement is event-driven (at answer
+/// time, `record_co_citation`); this is the time-driven other half. Pure CPU,
+/// no model. Mirrors the learn-to-rank trainer's open-from-disk shape.
+struct LivingEdgesDecayTask {
+    workspace_root: PathBuf,
+    factor: f64,
+    floor: f64,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for LivingEdgesDecayTask {
+    fn name(&self) -> &'static str {
+        "living_edges_decay"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let graph_dir = self.workspace_root.join(".thinkingroot").join("graph");
+        if !graph_dir.exists() {
+            return Ok(());
+        }
+        let (factor, floor, dir) = (self.factor, self.floor, graph_dir.clone());
+        // CozoDB work is sync — keep it off the async core.
+        let decayed = tokio::task::spawn_blocking(move || {
+            let graph = thinkingroot_graph::graph::GraphStore::init(&dir)?;
+            graph.decay_assoc_edges(factor, floor)
+        })
+        .await
+        .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("decay join: {e}")))??;
+        if decayed > 0 {
+            tracing::info!(decayed, "living-edges decay pass");
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the Living Engram edge-decay job. Gated on `TR_LIVING_EDGES` (the same
+/// switch that enables co-citation reinforcement + associative recall) so it is
+/// a true no-op until the feature is turned on after eval. Defaults give a
+/// ~14-day half-life when run daily: `TR_LIVING_EDGES_DECAY_FACTOR` (0.95),
+/// `TR_LIVING_EDGES_FLOOR` (0.02), `TR_LIVING_EDGES_DECAY_SECS` (86400).
+pub fn spawn_living_edges_decay(workspace_root: PathBuf) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_LIVING_EDGES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let factor = std::env::var("TR_LIVING_EDGES_DECAY_FACTOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.95f64);
+    let floor = std::env::var("TR_LIVING_EDGES_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.02f64);
+    let interval_secs = std::env::var("TR_LIVING_EDGES_DECAY_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86_400u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(LivingEdgesDecayTask {
+        workspace_root,
+        factor,
+        floor,
+        interval: Duration::from_secs(interval_secs.max(60)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Single cleanup pass. Exposed for tests.
 ///
 /// When `branch_engines` is provided, the cache is invalidated before each

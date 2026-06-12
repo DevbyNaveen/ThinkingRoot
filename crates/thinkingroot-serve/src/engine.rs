@@ -185,6 +185,37 @@ pub struct SleepReport {
     pub stale_expired: usize,
 }
 
+/// §11 #26 — outcome of a Night Shift dream pass (generative abstraction in a
+/// quarantined branch, verify-before-merge).
+#[derive(Debug, Clone, Serialize)]
+pub struct DreamReport {
+    /// Insight/playbook claims synthesized this pass.
+    pub insights: usize,
+    /// The quarantined dream branch they were written to (empty if none).
+    pub branch: String,
+    /// Whether the dream was merged into main (else kept on the branch for review).
+    pub merged: bool,
+    /// Honest note (why nothing dreamed, what was kept/discarded).
+    pub note: String,
+}
+
+/// §1 — outcome of a grounded `predict` ("what happens next"). Verified-or-
+/// silent: `refused` when there's no basis or no grounded citation.
+#[derive(Debug, Clone, Serialize)]
+pub struct PredictReport {
+    /// The grounded prediction text (with inline `[claim:id]` citations), or
+    /// empty when refused.
+    pub prediction: String,
+    /// Model-stated confidence 0..=1 (0 when refused).
+    pub confidence: f64,
+    /// Recalled claim ids the prediction is grounded in (the falsifier set).
+    pub citations: Vec<String>,
+    /// True when the prediction was withheld (no evidence / no grounded cite).
+    pub refused: bool,
+    /// Honest note.
+    pub note: String,
+}
+
 /// P2 — the being's HONEST developmental age. Every field is a real measured
 /// signal; `developmental_age` is a function of verified capability + knowledge +
 /// reconciliations, NOT wall-clock uptime (the research keystone: "age = verified
@@ -940,6 +971,25 @@ pub struct FnCapabilities {
     /// configured (`mcp-servers.toml`).
     mcp: Arc<crate::mcp::external_registry::ExternalMcpRegistry>,
     caps: CapSet,
+    /// A2 — branch-scoped invoke. When set, `memory.remember` writes its
+    /// claim into THIS branch's graph (a copy-on-write clone of main at
+    /// fork) instead of main, so a function's cognitive side effects are
+    /// quarantined for verify-before-keep (forge) and dreaming. `None` =
+    /// write to main (the default; fully backward compatible).
+    target_branch: Option<String>,
+}
+
+/// A2 — options for a branch-scoped Root Function invocation.
+/// `default()` (no branch, no dry-run) reproduces the original invoke
+/// behavior exactly.
+#[derive(Debug, Clone, Default)]
+pub struct InvokeBranchOpts {
+    /// Route this run's `memory.remember` writes to this branch (forked
+    /// from main if absent). The caller later merges or abandons it.
+    pub target_branch: Option<String>,
+    /// Run on a fresh ephemeral branch that is abandoned after the run —
+    /// a true dry run (side effects happen in isolation, then vanish).
+    pub dry_run: bool,
 }
 
 impl FnCapabilities {
@@ -951,7 +1001,14 @@ impl FnCapabilities {
         caps: CapSet,
     ) -> Self {
         let root_path = handle.root_path.clone();
-        Self { handle, root_path, ws, run_id, mcp, caps }
+        Self { handle, root_path, ws, run_id, mcp, caps, target_branch: None }
+    }
+
+    /// A2 — route `memory.remember` writes to `branch`'s graph instead of
+    /// main. Builder so the (long) `new` call sites stay unchanged.
+    pub fn with_target_branch(mut self, branch: Option<String>) -> Self {
+        self.target_branch = branch;
+        self
     }
 
     /// `ctx.memory.recall(query, k)` — semantic recall scoped to this run's
@@ -1088,6 +1145,32 @@ impl FnCapabilities {
 
         let ctype = claim_type.to_string();
         let conf = confidence.clamp(0.0, 1.0);
+
+        // ── A2: branch-scoped write ──────────────────────────────────────
+        // When this run is branch-scoped, the claim lands on the branch's
+        // own `graph.db` (a CoW clone of main at fork) — NOT the mounted
+        // main storage, and NOT the main read cache. This is the engine's
+        // own branch-write path (identical to `contribute_bulk(branch=…)`):
+        // open the branch graph directly via `resolve_data_dir`. Vector
+        // indexing is deferred to compile/merge (same as contribute-bulk),
+        // so semantic recall of these claims is keyword/graph-only until
+        // the branch is compiled or merged — the graph write itself is
+        // durable and immediately recallable by traversal. We do NOT touch
+        // the main cache, so a concurrent main read never sees branch state.
+        if let Some(branch) = self.target_branch.as_deref() {
+            let branch_graph_dir =
+                thinkingroot_branch::snapshot::resolve_data_dir(&self.root_path, Some(branch))
+                    .join("graph");
+            let bg = thinkingroot_graph::graph::GraphStore::init(&branch_graph_dir)
+                .map_err(|e| Error::GraphStorage(format!("remember(branch={branch}): {e}")))?;
+            bg.insert_source(&source)?;
+            bg.insert_claim(&claim)?;
+            bg.link_claim_to_source(&claim.id.to_string(), &source.id.to_string())?;
+            let _ = ctype; // (parity with main path; branch write is graph-only)
+            let _ = conf;
+            return Ok(claim.id.to_string());
+        }
+
         {
             let mut storage = self.handle.storage.lock().await;
             storage.graph.insert_source(&source)?;
@@ -2990,6 +3073,26 @@ impl QueryEngine {
         self.run_function_with_id(ws, name, input, &run_id).await
     }
 
+    /// A2 — branch-scoped invoke. Same as `invoke_function` but the run's
+    /// `memory.remember` writes are quarantined to a branch:
+    ///   - `opts.target_branch = Some(b)` → writes land on branch `b`
+    ///     (forked from main if absent); the caller later merges or abandons.
+    ///   - `opts.dry_run = true` → writes land on a fresh ephemeral branch
+    ///     that is **abandoned after the run** (a true dry run: side effects
+    ///     happen in isolation, then vanish). Returns the output with
+    ///     `_branch` / `_dry_run` markers describing where writes went.
+    /// Backward compatible: `InvokeBranchOpts::default()` == plain invoke.
+    pub async fn invoke_function_with_opts(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        opts: InvokeBranchOpts,
+    ) -> Result<serde_json::Value> {
+        let run_id = ulid::Ulid::new().to_string();
+        self.run_function_with_id_opts(ws, name, input, &run_id, opts).await
+    }
+
     /// Function-INDEPENDENT shape of an input (top-level key set / scalar
     /// kind). The basis for routing: functions are comparable only across a
     /// shared, name-free class. Heuristic v1 (an LLM classifier is the upgrade).
@@ -3094,8 +3197,56 @@ impl QueryEngine {
         input: &serde_json::Value,
         run_id: &str,
     ) -> Result<serde_json::Value> {
+        self.run_function_with_id_opts(ws, name, input, run_id, InvokeBranchOpts::default())
+            .await
+    }
+
+    /// Branch-scoped variant of [`run_function_with_id`]. See
+    /// [`Self::invoke_function_with_opts`] for the branch semantics. With
+    /// `InvokeBranchOpts::default()` it is byte-for-byte the old behavior.
+    pub async fn run_function_with_id_opts(
+        &self,
+        ws: &str,
+        name: &str,
+        input: &serde_json::Value,
+        run_id: &str,
+        opts: InvokeBranchOpts,
+    ) -> Result<serde_json::Value> {
         use crate::root_function_runtime::RunOutcome;
         use thinkingroot_graph::root_function::{PendingRequest, RootFunctionRun};
+
+        // ── A2: resolve & prepare the write-target branch (if any) ────────
+        // dry_run with no explicit branch → a fresh ephemeral branch named
+        // for this run. Either way, fork it from main if it does not exist
+        // yet so the branch graph dir is present before the first remember.
+        let target_branch: Option<String> = if let Some(b) = opts.target_branch.clone() {
+            Some(b)
+        } else if opts.dry_run {
+            Some(format!("dryrun/{run_id}"))
+        } else {
+            None
+        };
+        if let Some(branch) = target_branch.as_deref() {
+            let handle = self.get_workspace(ws)?;
+            let exists = thinkingroot_branch::list_branches(&handle.root_path)
+                .map(|bs| bs.iter().any(|b| b.name == branch))
+                .unwrap_or(false);
+            if !exists {
+                thinkingroot_branch::create_branch(
+                    &handle.root_path,
+                    branch,
+                    "main",
+                    Some(format!(
+                        "{} branch for root function '{}' (run {})",
+                        if opts.dry_run { "ephemeral dry-run" } else { "scoped" },
+                        name,
+                        run_id
+                    )),
+                )
+                .await
+                .map_err(|e| Error::Config(format!("branch-scoped invoke: fork failed: {e}")))?;
+            }
+        }
 
         let func = self
             .get_function(ws, name)
@@ -3189,13 +3340,10 @@ impl QueryEngine {
                     }
                 }
             };
-            std::sync::Arc::new(FnCapabilities::new(
-                handle,
-                ws.to_string(),
-                run_id.to_string(),
-                mcp,
-                cap_set,
-            ))
+            std::sync::Arc::new(
+                FnCapabilities::new(handle, ws.to_string(), run_id.to_string(), mcp, cap_set)
+                    .with_target_branch(target_branch.clone()),
+            )
         };
         let (outcome, new_steps, new_pending, new_cites) =
             crate::root_function_runtime::run_js_journaled(
@@ -3301,6 +3449,44 @@ impl QueryEngine {
                     "read",
                 );
             }
+        }
+
+        // ── A2: branch teardown + result markers ──────────────────────────
+        if let Some(branch) = target_branch.as_deref() {
+            let handle = self.get_workspace(ws)?;
+            // Honest "what landed on the branch" = the diff this branch would
+            // contribute back to main (best-effort; 0 if the diff can't be
+            // computed). Computed BEFORE any dry-run cleanup.
+            let claims_written = thinkingroot_branch::dry_run_merge_into(
+                &handle.root_path,
+                branch,
+                "main",
+                false,
+            )
+            .await
+            .map(|d| d.new_claims.len())
+            .unwrap_or(0);
+
+            if opts.dry_run {
+                // True dry run: discard the ephemeral branch and its writes.
+                // Best-effort — a failed cleanup must not fail an
+                // already-completed invocation.
+                if let Err(e) = thinkingroot_branch::delete_branch(&handle.root_path, branch) {
+                    tracing::warn!(branch, error = %e, "dry-run: ephemeral branch cleanup failed");
+                }
+            }
+
+            // Annotate the result (objects only — scalars/arrays are returned
+            // verbatim so a function's output contract is never reshaped).
+            return match ret {
+                Ok(serde_json::Value::Object(mut map)) => {
+                    map.insert("_branch".into(), serde_json::json!(branch));
+                    map.insert("_dry_run".into(), serde_json::json!(opts.dry_run));
+                    map.insert("_claims_written".into(), serde_json::json!(claims_written));
+                    Ok(serde_json::Value::Object(map))
+                }
+                other => other,
+            };
         }
 
         ret
@@ -4940,6 +5126,162 @@ side referenced. Strict rules:\n\
         })
     }
 
+    /// §11 #26 — Night Shift DREAM: generative abstraction. Synthesize
+    /// higher-level insights/playbooks from existing claims using the
+    /// workspace's OWN LLM (customer's model — not a new neural model), write
+    /// them to a QUARANTINED dream branch (A2 isolation), then verify-before-
+    /// merge into main (`auto_merge`) or leave them on the branch for review.
+    /// The novel part vs opaque consumer "dreaming": branch-quarantined +
+    /// merge-gated + provenance-tracked (`dream://`). Honest: too-few-claims or
+    /// no-insight passes return a no-op report, never fabricated rows.
+    pub async fn dream(
+        &self,
+        ws: &str,
+        max_claims: usize,
+        max_insights: usize,
+        auto_merge: bool,
+        sessions: &crate::intelligence::session::SessionStore,
+    ) -> Result<DreamReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!("workspace '{ws}' has no LLM configured — cannot dream"))
+        })?;
+        let handle = self.get_workspace(ws)?;
+        let root = handle.root_path.clone();
+
+        // Sample claim statements from the read cache (cheap; the dream
+        // abstracts over what's already there).
+        let claims: Vec<String> = {
+            let cache = handle.cache.read().await;
+            cache
+                .all_claims()
+                .filter(|c| !c.statement.trim().is_empty())
+                .take(max_claims.clamp(1, 200))
+                .map(|c| c.statement.clone())
+                .collect()
+        };
+        if claims.len() < 3 {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "not enough claims to dream over (need ≥3)".to_string(),
+            });
+        }
+
+        // Generative abstraction via the workspace LLM.
+        let prompt = crate::intelligence::dream::build_dream_prompt(&claims);
+        let out = llm.chat(crate::intelligence::dream::DREAM_SYSTEM, &prompt).await?;
+        let insights =
+            crate::intelligence::dream::parse_dream_insights(&out, max_insights.clamp(1, 20));
+        if insights.is_empty() {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "no insights synthesized this pass".to_string(),
+            });
+        }
+
+        // Quarantined dream branch (A2 isolation).
+        let branch = format!("dream/{}", ulid::Ulid::new());
+        thinkingroot_branch::create_branch(
+            &root,
+            &branch,
+            "main",
+            Some("night-shift dream — quarantined generative abstraction".to_string()),
+        )
+        .await
+        .map_err(|e| Error::Config(format!("dream: fork failed: {e}")))?;
+
+        // Write the insights to the dream branch (quarantined), tagged as
+        // dream-derived so provenance is honest.
+        let agent_claims: Vec<AgentClaim> = insights
+            .iter()
+            .map(|s| AgentClaim {
+                statement: s.clone(),
+                claim_type: "insight".to_string(),
+                confidence: Some(0.6),
+                entities: vec![],
+            })
+            .collect();
+        let idem = format!("dream:{branch}");
+        let principal =
+            Principal::Connector { connector_id: "dream".to_string(), install_id: "night".to_string() };
+        self.contribute_bulk(ws, &idem, Some(&branch), agent_claims, sessions, principal, &idem, false)
+            .await?;
+
+        // Verify-before-merge: merge the dream into main (kept) or leave it for
+        // review (discard = the branch simply isn't merged).
+        let merged = if auto_merge {
+            let merged_by =
+                thinkingroot_core::MergedBy::Agent { agent_id: format!("dream:{branch}") };
+            self.merge_branch(&root, &branch, false, false, merged_by).await.is_ok()
+        } else {
+            false
+        };
+
+        Ok(DreamReport {
+            insights: insights.len(),
+            branch,
+            merged,
+            note: if merged {
+                "insights merged into main".to_string()
+            } else {
+                "insights kept on the dream branch (review before merge)".to_string()
+            },
+        })
+    }
+
+    /// §1 — the `predict` verb ("what happens next"), grounded + falsifier-gated.
+    /// Recall claims relevant to the question, ask the WORKSPACE LLM (customer's
+    /// model — NOT the excluded generative adapter) to infer the next outcome
+    /// ONLY from those claims, then enforce verified-or-silent: refuse when
+    /// there's no relevant memory, the model declines, or the prediction cites
+    /// no recalled claim (the falsifier gate). Never prophesies unbacked.
+    pub async fn predict(&self, ws: &str, question: &str, top_k: usize) -> Result<PredictReport> {
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!("workspace '{ws}' has no LLM configured — cannot predict"))
+        })?;
+        let empty = std::collections::HashSet::new();
+        let res = self.search_scoped(ws, question, top_k.clamp(1, 50), &empty).await?;
+        let claims: Vec<(String, String)> =
+            res.claims.iter().map(|c| (c.id.clone(), c.statement.clone())).collect();
+        let refused = |note: &str| PredictReport {
+            prediction: String::new(),
+            confidence: 0.0,
+            citations: vec![],
+            refused: true,
+            note: note.to_string(),
+        };
+        if claims.is_empty() {
+            return Ok(refused("no relevant memory to predict from"));
+        }
+
+        let prompt = crate::intelligence::predict::build_predict_prompt(question, &claims);
+        let out = llm.chat(crate::intelligence::predict::PREDICT_SYSTEM, &prompt).await?;
+        if crate::intelligence::predict::is_refusal(&out) {
+            return Ok(refused("insufficient evidence to predict"));
+        }
+        // Falsifier gate: the prediction must cite a RECALLED claim.
+        let recalled: std::collections::HashSet<&str> =
+            claims.iter().map(|(id, _)| id.as_str()).collect();
+        let grounded: Vec<String> = crate::intelligence::citations::parse_all_markers(&out)
+            .into_iter()
+            .filter(|id| recalled.contains(id.as_str()))
+            .collect();
+        if grounded.is_empty() {
+            return Ok(refused("prediction had no grounded citation — withheld"));
+        }
+        let confidence = crate::intelligence::predict::parse_confidence(&out).unwrap_or(0.5);
+        Ok(PredictReport {
+            prediction: out.trim().to_string(),
+            confidence,
+            citations: grounded,
+            refused: false,
+            note: "grounded prediction".to_string(),
+        })
+    }
+
     /// P2 — the being's HONEST developmental age (see [`AgeReport`]): verified
     /// capability mass (Σ Wilson over learned experience) + knowledge breadth +
     /// reconciliations, mapped to a coarse life stage. Pure counts, no embedder.
@@ -6282,6 +6624,74 @@ Rules: \
         .await
     }
 
+    /// §6 multimodal (Phase 1) — caption an image with the workspace's vision
+    /// LLM, then run the caption through the EXISTING extraction pipeline so
+    /// an image's factual content becomes canonical text claims (text claims
+    /// canonical; visual embeddings are a later recall-only index). No new
+    /// models — uses the customer's configured (Azure) vision-capable model,
+    /// exactly like `ctx.llm`.
+    ///
+    /// Visual provenance: the claims attach to a source derived from the
+    /// image's content hash (`image:<blake3>`), so every claim traces back to
+    /// the exact image bytes it was read from. (Structured bbox/`SourceMetadata`
+    /// provenance is the documented follow-up.)
+    ///
+    /// Returns `(caption, contribute_result, image_sha256)`. Empty/garbage
+    /// input or an LLM without vision support surfaces an honest error — never
+    /// a fabricated claim.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn caption_and_contribute(
+        &self,
+        ws: &str,
+        image_bytes: &[u8],
+        media_type: &str,
+        instruction: Option<&str>,
+        branch: Option<&str>,
+        sessions: &crate::intelligence::session::SessionStore,
+        principal: Principal,
+        idempotency_key: &str,
+    ) -> Result<(String, ContributeResult, String)> {
+        if image_bytes.is_empty() {
+            return Err(Error::Config("caption_and_contribute: empty image".into()));
+        }
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!(
+                "workspace '{ws}' has no LLM configured — cannot caption images"
+            ))
+        })?;
+
+        let sha = blake3::hash(image_bytes).to_hex().to_string();
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(image_bytes)
+        };
+        let instr = instruction.unwrap_or(
+            "Describe this image's factual content in clear declarative sentences for knowledge \
+             extraction. Transcribe any visible text verbatim.",
+        );
+
+        let caption = llm.caption_image(instr, &b64, media_type).await?;
+        if caption.trim().is_empty() {
+            return Err(Error::Config(
+                "vision LLM returned an empty caption (no extractable content)".into(),
+            ));
+        }
+
+        // Provenance: source id derives from the image hash, so claims are
+        // traceable to the exact bytes. Idempotency is keyed on the image
+        // (re-ingesting the same image is a no-op via contribute_bulk).
+        let session_id = format!("image:{sha}");
+        let idem = if idempotency_key.is_empty() {
+            format!("image:{sha}")
+        } else {
+            idempotency_key.to_string()
+        };
+        let result = self
+            .extract_and_contribute(ws, &caption, branch, &session_id, sessions, principal, &idem)
+            .await?;
+        Ok((caption, result, sha))
+    }
+
     /// C1 — consolidation. Scans the durable (main) graph entity-by-entity and
     /// uses the workspace LLM to detect SUPERSESSIONS within each entity's claim
     /// cluster (a newer fact that replaces an older one about the SAME attribute
@@ -6700,6 +7110,38 @@ Rules: \
                     out
                 });
                 warnings.extend(vwarn);
+
+                // §11 A7-SEC ⑤ — write-time anomaly detection (AgentPoison
+                // defense), opt-in via TR_WRITE_ANOMALY. Poison injections
+                // cluster tightly in embedding space; flag a tight cluster in
+                // this batch as a memory-poisoning signal (warn-only — never
+                // blocks the write, so a false positive can't lose data; pairs
+                // with trust-aware retrieval ② which can demote flagged tiers).
+                if std::env::var("TR_WRITE_ANOMALY").map(|v| v == "1" || v == "true").unwrap_or(false)
+                    && agent_claims.len() >= 3
+                {
+                    let stmts: Vec<&str> =
+                        agent_claims.iter().map(|c| c.statement.as_str()).collect();
+                    if let Ok(embs) = run_blocking(|| storage.vector.embed_texts(&stmts)) {
+                        let rep = crate::intelligence::write_anomaly::detect_write_anomaly(
+                            &embs, 0.97, 3,
+                        );
+                        if rep.anomalous {
+                            tracing::warn!(
+                                source = %source_uri,
+                                cluster = rep.cluster.len(),
+                                mean_sim = rep.mean_pairwise_sim,
+                                "A7-SEC write anomaly: tight embedding cluster (possible poison)"
+                            );
+                            warnings.push(format!(
+                                "write-anomaly: {} of {} claims form a tight embedding cluster \
+                                 (possible memory-poisoning injection) — flagged for review",
+                                rep.cluster.len(),
+                                agent_claims.len()
+                            ));
+                        }
+                    }
+                }
             }
 
             // Skip per-claim rooting in backfill mode — the
@@ -8095,6 +8537,28 @@ Rules: \
         self.workspaces.get(ws).and_then(|h| h.llm.clone())
     }
 
+    /// Names of all currently-mounted workspaces. Cheap (just the map keys) —
+    /// used by the LLM keep-warm pinger (`maintenance::spawn_keep_warm`) to
+    /// enumerate which workspaces to probe without taking the heavier
+    /// `list_workspaces` path (which computes per-workspace counts).
+    pub fn mounted_workspace_names(&self) -> Vec<String> {
+        self.workspaces.keys().cloned().collect()
+    }
+
+    /// A7-SEC ③ — fetch the STORED embedding for each claim id (vector key
+    /// `claim:{id}`) from the workspace vector index. Read-only and NO embedding
+    /// is computed (latency-safe for the read path); `None` for a claim with no
+    /// stored vector or an unmounted workspace.
+    pub async fn get_claim_embeddings(&self, ws: &str, ids: &[String]) -> Vec<Option<Vec<f32>>> {
+        let Some(handle) = self.workspaces.get(ws) else {
+            return vec![None; ids.len()];
+        };
+        let storage = handle.storage.lock().await;
+        ids.iter()
+            .map(|id| storage.vector.get_embedding(&format!("claim:{id}")))
+            .collect()
+    }
+
     /// Return the `StreamsConfig` for a workspace (controls auto_session_branch, etc.).
     pub fn workspace_streams_config(
         &self,
@@ -8207,6 +8671,24 @@ Rules: \
         })
         .await
         .map_err(|e| Error::Config(format!("warm_models task panicked: {e}")))??;
+
+        // Warm the LLM HTTPS connection too. The FIRST Azure request after idle
+        // pays a ~30s cold-connection/routing stall (measured); paying it HERE
+        // (boot / warm-on-mount) keeps it off the user's first `/ask`, which
+        // otherwise hangs to the synthesizer timeout and the proxy disconnects.
+        // Best-effort: a failed/slow probe must never block the mount.
+        if let Some(llm) = self.workspace_llm(ws) {
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(40),
+                llm.chat("You are a warm-up probe.", "Reply with: ok"),
+            )
+            .await;
+            match probe {
+                Ok(Ok(_)) => tracing::info!(ws, "warm_models: LLM connection warmed"),
+                Ok(Err(e)) => tracing::warn!(ws, "warm_models: LLM warm probe error: {e}"),
+                Err(_) => tracing::warn!(ws, "warm_models: LLM warm probe timed out (cold)"),
+            }
+        }
         Ok(())
     }
 

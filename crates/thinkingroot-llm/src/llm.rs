@@ -223,6 +223,23 @@ pub fn requires_max_completion_tokens(name: &str) -> bool {
         || lower.starts_with("o4")
 }
 
+/// Output-token cap for the simple Q&A `chat()` path (ask synthesis, dream,
+/// predict, consolidation, react, root-function `ctx.llm`). Distinct from
+/// `model_max_output_tokens` (the model CAPABILITY, which also drives extraction
+/// batch sizing and must stay high). Azure estimates a request's TPM cost as
+/// `prompt + max_tokens`, so advertising the full 32k capability on every short
+/// answer made ~7 asks/min exhaust the 250k-TPM deployment → throttling →
+/// requests hang to the timeout → the front-door proxy disconnects. An answer
+/// never needs 32k tokens; 4k (~3000 words) is ample and keeps the TPM estimate
+/// honest. Extraction is untouched (it uses `chat_with_tools`, not `chat`).
+pub const CHAT_ANSWER_MAX_TOKENS: i32 = 4_096;
+
+/// The per-request output cap for a `chat()` answer: the smaller of the model's
+/// capability and [`CHAT_ANSWER_MAX_TOKENS`].
+pub fn chat_answer_cap(model_capability: i32) -> i32 {
+    model_capability.min(CHAT_ANSWER_MAX_TOKENS)
+}
+
 pub fn model_max_output_tokens(model: &str) -> i32 {
     let m = model.to_lowercase();
 
@@ -535,7 +552,44 @@ enum Provider {
     StructuralOnly,
 }
 
+/// §6 multimodal — build the OpenAI/Azure-style `messages` array for a vision
+/// captioning request: a factual-describer system prompt + a `user` message
+/// whose content is an array of a text instruction and an `image_url` data
+/// URL. Pure (no I/O) so the wire shape is unit-testable without a network.
+fn vision_messages(instruction: &str, image_b64: &str, media_type: &str) -> serde_json::Value {
+    let data_url = format!("data:{media_type};base64,{image_b64}");
+    serde_json::json!([
+        {
+            "role": "system",
+            "content": "You are a precise vision describer. In clear declarative sentences, state \
+                        only what is visibly present in the image — objects, text, people, layout, \
+                        readings, relationships. Do not speculate or infer beyond what is shown. \
+                        Output plain prose suitable for fact extraction."
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }
+    ])
+}
+
 impl Provider {
+    /// §6 — dispatch image captioning. Vision is currently implemented only on
+    /// the Azure provider (the live deployment); every other provider returns
+    /// an honest, non-fabricating error rather than silently degrading.
+    async fn caption(&self, instruction: &str, image_b64: &str, media_type: &str) -> Result<String> {
+        match self {
+            Provider::Azure(p) => p.caption(instruction, image_b64, media_type).await,
+            _ => Err(thinkingroot_core::Error::MissingConfig(format!(
+                "image captioning is supported only on the Azure provider (configured: {})",
+                self.provider_name()
+            ))),
+        }
+    }
+
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
         match self {
             Provider::Bedrock(p) => p.chat(system, user).await,
@@ -1039,6 +1093,55 @@ impl AzureProvider {
         })
     }
 
+    /// §6 multimodal — caption an image via the Azure deployment's vision
+    /// chat/completions API. Builds an OpenAI-style multimodal `user` message
+    /// (text + `image_url` data URL) and returns the model's description.
+    /// The deployment must back a vision-capable model (gpt-4o / gpt-4.1 / …);
+    /// a non-vision deployment surfaces a 400 as `Error::LlmProvider`. The
+    /// proven text `chat` path above is deliberately left untouched.
+    async fn caption(&self, instruction: &str, image_b64: &str, media_type: &str) -> Result<String> {
+        let mut body = serde_json::json!({
+            "messages": vision_messages(instruction, image_b64, media_type),
+            "temperature": 0.1,
+        });
+        if self.uses_new_completion_param {
+            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
+            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+        }
+
+        let resp = self
+            .client
+            .post(&self.endpoint_url)
+            .header("api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::LlmProvider { provider: "azure".into(), message: e.to_string() })?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs * 1000)
+                .unwrap_or(0);
+            return Err(Error::RateLimited { provider: "azure".into(), retry_after_ms: retry_after });
+        }
+        let json: serde_json::Value =
+            resp.json().await.map_err(|e| Error::LlmProvider {
+                provider: "azure".into(),
+                message: e.to_string(),
+            })?;
+        json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::LlmProvider {
+                provider: "azure".into(),
+                message: format!("unexpected caption response: {json}"),
+            })
+    }
+
     async fn chat(&self, system: &str, user: &str) -> Result<ChatOutput> {
         // Azure AOAI: no `model` field in body — deployment is in the URL.
         //
@@ -1048,6 +1151,10 @@ impl AzureProvider {
         // by model / deployment name so existing GPT-4.x callers are
         // unchanged.
         let uses_new_param = self.uses_new_completion_param;
+        // Cap the answer size (not the model capability) so a short Q&A doesn't
+        // advertise the full 32k against Azure's TPM estimate and throttle the
+        // deployment — see `chat_answer_cap`.
+        let answer_cap = chat_answer_cap(self.max_output_tokens);
         let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": system},
@@ -1056,9 +1163,9 @@ impl AzureProvider {
             "temperature": 0.1,
         });
         if uses_new_param {
-            body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+            body["max_completion_tokens"] = serde_json::json!(answer_cap);
         } else {
-            body["max_tokens"] = serde_json::json!(self.max_output_tokens);
+            body["max_tokens"] = serde_json::json!(answer_cap);
         }
 
         let resp = self
@@ -3454,6 +3561,39 @@ impl LlmClient {
     /// Unlike `extract()`, this does NOT parse the response as knowledge JSON.
     /// Used by the ReAct synthesis layer to generate natural language answers
     /// from retrieved memory notes. Same retry/rate-limit behaviour as `extract`.
+    /// §6 multimodal — caption an image via the workspace's vision LLM.
+    /// `image_b64` is the base64 of the raw image bytes; `media_type` is its
+    /// MIME type (e.g. `"image/jpeg"`). Returns the model's plain-prose
+    /// description, ready to feed the existing extraction pipeline. One-shot
+    /// (no retry loop): a 429 or vision-unsupported error surfaces honestly to
+    /// the caller. Currently Azure-only (see [`Provider::caption`]).
+    pub async fn caption_image(
+        &self,
+        instruction: &str,
+        image_b64: &str,
+        media_type: &str,
+    ) -> Result<String> {
+        // Respect the rate-limit scheduler when configured (same admission
+        // control as `chat`), then run under the outer safety-net timeout.
+        let _ticket = match self.scheduler {
+            Some(ref sched) => Some(sched.wait_for_slot().await),
+            None => None,
+        };
+        let outer = outer_timeout_secs(self.timeout_secs);
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(outer),
+            self.provider.caption(instruction, image_b64, media_type),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(Error::LlmProvider {
+                provider: self.provider.provider_name().to_string(),
+                message: format!("image caption exceeded {outer}s outer timeout"),
+            }),
+        }
+    }
+
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         let max_rl_retries = self.max_retries * 2;
         let mut rl_attempts: u32 = 0;
@@ -5243,6 +5383,29 @@ mod tests {
             }
             _ => panic!("expected ToolCalls"),
         }
+    }
+
+    // ── §6 vision message shape ──────────────────────────────────
+
+    #[test]
+    fn vision_messages_emits_multimodal_user_content() {
+        let msgs = vision_messages("Describe this.", "QUJD", "image/png");
+        let arr = msgs.as_array().expect("messages is an array");
+        assert_eq!(arr.len(), 2, "system + user");
+        // System prompt anchors factual, non-speculative description.
+        assert_eq!(arr[0]["role"], "system");
+        assert!(arr[0]["content"].as_str().unwrap().contains("visibly present"));
+        // User content is a multimodal ARRAY (text + image_url), not a string.
+        assert_eq!(arr[1]["role"], "user");
+        let content = arr[1]["content"].as_array().expect("user content is an array");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Describe this.");
+        assert_eq!(content[1]["type"], "image_url");
+        // The image rides as a base64 data URL with the given MIME type.
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str().unwrap(),
+            "data:image/png;base64,QUJD"
+        );
     }
 
     // ── Bedrock shape (smithy Document round-trip) ──────────────

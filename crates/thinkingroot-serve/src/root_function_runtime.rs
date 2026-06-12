@@ -1530,6 +1530,7 @@ mod deno_tests {
             None,
             steps,
             5,
+            None,
         )
         .await;
         assert_eq!(outcome.done().expect("done"), serde_json::json!("from-journal"));
@@ -1546,6 +1547,7 @@ mod deno_tests {
             None,
             HashMap::new(),
             5,
+            None,
         )
         .await;
         assert_eq!(outcome.done().expect("done"), serde_json::json!({ "x": 1 }));
@@ -1568,6 +1570,7 @@ mod deno_tests {
             None,
             HashMap::new(),
             5,
+            None,
         )
         .await;
         let v1 = o1.done().expect("run1");
@@ -1581,6 +1584,7 @@ mod deno_tests {
             None,
             preload,
             5,
+            None,
         )
         .await;
         assert_eq!(v1, o2.done().expect("run2"), "replay must reproduce the journaled random");
@@ -1605,6 +1609,7 @@ mod deno_tests {
             None,
             steps,
             5,
+            None,
         )
         .await;
         assert_eq!(outcome.done().expect("done"), serde_json::json!({ "hi": 1 }));
@@ -1653,6 +1658,7 @@ mod deno_tests {
             None,
             HashMap::new(),
             5,
+            None,
         )
         .await;
         assert_eq!(outcome.done().expect("done"), serde_json::json!(1));
@@ -1672,6 +1678,7 @@ mod deno_tests {
             None,
             HashMap::new(),
             5,
+            None,
         )
         .await;
         assert!(outcome.is_suspended(), "expected Suspended, got {outcome:?}");
@@ -1696,6 +1703,7 @@ mod deno_tests {
             None,
             steps,
             5,
+            None,
         )
         .await;
         assert!(pending.is_empty(), "should not re-suspend once answered");

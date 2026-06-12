@@ -27,6 +27,7 @@ mod secrets_cmd;
 mod mcp_cmd;
 mod mcp_config;
 mod mount_cmd;
+mod otel;
 mod pack_cmd;
 mod pipeline;
 mod progress;
@@ -1617,12 +1618,10 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&default_directive));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .with_writer(std::io::stderr) // always write to stderr, never stdout
-        .init();
+    // stderr fmt (unchanged) + optional OTLP export to OpenObserve when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set (the provisioner sets it per engine);
+    // unset → stderr-only, zero cost. See `otel` module.
+    otel::init_tracing("tr-engine", filter);
 
     let in_process_flag = cli.in_process;
 

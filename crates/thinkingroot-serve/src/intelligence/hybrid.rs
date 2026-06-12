@@ -141,6 +141,11 @@ pub async fn hybrid_retrieve(
     // If the query names an entity, pull in claims reachable only through the
     // entity graph — facts that vector/keyword recall miss. Additive + bounded.
     let merged = expand_via_graph(&graph, merged, &parsed, &req);
+    // ---- Layer 4.5b: Living Engram associative recall (Build 2) ----
+    // Seed from the strongest DIRECT hits and pull in their usage-learned
+    // co-citation neighbours via `assoc_edges` — fires on ANY query (no entity
+    // name needed). Additive + bounded + gated TR_LIVING_EDGES.
+    let merged = expand_via_assoc_edges(&graph, merged);
     check_cancel(&cancel)?;
 
     // ---- Layer 5: structural enricher ----
@@ -172,6 +177,35 @@ pub async fn hybrid_retrieve(
     if trust_scoring_flag_on() {
         for (c, s, _) in scored.iter_mut() {
             *s *= trust_class_factor(c.trust_class);
+        }
+    }
+    // ---- Layer 6.1b: use-time consensus demotion (A7-SEC ③, flag-gated) ----
+    // A-MemGuard: among the recalled cohort, demote a LOW-TRUST claim that
+    // corroborates NO consensus (the signature of context-activated poison that
+    // rode a trigger query in). Uses STORED int8 vectors (no re-embed) so the
+    // read path stays within the 100ms budget; legit rare-but-true facts from
+    // trusted channels are outliers too but kept (only low-trust ones demote).
+    // OFF by default (TR_CONSENSUS).
+    if consensus_flag_on() && scored.len() >= 4 {
+        let ids: Vec<String> = scored.iter().map(|(c, _, _)| c.claim_id.clone()).collect();
+        let embs = engine.get_claim_embeddings(ws, &ids).await;
+        let mut idx_map: Vec<usize> = Vec::new();
+        let mut vecs: Vec<Vec<f32>> = Vec::new();
+        let mut low_trust: Vec<bool> = Vec::new();
+        for (i, e) in embs.into_iter().enumerate() {
+            if let Some(v) = e {
+                idx_map.push(i);
+                vecs.push(v);
+                low_trust.push(trust_class_factor(scored[i].0.trust_class) < 1.0);
+            }
+        }
+        let demote =
+            crate::intelligence::write_anomaly::consensus_demotions(&vecs, &low_trust, 0.85);
+        if !demote.is_empty() {
+            tracing::debug!(demoted = demote.len(), "A7-SEC consensus: demoted low-trust outliers");
+            for pos in demote {
+                scored[idx_map[pos]].1 *= 0.5;
+            }
         }
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -379,6 +413,25 @@ pub async fn hybrid_retrieve(
         });
     }
 
+    // ---- Layer 6.6: attractor abstain gate (Build 3) ----
+    // Pattern-completion's honesty half. Read the top-2 final scores (sorted
+    // desc) BEFORE the hit loop consumes `scored`: a weak best match or a
+    // no-clear-winner result emits a result-level LowConfidence caveat the
+    // synthesizer can act on. Never drops or reorders a hit. Gated
+    // TR_ATTRACTOR_ABSTAIN — a no-op (and zero env reads beyond the flag) off.
+    if attractor_abstain_on() && !scored.is_empty() {
+        let top = scored[0].1;
+        let runner = scored.get(1).map(|s| s.1).unwrap_or(0.0);
+        let floor = attractor_conf_floor();
+        let ambiguous = scored.len() >= 2 && (top - runner) < attractor_min_gap();
+        if top < floor || ambiguous {
+            redactions.push(RetrievalCaveat::LowConfidence {
+                measured: top,
+                threshold: floor,
+            });
+        }
+    }
+
     let mut junk_dropped = 0usize;
     for (c, fused, breakdown) in scored {
         // Sensitivity gate (Layer 9 — applied per-hit so we accumulate
@@ -464,6 +517,15 @@ pub async fn hybrid_retrieve(
     }
 
     let elapsed_ms = start.elapsed().as_secs_f32() * 1000.0;
+    // §8 — the read-path latency signal, emitted at INFO so it ships to the
+    // OTLP collector (OpenObserve) for the <100ms dashboard. One structured
+    // event per retrieval: total ms, hit count, and the routing shape taken.
+    tracing::info!(
+        elapsed_ms,
+        hits = hits.len(),
+        routing_shape = ?shape,
+        "retrieval_complete"
+    );
     Ok(HybridResponse {
         hits,
         redactions,
@@ -959,6 +1021,13 @@ fn trust_scoring_flag_on() -> bool {
         .unwrap_or(false)
 }
 
+/// A7-SEC ③ use-time consensus demotion (flag-gated, default off).
+fn consensus_flag_on() -> bool {
+    std::env::var("TR_CONSENSUS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// A7-SECURITY ② — per-channel demotion factors. PLACEHOLDERS pending the
 /// eval run (the ORDERING is the security design; the magnitudes are tuned):
 /// owner/keyed channels are never demoted; agent-generated and fetched-web —
@@ -1046,6 +1115,37 @@ fn dedup_scored_by_content(scored: &mut Vec<(EnrichedCandidate, f32, ScoreBreakd
 const GRAPH_EXPANSION_SEED_CAP: usize = 64;
 const GRAPH_EXPANSION_CLAIM_CAP: usize = 128;
 
+// Living Engram (Build 2) — associative-recall caps. Seed from the top direct
+// hits; inject a bounded number of usage-learned neighbours, attenuated so they
+// never outrank a direct hit before fuse-scoring.
+const ASSOC_SEED_CAP: usize = 8;
+const ASSOC_CLAIM_CAP: usize = 32;
+const ASSOC_MIN_WEIGHT: f64 = 0.1;
+const ASSOC_EXPANSION_WEIGHT: f32 = 0.3;
+
+// Living Engram (Build 3) — attractor-recall abstain gate. When ON, a weak best
+// match (top score < floor) or a no-clear-winner result (top−runner < min_gap,
+// the Hopfield spurious-minimum regime) surfaces a LowConfidence caveat so the
+// answer can abstain instead of confidently stitching an ambiguous result.
+// OFF by default; thresholds eval-tuned (fused scores are unnormalised).
+fn attractor_abstain_on() -> bool {
+    std::env::var("TR_ATTRACTOR_ABSTAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+fn attractor_conf_floor() -> f32 {
+    std::env::var("TR_ATTRACTOR_CONF_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.15)
+}
+fn attractor_min_gap() -> f32 {
+    std::env::var("TR_ATTRACTOR_MIN_GAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.05)
+}
+
 /// Layer 4.5 — GraphRAG expansion. When the query names a resolvable entity,
 /// walk `entity_relations` from it (spreading activation, multi-hop) and add
 /// the reached entities' claims as extra candidates, so retrieval can surface a
@@ -1118,6 +1218,52 @@ fn expand_via_graph(
                     break;
                 }
             }
+        }
+    }
+    merged
+}
+
+/// Layer 4.5b — Living Engram associative recall (Build 2). Unlike
+/// `expand_via_graph` (which needs the query to NAME an entity), this seeds from
+/// the strongest DIRECT hits already in the candidate pool and pulls in their
+/// usage-learned co-citation neighbours via `assoc_edges` — so "fire-together"
+/// memories surface on ANY query. Additive only (injected candidates carry an
+/// attenuated relevance so they never displace a direct hit before fuse-score)
+/// and gated `TR_LIVING_EDGES`. A no-op when the tenant has no learned edges, so
+/// an untrained tenant's recall is byte-identical to today.
+fn expand_via_assoc_edges(graph: &GraphStore, mut merged: Vec<Candidate>) -> Vec<Candidate> {
+    let on = std::env::var("TR_LIVING_EDGES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !on || merged.is_empty() {
+        return merged;
+    }
+    // Seed from the strongest direct hits.
+    let mut by_rel: Vec<&Candidate> = merged.iter().collect();
+    by_rel.sort_by(|a, b| {
+        b.vector_relevance
+            .partial_cmp(&a.vector_relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let seeds: Vec<String> = by_rel
+        .iter()
+        .take(ASSOC_SEED_CAP)
+        .map(|c| c.claim_id.clone())
+        .collect();
+    let neighbors = match graph.get_assoc_neighbors(&seeds, ASSOC_MIN_WEIGHT, ASSOC_CLAIM_CAP) {
+        Ok(n) => n,
+        Err(_) => return merged,
+    };
+    if neighbors.is_empty() {
+        return merged;
+    }
+    let mut seen: HashSet<String> = merged.iter().map(|c| c.claim_id.clone()).collect();
+    for (claim_id, weight) in neighbors {
+        if seen.insert(claim_id.clone()) {
+            merged.push(Candidate {
+                claim_id,
+                vector_relevance: weight * ASSOC_EXPANSION_WEIGHT,
+            });
         }
     }
     merged
