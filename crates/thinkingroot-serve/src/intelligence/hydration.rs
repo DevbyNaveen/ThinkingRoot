@@ -86,6 +86,83 @@ pub fn hydrate_answer(answer: &str, grounding: &[(String, String)]) -> Hydration
     }
 }
 
+/// Streaming counterpart to [`hydrate_answer`]. Feed it LLM chunks as they
+/// arrive; it returns the text safe to emit now — with completed `[claim:id]`
+/// markers rendered to their verbatim statement — and withholds any trailing
+/// PARTIAL marker until it completes (so a marker split across chunks is never
+/// shown half-rendered). Same insert-before-marker + de-dup semantics as the
+/// one-shot transform. Call [`finish`](Self::finish) once at end-of-stream.
+pub struct StreamingHydrator {
+    map: std::collections::HashMap<String, String>,
+    present: std::collections::HashSet<String>,
+    pending: String,
+    pub claims_rendered: usize,
+    pub output_tokens_saved: usize,
+}
+
+impl StreamingHydrator {
+    pub fn new(grounding: &[(String, String)]) -> Self {
+        Self {
+            map: grounding.iter().cloned().collect(),
+            present: std::collections::HashSet::new(),
+            pending: String::new(),
+            claims_rendered: 0,
+            output_tokens_saved: 0,
+        }
+    }
+
+    /// Push a streamed chunk; return the renderable text to emit now.
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        // Hold from a trailing unterminated '[' (a possible partial marker);
+        // flush everything before it. A complete `[...]` anywhere earlier is
+        // safe to render.
+        let flush_to = match self.pending.rfind('[') {
+            Some(open) if !self.pending[open..].contains(']') => open,
+            _ => self.pending.len(),
+        };
+        if flush_to == 0 {
+            return String::new();
+        }
+        let segment: String = self.pending.drain(..flush_to).collect();
+        self.render(&segment)
+    }
+
+    /// Flush any withheld tail at end-of-stream.
+    pub fn finish(&mut self) -> String {
+        let rest = std::mem::take(&mut self.pending);
+        self.render(&rest)
+    }
+
+    fn render(&mut self, segment: &str) -> String {
+        let mut out = String::with_capacity(segment.len());
+        let mut idx = 0usize;
+        while let Some(rel) = segment[idx..].find(MARKER_OPEN) {
+            let mstart = idx + rel;
+            let Some(close_rel) = segment[mstart..].find(']') else {
+                break; // push() withholds partial markers, so unreachable in practice
+            };
+            let mend = mstart + close_rel + 1;
+            let id = &segment[mstart + MARKER_OPEN.len()..mend - 1];
+            out.push_str(&segment[idx..mstart]);
+            if let Some(stmt) = self.map.get(id) {
+                let t = stmt.trim();
+                if !t.is_empty() && !self.present.contains(t) {
+                    out.push_str(t);
+                    out.push(' ');
+                    self.present.insert(t.to_string());
+                    self.claims_rendered += 1;
+                    self.output_tokens_saved += (t.len() + 1) / 4;
+                }
+            }
+            out.push_str(&segment[mstart..mend]); // keep the marker
+            idx = mend;
+        }
+        out.push_str(&segment[idx..]);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +229,47 @@ mod tests {
         let r = hydrate_answer("a plain answer with no markers", &grounding);
         assert_eq!(r.text, "a plain answer with no markers");
         assert_eq!(r.claims_rendered, 0);
+    }
+
+    // ── StreamingHydrator ───────────────────────────────────────────────────
+
+    fn drain(h: &mut StreamingHydrator, chunks: &[&str]) -> String {
+        let mut out = String::new();
+        for c in chunks {
+            out.push_str(&h.push(c));
+        }
+        out.push_str(&h.finish());
+        out
+    }
+
+    #[test]
+    fn streaming_renders_marker_split_across_chunks() {
+        let grounding = g(&[("c1", "Postgres 16 on Azure")]);
+        let mut h = StreamingHydrator::new(&grounding);
+        // The marker arrives in pieces; it must never be shown half-rendered.
+        let out = drain(&mut h, &["The DB is ", "[clai", "m:c", "1]", "."]);
+        assert_eq!(out, "The DB is Postgres 16 on Azure [claim:c1].");
+        assert_eq!(h.claims_rendered, 1);
+        assert!(h.output_tokens_saved > 0);
+    }
+
+    #[test]
+    fn streaming_matches_one_shot_for_whole_answer() {
+        let grounding = g(&[("c1", "Acme Corp"), ("c2", "founded 2026")]);
+        let answer = "Acme [claim:c1] was [claim:c2] last year.";
+        let one_shot = hydrate_answer(answer, &grounding).text;
+        // Feed it one byte at a time — the streamed result must equal one-shot.
+        let mut h = StreamingHydrator::new(&grounding);
+        let chunks: Vec<String> = answer.chars().map(|c| c.to_string()).collect();
+        let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+        assert_eq!(drain(&mut h, &refs), one_shot);
+    }
+
+    #[test]
+    fn streaming_passes_non_claim_brackets_through() {
+        let grounding = g(&[("c1", "x")]);
+        let mut h = StreamingHydrator::new(&grounding);
+        assert_eq!(drain(&mut h, &["see arr", "ay[0] and [1] done"]), "see array[0] and [1] done");
+        assert_eq!(h.claims_rendered, 0);
     }
 }

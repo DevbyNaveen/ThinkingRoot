@@ -7747,22 +7747,43 @@ async fn ask_stream_handler(
                     Event::default().event("meta").data(meta.to_string())
                 );
                 let mut truncated = false;
-                // Accumulate the streamed answer so the citation gate can
-                // verify its `[claim:<id>]` markers once the full text is
-                // assembled (markers only resolve over the complete reply).
+                // Accumulate the RAW streamed answer (markers intact) so the
+                // citation gate can verify its `[claim:<id>]` markers once the
+                // full text is assembled. What we EMIT to the client is the
+                // hydrated stream — §5 output stack #1, streaming variant: when
+                // TR_HYDRATE_ANSWERS is on, render each `[claim:id]` marker to
+                // its verbatim statement inline as it streams (the LLM only
+                // generated the short marker, so the output-token saving is real
+                // — we just render the bytes the model didn't have to). Markers
+                // split across chunks are withheld until complete.
                 let mut answer_acc = String::new();
+                let mut hydrator = if hydrate_answers_on() && !grounding.is_empty() {
+                    let pairs: Vec<(String, String)> = grounding
+                        .iter()
+                        .map(|h| (h.id.clone(), h.statement.clone()))
+                        .collect();
+                    Some(crate::intelligence::hydration::StreamingHydrator::new(&pairs))
+                } else {
+                    None
+                };
+                let mut hydrated_output_tokens_saved = 0usize;
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(chunk) => {
                             if !chunk.text.is_empty() {
                                 answer_acc.push_str(&chunk.text);
-                                let payload =
-                                    serde_json::json!({ "text": chunk.text });
-                                yield Ok(
-                                    Event::default()
-                                        .event("token")
-                                        .data(payload.to_string())
-                                );
+                                let emit = match hydrator.as_mut() {
+                                    Some(h) => h.push(&chunk.text),
+                                    None => chunk.text.clone(),
+                                };
+                                if !emit.is_empty() {
+                                    let payload = serde_json::json!({ "text": emit });
+                                    yield Ok(
+                                        Event::default()
+                                            .event("token")
+                                            .data(payload.to_string())
+                                    );
+                                }
                             }
                             if let Some(finish) = chunk.finish {
                                 truncated = finish.truncated;
@@ -7779,6 +7800,17 @@ async fn ask_stream_handler(
                             return;
                         }
                     }
+                }
+                // Flush any withheld trailing marker, and read the saving.
+                if let Some(h) = hydrator.as_mut() {
+                    let tail = h.finish();
+                    if !tail.is_empty() {
+                        let payload = serde_json::json!({ "text": tail });
+                        yield Ok(
+                            Event::default().event("token").data(payload.to_string())
+                        );
+                    }
+                    hydrated_output_tokens_saved = h.output_tokens_saved;
                 }
                 // Mechanical citation gate (sync core — the engine handle
                 // was released before the stream opened). Emitted as a
@@ -7865,6 +7897,7 @@ async fn ask_stream_handler(
                     "claims_used": claims_used,
                     "category": category,
                     "truncated": truncated,
+                    "hydrated_output_tokens_saved": hydrated_output_tokens_saved,
                 });
                 yield Ok(
                     Event::default().event("final").data(final_payload.to_string())
