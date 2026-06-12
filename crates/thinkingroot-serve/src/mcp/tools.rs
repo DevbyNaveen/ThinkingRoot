@@ -2393,6 +2393,7 @@ pub async fn handle_call(
                 // is single-shot. Multi-turn memory comes from the
                 // calling agent's own context, not from us.
                 history: crate::intelligence::synthesizer::NO_HISTORY,
+                persona_override: None,
             };
             let result = synth_ask(engine, llm, &req).await;
             let text = format!(

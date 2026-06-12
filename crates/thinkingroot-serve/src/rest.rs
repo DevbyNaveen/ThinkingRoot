@@ -7178,6 +7178,13 @@ struct AskRequest {
     /// must pass this.
     #[serde(default)]
     conversation_id: Option<String>,
+    /// Name of a workspace Compiled Prompt to use as the answer persona/voice.
+    /// When unset, `/ask` looks for a prompt named `assistant` by convention.
+    /// If neither exists, falls back to the built-in persona — so workspaces
+    /// without a persona prompt keep working. The engine always appends the
+    /// citation contract on top, so grounding + hydration are preserved.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 /// Wire-format conversation turn. Mirrors the OpenAI Chat Completions /
@@ -7354,6 +7361,16 @@ async fn ask_handler(
 
     let history = decode_history(&body.history);
 
+    // Persona: use the workspace's Compiled Prompt (explicit `prompt` name, else
+    // the `assistant` convention) as the answer voice. None → built-in fallback.
+    let persona_name = body.prompt.clone().unwrap_or_else(|| "assistant".to_string());
+    let persona_text: Option<String> = engine
+        .prompt_get_latest(&ws, &persona_name)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.template_text);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -7368,6 +7385,7 @@ async fn ask_handler(
         identity: identity_owned.as_ref(),
         today: Some(&today),
         history: &history,
+        persona_override: persona_text.as_deref(),
     };
 
     // ── §5 input #4 — provenance-aware answer cache (read) ──────────
@@ -7686,6 +7704,16 @@ async fn ask_stream_handler(
 
     let history = decode_history(&body.history);
 
+    // Persona: workspace Compiled Prompt (explicit `prompt`, else `assistant`
+    // convention) as the answer voice; None → built-in fallback.
+    let persona_name = body.prompt.clone().unwrap_or_else(|| "assistant".to_string());
+    let persona_text: Option<String> = engine
+        .prompt_get_latest(&ws, &persona_name)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.template_text);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
@@ -7700,6 +7728,7 @@ async fn ask_stream_handler(
         identity: identity_owned.as_ref(),
         today: Some(&today),
         history: &history,
+        persona_override: persona_text.as_deref(),
     };
 
     let outcome = ask_streaming(&engine, llm, &req).await;

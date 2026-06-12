@@ -554,6 +554,22 @@ pub fn build_system_prompt_cow(chat: ResolvedChat) -> Cow<'static, str> {
     Cow::Borrowed(build_system_prompt(chat))
 }
 
+/// Resolve the answer system prompt for a request. When the workspace supplies
+/// a persona Compiled Prompt (`req.persona_override`), that becomes the VOICE
+/// and the engine appends the citation contract so grounding + hydration keep
+/// working no matter what the user wrote. Otherwise falls back to the built-in
+/// persona prompt — so a workspace with no persona prompt behaves exactly as
+/// before. This is what makes a Compiled Prompt actually drive `/ask` behaviour
+/// (BYO-voice, zero-config via a prompt named `assistant`).
+fn resolve_system_prompt(req: &AskRequest<'_>) -> Cow<'static, str> {
+    match req.persona_override {
+        Some(p) if !p.trim().is_empty() => {
+            Cow::Owned(format!("{}\n\n{}\n", p.trim(), CITATION_PROMPT))
+        }
+        _ => Cow::Borrowed(build_system_prompt(req.chat)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 2. Conversation memory types
 // ---------------------------------------------------------------------------
@@ -635,6 +651,12 @@ pub struct AskRequest<'a> {
     /// notion of conversation history and the bench harness pins this
     /// to `&[]` regardless.
     pub history: &'a [ChatTurn],
+    /// Optional workspace persona prompt (a Compiled Prompt's text) to use as
+    /// the answer system prompt instead of the built-in. `None` = built-in
+    /// fallback (so workspaces without a persona prompt keep working). The
+    /// engine always appends the citation contract on top, so grounding +
+    /// hydration are preserved regardless of what the user wrote.
+    pub persona_override: Option<&'a str>,
 }
 
 impl<'a> AskRequest<'a> {
@@ -899,7 +921,8 @@ pub async fn ask_streaming(
     };
 
     let user_msg = build_user_message(&claims, req);
-    let system_prompt = build_system_prompt(req.chat);
+    let system_prompt_owned = resolve_system_prompt(req);
+    let system_prompt: &str = system_prompt_owned.as_ref();
 
     match llm_client.chat_stream(system_prompt, &user_msg).await {
         Ok(stream) => StreamingAnswer::Stream {
@@ -928,7 +951,8 @@ pub async fn ask_streaming(
 // ---------------------------------------------------------------------------
 
 async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest<'_>) -> String {
-    let system_prompt = build_system_prompt(req.chat);
+    let system_prompt_owned = resolve_system_prompt(req);
+    let system_prompt: &str = system_prompt_owned.as_ref();
     let user_msg = build_user_message(claims, req);
     // The FIRST Azure request after idle pays a ~30s cold-connection/routing
     // stall; the next hits the warm connection and returns in ~1s (measured).
@@ -1205,7 +1229,8 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
         };
     };
 
-    let system_prompt = build_system_prompt(req.chat);
+    let system_prompt_owned = resolve_system_prompt(req);
+    let system_prompt: &str = system_prompt_owned.as_ref();
     let user_msg = build_chitchat_user_message(req);
 
     match tokio::time::timeout(
@@ -1256,7 +1281,8 @@ async fn chitchat_streaming(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -
         };
     };
 
-    let system_prompt = build_system_prompt(req.chat);
+    let system_prompt_owned = resolve_system_prompt(req);
+    let system_prompt: &str = system_prompt_owned.as_ref();
     let user_msg = build_chitchat_user_message(req);
 
     match llm_client.chat_stream(system_prompt, &user_msg).await {
@@ -2046,6 +2072,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: NO_HISTORY,
+            persona_override: None,
         };
         assert!(!should_skip_retrieval(&memory_req));
 
@@ -2116,6 +2143,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: NO_HISTORY,
+            persona_override: None,
         };
         let with_id = build_user_message(&claims, &req);
         let body = build_user_message_body(&claims, &req);
@@ -2186,9 +2214,11 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: Some(&identity),
             today: Some("2026-04-28"),
             history: NO_HISTORY,
+            persona_override: None,
         };
 
-        let system_prompt = build_system_prompt(req.chat);
+        let system_prompt_owned = resolve_system_prompt(&req);
+        let system_prompt: &str = system_prompt_owned.as_ref();
         let user_msg = build_user_message(&claims, &req);
 
         // System prompt = V2 XML 7-section conversational warm voice
@@ -2251,6 +2281,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: NO_HISTORY,
+            persona_override: None,
         };
         let msg = build_user_message(&claims, &req);
         assert!(
@@ -2284,6 +2315,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: NO_HISTORY,
+            persona_override: None,
         };
         let msg = build_user_message(&claims, &req);
         assert!(
@@ -2324,6 +2356,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: Some(&identity),
             today: Some("2026-04-28"),
             history: NO_HISTORY,
+            persona_override: None,
         };
         let msg = build_user_message(&claims, &req);
         assert!(msg.starts_with("<system-reminder>\n"));
@@ -2379,6 +2412,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: &history,
+            persona_override: None,
         };
         let msg = build_user_message(&claims, &req);
         assert!(msg.contains("## CONVERSATION HISTORY"));
@@ -2420,6 +2454,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: &history,
+            persona_override: None,
         };
         let msg = build_user_message(&claims, &req);
         assert!(!msg.contains("## CONVERSATION HISTORY"));
@@ -2429,6 +2464,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
         // for the same fixture inputs.
         let no_history_req = AskRequest {
             history: NO_HISTORY,
+            persona_override: None,
             ..req.clone()
         };
         let no_history_msg = build_user_message(&claims, &no_history_req);
@@ -2460,6 +2496,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             identity: None,
             today: None,
             history: &history,
+            persona_override: None,
         };
         let msg = build_chitchat_user_message(&req);
         assert!(!msg.contains("[CATEGORY:"));
