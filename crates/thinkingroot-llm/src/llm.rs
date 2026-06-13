@@ -7,12 +7,37 @@ use crate::prompts;
 use crate::scheduler::{HeaderRateLimits, ThroughputScheduler};
 use thinkingroot_extract::schema::ExtractionResult;
 
+/// Real LLM token usage for a single chat call. Every field is
+/// `Option` so a provider that does not report usage carries `None`
+/// rather than a fabricated `0` — callers (and the cloud gateway)
+/// distinguish "not reported" from "zero tokens".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+}
+
+impl TokenUsage {
+    /// Parse the OpenAI-shape `usage` object (`{prompt_tokens, completion_tokens}`)
+    /// off a parsed chat/completions response. Missing fields stay `None`.
+    pub fn from_response_json(json: &serde_json::Value) -> Self {
+        let u = &json["usage"];
+        Self {
+            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+            completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+        }
+    }
+}
+
 /// Output of a single provider chat call.
 struct ChatOutput {
     text: String,
     truncated: bool,
     /// Rate limit headers from the response (empty for Bedrock/Ollama).
     limits: HeaderRateLimits,
+    /// Real measured token usage when the provider reports it; `None`
+    /// fields otherwise (never fabricated).
+    usage: TokenUsage,
 }
 
 // ── Streaming chat ──────────────────────────────────────────────
@@ -47,6 +72,10 @@ pub struct ChatFinish {
     /// Rate-limit headers carried back to the scheduler so adaptive
     /// concurrency can adjust mid-flight.
     pub limits: HeaderRateLimits,
+    /// Real measured token usage, populated on the final chunk when the
+    /// provider streams a usage object (Azure with `stream_options.include_usage`);
+    /// `None` fields otherwise.
+    pub usage: TokenUsage,
 }
 
 /// Pinned, boxed stream of `ChatChunk` results — the public surface
@@ -633,6 +662,7 @@ impl Provider {
                     finish: Some(ChatFinish {
                         truncated: out.truncated,
                         limits: out.limits,
+                        usage: out.usage,
                     }),
                 };
                 let stream = async_stream::stream! { yield Ok(chunk); };
@@ -804,6 +834,7 @@ impl BedrockProvider {
                             text: text.clone(),
                             truncated,
                             limits: HeaderRateLimits::default(), // Bedrock uses SDK, no HTTP headers
+                            usage: TokenUsage::default(),
                         });
                     }
                 }
@@ -1213,12 +1244,14 @@ impl AzureProvider {
             );
         }
 
+        let usage = TokenUsage::from_response_json(&json);
         json["choices"][0]["message"]["content"]
             .as_str()
             .map(|s| ChatOutput {
                 text: s.to_string(),
                 truncated,
                 limits,
+                usage,
             })
             .ok_or_else(|| Error::LlmProvider {
                 provider: "azure".into(),
@@ -1245,6 +1278,10 @@ impl AzureProvider {
             ],
             "temperature": 0.1,
             "stream": true,
+            // Ask Azure for a final usage-only chunk (empty `choices`,
+            // populated `usage`) so streamed calls can report real token
+            // counts in the terminal ChatFinish.
+            "stream_options": {"include_usage": true},
         });
         if uses_new_param {
             body["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
@@ -1292,6 +1329,10 @@ impl AzureProvider {
 
         let stream = async_stream::stream! {
             let mut truncated = false;
+            // Azure emits a final usage-only chunk (empty `choices`,
+            // populated `usage`) when `stream_options.include_usage` is set.
+            // Capture it for the terminal ChatFinish.
+            let mut last_usage = TokenUsage::default();
             while let Some(item) = events.next().await {
                 match item {
                     Err(e) => {
@@ -1308,6 +1349,7 @@ impl AzureProvider {
                                 finish: Some(ChatFinish {
                                     truncated,
                                     limits: limits.clone(),
+                                    usage: last_usage,
                                 }),
                             });
                             return;
@@ -1323,6 +1365,9 @@ impl AzureProvider {
                                     return;
                                 }
                             };
+                        if json["usage"].is_object() {
+                            last_usage = TokenUsage::from_response_json(&json);
+                        }
                         let choice = &json["choices"][0];
                         if let Some(text) =
                             choice["delta"]["content"].as_str()
@@ -1347,6 +1392,7 @@ impl AzureProvider {
                 finish: Some(ChatFinish {
                     truncated,
                     limits: limits.clone(),
+                    usage: last_usage,
                 }),
             });
         };
@@ -1539,12 +1585,14 @@ impl OpenAiProvider {
             );
         }
 
+        let usage = TokenUsage::from_response_json(&json);
         json["choices"][0]["message"]["content"]
             .as_str()
             .map(|s| ChatOutput {
                 text: s.to_string(),
                 truncated,
                 limits,
+                usage,
             })
             .ok_or_else(|| Error::LlmProvider {
                 provider: self.provider_name.clone(),
@@ -1651,6 +1699,7 @@ impl OpenAiProvider {
                                 finish: Some(ChatFinish {
                                     truncated,
                                     limits: limits.clone(),
+                                    usage: TokenUsage::default(),
                                 }),
                             });
                             return;
@@ -1693,6 +1742,7 @@ impl OpenAiProvider {
                 finish: Some(ChatFinish {
                     truncated,
                     limits: limits.clone(),
+                    usage: TokenUsage::default(),
                 }),
             });
         };
@@ -1913,12 +1963,14 @@ impl CloudManagedProvider {
             );
         }
 
+        let usage = TokenUsage::from_response_json(&json);
         json["choices"][0]["message"]["content"]
             .as_str()
             .map(|s| ChatOutput {
                 text: s.to_string(),
                 truncated,
                 limits,
+                usage,
             })
             .ok_or_else(|| Error::LlmProvider {
                 provider: "thinkingroot-cloud".into(),
@@ -2000,6 +2052,7 @@ impl CloudManagedProvider {
                                 finish: Some(ChatFinish {
                                     truncated,
                                     limits: limits.clone(),
+                                    usage: TokenUsage::default(),
                                 }),
                             });
                             return;
@@ -2036,6 +2089,7 @@ impl CloudManagedProvider {
                 finish: Some(ChatFinish {
                     truncated,
                     limits: limits.clone(),
+                    usage: TokenUsage::default(),
                 }),
             });
         };
@@ -2214,6 +2268,7 @@ impl AnthropicProvider {
                 text: s.to_string(),
                 truncated,
                 limits,
+                usage: TokenUsage::default(),
             })
             .ok_or_else(|| Error::LlmProvider {
                 provider: "anthropic".into(),
@@ -2363,6 +2418,7 @@ impl AnthropicProvider {
                                     finish: Some(ChatFinish {
                                         truncated,
                                         limits: limits.clone(),
+                                        usage: TokenUsage::default(),
                                     }),
                                 });
                                 return;
@@ -2533,6 +2589,7 @@ impl OllamaProvider {
                 text: s.to_string(),
                 truncated,
                 limits: HeaderRateLimits::default(), // Ollama has no rate limits
+                usage: TokenUsage::default(),
             })
             .ok_or_else(|| Error::LlmProvider {
                 provider: "ollama".into(),
@@ -3594,7 +3651,21 @@ impl LlmClient {
         }
     }
 
+    /// Convenience wrapper that drops the usage metadata. Existing
+    /// callers that only need the text stay unchanged.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        self.chat_with_usage(system, user).await.map(|(text, _)| text)
+    }
+
+    /// Same retry/scheduler loop as [`chat`], but also returns the real
+    /// measured [`TokenUsage`] reported by the provider (Azure / OpenAI-
+    /// compatible non-stream). Usage fields are `None` when the provider
+    /// did not report them — never fabricated.
+    pub async fn chat_with_usage(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> Result<(String, TokenUsage)> {
         let max_rl_retries = self.max_retries * 2;
         let mut rl_attempts: u32 = 0;
         let mut normal_attempts: u32 = 0;
@@ -3645,7 +3716,7 @@ impl LlmClient {
                     if let (Some(sched), Some(ticket)) = (&self.scheduler, opt_ticket) {
                         sched.record_success(tokens, &output.limits, ticket).await;
                     }
-                    return Ok(output.text);
+                    return Ok((output.text, output.usage));
                 }
                 Err(e) if e.is_rate_limited() => {
                     rl_attempts += 1;

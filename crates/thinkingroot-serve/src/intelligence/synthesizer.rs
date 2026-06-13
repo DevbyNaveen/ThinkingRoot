@@ -60,7 +60,7 @@ use std::time::Duration;
 
 use thinkingroot_core::config::{ChatPersona, ChatVerbosity, ResolvedChat};
 use thinkingroot_llm::citation::CITATION_PROMPT;
-use thinkingroot_llm::llm::{ChatStream, LlmClient};
+use thinkingroot_llm::llm::{ChatStream, LlmClient, TokenUsage};
 
 use crate::engine::ClaimSearchHit;
 use crate::intelligence::augmenter::{extract_relevant_snippets, load_raw_sources};
@@ -686,6 +686,10 @@ pub struct AskResponse {
     /// set the citation gate verifies `[claim:<id>]` markers against.
     /// Empty for the chitchat / no-retrieval paths.
     pub grounding: Vec<crate::engine::ClaimSearchHit>,
+    /// Real measured LLM token usage for the synthesis call. Default
+    /// (all `None`) when no LLM call was made (empty workspace / no LLM
+    /// configured / static fallback) or the provider did not report it.
+    pub usage: thinkingroot_llm::llm::TokenUsage,
 }
 
 /// Run the full hybrid retrieval + synthesis pipeline.
@@ -772,6 +776,8 @@ async fn try_aggregation_answer(
         claims_used: claims.len(),
         category: req.category.to_string(),
         grounding,
+        // Aggregation answers are computed from the graph — no LLM call.
+        usage: TokenUsage::default(),
     })
 }
 
@@ -824,6 +830,7 @@ pub async fn ask(
             claims_used: 0,
             category: req.category.to_string(),
             grounding: Vec::new(),
+            usage: TokenUsage::default(),
         };
     }
 
@@ -833,15 +840,17 @@ pub async fn ask(
             claims_used,
             category: req.category.to_string(),
             grounding: claims,
+            usage: TokenUsage::default(),
         };
     };
 
-    let answer = synthesize(&claims, &llm_client, req).await;
+    let (answer, usage) = synthesize(&claims, &llm_client, req).await;
     AskResponse {
         answer,
         claims_used,
         category: req.category.to_string(),
         grounding: claims,
+        usage,
     }
 }
 
@@ -872,6 +881,10 @@ pub enum StreamingAnswer {
         /// SSE handler verifies streamed `[claim:<id>]` markers against at
         /// stream end before emitting the `citation` event.
         grounding: Vec<crate::engine::ClaimSearchHit>,
+        /// Real measured token usage is NOT known up front for a stream —
+        /// it arrives in the final `ChatFinish` of `stream`, which the SSE
+        /// handler reads. Defaulted here; the handler is the source of truth.
+        usage: TokenUsage,
     },
 }
 
@@ -930,6 +943,7 @@ pub async fn ask_streaming(
             claims_used,
             category,
             grounding: claims,
+            usage: TokenUsage::default(),
         },
         Err(e) => {
             // Connect-time failure — fall back to the highest-confidence
@@ -950,7 +964,11 @@ pub async fn ask_streaming(
 // 5. Internal synthesis (one-shot)
 // ---------------------------------------------------------------------------
 
-async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest<'_>) -> String {
+async fn synthesize(
+    claims: &[ClaimSearchHit],
+    llm: &LlmClient,
+    req: &AskRequest<'_>,
+) -> (String, TokenUsage) {
     let system_prompt_owned = resolve_system_prompt(req);
     let system_prompt: &str = system_prompt_owned.as_ref();
     let user_msg = build_user_message(claims, req);
@@ -964,17 +982,18 @@ async fn synthesize(claims: &[ClaimSearchHit], llm: &LlmClient, req: &AskRequest
     for attempt in 0..2 {
         match tokio::time::timeout(
             Duration::from_secs(40),
-            llm.chat(system_prompt, &user_msg),
+            llm.chat_with_usage(system_prompt, &user_msg),
         )
         .await
         {
-            Ok(Ok(answer)) => return answer,
+            Ok(Ok((answer, usage))) => return (answer, usage),
             Ok(Err(e)) => tracing::warn!("synthesizer: LLM error (attempt {attempt}): {e}"),
             Err(_) => tracing::warn!("synthesizer: LLM timeout (attempt {attempt})"),
         }
     }
     tracing::warn!("synthesizer: LLM unavailable after retries — using best claim");
-    claims[0].statement.clone()
+    // No LLM call succeeded → honest default usage (no tokens spent).
+    (claims[0].statement.clone(), TokenUsage::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1245,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
             claims_used: 0,
             category,
             grounding: Vec::new(),
+            usage: TokenUsage::default(),
         };
     };
 
@@ -1235,15 +1255,16 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
 
     match tokio::time::timeout(
         Duration::from_secs(60),
-        llm_client.chat(system_prompt, &user_msg),
+        llm_client.chat_with_usage(system_prompt, &user_msg),
     )
     .await
     {
-        Ok(Ok(answer)) => AskResponse {
+        Ok(Ok((answer, usage))) => AskResponse {
             answer,
             claims_used: 0,
             category,
             grounding: Vec::new(),
+            usage,
         },
         Ok(Err(e)) => {
             tracing::warn!("synthesizer: chitchat LLM error: {e}");
@@ -1252,6 +1273,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 claims_used: 0,
                 category,
                 grounding: Vec::new(),
+                usage: TokenUsage::default(),
             }
         }
         Err(_) => {
@@ -1261,6 +1283,7 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 claims_used: 0,
                 category,
                 grounding: Vec::new(),
+                usage: TokenUsage::default(),
             }
         }
     }
@@ -1291,6 +1314,7 @@ async fn chitchat_streaming(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -
             claims_used: 0,
             category,
             grounding: Vec::new(),
+            usage: TokenUsage::default(),
         },
         Err(e) => {
             tracing::warn!("synthesizer: chitchat chat_stream open failed: {e}");

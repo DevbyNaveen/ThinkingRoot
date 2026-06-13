@@ -587,6 +587,66 @@ fn ok_response<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
     })
 }
 
+/// Build the `/ask` JSON response and attach the real token-usage + savings
+/// headers the cloud gateway records. Header values are only set when known —
+/// a `prompt_tokens`/`completion_tokens` of `None` (provider did not report,
+/// or no LLM call) is OMITTED rather than sent as a fabricated `0`. The
+/// `x-tr-saved-*` headers always carry a real number (0 = nothing saved).
+///
+/// from_cache == true  → this call made NO LLM call: the cached body's
+///   token counts are the AVOIDED cost → emitted as `x-tr-saved-*`; tokens
+///   spent now are 0; reason = "answer_cache".
+/// from_cache == false → tokens spent now are emitted as `x-tr-prompt/
+///   completion-tokens`; the hydration saving is `x-tr-saved-output-tokens`;
+///   reason = "hydration" when hydrated > 0, else empty.
+fn ask_response_with_savings(body: &AskResponseBody) -> Response {
+    let mut resp = ok_response(body.clone()).into_response();
+    let headers = resp.headers_mut();
+    let set = |headers: &mut axum::http::HeaderMap, name: &'static str, val: String| {
+        if let Ok(v) = HeaderValue::from_str(&val) {
+            headers.insert(name, v);
+        }
+    };
+
+    if body.from_cache {
+        // No tokens spent now.
+        set(headers, "x-tr-prompt-tokens", "0".into());
+        set(headers, "x-tr-completion-tokens", "0".into());
+        // Cached token counts are the avoided cost (0 when not recorded).
+        set(
+            headers,
+            "x-tr-saved-input-tokens",
+            body.prompt_tokens.unwrap_or(0).to_string(),
+        );
+        set(
+            headers,
+            "x-tr-saved-output-tokens",
+            body.completion_tokens.unwrap_or(0).to_string(),
+        );
+        set(headers, "x-tr-savings-reason", "answer_cache".into());
+    } else {
+        if let Some(p) = body.prompt_tokens {
+            set(headers, "x-tr-prompt-tokens", p.to_string());
+        }
+        if let Some(c) = body.completion_tokens {
+            set(headers, "x-tr-completion-tokens", c.to_string());
+        }
+        set(headers, "x-tr-saved-input-tokens", "0".into());
+        set(
+            headers,
+            "x-tr-saved-output-tokens",
+            body.hydrated_output_tokens_saved.to_string(),
+        );
+        let reason = if body.hydrated_output_tokens_saved > 0 {
+            "hydration"
+        } else {
+            ""
+        };
+        set(headers, "x-tr-savings-reason", reason.into());
+    }
+    resp
+}
+
 fn err_response(status: StatusCode, code: &str, message: &str) -> Response {
     let body = ApiResponse::<()> {
         ok: false,
@@ -7245,6 +7305,16 @@ struct AskResponseBody {
     /// provenance-aware answer cache (no LLM call). Feeds the Savings Meter.
     #[serde(default)]
     from_cache: bool,
+    /// Real measured prompt (input) tokens for the LLM synthesis call, when
+    /// the provider reported it; `None` when not reported or no LLM call was
+    /// made. Rides along into the answer cache so a cache HIT knows the
+    /// AVOIDED token cost. Never fabricated.
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    /// Real measured completion (output) tokens for the LLM synthesis call.
+    /// Same semantics as `prompt_tokens`.
+    #[serde(default)]
+    completion_tokens: Option<u32>,
 }
 
 /// §3 #6 retry flag — give a refused answer one more synthesis pass before
@@ -7404,7 +7474,7 @@ async fn ask_handler(
                     {
                         cached.from_cache = true;
                         tracing::debug!("answer cache hit");
-                        return ok_response(cached).into_response();
+                        return ask_response_with_savings(&cached);
                     }
                 }
             }
@@ -7564,6 +7634,8 @@ async fn ask_handler(
         )
         .await;
 
+    let prompt_tokens = result.usage.prompt_tokens;
+    let completion_tokens = result.usage.completion_tokens;
     let resp_body = AskResponseBody {
         answer,
         claims_used,
@@ -7573,6 +7645,8 @@ async fn ask_handler(
         refused: gate.refused,
         hydrated_output_tokens_saved,
         from_cache: false,
+        prompt_tokens,
+        completion_tokens,
     };
 
     // ── §5 input #4 — answer cache (write) ──────────────────────────
@@ -7602,7 +7676,7 @@ async fn ask_handler(
         }
     }
 
-    ok_response(resp_body).into_response()
+    ask_response_with_savings(&resp_body)
 }
 
 // ─── Streaming Ask (SSE) ─────────────────────────────────────
@@ -7767,7 +7841,7 @@ async fn ask_stream_handler(
                     Event::default().event("final").data(final_payload.to_string())
                 );
             }
-            StreamingAnswer::Stream { mut stream, claims_used, category, grounding } => {
+            StreamingAnswer::Stream { mut stream, claims_used, category, grounding, usage: _ } => {
                 let meta = serde_json::json!({
                     "claims_used": claims_used,
                     "category": category,
@@ -7796,6 +7870,10 @@ async fn ask_stream_handler(
                     None
                 };
                 let mut hydrated_output_tokens_saved = 0usize;
+                // Real measured token usage arrives on the final ChatFinish
+                // (Azure emits a usage-only chunk via stream_options.include_usage).
+                // None fields when the provider did not report — never fabricated.
+                let mut final_usage = thinkingroot_llm::llm::TokenUsage::default();
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(chunk) => {
@@ -7816,6 +7894,7 @@ async fn ask_stream_handler(
                             }
                             if let Some(finish) = chunk.finish {
                                 truncated = finish.truncated;
+                                final_usage = finish.usage;
                             }
                         }
                         Err(e) => {
@@ -7922,11 +8001,26 @@ async fn ask_stream_handler(
                 yield Ok(
                     Event::default().event("citation").data(citation_payload.to_string())
                 );
+                // The streaming path never serves from the answer cache
+                // (that's the one-shot ask_handler), so from_cache is always
+                // false here → no saved input tokens; the only saving is
+                // hydration. Token counts are real (None → null in JSON).
+                let savings_reason = if hydrated_output_tokens_saved > 0 {
+                    "hydration"
+                } else {
+                    ""
+                };
                 let final_payload = serde_json::json!({
                     "claims_used": claims_used,
                     "category": category,
                     "truncated": truncated,
                     "hydrated_output_tokens_saved": hydrated_output_tokens_saved,
+                    "prompt_tokens": final_usage.prompt_tokens,
+                    "completion_tokens": final_usage.completion_tokens,
+                    "saved_output_tokens": hydrated_output_tokens_saved,
+                    "saved_input_tokens": 0,
+                    "from_cache": false,
+                    "savings_reason": savings_reason,
                 });
                 yield Ok(
                     Event::default().event("final").data(final_payload.to_string())
