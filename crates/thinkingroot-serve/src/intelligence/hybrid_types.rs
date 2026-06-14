@@ -477,6 +477,9 @@ impl From<RetrievalHit> for ClaimSearchHit {
                 AdmissionTier::Attested => 0.7,
                 AdmissionTier::Quarantined | AdmissionTier::Rejected => 0.0,
             });
+        // `valid_window.0` is the claim-level `valid_from` (Unix epoch
+        // seconds); map to the i64 ClaimSearchHit carries. `0` when absent.
+        let valid_from = h.valid_window.0.map(|s| s as i64).unwrap_or(0);
         Self {
             id: h.claim_id,
             statement: h.statement,
@@ -484,6 +487,7 @@ impl From<RetrievalHit> for ClaimSearchHit {
             confidence,
             source_uri: h.source_uri,
             relevance: h.fused_score,
+            valid_from,
         }
     }
 }

@@ -368,6 +368,7 @@ mod tests {
             confidence: 1.0,
             source_uri: "u".into(),
             relevance,
+            valid_from: 0,
         }
     }
 

@@ -2040,6 +2040,99 @@ impl GraphStore {
             .collect())
     }
 
+    /// Bulk-fetch a per-claim ingestion timestamp (Unix epoch seconds) for a
+    /// slice of claim ids.  Returns `claim_id -> ts` only for ids that resolve
+    /// to a positive timestamp.
+    ///
+    /// Source of truth: the `claims` table `created_at` (TRANSACTION time —
+    /// when the claim was recorded; see [`Self::get_claims_with_sources_as_of`]
+    /// for the bitemporal note), which is the ingestion timestamp for every
+    /// engine-inserted claim.  When `created_at` is missing/zero we fall back to
+    /// `claim_temporal.valid_from` (VALID time).  This powers per-claim recency
+    /// on the scoped /ask read path, which builds hits from the in-memory cache
+    /// (`CachedClaim`) that carries no timestamp.  One batched query for all
+    /// ids — no N round-trips.
+    pub fn claim_valid_from<S: AsRef<str>>(
+        &self,
+        ids: &[S],
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<DataValue> = ids
+            .iter()
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_ref().into())]))
+            .collect();
+        let to_f64 = |dv: &DataValue| -> f64 {
+            match dv {
+                DataValue::Num(Num::Float(f)) => *f,
+                DataValue::Num(Num::Int(i)) => *i as f64,
+                _ => 0.0,
+            }
+        };
+
+        // Pass 1 — the preferred source: claims-table `created_at` (ingestion /
+        // transaction time). Inline-relation join: pin candidate ids to a unary
+        // pseudo-relation, probe `claims` once per row (CozoDB rewrites to an
+        // indexed lookup).
+        let mut out: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        {
+            let mut params = BTreeMap::new();
+            params.insert("ids".into(), DataValue::List(rows.clone()));
+            let result = self
+                .db
+                .run_script(
+                    "candidate[id] <- $ids
+                     ?[id, ts] := candidate[id], *claims{id, created_at: ts}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+            for row in &result.rows {
+                if row.len() < 2 {
+                    continue;
+                }
+                let ts = to_f64(&row[1]);
+                if ts > 0.0 {
+                    out.insert(dv_to_string(&row[0]), ts as i64);
+                }
+            }
+        }
+
+        // Pass 2 — fallback for any id still unresolved (created_at zero/missing):
+        // VALID time from `claim_temporal.valid_from`. Only fills gaps; never
+        // overwrites a real ingestion timestamp.
+        let unresolved: Vec<DataValue> = ids
+            .iter()
+            .filter(|s| !out.contains_key(s.as_ref()))
+            .map(|s| DataValue::List(vec![DataValue::Str(s.as_ref().into())]))
+            .collect();
+        if !unresolved.is_empty() {
+            let mut params = BTreeMap::new();
+            params.insert("ids".into(), DataValue::List(unresolved));
+            let result = self
+                .db
+                .run_script(
+                    "candidate[id] <- $ids
+                     ?[id, ts] := candidate[id], *claim_temporal{claim_id: id, valid_from: ts}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))?;
+            for row in &result.rows {
+                if row.len() < 2 {
+                    continue;
+                }
+                let ts = to_f64(&row[1]);
+                if ts > 0.0 {
+                    out.entry(dv_to_string(&row[0])).or_insert(ts as i64);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Insert a claim node.
     pub fn insert_claim(&self, claim: &thinkingroot_core::Claim) -> Result<()> {
         let mut params = BTreeMap::new();

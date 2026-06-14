@@ -225,6 +225,7 @@ mod tests {
                 confidence: 0.9,
                 source_uri: "test".into(),
                 relevance: 0.5,
+                valid_from: 0,
             },
             ClaimSearchHit {
                 id: "2".into(),
@@ -233,6 +234,7 @@ mod tests {
                 confidence: 0.8,
                 source_uri: "test".into(),
                 relevance: 0.6, // higher initial vector score
+                valid_from: 0,
             },
         ];
 
@@ -253,6 +255,7 @@ mod tests {
                 confidence: 0.9,
                 source_uri: "test".into(),
                 relevance: 0.8,
+                valid_from: 0,
             },
             ClaimSearchHit {
                 id: "2".into(),
@@ -261,6 +264,7 @@ mod tests {
                 confidence: 0.9,
                 source_uri: "test".into(),
                 relevance: 0.9,
+                valid_from: 0,
             },
         ];
 

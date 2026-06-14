@@ -239,6 +239,7 @@ mod tests {
             confidence: 0.9,
             source_uri: uri.to_string(),
             relevance: 0.8,
+            valid_from: 0,
         }
     }
 

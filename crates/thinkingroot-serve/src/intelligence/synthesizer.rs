@@ -84,9 +84,9 @@ const MEMORY_SYSTEM_PROMPT: &str = r#"You are a precise personal memory assistan
 Raw transcripts are ground truth — if a detail is in the transcript but not in claims, TRUST THE TRANSCRIPT.
 
 ━━━ STRATEGY: FACTUAL RECALL ━━━
-(Categories: single-session-user, knowledge-update)
+(Categories: single-session-user, knowledge-update, temporal-reasoning)
 - Find the specific fact in claims or transcripts.
-- If multiple values exist, the MOST RECENT session date is the current truth.
+- When claims conflict, the MOST RECENT claim is the current truth — answer using it, and briefly note that an older conflicting value existed (e.g. "now X (previously recorded as Y)"). When MOST RECENT FACTS / OLDER FACTS sections appear, MOST RECENT is the current truth.
 - Answer with JUST the fact — short phrase or sentence.
 
 ━━━ STRATEGY: COUNTING & AGGREGATION ━━━
@@ -141,7 +141,7 @@ CRITICAL RULES for SSP:
 (When a fact was updated over time)
 - Claims will be presented in TWO sections: **MOST RECENT FACTS** and **OLDER FACTS**.
 - The **MOST RECENT FACTS** section has the current truth — ALWAYS use that section.
-- Ignore the **OLDER FACTS** section if the answer is in MOST RECENT FACTS.
+- When the older value conflicts with the current one, briefly note it (e.g. "now X (previously recorded as Y)"). Otherwise ignore the **OLDER FACTS** section if the answer is in MOST RECENT FACTS.
 
 ━━━ CRITICAL: WHEN TO SAY "NOT ENOUGH INFORMATION" ━━━
 ONLY say "not enough information" when [CATEGORY: multi-session], [CATEGORY: temporal-reasoning], or [CATEGORY: knowledge-update] AND the specific thing asked about is COMPLETELY ABSENT — meaning the exact word/entity never appears anywhere in any claim or transcript.
@@ -736,6 +736,7 @@ async fn try_aggregation_answer(
             confidence: 1.0,
             source_uri: String::new(),
             relevance: 1.0,
+            valid_from: 0,
         })
         .collect();
 
@@ -1373,10 +1374,23 @@ fn build_claim_notes(
     limit: usize,
     category: &str,
     session_dates: &HashMap<String, String>,
-    answer_sids: &[String],
+    // Previously used to pick the newest session; recency now keys on the
+    // claim-level `valid_from` (with a session-date fallback) instead.
+    _answer_sids: &[String],
     emit_claim_ids: bool,
 ) -> String {
-    if category != "knowledge-update" {
+    // The recency split (MOST RECENT / OLDER) applies to every FACTUAL
+    // category — not just `knowledge-update`. Single-session-user and
+    // temporal-reasoning answers also turn on "newest fact wins" when the
+    // recalled claims carry conflicting values, so they get the same
+    // deterministic grouping. Non-factual categories (multi-session,
+    // single-session-assistant/-preference, etc.) keep the flat rendering.
+    let recency_split = matches!(
+        category,
+        "knowledge-update" | "single-session-user" | "temporal-reasoning"
+    );
+
+    if !recency_split {
         let mut notes = String::new();
         for hit in claims.iter().take(limit) {
             let date_hint = session_dates
@@ -1400,20 +1414,29 @@ fn build_claim_notes(
         return notes;
     }
 
-    // Knowledge-update: split into MOST RECENT / OLDER to prevent stale-value errors
-    let most_recent_sid = answer_sids
+    // Split into MOST RECENT / OLDER to prevent stale-value errors.
+    //
+    // Recency key (newest-first): the claim-level `valid_from` (Unix epoch
+    // seconds) is the PRIMARY ordering signal, so two claims added in the
+    // SAME session seconds apart are still ordered correctly. We fall back
+    // to the session date (resolved via `session_dates` + `source_uri`)
+    // only when `valid_from` is missing (0) or ties. The "most recent"
+    // bucket is whatever shares the single newest key.
+    let recency_key = |hit: &ClaimSearchHit| -> (i64, String) {
+        let session_date = session_dates
+            .iter()
+            .find(|(sid, _)| hit.source_uri.contains(sid.as_str()))
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        (hit.valid_from, session_date)
+    };
+
+    let top_key = claims
         .iter()
-        .max_by_key(|sid| {
-            session_dates
-                .iter()
-                .find(|(date_sid, _)| {
-                    sid.contains(date_sid.as_str()) || date_sid.contains(sid.as_str())
-                })
-                .map(|(_, d)| d.as_str())
-                .unwrap_or("")
-        })
-        .cloned()
-        .unwrap_or_default();
+        .take(limit)
+        .map(&recency_key)
+        .max()
+        .unwrap_or((0, String::new()));
 
     let mut recent_notes = String::new();
     let mut older_notes = String::new();
@@ -1425,9 +1448,10 @@ fn build_claim_notes(
             .map(|(_, d)| format!(" [session: {d}]"))
             .unwrap_or_default();
 
-        let is_recent = !most_recent_sid.is_empty()
-            && (hit.source_uri.contains(most_recent_sid.as_str())
-                || most_recent_sid.contains(hit.source_uri.as_str()));
+        // A hit is "most recent" when it shares the single newest recency
+        // key. With a real claim timestamp this is exact; without one it
+        // degrades to the legacy session-date grouping.
+        let is_recent = top_key != (0, String::new()) && recency_key(hit) == top_key;
 
         let id_prefix = if emit_claim_ids {
             format!("[claim:{}] ", hit.id)
@@ -1599,9 +1623,9 @@ mod prompt_contract_tests {
 Raw transcripts are ground truth — if a detail is in the transcript but not in claims, TRUST THE TRANSCRIPT.
 
 ━━━ STRATEGY: FACTUAL RECALL ━━━
-(Categories: single-session-user, knowledge-update)
+(Categories: single-session-user, knowledge-update, temporal-reasoning)
 - Find the specific fact in claims or transcripts.
-- If multiple values exist, the MOST RECENT session date is the current truth.
+- When claims conflict, the MOST RECENT claim is the current truth — answer using it, and briefly note that an older conflicting value existed (e.g. "now X (previously recorded as Y)"). When MOST RECENT FACTS / OLDER FACTS sections appear, MOST RECENT is the current truth.
 - Answer with JUST the fact — short phrase or sentence.
 
 ━━━ STRATEGY: COUNTING & AGGREGATION ━━━
@@ -1656,7 +1680,7 @@ CRITICAL RULES for SSP:
 (When a fact was updated over time)
 - Claims will be presented in TWO sections: **MOST RECENT FACTS** and **OLDER FACTS**.
 - The **MOST RECENT FACTS** section has the current truth — ALWAYS use that section.
-- Ignore the **OLDER FACTS** section if the answer is in MOST RECENT FACTS.
+- When the older value conflicts with the current one, briefly note it (e.g. "now X (previously recorded as Y)"). Otherwise ignore the **OLDER FACTS** section if the answer is in MOST RECENT FACTS.
 
 ━━━ CRITICAL: WHEN TO SAY "NOT ENOUGH INFORMATION" ━━━
 ONLY say "not enough information" when [CATEGORY: multi-session], [CATEGORY: temporal-reasoning], or [CATEGORY: knowledge-update] AND the specific thing asked about is COMPLETELY ABSENT — meaning the exact word/entity never appears anywhere in any claim or transcript.
@@ -2135,6 +2159,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             confidence: 0.92,
             source_uri: "session_001/foo.json".to_string(),
             relevance: 0.5,
+            valid_from: 0,
         }]
     }
 
@@ -2211,6 +2236,7 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             confidence: 0.95,
             source_uri: "services/registry/src/providers.rs".to_string(),
             relevance: 0.9,
+            valid_from: 0,
         }];
 
         let allowed = HashSet::<String>::new();

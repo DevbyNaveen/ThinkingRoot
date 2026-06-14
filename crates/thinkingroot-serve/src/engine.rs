@@ -314,6 +314,12 @@ pub struct ClaimSearchHit {
     pub confidence: f64,
     pub source_uri: String,
     pub relevance: f32,
+    /// Claim-level ingestion timestamp (Unix epoch seconds), from
+    /// `Claim::valid_from`. Used by the synthesizer's recency split to order
+    /// conflicting facts newest-first even when they share a session date.
+    /// `0` when unknown (e.g. keyword-fallback hits) — callers fall back to
+    /// `session_dates` in that case.
+    pub valid_from: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -4821,6 +4827,10 @@ side referenced. Strict rules:\n\
                         confidence: c.confidence,
                         source_uri: c.source_uri.clone(),
                         relevance: *score,
+                        // The in-memory cache (CachedClaim) does not materialize a
+                        // claim-level ingestion timestamp, so recency on this path falls
+                        // back to session_dates in the synthesizer.
+                        valid_from: 0,
                     });
                 }
             }
@@ -4861,6 +4871,9 @@ side referenced. Strict rules:\n\
                         confidence: conf,
                         source_uri: uri,
                         relevance: 0.5,
+                        // keyword fallback carries no claim timestamp — the
+                        // synthesizer falls back to session_dates for recency.
+                        valid_from: 0,
                     });
                 }
             }
@@ -5009,6 +5022,10 @@ side referenced. Strict rules:\n\
                             confidence: c.confidence,
                             source_uri: c.source_uri.clone(),
                             relevance: *score,
+                            // The in-memory cache (CachedClaim) does not materialize a
+                            // claim-level ingestion timestamp, so recency on this path falls
+                            // back to session_dates in the synthesizer.
+                            valid_from: 0,
                         });
                     }
                 }
@@ -5041,7 +5058,29 @@ side referenced. Strict rules:\n\
                         confidence: conf,
                         source_uri: uri,
                         relevance: 0.5,
+                        // populated below via a single batched graph lookup.
+                        valid_from: 0,
                     });
+                }
+            }
+        }
+
+        // Per-claim recency: the in-memory cache (CachedClaim) carries no
+        // ingestion timestamp, and the keyword fallback carries none either, so
+        // both phases above left `valid_from: 0`. Resolve real per-claim
+        // timestamps with ONE batched graph read (claims.created_at, falling
+        // back to claim_temporal.valid_from) so the /ask synthesizer can split
+        // recency on real claim recency instead of tying on session date. Ids
+        // that don't resolve keep `0` → session-date fallback downstream.
+        if !claim_hits.is_empty() {
+            let ids: Vec<&str> = claim_hits.iter().map(|h| h.id.as_str()).collect();
+            let valid_from = {
+                let storage = handle.storage.lock().await;
+                storage.graph.claim_valid_from(&ids)?
+            };
+            for hit in claim_hits.iter_mut() {
+                if let Some(ts) = valid_from.get(&hit.id) {
+                    hit.valid_from = *ts;
                 }
             }
         }
@@ -5659,6 +5698,10 @@ side referenced. Strict rules:\n\
                             confidence: c.confidence,
                             source_uri: c.source_uri.clone(),
                             relevance: *score,
+                            // The in-memory cache (CachedClaim) does not materialize a
+                            // claim-level ingestion timestamp, so recency on this path falls
+                            // back to session_dates in the synthesizer.
+                            valid_from: 0,
                         });
                     } else if let Some(ref bh) = branch_handle {
                         // Branch-only claim — resolve via branch graph point-lookup.
@@ -5672,6 +5715,8 @@ side referenced. Strict rules:\n\
                                 confidence: conf,
                                 source_uri: uri,
                                 relevance: *score,
+                                // branch point-lookup tuple has no timestamp.
+                                valid_from: 0,
                             });
                         }
                     }
