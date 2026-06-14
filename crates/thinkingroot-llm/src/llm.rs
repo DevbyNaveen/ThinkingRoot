@@ -15,16 +15,28 @@ use thinkingroot_extract::schema::ExtractionResult;
 pub struct TokenUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Prompt-cache: input tokens served from the provider's prompt cache
+    /// (`usage.prompt_tokens_details.cached_tokens`, Azure/OpenAI). These are a
+    /// SUBSET of `prompt_tokens` — re-used context that was not re-processed at
+    /// full price. `None` when the provider does not report it (never
+    /// fabricated). Feeds the Savings Meter's input column.
+    pub cached_prompt_tokens: Option<u32>,
 }
 
 impl TokenUsage {
-    /// Parse the OpenAI-shape `usage` object (`{prompt_tokens, completion_tokens}`)
+    /// Parse the OpenAI-shape `usage` object
+    /// (`{prompt_tokens, completion_tokens, prompt_tokens_details:{cached_tokens}}`)
     /// off a parsed chat/completions response. Missing fields stay `None`.
     pub fn from_response_json(json: &serde_json::Value) -> Self {
         let u = &json["usage"];
         Self {
             prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
             completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+            cached_prompt_tokens: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         }
     }
 }
@@ -4519,6 +4531,35 @@ pub(crate) fn retry_after_seconds(h: &reqwest::header::HeaderMap) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_usage_parses_prompt_completion_and_cached() {
+        // Azure/OpenAI prompt-caching shape: cached_tokens nested under
+        // prompt_tokens_details, a subset of prompt_tokens.
+        let json = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 17000,
+                "completion_tokens": 797,
+                "prompt_tokens_details": { "cached_tokens": 14500 }
+            }
+        });
+        let u = TokenUsage::from_response_json(&json);
+        assert_eq!(u.prompt_tokens, Some(17000));
+        assert_eq!(u.completion_tokens, Some(797));
+        assert_eq!(u.cached_prompt_tokens, Some(14500));
+    }
+
+    #[test]
+    fn token_usage_cached_is_none_when_absent() {
+        // A provider that does not report prompt caching → None, never a
+        // fabricated 0 (honesty rule).
+        let json = serde_json::json!({
+            "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
+        });
+        let u = TokenUsage::from_response_json(&json);
+        assert_eq!(u.prompt_tokens, Some(100));
+        assert_eq!(u.cached_prompt_tokens, None);
+    }
 
     #[test]
     fn model_max_tokens_haiku_45() {

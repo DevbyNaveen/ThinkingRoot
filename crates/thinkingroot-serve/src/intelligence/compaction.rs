@@ -40,6 +40,16 @@ pub fn history_keep_from(history: &[ChatTurn], budget_tokens: usize) -> usize {
     0
 }
 
+/// Tokens elided from the rendered history block by compaction — Metric A of
+/// the Savings Meter (input). Sums exactly the turns `history_keep_from` drops,
+/// with the same `turn_tokens` estimate `render_history_block` pays, so the
+/// meter can never drift from what was actually elided. 0 when nothing is
+/// dropped (history fits the budget) — the honest under-claim.
+pub fn compaction_saved_tokens(history: &[ChatTurn], budget_tokens: usize) -> usize {
+    let from = history_keep_from(history, budget_tokens);
+    history[..from].iter().map(turn_tokens).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +89,27 @@ mod tests {
         // And it actually fits the budget.
         let kept_tokens: usize = h[from..].iter().map(turn_tokens).sum();
         assert!(kept_tokens <= 25, "kept suffix within budget ({kept_tokens})");
+    }
+
+    #[test]
+    fn saved_tokens_zero_when_nothing_dropped() {
+        let h = vec![turn("a"), turn("b")];
+        // Whole history fits → from == 0 → nothing elided → 0 saved.
+        assert_eq!(compaction_saved_tokens(&h, 1000), 0);
+    }
+
+    #[test]
+    fn saved_tokens_counts_exactly_the_dropped_turns() {
+        let h = vec![
+            turn(&"x".repeat(24)),
+            turn(&"y".repeat(24)),
+            turn(&"z".repeat(24)),
+            turn(&"w".repeat(24)),
+        ];
+        let from = history_keep_from(&h, 25);
+        let expect: usize = h[..from].iter().map(turn_tokens).sum();
+        assert_eq!(compaction_saved_tokens(&h, 25), expect);
+        assert!(expect > 0, "older turns were elided");
     }
 
     #[test]

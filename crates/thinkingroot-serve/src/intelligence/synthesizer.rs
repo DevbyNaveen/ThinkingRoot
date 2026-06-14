@@ -690,6 +690,32 @@ pub struct AskResponse {
     /// (all `None`) when no LLM call was made (empty workspace / no LLM
     /// configured / static fallback) or the provider did not report it.
     pub usage: thinkingroot_llm::llm::TokenUsage,
+    /// Savings Meter — Metric B (compression vs naive RAG). Token size of ALL
+    /// retrieved candidate claims, i.e. what a naive RAG that skipped the
+    /// rerank-and-cut would have stuffed into the prompt. Measured with
+    /// `estimate_tokens`; a counterfactual, never billed.
+    pub naive_claim_tokens: usize,
+    /// Savings Meter — Metric B. Token size of the top-K claims actually
+    /// rendered into the prompt (`claim_limit(category)`). `naive - sent` is the
+    /// compression. Equal to `naive` when nothing was cut (honest 0% then).
+    pub sent_claim_tokens: usize,
+}
+
+/// Metric B (compression vs naive RAG): token size of ALL retrieved candidate
+/// claims vs the top-K actually rendered into the prompt. Single source of the
+/// cut (`claim_limit`) so the meter can never drift from what `build_claim_notes`
+/// renders. Both sides measured with `estimate_tokens` — never a fabricated
+/// baseline.
+pub fn claim_block_tokens(
+    claims: &[crate::engine::ClaimSearchHit],
+    category: &str,
+) -> (usize, usize) {
+    let limit = claim_limit(category);
+    let tok =
+        |c: &crate::engine::ClaimSearchHit| crate::intelligence::token_budget::estimate_tokens(&c.statement);
+    let naive: usize = claims.iter().map(tok).sum();
+    let sent: usize = claims.iter().take(limit).map(tok).sum();
+    (naive, sent)
 }
 
 /// Run the full hybrid retrieval + synthesis pipeline.
@@ -779,6 +805,9 @@ async fn try_aggregation_answer(
         grounding,
         // Aggregation answers are computed from the graph — no LLM call.
         usage: TokenUsage::default(),
+        // No claim block was stuffed into a prompt → no compression to claim.
+        naive_claim_tokens: 0,
+        sent_claim_tokens: 0,
     })
 }
 
@@ -832,8 +861,12 @@ pub async fn ask(
             category: req.category.to_string(),
             grounding: Vec::new(),
             usage: TokenUsage::default(),
+            naive_claim_tokens: 0,
+            sent_claim_tokens: 0,
         };
     }
+
+    let (naive_claim_tokens, sent_claim_tokens) = claim_block_tokens(&claims, req.category);
 
     let Some(llm_client) = llm else {
         return AskResponse {
@@ -842,6 +875,8 @@ pub async fn ask(
             category: req.category.to_string(),
             grounding: claims,
             usage: TokenUsage::default(),
+            naive_claim_tokens,
+            sent_claim_tokens,
         };
     };
 
@@ -852,6 +887,8 @@ pub async fn ask(
         category: req.category.to_string(),
         grounding: claims,
         usage,
+        naive_claim_tokens,
+        sent_claim_tokens,
     }
 }
 
@@ -1130,15 +1167,18 @@ fn render_history_block(history: &[ChatTurn]) -> String {
 }
 
 /// §5 input #5 flag — compact long conversation history. OFF by default so the
-/// rendered block is byte-identical to before until explicitly enabled.
-fn history_compaction_on() -> bool {
+/// rendered block is byte-identical to before until explicitly enabled. `pub`
+/// so the ask handler reads the SAME flag the renderer does (Savings Meter must
+/// not drift from the actual elision).
+pub fn history_compaction_on() -> bool {
     std::env::var("TR_COMPACT_HISTORY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
-/// Token budget for the kept history suffix (default 4000).
-fn history_compaction_budget() -> usize {
+/// Token budget for the kept history suffix (default 4000). `pub` for the same
+/// no-drift reason as [`history_compaction_on`].
+pub fn history_compaction_budget() -> usize {
     std::env::var("TR_HISTORY_BUDGET_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1247,6 +1287,8 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
             category,
             grounding: Vec::new(),
             usage: TokenUsage::default(),
+            naive_claim_tokens: 0,
+            sent_claim_tokens: 0,
         };
     };
 
@@ -1266,6 +1308,8 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
             category,
             grounding: Vec::new(),
             usage,
+            naive_claim_tokens: 0,
+            sent_claim_tokens: 0,
         },
         Ok(Err(e)) => {
             tracing::warn!("synthesizer: chitchat LLM error: {e}");
@@ -1275,6 +1319,8 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 category,
                 grounding: Vec::new(),
                 usage: TokenUsage::default(),
+                naive_claim_tokens: 0,
+                sent_claim_tokens: 0,
             }
         }
         Err(_) => {
@@ -1285,6 +1331,8 @@ async fn chitchat_answer(llm: Option<Arc<LlmClient>>, req: &AskRequest<'_>) -> A
                 category,
                 grounding: Vec::new(),
                 usage: TokenUsage::default(),
+                naive_claim_tokens: 0,
+                sent_claim_tokens: 0,
             }
         }
     }
@@ -2161,6 +2209,44 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             relevance: 0.5,
             valid_from: 0,
         }]
+    }
+
+    fn claim(stmt: &str) -> ClaimSearchHit {
+        ClaimSearchHit {
+            id: "x".to_string(),
+            statement: stmt.to_string(),
+            claim_type: "fact".to_string(),
+            confidence: 0.9,
+            source_uri: "s".to_string(),
+            relevance: 0.5,
+            valid_from: 0,
+        }
+    }
+
+    #[test]
+    fn claim_block_tokens_empty_is_zero() {
+        assert_eq!(claim_block_tokens(&[], "default"), (0, 0));
+    }
+
+    #[test]
+    fn claim_block_tokens_no_cut_naive_equals_sent() {
+        // Far fewer claims than any claim_limit → nothing cut → naive == sent
+        // (honest 0% compression).
+        let claims: Vec<_> = (0..5).map(|i| claim(&format!("claim number {i}"))).collect();
+        let (naive, sent) = claim_block_tokens(&claims, "default");
+        assert_eq!(naive, sent);
+        assert!(naive > 0);
+    }
+
+    #[test]
+    fn claim_block_tokens_cuts_beyond_limit() {
+        // More candidates than the largest claim_limit (100) → sent < naive,
+        // i.e. real measured compression.
+        let claims: Vec<_> = (0..150)
+            .map(|i| claim(&format!("a reasonably sized memory statement number {i}")))
+            .collect();
+        let (naive, sent) = claim_block_tokens(&claims, "default");
+        assert!(sent < naive, "top-K cut produced compression: {sent} < {naive}");
     }
 
     fn empty_sessions_dir() -> PathBuf {

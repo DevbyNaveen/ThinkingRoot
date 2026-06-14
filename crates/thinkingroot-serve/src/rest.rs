@@ -593,12 +593,17 @@ fn ok_response<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
 /// or no LLM call) is OMITTED rather than sent as a fabricated `0`. The
 /// `x-tr-saved-*` headers always carry a real number (0 = nothing saved).
 ///
-/// from_cache == true  → this call made NO LLM call: the cached body's
-///   token counts are the AVOIDED cost → emitted as `x-tr-saved-*`; tokens
-///   spent now are 0; reason = "answer_cache".
+/// from_cache == true  → this call made NO LLM call: the cached body's whole
+///   input+output token counts are the AVOIDED cost → emitted as `x-tr-saved-*`;
+///   tokens spent now are 0; reason = "answer_cache".
 /// from_cache == false → tokens spent now are emitted as `x-tr-prompt/
-///   completion-tokens`; the hydration saving is `x-tr-saved-output-tokens`;
-///   reason = "hydration" when hydrated > 0, else empty.
+///   completion-tokens`. Metric A input saving = prompt-cache `cached_tokens`
+///   (provider-served, a subset of prompt_tokens) + compaction-elided history
+///   tokens; output saving = hydration. The dominant mechanism names
+///   `x-tr-savings-reason`.
+/// Both branches also carry Metric B (compression vs naive RAG) as
+/// `x-tr-naive-claim-tokens` / `x-tr-sent-claim-tokens` — a measured
+/// counterfactual, kept distinct from the avoided-cost `x-tr-saved-*` numbers.
 fn ask_response_with_savings(body: &AskResponseBody) -> Response {
     let mut resp = ok_response(body.clone()).into_response();
     let headers = resp.headers_mut();
@@ -631,20 +636,46 @@ fn ask_response_with_savings(body: &AskResponseBody) -> Response {
         if let Some(c) = body.completion_tokens {
             set(headers, "x-tr-completion-tokens", c.to_string());
         }
-        set(headers, "x-tr-saved-input-tokens", "0".into());
+        // Metric A (input) = prompt-cache served tokens + compaction-elided
+        // history tokens. Each term is real/counted; a mechanism that did not
+        // fire contributes 0 (the meter under-claims by construction).
+        let cached = body.cached_prompt_tokens.unwrap_or(0) as usize;
+        let saved_input = cached + body.compaction_saved_tokens;
+        set(headers, "x-tr-saved-input-tokens", saved_input.to_string());
+        set(headers, "x-tr-cached-input-tokens", cached.to_string());
+        set(
+            headers,
+            "x-tr-compaction-saved-tokens",
+            body.compaction_saved_tokens.to_string(),
+        );
         set(
             headers,
             "x-tr-saved-output-tokens",
             body.hydrated_output_tokens_saved.to_string(),
         );
-        let reason = if body.hydrated_output_tokens_saved > 0 {
-            "hydration"
-        } else {
-            ""
-        };
-        set(headers, "x-tr-savings-reason", reason.into());
+        set(headers, "x-tr-savings-reason", dominant_savings_reason(body).into());
     }
+    // Metric B (compression vs naive RAG) — emitted on both paths; the cache hit
+    // carries the values stored when the answer was first synthesised.
+    set(headers, "x-tr-naive-claim-tokens", body.naive_claim_tokens.to_string());
+    set(headers, "x-tr-sent-claim-tokens", body.sent_claim_tokens.to_string());
     resp
+}
+
+/// Dominant input/output saving mechanism for a non-cached `/ask`, in priority
+/// order: prompt-cache → compaction → hydration → none. The numeric breakdown
+/// lives in the `x-tr-*` headers, so a single dominant tag is honest (it never
+/// claims a mechanism that contributed 0).
+fn dominant_savings_reason(body: &AskResponseBody) -> &'static str {
+    if body.cached_prompt_tokens.unwrap_or(0) > 0 {
+        "prompt_cache"
+    } else if body.compaction_saved_tokens > 0 {
+        "compaction"
+    } else if body.hydrated_output_tokens_saved > 0 {
+        "hydration"
+    } else {
+        ""
+    }
 }
 
 fn err_response(status: StatusCode, code: &str, message: &str) -> Response {
@@ -7315,6 +7346,26 @@ struct AskResponseBody {
     /// Same semantics as `prompt_tokens`.
     #[serde(default)]
     completion_tokens: Option<u32>,
+    /// §5 input #2 — prompt-cache: input tokens the provider served from its
+    /// prompt cache (`prompt_tokens_details.cached_tokens`), a SUBSET of
+    /// `prompt_tokens`. Real avoided re-processing cost. `None` when the
+    /// provider does not report it. Feeds Savings-Meter Metric A (input).
+    #[serde(default)]
+    cached_prompt_tokens: Option<u32>,
+    /// §5 input #5 — context-compaction: history tokens elided before the LLM
+    /// call. 0 when compaction is off (the dark-flag default). Feeds Metric A.
+    #[serde(default)]
+    compaction_saved_tokens: usize,
+    /// Savings-Meter Metric B (compression vs naive RAG): token size of ALL
+    /// retrieved candidate claims (what a naive RAG without rerank-and-cut would
+    /// have stuffed). Counterfactual, never billed. 0 on the no-retrieval paths.
+    #[serde(default)]
+    naive_claim_tokens: usize,
+    /// Metric B: token size of the top-K claims actually rendered into the
+    /// prompt. `naive - sent` is the compression; equal to `naive` when nothing
+    /// was cut (honest 0%).
+    #[serde(default)]
+    sent_claim_tokens: usize,
 }
 
 /// §3 #6 retry flag — give a refused answer one more synthesis pass before
@@ -7636,6 +7687,17 @@ async fn ask_handler(
 
     let prompt_tokens = result.usage.prompt_tokens;
     let completion_tokens = result.usage.completion_tokens;
+    let cached_prompt_tokens = result.usage.cached_prompt_tokens;
+    // §5 input #5 — measure history tokens elided by compaction, reading the
+    // SAME flag/budget the renderer used (no drift). 0 when compaction is off.
+    let compaction_saved_tokens = if crate::intelligence::synthesizer::history_compaction_on() {
+        crate::intelligence::compaction::compaction_saved_tokens(
+            &history,
+            crate::intelligence::synthesizer::history_compaction_budget(),
+        )
+    } else {
+        0
+    };
     let resp_body = AskResponseBody {
         answer,
         claims_used,
@@ -7647,6 +7709,10 @@ async fn ask_handler(
         from_cache: false,
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
+        compaction_saved_tokens,
+        naive_claim_tokens: result.naive_claim_tokens,
+        sent_claim_tokens: result.sent_claim_tokens,
     };
 
     // ── §5 input #4 — answer cache (write) ──────────────────────────
@@ -7815,6 +7881,19 @@ async fn ask_stream_handler(
     let usage_ws = ws.clone();
     let usage_question = body.question.clone();
     let usage_session = body.conversation_id.clone().unwrap_or_default();
+
+    // §5 input #5 — history tokens compaction will elide before the LLM call,
+    // measured with the SAME flag/budget the renderer uses (no drift). 0 when
+    // compaction is off. Computed here (history is owned and the req borrow has
+    // ended) and move-captured by the SSE generator below.
+    let compaction_saved_tokens = if crate::intelligence::synthesizer::history_compaction_on() {
+        crate::intelligence::compaction::compaction_saved_tokens(
+            &history,
+            crate::intelligence::synthesizer::history_compaction_budget(),
+        )
+    } else {
+        0
+    };
 
     let stream = async_stream::stream! {
         match outcome {
@@ -8001,11 +8080,22 @@ async fn ask_stream_handler(
                 yield Ok(
                     Event::default().event("citation").data(citation_payload.to_string())
                 );
-                // The streaming path never serves from the answer cache
-                // (that's the one-shot ask_handler), so from_cache is always
-                // false here → no saved input tokens; the only saving is
-                // hydration. Token counts are real (None → null in JSON).
-                let savings_reason = if hydrated_output_tokens_saved > 0 {
+                // The streaming path never serves from the answer cache (that's
+                // the one-shot ask_handler), so from_cache is always false here.
+                // Metric A input saving = prompt-cache served tokens +
+                // compaction-elided history tokens; output saving = hydration.
+                // Token counts are real (None → null in JSON).
+                let cached_input_tokens = final_usage.cached_prompt_tokens.unwrap_or(0) as usize;
+                let saved_input_tokens = cached_input_tokens + compaction_saved_tokens;
+                // Metric B (compression vs naive RAG): all retrieved candidates
+                // vs the top-K rendered. Single source of the cut.
+                let (naive_claim_tokens, sent_claim_tokens) =
+                    crate::intelligence::synthesizer::claim_block_tokens(&grounding, &category);
+                let savings_reason = if cached_input_tokens > 0 {
+                    "prompt_cache"
+                } else if compaction_saved_tokens > 0 {
+                    "compaction"
+                } else if hydrated_output_tokens_saved > 0 {
                     "hydration"
                 } else {
                     ""
@@ -8018,7 +8108,11 @@ async fn ask_stream_handler(
                     "prompt_tokens": final_usage.prompt_tokens,
                     "completion_tokens": final_usage.completion_tokens,
                     "saved_output_tokens": hydrated_output_tokens_saved,
-                    "saved_input_tokens": 0,
+                    "saved_input_tokens": saved_input_tokens,
+                    "cached_input_tokens": cached_input_tokens,
+                    "compaction_saved_tokens": compaction_saved_tokens,
+                    "naive_claim_tokens": naive_claim_tokens,
+                    "sent_claim_tokens": sent_claim_tokens,
                     "from_cache": false,
                     "savings_reason": savings_reason,
                 });
