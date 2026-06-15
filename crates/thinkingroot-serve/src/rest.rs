@@ -4258,8 +4258,13 @@ async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> 
     // because the returned Future captures `&self` from the guard;
     // that's a public API break we're not pulling forward without
     // observed contention.
-    let engine = state.engine.read().await;
-    match engine.compile(&ws).await {
+    // Hold the read guard only for the compile itself, then drop it before
+    // spawning the reconcile (which re-acquires its own read guard).
+    let compiled = {
+        let engine = state.engine.read().await;
+        engine.compile(&ws).await
+    };
+    match compiled {
         Ok(result) => {
             // Plan §3.10: when compile dirties the cache, drop every Engram
             // pointing at this workspace. Without this hook a probe after a
@@ -4269,6 +4274,44 @@ async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> 
             if result.cache_dirty {
                 state.engram_manager.invalidate_workspace(&ws).await;
             }
+            // Rebuild the semantic index for the freshly-compiled witnesses.
+            // The STREAMING compile path does this via
+            // `finalize_successful_compile`; this non-streaming endpoint must
+            // match it, else clients that POST /compile (SDK, CLI, headless
+            // seeders) leave the vector index stale and semantic search /
+            // `/ask` return empty for everything compiled here. Backgrounded
+            // for the same reasons documented at `finalize_successful_compile`
+            // (per-workspace self-locked store; failures surface via warn!).
+            let engine = state.engine.clone();
+            let ws_owned = ws.clone();
+            let reconcile_cancel = tokio_util::sync::CancellationToken::new();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let r = engine
+                    .read()
+                    .await
+                    .reconcile_vector_index(&ws_owned, reconcile_cancel)
+                    .await;
+                let elapsed_ms = started.elapsed().as_millis();
+                match r {
+                    Ok(stats) => tracing::info!(
+                        workspace = %ws_owned,
+                        elapsed_ms,
+                        existing = stats.existing,
+                        current = stats.current,
+                        removed = stats.removed,
+                        added = stats.added,
+                        "background vector index reconciled (delta path, non-streaming compile)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        workspace = %ws_owned,
+                        elapsed_ms,
+                        "background vector index reconcile failed: {e} — \
+                         semantic search and AEP probes will return empty \
+                         results until the next compile re-attempts"
+                    ),
+                }
+            });
             ok_response(result).into_response()
         }
         Err(e) => match_engine_error(e),
