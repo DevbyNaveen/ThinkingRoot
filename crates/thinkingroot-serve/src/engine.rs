@@ -1952,7 +1952,20 @@ impl QueryEngine {
             })?;
             alt
         };
-        self.mount(ws.to_string(), root).await
+        self.mount(ws.to_string(), root).await?;
+        // Slice 1 (2026-06-17): a composite per-(user×agent) scope inherits the
+        // agent's OWN brain `agent_Y`; ensure it's mounted so the inheritance
+        // chain can resolve the agent's functions/prompts. Best-effort and
+        // depth-1 (an `agent_Y` brain is never itself composite, so no further
+        // recursion); a missing/unmountable agent brain just means nothing to
+        // inherit there. Boxed because this recurses into the same async fn.
+        if let Some(idx) = ws.find("__agent_") {
+            let agent_brain = format!("agent_{}", &ws[idx + "__agent_".len()..]);
+            if agent_brain != ws && !self.workspaces.contains_key(&agent_brain) {
+                let _ = Box::pin(self.get_or_mount_user_ws(&agent_brain)).await;
+            }
+        }
+        Ok(())
     }
 
     /// List all currently mounted workspaces with summary counts.
@@ -2932,32 +2945,56 @@ impl QueryEngine {
     }
 
     /// Latest version of a single function, or `None`.
+    /// Read-inheritance chain for a workspace, head-first: the brain itself,
+    /// then each brain it inherits from, ending at the shared/primary brain.
+    /// This is the resolution order for definitions a scope doesn't carry its
+    /// own copy of (agents, functions, prompts):
+    ///   `u_X__agent_Y` → [`u_X__agent_Y`, `agent_Y`, <primary>]   (Slice 1: 2-level)
+    ///   `u_X`          → [`u_X`, <primary>]
+    ///   `agent_Y`      → [`agent_Y`, <primary>]
+    ///   <primary>/other→ [`ws`]
+    /// Unmounted brains in the chain are skipped by callers, so it's safe to
+    /// list a parent that hasn't been referenced yet.
+    pub(crate) fn inheritance_chain(&self, ws: &str) -> Vec<String> {
+        let mut chain = vec![ws.to_string()];
+        // A composite per-(user×agent) scope `u_X__agent_Y` inherits the
+        // agent's OWN brain `agent_Y` (its functions/prompts) BEFORE the shared
+        // brain — so per-user runs get the agent's skills, then the project pool.
+        if let Some(idx) = ws.find("__agent_") {
+            let agent_brain = format!("agent_{}", &ws[idx + "__agent_".len()..]);
+            if agent_brain != ws && !chain.contains(&agent_brain) {
+                chain.push(agent_brain);
+            }
+        }
+        // Any auto-scoped brain finally inherits the shared/primary brain.
+        if is_auto_scoped_ws(ws)
+            && let Some(primary) = self.primary_ws_name()
+            && !chain.contains(&primary)
+        {
+            chain.push(primary);
+        }
+        chain
+    }
+
     pub async fn get_function(
         &self,
         ws: &str,
         name: &str,
     ) -> Result<Option<thinkingroot_graph::root_function::RootFunction>> {
-        let handle = self.get_workspace(ws)?;
-        {
-            let storage = handle.storage.lock().await;
-            if let Some(f) = storage.graph.get_function(name)? {
-                return Ok(Some(f));
+        // Preserve the prior contract: calling on an unmounted scope errors.
+        let _ = self.get_workspace(ws)?;
+        // Walk the inheritance chain (self → agent brain → shared) and return
+        // the first brain carrying the function. A function deployed once in the
+        // shared (or agent) brain is callable from any per-user / per-(user×agent)
+        // scope; it still EXECUTES in the calling scope (its `ctx.memory` targets
+        // that brain). Never crosses into another user's or agent's workspace.
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if let Some(f) = storage.graph.get_function(name)? {
+                    return Ok(Some(f));
+                }
             }
-        }
-        // Two-tier capability resolution: a Root Function deployed ONCE in the
-        // shared/primary brain is callable from a per-user `u_*` scope, so a
-        // single agent definition's functions work for every end-user without
-        // redeploying into each per-user workspace. The function still EXECUTES
-        // in the `u_*` scope (its `ctx.memory` targets the user's own brain) —
-        // only the definition is resolved from the shared brain. Per-user scopes
-        // only; never crosses into another user's workspace.
-        if is_auto_scoped_ws(ws)
-            && let Some(primary) = self.primary_ws_name()
-            && primary != ws
-            && let Ok(phandle) = self.get_workspace(&primary)
-        {
-            let storage = phandle.storage.lock().await;
-            return storage.graph.get_function(name);
         }
         Ok(None)
     }
@@ -2989,20 +3026,17 @@ impl QueryEngine {
         ws: &str,
         name: &str,
     ) -> Result<Option<thinkingroot_graph::agents::AgentDef>> {
-        let handle = self.get_workspace(ws)?;
-        {
-            let storage = handle.storage.lock().await;
-            if let Some(a) = storage.graph.get_agent(name)? {
-                return Ok(Some(a));
+        let _ = self.get_workspace(ws)?; // preserve "unmounted scope = error"
+        // Walk the inheritance chain (self → agent brain → shared). The agent
+        // DEFINITION lives in the shared brain, so a composite/per-user scope
+        // resolves it via the chain — an agent defined once serves every scope.
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if let Some(a) = storage.graph.get_agent(name)? {
+                    return Ok(Some(a));
+                }
             }
-        }
-        if is_auto_scoped_ws(ws)
-            && let Some(primary) = self.primary_ws_name()
-            && primary != ws
-            && let Ok(phandle) = self.get_workspace(&primary)
-        {
-            let storage = phandle.storage.lock().await;
-            return storage.graph.get_agent(name);
         }
         Ok(None)
     }
