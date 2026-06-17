@@ -5065,19 +5065,24 @@ side referenced. Strict rules:\n\
             && std::env::var("TR_TWO_TIER_RECALL")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-        if two_tier
-            && result.is_ok()
-            && let Some(primary) = self.primary_ws_name()
-            && primary != ws
-            && let Ok(phandle) = self.get_workspace(&primary)
-        {
-            // Unscoped over the shared brain: its sources are not the user's
-            // session ids, so an empty scope avoids filtering shared claims out.
+        if two_tier && result.is_ok() {
+            // Slice 1b: inherit recall from each PARENT brain in the inheritance
+            // chain — for a composite `u_X__agent_Y` scope that's the agent's
+            // own brain `agent_Y` THEN the shared brain; for a plain `u_X` it's
+            // just the shared brain (identical to before). So a per-user×agent
+            // run recalls its OWN private memory + the agent's + the project's.
+            // Each parent is searched unscoped (its sources aren't the user's
+            // session ids) and merged; never crosses into another user's brain.
             let unscoped: HashSet<String> = HashSet::new();
-            if let Ok(shared) = Self::search_scoped_on(phandle, query, top_k, &unscoped).await
-                && let Ok(base) = result.as_mut()
-            {
-                Self::merge_search_results(base, shared, top_k);
+            for parent in self.inheritance_chain(ws).into_iter().skip(1) {
+                let Ok(phandle) = self.get_workspace(&parent) else {
+                    continue;
+                };
+                if let Ok(shared) = Self::search_scoped_on(phandle, query, top_k, &unscoped).await
+                    && let Ok(base) = result.as_mut()
+                {
+                    Self::merge_search_results(base, shared, top_k);
+                }
             }
         }
 
