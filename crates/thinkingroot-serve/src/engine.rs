@@ -2183,9 +2183,22 @@ impl QueryEngine {
         name: &str,
         vars: &std::collections::BTreeMap<String, String>,
     ) -> Result<String> {
-        let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        storage.graph.assemble_prompt(name, vars)
+        let _ = self.get_workspace(ws)?; // preserve unmounted-scope error
+        // Resolve the prompt through the inheritance chain (self → agent brain
+        // → shared): the first brain that HAS the named template assembles it.
+        // `prompt_get_latest` distinguishes "not in this brain" from a real
+        // template error in the brain that owns it (Slice 1: prompt inheritance).
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if storage.graph.prompt_get_latest(name)?.is_some() {
+                    return storage.graph.assemble_prompt(name, vars);
+                }
+            }
+        }
+        Err(Error::Template(format!(
+            "prompt template `{name}` not found"
+        )))
     }
 
     /// A2 — rank an ARBITRARY tool catalog by semantic relevance to a query,
