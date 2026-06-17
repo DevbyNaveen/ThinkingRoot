@@ -262,7 +262,9 @@ pub async fn register_mcp_bridge_tools(
     mut registry: ToolRegistry,
     ctx: &ToolContext,
 ) -> ToolRegistry {
-    let entries = fetch_catalog_entries().await;
+    // Slice 2: the agent's workspace scopes which external MCP tools (the user's
+    // own connectors) the loop can see.
+    let entries = fetch_catalog_entries(Some(ctx.workspace.as_str())).await;
     for entry in entries.iter() {
         let Some(spec) = McpBridgeTool::spec_from_catalog(entry) else {
             tracing::warn!(
@@ -302,25 +304,19 @@ pub async fn register_mcp_bridge_tools(
     registry
 }
 
-/// Fetch the inner `tools` array from `mcp::tools::handle_list`.
-/// Returns an empty Vec on protocol error so the agent still boots
-/// with the hand-wrapped builtins — losing the bridge is recoverable;
-/// crashing the agent isn't.
-async fn fetch_catalog_entries() -> Vec<Value> {
-    let response = mcp_tools::handle_list(None).await;
-    if let Some(err) = response.error.as_ref() {
-        tracing::error!(
-            target: "mcp_bridge",
-            code = err.code,
-            message = %err.message,
-            "mcp::tools::handle_list returned an error — bridge will register zero tools",
-        );
-        return Vec::new();
-    }
-    response
-        .result
-        .as_ref()
-        .and_then(|v| v.get("tools"))
+/// Fetch the inner `tools` array for the agent loop's bridge.
+///
+/// Slice 2: takes the workspace so per-(user×agent) EXTERNAL MCP tools (e.g.
+/// each end-user's own Composio connectors) appear in the agent's catalog —
+/// without it, the bridge only ever saw the no-workspace (global) registry.
+/// Calls `build_tool_catalog` directly: the same source of truth as
+/// `tools/list` (including the defer-loading annotation pass), minus the
+/// JSON-RPC envelope. Empty Vec on absence so the agent still boots with the
+/// hand-wrapped builtins — losing the bridge is recoverable; crashing isn't.
+async fn fetch_catalog_entries(ws: Option<&str>) -> Vec<Value> {
+    mcp_tools::build_tool_catalog(ws)
+        .await
+        .get("tools")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default()
@@ -571,7 +567,7 @@ mod tests {
         // Wires the live `mcp::tools::handle_list` — the contract is
         // that handle_list always returns the full MCP catalog. Empty
         // result means the catalog wiring broke.
-        let entries = fetch_catalog_entries().await;
+        let entries = fetch_catalog_entries(None).await;
         assert!(
             !entries.is_empty(),
             "mcp::tools::handle_list returned no tools — bridge would register zero handlers",
@@ -599,7 +595,7 @@ mod tests {
         // Smoke test the catalog wiring with three tools that MUST
         // remain MCP-exposed: hybrid_retrieve (read), list_witnesses
         // (Witness Mesh read path), and materialize_engram (AEP).
-        let entries = fetch_catalog_entries().await;
+        let entries = fetch_catalog_entries(None).await;
         let names: Vec<String> = entries
             .iter()
             .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from))

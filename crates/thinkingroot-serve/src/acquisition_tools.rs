@@ -237,10 +237,10 @@ impl McpToolHandler for McpServerInstall {
         let count = upsert_server_entry(&workspace_root, entry)
             .map_err(McpToolError::Refused)?;
 
-        // Remount the global registry from the freshly-written config.
-        // A bad single entry is logged + skipped inside the registry
-        // builder, so this only errors on an unreadable/corrupt file.
-        external_registry::load_global_from_workspace_config(&workspace_root)
+        // Remount THIS workspace's registry from the freshly-written config
+        // (Slice 2: per-ws, not global). A bad single entry is logged + skipped
+        // inside the registry builder, so this only errors on a corrupt file.
+        external_registry::load_workspace_config(ctx.workspace, &workspace_root)
             .await
             .map_err(|e| McpToolError::Refused(format!("remount failed: {e}")))?;
 

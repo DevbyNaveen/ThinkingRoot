@@ -231,39 +231,50 @@ impl ExternalMcpRegistry {
 // callers load it via `load_global_from_workspace_config` at
 // workspace mount time (or via the `root mcp add` CLI subcommand).
 
-fn global_registry() -> &'static tokio::sync::RwLock<Arc<ExternalMcpRegistry>> {
-    static REG: std::sync::OnceLock<tokio::sync::RwLock<Arc<ExternalMcpRegistry>>> =
-        std::sync::OnceLock::new();
-    REG.get_or_init(|| tokio::sync::RwLock::new(Arc::new(ExternalMcpRegistry::empty())))
+// Per-WORKSPACE registries (Slice 2): external MCP tools are scoped to the
+// workspace whose `.thinkingroot/mcp-servers.toml` declared them, so per-user
+// (`u_*`) and per-(user×agent) scopes each get THEIR OWN external tools (e.g.
+// each end-user's own Composio OAuth) with NO cross-tenant leakage. Keyed by
+// workspace name; a ws with no config resolves to an empty registry.
+fn registry_map() -> &'static tokio::sync::RwLock<HashMap<String, Arc<ExternalMcpRegistry>>> {
+    static REG: std::sync::OnceLock<
+        tokio::sync::RwLock<HashMap<String, Arc<ExternalMcpRegistry>>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
 }
 
-/// Read-only handle to the current global registry. Cheap clone.
-pub async fn global() -> Arc<ExternalMcpRegistry> {
-    global_registry().read().await.clone()
+/// Read-only handle to a workspace's external-MCP registry. Empty when the
+/// workspace has no `mcp-servers.toml` mounted (or when `ws` is "" — the
+/// no-workspace context, which has no external tools). Cheap clone.
+pub async fn registry_for(ws: &str) -> Arc<ExternalMcpRegistry> {
+    registry_map()
+        .read()
+        .await
+        .get(ws)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(ExternalMcpRegistry::empty()))
 }
 
-/// Replace the global with a freshly-built registry. Atomic swap;
-/// in-flight `dispatch` calls against the old registry keep their
-/// `Arc` alive until they return.
-pub async fn install_global(reg: Arc<ExternalMcpRegistry>) {
-    let mut g = global_registry().write().await;
-    *g = reg;
+/// Install/replace a workspace's registry. Atomic per-ws swap; in-flight
+/// `dispatch` calls against the old registry keep their `Arc` alive until
+/// they return.
+pub async fn install_for(ws: &str, reg: Arc<ExternalMcpRegistry>) {
+    registry_map().write().await.insert(ws.to_string(), reg);
 }
 
-/// Load workspace config + install as global. Convenience helper
-/// for workspace-mount hooks. On config-parse error, returns the
-/// error and leaves the existing global in place.
-pub async fn load_global_from_workspace_config(
-    workspace_root: &Path,
-) -> Result<(), RegistryError> {
+/// Load a workspace's `mcp-servers.toml` and install it under that ws key.
+/// Convenience helper for workspace-mount + `root mcp add` hooks. On
+/// config-parse error, returns the error and leaves the existing registry
+/// in place.
+pub async fn load_workspace_config(ws: &str, workspace_root: &Path) -> Result<(), RegistryError> {
     let reg = ExternalMcpRegistry::from_workspace_config(workspace_root).await?;
-    install_global(Arc::new(reg)).await;
+    install_for(ws, Arc::new(reg)).await;
     Ok(())
 }
 
 #[cfg(test)]
-pub async fn clear_global_for_tests() {
-    install_global(Arc::new(ExternalMcpRegistry::empty())).await;
+pub async fn clear_for_tests(ws: &str) {
+    install_for(ws, Arc::new(ExternalMcpRegistry::empty())).await;
 }
 
 async fn spawn_one(entry: &ServerEntry) -> Result<Arc<McpClient>, RegistryError> {

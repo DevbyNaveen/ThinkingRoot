@@ -203,8 +203,11 @@ fn annotate_defer_loading(tools: &mut serde_json::Value) {
 /// source of truth. `handle_list` may apply a capability-router exposure filter
 /// on top; `tool_search` / `tool_invoke` always operate over THIS full set so
 /// progressive disclosure can reach every tool regardless of exposure mode.
+/// `ws` scopes the EXTERNAL MCP tools appended below to that workspace's
+/// registry (Slice 2: per-user/per-agent external tools). `None` = the
+/// no-workspace context, which has no external tools (builtins only).
 #[tracing::instrument(name = "mcp.tools.catalog", skip_all)]
-pub async fn build_tool_catalog() -> Value {
+pub async fn build_tool_catalog(ws: Option<&str>) -> Value {
     let mut tools = serde_json::json!({
         "tools": [
             // ── Classic CRUD tools ────────────────────────────────────────
@@ -1371,7 +1374,7 @@ pub async fn build_tool_catalog() -> Value {
             // installs the global via
             // `external_registry::load_global_from_workspace_config`
             // at workspace mount.
-            let external = crate::mcp::external_registry::global().await;
+            let external = crate::mcp::external_registry::registry_for(ws.unwrap_or("")).await;
             for (prefixed_name, tool) in external.list_all_tools().await {
                 arr_mut.push(serde_json::json!({
                     "name": prefixed_name,
@@ -1499,7 +1502,8 @@ fn apply_tool_exposure(tools: &mut Value) {
 
 #[tracing::instrument(name = "mcp.tools.list", skip_all)]
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
-    let mut tools = build_tool_catalog().await;
+    // No workspace context here → builtins only (no per-ws external tools).
+    let mut tools = build_tool_catalog(None).await;
     apply_tool_exposure(&mut tools);
     JsonRpcResponse::success(id, tools)
 }
@@ -1516,7 +1520,8 @@ pub async fn handle_list_for_ws(
     engine: &QueryEngine,
     default_ws: Option<&str>,
 ) -> JsonRpcResponse {
-    let mut tools = build_tool_catalog().await;
+    // Per-ws: external tools come from THIS workspace's registry (Slice 2).
+    let mut tools = build_tool_catalog(default_ws).await;
     if let Some(ws) = default_ws
         && let Ok(funcs) = engine.list_functions(ws).await
         && let Some(arr) = tools.get_mut("tools").and_then(|v| v.as_array_mut())
@@ -1574,7 +1579,7 @@ pub async fn handle_tool_search(
     // Always search the FULL catalog (same source of truth as tools/list,
     // including the defer_loading annotation pass) — NOT the exposure-filtered
     // list — so progressive disclosure can surface every tool in `meta` mode.
-    let result = build_tool_catalog().await;
+    let result = build_tool_catalog(None).await;
     let arr = result
         .get("tools")
         .and_then(|v| v.as_array())
@@ -3828,7 +3833,8 @@ pub async fn handle_call(
         // result in the MCP `text` content block shape so agents
         // see external tool results identically to built-ins.
         other if other.contains("::") => {
-            let registry = crate::mcp::external_registry::global().await;
+            let registry =
+                crate::mcp::external_registry::registry_for(default_ws.unwrap_or("")).await;
             match registry.dispatch(other, arguments.clone()).await {
                 Some(Ok(result)) => {
                     let text = serde_json::to_string_pretty(&result)
@@ -5458,7 +5464,7 @@ mod observer_tool_listing_tests {
     // long tail reachable. This is the 49k→~2k token mechanism.
     #[tokio::test]
     async fn meta_exposure_collapses_catalog_to_core() {
-        let mut cat = super::build_tool_catalog().await;
+        let mut cat = super::build_tool_catalog(None).await;
         let names_of = |v: &serde_json::Value| -> Vec<String> {
             v.get("tools")
                 .and_then(|t| t.as_array())
@@ -5493,7 +5499,7 @@ mod observer_tool_listing_tests {
     // catalog so the gateway's proxy_mcp forwards them to MCP clients.
     #[tokio::test]
     async fn compiled_workspace_tools_are_advertised() {
-        let cat = super::build_tool_catalog().await;
+        let cat = super::build_tool_catalog(None).await;
         let names: Vec<String> = cat
             .get("tools")
             .and_then(|t| t.as_array())

@@ -2778,7 +2778,7 @@ impl QueryEngine {
         }
         // 4. Fill remaining slots from the external MCP registry.
         if names.len() < k {
-            let registry = crate::mcp::external_registry::global().await;
+            let registry = crate::mcp::external_registry::registry_for(ws).await;
             for (tool_name, _desc) in registry.list_all_tools().await {
                 if !names.contains(&tool_name) {
                     names.push(tool_name);
@@ -3486,7 +3486,7 @@ impl QueryEngine {
         // and stays confined to this (per-user) workspace.
         let caps = {
             let handle = self.get_workspace(ws)?.clone();
-            let mcp = crate::mcp::external_registry::global().await;
+            let mcp = crate::mcp::external_registry::registry_for(ws).await;
             // A1 — per-function capability grants. Absent row → the all-on
             // default (unrestricted functions behave exactly as before).
             // Present-but-malformed row → DENY ALL (fail closed: a corrupt
@@ -3721,7 +3721,7 @@ impl QueryEngine {
         let configured = crate::acquisition_tools::list_configured_servers(&root)
             .map_err(Error::GraphStorage)?;
         // Live tool counts per server, by `<server>::` prefix.
-        let registry = crate::mcp::external_registry::global().await;
+        let registry = crate::mcp::external_registry::registry_for(ws).await;
         let tools = registry.list_all_tools().await;
         let mut out = Vec::new();
         for entry in configured {
@@ -3752,7 +3752,7 @@ impl QueryEngine {
             .ok_or_else(|| Error::GraphStorage(format!("workspace '{ws}' not mounted")))?;
         let count = crate::acquisition_tools::upsert_server_entry(&root, entry)
             .map_err(Error::GraphStorage)?;
-        crate::mcp::external_registry::load_global_from_workspace_config(&root)
+        crate::mcp::external_registry::load_workspace_config(ws, &root)
             .await
             .map_err(|e| Error::GraphStorage(format!("remount: {e}")))?;
         crate::mcp::sse::notify_tools_list_changed().await;
@@ -3769,7 +3769,7 @@ impl QueryEngine {
         let removed = crate::acquisition_tools::remove_server_entry(&root, name)
             .map_err(Error::GraphStorage)?;
         if removed {
-            crate::mcp::external_registry::load_global_from_workspace_config(&root)
+            crate::mcp::external_registry::load_workspace_config(ws, &root)
                 .await
                 .map_err(|e| Error::GraphStorage(format!("remount: {e}")))?;
             crate::mcp::sse::notify_tools_list_changed().await;
@@ -3784,7 +3784,7 @@ impl QueryEngine {
     pub async fn sync_mcp_nodes(&self, ws: &str) -> Result<()> {
         use std::collections::BTreeMap;
         use thinkingroot_graph::artifact_nodes::{artifact_node_id, KIND_MCP_SERVER, KIND_MCP_TOOL};
-        let registry = crate::mcp::external_registry::global().await;
+        let registry = crate::mcp::external_registry::registry_for(ws).await;
         let tools = registry.list_all_tools().await;
         let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (full, _desc) in &tools {
