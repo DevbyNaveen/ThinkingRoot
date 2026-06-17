@@ -884,6 +884,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // ─── Operating-layer artifact nodes (prompts/functions/flows/MCP) ─
             .route("/ws/{ws}/artifact-nodes", get(list_artifact_nodes_handler))
             .route("/ws/{ws}/branch-nodes", get(list_branch_nodes_handler))
+            .route(
+                "/ws/{ws}/branches/lineage",
+                get(ws_branch_lineage_handler),
+            )
             .route("/ws/{ws}/agents/spawn", post(agent_spawn_handler))
             .route("/ws/{ws}/agents/finish", post(agent_finish_handler))
             // ─── Per-user-namespaced store (path-guardable; auto-mounts u_*) ─
@@ -908,6 +912,15 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // ─── Agents (persisted agent entity; SDK + Console both CRUD here) ─
+            .route(
+                "/ws/{ws}/agents",
+                get(list_agents_handler).put(put_agent_handler),
+            )
+            .route(
+                "/ws/{ws}/agents/{name}",
+                get(get_agent_handler).delete(delete_agent_handler),
+            )
             // Learned retrieval prior (item 10) — read-only learning window.
             .route(
                 "/ws/{ws}/learning/retrieval-prior",
@@ -2162,6 +2175,83 @@ async fn put_function_handler(
     let lang = payload.language.as_deref().unwrap_or("js");
     match engine.put_function(&ws, &payload.name, &payload.body, lang).await {
         Ok(f) => ok_response(f).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── Agents (persisted agent entity) — the create-once definition the SDK and
+//     Console both read/write so the two stay in sync. All handlers auto-mount a
+//     per-user `u_*` scope first, so get/list resolve the shared brain's agents
+//     from any scope (the engine's primary-workspace fallback).
+
+#[derive(Deserialize)]
+struct PutAgentBody {
+    name: String,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    config_json: Option<String>,
+}
+
+async fn put_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(payload): Json<PutAgentBody>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    let cfg = payload.config_json.as_deref().unwrap_or("{}");
+    match engine
+        .put_agent(&ws, &payload.name, &payload.persona, &payload.model, cfg)
+        .await
+    {
+        Ok(a) => ok_response(a).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn get_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.get_agent(&ws, &name).await {
+        Ok(a) => ok_response(a).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn list_agents_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.list_agents(&ws).await {
+        Ok(a) => ok_response(serde_json::json!({ "agents": a })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+async fn delete_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.delete_agent(&ws, &name).await {
+        Ok(removed) => ok_response(serde_json::json!({ "deleted": removed })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
@@ -5599,7 +5689,7 @@ async fn consolidate_claims_handler(
 /// namespace on first reference. Non-`u_` names are left to the normal
 /// not-mounted error path. Returns an error `Response` on mount failure.
 async fn ensure_user_ws(state: &AppState, ws: &str) -> std::result::Result<(), Response> {
-    if !ws.starts_with("u_") {
+    if !crate::engine::is_auto_scoped_ws(ws) {
         return Ok(());
     }
     let mounted = { state.engine.read().await.is_mounted(ws) };
@@ -6383,6 +6473,36 @@ async fn branch_lineage_handler(State(state): State<Arc<AppState>>) -> Response 
             );
         }
     };
+    lineage_for_root(&root)
+}
+
+/// `GET /api/v1/ws/{ws}/branches/lineage` — branch lineage for a SPECIFIC
+/// workspace (the shared `main` brain or a per-user `u_*` brain), so the
+/// Console can drive the branch view from a workspace switcher instead of
+/// being pinned to the single active workspace. Auto-mounts a `u_*` namespace
+/// on first reference, mirroring the other `/ws/{ws}/` read handlers.
+async fn ws_branch_lineage_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let root = { state.engine.read().await.workspace_root_path(&ws) };
+    match root {
+        Some(r) => lineage_for_root(&r),
+        None => err_response(
+            StatusCode::NOT_FOUND,
+            "WORKSPACE_NOT_FOUND",
+            &format!("workspace '{ws}' is not mounted"),
+        ),
+    }
+}
+
+/// Build branch lineage (typed nodes + fork/merge edges) for the workspace
+/// rooted at `root`. Shared by the active-workspace and ws-scoped handlers so
+/// both return identical topology for whichever brain is named.
+fn lineage_for_root(root: &std::path::Path) -> Response {
     use thinkingroot_branch::branch::BranchRegistry;
     use thinkingroot_core::BranchEvent;
 
@@ -7302,6 +7422,13 @@ struct AskRequest {
     /// wired to render `tool_call_*` SSE events.
     #[serde(default)]
     use_agent: bool,
+    /// Optional name of a persisted agent (`AgentDef`) to run. When set and the
+    /// agent exists, its persona leads the system prompt and its name becomes
+    /// the `agent_id` (provenance + session scoping). Absent or unknown name →
+    /// the workspace-default persona, byte-identical to prior behaviour. Only
+    /// honoured on the `use_agent` streaming path.
+    #[serde(default)]
+    agent: Option<String>,
     /// Stable identifier for this conversation. Used by the agent
     /// path as the MCP session id (which scopes
     /// `contribute_claim`'s active branch and provenance). When
@@ -8403,6 +8530,54 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     let intent = crate::intelligence::intent::classify_intent(&intent_inputs);
     let workflow_appendix = crate::intelligence::intent::workflow_appendix(intent);
     system_prompt.push_str(workflow_appendix);
+
+    // A#1 (2026-06-17): when the caller names a persisted agent, lead the
+    // prompt with that agent's persona and stamp its name as `agent_id`.
+    // `get_agent` already falls back from a `u_*`/`agent_*` scope to the
+    // primary brain, so a project-level agent resolves from any scope. Absent
+    // or unknown name → workspace-default persona (byte-identical to before).
+    let mut agent_id = "thinkingroot".to_string();
+    if let Some(agent_name) = body
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let looked_up = {
+            let engine = state.engine.read().await;
+            engine.get_agent(&ws, agent_name).await
+        };
+        match looked_up {
+            Ok(Some(def)) => {
+                agent_id = def.name.clone();
+                if !def.persona.trim().is_empty() {
+                    // Agent persona leads; the composed workspace prompt
+                    // (skills + workflow appendix + ambient identity) follows.
+                    system_prompt = format!("{}\n\n{}", def.persona.trim(), system_prompt);
+                }
+                tracing::info!(
+                    target: "chat_turn",
+                    workspace = %ws,
+                    agent = %def.name,
+                    model = %def.model,
+                    "agent_persona_loaded"
+                );
+            }
+            Ok(None) => tracing::warn!(
+                target: "chat_turn",
+                workspace = %ws,
+                agent = %agent_name,
+                "named agent not found — using workspace-default persona"
+            ),
+            Err(e) => tracing::warn!(
+                target: "chat_turn",
+                workspace = %ws,
+                agent = %agent_name,
+                error = %e,
+                "agent lookup failed — using workspace-default persona"
+            ),
+        }
+    }
     tracing::info!(
         target: "chat_turn",
         workspace = %ws,
@@ -8565,7 +8740,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         workspace: ws.clone(),
         workspace_root,
         session_id: conversation_id,
-        agent_id: "thinkingroot".to_string(),
+        agent_id,
         system_prompt,
         user_question,
         history: agent_messages,

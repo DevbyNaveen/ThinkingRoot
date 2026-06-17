@@ -291,6 +291,15 @@ pub struct InheritReport {
     pub forebear_stage: String,
 }
 
+/// Workspaces that auto-mount on first reference and fall back to the primary
+/// (shared) brain for unscoped reads: per-user `u_*` brains and per-agent
+/// `agent_*` brains. Both get their OWN isolated graph (functions, prompts,
+/// branches, memory) yet inherit the shared project brain when they don't carry
+/// their own — so one agent owns everything but still uses the shared pool.
+pub(crate) fn is_auto_scoped_ws(ws: &str) -> bool {
+    ws.starts_with("u_") || ws.starts_with("agent_")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub entities: Vec<EntitySearchHit>,
@@ -1909,7 +1918,7 @@ impl QueryEngine {
         if self.workspaces.contains_key(ws) {
             return Ok(());
         }
-        if !ws.starts_with("u_") {
+        if !is_auto_scoped_ws(ws) {
             return Err(Error::EntityNotFound(format!(
                 "workspace '{ws}' is not mounted and is not an auto-mountable per-user namespace"
             )));
@@ -2929,8 +2938,104 @@ impl QueryEngine {
         name: &str,
     ) -> Result<Option<thinkingroot_graph::root_function::RootFunction>> {
         let handle = self.get_workspace(ws)?;
+        {
+            let storage = handle.storage.lock().await;
+            if let Some(f) = storage.graph.get_function(name)? {
+                return Ok(Some(f));
+            }
+        }
+        // Two-tier capability resolution: a Root Function deployed ONCE in the
+        // shared/primary brain is callable from a per-user `u_*` scope, so a
+        // single agent definition's functions work for every end-user without
+        // redeploying into each per-user workspace. The function still EXECUTES
+        // in the `u_*` scope (its `ctx.memory` targets the user's own brain) —
+        // only the definition is resolved from the shared brain. Per-user scopes
+        // only; never crosses into another user's workspace.
+        if is_auto_scoped_ws(ws)
+            && let Some(primary) = self.primary_ws_name()
+            && primary != ws
+            && let Ok(phandle) = self.get_workspace(&primary)
+        {
+            let storage = phandle.storage.lock().await;
+            return storage.graph.get_function(name);
+        }
+        Ok(None)
+    }
+
+    // ─── Agents (persisted agent entity) ──────────────────────────────────
+    // The create-once agent definition (persona + model + memory policy) the
+    // SDK and Console both read/write. Stored in the project's shared brain;
+    // get/list resolve from the primary brain for per-user `u_*` scopes (an
+    // agent defined once serves every end-user), mirroring Root Functions.
+
+    /// Create or update an agent definition in workspace `ws`.
+    pub async fn put_agent(
+        &self,
+        ws: &str,
+        name: &str,
+        persona: &str,
+        model: &str,
+        config_json: &str,
+    ) -> Result<thinkingroot_graph::agents::AgentDef> {
+        let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        storage.graph.get_function(name)
+        storage.graph.put_agent(name, persona, model, config_json)
+    }
+
+    /// Fetch one agent, with the per-user → primary fallback: an agent defined
+    /// once in the shared brain resolves from any `u_*` scope.
+    pub async fn get_agent(
+        &self,
+        ws: &str,
+        name: &str,
+    ) -> Result<Option<thinkingroot_graph::agents::AgentDef>> {
+        let handle = self.get_workspace(ws)?;
+        {
+            let storage = handle.storage.lock().await;
+            if let Some(a) = storage.graph.get_agent(name)? {
+                return Ok(Some(a));
+            }
+        }
+        if is_auto_scoped_ws(ws)
+            && let Some(primary) = self.primary_ws_name()
+            && primary != ws
+            && let Ok(phandle) = self.get_workspace(&primary)
+        {
+            let storage = phandle.storage.lock().await;
+            return storage.graph.get_agent(name);
+        }
+        Ok(None)
+    }
+
+    /// List agents. A per-user `u_*` scope with no agents of its own lists the
+    /// shared/primary brain's agents (agents are project-level definitions).
+    pub async fn list_agents(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::agents::AgentDef>> {
+        let handle = self.get_workspace(ws)?;
+        {
+            let storage = handle.storage.lock().await;
+            let own = storage.graph.list_agents()?;
+            if !own.is_empty() || !is_auto_scoped_ws(ws) {
+                return Ok(own);
+            }
+        }
+        if let Some(primary) = self.primary_ws_name()
+            && primary != ws
+            && let Ok(phandle) = self.get_workspace(&primary)
+        {
+            let storage = phandle.storage.lock().await;
+            return storage.graph.list_agents();
+        }
+        Ok(Vec::new())
+    }
+
+    /// Delete an agent from workspace `ws`. Returns true if a row was removed.
+    pub async fn delete_agent(&self, ws: &str, name: &str) -> Result<bool> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.delete_agent(name)
     }
 
     /// A6 — record a verification verdict for one forge test case and CORRECT
@@ -4914,7 +5019,34 @@ side referenced. Strict rules:\n\
     ) -> Result<SearchResult> {
         let handle = self.get_workspace(ws)?;
         let start = std::time::Instant::now();
-        let result = Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await;
+        let mut result = Self::search_scoped_on(handle, query, top_k, allowed_source_ids).await;
+
+        // Two-tier recall (TR_TWO_TIER_RECALL, default-off): a per-user `u_*`
+        // scope ALSO recalls from the shared/primary brain and merges the hits,
+        // so a single agent serves the user's PRIVATE memory plus the project's
+        // SHARED knowledge. Flag-gated so this deploy is zero behaviour-change
+        // until validated; per-user scopes only, and it only ever unions `u_*`
+        // with the primary brain — never another user's workspace.
+        let two_tier = is_auto_scoped_ws(ws)
+            && std::env::var("TR_TWO_TIER_RECALL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        if two_tier
+            && result.is_ok()
+            && let Some(primary) = self.primary_ws_name()
+            && primary != ws
+            && let Ok(phandle) = self.get_workspace(&primary)
+        {
+            // Unscoped over the shared brain: its sources are not the user's
+            // session ids, so an empty scope avoids filtering shared claims out.
+            let unscoped: HashSet<String> = HashSet::new();
+            if let Ok(shared) = Self::search_scoped_on(phandle, query, top_k, &unscoped).await
+                && let Ok(base) = result.as_mut()
+            {
+                Self::merge_search_results(base, shared, top_k);
+            }
+        }
+
         // §8 — read-path latency for the <100ms dashboard. `search_scoped` is the
         // choke point the /ask retriever (`intelligence::retriever`) actually
         // calls (the MCP `hybrid_retrieve` tool emits its own event separately).
@@ -4929,6 +5061,37 @@ side referenced. Strict rules:\n\
             );
         }
         result
+    }
+
+    /// Merge shared-brain hits into a per-user recall (two-tier recall): append
+    /// `extra` hits not already present (dedup by id), re-sort by relevance, and
+    /// keep the top `top_k` of each kind. Only used when `TR_TWO_TIER_RECALL` is on.
+    fn merge_search_results(base: &mut SearchResult, extra: SearchResult, top_k: usize) {
+        let seen_c: HashSet<String> = base.claims.iter().map(|c| c.id.clone()).collect();
+        for c in extra.claims {
+            if !seen_c.contains(&c.id) {
+                base.claims.push(c);
+            }
+        }
+        base.claims.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        base.claims.truncate(top_k);
+
+        let seen_e: HashSet<String> = base.entities.iter().map(|e| e.id.clone()).collect();
+        for e in extra.entities {
+            if !seen_e.contains(&e.id) {
+                base.entities.push(e);
+            }
+        }
+        base.entities.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        base.entities.truncate(top_k);
     }
 
     /// Late-interaction (MaxSim) scores for a candidate claim-id set — the

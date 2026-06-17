@@ -1131,6 +1131,23 @@ impl GraphStore {
                 version: Int default 1,
                 created_at: Float default 0.0
             }",
+            // ─── Agents — the persisted agent definition (persona + model +
+            //     memory policy), the create-once entity the SDK and Console
+            //     both read/write so the two stay in sync. Stored in the
+            //     project's shared brain; resolvable from any per-user `u_*`
+            //     scope via the primary-workspace fallback (mirrors Root
+            //     Function resolution). Un-versioned for v1: a PUT upserts the
+            //     latest config. PK is `name`. New relation → created on mount
+            //     via create_schema, zero migration.
+            ":create agents {
+                name: String
+                =>
+                persona: String default '',
+                model: String default '',
+                config_json: String default '{}',
+                created_at: Float default 0.0,
+                updated_at: Float default 0.0
+            }",
             // A6 — durable verification verdicts. One row per forge/verify
             // test case: did the function's OUTPUT match the expectation?
             // This is the signal the run-log cannot carry (a run that
