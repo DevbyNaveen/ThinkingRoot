@@ -57,6 +57,12 @@ pub struct StreamAgentRequest {
     /// `Arc<RestStreamSystemRefresher>` so a long multi-iteration
     /// turn never answers from a system prompt that's now stale.
     pub system_refresher: Option<Arc<dyn SystemPromptRefresher>>,
+    /// A#4 (2026-06-17) — the agent's tool allowlist from `AgentPolicy.tools`.
+    /// `Some(names)` keeps every READ-class tool plus only the named
+    /// WRITE/external tools; `None` keeps every tool (back-compat). The REST
+    /// handler passes `None` when no agent is named or the agent declares no
+    /// tools, so existing flows are byte-identical.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Dependencies the streaming runner needs from the surrounding
@@ -167,6 +173,12 @@ pub fn spawn_agent_run(
             engram_manager: deps.engram_manager,
         };
         let registry = register_builtin_tools(ctx).await;
+        // A#4: scope the agent to its declared tool allowlist (reads always
+        // kept; writes/external gated). `None` = full registry (back-compat).
+        let registry = match &req.allowed_tools {
+            Some(allowed) => registry.restrict_writes_to(allowed),
+            None => registry,
+        };
 
         let llm: Arc<dyn LlmBackend> = deps.llm;
         let mut agent = Agent::new(llm, registry, agent_gate);

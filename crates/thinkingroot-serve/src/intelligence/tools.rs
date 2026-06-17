@@ -181,6 +181,28 @@ impl ToolRegistry {
         }
     }
 
+    /// Scope this registry to an agent's tool allowlist ("allowlist + keep
+    /// essentials" policy for `AgentPolicy.tools`): READ-class tools are ALWAYS
+    /// kept (an agent can always search/recall/think), and WRITE/external tools
+    /// are kept only when named in `allowed`. Unknown names are ignored.
+    /// Consumes and rebuilds, so call it before the registry is shared (same
+    /// refcount-1 assumption as `register`).
+    pub fn restrict_writes_to(self, allowed: &[String]) -> Self {
+        let set: std::collections::HashSet<&str> = allowed.iter().map(String::as_str).collect();
+        let mut inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| {
+            panic!(
+                "ToolRegistry::restrict_writes_to called on a registry that has been cloned; \
+                 restrict before sharing"
+            )
+        });
+        inner
+            .tools
+            .retain(|name, t| !t.is_write || set.contains(name.as_str()));
+        ToolRegistry {
+            inner: Arc::new(inner),
+        }
+    }
+
     /// All registered tool specs, in registration order is not
     /// guaranteed (HashMap order). Pass to
     /// `LlmClient::chat_with_tools` as the `tools` slice.

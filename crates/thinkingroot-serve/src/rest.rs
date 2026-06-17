@@ -8537,6 +8537,8 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // primary brain, so a project-level agent resolves from any scope. Absent
     // or unknown name → workspace-default persona (byte-identical to before).
     let mut agent_id = "thinkingroot".to_string();
+    // A#4: write/external-tool allowlist parsed from the agent's AgentPolicy.
+    let mut agent_allowed_tools: Option<Vec<String>> = None;
     if let Some(agent_name) = body
         .agent
         .as_deref()
@@ -8555,11 +8557,27 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                     // (skills + workflow appendix + ambient identity) follows.
                     system_prompt = format!("{}\n\n{}", def.persona.trim(), system_prompt);
                 }
+                // A#4 (allowlist + keep essentials): AgentPolicy.tools scopes
+                // WRITE/external tools; READ tools always stay. Empty/absent =
+                // no restriction (None).
+                agent_allowed_tools = serde_json::from_str::<serde_json::Value>(&def.config_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("tools")
+                            .and_then(|t| t.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .filter(|v| !v.is_empty());
                 tracing::info!(
                     target: "chat_turn",
                     workspace = %ws,
                     agent = %def.name,
                     model = %def.model,
+                    tools_scoped = agent_allowed_tools.as_ref().map(|t| t.len()).unwrap_or(0),
                     "agent_persona_loaded"
                 );
             }
@@ -8746,6 +8764,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         history: agent_messages,
         skills,
         system_refresher: Some(refresher),
+        allowed_tools: agent_allowed_tools,
     };
     let deps = StreamAgentDeps {
         engine: state.engine.clone(),
