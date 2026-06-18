@@ -8976,7 +8976,23 @@ Rules: \
 
     /// Return the LLM client for a workspace, if one was successfully initialised.
     pub fn workspace_llm(&self, ws: &str) -> Option<Arc<thinkingroot_llm::llm::LlmClient>> {
-        self.workspaces.get(ws).and_then(|h| h.llm.clone())
+        if let Some(llm) = self.workspaces.get(ws).and_then(|h| h.llm.clone()) {
+            return Some(llm);
+        }
+        // Auto-scoped workspaces (`u_*` / `agent_*`) are mounted on demand and
+        // carry no own `[llm]` block, so their handle has no client. They INHERIT
+        // the primary brain's LLM — the project's single global provider — exactly
+        // as functions / prompts / recall inherit the chain. Without this, per-user
+        // chat (`ask`) and the night-shift `dream`/`predict` fail with "no LLM
+        // configured" even though the engine has a provider configured on `main`.
+        if is_auto_scoped_ws(ws) {
+            if let Some(primary) = self.primary_ws_name() {
+                if primary != ws {
+                    return self.workspaces.get(&primary).and_then(|h| h.llm.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Names of all currently-mounted workspaces. Cheap (just the map keys) —
