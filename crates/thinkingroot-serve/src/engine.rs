@@ -973,6 +973,13 @@ pub struct CapSet {
     /// workspace (self-extension). A graph write on the caller's own brain,
     /// so default-on like remember.
     pub can_acquire: bool,
+    /// P2c — max concurrent runs of this function (0 = unlimited). Enforced via
+    /// an in-process fair semaphore. `u32` (not a String key) so CapSet stays
+    /// `Copy`. Stored in the same caps grant; default 0 keeps today's behaviour.
+    pub concurrency_limit: u32,
+    /// P2c — when true the limit is PER SCOPE (per-user fairness: at most
+    /// `limit` runs per `u_*`); else global to the function across all scopes.
+    pub concurrency_per_scope: bool,
 }
 
 impl CapSet {
@@ -990,6 +997,9 @@ impl CapSet {
             can_mcp: true,
             // Self-extension is a graph write on the run's own workspace.
             can_acquire: true,
+            // Unlimited concurrency by default (opt-in fairness).
+            concurrency_limit: 0,
+            concurrency_per_scope: false,
         }
     }
 
@@ -1005,6 +1015,31 @@ impl CapSet {
     pub fn deny_all() -> Self {
         Self::default()
     }
+}
+
+/// P2c — in-process fair semaphores for Root Function concurrency limits, keyed
+/// by `"{fn}:{scope|_global}"`. A permit is held for a run's duration (RAII), so
+/// `limit` bounds concurrent runs. Per-scope keys give per-user fairness. The
+/// semaphore for a key is created once at its first limited run; changing a
+/// function's limit takes effect on the next process start (acceptable v1).
+static FN_CONCURRENCY: std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+> = std::sync::OnceLock::new();
+
+async fn acquire_concurrency_permit(key: String, limit: usize) -> tokio::sync::OwnedSemaphorePermit {
+    let map =
+        FN_CONCURRENCY.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let sem = {
+        let mut guard = map.lock().await;
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
+            .clone()
+    };
+    // The semaphore is never closed, so acquire_owned cannot fail.
+    sem.acquire_owned()
+        .await
+        .expect("fn concurrency semaphore unexpectedly closed")
 }
 
 /// One recalled claim, JSON-serialisable for the isolate boundary.
@@ -3933,7 +3968,7 @@ impl QueryEngine {
         // reach the cognition graph WITHOUT re-locking the engine during the
         // run (avoids the writer-queue deadlock when a workspace mounts mid-run)
         // and stays confined to this (per-user) workspace.
-        let caps = {
+        let (caps, conc_limit, conc_per_scope) = {
             let handle = self.get_workspace(ws)?.clone();
             // Slice 2b: `ctx.mcp.call` resolves connectors across the workspace's
             // inheritance chain (self → agent brain → shared), nearest-server-
@@ -3974,12 +4009,31 @@ impl QueryEngine {
                 .primary_ws_name()
                 .filter(|p| p.as_str() != ws)
                 .and_then(|p| self.get_workspace(&p).ok().cloned());
-            std::sync::Arc::new(
-                FnCapabilities::new(handle, ws.to_string(), run_id.to_string(), mcp, cap_set)
-                    .with_target_branch(target_branch.clone())
-                    .with_primary_handle(primary_handle),
+            (
+                std::sync::Arc::new(
+                    FnCapabilities::new(handle, ws.to_string(), run_id.to_string(), mcp, cap_set)
+                        .with_target_branch(target_branch.clone())
+                        .with_primary_handle(primary_handle),
+                ),
+                cap_set.concurrency_limit,
+                cap_set.concurrency_per_scope,
             )
         };
+
+        // P2c — hold a fair concurrency permit for the whole run (per-scope key =
+        // per-user fairness; 0 = unlimited). The guard releases on return, so a
+        // suspended run (sleep/event) frees its slot and re-acquires on resume.
+        let _conc_permit = if conc_limit > 0 {
+            let key = if conc_per_scope {
+                format!("{name}:{ws}")
+            } else {
+                format!("{name}:_global")
+            };
+            Some(acquire_concurrency_permit(key, conc_limit as usize).await)
+        } else {
+            None
+        };
+
         let (outcome, new_steps, new_pending, new_cites) =
             crate::root_function_runtime::run_js_journaled(
                 &func.body,
