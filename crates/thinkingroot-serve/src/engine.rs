@@ -3403,6 +3403,19 @@ impl QueryEngine {
         storage.graph.list_function_runs(name)
     }
 
+    /// P3 — the durable-execution journal for a run: the `(step_key, result)`
+    /// pairs in execution order. Powers the run inspector (what ran, what each
+    /// step returned) + replay tooling. Empty for an unknown run.
+    pub async fn list_function_steps(
+        &self,
+        ws: &str,
+        run_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_steps_for_run(run_id)
+    }
+
     /// P1 — due scheduled-function timers from the PRIMARY brain (the ticker's
     /// scan). Timers are stored centrally there so they fire regardless of
     /// whether the target per-user scope is mounted. Empty on any error/absence.

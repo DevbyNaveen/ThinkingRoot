@@ -912,6 +912,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // P3 — the durable-execution journal for a run (the inspector data).
+            .route(
+                "/ws/{ws}/functions/{name}/runs/{run_id}/steps",
+                get(function_steps_handler),
+            )
             // P2 — deliver an event to ctx.waitForEvent waiters in this scope
             // (external webhooks / cross-function signals).
             .route("/ws/{ws}/events", post(emit_event_handler))
@@ -2460,6 +2465,29 @@ async fn emit_event_handler(
     match engine.emit_event(&ws, &body.event, &payload_json).await {
         Ok(delivered) => {
             ok_response(serde_json::json!({ "delivered": delivered })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// P3 — `GET /ws/{ws}/functions/{name}/runs/{run_id}/steps` — the durable
+/// journal for a run (each `ctx.step`/op result, in order). The run inspector.
+async fn function_steps_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, _name, run_id)): Path<(String, String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_function_steps(&ws, &run_id).await {
+        Ok(steps) => {
+            let out: Vec<serde_json::Value> = steps
+                .into_iter()
+                .map(|(key, result_json)| {
+                    let result: serde_json::Value =
+                        serde_json::from_str(&result_json).unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({ "step": key, "result": result })
+                })
+                .collect();
+            ok_response(serde_json::json!({ "run_id": run_id, "steps": out })).into_response()
         }
         Err(e) => match_engine_error(e),
     }
