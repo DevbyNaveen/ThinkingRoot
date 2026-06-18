@@ -342,6 +342,13 @@ pub(crate) fn is_auto_scoped_ws(ws: &str) -> bool {
     ws.starts_with("u_") || ws.starts_with("agent_")
 }
 
+/// Compiled-prompt name that holds an agent's persona. Namespaced so it never
+/// collides with the workspace `assistant` voice prompt. The persona flows
+/// through the single prompt pipeline under this name.
+pub(crate) fn agent_persona_prompt_name(agent_name: &str) -> String {
+    format!("agent::{agent_name}::persona")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub entities: Vec<EntitySearchHit>,
@@ -3074,7 +3081,40 @@ impl QueryEngine {
     ) -> Result<thinkingroot_graph::agents::AgentDef> {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        storage.graph.put_agent(name, persona, model, config_json)
+        let def = storage.graph.put_agent(name, persona, model, config_json)?;
+        // Mirror the persona into the ONE compiled-prompt pipeline so it's a
+        // versioned, editable, `prompt_get_latest`-resolved template like every
+        // other prompt — co-located with the definition (reachable from any
+        // scope via the inheritance chain). The agent loop reads it from here,
+        // not as a raw field. Empty persona → no prompt (loop keeps the
+        // workspace-default).
+        if !persona.trim().is_empty() {
+            let _ = storage
+                .graph
+                .prompt_put_template(&agent_persona_prompt_name(name), persona);
+        }
+        Ok(def)
+    }
+
+    /// The agent's persona resolved through the compiled-prompt pipeline:
+    /// the `agent::<name>::persona` template, walked along the inheritance chain
+    /// (so a project-level agent's persona resolves from any `u_*`/`agent_*`
+    /// scope — `main` is always the chain tail). `None` when no persona prompt
+    /// exists, so the caller falls back to the `AgentDef.persona` field (legacy
+    /// agents created before the mirror).
+    pub async fn agent_persona_prompt(&self, ws: &str, agent_name: &str) -> Option<String> {
+        let pname = agent_persona_prompt_name(agent_name);
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if let Ok(Some(p)) = storage.graph.prompt_get_latest(&pname) {
+                    if !p.template_text.trim().is_empty() {
+                        return Some(p.template_text);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Fetch one agent, with the per-user → primary fallback: an agent defined

@@ -8545,17 +8545,29 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let looked_up = {
+        let (looked_up, persona_via_prompt) = {
             let engine = state.engine.read().await;
-            engine.get_agent(&ws, agent_name).await
+            let def = engine.get_agent(&ws, agent_name).await;
+            // Resolve the persona through the ONE compiled-prompt pipeline.
+            let persona = match &def {
+                Ok(Some(d)) => engine.agent_persona_prompt(&ws, &d.name).await,
+                _ => None,
+            };
+            (def, persona)
         };
         match looked_up {
             Ok(Some(def)) => {
                 agent_id = def.name.clone();
-                if !def.persona.trim().is_empty() {
+                // Persona comes from the compiled-prompt pipeline (versioned
+                // `agent::<name>::persona`); fall back to the raw AgentDef field
+                // only for legacy agents created before the persona was mirrored.
+                let persona_text = persona_via_prompt
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| def.persona.clone());
+                if !persona_text.trim().is_empty() {
                     // Agent persona leads; the composed workspace prompt
                     // (skills + workflow appendix + ambient identity) follows.
-                    system_prompt = format!("{}\n\n{}", def.persona.trim(), system_prompt);
+                    system_prompt = format!("{}\n\n{}", persona_text.trim(), system_prompt);
                 }
                 // A#4 (allowlist + keep essentials): AgentPolicy.tools scopes
                 // WRITE/external tools; READ tools always stay. Empty/absent =
