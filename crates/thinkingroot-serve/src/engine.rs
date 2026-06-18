@@ -1059,6 +1059,9 @@ pub struct InvokeBranchOpts {
     /// Run on a fresh ephemeral branch that is abandoned after the run —
     /// a true dry run (side effects happen in isolation, then vanish).
     pub dry_run: bool,
+    /// P1b-ii — retry attempt number (0/1 = first run; bumped by the durable
+    /// retry timer). Surfaced as `ctx.attempt`. 0 is treated as 1.
+    pub attempt: u32,
 }
 
 impl FnCapabilities {
@@ -3451,6 +3454,39 @@ impl QueryEngine {
         self.run_function_with_id(scope, fn_name, &input, run_id).await
     }
 
+    /// P1b-ii — register a durable RETRY timer in the primary brain. When due,
+    /// the ticker re-enters `run_id` with `next_attempt` (the journal replays
+    /// completed steps, so only the failed work re-runs).
+    async fn put_retry_timer(
+        &self,
+        scope: &str,
+        fn_name: &str,
+        run_id: &str,
+        fire_at: f64,
+        next_attempt: u32,
+        input_json: &str,
+    ) {
+        let primary = self.primary_ws_name().unwrap_or_else(|| scope.to_string());
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let timer = thinkingroot_graph::root_function::FnTimer {
+            id: ulid::Ulid::new().to_string(),
+            scope: scope.to_string(),
+            fn_name: fn_name.to_string(),
+            kind: "retry".to_string(),
+            run_id: run_id.to_string(),
+            fire_at,
+            input_json: input_json.to_string(), // original invocation input
+            dedupe_key: next_attempt.to_string(), // the attempt number to run next
+            status: "pending".to_string(),
+            created_at: now,
+        };
+        let storage = handle.storage.lock().await;
+        let _ = storage.graph.put_timer(&timer);
+    }
+
     /// Invoke the latest version of `name` with `input`. Resolves the
     /// body, builds the secret-backed `env` map, runs it in the isolate,
     /// records a run row, and returns the JSON result. Errors (function
@@ -3676,7 +3712,7 @@ impl QueryEngine {
             ws: ws.to_string(),
             fn_name: name.to_string(),
             version: func.version,
-            attempt: 1,
+            attempt: opts.attempt.max(1),
             // REST/flow invocation path is session-less; an MCP-originated
             // path will thread the real session id here in a later phase.
             session_id: None,
@@ -3768,6 +3804,14 @@ impl QueryEngine {
         // Coarse, deterministic input class for run-learning (no LLM call).
         let input_class = Self::input_class_for(name, input);
 
+        // P1b-ii — durable retry. A retryable failure (not a NonRetryableError,
+        // attempt < cap) schedules a retry timer that re-enters THIS run with
+        // attempt+1; completed steps replay from the journal, so only the failed
+        // work re-runs. `retry_in_secs` is set in the Failed arm below.
+        let attempt = opts.attempt.max(1);
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut retry_in_secs: Option<u64> = None;
+
         // Map the run outcome to a recorded status + the returned value.
         let (status, output_json, error, ret): (&str, String, String, Result<serde_json::Value>) =
             match &outcome {
@@ -3792,7 +3836,28 @@ impl QueryEngine {
                     )
                 }
                 RunOutcome::Failed(e) => {
-                    ("error", String::new(), e.clone(), Err(Error::Template(e.clone())))
+                    let non_retryable = e.contains("__TR_NONRETRYABLE__");
+                    if !non_retryable && attempt < MAX_ATTEMPTS {
+                        // Exponential backoff: 1s, 2s, 4s, … capped at 60s.
+                        retry_in_secs = Some((1u64 << (attempt - 1)).min(60));
+                        let marker = serde_json::json!({
+                            "_retrying": true, "attempt": attempt,
+                            "next_attempt": attempt + 1, "error": e
+                        });
+                        (
+                            "retrying",
+                            serde_json::to_string(&marker).unwrap_or_default(),
+                            String::new(),
+                            Ok(marker),
+                        )
+                    } else {
+                        // Terminal: strip the NonRetryableError marker for the
+                        // user-facing error.
+                        let clean = e
+                            .replace("__TR_NONRETRYABLE__:", "")
+                            .replace("__TR_NONRETRYABLE__", "");
+                        ("error", String::new(), clean.clone(), Err(Error::Template(clean)))
+                    }
                 }
             };
 
@@ -3849,10 +3914,12 @@ impl QueryEngine {
                 RunOutcome::Done(_) => {
                     let _ = storage.graph.bump_function_experience(&input_class, name, true);
                 }
-                RunOutcome::Failed(_) => {
+                // Only a TERMINAL failure is negative evidence; a failure that
+                // will be retried (retry_in_secs set) is not judged yet.
+                RunOutcome::Failed(_) if retry_in_secs.is_none() => {
                     let _ = storage.graph.bump_function_experience(&input_class, name, false);
                 }
-                RunOutcome::Suspended => {}
+                _ => {}
             }
             // Touch edges: link this run to the claims it declared via
             // ctx.cite, so a later change to any of them causally invalidates
@@ -3874,6 +3941,14 @@ impl QueryEngine {
         // (the engine ticker records the wake step + replays).
         for (step_key, wake_at) in resume_timers {
             self.put_resume_timer(ws, name, run_id, wake_at, &step_key, &resume_input_json)
+                .await;
+        }
+
+        // P1b-ii — register a durable retry timer (re-enters this run with
+        // attempt+1 after backoff; the journal skips already-completed steps).
+        if let Some(backoff) = retry_in_secs {
+            let fire_at = (chrono::Utc::now().timestamp_millis() as f64 / 1000.0) + backoff as f64;
+            self.put_retry_timer(ws, name, run_id, fire_at, attempt + 1, &resume_input_json)
                 .await;
         }
 

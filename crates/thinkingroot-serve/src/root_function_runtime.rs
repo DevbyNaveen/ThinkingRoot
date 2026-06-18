@@ -1101,6 +1101,16 @@ globalThis.fetch = async (url, opts = {}) => {
 /// `ctx.cognition` here.
 #[cfg(feature = "root-functions")]
 const CTX_BOOTSTRAP: &str = r#"
+// P1b-ii — NonRetryableError: throw this to STOP the durable retry loop (a
+// terminal failure). Any other throw is retried with exponential backoff up to
+// the attempt cap. The marker in the message is how the host detects it; it is
+// stripped from the user-facing error.
+globalThis.NonRetryableError = class NonRetryableError extends Error {
+  constructor(message) {
+    super("__TR_NONRETRYABLE__:" + (message === undefined ? "" : String(message)));
+    this.name = "NonRetryableError";
+  }
+};
 globalThis.__tr_buildCtx = (input, env) => {
   const meta = Deno.core.ops.op_tr_ctx();
   const ctx = Object.assign({}, env);   // legacy: secrets at top level

@@ -561,9 +561,10 @@ impl PeriodicTask for FnSchedulerTask {
         let due = { self.engine.read().await.due_fn_timers(self.batch).await };
         for t in due {
             // `schedule` = a fresh run (ctx.scheduleSelf/schedule);
-            // `resume`   = re-enter a suspended run (ctx.sleep/ctx.wakeAt).
+            // `resume`   = re-enter a suspended run (ctx.sleep/ctx.wakeAt);
+            // `retry`    = re-enter a failed run with attempt+1.
             // Unknown kinds are left untouched (forward-compatible).
-            if t.kind != "schedule" && t.kind != "resume" {
+            if t.kind != "schedule" && t.kind != "resume" && t.kind != "retry" {
                 continue;
             }
             // Mount the target scope on demand (per-user `u_*`/`agent_*` brains
@@ -582,6 +583,21 @@ impl PeriodicTask for FnSchedulerTask {
                     // original invocation input.
                     eng.resume_timer(&t.scope, &t.fn_name, &t.run_id, &t.dedupe_key, &t.input_json)
                         .await
+                } else if t.kind == "retry" {
+                    // dedupe_key = the attempt number to run next; re-enter the
+                    // run (journal replays completed steps, so only failed work
+                    // re-runs).
+                    let next_attempt: u32 = t.dedupe_key.parse().unwrap_or(2);
+                    let input: serde_json::Value =
+                        serde_json::from_str(&t.input_json).unwrap_or(serde_json::Value::Null);
+                    eng.run_function_with_id_opts(
+                        &t.scope,
+                        &t.fn_name,
+                        &input,
+                        &t.run_id,
+                        crate::engine::InvokeBranchOpts { attempt: next_attempt, ..Default::default() },
+                    )
+                    .await
                 } else {
                     let input: serde_json::Value =
                         serde_json::from_str(&t.input_json).unwrap_or(serde_json::Value::Null);
