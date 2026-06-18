@@ -513,6 +513,30 @@ impl GraphStore {
             .collect())
     }
 
+    /// P3 — steps for a run WITH completion timestamps `(key, result, recorded_at)`,
+    /// in execution order. Powers the inspector's per-step timing (latency between
+    /// consecutive steps). Reads the existing `recorded_at` column — no new state.
+    pub fn list_steps_for_run_timed(&self, run_id: &str) -> Result<Vec<(String, String, f64)>> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[step_key, result_json, recorded_at] := \
+                 *root_function_steps{run_id, step_key, result_json, recorded_at}, run_id = $run_id",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_steps_for_run_timed: {e}")))?;
+        let mut out: Vec<(String, String, f64)> = rows
+            .rows
+            .iter()
+            .map(|r| (dv_str(&r[0]), dv_str(&r[1]), dv_f64(&r[2])))
+            .collect();
+        out.sort_by(|a, b| a.2.total_cmp(&b.2));
+        Ok(out)
+    }
+
     /// Persist newly-recorded steps for a run (idempotent `:put`, keyed on
     /// `(run_id, step_key)` — re-recording the same key is a no-op).
     pub fn record_function_steps(&self, run_id: &str, steps: &[(String, String)]) -> Result<()> {

@@ -2479,12 +2479,21 @@ async fn function_steps_handler(
     let engine = state.engine.read().await;
     match engine.list_function_steps(&ws, &run_id).await {
         Ok(steps) => {
+            // Per-step latency = gap to the previous step's completion time.
+            let mut prev: Option<f64> = None;
             let out: Vec<serde_json::Value> = steps
                 .into_iter()
-                .map(|(key, result_json)| {
+                .map(|(key, result_json, recorded_at)| {
                     let result: serde_json::Value =
                         serde_json::from_str(&result_json).unwrap_or(serde_json::Value::Null);
-                    serde_json::json!({ "step": key, "result": result })
+                    let latency_ms = prev.map(|p| ((recorded_at - p) * 1000.0).max(0.0));
+                    prev = Some(recorded_at);
+                    serde_json::json!({
+                        "step": key,
+                        "result": result,
+                        "recorded_at": recorded_at,
+                        "latency_ms": latency_ms,
+                    })
                 })
                 .collect();
             ok_response(serde_json::json!({ "run_id": run_id, "steps": out })).into_response()

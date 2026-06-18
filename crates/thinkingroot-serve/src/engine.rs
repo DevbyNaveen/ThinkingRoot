@@ -3445,10 +3445,10 @@ impl QueryEngine {
         &self,
         ws: &str,
         run_id: &str,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, String, f64)>> {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        storage.graph.list_steps_for_run(run_id)
+        storage.graph.list_steps_for_run_timed(run_id)
     }
 
     /// P1 — due scheduled-function timers from the PRIMARY brain (the ticker's
