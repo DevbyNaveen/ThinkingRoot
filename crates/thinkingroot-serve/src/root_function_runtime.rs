@@ -102,10 +102,14 @@ pub struct PendingReq {
     pub token: String,
     /// Journal step key the answer/wake is recorded under (so replay finds it).
     pub step_key: String,
-    /// The question posed to the answerer (cognition; empty for a timer).
+    /// The question posed to the answerer (cognition; empty for a timer/event).
     pub question: String,
-    /// `Some(epoch_secs)` for a `ctx.sleep`/`ctx.wakeAt` timer suspend.
+    /// `Some(epoch_secs)` for a `ctx.sleep`/`ctx.wakeAt` timer suspend, or the
+    /// timeout deadline for a `ctx.waitForEvent` suspend.
     pub wake_at: Option<f64>,
+    /// `Some(name)` for a `ctx.waitForEvent` suspend (register a waiter, with
+    /// `wake_at` as the timeout). `None` → cognition or sleep.
+    pub event_name: Option<String>,
 }
 
 /// Run a Root Function body. `timeout_secs` bounds wall-clock; `env` is
@@ -869,6 +873,7 @@ mod host_ext {
             step_key: req.step_key,
             question: req.question,
             wake_at: None,
+            event_name: None,
         });
     }
 
@@ -891,7 +896,69 @@ mod host_ext {
             step_key: req.step_key,
             question: String::new(),
             wake_at: Some(req.wake_at),
+            event_name: None,
         });
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct WaitEventReq {
+        pub step_key: String,
+        pub event_name: String,
+        /// Epoch seconds the wait times out (resume with null).
+        pub expires_at: f64,
+    }
+
+    /// Sync op behind `ctx.waitForEvent`: register a waiter + suspend (JS throws
+    /// the sentinel). The engine resolves it when a matching `emit` arrives, or
+    /// resumes with null at `expires_at`.
+    #[op2]
+    pub fn op_tr_wait_event(state: &mut OpState, #[serde] req: WaitEventReq) {
+        let token = ulid::Ulid::new().to_string();
+        let h = state.borrow_mut::<FnHostState>();
+        h.new_pending.push(super::PendingReq {
+            token,
+            step_key: req.step_key,
+            question: String::new(),
+            wake_at: Some(req.expires_at),
+            event_name: Some(req.event_name),
+        });
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct EmitReq {
+        pub event_name: String,
+        #[serde(default)]
+        pub payload_json: String,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct EmitResult {
+        /// Number of waiters marked ready (0 → buffered for a future waiter).
+        pub delivered: u32,
+    }
+
+    /// Async op behind `ctx.emit(name, payload)`: deliver an event to waiters in
+    /// THIS scope (or buffer it if none waiting yet). Delivery resumes those
+    /// runs via the ticker — never re-enters synchronously.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_emit(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: EmitReq,
+    ) -> Result<EmitResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.emit is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.emit_event(&req.event_name, &req.payload_json)
+            .await
+            .map(|delivered| EmitResult { delivered })
+            .map_err(|e| JsErrorBox::generic(format!("emit failed: {e}")))
     }
 
     #[derive(serde::Deserialize)]
@@ -1062,6 +1129,8 @@ mod host_ext {
             op_tr_acquire(),
             op_tr_schedule(),
             op_tr_sleep(),
+            op_tr_wait_event(),
+            op_tr_emit(),
         ];
         Extension {
             name: "tr_host",
@@ -1333,6 +1402,29 @@ globalThis.__tr_buildCtx = (input, env) => {
   };
   ctx.sleep = async (delayMs) => await __sleepUntil((Date.now() + Number(delayMs)) / 1000);
   ctx.wakeAt = async (epochMs) => await __sleepUntil(Number(epochMs) / 1000);
+  // ctx.waitForEvent(name, {timeoutMs?}) / ctx.emit(name, payload): durable
+  // signals. waitForEvent SUSPENDS until a matching emit (in this scope) or the
+  // timeout (resume with null). emit delivers to waiters (or buffers for a
+  // future one); delivery resumes the waiting runs via the ticker. On replay
+  // the resolved value is found in the journal and returned.
+  let __eventSeq = 0;
+  ctx.waitForEvent = async (name, opts) => {
+    const o = opts || {};
+    const key = `__event__${__eventSeq++}`;
+    const hit = Deno.core.ops.op_tr_step_lookup({ key });
+    if (hit.found) return JSON.parse(hit.result_json);   // resolved (replay) → return payload
+    const timeoutMs = (typeof o.timeoutMs === "number") ? o.timeoutMs : 86400000; // 24h default
+    const expiresAt = (Date.now() + timeoutMs) / 1000;
+    Deno.core.ops.op_tr_wait_event({ step_key: key, event_name: String(name), expires_at: expiresAt });
+    throw new Error("__TR_SUSPEND__");
+  };
+  ctx.emit = async (name, payload) => {
+    return await ctx.step(`__emit__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_emit({
+        event_name: String(name),
+        payload_json: (payload === undefined || payload === null) ? "null" : JSON.stringify(payload),
+      }));
+  };
   // ctx.cognition.ask(question): tools-blind, durable human/agent-in-the-loop.
   // On replay the journaled answer is returned; otherwise the run registers a
   // pending request and suspends (throws the sentinel the host turns into a

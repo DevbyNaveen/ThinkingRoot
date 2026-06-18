@@ -1129,6 +1129,37 @@ impl FnCapabilities {
         Ok(id)
     }
 
+    /// `ctx.emit(name, payload)` — deliver an event to waiters in THIS scope, or
+    /// buffer it (1h TTL) if none are waiting yet. Matching waiters are marked
+    /// `ready` (the engine ticker resumes them — never re-enters synchronously).
+    /// Returns the number of waiters delivered to (0 → buffered).
+    pub async fn emit_event(&self, event_name: &str, payload_json: &str) -> Result<u32> {
+        if !self.caps.can_remember {
+            return Err(Error::Config(
+                "capability 'emit' is not granted to this function".to_string(),
+            ));
+        }
+        let handle = self.primary_handle.as_ref().unwrap_or(&self.handle);
+        let storage = handle.storage.lock().await;
+        let waiters = storage.graph.find_pending_waiters(&self.ws, event_name)?;
+        if waiters.is_empty() {
+            let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let id = ulid::Ulid::new().to_string();
+            storage
+                .graph
+                .put_event_buffer(&id, &self.ws, event_name, payload_json, now + 3600.0)?;
+            return Ok(0);
+        }
+        let mut delivered = 0u32;
+        for mut w in waiters {
+            w.status = "ready".to_string();
+            w.payload_json = payload_json.to_string();
+            storage.graph.put_waiter(&w)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
     /// `ctx.memory.recall(query, k)` — semantic recall scoped to this run's
     /// own workspace (per-user isolation is the workspace boundary itself).
     pub async fn recall(&self, query: &str, k: usize) -> Result<Vec<RecallHit>> {
@@ -3442,12 +3473,30 @@ impl QueryEngine {
         step_key: &str,
         input_json: &str,
     ) -> Result<serde_json::Value> {
+        // A sleep wakes with no value.
+        self.resume_with_value(scope, fn_name, run_id, step_key, "null", input_json)
+            .await
+    }
+
+    /// P1b/P2 — record `value_json` as the journaled step the suspend awaits
+    /// (sleep → "null"; waitForEvent → the event payload), then re-enter the run
+    /// (replays completed steps; the suspending call returns `value_json`). The
+    /// scope must already be mounted.
+    pub async fn resume_with_value(
+        &self,
+        scope: &str,
+        fn_name: &str,
+        run_id: &str,
+        step_key: &str,
+        value_json: &str,
+        input_json: &str,
+    ) -> Result<serde_json::Value> {
         {
             let handle = self.get_workspace(scope)?;
             let storage = handle.storage.lock().await;
             let _ = storage
                 .graph
-                .record_function_steps(run_id, &[(step_key.to_string(), "null".to_string())]);
+                .record_function_steps(run_id, &[(step_key.to_string(), value_json.to_string())]);
         }
         let input: serde_json::Value =
             serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
@@ -3485,6 +3534,101 @@ impl QueryEngine {
         };
         let storage = handle.storage.lock().await;
         let _ = storage.graph.put_timer(&timer);
+    }
+
+    /// P2 — deliver an event to waiters in `scope` (or buffer it, 1h TTL, if
+    /// none waiting). Marks matching waiters `ready` (the ticker resumes them).
+    /// Used by the `POST /ws/{ws}/events` endpoint. Returns waiters delivered to.
+    pub async fn emit_event(&self, scope: &str, event_name: &str, payload_json: &str) -> Result<u32> {
+        let primary = self.primary_ws_name().unwrap_or_else(|| scope.to_string());
+        let handle = self.get_workspace(&primary)?;
+        let storage = handle.storage.lock().await;
+        let waiters = storage.graph.find_pending_waiters(scope, event_name)?;
+        if waiters.is_empty() {
+            let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let id = ulid::Ulid::new().to_string();
+            storage
+                .graph
+                .put_event_buffer(&id, scope, event_name, payload_json, now + 3600.0)?;
+            return Ok(0);
+        }
+        let mut delivered = 0u32;
+        for mut w in waiters {
+            w.status = "ready".to_string();
+            w.payload_json = payload_json.to_string();
+            storage.graph.put_waiter(&w)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// P2 — register a waiter for a `ctx.waitForEvent` suspend (in the primary
+    /// brain). If a matching event was already buffered (emitted before the
+    /// wait), the waiter is created `ready` so the ticker resumes it promptly.
+    async fn put_waiter_for_run(
+        &self,
+        scope: &str,
+        fn_name: &str,
+        run_id: &str,
+        step_key: &str,
+        event_name: &str,
+        expires_at: f64,
+        input_json: &str,
+    ) {
+        let primary = self.primary_ws_name().unwrap_or_else(|| scope.to_string());
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        let (status, payload, buffered_id) =
+            match storage.graph.find_buffered_event(scope, event_name, now) {
+                Ok(Some((bid, payload))) => ("ready".to_string(), payload, Some(bid)),
+                _ => ("pending".to_string(), String::new(), None),
+            };
+        let waiter = thinkingroot_graph::root_function::FnWaiter {
+            id: ulid::Ulid::new().to_string(),
+            scope: scope.to_string(),
+            event_name: event_name.to_string(),
+            run_id: run_id.to_string(),
+            fn_name: fn_name.to_string(),
+            step_key: step_key.to_string(),
+            input_json: input_json.to_string(),
+            payload_json: payload,
+            expires_at,
+            status,
+            created_at: now,
+        };
+        let _ = storage.graph.put_waiter(&waiter);
+        if let Some(bid) = buffered_id {
+            let _ = storage.graph.delete_event_buffer(&bid);
+        }
+    }
+
+    /// P2 — actionable waiters from the primary brain (the ticker's scan).
+    pub async fn due_fn_waiters(
+        &self,
+        limit: usize,
+    ) -> Vec<thinkingroot_graph::root_function::FnWaiter> {
+        let Some(primary) = self.primary_ws_name() else {
+            return Vec::new();
+        };
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return Vec::new();
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_actionable_waiters(now, limit).unwrap_or_default()
+    }
+
+    /// P2 — delete a resolved waiter from the primary brain.
+    pub async fn delete_fn_waiter(&self, id: &str) {
+        if let Some(primary) = self.primary_ws_name() {
+            if let Ok(handle) = self.get_workspace(&primary) {
+                let storage = handle.storage.lock().await;
+                let _ = storage.graph.delete_waiter(id);
+            }
+        }
     }
 
     /// Invoke the latest version of `name` with `input`. Resolves the
@@ -3875,6 +4019,8 @@ impl QueryEngine {
         // replays a complete journal.
         let resume_input_json = serde_json::to_string(input).unwrap_or_default();
         let mut resume_timers: Vec<(String, f64)> = Vec::new();
+        // P2 — (step_key, event_name, timeout_epoch) for ctx.waitForEvent suspends.
+        let mut event_waiters: Vec<(String, String, f64)> = Vec::new();
         {
             let handle = self.get_workspace(ws)?;
             let storage = handle.storage.lock().await;
@@ -3884,6 +4030,16 @@ impl QueryEngine {
             if !new_pending.is_empty() {
                 let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
                 for p in &new_pending {
+                    // P2 — a ctx.waitForEvent suspend registers a waiter (below)
+                    // with wake_at as the timeout deadline.
+                    if let Some(event_name) = &p.event_name {
+                        event_waiters.push((
+                            p.step_key.clone(),
+                            event_name.clone(),
+                            p.wake_at.unwrap_or(0.0),
+                        ));
+                        continue;
+                    }
                     // P1b — a ctx.sleep/ctx.wakeAt timer suspend registers a
                     // durable RESUME timer (below); a cognition ask stays a
                     // pending request awaiting an answer.
@@ -3942,6 +4098,21 @@ impl QueryEngine {
         for (step_key, wake_at) in resume_timers {
             self.put_resume_timer(ws, name, run_id, wake_at, &step_key, &resume_input_json)
                 .await;
+        }
+
+        // P2 — register ctx.waitForEvent waiters (resolves a pre-buffered event
+        // immediately; otherwise the ticker fires on emit or timeout).
+        for (step_key, event_name, expires_at) in event_waiters {
+            self.put_waiter_for_run(
+                ws,
+                name,
+                run_id,
+                &step_key,
+                &event_name,
+                expires_at,
+                &resume_input_json,
+            )
+            .await;
         }
 
         // P1b-ii — register a durable retry timer (re-enters this run with

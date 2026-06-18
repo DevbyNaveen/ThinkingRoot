@@ -912,6 +912,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/functions/{name}/invoke", post(invoke_function_handler))
             .route("/ws/{ws}/functions/{name}/runs", get(function_runs_handler))
+            // P2 — deliver an event to ctx.waitForEvent waiters in this scope
+            // (external webhooks / cross-function signals).
+            .route("/ws/{ws}/events", post(emit_event_handler))
             // ─── Agents (persisted agent entity; SDK + Console both CRUD here) ─
             .route(
                 "/ws/{ws}/agents",
@@ -2395,6 +2398,7 @@ async fn invoke_function_handler(
         let opts = crate::engine::InvokeBranchOpts {
             target_branch: payload.target_branch.clone(),
             dry_run: payload.dry_run,
+            ..Default::default()
         };
         engine.invoke_function_with_opts(&ws, &name, &payload.input, opts).await
     } else {
@@ -2429,6 +2433,32 @@ async fn invoke_function_handler(
                 .await;
             match_engine_error(e)
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct EmitEventBody {
+    event: String,
+    #[serde(default)]
+    payload: serde_json::Value,
+}
+
+/// P2 — `POST /ws/{ws}/events {event, payload}` — deliver an event to
+/// `ctx.waitForEvent` waiters in this scope (or buffer it for a future waiter).
+/// Powers external webhooks + cross-function signals.
+async fn emit_event_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<EmitEventBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let payload_json =
+        serde_json::to_string(&body.payload).unwrap_or_else(|_| "null".to_string());
+    match engine.emit_event(&ws, &body.event, &payload_json).await {
+        Ok(delivered) => {
+            ok_response(serde_json::json!({ "delivered": delivered })).into_response()
+        }
+        Err(e) => match_engine_error(e),
     }
 }
 

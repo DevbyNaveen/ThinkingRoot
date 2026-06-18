@@ -620,6 +620,39 @@ impl PeriodicTask for FnSchedulerTask {
             // Delete regardless of outcome so a bad timer can't loop forever.
             self.engine.read().await.delete_fn_timer(&t.id).await;
         }
+
+        // P2 — resolve ctx.waitForEvent waiters: `ready` (an event arrived) →
+        // resume with the payload; an expired `pending` waiter → resume with null
+        // (timeout).
+        let waiters = { self.engine.read().await.due_fn_waiters(self.batch).await };
+        for w in waiters {
+            if crate::engine::is_auto_scoped_ws(&w.scope) {
+                let mut eng = self.engine.write().await;
+                if let Err(e) = eng.get_or_mount_user_ws(&w.scope).await {
+                    tracing::warn!(scope = %w.scope, "fn_scheduler: waiter mount failed, will retry: {e}");
+                    continue;
+                }
+            }
+            let value_json: &str = if w.status == "ready" { w.payload_json.as_str() } else { "null" };
+            let res = {
+                let eng = self.engine.read().await;
+                eng.resume_with_value(
+                    &w.scope, &w.fn_name, &w.run_id, &w.step_key, value_json, &w.input_json,
+                )
+                .await
+            };
+            match res {
+                Ok(_) => tracing::info!(
+                    scope = %w.scope, function = %w.fn_name, event = %w.event_name,
+                    status = %w.status, "fn_scheduler: resolved waiter"
+                ),
+                Err(e) => tracing::warn!(
+                    scope = %w.scope, function = %w.fn_name,
+                    "fn_scheduler: waiter resume errored: {e}"
+                ),
+            }
+            self.engine.read().await.delete_fn_waiter(&w.id).await;
+        }
         Ok(())
     }
 }

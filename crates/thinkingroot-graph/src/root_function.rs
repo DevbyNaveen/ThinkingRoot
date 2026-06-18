@@ -85,6 +85,25 @@ pub struct FnTimer {
     pub created_at: f64,
 }
 
+/// A run suspended on `ctx.waitForEvent` (Root Function SOTA Phase 2). Stored in
+/// the primary brain keyed by scope. `status` `"pending"` → awaiting an event;
+/// `"ready"` → an event arrived (payload set) and the ticker resumes the run
+/// with it; an expired pending waiter resumes with null (timeout).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FnWaiter {
+    pub id: String,
+    pub scope: String,
+    pub event_name: String,
+    pub run_id: String,
+    pub fn_name: String,
+    pub step_key: String,
+    pub input_json: String,
+    pub payload_json: String,
+    pub expires_at: f64,
+    pub status: String,
+    pub created_at: f64,
+}
+
 /// A control-plane-owned test fixture for a Root Function: an input and the
 /// expected JSON output. Authored separately from the function body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -670,6 +689,171 @@ impl GraphStore {
         for r in &rows.rows {
             let _ = self.delete_timer(&dv_str(&r[0]));
         }
+        Ok(())
+    }
+
+    // ─── fn_waiter / fn_event_buffer — ctx.waitForEvent / ctx.emit (P2) ─────
+
+    /// Register/update a waiter (idempotent `:put` by id).
+    pub fn put_waiter(&self, w: &FnWaiter) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(w.id.clone().into()));
+        params.insert("scope".into(), DataValue::Str(w.scope.clone().into()));
+        params.insert("event_name".into(), DataValue::Str(w.event_name.clone().into()));
+        params.insert("run_id".into(), DataValue::Str(w.run_id.clone().into()));
+        params.insert("fn_name".into(), DataValue::Str(w.fn_name.clone().into()));
+        params.insert("step_key".into(), DataValue::Str(w.step_key.clone().into()));
+        params.insert("input_json".into(), DataValue::Str(w.input_json.clone().into()));
+        params.insert("payload_json".into(), DataValue::Str(w.payload_json.clone().into()));
+        params.insert("expires_at".into(), DataValue::Num(Num::Float(w.expires_at)));
+        params.insert("status".into(), DataValue::Str(w.status.clone().into()));
+        params.insert("created_at".into(), DataValue::Num(Num::Float(w.created_at)));
+        self.query(
+            r#"?[id, scope, event_name, run_id, fn_name, step_key, input_json, payload_json, expires_at, status, created_at] <- [[
+                $id, $scope, $event_name, $run_id, $fn_name, $step_key, $input_json, $payload_json, $expires_at, $status, $created_at
+            ]]
+            :put fn_waiter {id => scope, event_name, run_id, fn_name, step_key, input_json, payload_json, expires_at, status, created_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    fn parse_waiter(r: &[DataValue]) -> FnWaiter {
+        FnWaiter {
+            id: dv_str(&r[0]),
+            scope: dv_str(&r[1]),
+            event_name: dv_str(&r[2]),
+            run_id: dv_str(&r[3]),
+            fn_name: dv_str(&r[4]),
+            step_key: dv_str(&r[5]),
+            input_json: dv_str(&r[6]),
+            payload_json: dv_str(&r[7]),
+            expires_at: dv_f64(&r[8]),
+            status: dv_str(&r[9]),
+            created_at: dv_f64(&r[10]),
+        }
+    }
+
+    const WAITER_COLS: &'static str =
+        "id, scope, event_name, run_id, fn_name, step_key, input_json, payload_json, expires_at, status, created_at";
+
+    /// Waiters the ticker should act on now: `ready` (an event arrived) or a
+    /// `pending` one whose timeout has passed (→ resume with null). Status is
+    /// fetched all (few waiters) and filtered in Rust.
+    pub fn list_actionable_waiters(&self, now: f64, limit: usize) -> Result<Vec<FnWaiter>> {
+        let params: BTreeMap<String, DataValue> = BTreeMap::new();
+        let rows = self
+            .raw_db()
+            .run_script(
+                &format!("?[{c}] := *fn_waiter{{{c}}}", c = Self::WAITER_COLS),
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_actionable_waiters: {e}")))?;
+        let mut out: Vec<FnWaiter> = rows
+            .rows
+            .iter()
+            .map(|r| Self::parse_waiter(r))
+            .filter(|w| {
+                w.status == "ready"
+                    || (w.status == "pending" && w.expires_at > 0.0 && w.expires_at <= now)
+            })
+            .collect();
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Pending waiters matching (scope, event_name) — the set `emit` resolves.
+    pub fn find_pending_waiters(&self, scope: &str, event_name: &str) -> Result<Vec<FnWaiter>> {
+        let mut params = BTreeMap::new();
+        params.insert("scope".into(), DataValue::Str(scope.into()));
+        params.insert("event_name".into(), DataValue::Str(event_name.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                &format!(
+                    "?[{c}] := *fn_waiter{{{c}}}, scope = $scope, event_name = $event_name, status = 'pending'",
+                    c = Self::WAITER_COLS
+                ),
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("find_pending_waiters: {e}")))?;
+        Ok(rows.rows.iter().map(|r| Self::parse_waiter(r)).collect())
+    }
+
+    /// Delete a waiter by id (after it's resumed).
+    pub fn delete_waiter(&self, id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        self.query("?[id] := *fn_waiter{id}, id = $id\n:rm fn_waiter {id}", params)?;
+        Ok(())
+    }
+
+    /// Buffer an emitted event that had no waiter yet (resolved by a later
+    /// waitForEvent within the TTL). `id` is caller-supplied (unique).
+    pub fn put_event_buffer(
+        &self,
+        id: &str,
+        scope: &str,
+        event_name: &str,
+        payload_json: &str,
+        expires_at: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        params.insert("scope".into(), DataValue::Str(scope.into()));
+        params.insert("event_name".into(), DataValue::Str(event_name.into()));
+        params.insert("payload_json".into(), DataValue::Str(payload_json.into()));
+        params.insert("expires_at".into(), DataValue::Num(Num::Float(expires_at)));
+        params.insert("created_at".into(), DataValue::Num(Num::Float(now)));
+        self.query(
+            r#"?[id, scope, event_name, payload_json, expires_at, created_at] <- [[
+                $id, $scope, $event_name, $payload_json, $expires_at, $created_at
+            ]]
+            :put fn_event_buffer {id => scope, event_name, payload_json, expires_at, created_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// First non-expired buffered event for (scope, event_name): `(id, payload)`.
+    pub fn find_buffered_event(
+        &self,
+        scope: &str,
+        event_name: &str,
+        now: f64,
+    ) -> Result<Option<(String, String)>> {
+        let mut params = BTreeMap::new();
+        params.insert("scope".into(), DataValue::Str(scope.into()));
+        params.insert("event_name".into(), DataValue::Str(event_name.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id, payload_json, expires_at] := \
+                 *fn_event_buffer{id, scope, event_name, payload_json, expires_at}, \
+                 scope = $scope, event_name = $event_name",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("find_buffered_event: {e}")))?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter(|r| {
+                let exp = dv_f64(&r[2]);
+                exp <= 0.0 || exp > now
+            })
+            .map(|r| (dv_str(&r[0]), dv_str(&r[1])))
+            .next())
+    }
+
+    /// Delete a buffered event by id (after it's consumed).
+    pub fn delete_event_buffer(&self, id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        self.query("?[id] := *fn_event_buffer{id}, id = $id\n:rm fn_event_buffer {id}", params)?;
         Ok(())
     }
 

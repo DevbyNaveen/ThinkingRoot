@@ -1237,6 +1237,39 @@ impl GraphStore {
                 status: String default 'pending',
                 created_at: Float default 0.0
             }",
+            // ─── fn_waiter — a run suspended on ctx.waitForEvent (Root Function
+            //     SOTA Phase 2). Stored in the PRIMARY brain keyed by scope so
+            //     the engine ticker resolves it regardless of mount state.
+            //     status 'pending' → awaiting; 'ready' → an event arrived
+            //     (payload_json set) and the ticker will resume the run with it;
+            //     an expired pending waiter resumes with null (timeout).
+            //     New relation → created on mount via create_schema, zero migration.
+            ":create fn_waiter {
+                id: String
+                =>
+                scope: String,
+                event_name: String,
+                run_id: String,
+                fn_name: String,
+                step_key: String,
+                input_json: String default '',
+                payload_json: String default '',
+                expires_at: Float default 0.0,
+                status: String default 'pending',
+                created_at: Float default 0.0
+            }",
+            // ─── fn_event_buffer — an emitted event that arrived BEFORE any
+            //     waiter (Phase 2). Buffered (TTL-bounded) so a later
+            //     waitForEvent within the window resolves immediately.
+            ":create fn_event_buffer {
+                id: String
+                =>
+                scope: String,
+                event_name: String,
+                payload_json: String default '',
+                expires_at: Float default 0.0,
+                created_at: Float default 0.0
+            }",
             // ─── function_experience — the MOAT. Learned "which function
             //     serves which input class", reweighted by run outcomes.
             //     Competitors with stateless executors can't accumulate this.
