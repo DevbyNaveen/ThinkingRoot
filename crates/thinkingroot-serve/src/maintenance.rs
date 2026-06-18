@@ -560,9 +560,10 @@ impl PeriodicTask for FnSchedulerTask {
     async fn run(&self) -> Result<(), thinkingroot_core::Error> {
         let due = { self.engine.read().await.due_fn_timers(self.batch).await };
         for t in due {
-            // Phase 1a fires only `schedule` (fresh-run) timers; resume/retry
-            // (suspend-this-run) arrive in 1b.
-            if t.kind != "schedule" {
+            // `schedule` = a fresh run (ctx.scheduleSelf/schedule);
+            // `resume`   = re-enter a suspended run (ctx.sleep/ctx.wakeAt).
+            // Unknown kinds are left untouched (forward-compatible).
+            if t.kind != "schedule" && t.kind != "resume" {
                 continue;
             }
             // Mount the target scope on demand (per-user `u_*`/`agent_*` brains
@@ -574,24 +575,33 @@ impl PeriodicTask for FnSchedulerTask {
                     continue; // leave the timer pending for the next tick
                 }
             }
-            let input: serde_json::Value =
-                serde_json::from_str(&t.input_json).unwrap_or(serde_json::Value::Null);
             let res = {
                 let eng = self.engine.read().await;
-                eng.invoke_function(&t.scope, &t.fn_name, &input).await
+                if t.kind == "resume" {
+                    // dedupe_key = the sleep journal step key; input_json = the
+                    // original invocation input.
+                    eng.resume_timer(&t.scope, &t.fn_name, &t.run_id, &t.dedupe_key, &t.input_json)
+                        .await
+                } else {
+                    let input: serde_json::Value =
+                        serde_json::from_str(&t.input_json).unwrap_or(serde_json::Value::Null);
+                    eng.invoke_function(&t.scope, &t.fn_name, &input).await
+                }
             };
             match res {
                 Ok(_) => tracing::info!(
-                    scope = %t.scope, function = %t.fn_name, "fn_scheduler: fired scheduled run"
+                    scope = %t.scope, function = %t.fn_name, kind = %t.kind,
+                    "fn_scheduler: fired timer"
                 ),
                 Err(e) => tracing::warn!(
-                    scope = %t.scope, function = %t.fn_name,
-                    "fn_scheduler: scheduled run errored: {e}"
+                    scope = %t.scope, function = %t.fn_name, kind = %t.kind,
+                    "fn_scheduler: timer run errored: {e}"
                 ),
             }
-            // A schedule fires once; the function re-arms (scheduleSelf) if it
-            // wants a next wake. Delete regardless of outcome so a bad timer
-            // can't loop forever.
+            // Fired timers are one-shot: a schedule fires once (the function
+            // re-arms via scheduleSelf if it wants more); a resume re-enters the
+            // run (which registers a NEW resume timer if it sleeps again).
+            // Delete regardless of outcome so a bad timer can't loop forever.
             self.engine.read().await.delete_fn_timer(&t.id).await;
         }
         Ok(())

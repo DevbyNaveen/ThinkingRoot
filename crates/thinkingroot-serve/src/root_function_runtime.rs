@@ -92,16 +92,20 @@ impl RunOutcome {
     }
 }
 
-/// A cognition request a run is blocked on. Persisted so an answer can be
-/// matched back to the right run + journal step.
+/// A reason a run is suspended, returned so the host can persist the right
+/// resume mechanism. `wake_at = None` → a cognition request (awaits an answer);
+/// `wake_at = Some(epoch_secs)` → a durable timer (`ctx.sleep`/`ctx.wakeAt`):
+/// the engine ticker re-enters this run at that time, replaying completed steps.
 #[derive(Debug, Clone)]
 pub struct PendingReq {
-    /// Unguessable id used to answer this request.
+    /// Unguessable id used to answer this request (cognition).
     pub token: String,
-    /// Journal step key the answer is recorded under (so replay finds it).
+    /// Journal step key the answer/wake is recorded under (so replay finds it).
     pub step_key: String,
-    /// The question posed to the answerer.
+    /// The question posed to the answerer (cognition; empty for a timer).
     pub question: String,
+    /// `Some(epoch_secs)` for a `ctx.sleep`/`ctx.wakeAt` timer suspend.
+    pub wake_at: Option<f64>,
 }
 
 /// Run a Root Function body. `timeout_secs` bounds wall-clock; `env` is
@@ -864,6 +868,29 @@ mod host_ext {
             token,
             step_key: req.step_key,
             question: req.question,
+            wake_at: None,
+        });
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct SleepReq {
+        pub step_key: String,
+        /// Epoch seconds to wake at (JS computes it from a relative delay).
+        pub wake_at: f64,
+    }
+
+    /// Sync op behind `ctx.sleep`/`ctx.wakeAt`: register a durable resume timer
+    /// and suspend (JS throws the `__TR_SUSPEND__` sentinel right after). The
+    /// engine ticker re-enters this run at `wake_at`, replaying completed steps.
+    #[op2]
+    pub fn op_tr_sleep(state: &mut OpState, #[serde] req: SleepReq) {
+        let token = ulid::Ulid::new().to_string();
+        let h = state.borrow_mut::<FnHostState>();
+        h.new_pending.push(super::PendingReq {
+            token,
+            step_key: req.step_key,
+            question: String::new(),
+            wake_at: Some(req.wake_at),
         });
     }
 
@@ -1034,6 +1061,7 @@ mod host_ext {
             op_tr_cite(),
             op_tr_acquire(),
             op_tr_schedule(),
+            op_tr_sleep(),
         ];
         Extension {
             name: "tr_host",
@@ -1279,6 +1307,22 @@ globalThis.__tr_buildCtx = (input, env) => {
   };
   ctx.scheduleSelf = async (delayMs, input, opts) =>
     await ctx.schedule(ctx.fnName, delayMs, input, opts);
+  // ctx.sleep(delayMs) / ctx.wakeAt(epochMs): durable timer — SUSPEND this run
+  // and resume it later. The engine ticker re-enters the SAME run at the wake
+  // time, replaying completed steps (work before the sleep is not redone), and
+  // no compute is consumed while sleeping. On replay the recorded wake is found
+  // and sleep returns immediately. Uses its own counter so the journal key is
+  // stable regardless of other ops.
+  let __sleepSeq = 0;
+  const __sleepUntil = async (fireAtSecs) => {
+    const key = `__sleep__${__sleepSeq++}`;
+    const hit = Deno.core.ops.op_tr_step_lookup({ key });
+    if (hit.found) return;                      // already woke (replay) → continue
+    Deno.core.ops.op_tr_sleep({ step_key: key, wake_at: fireAtSecs });
+    throw new Error("__TR_SUSPEND__");
+  };
+  ctx.sleep = async (delayMs) => await __sleepUntil((Date.now() + Number(delayMs)) / 1000);
+  ctx.wakeAt = async (epochMs) => await __sleepUntil(Number(epochMs) / 1000);
   // ctx.cognition.ask(question): tools-blind, durable human/agent-in-the-loop.
   // On replay the journaled answer is returned; otherwise the run registers a
   // pending request and suspends (throws the sentinel the host turns into a

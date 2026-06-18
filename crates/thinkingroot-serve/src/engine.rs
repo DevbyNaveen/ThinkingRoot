@@ -3394,6 +3394,63 @@ impl QueryEngine {
         }
     }
 
+    /// P1b — register a durable RESUME timer in the primary brain (a `ctx.sleep`/
+    /// `ctx.wakeAt` suspend). When due, the ticker records the wake step + re-
+    /// enters `run_id`. `step_key` is the sleep journal key; `input_json` the
+    /// original invocation input.
+    async fn put_resume_timer(
+        &self,
+        scope: &str,
+        fn_name: &str,
+        run_id: &str,
+        fire_at: f64,
+        step_key: &str,
+        input_json: &str,
+    ) {
+        let primary = self.primary_ws_name().unwrap_or_else(|| scope.to_string());
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let timer = thinkingroot_graph::root_function::FnTimer {
+            id: ulid::Ulid::new().to_string(),
+            scope: scope.to_string(),
+            fn_name: fn_name.to_string(),
+            kind: "resume".to_string(),
+            run_id: run_id.to_string(),
+            fire_at,
+            input_json: input_json.to_string(), // original invocation input
+            dedupe_key: step_key.to_string(),   // the sleep journal step key
+            status: "pending".to_string(),
+            created_at: now,
+        };
+        let storage = handle.storage.lock().await;
+        let _ = storage.graph.put_timer(&timer);
+    }
+
+    /// P1b — fire a RESUME timer: record the sleep's wake step in the SCOPE
+    /// brain, then re-enter the run (replays completed steps; the sleep returns
+    /// and the function continues). The scope must already be mounted.
+    pub async fn resume_timer(
+        &self,
+        scope: &str,
+        fn_name: &str,
+        run_id: &str,
+        step_key: &str,
+        input_json: &str,
+    ) -> Result<serde_json::Value> {
+        {
+            let handle = self.get_workspace(scope)?;
+            let storage = handle.storage.lock().await;
+            let _ = storage
+                .graph
+                .record_function_steps(run_id, &[(step_key.to_string(), "null".to_string())]);
+        }
+        let input: serde_json::Value =
+            serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
+        self.run_function_with_id(scope, fn_name, &input, run_id).await
+    }
+
     /// Invoke the latest version of `name` with `input`. Resolves the
     /// body, builds the secret-backed `env` map, runs it in the isolate,
     /// records a run row, and returns the JSON result. Errors (function
@@ -3748,6 +3805,11 @@ impl QueryEngine {
             output_json,
             error,
         };
+        // P1b — original input (for a resume re-invoke) + sleep timers collected
+        // here and registered AFTER the scope journal persists, so a wake always
+        // replays a complete journal.
+        let resume_input_json = serde_json::to_string(input).unwrap_or_default();
+        let mut resume_timers: Vec<(String, f64)> = Vec::new();
         {
             let handle = self.get_workspace(ws)?;
             let storage = handle.storage.lock().await;
@@ -3755,9 +3817,15 @@ impl QueryEngine {
                 let _ = storage.graph.record_function_steps(run_id, &new_steps);
             }
             if !new_pending.is_empty() {
-                let input_json = serde_json::to_string(input).unwrap_or_default();
                 let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
                 for p in &new_pending {
+                    // P1b — a ctx.sleep/ctx.wakeAt timer suspend registers a
+                    // durable RESUME timer (below); a cognition ask stays a
+                    // pending request awaiting an answer.
+                    if let Some(wake_at) = p.wake_at {
+                        resume_timers.push((p.step_key.clone(), wake_at));
+                        continue;
+                    }
                     let _ = storage.graph.put_pending_request(&PendingRequest {
                         token: p.token.clone(),
                         run_id: run_id.to_string(),
@@ -3765,7 +3833,7 @@ impl QueryEngine {
                         function_name: name.to_string(),
                         step_key: p.step_key.clone(),
                         question: p.question.clone(),
-                        input_json: input_json.clone(),
+                        input_json: resume_input_json.clone(),
                         status: "pending".to_string(),
                         created_at: now,
                     });
@@ -3799,6 +3867,14 @@ impl QueryEngine {
                     "read",
                 );
             }
+        }
+
+        // P1b — register durable resume timers in the PRIMARY brain now that the
+        // scope's journal is persisted. Each re-enters THIS run at `wake_at`
+        // (the engine ticker records the wake step + replays).
+        for (step_key, wake_at) in resume_timers {
+            self.put_resume_timer(ws, name, run_id, wake_at, &step_key, &resume_input_json)
+                .await;
         }
 
         // ── A2: branch teardown + result markers ──────────────────────────
