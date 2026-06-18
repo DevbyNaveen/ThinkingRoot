@@ -1270,6 +1270,19 @@ impl GraphStore {
                 expires_at: Float default 0.0,
                 created_at: Float default 0.0
             }",
+            // ─── fn_idempotency — cross-call exactly-once (Phase 2b). A caller-
+            //     supplied key; a fresh prior result short-circuits a re-run
+            //     (duplicate webhook / client retry). Stored in the SCOPE's own
+            //     brain so keys are per-user. TTL-bounded (expires_at).
+            ":create fn_idempotency {
+                key: String
+                =>
+                run_id: String default '',
+                result_json: String default '',
+                status: String default 'done',
+                expires_at: Float default 0.0,
+                created_at: Float default 0.0
+            }",
             // ─── function_experience — the MOAT. Learned "which function
             //     serves which input class", reweighted by run outcomes.
             //     Competitors with stateless executors can't accumulate this.

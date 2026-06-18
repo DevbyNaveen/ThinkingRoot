@@ -1062,6 +1062,9 @@ pub struct InvokeBranchOpts {
     /// P1b-ii — retry attempt number (0/1 = first run; bumped by the durable
     /// retry timer). Surfaced as `ctx.attempt`. 0 is treated as 1.
     pub attempt: u32,
+    /// P2b — cross-call exactly-once: a fresh prior result stored under this key
+    /// short-circuits the run (duplicate webhook / client retry).
+    pub idempotency_key: Option<String>,
 }
 
 impl FnCapabilities {
@@ -3631,6 +3634,30 @@ impl QueryEngine {
         }
     }
 
+    /// P2b — a fresh idempotency result for `key` in this scope, or None. Stored
+    /// in the scope's OWN brain so keys are per-user.
+    async fn idempotency_get(&self, ws: &str, key: &str) -> Option<serde_json::Value> {
+        let Ok(handle) = self.get_workspace(ws) else {
+            return None;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        match storage.graph.get_idempotency(key, now) {
+            Ok(Some(json)) => serde_json::from_str(&json).ok(),
+            _ => None,
+        }
+    }
+
+    /// P2b — record a terminal result under `key` (24h TTL).
+    async fn idempotency_put(&self, ws: &str, key: &str, run_id: &str, result_json: &str) {
+        let Ok(handle) = self.get_workspace(ws) else {
+            return;
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        let _ = storage.graph.put_idempotency(key, run_id, result_json, now + 86400.0);
+    }
+
     /// Invoke the latest version of `name` with `input`. Resolves the
     /// body, builds the secret-backed `env` map, runs it in the isolate,
     /// records a run row, and returns the JSON result. Errors (function
@@ -3787,6 +3814,14 @@ impl QueryEngine {
     ) -> Result<serde_json::Value> {
         use crate::root_function_runtime::RunOutcome;
         use thinkingroot_graph::root_function::{PendingRequest, RootFunctionRun};
+
+        // P2b — idempotency: a fresh prior result for this key short-circuits the
+        // run (duplicate webhook / client retry → exactly-once).
+        if let Some(key) = opts.idempotency_key.as_deref() {
+            if let Some(cached) = self.idempotency_get(ws, key).await {
+                return Ok(cached);
+            }
+        }
 
         // ── A2: resolve & prepare the write-target branch (if any) ────────
         // dry_run with no explicit branch → a fresh ephemeral branch named
@@ -4121,6 +4156,15 @@ impl QueryEngine {
             let fire_at = (chrono::Utc::now().timestamp_millis() as f64 / 1000.0) + backoff as f64;
             self.put_retry_timer(ws, name, run_id, fire_at, attempt + 1, &resume_input_json)
                 .await;
+        }
+
+        // P2b — record the idempotency result on a terminal success (so a
+        // duplicate invoke with the same key returns this instead of re-running).
+        if status == "ok" {
+            if let (Some(key), Ok(v)) = (opts.idempotency_key.as_deref(), &ret) {
+                let result_json = serde_json::to_string(v).unwrap_or_default();
+                self.idempotency_put(ws, key, run_id, &result_json).await;
+            }
         }
 
         // ── A2: branch teardown + result markers ──────────────────────────

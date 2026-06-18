@@ -857,6 +857,59 @@ impl GraphStore {
         Ok(())
     }
 
+    // ─── fn_idempotency — cross-call exactly-once (P2b) ─────────────────────
+
+    /// Store an idempotency result (idempotent `:put` by key, 'done' status).
+    pub fn put_idempotency(
+        &self,
+        key: &str,
+        run_id: &str,
+        result_json: &str,
+        expires_at: f64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("key".into(), DataValue::Str(key.into()));
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        params.insert("result_json".into(), DataValue::Str(result_json.into()));
+        params.insert("status".into(), DataValue::Str("done".into()));
+        params.insert("expires_at".into(), DataValue::Num(Num::Float(expires_at)));
+        params.insert("created_at".into(), DataValue::Num(Num::Float(now)));
+        self.query(
+            r#"?[key, run_id, result_json, status, expires_at, created_at] <- [[
+                $key, $run_id, $result_json, $status, $expires_at, $created_at
+            ]]
+            :put fn_idempotency {key => run_id, result_json, status, expires_at, created_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// A fresh idempotency result for `key` (the stored `result_json`), or None
+    /// when absent or expired.
+    pub fn get_idempotency(&self, key: &str, now: f64) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("key".into(), DataValue::Str(key.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[result_json, expires_at] := \
+                 *fn_idempotency{key, result_json, expires_at}, key = $key",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_idempotency: {e}")))?;
+        Ok(rows
+            .rows
+            .iter()
+            .filter(|r| {
+                let exp = dv_f64(&r[1]);
+                exp <= 0.0 || exp > now
+            })
+            .map(|r| dv_str(&r[0]))
+            .next())
+    }
+
     // ─── Run-learning (the moat) ─────────────────────────────────────
 
     pub fn get_experience(

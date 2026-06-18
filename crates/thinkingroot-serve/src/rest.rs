@@ -2375,6 +2375,10 @@ struct InvokeFunctionBody {
     /// (a true dry run: side effects happen in isolation, then vanish).
     #[serde(default)]
     dry_run: bool,
+    /// P2b — cross-call exactly-once: a fresh prior result for this key
+    /// short-circuits the run (duplicate webhook / client retry).
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 async fn invoke_function_handler(
@@ -2394,15 +2398,14 @@ async fn invoke_function_handler(
             .with_detail(serde_json::json!({ "function": name })),
         )
         .await;
-    let invoke_result = if payload.target_branch.is_some() || payload.dry_run {
+    let invoke_result = {
         let opts = crate::engine::InvokeBranchOpts {
             target_branch: payload.target_branch.clone(),
             dry_run: payload.dry_run,
+            idempotency_key: payload.idempotency_key.clone(),
             ..Default::default()
         };
         engine.invoke_function_with_opts(&ws, &name, &payload.input, opts).await
-    } else {
-        engine.invoke_function(&ws, &name, &payload.input).await
     };
     match invoke_result {
         Ok(v) => {
