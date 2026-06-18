@@ -272,6 +272,61 @@ pub async fn load_workspace_config(ws: &str, workspace_root: &Path) -> Result<()
     Ok(())
 }
 
+// ── Inheritance-chain resolution (Slice 2b) ─────────────────────────
+//
+// A connector installed once on the shared/project brain (`main`) must be
+// usable from every scope that inherits it — each agent (`agent_<name>`) and
+// per-user scope (`u_<id>`/`u_<id>__agent_<name>`) — exactly like deployed
+// functions/agents/prompts already cascade via `QueryEngine::inheritance_chain`.
+// These helpers take that precomputed chain (MOST-specific first) and fold the
+// per-ws registries into one view so the catalog, `tools/call` dispatch, the
+// capability router, and Root-Function `ctx.mcp.call` all resolve identically.
+//
+// Resolution is **nearest-server-wins**: the first brain in the chain that
+// declares a given server name owns it entirely (all its tools, its own
+// token/config). So a user's own `gmail` (their OAuth, scope `u_X`) fully
+// shadows the project-default `gmail` on `main`; connectors only present at an
+// outer scope are inherited. Listing and dispatch share this rule, so anything
+// advertised is callable.
+
+/// Fold every brain in `chain` (most-specific first) into a SINGLE registry,
+/// nearest-server-wins. Cheap: clones `Arc<McpClient>` handles, spawns nothing.
+/// Empty `chain` → empty registry (the no-workspace context has no externals).
+pub async fn merged_for_chain(chain: &[String]) -> Arc<ExternalMcpRegistry> {
+    let mut merged: HashMap<String, Arc<McpClient>> = HashMap::new();
+    for ws in chain {
+        let reg = registry_for(ws).await;
+        let guard = reg.inner.read().await;
+        for (server, client) in guard.iter() {
+            // First (nearest) scope to declare this server keeps it.
+            merged.entry(server.clone()).or_insert_with(|| client.clone());
+        }
+    }
+    Arc::new(ExternalMcpRegistry {
+        inner: RwLock::new(merged),
+    })
+}
+
+/// Every external tool visible to `chain`, prefixed `<server>::<tool>`,
+/// nearest-server-wins. Mirrors [`dispatch_for_chain`] exactly.
+pub async fn list_tools_for_chain(chain: &[String]) -> Vec<(String, McpToolDescriptor)> {
+    merged_for_chain(chain).await.list_all_tools().await
+}
+
+/// Dispatch a `<server>::<tool>` call across `chain`, nearest-server-wins.
+/// `None` when no brain in the chain declares the server (caller surfaces a
+/// "not registered" error) — same contract as [`ExternalMcpRegistry::dispatch`].
+pub async fn dispatch_for_chain(
+    chain: &[String],
+    prefixed_name: &str,
+    arguments: serde_json::Value,
+) -> Option<Result<McpToolResult, McpClientError>> {
+    merged_for_chain(chain)
+        .await
+        .dispatch(prefixed_name, arguments)
+        .await
+}
+
 #[cfg(test)]
 pub async fn clear_for_tests(ws: &str) {
     install_for(ws, Arc::new(ExternalMcpRegistry::empty())).await;
@@ -473,6 +528,112 @@ fn resolve_env_map(input: &HashMap<String, String>) -> Result<HashMap<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::client::McpTransport;
+
+    /// Minimal transport: handshakes + replays a fixed `tools/list`. Lets a
+    /// test build a live `McpClient` with named tools, no real server.
+    struct FakeToolsTransport {
+        tools: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpTransport for FakeToolsTransport {
+        async fn rpc(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, McpClientError> {
+            match method {
+                "initialize" => Ok(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {}
+                })),
+                "notifications/initialized" => Ok(serde_json::json!(null)),
+                "tools/list" => Ok(serde_json::json!({
+                    "tools": self
+                        .tools
+                        .iter()
+                        .map(|n| serde_json::json!({ "name": n }))
+                        .collect::<Vec<_>>()
+                })),
+                other => Err(McpClientError::Protocol(format!("no scripted: {other}"))),
+            }
+        }
+    }
+
+    async fn fake_client(tools: Vec<&'static str>) -> Arc<McpClient> {
+        let c = McpClient::new(Arc::new(FakeToolsTransport { tools }));
+        c.initialize().await.expect("fake initialize");
+        Arc::new(c)
+    }
+
+    async fn fake_registry(
+        servers: Vec<(&'static str, Vec<&'static str>)>,
+    ) -> Arc<ExternalMcpRegistry> {
+        let mut map: HashMap<String, Arc<McpClient>> = HashMap::new();
+        for (name, tools) in servers {
+            map.insert(name.to_string(), fake_client(tools).await);
+        }
+        Arc::new(ExternalMcpRegistry {
+            inner: RwLock::new(map),
+        })
+    }
+
+    #[tokio::test]
+    async fn chain_inherits_connectors_nearest_server_wins() {
+        // Project brain has `gmail` (send) + `telegram`; the per-user scope has
+        // its OWN `gmail` (draft). Chain is most-specific first: [u_1, main].
+        install_for(
+            "cscope_main",
+            fake_registry(vec![("gmail", vec!["send"]), ("telegram", vec!["msg"])]).await,
+        )
+        .await;
+        install_for(
+            "cscope_u1",
+            fake_registry(vec![("gmail", vec!["draft"])]).await,
+        )
+        .await;
+
+        let chain = vec!["cscope_u1".to_string(), "cscope_main".to_string()];
+        let names: std::collections::HashSet<String> = list_tools_for_chain(&chain)
+            .await
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+
+        // `gmail` resolves to the NEAREST scope (u_1) → its tool wins, the
+        // project default is fully shadowed (nearest-server-wins).
+        assert!(names.contains("gmail::draft"), "nearest gmail wins: {names:?}");
+        assert!(
+            !names.contains("gmail::send"),
+            "project gmail must be shadowed: {names:?}"
+        );
+        // `telegram` exists only on the project brain → inherited downward.
+        assert!(
+            names.contains("telegram::msg"),
+            "telegram should cascade from main: {names:?}"
+        );
+
+        // Dispatch resolves the same way: nearest scope owning the server.
+        assert!(
+            dispatch_for_chain(&chain, "gmail::draft", serde_json::json!({}))
+                .await
+                .is_some(),
+            "inherited/nearest tool must be callable"
+        );
+
+        // Empty chain = no externals (the no-workspace guarantee that keeps the
+        // dispatch `None` path and builtins-only catalog honest).
+        assert!(list_tools_for_chain(&[]).await.is_empty());
+        assert!(
+            dispatch_for_chain(&[], "gmail::send", serde_json::json!({}))
+                .await
+                .is_none()
+        );
+
+        clear_for_tests("cscope_main").await;
+        clear_for_tests("cscope_u1").await;
+    }
 
     #[test]
     fn empty_registry_is_empty() {

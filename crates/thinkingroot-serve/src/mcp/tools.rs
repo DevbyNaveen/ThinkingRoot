@@ -203,11 +203,13 @@ fn annotate_defer_loading(tools: &mut serde_json::Value) {
 /// source of truth. `handle_list` may apply a capability-router exposure filter
 /// on top; `tool_search` / `tool_invoke` always operate over THIS full set so
 /// progressive disclosure can reach every tool regardless of exposure mode.
-/// `ws` scopes the EXTERNAL MCP tools appended below to that workspace's
-/// registry (Slice 2: per-user/per-agent external tools). `None` = the
+/// `ws_chain` scopes the EXTERNAL MCP tools appended below: the workspace's
+/// inheritance chain (most-specific first, from `QueryEngine::inheritance_chain`)
+/// so a connector installed once on the shared/project brain cascades to every
+/// agent + per-user scope (Slice 2b), nearest-server-wins. An empty slice = the
 /// no-workspace context, which has no external tools (builtins only).
 #[tracing::instrument(name = "mcp.tools.catalog", skip_all)]
-pub async fn build_tool_catalog(ws: Option<&str>) -> Value {
+pub async fn build_tool_catalog(ws_chain: &[String]) -> Value {
     let mut tools = serde_json::json!({
         "tools": [
             // ── Classic CRUD tools ────────────────────────────────────────
@@ -1366,16 +1368,15 @@ pub async fn build_tool_catalog(ws: Option<&str>) -> Value {
             for schema in crate::mcp::tool_trait::list_schemas() {
                 arr_mut.push(schema);
             }
-            // Phase E.5 (2026-05-17) — append external MCP tools
-            // from the bridged registry under
-            // `<server_name>::<tool_name>` namespace. Tolerates a
-            // slow external server: list_all_tools internally
-            // logs + skips servers that fail. Production startup
-            // installs the global via
-            // `external_registry::load_global_from_workspace_config`
-            // at workspace mount.
-            let external = crate::mcp::external_registry::registry_for(ws.unwrap_or("")).await;
-            for (prefixed_name, tool) in external.list_all_tools().await {
+            // Phase E.5 (2026-05-17) — append external MCP tools under the
+            // `<server_name>::<tool_name>` namespace. Slice 2b: resolved across
+            // the workspace's INHERITANCE CHAIN (nearest-server-wins) so a
+            // connector installed on the shared brain cascades to every agent +
+            // per-user scope. Tolerates a slow external server: list_all_tools
+            // internally logs + skips servers that fail.
+            for (prefixed_name, tool) in
+                crate::mcp::external_registry::list_tools_for_chain(ws_chain).await
+            {
                 arr_mut.push(serde_json::json!({
                     "name": prefixed_name,
                     "description": format!("[external] {}", tool.description),
@@ -1503,7 +1504,7 @@ fn apply_tool_exposure(tools: &mut Value) {
 #[tracing::instrument(name = "mcp.tools.list", skip_all)]
 pub async fn handle_list(id: Option<Value>) -> JsonRpcResponse {
     // No workspace context here → builtins only (no per-ws external tools).
-    let mut tools = build_tool_catalog(None).await;
+    let mut tools = build_tool_catalog(&[]).await;
     apply_tool_exposure(&mut tools);
     JsonRpcResponse::success(id, tools)
 }
@@ -1520,8 +1521,13 @@ pub async fn handle_list_for_ws(
     engine: &QueryEngine,
     default_ws: Option<&str>,
 ) -> JsonRpcResponse {
-    // Per-ws: external tools come from THIS workspace's registry (Slice 2).
-    let mut tools = build_tool_catalog(default_ws).await;
+    // Per-ws: external tools come from this workspace's INHERITANCE CHAIN
+    // (Slice 2b) — self → agent brain → shared — so project-level connectors
+    // cascade. Empty chain when there's no ws (builtins only).
+    let chain = default_ws
+        .map(|w| engine.inheritance_chain(w))
+        .unwrap_or_default();
+    let mut tools = build_tool_catalog(&chain).await;
     if let Some(ws) = default_ws
         && let Ok(funcs) = engine.list_functions(ws).await
         && let Some(arr) = tools.get_mut("tools").and_then(|v| v.as_array_mut())
@@ -1560,6 +1566,7 @@ pub async fn handle_list_for_ws(
 pub async fn handle_tool_search(
     id: Option<Value>,
     arguments: &Value,
+    ws_chain: &[String],
 ) -> JsonRpcResponse {
     let query = arguments
         .get("query")
@@ -1578,8 +1585,9 @@ pub async fn handle_tool_search(
 
     // Always search the FULL catalog (same source of truth as tools/list,
     // including the defer_loading annotation pass) — NOT the exposure-filtered
-    // list — so progressive disclosure can surface every tool in `meta` mode.
-    let result = build_tool_catalog(None).await;
+    // list — so progressive disclosure can surface every tool in `meta` mode,
+    // including external connectors inherited across the workspace chain.
+    let result = build_tool_catalog(ws_chain).await;
     let arr = result
         .get("tools")
         .and_then(|v| v.as_array())
@@ -3724,7 +3732,12 @@ pub async fn handle_call(
         // because the handler ignores it. Meta-tool that returns
         // matching tool descriptors so the client can discover
         // `defer_loading: true` tools on demand without preloading.
-        "tool_search" => handle_tool_search(id, &arguments).await,
+        "tool_search" => {
+            let chain = default_ws
+                .map(|w| engine.inheritance_chain(w))
+                .unwrap_or_default();
+            handle_tool_search(id, &arguments, &chain).await
+        }
         // Capability-router execution bridge. Re-dispatches to ANY tool by
         // name so `meta` exposure mode (which advertises only a small core)
         // can still reach the full surface: an LLM can only *call* a listed
@@ -3832,10 +3845,20 @@ pub async fn handle_call(
         // prefix, dispatch via `McpClient::call_tool`. Wrap the
         // result in the MCP `text` content block shape so agents
         // see external tool results identically to built-ins.
+        // Slice 2b: dispatch across the workspace's INHERITANCE CHAIN
+        // (nearest-server-wins), the SAME resolution `build_tool_catalog`
+        // advertises — so any inherited connector that's listed is callable.
         other if other.contains("::") => {
-            let registry =
-                crate::mcp::external_registry::registry_for(default_ws.unwrap_or("")).await;
-            match registry.dispatch(other, arguments.clone()).await {
+            let chain = default_ws
+                .map(|w| engine.inheritance_chain(w))
+                .unwrap_or_default();
+            match crate::mcp::external_registry::dispatch_for_chain(
+                &chain,
+                other,
+                arguments.clone(),
+            )
+            .await
+            {
                 Some(Ok(result)) => {
                     let text = serde_json::to_string_pretty(&result)
                         .unwrap_or_else(|_| String::from("(serialization failure)"));
@@ -5151,6 +5174,7 @@ mod defer_loading_tests {
         let resp = handle_tool_search(
             None,
             &serde_json::json!({ "query": "engram", "limit": 50 }),
+            &[],
         )
         .await;
         let payload = resp
@@ -5193,6 +5217,7 @@ mod defer_loading_tests {
         let resp = handle_tool_search(
             None,
             &serde_json::json!({ "include_non_deferred": false, "limit": 100 }),
+            &[],
         )
         .await;
         let payload = resp.result.expect("result");
@@ -5228,6 +5253,7 @@ mod defer_loading_tests {
         let resp = handle_tool_search(
             None,
             &serde_json::json!({ "query": "", "limit": 3 }),
+            &[],
         )
         .await;
         let payload = resp.result.expect("result");
@@ -5464,7 +5490,7 @@ mod observer_tool_listing_tests {
     // long tail reachable. This is the 49k→~2k token mechanism.
     #[tokio::test]
     async fn meta_exposure_collapses_catalog_to_core() {
-        let mut cat = super::build_tool_catalog(None).await;
+        let mut cat = super::build_tool_catalog(&[]).await;
         let names_of = |v: &serde_json::Value| -> Vec<String> {
             v.get("tools")
                 .and_then(|t| t.as_array())
@@ -5499,7 +5525,7 @@ mod observer_tool_listing_tests {
     // catalog so the gateway's proxy_mcp forwards them to MCP clients.
     #[tokio::test]
     async fn compiled_workspace_tools_are_advertised() {
-        let cat = super::build_tool_catalog(None).await;
+        let cat = super::build_tool_catalog(&[]).await;
         let names: Vec<String> = cat
             .get("tools")
             .and_then(|t| t.as_array())

@@ -160,6 +160,48 @@ pub struct SourceInfo {
     /// dedicated status endpoint.
     #[serde(default)]
     pub content_hash: String,
+    /// On-disk size of the backing source file in bytes, when it still
+    /// exists on the workspace volume. `None` for agent-contributed
+    /// sources (no file) or files since removed. Read live from the
+    /// filesystem at list time — never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_size: Option<u64>,
+    /// Unix epoch SECONDS when the backing source file was imported —
+    /// the file's creation time (falling back to last-modified where the
+    /// platform doesn't expose birth time). `None` when there is no file.
+    /// This is the real filesystem time, not a stored/guessed value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<i64>,
+}
+
+/// Resolve a source's `uri` to its file on the workspace volume and read its
+/// size + import time STRAIGHT FROM THE FILESYSTEM. The compiler records the
+/// absolute on-disk path as the uri, so we stat that directly; we also try the
+/// uri joined under `root` as a fallback. Returns `(None, None)` for sources
+/// with no backing file (agent-contributed) or files since removed — never a
+/// fabricated value. Import time = the file's creation (birth) time where the
+/// platform exposes it, else last-modified, as Unix epoch seconds.
+fn source_file_meta(root: &std::path::Path, uri: &str) -> (Option<u64>, Option<i64>) {
+    let candidates = [
+        std::path::PathBuf::from(uri),
+        root.join(uri.trim_start_matches('/')),
+    ];
+    for path in candidates {
+        let Ok(md) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let ts = md
+            .created()
+            .or_else(|_| md.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        return (Some(md.len()), ts);
+    }
+    (None, None)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2776,9 +2818,12 @@ impl QueryEngine {
                 break;
             }
         }
-        // 4. Fill remaining slots from the external MCP registry.
+        // 4. Fill remaining slots from the external MCP registry — resolved
+        //    across the workspace's inheritance chain (Slice 2b) so the router
+        //    can rank inherited project/agent connectors from a per-user scope.
         if names.len() < k {
-            let registry = crate::mcp::external_registry::registry_for(ws).await;
+            let registry =
+                crate::mcp::external_registry::merged_for_chain(&self.inheritance_chain(ws)).await;
             for (tool_name, _desc) in registry.list_all_tools().await {
                 if !names.contains(&tool_name) {
                     names.push(tool_name);
@@ -3486,7 +3531,13 @@ impl QueryEngine {
         // and stays confined to this (per-user) workspace.
         let caps = {
             let handle = self.get_workspace(ws)?.clone();
-            let mcp = crate::mcp::external_registry::registry_for(ws).await;
+            // Slice 2b: `ctx.mcp.call` resolves connectors across the workspace's
+            // inheritance chain (self → agent brain → shared), nearest-server-
+            // wins — so a function in a per-user scope can call a project-level
+            // connector. The chain NEVER includes sibling scopes, so this stays
+            // confined to the legitimate inheritance path (no cross-tenant leak).
+            let mcp =
+                crate::mcp::external_registry::merged_for_chain(&self.inheritance_chain(ws)).await;
             // A1 — per-function capability grants. Absent row → the all-on
             // default (unrestricted functions behave exactly as before).
             // Present-but-malformed row → DENY ALL (fail closed: a corrupt
@@ -4435,16 +4486,25 @@ side referenced. Strict rules:\n\
     /// Served from in-memory cache.
     pub async fn list_sources(&self, ws: &str) -> Result<Vec<SourceInfo>> {
         let handle = self.get_workspace(ws)?;
+        let root = handle.root_path.clone();
         let cache = handle.cache.read().await;
 
         Ok(cache
             .all_sources()
             .iter()
-            .map(|s| SourceInfo {
-                id: s.id.clone(),
-                uri: s.uri.clone(),
-                source_type: s.source_type.clone(),
-                content_hash: s.content_hash.clone(),
+            .map(|s| {
+                // Enrich with REAL filesystem metadata (size + import time) by
+                // resolving the source's uri to its file on the workspace
+                // volume. Agent-contributed sources (no file) → both None.
+                let (byte_size, imported_at) = source_file_meta(&root, &s.uri);
+                SourceInfo {
+                    id: s.id.clone(),
+                    uri: s.uri.clone(),
+                    source_type: s.source_type.clone(),
+                    content_hash: s.content_hash.clone(),
+                    byte_size,
+                    imported_at,
+                }
             })
             .collect())
     }
