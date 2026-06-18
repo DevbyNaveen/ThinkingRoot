@@ -60,6 +60,31 @@ pub struct PendingRequest {
     pub created_at: f64,
 }
 
+/// A durable scheduled invocation (Root Function SOTA Phase 1). Persisted in
+/// the PRIMARY brain keyed by the target `scope`, so the engine ticker fires it
+/// even when the per-user `u_*` brain is unmounted (proactive "while you sleep").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FnTimer {
+    pub id: String,
+    /// Workspace/scope to run the function in (`u_<id>` / `agent_<name>` / `main`).
+    pub scope: String,
+    pub fn_name: String,
+    /// `"schedule"` (a fresh run) — `"resume"`/`"retry"` arrive in Phase 1b.
+    pub kind: String,
+    /// For resume/retry kinds: the run id to re-enter. Empty for schedule.
+    pub run_id: String,
+    /// Epoch seconds when this timer is due.
+    pub fire_at: f64,
+    /// JSON-encoded input for a `schedule` run.
+    pub input_json: String,
+    /// Re-arm dedupe: scheduling again with the same (scope, fn, key) replaces
+    /// the prior pending timer instead of stacking.
+    pub dedupe_key: String,
+    /// `"pending"` (fired timers are deleted).
+    pub status: String,
+    pub created_at: f64,
+}
+
 /// A control-plane-owned test fixture for a Root Function: an input and the
 /// expected JSON output. Authored separately from the function body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -545,6 +570,105 @@ impl GraphStore {
         if let Some(mut req) = self.get_pending_request(token)? {
             req.status = "answered".to_string();
             self.put_pending_request(&req)?;
+        }
+        Ok(())
+    }
+
+    // ─── fn_timer — durable scheduled invocations (Root Function SOTA P1) ───
+
+    /// Register a durable timer (idempotent `:put` by id).
+    pub fn put_timer(&self, t: &FnTimer) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(t.id.clone().into()));
+        params.insert("scope".into(), DataValue::Str(t.scope.clone().into()));
+        params.insert("fn_name".into(), DataValue::Str(t.fn_name.clone().into()));
+        params.insert("kind".into(), DataValue::Str(t.kind.clone().into()));
+        params.insert("run_id".into(), DataValue::Str(t.run_id.clone().into()));
+        params.insert("fire_at".into(), DataValue::Num(Num::Float(t.fire_at)));
+        params.insert("input_json".into(), DataValue::Str(t.input_json.clone().into()));
+        params.insert("dedupe_key".into(), DataValue::Str(t.dedupe_key.clone().into()));
+        params.insert("status".into(), DataValue::Str(t.status.clone().into()));
+        params.insert("created_at".into(), DataValue::Num(Num::Float(t.created_at)));
+        self.query(
+            r#"?[id, scope, fn_name, kind, run_id, fire_at, input_json, dedupe_key, status, created_at] <- [[
+                $id, $scope, $fn_name, $kind, $run_id, $fire_at, $input_json, $dedupe_key, $status, $created_at
+            ]]
+            :put fn_timer {id => scope, fn_name, kind, run_id, fire_at, input_json, dedupe_key, status, created_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Pending timers due at or before `now`, oldest-first (the ticker's scan).
+    /// Filters `status` in CozoScript (the proven `=` form) and `fire_at` in
+    /// Rust — pending timers are few (per-user, deduped), so this is cheap and
+    /// avoids relying on an inline `<=` comparison in the rule body.
+    pub fn list_due_timers(&self, now: f64, limit: usize) -> Result<Vec<FnTimer>> {
+        let params: BTreeMap<String, DataValue> = BTreeMap::new();
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id, scope, fn_name, kind, run_id, fire_at, input_json, dedupe_key, status, created_at] := \
+                 *fn_timer{id, scope, fn_name, kind, run_id, fire_at, input_json, dedupe_key, status, created_at}, \
+                 status = 'pending'",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_due_timers: {e}")))?;
+        let mut out: Vec<FnTimer> = rows
+            .rows
+            .iter()
+            .map(|r| FnTimer {
+                id: dv_str(&r[0]),
+                scope: dv_str(&r[1]),
+                fn_name: dv_str(&r[2]),
+                kind: dv_str(&r[3]),
+                run_id: dv_str(&r[4]),
+                fire_at: dv_f64(&r[5]),
+                input_json: dv_str(&r[6]),
+                dedupe_key: dv_str(&r[7]),
+                status: dv_str(&r[8]),
+                created_at: dv_f64(&r[9]),
+            })
+            .filter(|t| t.fire_at <= now)
+            .collect();
+        out.sort_by(|a, b| a.fire_at.total_cmp(&b.fire_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Delete a timer by id (used to mark one fired — fired rows aren't kept).
+    pub fn delete_timer(&self, id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        self.query(
+            "?[id] := *fn_timer{id}, id = $id\n:rm fn_timer {id}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Cancel any pending timer with this (scope, fn_name, dedupe_key) — so a
+    /// re-arm with the same key replaces rather than stacks. No-op if none.
+    pub fn cancel_timer_dedupe(&self, scope: &str, fn_name: &str, dedupe_key: &str) -> Result<()> {
+        if dedupe_key.is_empty() {
+            return Ok(());
+        }
+        let mut params = BTreeMap::new();
+        params.insert("scope".into(), DataValue::Str(scope.into()));
+        params.insert("fn_name".into(), DataValue::Str(fn_name.into()));
+        params.insert("dedupe_key".into(), DataValue::Str(dedupe_key.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id] := *fn_timer{id, scope, fn_name, dedupe_key, status}, \
+                 scope = $scope, fn_name = $fn_name, dedupe_key = $dedupe_key, status = 'pending'",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("cancel_timer_dedupe: {e}")))?;
+        for r in &rows.rows {
+            let _ = self.delete_timer(&dv_str(&r[0]));
         }
         Ok(())
     }

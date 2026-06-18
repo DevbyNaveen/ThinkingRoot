@@ -1041,6 +1041,11 @@ pub struct FnCapabilities {
     /// quarantined for verify-before-keep (forge) and dreaming. `None` =
     /// write to main (the default; fully backward compatible).
     target_branch: Option<String>,
+    /// Root Function SOTA P1 — the PRIMARY brain's handle, where durable
+    /// timers (`ctx.scheduleSelf`/`ctx.schedule`) are persisted so the engine
+    /// ticker fires them even when this (per-user) scope is unmounted. `None`
+    /// → timers fall back to this run's own handle (e.g. running in main).
+    primary_handle: Option<WorkspaceHandle>,
 }
 
 /// A2 — options for a branch-scoped Root Function invocation.
@@ -1065,7 +1070,7 @@ impl FnCapabilities {
         caps: CapSet,
     ) -> Self {
         let root_path = handle.root_path.clone();
-        Self { handle, root_path, ws, run_id, mcp, caps, target_branch: None }
+        Self { handle, root_path, ws, run_id, mcp, caps, target_branch: None, primary_handle: None }
     }
 
     /// A2 — route `memory.remember` writes to `branch`'s graph instead of
@@ -1073,6 +1078,52 @@ impl FnCapabilities {
     pub fn with_target_branch(mut self, branch: Option<String>) -> Self {
         self.target_branch = branch;
         self
+    }
+
+    /// P1 — the primary brain's handle, where durable timers are persisted.
+    pub fn with_primary_handle(mut self, h: Option<WorkspaceHandle>) -> Self {
+        self.primary_handle = h;
+        self
+    }
+
+    /// `ctx.scheduleSelf(when, input)` / `ctx.schedule(fn, when, input)` —
+    /// register a durable future invocation. Persisted in the PRIMARY brain
+    /// keyed by THIS run's scope, so the engine ticker fires a fresh run of
+    /// `fn_name` in this scope at `fire_at` even if the scope is unmounted. A
+    /// non-empty `dedupe_key` replaces any prior pending timer with the same
+    /// (scope, fn, key) — the per-user proactive re-arm pattern. Returns the
+    /// timer id.
+    pub async fn schedule_timer(
+        &self,
+        fn_name: &str,
+        fire_at: f64,
+        input_json: &str,
+        dedupe_key: &str,
+    ) -> Result<String> {
+        if !self.caps.can_remember {
+            return Err(Error::Config(
+                "capability 'schedule' is not granted to this function".to_string(),
+            ));
+        }
+        let handle = self.primary_handle.as_ref().unwrap_or(&self.handle);
+        let id = ulid::Ulid::new().to_string();
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let timer = thinkingroot_graph::root_function::FnTimer {
+            id: id.clone(),
+            scope: self.ws.clone(),
+            fn_name: fn_name.to_string(),
+            kind: "schedule".to_string(),
+            run_id: String::new(),
+            fire_at,
+            input_json: input_json.to_string(),
+            dedupe_key: dedupe_key.to_string(),
+            status: "pending".to_string(),
+            created_at: now,
+        };
+        let storage = handle.storage.lock().await;
+        storage.graph.cancel_timer_dedupe(&self.ws, fn_name, dedupe_key)?;
+        storage.graph.put_timer(&timer)?;
+        Ok(id)
     }
 
     /// `ctx.memory.recall(query, k)` — semantic recall scoped to this run's
@@ -3315,6 +3366,34 @@ impl QueryEngine {
         storage.graph.list_function_runs(name)
     }
 
+    /// P1 — due scheduled-function timers from the PRIMARY brain (the ticker's
+    /// scan). Timers are stored centrally there so they fire regardless of
+    /// whether the target per-user scope is mounted. Empty on any error/absence.
+    pub async fn due_fn_timers(
+        &self,
+        limit: usize,
+    ) -> Vec<thinkingroot_graph::root_function::FnTimer> {
+        let Some(primary) = self.primary_ws_name() else {
+            return Vec::new();
+        };
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return Vec::new();
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_due_timers(now, limit).unwrap_or_default()
+    }
+
+    /// P1 — delete a fired timer from the primary brain.
+    pub async fn delete_fn_timer(&self, id: &str) {
+        if let Some(primary) = self.primary_ws_name() {
+            if let Ok(handle) = self.get_workspace(&primary) {
+                let storage = handle.storage.lock().await;
+                let _ = storage.graph.delete_timer(id);
+            }
+        }
+    }
+
     /// Invoke the latest version of `name` with `input`. Resolves the
     /// body, builds the secret-backed `env` map, runs it in the isolate,
     /// records a run row, and returns the JSON result. Errors (function
@@ -3603,9 +3682,17 @@ impl QueryEngine {
                     }
                 }
             };
+            // P1 — durable timers live in the PRIMARY brain (so the ticker
+            // fires them even when this per-user scope is unmounted). None when
+            // already running in the primary (timers then use the run's handle).
+            let primary_handle = self
+                .primary_ws_name()
+                .filter(|p| p.as_str() != ws)
+                .and_then(|p| self.get_workspace(&p).ok().cloned());
             std::sync::Arc::new(
                 FnCapabilities::new(handle, ws.to_string(), run_id.to_string(), mcp, cap_set)
-                    .with_target_branch(target_branch.clone()),
+                    .with_target_branch(target_branch.clone())
+                    .with_primary_handle(primary_handle),
             )
         };
         let (outcome, new_steps, new_pending, new_cites) =

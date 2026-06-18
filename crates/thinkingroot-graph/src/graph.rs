@@ -1216,6 +1216,27 @@ impl GraphStore {
                 status: String default 'pending',
                 created_at: Float default 0.0
             }",
+            // ─── fn_timer — durable scheduled invocations (Root Function SOTA
+            //     Phase 1). One row per pending wake: `ctx.scheduleSelf` /
+            //     `ctx.schedule` (kind 'schedule' → a fresh run), or a resume/
+            //     retry timer (later). Stored in the PRIMARY brain keyed by the
+            //     target `scope`, so the engine ticker fires it even when the
+            //     per-user `u_*` brain is unmounted (proactive "while you sleep").
+            //     `dedupe_key` lets a re-arm replace its own pending timer.
+            //     New relation → created on mount via create_schema, zero migration.
+            ":create fn_timer {
+                id: String
+                =>
+                scope: String,
+                fn_name: String,
+                kind: String default 'schedule',
+                run_id: String default '',
+                fire_at: Float default 0.0,
+                input_json: String default '',
+                dedupe_key: String default '',
+                status: String default 'pending',
+                created_at: Float default 0.0
+            }",
             // ─── function_experience — the MOAT. Learned "which function
             //     serves which input class", reweighted by run outcomes.
             //     Competitors with stateless executors can't accumulate this.

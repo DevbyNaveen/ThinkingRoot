@@ -539,6 +539,82 @@ pub fn spawn_keep_warm(
     spawn_periodic_task(task)
 }
 
+/// Root Function SOTA P1 — the durable timer ticker. Scans the PRIMARY brain
+/// for due `ctx.scheduleSelf`/`ctx.schedule` timers and fires each as a fresh
+/// run in its scope (mounting the per-user brain on demand). This is what makes
+/// a Root Function proactive: it wakes itself, per user, while the user is away.
+struct FnSchedulerTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    interval: Duration,
+    batch: usize,
+}
+
+#[async_trait]
+impl PeriodicTask for FnSchedulerTask {
+    fn name(&self) -> &'static str {
+        "fn_scheduler"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let due = { self.engine.read().await.due_fn_timers(self.batch).await };
+        for t in due {
+            // Phase 1a fires only `schedule` (fresh-run) timers; resume/retry
+            // (suspend-this-run) arrive in 1b.
+            if t.kind != "schedule" {
+                continue;
+            }
+            // Mount the target scope on demand (per-user `u_*`/`agent_*` brains
+            // auto-mount; `main` is always mounted).
+            if crate::engine::is_auto_scoped_ws(&t.scope) {
+                let mut eng = self.engine.write().await;
+                if let Err(e) = eng.get_or_mount_user_ws(&t.scope).await {
+                    tracing::warn!(scope = %t.scope, "fn_scheduler: mount failed, will retry: {e}");
+                    continue; // leave the timer pending for the next tick
+                }
+            }
+            let input: serde_json::Value =
+                serde_json::from_str(&t.input_json).unwrap_or(serde_json::Value::Null);
+            let res = {
+                let eng = self.engine.read().await;
+                eng.invoke_function(&t.scope, &t.fn_name, &input).await
+            };
+            match res {
+                Ok(_) => tracing::info!(
+                    scope = %t.scope, function = %t.fn_name, "fn_scheduler: fired scheduled run"
+                ),
+                Err(e) => tracing::warn!(
+                    scope = %t.scope, function = %t.fn_name,
+                    "fn_scheduler: scheduled run errored: {e}"
+                ),
+            }
+            // A schedule fires once; the function re-arms (scheduleSelf) if it
+            // wants a next wake. Delete regardless of outcome so a bad timer
+            // can't loop forever.
+            self.engine.read().await.delete_fn_timer(&t.id).await;
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the Root Function timer ticker. Always on (one cheap DB scan per
+/// tick); `TR_FN_SCHEDULER_SECS` (default 15) sets the cadence.
+pub fn spawn_fn_scheduler(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let interval_secs = std::env::var("TR_FN_SCHEDULER_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(FnSchedulerTask {
+        engine,
+        interval: Duration::from_secs(interval_secs.max(5)),
+        batch: 50,
+    });
+    spawn_periodic_task(task)
+}
+
 /// Living Engram (Build 1) — idle decay of usage-learned associative edges.
 /// Multiplicatively pulls every edge toward a non-zero floor each run
 /// (`w ← floor + (w − floor)·factor`), so unused associations fade while a

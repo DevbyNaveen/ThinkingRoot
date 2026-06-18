@@ -424,6 +424,12 @@ pub async fn run_serve(
     let _keep_warm_handle =
         thinkingroot_serve::maintenance::spawn_keep_warm(state.engine.clone());
 
+    // Root Function SOTA P1 — durable timer ticker: fires due
+    // ctx.scheduleSelf/ctx.schedule timers as fresh per-scope runs (the
+    // proactive "while you sleep" loop). Always on; cheap DB scan per tick.
+    let _fn_scheduler_handle =
+        thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
+
     // Living Engram (Build 1): idle decay of usage-learned associative edges.
     // No-op handle unless TR_LIVING_EDGES=1.
     let _living_edges_handle = workspace_root
@@ -815,6 +821,12 @@ async fn run_serve_with_listener(
     // TR_LLM_KEEPWARM (cloud provisioner sets =1); a literal no-op otherwise.
     let _keep_warm_handle =
         thinkingroot_serve::maintenance::spawn_keep_warm(state.engine.clone());
+
+    // Root Function SOTA P1 — durable timer ticker: fires due
+    // ctx.scheduleSelf/ctx.schedule timers as fresh per-scope runs (the
+    // proactive "while you sleep" loop). Always on; cheap DB scan per tick.
+    let _fn_scheduler_handle =
+        thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
 
     // Living Engram (Build 1): idle decay of usage-learned associative edges.
     // No-op handle unless TR_LIVING_EDGES=1.

@@ -974,6 +974,47 @@ mod host_ext {
         Ok(AcquireResult { name, body, authored })
     }
 
+    #[derive(serde::Deserialize)]
+    pub struct ScheduleReq {
+        pub fn_name: String,
+        /// Epoch seconds the run is due (JS computes it from a relative delay).
+        pub fire_at: f64,
+        #[serde(default)]
+        pub input_json: String,
+        #[serde(default)]
+        pub dedupe_key: String,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct ScheduleResult {
+        pub id: String,
+    }
+
+    /// Async op behind `ctx.scheduleSelf`/`ctx.schedule` — register a durable
+    /// future invocation (a fresh run of `fn_name` in THIS scope at `fire_at`),
+    /// persisted in the primary brain so the engine ticker fires it even when
+    /// the scope is unmounted. The per-user proactive self-scheduling primitive.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_schedule(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: ScheduleReq,
+    ) -> Result<ScheduleResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.schedule is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.schedule_timer(&req.fn_name, req.fire_at, &req.input_json, &req.dedupe_key)
+            .await
+            .map(|id| ScheduleResult { id })
+            .map_err(|e| JsErrorBox::generic(format!("schedule failed: {e}")))
+    }
+
     pub fn extension() -> Extension {
         const OPS: &[OpDecl] = &[
             op_tr_ctx(),
@@ -992,6 +1033,7 @@ mod host_ext {
             op_tr_cognition_request(),
             op_tr_cite(),
             op_tr_acquire(),
+            op_tr_schedule(),
         ];
         Extension {
             name: "tr_host",
@@ -1216,6 +1258,27 @@ globalThis.__tr_buildCtx = (input, env) => {
         }));
     },
   };
+  // ctx.schedule(fnName, delayMs, input?, {key?}) / ctx.scheduleSelf(delayMs, …):
+  // register a durable FUTURE invocation — a fresh run of the function in THIS
+  // scope after `delayMs`. The engine ticker fires it even while the user is
+  // away/unmounted. A function that re-arms itself (scheduleSelf) at the end of
+  // each run IS the proactive per-user loop ("while you sleep"). `key` dedups so
+  // a re-arm replaces its own pending timer instead of stacking. JOURNALED via
+  // ctx.step so a crash-resume does not double-schedule. Returns { id }.
+  ctx.schedule = async (fnName, delayMs, input, opts) => {
+    const o = opts || {};
+    return await ctx.step(`__sched__${__opSeq++}`, async () => {
+      const fireAt = (Date.now() + Number(delayMs)) / 1000;
+      return await Deno.core.ops.op_tr_schedule({
+        fn_name: String(fnName),
+        fire_at: fireAt,
+        input_json: (input === undefined || input === null) ? "" : JSON.stringify(input),
+        dedupe_key: o.key ? String(o.key) : "",
+      });
+    });
+  };
+  ctx.scheduleSelf = async (delayMs, input, opts) =>
+    await ctx.schedule(ctx.fnName, delayMs, input, opts);
   // ctx.cognition.ask(question): tools-blind, durable human/agent-in-the-loop.
   // On replay the journaled answer is returned; otherwise the run registers a
   // pending request and suspends (throws the sentinel the host turns into a
