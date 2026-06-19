@@ -222,7 +222,16 @@ async fn dispatch_envelope(
 
 #[async_trait]
 impl McpTransport for StdioTransport {
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, McpClientError> {
+    /// stdio connectors are not OAuth-aware — `user_id` is accepted to
+    /// satisfy the `McpTransport` trait but is intentionally ignored.
+    /// OAuth injection only applies to HTTP connectors (Klavis MCP
+    /// servers), never to local subprocess-based servers.
+    async fn rpc(
+        &self,
+        method: &str,
+        params: Value,
+        _user_id: Option<&str>,
+    ) -> Result<Value, McpClientError> {
         // Fast-fail when the reader has already observed EOF/error —
         // queueing a request that no one will answer wastes the full
         // per-RPC timeout and pollutes `pending` with a stale entry
@@ -312,7 +321,7 @@ mod tests {
         // Any rpc must fail with TransportFailed (channel dropped
         // by EOF-cleanup) or Timeout (rare race).
         let result = transport
-            .rpc("initialize", serde_json::json!({}))
+            .rpc("initialize", serde_json::json!({}), None)
             .await;
         assert!(result.is_err(), "expected error after child exit");
     }

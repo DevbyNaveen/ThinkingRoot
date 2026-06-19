@@ -761,6 +761,7 @@ mod tests {
             endpoint: None,
             timeout_secs: None,
             auth: None,
+            oauth_provider: None,
         };
         let n = upsert_server_entry(root, stdio).unwrap();
         assert_eq!(n, 1);
@@ -776,6 +777,7 @@ mod tests {
             endpoint: None,
             timeout_secs: None,
             auth: None,
+            oauth_provider: None,
         };
         let n = upsert_server_entry(root, updated).unwrap();
         assert_eq!(n, 1, "re-installing the same name must not duplicate");
@@ -791,6 +793,7 @@ mod tests {
             endpoint: Some("https://example.com/mcp".into()),
             timeout_secs: Some(30),
             auth: None,
+            oauth_provider: None,
         };
         let n = upsert_server_entry(root, http).unwrap();
         assert_eq!(n, 2);
@@ -841,6 +844,7 @@ mod tests {
                 endpoint: None,
                 timeout_secs: None,
                 auth: None,
+                oauth_provider: None,
             },
         )
         .unwrap();

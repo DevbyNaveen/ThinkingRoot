@@ -78,7 +78,16 @@ pub trait McpTransport: Send + Sync {
     /// Perform one JSON-RPC request. `method` is e.g. `"initialize"`,
     /// `"tools/list"`, `"tools/call"`. Returns the unwrapped `result`
     /// payload OR a typed error.
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value, McpClientError>;
+    ///
+    /// `user_id` is the end-user identity for per-user OAuth connector
+    /// calls.  Control-plane calls (`initialize`, `tools/list`) pass
+    /// `None`; stdio transports accept and silently ignore it.
+    async fn rpc(
+        &self,
+        method: &str,
+        params: Value,
+        user_id: Option<&str>,
+    ) -> Result<Value, McpClientError>;
 }
 
 /// One tool descriptor returned by an external `tools/list`.
@@ -153,7 +162,7 @@ impl McpClient {
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
-        let result = self.transport.rpc("initialize", params).await?;
+        let result = self.transport.rpc("initialize", params, None).await?;
         let server_version = result
             .get("protocolVersion")
             .and_then(|v| v.as_str())
@@ -177,7 +186,7 @@ impl McpClient {
         // protocol-correct path.
         let _ = self
             .transport
-            .rpc("notifications/initialized", serde_json::json!({}))
+            .rpc("notifications/initialized", serde_json::json!({}), None)
             .await; // tolerant of "method not found" on some servers
 
         let mut state = self.state.write().await;
@@ -202,7 +211,7 @@ impl McpClient {
         }
         let raw = self
             .transport
-            .rpc("tools/list", serde_json::json!({}))
+            .rpc("tools/list", serde_json::json!({}), None)
             .await?;
         let tools: Vec<McpToolDescriptor> = raw
             .get("tools")
@@ -221,10 +230,15 @@ impl McpClient {
     /// from `list_tools` — the `<server>::` prefix used at the
     /// thinkingroot dispatcher layer is stripped before reaching
     /// this method.
+    ///
+    /// `user_id` is passed to the transport so OAuth-tagged HTTP
+    /// connectors can fetch a per-user Bearer token.  Pass `None`
+    /// for non-user-scoped project-brain calls.
     pub async fn call_tool(
         &self,
         name: &str,
         arguments: Value,
+        user_id: Option<&str>,
     ) -> Result<McpToolResult, McpClientError> {
         if !self.state.read().await.initialized {
             return Err(McpClientError::NotInitialized);
@@ -233,7 +247,7 @@ impl McpClient {
             "name": name,
             "arguments": arguments,
         });
-        let raw = self.transport.rpc("tools/call", params).await?;
+        let raw = self.transport.rpc("tools/call", params, user_id).await?;
         let result: McpToolResult = serde_json::from_value(raw)?;
         Ok(result)
     }
@@ -281,7 +295,12 @@ mod tests {
 
     #[async_trait]
     impl McpTransport for ScriptedTransport {
-        async fn rpc(&self, method: &str, params: Value) -> Result<Value, McpClientError> {
+        async fn rpc(
+            &self,
+            method: &str,
+            params: Value,
+            _user_id: Option<&str>,
+        ) -> Result<Value, McpClientError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -407,7 +426,7 @@ mod tests {
         let client = McpClient::new(transport.clone());
         client.initialize().await.unwrap();
         let result = client
-            .call_tool("read_file", serde_json::json!({"path": "/tmp/x"}))
+            .call_tool("read_file", serde_json::json!({"path": "/tmp/x"}), None)
             .await
             .unwrap();
         assert!(!result.is_error);

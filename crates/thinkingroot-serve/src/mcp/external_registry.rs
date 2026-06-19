@@ -80,6 +80,12 @@ pub struct ServerEntry {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub auth: Option<AuthEntry>,
+    /// When set, this HTTP connector requires a per-user OAuth Bearer token
+    /// fetched from the gateway OAuth broker at call time.  The value is the
+    /// provider slug the broker recognises (e.g. `"google"`, `"slack"`).
+    /// Setting this on a `stdio` transport is a config error caught at spawn.
+    #[serde(default)]
+    pub oauth_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -202,14 +208,22 @@ impl ExternalMcpRegistry {
     /// Dispatch a `<server>::<tool>` call. Returns `None` when
     /// `prefixed_name` doesn't match the `<server>::<tool>` shape
     /// (caller should fall back to other resolution paths).
+    ///
+    /// `user_id` is forwarded to `McpClient::call_tool` so that
+    /// OAuth-tagged connectors can fetch a per-user Bearer token
+    /// from the gateway broker.  Pass `None` for non-user-scoped
+    /// calls (e.g. from the project brain directly); an OAuth
+    /// connector called with `None` will return a typed error
+    /// rather than using a wrong identity.
     pub async fn dispatch(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
+        user_id: Option<&str>,
     ) -> Option<Result<McpToolResult, McpClientError>> {
         let (server, tool) = prefixed_name.split_once("::")?;
         let client = self.inner.read().await.get(server).cloned()?;
-        Some(client.call_tool(tool, arguments).await)
+        Some(client.call_tool(tool, arguments, user_id).await)
     }
 
     /// True iff there is at least one registered server.
@@ -316,14 +330,28 @@ pub async fn list_tools_for_chain(chain: &[String]) -> Vec<(String, McpToolDescr
 /// Dispatch a `<server>::<tool>` call across `chain`, nearest-server-wins.
 /// `None` when no brain in the chain declares the server (caller surfaces a
 /// "not registered" error) — same contract as [`ExternalMcpRegistry::dispatch`].
+///
+/// `user_id` is derived from `chain`: the first workspace element whose
+/// name starts with `"u_"` supplies the end-user identity.  The segment
+/// after `"u_"` is taken up to the first `"__"` separator (e.g.
+/// `u_alice__agent_x` → `alice`).  When no `u_*` element is present in
+/// the chain, `user_id` is `None` — OAuth connectors will reject the
+/// call with a typed "oauth connector requires a per-user scope" error.
 pub async fn dispatch_for_chain(
     chain: &[String],
     prefixed_name: &str,
     arguments: serde_json::Value,
 ) -> Option<Result<McpToolResult, McpClientError>> {
+    // Derive user_id from the most-specific `u_*` workspace in the chain.
+    let user_id: Option<String> = chain.iter().find_map(|ws| {
+        ws.strip_prefix("u_").map(|rest| {
+            // `u_alice__agent_x` → strip the agent suffix
+            rest.split("__").next().unwrap_or(rest).to_string()
+        })
+    });
     merged_for_chain(chain)
         .await
-        .dispatch(prefixed_name, arguments)
+        .dispatch(prefixed_name, arguments, user_id.as_deref())
         .await
 }
 
@@ -374,8 +402,9 @@ async fn spawn_one(entry: &ServerEntry) -> Result<Arc<McpClient>, RegistryError>
                 }
                 None => None,
             };
-            let transport = HttpTransport::new(endpoint, auth, timeout)
-                .map_err(|e| RegistryError::TransportStartup(entry.name.clone(), e))?;
+            let transport =
+                HttpTransport::new(endpoint, auth, timeout, entry.oauth_provider.clone())
+                    .map_err(|e| RegistryError::TransportStartup(entry.name.clone(), e))?;
             McpClient::new(transport)
         }
     };
@@ -542,6 +571,7 @@ mod tests {
             &self,
             method: &str,
             _params: serde_json::Value,
+            _user_id: Option<&str>,
         ) -> Result<serde_json::Value, McpClientError> {
             match method {
                 "initialize" => Ok(serde_json::json!({

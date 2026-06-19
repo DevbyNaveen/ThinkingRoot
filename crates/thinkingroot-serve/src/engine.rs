@@ -1538,7 +1538,14 @@ impl FnCapabilities {
                 "capability 'mcp.call' is not granted to this function".to_string(),
             ));
         }
-        match self.mcp.dispatch(tool, args).await {
+        // Derive per-user identity from the bound workspace (`u_<id>` →
+        // `id`).  OAuth connectors require this; non-OAuth connectors
+        // ignore it.  A Root Function running in a per-user scope ALWAYS
+        // has a `u_*` workspace — a function running in `main` has `None`.
+        let user_id: Option<String> = self.ws.strip_prefix("u_").map(|rest| {
+            rest.split("__").next().unwrap_or(rest).to_string()
+        });
+        match self.mcp.dispatch(tool, args, user_id.as_deref()).await {
             Some(Ok(r)) => Ok(r),
             Some(Err(e)) => Err(Error::Config(format!("mcp.call '{tool}' failed: {e}"))),
             None => Err(Error::Config(format!(
