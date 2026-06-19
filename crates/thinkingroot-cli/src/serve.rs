@@ -430,6 +430,13 @@ pub async fn run_serve(
     let _fn_scheduler_handle =
         thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
 
+    // Backstop GC for orphaned run/* branches (crash recovery: branches left
+    // behind if settle_run_branch never ran). Best-effort; log on error, never
+    // fails the tick. TR_GC_RUN_BRANCHES_TTL_SECS (default 3600) sets the
+    // orphan age threshold; TR_GC_RUN_BRANCHES_SECS (default 60) the cadence.
+    let _gc_run_branches_handle =
+        thinkingroot_serve::maintenance::spawn_gc_run_branches(state.engine.clone());
+
     // Living Engram (Build 1): idle decay of usage-learned associative edges.
     // No-op handle unless TR_LIVING_EDGES=1.
     let _living_edges_handle = workspace_root
@@ -827,6 +834,10 @@ async fn run_serve_with_listener(
     // proactive "while you sleep" loop). Always on; cheap DB scan per tick.
     let _fn_scheduler_handle =
         thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
+
+    // Backstop GC for orphaned run/* branches (crash recovery).
+    let _gc_run_branches_handle =
+        thinkingroot_serve::maintenance::spawn_gc_run_branches(state.engine.clone());
 
     // Living Engram (Build 1): idle decay of usage-learned associative edges.
     // No-op handle unless TR_LIVING_EDGES=1.

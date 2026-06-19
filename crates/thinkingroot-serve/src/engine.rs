@@ -9608,6 +9608,56 @@ Rules: \
             .map_err(|e| Error::GraphStorage(format!("gc_branches failed: {e}")))
     }
 
+    /// Backstop GC: purge orphaned `run/*` branches older than `idle_secs`.
+    ///
+    /// `settle_run_branch` is the normal cleanup path; this is the crash
+    /// backstop for branches left behind when a process exits before
+    /// `settle_run_branch` runs. Uses `self.delete_branch` (cache-invalidate
+    /// + graph-node sync) rather than the raw branch-layer call.
+    ///
+    /// `idle_secs = 0` makes every `run/*` branch immediately eligible
+    /// (useful in tests). Only Active `run/*` branches are touched — other
+    /// prefixes (stream/, topic/, feature/, agent_*) are never purged.
+    pub async fn gc_run_branches(&self, ws: &str, idle_secs: i64) -> Result<usize> {
+        let root = self.get_workspace(ws)?.root_path.clone();
+        let now = chrono::Utc::now().timestamp();
+        let mut purged = 0usize;
+        let branches = thinkingroot_branch::list_branches(&root)
+            .map_err(|e| Error::GraphStorage(format!("gc_run_branches list_branches: {e}")))?;
+        for b in branches {
+            if !b.name.starts_with("run/") {
+                continue;
+            }
+            if !matches!(b.status, thinkingroot_core::BranchStatus::Active) {
+                continue;
+            }
+            let age = now - b.created_at.timestamp();
+            if age < idle_secs {
+                continue;
+            }
+            match self.delete_branch(&root, &b.name).await {
+                Ok(()) => {
+                    purged += 1;
+                    tracing::info!(
+                        target: "maintenance",
+                        branch = %b.name,
+                        age_secs = age,
+                        "gc_run_branches: purged orphan run branch"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "maintenance",
+                        branch = %b.name,
+                        err = %e,
+                        "gc_run_branches: delete failed"
+                    );
+                }
+            }
+        }
+        Ok(purged)
+    }
+
     /// Phase 9 Reflect — discover patterns + surface gaps for a workspace.
     ///
     /// Serialised against the storage mutex because pattern discovery

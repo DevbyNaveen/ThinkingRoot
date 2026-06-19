@@ -514,6 +514,73 @@ impl PeriodicTask for KeepWarmTask {
     }
 }
 
+/// Backstop GC task for orphaned `run/*` branches.
+///
+/// `settle_run_branch` is the normal cleanup path. This periodic task is the
+/// crash backstop — it purges any `run/*` branch that outlived its expected
+/// lifetime, e.g. because the process died before `settle_run_branch` ran.
+/// Best-effort: errors per-branch are logged at WARN and the tick continues.
+struct GcRunBranchesTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    idle_secs: i64,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for GcRunBranchesTask {
+    fn name(&self) -> &'static str {
+        "gc_run_branches"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let workspaces: Vec<String> = {
+            let eng = self.engine.read().await;
+            eng.mounted_workspace_names()
+        };
+        for ws in workspaces {
+            let result = {
+                let eng = self.engine.read().await;
+                eng.gc_run_branches(&ws, self.idle_secs).await
+            };
+            match result {
+                Ok(purged) if purged > 0 => {
+                    tracing::info!(ws = %ws, purged, "gc_run_branches: tick complete");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(ws = %ws, "gc_run_branches: tick error: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the `run/*`-branch GC backstop. Always on; runs on the same cadence
+/// as the stream cleanup (defaulting to 60 s). `TR_GC_RUN_BRANCHES_SECS`
+/// overrides the interval; `TR_GC_RUN_BRANCHES_TTL_SECS` (default 3600)
+/// sets the orphan age threshold — branches younger than this are left alone.
+pub fn spawn_gc_run_branches(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let idle_secs = std::env::var("TR_GC_RUN_BRANCHES_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(3600);
+    let interval_secs = std::env::var("TR_GC_RUN_BRANCHES_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let task: Arc<dyn PeriodicTask> = Arc::new(GcRunBranchesTask {
+        engine,
+        idle_secs,
+        interval: Duration::from_secs(interval_secs.max(10)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Spawn the LLM keep-warm pinger. Gated on `TR_LLM_KEEPWARM` (the cloud
 /// provisioner sets `=1`); OFF by default so desktop/CLI users never pay
 /// periodic LLM tokens. `TR_LLM_KEEPWARM_SECS` (default 45) sets the cadence —

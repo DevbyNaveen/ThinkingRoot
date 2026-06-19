@@ -173,3 +173,57 @@ async fn settle_verified_runs_health_gate() {
         report
     );
 }
+
+// ── gc_run_branches tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn orphan_run_branches_are_gc_after_ttl() {
+    let (_d, _root, engine) = setup().await;
+    let ws = "brain";
+
+    // Fork an orphaned run branch (simulate crash before settle_run_branch).
+    let _b = engine.fork_run_branch(ws, "orphan-1", None).await.unwrap();
+
+    // idle_secs = 0 → every run/* branch is immediately eligible.
+    let purged = engine.gc_run_branches(ws, 0).await.unwrap();
+    assert!(purged >= 1, "expected at least one orphan purged, got {purged}");
+
+    // Non-run/ branches must be untouched: fork a normal feature branch and
+    // confirm it still exists as Active after GC.
+    engine.fork_run_branch(ws, "run-safe", None).await.unwrap();
+
+    // Use the branch module directly to create a non-run branch.
+    let root = _root.clone();
+    thinkingroot_branch::create_branch_full(
+        &root,
+        "feature/keep-me",
+        "main",
+        None,
+        None,
+        thinkingroot_core::BranchPermissions::default(),
+        thinkingroot_core::BranchKind::Feature,
+        thinkingroot_core::MergePolicy::Manual,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // GC with idle_secs = 0 again — should only purge run/ branches.
+    let purged2 = engine.gc_run_branches(ws, 0).await.unwrap();
+    assert!(purged2 >= 1, "run/run-safe must also be purged");
+
+    // feature/keep-me must still be Active.
+    let branches = thinkingroot_branch::list_branches(&root).unwrap();
+    let keep_me = branches.iter().find(|b| b.name == "feature/keep-me");
+    assert!(
+        keep_me.is_some(),
+        "feature/keep-me must survive gc_run_branches"
+    );
+    assert!(
+        matches!(
+            keep_me.unwrap().status,
+            thinkingroot_core::BranchStatus::Active
+        ),
+        "feature/keep-me must still be Active after GC"
+    );
+}
