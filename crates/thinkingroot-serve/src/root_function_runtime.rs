@@ -1267,20 +1267,34 @@ globalThis.__tr_buildCtx = (input, env) => {
   // so a crash-resume replay re-writes the SAME id (a no-op `:put`), giving
   // exactly-once for the effect even if the step journal didn't persist.
   ctx.memory = {
+    // recall(query, 5) OR recall(query, {k|top_k|limit: 5}) — tolerate both the
+    // bare-count and options-object forms (the REST/SDK speak objects), so a
+    // natural call never returns a cryptic serde error.
     recall: async (query, k) => {
+      let kk = k;
+      if (kk !== null && typeof kk === "object") kk = kk.k ?? kk.top_k ?? kk.limit;
       return await ctx.step(`__recall__${__opSeq++}`, async () =>
         await Deno.core.ops.op_tr_memory_recall({
           query: String(query),
-          k: (k === undefined || k === null) ? 8 : k,
+          k: (kk === undefined || kk === null) ? 8 : Number(kk),
         }));
     },
+    // remember("text", {type}) OR remember({statement|text|fact, type|claim_type,
+    // confidence}). The object form previously stringified to "[object Object]"
+    // (a silent data-integrity bug) — now the statement is extracted honestly.
     remember: async (fact, opts) => {
+      let text = fact;
+      let o = opts || {};
+      if (fact !== null && typeof fact === "object") {
+        text = fact.statement ?? fact.text ?? fact.fact ?? "";
+        o = { ...fact, ...o };
+      }
       const seq = __opSeq++;
       return await ctx.step(`__remember__${seq}`, async () =>
         await Deno.core.ops.op_tr_memory_remember({
-          statement: String(fact),
-          claim_type: (opts && opts.type) ? String(opts.type) : "fact",
-          confidence: (opts && typeof opts.confidence === 'number') ? opts.confidence : 0.7,
+          statement: String(text),
+          claim_type: (o.type || o.claim_type) ? String(o.type || o.claim_type) : "fact",
+          confidence: (typeof o.confidence === 'number') ? o.confidence : 0.7,
           seq: seq,
         }));
     },
