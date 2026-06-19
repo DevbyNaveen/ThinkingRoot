@@ -58,6 +58,8 @@ async fn target_branch_routes_writes_off_main() {
             InvokeBranchOpts {
                 target_branch: Some("exp/x".to_string()),
                 dry_run: false,
+                attempt: 0,
+                idempotency_key: None,
             },
         )
         .await
@@ -98,7 +100,7 @@ async fn dry_run_discards_branch_and_leaves_main_clean() {
             "acme",
             "saver",
             &serde_json::json!({ "fact": "a thought I am only trying out" }),
-            InvokeBranchOpts { target_branch: None, dry_run: true },
+            InvokeBranchOpts { target_branch: None, dry_run: true, attempt: 0, idempotency_key: None },
         )
         .await
         .unwrap();
