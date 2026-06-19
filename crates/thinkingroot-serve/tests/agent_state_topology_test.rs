@@ -8,13 +8,15 @@
 //!   - `settle_run_branch` with Auto policy and ok=true merges the run branch;
 //!   - `settle_run_branch` with ok=false rolls back (abandons) the branch;
 //!   - `settle_run_branch` with Verified policy runs the health_score check.
+//!   - (Task 8) a claim written on a run branch reaches main after a successful
+//!     auto-merge, and does NOT reach main after a failed (rolled-back) run.
 
 use std::path::PathBuf;
 
 use tempfile::tempdir;
 use thinkingroot_core::{AgentMergePolicy, AgentTopology, WriteTarget};
 use thinkingroot_graph::graph::GraphStore;
-use thinkingroot_serve::engine::{AgentClaim, Principal, QueryEngine};
+use thinkingroot_serve::engine::{AgentClaim, ClaimFilter, Principal, QueryEngine};
 use thinkingroot_serve::intelligence::session::SessionStore;
 
 async fn setup() -> (tempfile::TempDir, PathBuf, QueryEngine) {
@@ -225,5 +227,124 @@ async fn orphan_run_branches_are_gc_after_ttl() {
             thinkingroot_core::BranchStatus::Active
         ),
         "feature/keep-me must still be Active after GC"
+    );
+}
+
+// ── Task 8: end-to-end isolation proof ────────────────────────────────────────
+//
+// Verification method: `engine.list_claims_branched(ws, filter, None)` reads
+// claims from main via the in-memory cache, which is atomically reloaded on a
+// successful merge into main (engine.rs:9541 `*handle.cache.write().await = new_cache`).
+// After a rollback (delete_branch) the cache is never touched, so main stays clean.
+// We use `list_claims_branched` with an empty filter and look for the distinctive
+// statement substring — no ONNX embedder / semantic search required; it is a pure
+// graph/cache read.
+
+/// A successful per_run agent run: the claim it wrote on its isolated run branch
+/// must become visible on main after the auto-merge.
+#[tokio::test]
+async fn per_run_success_merges_claim_to_main() {
+    let (_d, _root, engine) = setup().await;
+    let ws = "brain";
+    let sessions = SessionStore::default();
+
+    // Distinctive marker — unique enough to rule out any false-positive from
+    // other tests sharing the same process (each test uses its own tempdir+engine).
+    let marker = "Zephyr protocol uses port 7777";
+
+    // Fork an isolated run branch and write the marker claim onto it.
+    let branch = engine.fork_run_branch(ws, "run-e2e-ok", None).await.unwrap();
+    engine
+        .contribute_claims_as(
+            ws,
+            "sess-e2e-ok",
+            Some(&branch),
+            vec![mem(marker)],
+            &sessions,
+            Principal::Agent("run-e2e-ok".into()),
+        )
+        .await
+        .unwrap();
+
+    // Settle with Auto+ok=true — must merge into main.
+    let report = engine
+        .settle_run_branch(ws, &branch, AgentMergePolicy::Auto, true)
+        .await
+        .unwrap();
+    assert!(
+        report.merged,
+        "Auto+ok=true must have merged the run branch: {:?}",
+        report
+    );
+
+    // The cache is reloaded by merge_into_branch_cancellable (engine.rs:9541).
+    // list_claims_branched(…, None) → delegates to list_claims → in-memory cache.
+    let claims = engine
+        .list_claims_branched(ws, ClaimFilter::default(), None)
+        .await
+        .unwrap();
+
+    let found = claims.iter().any(|c| c.statement.contains(marker));
+    assert!(
+        found,
+        "marker claim '{marker}' must be recallable on main after a successful auto-merge; \
+         main had {} claims: {:#?}",
+        claims.len(),
+        claims.iter().map(|c| &c.statement).collect::<Vec<_>>()
+    );
+}
+
+/// A failed per_run agent run: the claim it wrote is discarded; main stays clean.
+#[tokio::test]
+async fn failed_per_run_leaves_main_clean() {
+    let (_d, _root, engine) = setup().await;
+    let ws = "brain";
+    let sessions = SessionStore::default();
+
+    // Distinctive marker for the "bad" claim.
+    let bad_marker = "Omega backdoor listens on port 1337 — INVALID claim";
+
+    // Fork and write a "bad" claim to the run branch.
+    let branch = engine
+        .fork_run_branch(ws, "run-e2e-fail", None)
+        .await
+        .unwrap();
+    engine
+        .contribute_claims_as(
+            ws,
+            "sess-e2e-fail",
+            Some(&branch),
+            vec![mem(bad_marker)],
+            &sessions,
+            Principal::Agent("run-e2e-fail".into()),
+        )
+        .await
+        .unwrap();
+
+    // Settle with ok=false — branch is abandoned; nothing reaches main.
+    let report = engine
+        .settle_run_branch(ws, &branch, AgentMergePolicy::Auto, false)
+        .await
+        .unwrap();
+    assert!(
+        report.rolled_back,
+        "ok=false must have rolled back (abandoned) the branch: {:?}",
+        report
+    );
+    assert!(!report.merged, "must not be merged on failure");
+
+    // The cache is NOT updated on a rollback — main stays unchanged.
+    let claims = engine
+        .list_claims_branched(ws, ClaimFilter::default(), None)
+        .await
+        .unwrap();
+
+    let found = claims.iter().any(|c| c.statement.contains(bad_marker));
+    assert!(
+        !found,
+        "bad marker claim must NOT appear on main after a rolled-back run; \
+         main had {} claims: {:#?}",
+        claims.len(),
+        claims.iter().map(|c| &c.statement).collect::<Vec<_>>()
     );
 }
