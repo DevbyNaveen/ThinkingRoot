@@ -1,3 +1,4 @@
+pub mod agent_topology;
 mod artifact;
 mod branch;
 mod claim;
@@ -17,6 +18,7 @@ mod workspace;
 mod workspace_event;
 mod workspace_status;
 
+pub use agent_topology::{AgentMergePolicy, AgentTopology, ReadScope, WriteTarget};
 pub use artifact::*;
 pub use branch::*;
 pub use claim::*;
