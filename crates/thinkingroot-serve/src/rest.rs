@@ -8766,6 +8766,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
             ),
         }
     }
+
     tracing::info!(
         target: "chat_turn",
         workspace = %ws,
@@ -8799,6 +8800,34 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         .conversation_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Agent State Topology (Tasks 5+6): resolve the topology from the agent's
+    // config_json and, when `write_target == PerRun`, fork an isolated run
+    // branch before the agent loop drives. On fork failure (e.g. engine not
+    // yet mounted), we warn and fall back to main-branch behavior — no hard
+    // error so the chat turn proceeds. `conversation_id` is used as the run
+    // id so the branch name is deterministic and traceable in the registry.
+    let topology = {
+        let engine = state.engine.read().await;
+        engine.agent_topology(&ws, &agent_id).await
+    };
+    let run_branch = if topology.isolates_run() {
+        let engine = state.engine.read().await;
+        match engine.fork_run_branch(&ws, &conversation_id, None).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    target: "chat_turn",
+                    workspace = %ws,
+                    err = %e,
+                    "fork_run_branch failed; running on main"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // River v1.0 — symmetric stream-branch auto-create on the REST chat
     // path. The MCP `tools/call` path has called this since T0.6; the
@@ -8935,6 +8964,8 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         skills,
         system_refresher: Some(refresher),
         allowed_tools: agent_allowed_tools,
+        run_branch,
+        merge_policy: topology.merge_policy,
     };
     let deps = StreamAgentDeps {
         engine: state.engine.clone(),

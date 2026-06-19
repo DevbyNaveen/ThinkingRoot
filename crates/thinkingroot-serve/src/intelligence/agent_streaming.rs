@@ -63,6 +63,11 @@ pub struct StreamAgentRequest {
     /// handler passes `None` when no agent is named or the agent declares no
     /// tools, so existing flows are byte-identical.
     pub allowed_tools: Option<Vec<String>>,
+    /// Agent State Topology (Tasks 5+6): when set, the run executes isolated on
+    /// this branch and is settled per `merge_policy` after the loop completes.
+    /// `None` means no per-run isolation (legacy / default topology behavior).
+    pub run_branch: Option<String>,
+    pub merge_policy: thinkingroot_core::AgentMergePolicy,
 }
 
 /// Dependencies the streaming runner needs from the surrounding
@@ -162,6 +167,26 @@ pub fn spawn_agent_run(
     tokio::spawn(async move {
         let _ = router_for_agent_lifetime; // hold the Arc alive
 
+        // Agent State Topology (Tasks 5+6): set `active_branch` to the
+        // isolated run branch BEFORE the agent loop drives so that every
+        // claim write (routed via `session.active_branch` in builtin_tools)
+        // lands on the run branch, not on main.
+        //
+        // `sessions_for_obs` is a clone captured before the `ToolContext`
+        // move below, so it is in scope here and stays alive for settle.
+        if let Some(rb) = req.run_branch.clone() {
+            let mut store = sessions_for_obs.lock().await;
+            let session = store
+                .entry(req.session_id.clone())
+                .or_insert_with(|| {
+                    crate::intelligence::session::SessionContext::new(
+                        &req.session_id,
+                        &req.workspace,
+                    )
+                });
+            session.set_branch(rb);
+        }
+
         let ctx = ToolContext {
             engine: deps.engine,
             workspace: req.workspace.clone(),
@@ -234,6 +259,35 @@ pub fn spawn_agent_run(
 
         let captured_final = relay_events(&mut relay_rx, &tx).await;
         let _ = agent_handle.await;
+
+        // Agent State Topology (Tasks 5+6): settle the run branch now that
+        // the agent loop has fully completed (relay drained + agent task
+        // joined). This position covers BOTH the success path (Done event
+        // captured) and the failure/cancellation path (no Done). The
+        // `run_succeeded` flag drives the settle policy table: Auto/Verified
+        // merge on success, failure always rolls back regardless of policy.
+        if let Some(rb) = req.run_branch.clone() {
+            let run_succeeded = captured_final.is_some();
+            let engine = engine_for_obs.read().await;
+            match engine
+                .settle_run_branch(&workspace_for_obs, &rb, req.merge_policy, run_succeeded)
+                .await
+            {
+                Ok(r) => tracing::info!(
+                    target: "chat_turn",
+                    branch = %rb,
+                    merged = r.merged,
+                    rolled_back = r.rolled_back,
+                    "agent run branch settled"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "chat_turn",
+                    branch = %rb,
+                    err = %e,
+                    "settle_run_branch failed"
+                ),
+            }
+        }
 
         // Observe the completed turn. Best-effort, never propagates
         // an error: the chat reply has already streamed to the user
