@@ -48,6 +48,7 @@ pub fn add(name: &str, workspace: &Path, command_and_args: &[String]) -> Result<
         endpoint: None,
         timeout_secs: None,
         auth: None,
+        oauth_provider: None,
     });
     write(workspace, &config)?;
     println!(
