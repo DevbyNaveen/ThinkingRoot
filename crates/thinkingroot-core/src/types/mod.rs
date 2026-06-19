@@ -1,4 +1,4 @@
-pub mod agent_topology;
+mod agent_topology;
 mod artifact;
 mod branch;
 mod claim;

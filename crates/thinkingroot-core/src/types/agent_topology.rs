@@ -22,6 +22,8 @@ pub enum WriteTarget {
     PerUser,
 }
 
+/// When agent-written claims are promoted out of an isolated run branch.
+/// Distinct from `branch::MergePolicy`, which governs branch-lifecycle merge gating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMergePolicy {
