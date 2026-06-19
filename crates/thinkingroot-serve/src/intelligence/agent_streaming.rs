@@ -146,6 +146,10 @@ pub fn spawn_agent_run(
     let workspace_for_obs = req.workspace.clone();
     let engine_for_obs = deps.engine.clone();
     let sessions_for_obs = deps.sessions.clone();
+    // Agent State Topology settle: pre-capture run_branch once here so
+    // the two settle uses below share a single clone instead of calling
+    // req.run_branch.clone() at each site.
+    let run_branch = req.run_branch.clone();
     // Phase β.2 — auto-commit needs the model id for the
     // `CommitAuthor::Agent { model, principal }` projection.
     let llm_model_for_commit = deps.llm.model_name().to_string();
@@ -174,7 +178,8 @@ pub fn spawn_agent_run(
         //
         // `sessions_for_obs` is a clone captured before the `ToolContext`
         // move below, so it is in scope here and stays alive for settle.
-        if let Some(rb) = req.run_branch.clone() {
+        if let Some(rb) = run_branch.as_deref() {
+            // run branch supersedes any auto-created stream branch — agent writes route here.
             let mut store = sessions_for_obs.lock().await;
             let session = store
                 .entry(req.session_id.clone())
@@ -184,7 +189,7 @@ pub fn spawn_agent_run(
                         &req.workspace,
                     )
                 });
-            session.set_branch(rb);
+            session.set_branch(rb.to_string());
         }
 
         let ctx = ToolContext {
@@ -263,11 +268,14 @@ pub fn spawn_agent_run(
         // Agent State Topology (Tasks 5+6): settle the run branch now that
         // the agent loop has fully completed (relay drained + agent task
         // joined). This position covers BOTH the success path (Done event
-        // captured) and the failure/cancellation path (no Done). The
-        // `run_succeeded` flag drives the settle policy table: Auto/Verified
-        // merge on success, failure always rolls back regardless of policy.
-        if let Some(rb) = req.run_branch.clone() {
-            let run_succeeded = captured_final.is_some();
+        // captured) and the cancellation/failure path.
+        //
+        // run_succeeded gates merge-vs-rollback. captured_final.is_some() means
+        // a Done frame arrived (normal completion OR cancellation, which emits
+        // Error then Done with partial text), so we AND in !cancel.is_cancelled()
+        // to ensure cancelled/partial runs roll back, never merge.
+        if let Some(rb) = run_branch {
+            let run_succeeded = captured_final.is_some() && !cancel.is_cancelled();
             let engine = engine_for_obs.read().await;
             match engine
                 .settle_run_branch(&workspace_for_obs, &rb, req.merge_policy, run_succeeded)
