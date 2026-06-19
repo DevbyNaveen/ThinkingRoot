@@ -167,4 +167,9 @@ async fn settle_verified_runs_health_gate() {
         "Verified policy must run the health_score check: {:?}",
         report.checks
     );
+    assert!(
+        report.merged || !report.note.is_empty(),
+        "health gate must either merge or explain why not: {:?}",
+        report
+    );
 }

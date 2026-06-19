@@ -8720,7 +8720,7 @@ Rules: \
     }
 
     /// Per-run isolation: **fork an isolated `run/{run_id}` branch** off `parent`
-    /// (default main). Mirrors `spawn_agent_branch` exactly — same
+    /// (default main). Mirrors `spawn_agent_branch` structurally — same
     /// `RequiresProposal` + `health_score` gate, owner set to `run_id`, branch
     /// kind label `"run"`. The engine caller must `settle_run_branch` after the
     /// run completes.
@@ -8780,15 +8780,23 @@ Rules: \
             branch: branch.to_string(),
             merged: false,
             rolled_back: false,
+            proposal_id: None,
             checks: Vec::new(),
             note: String::new(),
         };
 
         // Failure path — abandon the branch regardless of policy.
         if !ok {
-            let _ = thinkingroot_branch::delete_branch(&root, branch);
-            report.rolled_back = true;
-            report.note = "run failed — branch abandoned".into();
+            match self.delete_branch(&root, branch).await {
+                Ok(_) => {
+                    report.rolled_back = true;
+                    report.note = "run failed — branch abandoned".into();
+                }
+                Err(e) => {
+                    report.rolled_back = false;
+                    report.note = format!("run failed; rollback ALSO failed: {e}");
+                }
+            }
             return Ok(report);
         }
 
@@ -8808,9 +8816,11 @@ Rules: \
                     1,
                     vec!["health_score".to_string()],
                 )?;
+                report.proposal_id = Some(proposal.id.clone());
                 report.note = format!("proposal {} left open for manual review", proposal.id);
             }
             P::Auto | P::Verified => {
+                // Auto and Verified both gate the merge on health_score; Verified is intentionally treated as Auto until a stricter reviewer/check policy is added.
                 // Open proposal → run checks → merge if the gate approves.
                 let refs_dir = root.join(".thinkingroot-refs");
                 let proposal = thinkingroot_pr::open_proposal(
@@ -8822,6 +8832,7 @@ Rules: \
                     0,
                     vec!["health_score".to_string()],
                 )?;
+                report.proposal_id = Some(proposal.id.clone());
 
                 let proposal = self.run_proposal_checks(&root, &proposal.id).await?;
                 let mut latest: std::collections::HashMap<String, &thinkingroot_pr::CheckRun> =
@@ -10747,6 +10758,7 @@ pub struct RunBranchReport {
     pub branch: String,
     pub merged: bool,
     pub rolled_back: bool,
+    pub proposal_id: Option<String>,
     pub checks: Vec<(String, bool, Option<String>)>,
     pub note: String,
 }
