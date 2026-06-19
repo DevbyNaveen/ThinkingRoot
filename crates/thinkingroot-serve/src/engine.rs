@@ -8719,6 +8719,153 @@ Rules: \
         Ok(report)
     }
 
+    /// Per-run isolation: **fork an isolated `run/{run_id}` branch** off `parent`
+    /// (default main). Mirrors `spawn_agent_branch` exactly — same
+    /// `RequiresProposal` + `health_score` gate, owner set to `run_id`, branch
+    /// kind label `"run"`. The engine caller must `settle_run_branch` after the
+    /// run completes.
+    pub async fn fork_run_branch(
+        &self,
+        ws: &str,
+        run_id: &str,
+        parent: Option<&str>,
+    ) -> Result<String> {
+        let root = self.get_workspace(ws)?.root_path.clone();
+        let parent = parent.unwrap_or("main");
+        let branch = format!("run/{run_id}");
+        thinkingroot_branch::create_branch_full(
+            &root,
+            &branch,
+            parent,
+            Some(format!("isolated run branch for run '{run_id}'")),
+            Some(run_id.to_string()),
+            thinkingroot_core::BranchPermissions::default(),
+            thinkingroot_core::BranchKind::default(),
+            thinkingroot_core::MergePolicy::RequiresProposal {
+                min_reviewers: 0,
+                required_checks: vec!["health_score".to_string()],
+            },
+            None,
+        )
+        .await?;
+        let created = chrono::Utc::now().timestamp() as f64;
+        let _ = self
+            .sync_branch_created(&root, &branch, Some(parent), Some("run"), created)
+            .await;
+        Ok(branch)
+    }
+
+    /// Per-run isolation: **settle a run branch** — merge/gate/quarantine or
+    /// roll back depending on `policy` and whether the run succeeded (`ok`).
+    ///
+    /// | `ok` | policy     | outcome                                          |
+    /// |------|------------|--------------------------------------------------|
+    /// | false | any        | branch abandoned (rolled back); `rolled_back=true`|
+    /// | true  | Auto       | open proposal → run checks → merge if Approved   |
+    /// | true  | Verified   | same as Auto (checks gate the merge)             |
+    /// | true  | Manual     | open proposal, leave open for human review       |
+    /// | true  | Never      | quarantine — branch left, no proposal opened     |
+    ///
+    /// Honest: `merged` is true only when the run's work actually reached main.
+    pub async fn settle_run_branch(
+        &self,
+        ws: &str,
+        branch: &str,
+        policy: thinkingroot_core::AgentMergePolicy,
+        ok: bool,
+    ) -> Result<RunBranchReport> {
+        use thinkingroot_core::AgentMergePolicy as P;
+        let root = self.get_workspace(ws)?.root_path.clone();
+        let mut report = RunBranchReport {
+            branch: branch.to_string(),
+            merged: false,
+            rolled_back: false,
+            checks: Vec::new(),
+            note: String::new(),
+        };
+
+        // Failure path — abandon the branch regardless of policy.
+        if !ok {
+            let _ = thinkingroot_branch::delete_branch(&root, branch);
+            report.rolled_back = true;
+            report.note = "run failed — branch abandoned".into();
+            return Ok(report);
+        }
+
+        match policy {
+            P::Never => {
+                report.note = "quarantined (merge_policy=never)".into();
+            }
+            P::Manual => {
+                // Open a proposal and leave it open for a human reviewer.
+                let refs_dir = root.join(".thinkingroot-refs");
+                let proposal = thinkingroot_pr::open_proposal(
+                    &refs_dir,
+                    branch,
+                    None,
+                    "system:run",
+                    Some(format!("run branch '{branch}' awaiting manual review")),
+                    1,
+                    vec!["health_score".to_string()],
+                )?;
+                report.note = format!("proposal {} left open for manual review", proposal.id);
+            }
+            P::Auto | P::Verified => {
+                // Open proposal → run checks → merge if the gate approves.
+                let refs_dir = root.join(".thinkingroot-refs");
+                let proposal = thinkingroot_pr::open_proposal(
+                    &refs_dir,
+                    branch,
+                    None,
+                    "system:run",
+                    Some(format!("run branch '{branch}' merge-back")),
+                    0,
+                    vec!["health_score".to_string()],
+                )?;
+
+                let proposal = self.run_proposal_checks(&root, &proposal.id).await?;
+                let mut latest: std::collections::HashMap<String, &thinkingroot_pr::CheckRun> =
+                    std::collections::HashMap::new();
+                for c in &proposal.checks {
+                    latest.insert(c.name.clone(), c);
+                }
+                report.checks = latest
+                    .into_values()
+                    .map(|c| (c.name.clone(), c.passed, c.detail.clone()))
+                    .collect();
+
+                if matches!(proposal.status, thinkingroot_pr::ProposalStatus::Approved) {
+                    match self
+                        .merge_into_branch(
+                            &root,
+                            branch,
+                            None,
+                            false,
+                            false,
+                            thinkingroot_core::MergedBy::System,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            report.merged = true;
+                            report.note =
+                                format!("run branch '{branch}' merged into shared brain");
+                        }
+                        Err(e) => {
+                            report.note = format!("merge blocked after approval: {e}");
+                        }
+                    }
+                } else {
+                    report.note = format!(
+                        "health gate failed — not merged (proposal status: {:?})",
+                        proposal.status
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub async fn merge_into_branch(
         &self,
         root: &std::path::Path,
@@ -10588,6 +10735,19 @@ pub struct AgentBranchReport {
     pub proposal_status: Option<String>,
     pub checks: Vec<(String, bool, Option<String>)>,
     pub merged: bool,
+    pub note: String,
+}
+
+/// Outcome of a per-run branch settle ([`QueryEngine::settle_run_branch`]).
+/// Honest: `merged` is true only if the run's work actually reached the shared
+/// brain through the verify-before-merge gate. `rolled_back` is true only when
+/// the run failed and the branch was abandoned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunBranchReport {
+    pub branch: String,
+    pub merged: bool,
+    pub rolled_back: bool,
+    pub checks: Vec<(String, bool, Option<String>)>,
     pub note: String,
 }
 
