@@ -8902,6 +8902,14 @@ Rules: \
 
         let target_branch_str = target_branch.unwrap_or("main").to_string();
 
+        // ── I1: guard against merging a workspace into itself ────────────────
+        if source_ws == target_ws && source_branch == target_branch_str {
+            return Err(Error::MergeBlocked(format!(
+                "cross-brain merge: source and target are identical \
+                 ('{source_ws}/{source_branch}') — cannot merge a branch into itself"
+            )));
+        }
+
         // ── resolve workspace handles ────────────────────────────────────────
         let src_root = self.get_workspace(source_ws)?.root_path.clone();
         let tgt_root = self.get_workspace(target_ws)?.root_path.clone();
@@ -8981,7 +8989,7 @@ Rules: \
         let source_uri = format!("merged_from:{source_ws}/{source_branch}");
         let ts = chrono::Utc::now().timestamp();
         let merge_source =
-            thinkingroot_core::Source::new(source_uri.clone(), SourceType::ChatMessage)
+            thinkingroot_core::Source::new(source_uri.clone(), SourceType::Manual)
                 .with_trust(thinkingroot_core::types::TrustLevel::Untrusted)
                 .with_hash(ContentHash(format!(
                     "cross-brain-{source_ws}-{source_branch}-{ts}"
@@ -9000,14 +9008,83 @@ Rules: \
             (vec![], vec![])
         };
 
-        // ── apply auto-resolutions (supersede losers in the target) ──────────
+        // ── apply auto-resolutions ───────────────────────────────────────────
+        //
+        // SAFETY RULE: supersede_claim(old, new) must only ever be called with
+        // IDs that exist in the TARGET graph.  `res.winner` can be either
+        // `res.main_claim_id` (existing in target — the easy case) or
+        // `res.branch_claim_id` (exists ONLY in source — the ghost-id bug).
+        //
+        // Correct handling:
+        //  • main wins  → do nothing; the target claim is already correct.
+        //  • branch wins → fetch the branch claim from source_graph, write it
+        //    into the target (getting a fresh target-local ID), then supersede
+        //    the old main claim with that new target ID.
         for res in &diff.auto_resolved {
-            if let Err(e) = target_graph.supersede_claim(&res.main_claim_id, &res.winner) {
-                tracing::warn!(
-                    "merge_across_workspaces: supersede_claim({} → {}) failed (non-fatal): {e}",
-                    res.main_claim_id,
-                    res.winner
-                );
+            if res.winner == res.main_claim_id {
+                // Target claim wins: nothing to do — keep it as-is and simply
+                // skip the contradicting branch claim.
+                continue;
+            }
+
+            // Branch claim wins: it must be written into the target first so
+            // that supersede_claim is called with a real target-side ID.
+            let branch_claim = match source_graph.get_claim_by_id(&res.branch_claim_id) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    tracing::warn!(
+                        "merge_across_workspaces: auto-resolution winner '{}' not found in \
+                         source graph — skipping supersede to avoid ghost-id deletion",
+                        res.branch_claim_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "merge_across_workspaces: failed to fetch branch winner '{}' from \
+                         source graph ({e}) — skipping supersede",
+                        res.branch_claim_id
+                    );
+                    continue;
+                }
+            };
+
+            let winner_agent_claim = AgentClaim {
+                statement: branch_claim.statement.clone(),
+                claim_type: branch_claim.claim_type.wire_str().to_string(),
+                confidence: Some(branch_claim.confidence.value()),
+                entities: vec![],
+            };
+
+            match Self::write_agent_claims_to_graph(
+                &target_graph,
+                &merge_source,
+                &[winner_agent_claim],
+            ) {
+                Ok((new_ids, warns)) => {
+                    for w in &warns {
+                        tracing::warn!("merge_across_workspaces: auto-resolve write warning: {w}");
+                    }
+                    if let Some(new_id) = new_ids.into_iter().next() {
+                        // Both IDs are now guaranteed to exist in the target.
+                        if let Err(e) =
+                            target_graph.supersede_claim(&res.main_claim_id, &new_id)
+                        {
+                            tracing::warn!(
+                                "merge_across_workspaces: supersede_claim({} → {new_id}) \
+                                 failed (non-fatal): {e}",
+                                res.main_claim_id
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "merge_across_workspaces: failed to write branch-winner claim into \
+                         target ({e}) — skipping supersede for main_claim_id '{}'",
+                        res.main_claim_id
+                    );
+                }
             }
         }
 
