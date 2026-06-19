@@ -3456,6 +3456,15 @@ impl QueryEngine {
         Ok(None)
     }
 
+    /// Resolve the agent's declarative state topology (defaults if unset/unknown).
+    /// Uses the same inheritance-chain fallback as `get_agent`.
+    pub async fn agent_topology(&self, ws: &str, name: &str) -> thinkingroot_core::AgentTopology {
+        match self.get_agent(ws, name).await {
+            Ok(Some(def)) => thinkingroot_core::AgentTopology::from_config_json(&def.config_json),
+            _ => thinkingroot_core::AgentTopology::default(),
+        }
+    }
+
     /// List agents. A per-user `u_*` scope with no agents of its own lists the
     /// shared/primary brain's agents (agents are project-level definitions).
     pub async fn list_agents(
