@@ -179,13 +179,17 @@ impl HttpTransport {
             )
         })?;
 
-        let url = format!(
-            "{}/oauth/token/{}?project={}&user={}",
+        let base_url = format!(
+            "{}/oauth/token/{}",
             gateway_url.trim_end_matches('/'),
             provider,
-            project_id,
-            user_id,
         );
+        let mut url = reqwest::Url::parse(&base_url)
+            .map_err(|e| McpClientError::TransportFailed(format!("oauth broker URL parse: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("project", &project_id)
+            .append_pair("user", &user_id);
+        let url = url.to_string();
 
         // SECURITY: service_token is in the Authorization header; it
         // must never be logged.  We deliberately avoid tracing the
@@ -304,8 +308,9 @@ impl HttpTransport {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
             return Err(McpClientError::TransportFailed(format!(
-                "HTTP {}: {body}",
+                "HTTP {}: {snippet}",
                 status
             )));
         }
