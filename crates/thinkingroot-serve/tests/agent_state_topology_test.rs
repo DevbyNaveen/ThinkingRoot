@@ -47,6 +47,7 @@ async fn agent_topology_resolves_write_target_from_config_json() {
         WriteTarget::PerRun,
         "researcher topology must resolve PerRun from config_json"
     );
+    assert_eq!(topo.merge_policy, thinkingroot_core::AgentMergePolicy::Verified);
 }
 
 #[tokio::test]

@@ -3461,7 +3461,11 @@ impl QueryEngine {
     pub async fn agent_topology(&self, ws: &str, name: &str) -> thinkingroot_core::AgentTopology {
         match self.get_agent(ws, name).await {
             Ok(Some(def)) => thinkingroot_core::AgentTopology::from_config_json(&def.config_json),
-            _ => thinkingroot_core::AgentTopology::default(),
+            Ok(None) => thinkingroot_core::AgentTopology::default(),
+            Err(e) => {
+                tracing::warn!(ws, name, err = %e, "agent_topology: lookup failed, using default");
+                thinkingroot_core::AgentTopology::default()
+            }
         }
     }
 
