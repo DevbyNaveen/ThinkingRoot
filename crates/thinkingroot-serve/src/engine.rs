@@ -3052,6 +3052,20 @@ impl QueryEngine {
         Ok(row)
     }
 
+    /// Delete a function (all versions) by name + drop its capability
+    /// embedding so the router stops matching a name that no longer resolves.
+    /// Returns whether it existed. Idempotent.
+    pub async fn delete_function(&self, ws: &str, name: &str) -> Result<bool> {
+        let handle = self.get_workspace(ws)?;
+        let mut storage = handle.storage.lock().await;
+        let existed = storage.graph.delete_function(name)?;
+        storage
+            .vector
+            .remove_by_ids(&[&format!("cap:root_function:{name}")]);
+        let _ = storage.vector.save();
+        Ok(existed)
+    }
+
     /// Deploy a function version onto a specific branch's graph (e.g. a
     /// session's `stream/{id}` quarantine branch) instead of trunk. Errors
     /// if the branch doesn't exist. The function reaches trunk only when the

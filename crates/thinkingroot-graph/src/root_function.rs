@@ -428,6 +428,20 @@ impl GraphStore {
         Ok(rows.rows.first().map(|r| row_to_function(r)))
     }
 
+    /// Delete a function (ALL versions) by name. Idempotent — a no-op if the
+    /// name doesn't exist. Removes it from `list_functions`/`get_function`; run
+    /// history (a separate relation) is left intact for audit.
+    pub fn delete_function(&self, name: &str) -> Result<bool> {
+        let existed = self.function_latest_version(name)?.is_some();
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        self.query(
+            "?[id] := *root_functions{id, name}, name = $name\n:rm root_functions {id}",
+            params,
+        )?;
+        Ok(existed)
+    }
+
     /// The latest version of every distinct function, sorted by name.
     pub fn list_functions(&self) -> Result<Vec<RootFunction>> {
         let rows = self

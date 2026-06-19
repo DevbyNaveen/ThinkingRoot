@@ -897,7 +897,10 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/functions",
                 get(list_functions_handler).put(put_function_handler),
             )
-            .route("/ws/{ws}/functions/{name}", get(get_function_handler))
+            .route(
+                "/ws/{ws}/functions/{name}",
+                get(get_function_handler).delete(delete_function_handler),
+            )
             .route(
                 "/ws/{ws}/functions/{name}/caps",
                 get(get_function_caps_handler).put(set_function_caps_handler),
@@ -2276,6 +2279,19 @@ async fn get_function_handler(
             "not_found",
             &format!("root function '{name}' not found"),
         ),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `DELETE /ws/{ws}/functions/{name}` — remove a function (all versions) and
+/// its capability embedding. Idempotent: a missing name returns deleted:false.
+async fn delete_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.delete_function(&ws, &name).await {
+        Ok(existed) => ok_response(serde_json::json!({ "deleted": existed, "name": name })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
