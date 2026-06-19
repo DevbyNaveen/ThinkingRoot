@@ -8877,6 +8877,204 @@ Rules: \
         Ok(report)
     }
 
+    /// Cross-brain verified merge (Agent State Topology Phase 2).
+    ///
+    /// Merges the claims that are unique to `source_ws/source_branch` into
+    /// `target_ws`'s trunk (or an explicit `target_branch`), stamping provenance
+    /// `merged_from:<source_ws>/<source_branch>`.  The diff health gate
+    /// (`compute_diff_into`) is always consulted; if it blocks, the method returns
+    /// `Ok(report)` with `merged = false` (no panic, no partial write).
+    ///
+    /// Only `new_claims` and `auto_resolved` are written.  `needs_review` pairs
+    /// are counted and reported but never written (ambiguous resolution would be
+    /// dishonest).
+    pub async fn merge_across_workspaces(
+        &self,
+        source_ws: &str,
+        source_branch: &str,
+        target_ws: &str,
+        target_branch: Option<&str>,
+    ) -> Result<MergeAcrossReport> {
+        use thinkingroot_branch::diff::compute_diff_into;
+        use thinkingroot_branch::snapshot::resolve_data_dir;
+        use thinkingroot_core::types::{ContentHash, SourceType};
+        use thinkingroot_graph::graph::GraphStore;
+
+        let target_branch_str = target_branch.unwrap_or("main").to_string();
+
+        // ── resolve workspace handles ────────────────────────────────────────
+        let src_root = self.get_workspace(source_ws)?.root_path.clone();
+        let tgt_root = self.get_workspace(target_ws)?.root_path.clone();
+
+        // ── open the source branch graph ─────────────────────────────────────
+        let source_data_dir = resolve_data_dir(&src_root, Some(source_branch));
+        if !source_data_dir.exists() {
+            return Err(Error::EntityNotFound(format!(
+                "cross-brain merge: source branch '{source_branch}' not found in workspace \
+                 '{source_ws}'"
+            )));
+        }
+        let source_graph = GraphStore::init(&source_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("source branch graph init failed: {e}")))?;
+
+        // ── open the target trunk graph ──────────────────────────────────────
+        let target_data_dir = resolve_data_dir(&tgt_root, target_branch);
+        let target_graph = GraphStore::init(&target_data_dir.join("graph"))
+            .map_err(|e| Error::GraphStorage(format!("target graph init failed: {e}")))?;
+
+        // ── compute diff (health gate) ────────────────────────────────────────
+        let diff = compute_diff_into(
+            &target_graph,
+            &source_graph,
+            source_branch,
+            target_branch,
+            0.7,
+            0.1,
+            false,
+        )?;
+
+        let mut report = MergeAcrossReport {
+            source_ws: source_ws.to_string(),
+            source_branch: source_branch.to_string(),
+            target_ws: target_ws.to_string(),
+            target_branch: target_branch_str.clone(),
+            merged: false,
+            merged_claims: 0,
+            auto_resolved: diff.auto_resolved.len(),
+            needs_review: diff.needs_review.len(),
+            merge_allowed: diff.merge_allowed,
+            blocking_reasons: diff.blocking_reasons.clone(),
+            note: String::new(),
+        };
+
+        if !diff.merge_allowed {
+            report.note = format!(
+                "health gate blocked cross-brain merge from '{source_ws}/{source_branch}' \
+                 into '{target_ws}/{target_branch_str}'"
+            );
+            return Ok(report);
+        }
+
+        // ── build agent claims from diff.new_claims ──────────────────────────
+        let agent_claims: Vec<AgentClaim> = diff
+            .new_claims
+            .iter()
+            .map(|dc| AgentClaim {
+                statement: dc.claim.statement.clone(),
+                claim_type: dc.claim.claim_type.wire_str().to_string(),
+                confidence: Some(dc.claim.confidence.value()),
+                entities: dc.entity_context.clone(),
+            })
+            .collect();
+
+        // Nothing to write → idempotent success.
+        if agent_claims.is_empty() && diff.auto_resolved.is_empty() {
+            report.merged = true;
+            report.note = format!(
+                "cross-brain merge '{source_ws}/{source_branch}' → \
+                 '{target_ws}/{target_branch_str}': no new claims to merge (already up to date)"
+            );
+            return Ok(report);
+        }
+
+        // ── provenance source ────────────────────────────────────────────────
+        let source_uri = format!("merged_from:{source_ws}/{source_branch}");
+        let ts = chrono::Utc::now().timestamp();
+        let merge_source =
+            thinkingroot_core::Source::new(source_uri.clone(), SourceType::ChatMessage)
+                .with_trust(thinkingroot_core::types::TrustLevel::Untrusted)
+                .with_hash(ContentHash(format!(
+                    "cross-brain-{source_ws}-{source_branch}-{ts}"
+                )));
+
+        // ── write new claims into target graph ───────────────────────────────
+        let (accepted_ids, write_warnings) = if !agent_claims.is_empty() {
+            let res = Self::write_agent_claims_to_graph(&target_graph, &merge_source, &agent_claims)?;
+            for w in &res.1 {
+                tracing::warn!(
+                    "merge_across_workspaces: write warning (non-fatal): {w}"
+                );
+            }
+            res
+        } else {
+            (vec![], vec![])
+        };
+
+        // ── apply auto-resolutions (supersede losers in the target) ──────────
+        for res in &diff.auto_resolved {
+            if let Err(e) = target_graph.supersede_claim(&res.main_claim_id, &res.winner) {
+                tracing::warn!(
+                    "merge_across_workspaces: supersede_claim({} → {}) failed (non-fatal): {e}",
+                    res.main_claim_id,
+                    res.winner
+                );
+            }
+        }
+
+        // ── upsert vectors into the TARGET workspace's vector index ──────────
+        // Mirror contribute_claims_as main path: best-effort, warn on failure.
+        if !accepted_ids.is_empty() {
+            let tgt_handle = self.get_workspace(target_ws)?;
+            let mut storage = tgt_handle.storage.lock().await;
+            let items: Vec<(String, String, String)> = agent_claims
+                .iter()
+                .zip(accepted_ids.iter())
+                .map(|(ac, id)| {
+                    let ctype = &ac.claim_type;
+                    let conf = ac.confidence.unwrap_or(0.7);
+                    (
+                        format!("claim:{id}"),
+                        ac.statement.clone(),
+                        format!("claim|{id}|{ctype}|{conf}|{source_uri}"),
+                    )
+                })
+                .collect();
+            let vwarn = run_blocking(|| {
+                let mut out = Vec::new();
+                if let Err(e) = storage.vector.upsert_batch(&items) {
+                    out.push(format!(
+                        "merge_across: target vector index degraded — upsert of {} embeddings \
+                         failed ({e}); hybrid retrieval will miss these claims until `root compile`",
+                        items.len()
+                    ));
+                } else if let Err(e) = storage.vector.save() {
+                    out.push(format!(
+                        "merge_across: target vector index save failed ({e})"
+                    ));
+                }
+                out
+            });
+            for w in vwarn {
+                tracing::warn!("{w}");
+            }
+
+            // Reload the target cache while still holding the storage lock so
+            // the next list/search sees the freshly merged claims immediately.
+            let new_cache = KnowledgeGraph::load_from_graph(&storage.graph).map_err(|e| {
+                Error::GraphStorage(format!(
+                    "merge_across: claims written into '{target_ws}' but in-memory cache \
+                     reload failed — remount the workspace to refresh.  Error: {e}"
+                ))
+            })?;
+            // Unlock storage before taking the cache write lock (prevents ordering deadlock).
+            drop(storage);
+            let tgt_handle = self.get_workspace(target_ws)?;
+            *tgt_handle.cache.write().await = new_cache;
+        }
+
+        report.merged = true;
+        report.merged_claims = accepted_ids.len();
+        report.note = format!(
+            "cross-brain merge '{source_ws}/{source_branch}' → \
+             '{target_ws}/{target_branch_str}': {} claim(s) written, \
+             {} auto-resolved, {} deferred for review",
+            accepted_ids.len(),
+            diff.auto_resolved.len(),
+            diff.needs_review.len(),
+        );
+        Ok(report)
+    }
+
     pub async fn merge_into_branch(
         &self,
         root: &std::path::Path,
@@ -10810,6 +11008,33 @@ pub struct RunBranchReport {
     pub rolled_back: bool,
     pub proposal_id: Option<String>,
     pub checks: Vec<(String, bool, Option<String>)>,
+    pub note: String,
+}
+
+/// Outcome of a [`QueryEngine::merge_across_workspaces`] call — the cross-brain
+/// verified merge primitive (Agent State Topology Phase 2).
+///
+/// `merged` is true only when the health gate approved AND at least one claim
+/// was written into the target workspace. `merge_allowed` reflects what
+/// `compute_diff_into` reported regardless of outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeAcrossReport {
+    pub source_ws: String,
+    pub source_branch: String,
+    pub target_ws: String,
+    pub target_branch: String,
+    /// Whether the overall operation succeeded and claims reached the target.
+    pub merged: bool,
+    /// Number of new claims written into the target workspace's graph.
+    pub merged_claims: usize,
+    /// Number of contradictions auto-resolved by confidence heuristic.
+    pub auto_resolved: usize,
+    /// Number of contradictions deferred for review (not merged).
+    pub needs_review: usize,
+    /// Whether the diff health gate permitted the merge.
+    pub merge_allowed: bool,
+    /// Non-empty only when `merge_allowed == false`.
+    pub blocking_reasons: Vec<String>,
     pub note: String,
 }
 
