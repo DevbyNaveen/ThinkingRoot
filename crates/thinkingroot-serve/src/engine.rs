@@ -1074,8 +1074,10 @@ pub struct FnCapabilities {
     /// claim into THIS branch's graph (a copy-on-write clone of main at
     /// fork) instead of main, so a function's cognitive side effects are
     /// quarantined for verify-before-keep (forge) and dreaming. `None` =
-    /// write to main (the default; fully backward compatible).
-    target_branch: Option<String>,
+    /// write to main (the default; fully backward compatible). Interior-mutable
+    /// (RwLock) so `ctx.transaction` can switch the write target MID-RUN — the
+    /// memory-saga: writes route to a fork, then commit-merges or rolls back.
+    target_branch: std::sync::RwLock<Option<String>>,
     /// Root Function SOTA P1 — the PRIMARY brain's handle, where durable
     /// timers (`ctx.scheduleSelf`/`ctx.schedule`) are persisted so the engine
     /// ticker fires them even when this (per-user) scope is unmounted. `None`
@@ -1111,13 +1113,22 @@ impl FnCapabilities {
         caps: CapSet,
     ) -> Self {
         let root_path = handle.root_path.clone();
-        Self { handle, root_path, ws, run_id, mcp, caps, target_branch: None, primary_handle: None }
+        Self {
+            handle,
+            root_path,
+            ws,
+            run_id,
+            mcp,
+            caps,
+            target_branch: std::sync::RwLock::new(None),
+            primary_handle: None,
+        }
     }
 
     /// A2 — route `memory.remember` writes to `branch`'s graph instead of
     /// main. Builder so the (long) `new` call sites stay unchanged.
     pub fn with_target_branch(mut self, branch: Option<String>) -> Self {
-        self.target_branch = branch;
+        self.target_branch = std::sync::RwLock::new(branch);
         self
     }
 
@@ -1344,7 +1355,8 @@ impl FnCapabilities {
         // the branch is compiled or merged — the graph write itself is
         // durable and immediately recallable by traversal. We do NOT touch
         // the main cache, so a concurrent main read never sees branch state.
-        if let Some(branch) = self.target_branch.as_deref() {
+        let active_branch = self.target_branch.read().unwrap().clone();
+        if let Some(branch) = active_branch.as_deref() {
             let branch_graph_dir =
                 thinkingroot_branch::snapshot::resolve_data_dir(&self.root_path, Some(branch))
                     .join("graph");
@@ -1474,6 +1486,42 @@ impl FnCapabilities {
             auto_resolved: diff.auto_resolved.len() as u64,
             needs_review: diff.needs_review.len() as u64,
         })
+    }
+
+    // ── Memory-saga (ctx.transaction) — durable transactional memory ────────
+    // begin → (writes route to a forked branch) → commit (merge into main) OR
+    // rollback (abandon). Built on the existing fork/merge; the only new bit is
+    // switching the run's write target mid-run (the RwLock target_branch).
+
+    /// `ctx.transaction` begin — fork `branch` (idempotent) and route this run's
+    /// subsequent `memory.remember` writes to it. Requires `can_branch`.
+    pub async fn tx_begin(&self, branch: &str) -> Result<()> {
+        if !self.caps.can_branch {
+            return Err(Error::Config(
+                "capability 'branch' is not granted to this function (ctx.transaction)".to_string(),
+            ));
+        }
+        self.branch_fork(branch, None).await?;
+        *self.target_branch.write().unwrap() = Some(branch.to_string());
+        Ok(())
+    }
+
+    /// `ctx.transaction` commit — merge the active tx branch into main, then
+    /// route writes back to main. No-op if no tx is active.
+    pub async fn tx_commit(&self) -> Result<()> {
+        let active = self.target_branch.read().unwrap().clone();
+        if let Some(branch) = active {
+            self.branch_merge(&branch, None).await?;
+            *self.target_branch.write().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// `ctx.transaction` rollback — abandon the active tx branch (its writes are
+    /// discarded; the branch graph is left unmerged) and route writes back to
+    /// main. Sync (just clears the target).
+    pub fn tx_rollback(&self) {
+        *self.target_branch.write().unwrap() = None;
     }
 
     /// `ctx.mcp.call(tool, args)` — invoke a tool on a project-configured

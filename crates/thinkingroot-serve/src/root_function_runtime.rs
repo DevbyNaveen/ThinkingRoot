@@ -1109,6 +1109,55 @@ mod host_ext {
             .map_err(|e| JsErrorBox::generic(format!("schedule failed: {e}")))
     }
 
+    #[derive(serde::Deserialize)]
+    pub struct TxReq {
+        /// "begin" | "commit" | "rollback".
+        pub action: String,
+        #[serde(default)]
+        pub branch: String,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct TxResult {
+        pub ok: bool,
+    }
+
+    /// Async op behind `ctx.transaction` (memory-saga): begin routes writes to a
+    /// forked branch; commit merges it into main; rollback abandons it.
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_tx(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: TxReq,
+    ) -> Result<TxResult, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.transaction is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        match req.action.as_str() {
+            "begin" => caps
+                .tx_begin(&req.branch)
+                .await
+                .map(|_| TxResult { ok: true })
+                .map_err(|e| JsErrorBox::generic(format!("tx begin failed: {e}"))),
+            "commit" => caps
+                .tx_commit()
+                .await
+                .map(|_| TxResult { ok: true })
+                .map_err(|e| JsErrorBox::generic(format!("tx commit failed: {e}"))),
+            "rollback" => {
+                caps.tx_rollback();
+                Ok(TxResult { ok: true })
+            }
+            other => Err(JsErrorBox::generic(format!("unknown tx action: {other}"))),
+        }
+    }
+
     pub fn extension() -> Extension {
         const OPS: &[OpDecl] = &[
             op_tr_ctx(),
@@ -1131,6 +1180,7 @@ mod host_ext {
             op_tr_sleep(),
             op_tr_wait_event(),
             op_tr_emit(),
+            op_tr_tx(),
         ];
         Extension {
             name: "tr_host",
@@ -1424,6 +1474,24 @@ globalThis.__tr_buildCtx = (input, env) => {
         event_name: String(name),
         payload_json: (payload === undefined || payload === null) ? "null" : JSON.stringify(payload),
       }));
+  };
+  // ctx.transaction(fn): memory-saga — `memory.remember` writes inside `fn`
+  // route to a forked branch; on success the branch merges into main (commit),
+  // on a throw it's abandoned (rollback). Atomic all-or-nothing memory mutation
+  // + the substrate for verify-before-merge. Best within a single (non-
+  // suspending) run. Returns fn's result; re-throws after rollback.
+  let __txSeq = 0;
+  ctx.transaction = async (fn) => {
+    const branch = "tx/" + ctx.runId + "/" + (__txSeq++);
+    await Deno.core.ops.op_tr_tx({ action: "begin", branch });
+    try {
+      const result = await fn();
+      await Deno.core.ops.op_tr_tx({ action: "commit" });
+      return result;
+    } catch (e) {
+      await Deno.core.ops.op_tr_tx({ action: "rollback" });
+      throw e;
+    }
   };
   // ctx.cognition.ask(question): tools-blind, durable human/agent-in-the-loop.
   // On replay the journaled answer is returned; otherwise the run registers a
