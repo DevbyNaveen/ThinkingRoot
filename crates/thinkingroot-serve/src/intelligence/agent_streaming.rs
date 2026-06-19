@@ -262,7 +262,7 @@ pub fn spawn_agent_run(
                 .await;
         });
 
-        let captured_final = relay_events(&mut relay_rx, &tx).await;
+        let (captured_final, saw_terminal_error) = relay_events(&mut relay_rx, &tx).await;
         let _ = agent_handle.await;
 
         // Agent State Topology (Tasks 5+6): settle the run branch now that
@@ -270,12 +270,12 @@ pub fn spawn_agent_run(
         // joined). This position covers BOTH the success path (Done event
         // captured) and the cancellation/failure path.
         //
-        // run_succeeded gates merge-vs-rollback. captured_final.is_some() means
-        // a Done frame arrived (normal completion OR cancellation, which emits
-        // Error then Done with partial text), so we AND in !cancel.is_cancelled()
-        // to ensure cancelled/partial runs roll back, never merge.
+        // A run merges only if it produced a final result AND did not end via
+        // an error or cancellation event. Do NOT use cancel.is_cancelled() here:
+        // the SSE body's drop-guard fires the token on NORMAL client disconnect
+        // (after completion), which races and would roll back successful runs.
         if let Some(rb) = run_branch {
-            let run_succeeded = captured_final.is_some() && !cancel.is_cancelled();
+            let run_succeeded = captured_final.is_some() && !saw_terminal_error;
             let engine = engine_for_obs.read().await;
             match engine
                 .settle_run_branch(&workspace_for_obs, &rb, req.merge_policy, run_succeeded)
@@ -343,19 +343,31 @@ pub fn spawn_agent_run(
 /// `tx`, the helper drains `agent_rx` to completion so the agent task
 /// is never left blocked on a full channel.
 ///
-/// Returns the captured `final_text` if a `Done` event was observed
-/// before the relay terminated, or `None` if the agent finished
-/// without `Done` (error path, cancellation, or upstream disconnect
-/// before completion). Honest semantics: only fully-completed turns
-/// produce an Observer recording.
+/// Returns `(captured_final, saw_terminal_error)`:
+///
+/// * `captured_final` — the `final_text` from the `Done` event if one
+///   was observed, or `None` if the stream ended without a `Done`.
+/// * `saw_terminal_error` — `true` iff an `Error` event was relayed
+///   during this run. The cancellation path emits
+///   `Error { "agent cancelled by client" }` followed by `Done` with
+///   the partial text, so this flag reliably distinguishes a cancelled /
+///   error run from a clean completion — even when `Done` was received
+///   in both cases. Do NOT use `cancel.is_cancelled()` for this purpose:
+///   the SSE body's drop-guard fires the token on normal client
+///   disconnect (after the final frame is consumed), which races and
+///   would incorrectly classify successful runs as cancelled.
 async fn relay_events(
     agent_rx: &mut mpsc::Receiver<AgentEvent>,
     tx: &mpsc::Sender<AgentEvent>,
-) -> Option<String> {
+) -> (Option<String>, bool) {
     let mut captured: Option<String> = None;
+    let mut saw_terminal_error = false;
     while let Some(event) = agent_rx.recv().await {
         if let AgentEvent::Done { final_text, .. } = &event {
             captured = Some(final_text.clone());
+        }
+        if matches!(&event, AgentEvent::Error { .. }) {
+            saw_terminal_error = true;
         }
         if tx.send(event).await.is_err() {
             // Caller disconnected. Drain remaining events from the
@@ -365,7 +377,7 @@ async fn relay_events(
             break;
         }
     }
-    captured
+    (captured, saw_terminal_error)
 }
 
 /// Persist one completed (user_prompt, assistant_reply) pair into the
@@ -742,7 +754,7 @@ mod tests {
             // drop sender → relay sees end-of-stream
         });
 
-        let captured = relay_events(&mut agent_rx, &caller_tx).await;
+        let (captured, saw_terminal_error) = relay_events(&mut agent_rx, &caller_tx).await;
         producer.await.unwrap();
 
         // Caller receives the three events verbatim.
@@ -764,6 +776,10 @@ mod tests {
             Some("the answer is 42"),
             "Done event must be captured for Observer recording"
         );
+        assert!(
+            !saw_terminal_error,
+            "clean run must not set saw_terminal_error"
+        );
     }
 
     #[tokio::test]
@@ -783,12 +799,16 @@ mod tests {
             // No Done — drop sender.
         });
 
-        let captured = relay_events(&mut agent_rx, &caller_tx).await;
+        let (captured, saw_terminal_error) = relay_events(&mut agent_rx, &caller_tx).await;
         producer.await.unwrap();
 
         assert!(
             captured.is_none(),
             "no Done event → no Observer recording (honest: incomplete turns produce no memory)"
+        );
+        assert!(
+            saw_terminal_error,
+            "Error event relayed → saw_terminal_error must be true"
         );
     }
 
@@ -819,7 +839,7 @@ mod tests {
 
         // Even with the caller gone, relay_events must terminate
         // (drain loop) so the agent task can complete.
-        let _captured = relay_events(&mut agent_rx, &caller_tx).await;
+        let (_captured, _saw_error) = relay_events(&mut agent_rx, &caller_tx).await;
         producer.await.unwrap();
         // No assertion on `_captured` — the Done may or may not have
         // been read before the caller-disconnect break; what matters
