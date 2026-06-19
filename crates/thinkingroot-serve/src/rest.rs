@@ -906,6 +906,14 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 get(get_function_caps_handler).put(set_function_caps_handler),
             )
             .route(
+                "/ws/{ws}/functions/{name}/attributes",
+                get(get_function_attributes_handler).put(set_function_attributes_handler),
+            )
+            .route(
+                "/ws/{ws}/functions/{name}/promote",
+                post(promote_function_handler),
+            )
+            .route(
                 "/ws/{ws}/functions/{name}/verdict",
                 post(function_verdict_handler),
             )
@@ -2292,6 +2300,70 @@ async fn delete_function_handler(
     let engine = state.engine.read().await;
     match engine.delete_function(&ws, &name).await {
         Ok(existed) => ok_response(serde_json::json!({ "deleted": existed, "name": name })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PromoteFunctionBody {
+    /// The quarantine branch holding the candidate body to verify + promote.
+    branch: String,
+}
+
+/// Phase 6 (auto-promote) — verify a function on its quarantine branch (run its
+/// fixtures) and, only if they pass, promote the verified body to trunk. The
+/// verify-before-keep gate for self-extended capabilities, as an explicit verb.
+async fn promote_function_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(body): Json<PromoteFunctionBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.verify_and_promote_function(&ws, &name, &body.branch).await {
+        Ok(v) => ok_response(v).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// §2.5 — the declarative attributes (cron `schedule` + `retry_max`) for a function.
+async fn get_function_attributes_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_function_attributes(&ws, &name).await {
+        Ok((schedule, retry_max)) => {
+            ok_response(serde_json::json!({ "schedule": schedule, "retry_max": retry_max }))
+                .into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetFunctionAttributesBody {
+    #[serde(default)]
+    schedule: String,
+    #[serde(default)]
+    retry_max: i64,
+}
+
+/// §2.5 — set a function's cron `schedule` (validated) + `retry_max`. Re-arms
+/// the declarative cron timer; an empty schedule cancels it.
+async fn set_function_attributes_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+    Json(body): Json<SetFunctionAttributesBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .set_function_attributes(&ws, &name, &body.schedule, body.retry_max)
+        .await
+    {
+        Ok(()) => ok_response(serde_json::json!({
+            "schedule": body.schedule, "retry_max": body.retry_max
+        }))
+        .into_response(),
         Err(e) => match_engine_error(e),
     }
 }

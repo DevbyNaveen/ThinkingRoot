@@ -392,6 +392,58 @@ impl GraphStore {
             .filter(|s| !s.is_empty()))
     }
 
+    /// §2.5 — set a function's declarative attributes (cron `schedule` +
+    /// `retry_max`). Empty schedule + 0 retry_max means "no override". Keyed by
+    /// name so attributes survive redeploys (like caps).
+    pub fn set_function_attributes(&self, name: &str, schedule: &str, retry_max: i64) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(Error::Template("function name must be non-empty".into()));
+        }
+        let updated_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("schedule".into(), DataValue::Str(schedule.into()));
+        params.insert("retry".into(), DataValue::Num(Num::Int(retry_max)));
+        params.insert("at".into(), DataValue::Num(Num::Float(updated_at)));
+        self.query(
+            "?[name, schedule, retry_max, updated_at] <- [[$name, $schedule, $retry, $at]] \
+             :put fn_attributes {name => schedule, retry_max, updated_at}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// §2.5 — a function's stored attributes `(schedule, retry_max)`, or
+    /// `("", 0)` when none set. `retry_max == 0` means "use the engine default".
+    pub fn get_function_attributes(&self, name: &str) -> Result<(String, i64)> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[schedule, retry_max] := *fn_attributes{name: $name, schedule, retry_max}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_function_attributes: {e}")))?;
+        Ok(rows
+            .rows
+            .first()
+            .map(|r| (dv_str(&r[0]), dv_i64(&r[1])))
+            .unwrap_or_else(|| (String::new(), 0)))
+    }
+
+    /// Every function that carries a non-empty cron `schedule` → `(name, expr)`.
+    /// The ticker uses this to (re-)arm cron timers for the workspace.
+    pub fn list_scheduled_functions(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .query_read(
+                "?[name, schedule] := *fn_attributes{name, schedule}, schedule != ''",
+            )?
+            .rows;
+        Ok(rows.iter().map(|r| (dv_str(&r[0]), dv_str(&r[1]))).collect())
+    }
+
     pub fn function_latest_version(&self, name: &str) -> Result<Option<i64>> {
         let mut params = BTreeMap::new();
         params.insert("name".into(), DataValue::Str(name.into()));
@@ -439,6 +491,13 @@ impl GraphStore {
             "?[id] := *root_functions{id, name}, name = $name\n:rm root_functions {id}",
             params,
         )?;
+        // Best-effort: drop the function's declarative attributes too.
+        let mut p2 = BTreeMap::new();
+        p2.insert("name".into(), DataValue::Str(name.into()));
+        let _ = self.query(
+            "?[name] := *fn_attributes{name}, name = $name\n:rm fn_attributes {name}",
+            p2,
+        );
         Ok(existed)
     }
 

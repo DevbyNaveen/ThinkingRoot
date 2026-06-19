@@ -1568,6 +1568,138 @@ impl FnCapabilities {
         let f = storage.graph.put_function(name, body, lang)?;
         Ok(f.id)
     }
+
+    /// `ctx.predict(question, top_k?)` — grounded, falsifier-gated "what happens
+    /// next" over THIS run's own workspace memory. Recall → the run's workspace
+    /// LLM (passed in) → verified-or-silent (refuse if no memory, the model
+    /// declines, or the prediction cites no recalled claim). Mirrors
+    /// `QueryEngine::predict` using the SAME `intelligence::` helpers, but over
+    /// the captured handle — so it never re-locks the engine mid-run.
+    pub async fn predict(
+        &self,
+        llm: &thinkingroot_llm::llm::LlmClient,
+        question: &str,
+        top_k: usize,
+    ) -> Result<PredictReport> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'predict' (recall) is not granted to this function".to_string(),
+            ));
+        }
+        let empty = std::collections::HashSet::new();
+        let res = QueryEngine::search_scoped_on(&self.handle, question, top_k.clamp(1, 50), &empty)
+            .await?;
+        let claims: Vec<(String, String)> =
+            res.claims.iter().map(|c| (c.id.clone(), c.statement.clone())).collect();
+        let refused = |note: &str| PredictReport {
+            prediction: String::new(),
+            confidence: 0.0,
+            citations: vec![],
+            refused: true,
+            note: note.to_string(),
+        };
+        if claims.is_empty() {
+            return Ok(refused("no relevant memory to predict from"));
+        }
+        let prompt = crate::intelligence::predict::build_predict_prompt(question, &claims);
+        let out = llm.chat(crate::intelligence::predict::PREDICT_SYSTEM, &prompt).await?;
+        if crate::intelligence::predict::is_refusal(&out) {
+            return Ok(refused("insufficient evidence to predict"));
+        }
+        let recalled: std::collections::HashSet<&str> =
+            claims.iter().map(|(id, _)| id.as_str()).collect();
+        let grounded: Vec<String> = crate::intelligence::citations::parse_all_markers(&out)
+            .into_iter()
+            .filter(|id| recalled.contains(id.as_str()))
+            .collect();
+        if grounded.is_empty() {
+            return Ok(refused("prediction had no grounded citation — withheld"));
+        }
+        let confidence = crate::intelligence::predict::parse_confidence(&out).unwrap_or(0.5);
+        Ok(PredictReport {
+            prediction: out.trim().to_string(),
+            confidence,
+            citations: grounded,
+            refused: false,
+            note: "grounded prediction".to_string(),
+        })
+    }
+
+    /// `ctx.dream(opts?)` — the Night-Shift verb: sample this workspace's memory,
+    /// abstract insights via the run's workspace LLM, write them to a QUARANTINED
+    /// `dream/<ulid>` branch (honest provenance), and merge into main only when
+    /// `auto_merge` (else left for review). Built on the run's own fork/remember/
+    /// merge primitives — the verify-before-merge quarantine holds, no engine lock.
+    pub async fn dream(
+        &self,
+        llm: &thinkingroot_llm::llm::LlmClient,
+        max_claims: usize,
+        max_insights: usize,
+        auto_merge: bool,
+    ) -> Result<DreamReport> {
+        if !self.caps.can_recall || !self.caps.can_remember || !self.caps.can_branch {
+            return Err(Error::Config(
+                "ctx.dream needs recall + remember + branch capabilities".to_string(),
+            ));
+        }
+        let claims: Vec<String> = {
+            let cache = self.handle.cache.read().await;
+            cache
+                .all_claims()
+                .filter(|c| !c.statement.trim().is_empty())
+                .take(max_claims.clamp(1, 200))
+                .map(|c| c.statement.clone())
+                .collect()
+        };
+        if claims.len() < 3 {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "not enough claims to dream over (need ≥3)".to_string(),
+            });
+        }
+        let prompt = crate::intelligence::dream::build_dream_prompt(&claims);
+        let out = llm.chat(crate::intelligence::dream::DREAM_SYSTEM, &prompt).await?;
+        let insights =
+            crate::intelligence::dream::parse_dream_insights(&out, max_insights.clamp(1, 20));
+        if insights.is_empty() {
+            return Ok(DreamReport {
+                insights: 0,
+                branch: String::new(),
+                merged: false,
+                note: "no insights synthesized this pass".to_string(),
+            });
+        }
+        // Quarantined dream branch. Route insight writes there, then restore the
+        // prior write target (so a dream inside a ctx.transaction doesn't clobber it).
+        let branch = format!("dream/{}", ulid::Ulid::new());
+        self.branch_fork(&branch, Some("main")).await?;
+        let prior = self.target_branch.read().unwrap().clone();
+        *self.target_branch.write().unwrap() = Some(branch.clone());
+        // Dream insights live in a separate deterministic seq space so their ids
+        // never collide with the function's own remember() calls.
+        let base_seq = 1_000_000u64;
+        for (i, s) in insights.iter().enumerate() {
+            let _ = self.remember(s, "insight", 0.6, base_seq + i as u64).await;
+        }
+        *self.target_branch.write().unwrap() = prior;
+        let merged = if auto_merge {
+            self.branch_merge(&branch, Some("main")).await.is_ok()
+        } else {
+            false
+        };
+        Ok(DreamReport {
+            insights: insights.len(),
+            branch,
+            merged,
+            note: if merged {
+                "insights merged into main".to_string()
+            } else {
+                "insights kept on the dream branch (review before merge)".to_string()
+            },
+        })
+    }
 }
 
 /// Result of `ctx.branch.fork`.
@@ -3479,6 +3611,128 @@ impl QueryEngine {
         })
     }
 
+    /// §2.5 — set a function's declarative attributes (cron `schedule` +
+    /// `retry_max`). A non-empty schedule is validated as cron up front (a bad
+    /// expr is rejected, never silently dropped) and then (re-)arms a durable
+    /// `cron` timer in the primary brain; clearing the schedule cancels it.
+    pub async fn set_function_attributes(
+        &self,
+        ws: &str,
+        name: &str,
+        schedule: &str,
+        retry_max: i64,
+    ) -> Result<()> {
+        let schedule = schedule.trim();
+        if !schedule.is_empty() {
+            crate::cron::Cron::parse(schedule)
+                .map_err(|e| Error::Config(format!("invalid cron schedule '{schedule}': {e}")))?;
+        }
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            if storage.graph.get_function(name)?.is_none() {
+                return Err(Error::EntityNotFound(format!(
+                    "root function '{name}' is not deployed — deploy it before setting attributes"
+                )));
+            }
+            storage
+                .graph
+                .set_function_attributes(name, schedule, retry_max.clamp(0, 10))?;
+        }
+        if schedule.is_empty() {
+            self.cancel_cron_timer(ws, name).await;
+        } else {
+            self.arm_cron_timer(ws, name, schedule).await?;
+        }
+        Ok(())
+    }
+
+    /// §2.5 — a function's `(schedule, retry_max)`; `("", 0)` when unset.
+    pub async fn get_function_attributes(&self, ws: &str, name: &str) -> Result<(String, i64)> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_function_attributes(name)
+    }
+
+    /// The effective retry cap for a function: its `retry_max` attribute when
+    /// set (1..=10), else the engine default of 3. Read on the invoke path.
+    pub async fn function_retry_max(&self, ws: &str, name: &str) -> u32 {
+        let Ok(handle) = self.get_workspace(ws) else {
+            return 3;
+        };
+        let storage = handle.storage.lock().await;
+        match storage.graph.get_function_attributes(name) {
+            Ok((_, r)) if r >= 1 => (r as u32).min(10),
+            _ => 3,
+        }
+    }
+
+    /// Register (replace) the durable `cron` timer for a scheduled function in
+    /// the primary brain, computing the next firing minute from the expr. The
+    /// ticker fires it (a fresh run) then re-arms the next one — a self-
+    /// perpetuating declarative schedule that survives the scope being unmounted.
+    pub async fn arm_cron_timer(&self, ws: &str, name: &str, expr: &str) -> Result<()> {
+        let cron = crate::cron::Cron::parse(expr)
+            .map_err(|e| Error::Config(format!("invalid cron '{expr}': {e}")))?;
+        let now = chrono::Utc::now();
+        let Some(next) = cron.next_after(now) else {
+            return Err(Error::Config(format!("cron '{expr}' never fires")));
+        };
+        let fire_at = next.timestamp_millis() as f64 / 1000.0;
+        let primary = self.primary_ws_name().unwrap_or_else(|| ws.to_string());
+        let handle = self.get_workspace(&primary)?;
+        let dedupe = format!("cron:{name}");
+        let timer = thinkingroot_graph::root_function::FnTimer {
+            id: ulid::Ulid::new().to_string(),
+            scope: ws.to_string(),
+            fn_name: name.to_string(),
+            kind: "cron".to_string(),
+            run_id: String::new(),
+            fire_at,
+            input_json: "{}".to_string(),
+            dedupe_key: dedupe.clone(),
+            status: "pending".to_string(),
+            created_at: now.timestamp_millis() as f64 / 1000.0,
+        };
+        let storage = handle.storage.lock().await;
+        storage.graph.cancel_timer_dedupe(ws, name, &dedupe)?;
+        storage.graph.put_timer(&timer)?;
+        Ok(())
+    }
+
+    /// Cancel a function's pending `cron` timer (schedule cleared / function deleted).
+    pub async fn cancel_cron_timer(&self, ws: &str, name: &str) {
+        if let Some(primary) = self.primary_ws_name() {
+            if let Ok(handle) = self.get_workspace(&primary) {
+                let storage = handle.storage.lock().await;
+                let _ = storage
+                    .graph
+                    .cancel_timer_dedupe(ws, name, &format!("cron:{name}"));
+            }
+        }
+    }
+
+    /// After a `cron` timer fires, re-arm the next one from the stored schedule.
+    /// No-op if the schedule was cleared meanwhile (honest: a removed cron stops).
+    pub async fn rearm_cron_after_fire(&self, ws: &str, name: &str) {
+        let schedule = {
+            let Ok(handle) = self.get_workspace(ws) else {
+                return;
+            };
+            let storage = handle.storage.lock().await;
+            storage
+                .graph
+                .get_function_attributes(name)
+                .map(|(s, _)| s)
+                .unwrap_or_default()
+        };
+        if !schedule.trim().is_empty() {
+            if let Err(e) = self.arm_cron_timer(ws, name, schedule.trim()).await {
+                tracing::warn!(function = name, scope = ws, "cron re-arm failed: {e}");
+            }
+        }
+    }
+
     /// Latest version of every distinct function.
     pub async fn list_functions(
         &self,
@@ -4117,7 +4371,8 @@ impl QueryEngine {
         // attempt+1; completed steps replay from the journal, so only the failed
         // work re-runs. `retry_in_secs` is set in the Failed arm below.
         let attempt = opts.attempt.max(1);
-        const MAX_ATTEMPTS: u32 = 3;
+        // §2.5 — the retry cap is a per-function attribute (default 3).
+        let max_attempts: u32 = self.function_retry_max(ws, name).await;
         let mut retry_in_secs: Option<u64> = None;
 
         // Map the run outcome to a recorded status + the returned value.
@@ -4145,7 +4400,7 @@ impl QueryEngine {
                 }
                 RunOutcome::Failed(e) => {
                     let non_retryable = e.contains("__TR_NONRETRYABLE__");
-                    if !non_retryable && attempt < MAX_ATTEMPTS {
+                    if !non_retryable && attempt < max_attempts {
                         // Exponential backoff: 1s, 2s, 4s, … capped at 60s.
                         retry_in_secs = Some((1u64 << (attempt - 1)).min(60));
                         let marker = serde_json::json!({

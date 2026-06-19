@@ -1283,6 +1283,19 @@ impl GraphStore {
                 expires_at: Float default 0.0,
                 created_at: Float default 0.0
             }",
+            // ─── fn_attributes — declarative function metadata (Root Function
+            //     SOTA §2.5): the cron `schedule` (engine fires fresh runs) and
+            //     `retry_max` (overrides the default attempt cap). One row per
+            //     function name, in the function's own brain. Concurrency stays
+            //     in the CapSet; this holds the scheduling + retry knobs.
+            //     New relation → created on mount via create_schema, zero migration.
+            ":create fn_attributes {
+                name: String
+                =>
+                schedule: String default '',
+                retry_max: Int default 0,
+                updated_at: Float default 0.0
+            }",
             // ─── function_experience — the MOAT. Learned "which function
             //     serves which input class", reweighted by run outcomes.
             //     Competitors with stateless executors can't accumulate this.

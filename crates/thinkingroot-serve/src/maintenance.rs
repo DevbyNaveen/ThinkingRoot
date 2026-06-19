@@ -561,10 +561,12 @@ impl PeriodicTask for FnSchedulerTask {
         let due = { self.engine.read().await.due_fn_timers(self.batch).await };
         for t in due {
             // `schedule` = a fresh run (ctx.scheduleSelf/schedule);
+            // `cron`     = a fresh run on a declarative cron schedule (§2.5),
+            //              which re-arms the next firing after it runs;
             // `resume`   = re-enter a suspended run (ctx.sleep/ctx.wakeAt);
             // `retry`    = re-enter a failed run with attempt+1.
             // Unknown kinds are left untouched (forward-compatible).
-            if t.kind != "schedule" && t.kind != "resume" && t.kind != "retry" {
+            if t.kind != "schedule" && t.kind != "cron" && t.kind != "resume" && t.kind != "retry" {
                 continue;
             }
             // Mount the target scope on demand (per-user `u_*`/`agent_*` brains
@@ -613,6 +615,11 @@ impl PeriodicTask for FnSchedulerTask {
                     scope = %t.scope, function = %t.fn_name, kind = %t.kind,
                     "fn_scheduler: timer run errored: {e}"
                 ),
+            }
+            // A `cron` timer re-arms its NEXT firing from the stored schedule
+            // (declarative recurrence) before the one-shot row is deleted.
+            if t.kind == "cron" {
+                self.engine.read().await.rearm_cron_after_fire(&t.scope, &t.fn_name).await;
             }
             // Fired timers are one-shot: a schedule fires once (the function
             // re-arms via scheduleSelf if it wants more); a resume re-enters the

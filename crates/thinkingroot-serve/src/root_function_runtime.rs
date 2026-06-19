@@ -1068,6 +1068,116 @@ mod host_ext {
         Ok(AcquireResult { name, body, authored })
     }
 
+    // ── ctx.predict / ctx.dream — the Life-Layer verbs, callable from a run ──
+    // Both reach the run's captured workspace handle + its workspace LLM (the
+    // customer's own model) via FnCapabilities, so a self-scheduling function
+    // (e.g. night_shift) can dream + predict natively. Journaled via ctx.step,
+    // so a resumed run returns the recorded result instead of re-calling the LLM.
+
+    #[derive(serde::Deserialize)]
+    pub struct PredictReq {
+        pub question: String,
+        #[serde(default)]
+        pub top_k: u32,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct PredictResult {
+        pub prediction: String,
+        pub confidence: f64,
+        pub citations: Vec<String>,
+        pub refused: bool,
+        pub note: String,
+    }
+
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_predict(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: PredictReq,
+    ) -> Result<PredictResult, JsErrorBox> {
+        let (llm, caps) = {
+            let s = state.borrow();
+            let h = s.borrow::<FnHostState>();
+            (h.llm.clone(), h.caps.clone())
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.predict is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        let Some(llm) = llm else {
+            return Err(JsErrorBox::generic(
+                "ctx.predict needs an LLM provider (configure one in Secrets)",
+            ));
+        };
+        let top_k = if req.top_k == 0 { 12 } else { req.top_k as usize };
+        let r = caps
+            .predict(&llm, &req.question, top_k)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("ctx.predict failed: {e}")))?;
+        Ok(PredictResult {
+            prediction: r.prediction,
+            confidence: r.confidence,
+            citations: r.citations,
+            refused: r.refused,
+            note: r.note,
+        })
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct DreamReq {
+        #[serde(default)]
+        pub max_claims: u32,
+        #[serde(default)]
+        pub max_insights: u32,
+        #[serde(default)]
+        pub auto_merge: bool,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct DreamResult {
+        pub insights: u32,
+        pub branch: String,
+        pub merged: bool,
+        pub note: String,
+    }
+
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_dream(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: DreamReq,
+    ) -> Result<DreamResult, JsErrorBox> {
+        let (llm, caps) = {
+            let s = state.borrow();
+            let h = s.borrow::<FnHostState>();
+            (h.llm.clone(), h.caps.clone())
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.dream is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        let Some(llm) = llm else {
+            return Err(JsErrorBox::generic(
+                "ctx.dream needs an LLM provider (configure one in Secrets)",
+            ));
+        };
+        let max_claims = if req.max_claims == 0 { 50 } else { req.max_claims as usize };
+        let max_insights = if req.max_insights == 0 { 5 } else { req.max_insights as usize };
+        let r = caps
+            .dream(&llm, max_claims, max_insights, req.auto_merge)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("ctx.dream failed: {e}")))?;
+        Ok(DreamResult {
+            insights: r.insights as u32,
+            branch: r.branch,
+            merged: r.merged,
+            note: r.note,
+        })
+    }
+
     #[derive(serde::Deserialize)]
     pub struct ScheduleReq {
         pub fn_name: String,
@@ -1176,6 +1286,8 @@ mod host_ext {
             op_tr_cognition_request(),
             op_tr_cite(),
             op_tr_acquire(),
+            op_tr_predict(),
+            op_tr_dream(),
             op_tr_schedule(),
             op_tr_sleep(),
             op_tr_wait_event(),
@@ -1339,6 +1451,27 @@ globalThis.__tr_buildCtx = (input, env) => {
         name: String(s.name || ""),
         description: String(s.description || s.name || ""),
         body: s.body ? String(s.body) : "",
+      }));
+  };
+  // ctx.predict(question, top_k? | {top_k}): grounded, falsifier-gated "what
+  // happens next" over this run's memory. Journaled (replay returns the result).
+  ctx.predict = async (question, opts) => {
+    const o = (typeof opts === "number") ? { top_k: opts } : (opts || {});
+    return await ctx.step(`__predict__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_predict({
+        question: String(question || ""),
+        top_k: Number(o.top_k ?? o.topK ?? 0) || 0,
+      }));
+  };
+  // ctx.dream({max_claims?, max_insights?, auto_merge?}): the Night-Shift verb —
+  // abstract insights to a quarantined dream branch (merged only if auto_merge).
+  ctx.dream = async (opts) => {
+    const o = opts || {};
+    return await ctx.step(`__dream__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_dream({
+        max_claims: Number(o.max_claims ?? o.maxClaims ?? 0) || 0,
+        max_insights: Number(o.max_insights ?? o.maxInsights ?? 0) || 0,
+        auto_merge: Boolean(o.auto_merge ?? o.autoMerge ?? false),
       }));
   };
   // ctx.step(name, fn): durable memoization. On a resumed run the recorded
