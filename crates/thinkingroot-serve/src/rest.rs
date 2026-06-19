@@ -875,6 +875,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/sleep", post(sleep_handler))
             .route("/ws/{ws}/dream", post(dream_handler))
             .route("/ws/{ws}/predict", post(predict_handler))
+            .route("/ws/{ws}/merge-across", post(merge_across_handler))
             .route("/ws/{ws}/age", get(age_handler))
             .route("/ws/{ws}/drives", get(drives_handler))
             .route("/ws/{ws}/bequeath", post(bequeath_handler))
@@ -4236,6 +4237,38 @@ async fn predict_handler(
 ) -> Response {
     let engine = state.engine.read().await;
     match engine.predict(&ws, &body.question, body.top_k).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /api/v1/ws/{ws}/merge-across` — cross-brain merge: copy verified claims
+/// from `source_ws`/`source_branch` into `{ws}` (the target workspace), optionally
+/// onto `target_branch`. Mirrors the diff-health-gate + auto-resolution logic of
+/// the in-brain merge but across two distinct workspaces (Agent State Topology P2.2).
+#[derive(Deserialize)]
+struct MergeAcrossBody {
+    source_ws: String,
+    source_branch: String,
+    #[serde(default)]
+    target_branch: Option<String>,
+}
+
+async fn merge_across_handler(
+    State(state): State<Arc<AppState>>,
+    Path(target_ws): Path<String>,
+    Json(body): Json<MergeAcrossBody>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine
+        .merge_across_workspaces(
+            &body.source_ws,
+            &body.source_branch,
+            &target_ws,
+            body.target_branch.as_deref(),
+        )
+        .await
+    {
         Ok(report) => ok_response(serde_json::json!(report)).into_response(),
         Err(e) => match_engine_error(e),
     }
