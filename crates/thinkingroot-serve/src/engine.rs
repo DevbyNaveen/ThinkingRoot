@@ -342,6 +342,22 @@ pub(crate) fn is_auto_scoped_ws(ws: &str) -> bool {
     ws.starts_with("u_") || ws.starts_with("agent_")
 }
 
+/// Derive the AGENT a run belongs to from its workspace/scope name — the
+/// same `__agent_`/`agent_` convention the topology + connector code uses
+/// (`u_X__agent_Y` and bare `agent_Y` → `Y`). Returns `None` for `main` and
+/// plain per-user `u_X` scopes (no agent in play), so attribution/provenance
+/// is stamped ONLY when a run is genuinely an agent's. This is the single
+/// place "who is the acting agent for this run" is decided.
+pub(crate) fn agent_from_ws(ws: &str) -> Option<String> {
+    if let Some(idx) = ws.find("__agent_") {
+        let name = &ws[idx + "__agent_".len()..];
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    ws.strip_prefix("agent_")
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+}
+
 /// Compiled-prompt name that holds an agent's persona. Namespaced so it never
 /// collides with the workspace `assistant` voice prompt. The persona flows
 /// through the single prompt pipeline under this name.
@@ -1051,6 +1067,34 @@ pub struct RecallHit {
     pub source_uri: String,
 }
 
+/// One row of the `ctx.agents()` runtime roster — an agent definition (with
+/// provenance) plus a small slice of its recent runs. Subagent oversight: this
+/// is what an agent reads to report "I spun up a research agent; here's what
+/// it's doing".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentRosterEntry {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_agent: Option<String>,
+    pub created_at: f64,
+    pub updated_at: f64,
+    pub recent_runs: Vec<RosterRun>,
+}
+
+/// A compact recent-run entry in the `ctx.agents()` roster.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RosterRun {
+    pub function_name: String,
+    pub status: String,
+    pub started_at: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoked_by: Option<String>,
+}
+
 /// The narrow, capability-gated facade threaded into a Root Function's
 /// isolate (as `Arc<FnCapabilities>` in `FnHostState`). It holds a *cloned*
 /// `WorkspaceHandle` (cheap — Arcs inside) so ops recall/remember/assemble
@@ -1574,6 +1618,103 @@ impl FnCapabilities {
         let storage = self.handle.storage.lock().await;
         let f = storage.graph.put_function(name, body, lang)?;
         Ok(f.id)
+    }
+
+    /// The brain where agent DEFINITIONS live (primary/shared), so an agent
+    /// created from inside a per-agent/per-user run lands where every scope
+    /// resolves it — never siloed in the run's own scope. Falls back to the
+    /// run's handle when no primary is set (e.g. running in `main` itself).
+    fn agent_home_handle(&self) -> &WorkspaceHandle {
+        self.primary_handle.as_ref().unwrap_or(&self.handle)
+    }
+
+    /// `ctx.putAgent(spec)` host side — an agent (or any run) creates/updates a
+    /// sub-agent at runtime. Provenance is STAMPED from the acting agent
+    /// (derived from this run's scope): `created_by` = the caller, and for an
+    /// agent-created agent `parent_agent` = the caller too. A run with no acting
+    /// agent (`main`/plain `u_*`) records `created_by = "user"` and no parent.
+    /// Gated on `can_acquire` (the same self-extension grant as `ctx.acquire`).
+    pub async fn create_agent(
+        &self,
+        name: &str,
+        persona: &str,
+        model: &str,
+        config_json: &str,
+    ) -> Result<thinkingroot_graph::agents::AgentDef> {
+        if !self.caps.can_acquire {
+            return Err(Error::Config(
+                "capability 'acquire' is not granted to this function (needed for ctx.putAgent)"
+                    .to_string(),
+            ));
+        }
+        if name.trim().is_empty() {
+            return Err(Error::Config("ctx.putAgent: name is required".to_string()));
+        }
+        let caller = agent_from_ws(&self.ws);
+        let created_by = caller.clone().unwrap_or_else(|| "user".to_string());
+        let parent_agent = caller; // only set when an AGENT is the creator
+        let cfg = if config_json.trim().is_empty() { "{}" } else { config_json };
+        let storage = self.agent_home_handle().storage.lock().await;
+        let def = storage.graph.put_agent_with_provenance(
+            name,
+            persona,
+            model,
+            cfg,
+            Some(&created_by),
+            parent_agent.as_deref(),
+        )?;
+        Ok(def)
+    }
+
+    /// `ctx.agents()` host side — the runtime roster an agent reads to oversee
+    /// its subagents. Lists agent definitions from the brain where they live
+    /// (primary/shared, with a fallback to this run's own scope), each with its
+    /// provenance and a small slice of recent runs (with `invoked_by` when set).
+    /// Read-only; gated on `can_recall` (consistent with `ctx.memory.recall`).
+    /// Confined to the run's own inheritance scope — no cross-tenant access.
+    pub async fn list_agents_roster(&self, recent_runs_per_agent: usize) -> Result<Vec<AgentRosterEntry>> {
+        if !self.caps.can_recall {
+            return Err(Error::Config(
+                "capability 'memory.recall' is not granted to this function (needed for ctx.agents)"
+                    .to_string(),
+            ));
+        }
+        let runs_cap = recent_runs_per_agent.clamp(0, 20);
+        let storage = self.agent_home_handle().storage.lock().await;
+        let agents = storage.graph.list_agents()?;
+        let mut out = Vec::with_capacity(agents.len());
+        for a in agents {
+            // Recent runs of the agent's OWN function (by convention an agent's
+            // runs are recorded under its agent name as the function). Best-
+            // effort: a function with no run history simply yields an empty list.
+            let recent: Vec<RosterRun> = if runs_cap == 0 {
+                Vec::new()
+            } else {
+                storage
+                    .graph
+                    .list_function_runs(&a.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(runs_cap)
+                    .map(|r| RosterRun {
+                        function_name: r.function_name,
+                        status: r.status,
+                        started_at: r.started_at,
+                        invoked_by: r.invoked_by,
+                    })
+                    .collect()
+            };
+            out.push(AgentRosterEntry {
+                name: a.name.clone(),
+                persona: (!a.persona.trim().is_empty()).then(|| a.persona.clone()),
+                created_by: a.created_by(),
+                parent_agent: a.parent_agent(),
+                created_at: a.created_at,
+                updated_at: a.updated_at,
+                recent_runs: recent,
+            });
+        }
+        Ok(out)
     }
 
     /// `ctx.predict(question, top_k?)` — grounded, falsifier-gated "what happens
@@ -3394,7 +3535,9 @@ impl QueryEngine {
     // get/list resolve from the primary brain for per-user `u_*` scopes (an
     // agent defined once serves every end-user), mirroring Root Functions.
 
-    /// Create or update an agent definition in workspace `ws`.
+    /// Create or update an agent definition in workspace `ws`. Provenance
+    /// (`created_by` / `parent_agent`) defaults to preserved-on-update; the
+    /// REST handler passes the human/agent identity when it has one.
     pub async fn put_agent(
         &self,
         ws: &str,
@@ -3403,9 +3546,33 @@ impl QueryEngine {
         model: &str,
         config_json: &str,
     ) -> Result<thinkingroot_graph::agents::AgentDef> {
+        self.put_agent_with_provenance(ws, name, persona, model, config_json, None, None)
+            .await
+    }
+
+    /// Create or update an agent definition with explicit provenance stamping.
+    /// `created_by`/`parent_agent` are merged into `config_json.provenance` and
+    /// PRESERVED on update when `None` (mirrors the graph layer).
+    pub async fn put_agent_with_provenance(
+        &self,
+        ws: &str,
+        name: &str,
+        persona: &str,
+        model: &str,
+        config_json: &str,
+        created_by: Option<&str>,
+        parent_agent: Option<&str>,
+    ) -> Result<thinkingroot_graph::agents::AgentDef> {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        let def = storage.graph.put_agent(name, persona, model, config_json)?;
+        let def = storage.graph.put_agent_with_provenance(
+            name,
+            persona,
+            model,
+            config_json,
+            created_by,
+            parent_agent,
+        )?;
         // Mirror the persona into the ONE compiled-prompt pipeline so it's a
         // versioned, editable, `prompt_get_latest`-resolved template like every
         // other prompt — co-located with the definition (reachable from any
@@ -4452,6 +4619,10 @@ impl QueryEngine {
             finished_at,
             output_json,
             error,
+            // Subagent oversight — attribute the run to its acting agent (derived
+            // from the run's scope). `None` for `main`/plain `u_*` runs, so a
+            // non-agent run records no attribution (back-compatible).
+            invoked_by: agent_from_ws(ws),
         };
         // P1b — original input (for a resume re-invoke) + sleep timers collected
         // here and registered AFTER the scope journal persists, so a wake always

@@ -1068,6 +1068,78 @@ mod host_ext {
         Ok(AcquireResult { name, body, authored })
     }
 
+    // ── ctx.agents / ctx.putAgent — subagent oversight ──────────────────────
+    // An agent reads the roster (definitions + provenance + recent activity) so
+    // it can oversee the subagents it (or a human) created, and can create a new
+    // subagent at runtime with provenance auto-stamped from the acting agent.
+
+    fn default_roster_runs() -> u32 {
+        5
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct AgentsReq {
+        /// Recent runs to include per agent (0–20; default 5).
+        #[serde(default = "default_roster_runs")]
+        pub recent_runs: u32,
+    }
+
+    /// `ctx.agents()` — the workspace agent roster with provenance + recent runs.
+    /// Read-only, capability-gated on recall (like `ctx.memory.recall`).
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_agents(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: AgentsReq,
+    ) -> Result<Vec<crate::engine::AgentRosterEntry>, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.agents is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.list_agents_roster(req.recent_runs as usize)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("ctx.agents failed: {e}")))
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct PutAgentReq {
+        pub name: String,
+        #[serde(default)]
+        pub persona: String,
+        #[serde(default)]
+        pub model: String,
+        #[serde(default)]
+        pub config_json: String,
+    }
+
+    /// `ctx.putAgent(spec)` — create/update a sub-agent at runtime. Provenance
+    /// (`created_by` / `parent_agent`) is stamped from the acting agent by the
+    /// host. Gated on the `acquire` capability (self-extension).
+    #[op2(async(lazy))]
+    #[serde]
+    pub async fn op_tr_put_agent(
+        state: Rc<RefCell<OpState>>,
+        #[serde] req: PutAgentReq,
+    ) -> Result<thinkingroot_graph::agents::AgentDef, JsErrorBox> {
+        let caps = {
+            let s = state.borrow();
+            s.borrow::<FnHostState>().caps.clone()
+        };
+        let Some(caps) = caps else {
+            return Err(JsErrorBox::generic(
+                "ctx.putAgent is unavailable: this run is not bound to a workspace",
+            ));
+        };
+        caps.create_agent(&req.name, &req.persona, &req.model, &req.config_json)
+            .await
+            .map_err(|e| JsErrorBox::generic(format!("ctx.putAgent failed: {e}")))
+    }
+
     // ── ctx.predict / ctx.dream — the Life-Layer verbs, callable from a run ──
     // Both reach the run's captured workspace handle + its workspace LLM (the
     // customer's own model) via FnCapabilities, so a self-scheduling function
@@ -1286,6 +1358,8 @@ mod host_ext {
             op_tr_cognition_request(),
             op_tr_cite(),
             op_tr_acquire(),
+            op_tr_agents(),
+            op_tr_put_agent(),
             op_tr_predict(),
             op_tr_dream(),
             op_tr_schedule(),
@@ -1451,6 +1525,33 @@ globalThis.__tr_buildCtx = (input, env) => {
         name: String(s.name || ""),
         description: String(s.description || s.name || ""),
         body: s.body ? String(s.body) : "",
+      }));
+  };
+  // ctx.agents(opts?): subagent oversight — the workspace agent roster, each
+  // with provenance {created_by, parent_agent} and a slice of recent runs
+  // (recentRuns, 0–20; default 5). Read-only, journaled (replay returns the
+  // recorded snapshot). Use it to report what subagents exist + what they're
+  // doing. opts: { recentRuns?: number } (also accepts recent_runs).
+  ctx.agents = async (opts) => {
+    const o = (typeof opts === "number") ? { recentRuns: opts } : (opts || {});
+    return await ctx.step(`__agents__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_agents({
+        recent_runs: Number(o.recentRuns ?? o.recent_runs ?? 5) || 0,
+      }));
+  };
+  // ctx.putAgent(spec): create/update a sub-agent at runtime. Provenance
+  // (created_by / parent_agent) is auto-stamped from the acting agent by the
+  // host — the caller cannot forge it. Journaled (no double-create on resume).
+  // spec: { name, persona?, model?, config? } (config is JSON-serialisable).
+  ctx.putAgent = async (spec) => {
+    const s = spec || {};
+    return await ctx.step(`__putAgent__${__opSeq++}`, async () =>
+      await Deno.core.ops.op_tr_put_agent({
+        name: String(s.name || ""),
+        persona: s.persona ? String(s.persona) : "",
+        model: s.model ? String(s.model) : "",
+        config_json: s.config === undefined || s.config === null
+          ? "" : (typeof s.config === "string" ? s.config : JSON.stringify(s.config)),
       }));
   };
   // ctx.predict(question, top_k? | {top_k}): grounded, falsifier-gated "what

@@ -41,6 +41,12 @@ pub struct RootFunctionRun {
     pub output_json: String,
     /// Error message on failure, else `""`.
     pub error: String,
+    /// WHO/WHAT invoked this run (subagent oversight) — a human handle, `"user"`,
+    /// or the calling agent's name. Stored in the `fn_run_attribution` SIDECAR
+    /// (not a column on `root_function_runs`), joined in at read time. `None` for
+    /// every legacy run with no attribution row — back-compatible by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoked_by: Option<String>,
 }
 
 /// A suspended run's outstanding cognition request, awaiting an answer.
@@ -223,6 +229,9 @@ fn row_to_run(row: &[DataValue]) -> RootFunctionRun {
         finished_at: dv_f64(&row[4]),
         output_json: dv_str(&row[5]),
         error: dv_str(&row[6]),
+        // Enriched from the fn_run_attribution sidecar by the caller; the bare
+        // root_function_runs row carries no attribution.
+        invoked_by: None,
     }
 }
 
@@ -543,10 +552,52 @@ impl GraphStore {
             :put root_function_runs {id => function_name, status, started_at, finished_at, output_json, error}"#,
             params,
         )?;
+        // Subagent oversight — persist WHO invoked the run in the sidecar
+        // (only when known; a None invoker writes nothing, so legacy/unattributed
+        // runs leave the sidecar empty and read back as `invoked_by: None`).
+        if let Some(by) = run.invoked_by.as_deref().filter(|s| !s.is_empty()) {
+            self.set_run_attribution(&run.id, by)?;
+        }
         Ok(())
     }
 
-    /// Runs for a function, most-recent first.
+    /// Record WHO/WHAT invoked a run (subagent oversight) in the
+    /// `fn_run_attribution` sidecar. Idempotent `:put` by run id.
+    pub fn set_run_attribution(&self, run_id: &str, invoked_by: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        params.insert("invoked_by".into(), DataValue::Str(invoked_by.into()));
+        params.insert("recorded_at".into(), DataValue::Num(Num::Float(now)));
+        self.query(
+            "?[run_id, invoked_by, recorded_at] <- [[$run_id, $invoked_by, $recorded_at]] \
+             :put fn_run_attribution {run_id => invoked_by, recorded_at}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// The recorded invoker for a run, or `None` when unattributed (legacy).
+    pub fn get_run_attribution(&self, run_id: &str) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[invoked_by] := *fn_run_attribution{run_id: $run_id, invoked_by}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_run_attribution: {e}")))?;
+        Ok(rows
+            .rows
+            .first()
+            .map(|r| dv_str(&r[0]))
+            .filter(|s| !s.is_empty()))
+    }
+
+    /// Runs for a function, most-recent first. Each run's `invoked_by` is joined
+    /// in from the `fn_run_attribution` sidecar (`None` for unattributed runs).
     pub fn list_function_runs(&self, name: &str) -> Result<Vec<RootFunctionRun>> {
         let mut params = BTreeMap::new();
         params.insert("name".into(), DataValue::Str(name.into()));
@@ -561,6 +612,13 @@ impl GraphStore {
             )
             .map_err(|e| Error::GraphStorage(format!("list_function_runs: {e}")))?;
         let mut out: Vec<RootFunctionRun> = rows.rows.iter().map(|r| row_to_run(r)).collect();
+        // Enrich with attribution (sidecar). Best-effort — a lookup failure
+        // leaves invoked_by None rather than failing the whole listing.
+        for run in &mut out {
+            if let Ok(by) = self.get_run_attribution(&run.id) {
+                run.invoked_by = by;
+            }
+        }
         out.sort_by(|a, b| b.started_at.total_cmp(&a.started_at));
         Ok(out)
     }
@@ -1301,6 +1359,7 @@ mod tests {
             finished_at: 100.5,
             output_json: "1".into(),
             error: String::new(),
+            invoked_by: None,
         })
         .unwrap();
         s.record_function_run(&RootFunctionRun {
@@ -1311,12 +1370,16 @@ mod tests {
             finished_at: 200.2,
             output_json: String::new(),
             error: "boom".into(),
+            invoked_by: Some("mrguy".into()),
         })
         .unwrap();
         let runs = s.list_function_runs("hello").unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, "run2", "newest first");
         assert_eq!(runs[1].id, "run1");
+        // Attribution round-trips: run2 was invoked by an agent; run1 was not.
+        assert_eq!(runs[0].invoked_by.as_deref(), Some("mrguy"));
+        assert_eq!(runs[1].invoked_by, None, "legacy/unattributed run reads None");
     }
 
     #[test]

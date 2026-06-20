@@ -1189,6 +1189,20 @@ impl GraphStore {
                 output_json: String default '',
                 error: String default ''
             }",
+            // ─── fn_run_attribution — WHO/WHAT invoked a run (subagent
+            //     oversight). A SIDECAR keyed by run id, NOT a column on
+            //     root_function_runs: adding a column to a `:create` is a no-op
+            //     on an existing brain (so a 7-col INSERT would fail on every
+            //     live workspace), whereas a brand-new relation is created on
+            //     mount via create_schema with ZERO migration. A run with no
+            //     attribution row reads back as `invoked_by = None`, so existing
+            //     runs and the legacy code path are entirely unaffected.
+            ":create fn_run_attribution {
+                run_id: String
+                =>
+                invoked_by: String default '',
+                recorded_at: Float default 0.0
+            }",
             // ─── root_function_steps — durable-execution journal. One row
             //     per completed ctx.step()/shimmed-nondeterminism call, so a
             //     suspended or crashed run REPLAYS recorded results instead

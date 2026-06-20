@@ -2213,6 +2213,13 @@ struct PutAgentBody {
     model: String,
     #[serde(default)]
     config_json: Option<String>,
+    /// Subagent oversight — who created this agent (a human handle / `"user"`).
+    /// Optional + back-compat: omitted → preserved-on-update / absent-on-create.
+    #[serde(default)]
+    created_by: Option<String>,
+    /// When an AGENT created it, the creating agent's name (optional).
+    #[serde(default)]
+    parent_agent: Option<String>,
 }
 
 async fn put_agent_handler(
@@ -2226,7 +2233,15 @@ async fn put_agent_handler(
     let engine = state.engine.read().await;
     let cfg = payload.config_json.as_deref().unwrap_or("{}");
     match engine
-        .put_agent(&ws, &payload.name, &payload.persona, &payload.model, cfg)
+        .put_agent_with_provenance(
+            &ws,
+            &payload.name,
+            &payload.persona,
+            &payload.model,
+            cfg,
+            payload.created_by.as_deref().filter(|s| !s.is_empty()),
+            payload.parent_agent.as_deref().filter(|s| !s.is_empty()),
+        )
         .await
     {
         Ok(a) => ok_response(a).into_response(),
