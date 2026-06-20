@@ -72,6 +72,11 @@ pub struct ToolContext {
     /// HMAC pointer-secret. Required by the McpBridge adapter that
     /// surfaces the full MCP tool catalogue inside the in-app agent.
     pub engram_manager: Arc<EngramManager>,
+    /// Per-agent guardrail: when true, the agent's write/remember path
+    /// (`contribute_claim`) redacts detected PII / secrets from the claim
+    /// statement before persisting (reuses the extractor's pattern catalog).
+    /// `false` (the default for every legacy / non-agent context) = no change.
+    pub block_pii_in_remember: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -812,9 +817,27 @@ impl ContributeClaimTool {
 #[async_trait]
 impl ToolHandler for ContributeClaimTool {
     async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
-        let Some(statement) = input.get("statement").and_then(|v| v.as_str()) else {
+        let Some(statement_raw) = input.get("statement").and_then(|v| v.as_str()) else {
             return ToolHandlerResult::error("missing required field: statement");
         };
+        // PII-on-remember guardrail: strip detected PII / secrets before the
+        // claim is persisted. Off (the default) → byte-identical to before.
+        let statement = if self.ctx.block_pii_in_remember {
+            let (redacted, hit) =
+                thinkingroot_extract::sensitivity::redact_pii(statement_raw);
+            if hit {
+                tracing::info!(
+                    target: "chat_turn",
+                    workspace = %self.ctx.workspace,
+                    agent = %self.ctx.agent_id,
+                    "guardrail redacted PII from remembered claim"
+                );
+            }
+            redacted
+        } else {
+            statement_raw.to_string()
+        };
+        let statement = statement.as_str();
         let claim_type = input
             .get("claim_type")
             .and_then(|v| v.as_str())
@@ -1612,6 +1635,7 @@ mod tests {
             engram_manager: crate::intelligence::engram::EngramManager::new(
                 crate::intelligence::engram::EngramConfig::default(),
             ),
+            block_pii_in_remember: false,
         }
     }
 

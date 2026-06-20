@@ -343,6 +343,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restrict_writes_to_keeps_reads_and_listed_writes_only() {
+        // Guardrail tool-allowlist enforcement: READ tools are always kept;
+        // WRITE tools survive only when named in the allowlist.
+        let r = ToolRegistry::new()
+            .register_read(fixture_tool("search"), Arc::new(EchoHandler { prefix: "" }))
+            .register_read(fixture_tool("recall"), Arc::new(EchoHandler { prefix: "" }))
+            .register_write(fixture_tool("contribute_claim"), Arc::new(EchoHandler { prefix: "" }))
+            .register_write(fixture_tool("merge_branch"), Arc::new(EchoHandler { prefix: "" }));
+        // Allow only `contribute_claim` (a write).
+        let restricted = r.restrict_writes_to(&["contribute_claim".to_string()]);
+        // Reads survive untouched.
+        assert!(restricted.contains("search"));
+        assert!(restricted.contains("recall"));
+        // Listed write survives; unlisted write is dropped.
+        assert!(restricted.contains("contribute_claim"));
+        assert!(!restricted.contains("merge_branch"));
+        assert_eq!(restricted.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn restrict_writes_to_empty_allowlist_drops_all_writes_keeps_reads() {
+        // Enabled-but-empty allowlist = reads-only (the `Some(vec![])` case).
+        let r = ToolRegistry::new()
+            .register_read(fixture_tool("search"), Arc::new(EchoHandler { prefix: "" }))
+            .register_write(fixture_tool("contribute_claim"), Arc::new(EchoHandler { prefix: "" }));
+        let restricted = r.restrict_writes_to(&[]);
+        assert!(restricted.contains("search"));
+        assert!(!restricted.contains("contribute_claim"));
+        assert_eq!(restricted.len(), 1);
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "duplicate tool name")]
     async fn duplicate_registration_panics() {
         let _ = ToolRegistry::new()

@@ -8730,6 +8730,9 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     let mut agent_id = "thinkingroot".to_string();
     // A#4: write/external-tool allowlist parsed from the agent's AgentPolicy.
     let mut agent_allowed_tools: Option<Vec<String>> = None;
+    // Per-agent guardrails (Console `config_json.guardrails`). Default = all-off
+    // (no agent / no guardrails block → byte-identical to legacy behavior).
+    let mut agent_guardrails = thinkingroot_graph::agents::AgentGuardrails::default();
     if let Some(agent_name) = body
         .agent
         .as_deref()
@@ -8775,6 +8778,21 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                             })
                     })
                     .filter(|v| !v.is_empty());
+                // Per-agent guardrails (Console `config_json.guardrails`). The
+                // Console persists the tool allowlist under
+                // `guardrails.{tool_allowlist_enabled, allowed_tools}` (NOT the
+                // legacy flat `tools` key A#4 read). Bridge it: when the
+                // guardrail toggle is on, its `allowed_tools` takes precedence;
+                // otherwise we keep honoring the legacy `tools` key above so
+                // older agents are unaffected.
+                agent_guardrails = def.guardrails();
+                if agent_guardrails.tool_allowlist_enabled {
+                    // Enabled-but-empty is meaningful: restrict to READ tools
+                    // only (no writes/external). `restrict_writes_to(&[])` keeps
+                    // every read and drops every write — that's `Some(vec![])`,
+                    // NOT `None` (None = unrestricted full catalog).
+                    agent_allowed_tools = Some(agent_guardrails.allowed_tools.clone());
+                }
                 tracing::info!(
                     target: "chat_turn",
                     workspace = %ws,
@@ -8798,6 +8816,49 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                 "agent lookup failed — using workspace-default persona"
             ),
         }
+    }
+
+    // Blocked-topics guardrail: when the agent declares blocked topics and the
+    // user's question matches one (case-insensitive substring — v1 is a
+    // conservative keyword match, NOT semantic), refuse the turn before the
+    // agent loop runs. Empty list → never fires (legacy behavior preserved).
+    // The refusal is emitted on the SAME SSE `text`/`done` channel the agent
+    // loop uses, so the client renders it identically to any other answer.
+    if let Some(topic) = agent_guardrails.blocks_question(&body.question) {
+        tracing::info!(
+            target: "chat_turn",
+            workspace = %ws,
+            agent = %agent_id,
+            blocked_topic = %topic,
+            "guardrail blocked question (blocked topic)"
+        );
+        let message = format!(
+            "I can't help with that — this assistant is configured to decline questions about \"{topic}\"."
+        );
+        // Match the agent loop's SSE contract exactly: a `token` event carrying
+        // `{text}` followed by a `final` event carrying `{full_text}` (see
+        // `agent_event_to_sse`), so the client renders this refusal identically
+        // to any other answer.
+        let stream = async_stream::stream! {
+            yield Ok::<Event, std::convert::Infallible>(
+                Event::default().event("token").data(
+                    serde_json::json!({ "text": message }).to_string()
+                )
+            );
+            yield Ok::<Event, std::convert::Infallible>(
+                Event::default().event("final").data(
+                    serde_json::json!({
+                        "full_text": message,
+                        "iterations": 0,
+                        "refused": true,
+                        "reason": "blocked_topic",
+                    }).to_string()
+                )
+            );
+        };
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().text("keep-alive"))
+            .into_response();
     }
 
     tracing::info!(
@@ -8997,6 +9058,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         skills,
         system_refresher: Some(refresher),
         allowed_tools: agent_allowed_tools,
+        block_pii_in_remember: agent_guardrails.block_pii_in_remember,
         run_branch,
         merge_policy: topology.merge_policy,
     };

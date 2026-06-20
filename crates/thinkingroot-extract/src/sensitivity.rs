@@ -112,9 +112,76 @@ fn patterns() -> &'static [(Regex, Sensitivity)] {
     })
 }
 
+/// The subset of the pattern catalog that matches concrete PII / secret
+/// *values* (as opposed to advisory keywords like "confidential" or
+/// "do not share", which describe sensitivity but are not themselves data to
+/// strip). These are safe to *replace in place* for the "block PII in
+/// remember" guardrail. Compiled once.
+fn redaction_patterns() -> &'static [Regex] {
+    static CELL: OnceLock<Vec<Regex>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let raw: &[&str] = &[
+            r"[\w.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+", // email
+            r"\b\d{3}-\d{2}-\d{4}\b",                  // US SSN
+            r"\b(?:\d[ -]*?){13,19}\b",                // credit-card-shape numbers
+            r"\bAKIA[0-9A-Z]{16}\b",                   // AWS access key id
+            r"\bASIA[0-9A-Z]{16}\b",                   // AWS STS key id
+            r"\bAIza[0-9A-Za-z_-]{35}\b",              // Google API key
+            r"\bghp_[A-Za-z0-9]{36}\b",                // GitHub PAT
+            r"\bgho_[A-Za-z0-9]{36}\b",                // GitHub OAuth
+            r"eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_.+/=-]+", // JWT
+            r"(?i)\bBearer\s+[A-Za-z0-9_\-.=]{20,}\b", // Bearer token
+            r"(?i)\b(?:password|passwd|secret|api[_-]?key)\s*[:=]\s*[\S]+", // assignment
+        ];
+        raw.iter()
+            .map(|p| Regex::new(p).expect("valid redaction regex"))
+            .collect()
+    })
+}
+
+/// Redact concrete PII / secret values from `text`, replacing each match with
+/// `[redacted]`. Returns the (possibly-rewritten) text and a flag indicating
+/// whether anything was redacted. Reuses the same high-confidence pattern
+/// catalog the sensitivity classifier uses (no new PII engine). Advisory
+/// keyword patterns (e.g. "confidential") are intentionally NOT redacted —
+/// only literal data is stripped.
+pub fn redact_pii(text: &str) -> (String, bool) {
+    let mut out = text.to_string();
+    let mut redacted = false;
+    for re in redaction_patterns() {
+        if re.is_match(&out) {
+            redacted = true;
+            out = re.replace_all(&out, "[redacted]").into_owned();
+        }
+    }
+    (out, redacted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_pii_strips_email_and_flags() {
+        let (out, hit) = redact_pii("contact alice@example.com today");
+        assert!(hit);
+        assert!(!out.contains("alice@example.com"));
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_pii_leaves_plain_prose_untouched() {
+        let (out, hit) = redact_pii("Rust is a systems language.");
+        assert!(!hit);
+        assert_eq!(out, "Rust is a systems language.");
+    }
+
+    #[test]
+    fn redact_pii_strips_aws_key() {
+        let (out, hit) = redact_pii("key is AKIAIOSFODNN7EXAMPLE here");
+        assert!(hit);
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
 
     #[test]
     fn empty_input_returns_none() {

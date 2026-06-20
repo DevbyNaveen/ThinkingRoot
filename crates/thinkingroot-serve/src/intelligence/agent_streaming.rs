@@ -63,6 +63,10 @@ pub struct StreamAgentRequest {
     /// handler passes `None` when no agent is named or the agent declares no
     /// tools, so existing flows are byte-identical.
     pub allowed_tools: Option<Vec<String>>,
+    /// Per-agent guardrail (Console `config_json.guardrails.block_pii_in_remember`):
+    /// when true, the agent's `contribute_claim` write path redacts detected
+    /// PII / secrets before persisting. `false` = legacy behavior (no change).
+    pub block_pii_in_remember: bool,
     /// Agent State Topology (Tasks 5+6): when set, the run executes isolated on
     /// this branch and is settled per `merge_policy` after the loop completes.
     /// `None` means no per-run isolation (legacy / default topology behavior).
@@ -201,6 +205,7 @@ pub fn spawn_agent_run(
             agent_id: req.agent_id,
             skills: req.skills,
             engram_manager: deps.engram_manager,
+            block_pii_in_remember: req.block_pii_in_remember,
         };
         let registry = register_builtin_tools(ctx).await;
         // A#4: scope the agent to its declared tool allowlist (reads always
