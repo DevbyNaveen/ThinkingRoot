@@ -2789,10 +2789,12 @@ impl QueryEngine {
         let source_store = FileSystemSourceStore::new(&source_store_dir)
             .map_err(|e| Error::Config(format!("open source store: {e}")))?;
 
-        // Minimal manifest — name from the workspace, version 0.1.0. The
-        // v3 writer fills in all hash fields at build() time.
+        // Minimal manifest — the pack name MUST match the `owner/name`
+        // convention (`validate_name` requires exactly one `/`), so a bare
+        // workspace like `main` is namespaced under `export/`. Version 0.1.0;
+        // the v3 writer fills in all hash fields at build() time.
         let mut manifest = ManifestV3::new(
-            ws,
+            format!("export/{ws}"),
             Version::parse("0.1.0").map_err(|e| Error::Config(format!("pack version: {e}")))?,
         );
         manifest.extracted_at = Some(chrono::Utc::now());
