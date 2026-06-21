@@ -67,10 +67,18 @@ pub struct StreamAgentRequest {
     /// when true, the agent's `contribute_claim` write path redacts detected
     /// PII / secrets before persisting. `false` = legacy behavior (no change).
     pub block_pii_in_remember: bool,
+    /// P1.2 capability flag (`config_json.feature_flags.can_remember`): when
+    /// false, the agent's memory-write tool (`contribute_claim`) is refused so
+    /// the run can read/act but never persists memory. `true` = legacy behavior.
+    pub can_remember: bool,
     /// Agent State Topology (Tasks 5+6): when set, the run executes isolated on
     /// this branch and is settled per `merge_policy` after the loop completes.
     /// `None` means no per-run isolation (legacy / default topology behavior).
     pub run_branch: Option<String>,
+    /// P1.6 — base branch this run reads from (and writes to when there is no
+    /// per-run isolation). `None` = the live trunk. Lower precedence than
+    /// `run_branch` (per-run isolation), which fully overrides routing.
+    pub target_branch: Option<String>,
     pub merge_policy: thinkingroot_core::AgentMergePolicy,
 }
 
@@ -194,6 +202,20 @@ pub fn spawn_agent_run(
                     )
                 });
             session.set_branch(rb.to_string());
+        } else if let Some(tb) = req.target_branch.as_deref() {
+            // P1.6 — no per-run isolation: route this run's reads + writes to the
+            // requested target branch (e.g. a canary agent-version branch). Lower
+            // precedence than run_branch above.
+            let mut store = sessions_for_obs.lock().await;
+            let session = store
+                .entry(req.session_id.clone())
+                .or_insert_with(|| {
+                    crate::intelligence::session::SessionContext::new(
+                        &req.session_id,
+                        &req.workspace,
+                    )
+                });
+            session.set_branch(tb.to_string());
         }
 
         let ctx = ToolContext {
@@ -206,6 +228,7 @@ pub fn spawn_agent_run(
             skills: req.skills,
             engram_manager: deps.engram_manager,
             block_pii_in_remember: req.block_pii_in_remember,
+            can_remember: req.can_remember,
         };
         let registry = register_builtin_tools(ctx).await;
         // A#4: scope the agent to its declared tool allowlist (reads always

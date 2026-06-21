@@ -959,6 +959,10 @@ struct WorkspaceHandle {
     config: Config,
     /// LLM client for ReAct synthesis — None if provider is not configured.
     llm: Option<Arc<thinkingroot_llm::llm::LlmClient>>,
+    /// P1.7 — last-access unix timestamp (interior-mutable so reads via the
+    /// shared `&self` get_workspace can touch it); the per-user LRU evicts the
+    /// least-recently-used idle brain when over `TR_MAX_MOUNTED_WS`.
+    last_use: Arc<std::sync::atomic::AtomicI64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,6 +1659,41 @@ impl FnCapabilities {
         let parent_agent = caller; // only set when an AGENT is the creator
         let cfg = if config_json.trim().is_empty() { "{}" } else { config_json };
         let storage = self.agent_home_handle().storage.lock().await;
+        // P1.3 sub-agent governance — enforce the CREATING agent's policy. Human/
+        // user creates (no caller agent) are ungated. A missing parent def is
+        // permissive (never break creation on a lookup miss).
+        if let Some(parent) = parent_agent.as_deref()
+            && let Some(parent_def) = storage.graph.get_agent(parent)?
+        {
+            let pol = parent_def.subagent_policy();
+            if !pol.can_spawn_subagents {
+                return Err(Error::Config(format!(
+                    "agent '{parent}' is not permitted to spawn sub-agents \
+                     (can_spawn_subagents=false)"
+                )));
+            }
+            // New sub-agent depth = parent's depth + 1; walk parent_agent upward
+            // (bounded) to find the parent's depth from a root (parent_agent=None).
+            let mut parent_depth = 1usize;
+            let mut cur = parent.to_string();
+            for _ in 0..16 {
+                match storage.graph.get_agent(&cur)?.and_then(|d| d.parent_agent()) {
+                    Some(p) if p != cur => {
+                        parent_depth += 1;
+                        cur = p;
+                    }
+                    _ => break,
+                }
+            }
+            let new_depth = (parent_depth + 1) as u32;
+            if new_depth > pol.max_depth {
+                return Err(Error::Config(format!(
+                    "sub-agent nesting depth {new_depth} exceeds agent '{parent}' \
+                     max_depth {}",
+                    pol.max_depth
+                )));
+            }
+        }
         let def = storage.graph.put_agent_with_provenance(
             name,
             persona,
@@ -2303,6 +2342,9 @@ impl QueryEngine {
                 cache: Arc::new(RwLock::new(cache)),
                 config,
                 llm,
+                last_use: Arc::new(std::sync::atomic::AtomicI64::new(
+                    chrono::Utc::now().timestamp(),
+                )),
             },
         );
 
@@ -2374,6 +2416,9 @@ impl QueryEngine {
                 cache: Arc::new(RwLock::new(cache)),
                 config,
                 llm,
+                last_use: Arc::new(std::sync::atomic::AtomicI64::new(
+                    chrono::Utc::now().timestamp(),
+                )),
             },
         );
 
@@ -2414,6 +2459,32 @@ impl QueryEngine {
     /// namespace), so a typo can't spawn junk workspaces. Per-user data dirs
     /// live OUTSIDE the shared workspace root (sibling `.thinkingroot-users/`)
     /// so the shared source-tree watcher never picks them up.
+    /// Reject workspace names that could escape the data volume or collide.
+    /// The gateway already charset-guards the path SEGMENT for gateway-routed
+    /// requests (`is_clean_namespace_token`); this is the engine-side belt-and-
+    /// suspenders so a malformed name reaching mount from ANY path can't
+    /// traverse out of the per-user dir. Allows `[A-Za-z0-9_.:-]` (covers
+    /// `u_<id>`, `agent_<name>`, composite `u_X__agent_Y`, and `:`-hierarchical
+    /// ids) but blocks empties, path separators, parent refs, and leading dots.
+    fn validate_workspace_name(ws: &str) -> Result<()> {
+        let bad = ws.is_empty()
+            || ws.len() > 200
+            || ws.starts_with('.')
+            || ws.contains("..")
+            || ws.contains('/')
+            || ws.contains('\\')
+            || !ws
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b':'));
+        if bad {
+            return Err(Error::Config(format!(
+                "invalid workspace name '{ws}': must be non-empty, <=200 chars, contain no \
+                 path separators / '..' / leading '.', and only [A-Za-z0-9_.:-]"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn get_or_mount_user_ws(&mut self, ws: &str) -> Result<()> {
         if self.workspaces.contains_key(ws) {
             return Ok(());
@@ -2423,6 +2494,9 @@ impl QueryEngine {
                 "workspace '{ws}' is not mounted and is not an auto-mountable per-user namespace"
             )));
         }
+        // Belt-and-suspenders path-traversal guard before any filesystem join
+        // (the gateway also charset-guards gateway-routed requests).
+        Self::validate_workspace_name(ws)?;
         let anchor = self
             .primary_ws_name()
             .and_then(|p| self.workspaces.get(&p))
@@ -2465,7 +2539,55 @@ impl QueryEngine {
                 let _ = Box::pin(self.get_or_mount_user_ws(&agent_brain)).await;
             }
         }
+        // P1.7 — bound the mounted set after a USER mount (skip the agent_*
+        // recursion above; agent brains are pinned anyway). The current request's
+        // whole inheritance chain is protected, so we never unmount a brain it
+        // still needs.
+        if !ws.starts_with("agent_") {
+            self.evict_idle_user_ws(ws);
+        }
         Ok(())
+    }
+
+    /// P1.7 — per-user LRU eviction. Bounds the mounted set: drops the
+    /// least-recently-used per-user/composite brain (`u_*`) whose CozoDB has NO
+    /// live clones (`Arc::strong_count(storage) == 1` → no in-flight run holding
+    /// it, so remount can't double-open the DB). `main` and `agent_*` are pinned;
+    /// every brain in `keep`'s inheritance chain is protected. No-op unless
+    /// `TR_MAX_MOUNTED_WS` is set (> 0).
+    fn evict_idle_user_ws(&mut self, keep: &str) {
+        let Some(cap) = std::env::var("TR_MAX_MOUNTED_WS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|c| *c > 0)
+        else {
+            return;
+        };
+        let protected: std::collections::HashSet<String> =
+            self.inheritance_chain(keep).into_iter().collect();
+        while self.workspaces.len() > cap {
+            let victim = self
+                .workspaces
+                .iter()
+                .filter(|(name, h)| {
+                    name.starts_with("u_")
+                        && !protected.contains(name.as_str())
+                        && Arc::strong_count(&h.storage) == 1
+                })
+                .min_by_key(|(_, h)| h.last_use.load(std::sync::atomic::Ordering::Relaxed))
+                .map(|(name, _)| name.clone());
+            match victim {
+                Some(name) => {
+                    self.workspaces.remove(&name);
+                    tracing::info!(
+                        target: "engine",
+                        ws = %name,
+                        "P1.7 LRU: evicted idle per-user brain"
+                    );
+                }
+                None => break, // nothing evictable without risking a live brain
+            }
+        }
     }
 
     /// List all currently mounted workspaces with summary counts.
@@ -2688,10 +2810,25 @@ impl QueryEngine {
         // → shared): the first brain that HAS the named template assembles it.
         // `prompt_get_latest` distinguishes "not in this brain" from a real
         // template error in the brain that owns it (Slice 1: prompt inheritance).
+        let primary = self.primary_ws_name();
         for brain in self.inheritance_chain(ws) {
-            if let Ok(handle) = self.get_workspace(&brain) {
+            // Check presence + drop the lock BEFORE the connect gate (re-locks).
+            let has = if let Ok(handle) = self.get_workspace(&brain) {
                 let storage = handle.storage.lock().await;
-                if storage.graph.prompt_get_latest(name)?.is_some() {
+                storage.graph.prompt_get_latest(name)?.is_some()
+            } else {
+                false
+            };
+            if has {
+                // Gate ONLY an inherited primary-catalog prompt (connect-don't-inherit).
+                if brain != ws
+                    && primary.as_deref() == Some(brain.as_str())
+                    && !self.inherited_from_catalog_allowed(ws, name, true).await
+                {
+                    continue;
+                }
+                if let Ok(handle) = self.get_workspace(&brain) {
+                    let storage = handle.storage.lock().await;
                     return storage.graph.assemble_prompt(name, vars);
                 }
             }
@@ -3506,6 +3643,34 @@ impl QueryEngine {
         chain
     }
 
+    /// "Connect, don't inherit": for an AGENT scope (`agent_<name>` or a
+    /// composite `u_<id>__agent_<name>`), a capability resolved from the shared
+    /// PRIMARY catalog is allowed only if the agent explicitly connected it.
+    /// Matches in the agent's OWN brain (or the calling scope itself) are never
+    /// gated. Non-agent scopes (bare `u_*`, the primary, sub-topic brains) and
+    /// agents with no connected list set → always allowed (inherit-all,
+    /// preserving today's behavior). MUST be called with NO workspace storage
+    /// lock held — it re-resolves the agent def via the inheritance chain.
+    async fn inherited_from_catalog_allowed(&self, ws: &str, name: &str, is_prompt: bool) -> bool {
+        // Derive the agent owning this scope (`u_X__agent_Y`/`agent_Y` → Y).
+        let Some(agent) = agent_from_ws(ws) else {
+            return true; // not an agent scope → inherit-all
+        };
+        let def = match self.get_agent(ws, &agent).await {
+            Ok(Some(d)) => d,
+            _ => return true, // no agent def → never break resolution
+        };
+        let list = if is_prompt {
+            def.connected_prompts()
+        } else {
+            def.connected_functions()
+        };
+        match list {
+            None => true,                           // no list → inherit-all (legacy)
+            Some(l) => l.iter().any(|n| n == name), // gated to the connected set
+        }
+    }
+
     pub async fn get_function(
         &self,
         ws: &str,
@@ -3518,12 +3683,26 @@ impl QueryEngine {
         // shared (or agent) brain is callable from any per-user / per-(user×agent)
         // scope; it still EXECUTES in the calling scope (its `ctx.memory` targets
         // that brain). Never crosses into another user's or agent's workspace.
+        let primary = self.primary_ws_name();
         for brain in self.inheritance_chain(ws) {
-            if let Ok(handle) = self.get_workspace(&brain) {
+            // Look up + drop the storage lock BEFORE the connect gate (which
+            // re-locks via get_agent) — holding it across that await deadlocks.
+            let found = if let Ok(handle) = self.get_workspace(&brain) {
                 let storage = handle.storage.lock().await;
-                if let Some(f) = storage.graph.get_function(name)? {
-                    return Ok(Some(f));
+                storage.graph.get_function(name)?
+            } else {
+                None
+            };
+            if let Some(f) = found {
+                // Gate ONLY a match inherited from the shared/primary catalog;
+                // the calling scope itself + the agent's own brain are always ok.
+                if brain != ws
+                    && primary.as_deref() == Some(brain.as_str())
+                    && !self.inherited_from_catalog_allowed(ws, name, false).await
+                {
+                    continue;
                 }
+                return Ok(Some(f));
             }
         }
         Ok(None)
@@ -3672,6 +3851,36 @@ impl QueryEngine {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
         storage.graph.delete_agent(name)
+    }
+
+    /// Read a per-workspace setting (P1.4 `ws_settings`), resolving through the
+    /// inheritance chain (self → agent brain → shared): a userMind's own value
+    /// wins, else a project-level default is visible. `None` if unset everywhere.
+    pub async fn get_ws_setting(&self, ws: &str, key: &str) -> Result<Option<String>> {
+        let _ = self.get_workspace(ws)?;
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if let Some(v) = storage.graph.get_setting(key)? {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Upsert a per-workspace setting in THIS scope's own brain (no inheritance).
+    pub async fn set_ws_setting(&self, ws: &str, key: &str, value: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.set_setting(key, value)
+    }
+
+    /// List this scope's own settings (no inheritance).
+    pub async fn list_ws_settings(&self, ws: &str) -> Result<Vec<(String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_settings()
     }
 
     /// A6 — record a verification verdict for one forge test case and CORRECT
@@ -6553,6 +6762,16 @@ side referenced. Strict rules:\n\
         auto_merge: bool,
         sessions: &crate::intelligence::session::SessionStore,
     ) -> Result<DreamReport> {
+        // P1.2: an agent with `dream_enabled=false` may not dream. Non-agent
+        // scopes (main, bare `u_<id>`) carry no flag → unchanged.
+        if let Some(agent) = agent_from_ws(ws)
+            && let Ok(Some(def)) = self.get_agent(ws, &agent).await
+            && !def.feature_flags().dream_enabled
+        {
+            return Err(Error::Config(format!(
+                "agent '{agent}' is not permitted to dream (dream_enabled=false)"
+            )));
+        }
         let llm = self.workspace_llm(ws).ok_or_else(|| {
             Error::Config(format!("workspace '{ws}' has no LLM configured — cannot dream"))
         })?;
@@ -6579,8 +6798,17 @@ side referenced. Strict rules:\n\
             });
         }
 
-        // Generative abstraction via the workspace LLM.
-        let prompt = crate::intelligence::dream::build_dream_prompt(&claims);
+        // Generative abstraction via the workspace LLM. P1.4: prepend this
+        // userMind's `entity_context` (if set) so dreams are personalized to the
+        // memory space — consumed HERE at the LLM, NOT in the (pure-CPU)
+        // structural extractor where it would be a no-op.
+        let mut prompt = crate::intelligence::dream::build_dream_prompt(&claims);
+        if let Ok(Some(ctx)) = self.get_ws_setting(ws, "entity_context").await {
+            let ctx = ctx.trim();
+            if !ctx.is_empty() {
+                prompt = format!("Context about this memory space:\n{ctx}\n\n{prompt}");
+            }
+        }
         let out = llm.chat(crate::intelligence::dream::DREAM_SYSTEM, &prompt).await?;
         let insights =
             crate::intelligence::dream::parse_dream_insights(&out, max_insights.clamp(1, 20));
@@ -10520,9 +10748,15 @@ Rules: \
 
     /// Look up a mounted workspace by name, returning an error if not found.
     fn get_workspace(&self, name: &str) -> Result<&WorkspaceHandle> {
-        self.workspaces
+        let handle = self
+            .workspaces
             .get(name)
-            .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))
+            .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))?;
+        // P1.7 LRU: record access through the shared ref (atomic = interior mut).
+        handle
+            .last_use
+            .store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+        Ok(handle)
     }
 
     /// Return the LLM client for a workspace, if one was successfully initialised.
@@ -11473,5 +11707,35 @@ mod routing_tests {
             QueryEngine::input_class_for("classify", &serde_json::json!({"msg": "x"})),
             "classify:obj[msg]"
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_name_guard_tests {
+    //! P1.5 — the engine-side path-traversal guard for per-user workspace
+    //! names (belt-and-suspenders behind the gateway's namespace charset check).
+    use super::*;
+
+    #[test]
+    fn accepts_legitimate_scopes() {
+        for ws in [
+            "u_alice",
+            "agent_sales",
+            "u_naveen__agent_coach",
+            "main",
+            "org:acme:user:jo",
+            "u_123-x.y",
+        ] {
+            assert!(QueryEngine::validate_workspace_name(ws).is_ok(), "ws={ws}");
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_separators() {
+        for ws in [
+            "", ".", "..", "u_../../etc", "u_a/b", "u_a\\b", ".hidden", "u_a..b", "u_a b", "u_a@b",
+        ] {
+            assert!(QueryEngine::validate_workspace_name(ws).is_err(), "ws={ws}");
+        }
     }
 }

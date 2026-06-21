@@ -101,6 +101,75 @@ impl AgentGuardrails {
     }
 }
 
+fn flag_on() -> bool {
+    true
+}
+
+fn default_max_depth() -> u32 {
+    2
+}
+
+/// Per-agent capability switches stored under `config_json.feature_flags`.
+/// Every field defaults to TRUE, so an agent with no `feature_flags` block (every
+/// agent created before this feature) behaves exactly as before — flags only ever
+/// RESTRICT, opt-in. The Console writes the same snake_case keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentFeatureFlags {
+    /// May the agent persist memories (remember/store) during a run.
+    #[serde(default = "flag_on")]
+    pub can_remember: bool,
+    /// May the agent call WRITE/external tools (READ tools are always kept).
+    #[serde(default = "flag_on")]
+    pub can_use_tools: bool,
+    /// May the agent use the web-search tool.
+    #[serde(default = "flag_on")]
+    pub web_search: bool,
+    /// May the agent invoke `dream` (night-shift synthesis).
+    #[serde(default = "flag_on")]
+    pub dream_enabled: bool,
+}
+
+impl Default for AgentFeatureFlags {
+    fn default() -> Self {
+        Self {
+            can_remember: true,
+            can_use_tools: true,
+            web_search: true,
+            dream_enabled: true,
+        }
+    }
+}
+
+/// Governs whether/how this agent may spawn TIER-2 sub-agents, stored under
+/// `config_json.subagents`. Defaults preserve today's behavior: spawning
+/// allowed, JIT auto-spawn off (it's a dark capability), no approval gate,
+/// children inherit the parent's connected tools, max nesting depth 2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSubagentPolicy {
+    #[serde(default = "flag_on")]
+    pub can_spawn_subagents: bool,
+    #[serde(default)]
+    pub auto_jit: bool,
+    #[serde(default)]
+    pub require_approval: bool,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "flag_on")]
+    pub inherit_parent_tools: bool,
+}
+
+impl Default for AgentSubagentPolicy {
+    fn default() -> Self {
+        Self {
+            can_spawn_subagents: true,
+            auto_jit: false,
+            require_approval: false,
+            max_depth: 2,
+            inherit_parent_tools: true,
+        }
+    }
+}
+
 impl AgentDef {
     /// Parse this agent's `config_json.guardrails` into the typed view.
     /// A missing / malformed `config_json` or absent `guardrails` block
@@ -123,6 +192,56 @@ impl AgentDef {
     /// `config_json.provenance.parent_agent`. `None` for human-created agents.
     pub fn parent_agent(&self) -> Option<String> {
         provenance_field(&self.config_json, "parent_agent")
+    }
+
+    /// The functions this agent has explicitly CONNECTED from the shared
+    /// catalog (`config_json.connected_functions`). The "connect, don't
+    /// inherit" model: a capability deployed in the shared/primary brain reaches
+    /// this agent only if its name is in this list.
+    ///
+    /// `None` = no list set → **inherit-all** (legacy behavior, zero regression
+    /// until an agent opts in). `Some([])` = connected to nothing from the
+    /// catalog (the agent uses only its OWN local capabilities). A match in the
+    /// agent's OWN brain is always allowed regardless of this list — it gates
+    /// only INHERITED catalog matches.
+    pub fn connected_functions(&self) -> Option<Vec<String>> {
+        self.connected_list("connected_functions")
+    }
+
+    /// Prompts this agent has explicitly connected from the catalog
+    /// (`config_json.connected_prompts`). Same semantics as
+    /// [`connected_functions`](Self::connected_functions).
+    pub fn connected_prompts(&self) -> Option<Vec<String>> {
+        self.connected_list("connected_prompts")
+    }
+
+    /// Read an optional string-array field from `config_json`. A missing field,
+    /// non-array value, or malformed config yields `None` (= inherit-all).
+    fn connected_list(&self, field: &str) -> Option<Vec<String>> {
+        serde_json::from_str::<serde_json::Value>(&self.config_json)
+            .ok()
+            .and_then(|v| v.get(field).cloned())
+            .and_then(|a| serde_json::from_value::<Vec<String>>(a).ok())
+    }
+
+    /// Capability flags (`config_json.feature_flags`). Absent/malformed → all-on
+    /// (legacy behavior). Flags only ever RESTRICT.
+    pub fn feature_flags(&self) -> AgentFeatureFlags {
+        serde_json::from_str::<serde_json::Value>(&self.config_json)
+            .ok()
+            .and_then(|v| v.get("feature_flags").cloned())
+            .and_then(|f| serde_json::from_value::<AgentFeatureFlags>(f).ok())
+            .unwrap_or_default()
+    }
+
+    /// Sub-agent governance (`config_json.subagents`). Absent/malformed →
+    /// permissive defaults (spawning allowed, depth 2).
+    pub fn subagent_policy(&self) -> AgentSubagentPolicy {
+        serde_json::from_str::<serde_json::Value>(&self.config_json)
+            .ok()
+            .and_then(|v| v.get("subagents").cloned())
+            .and_then(|s| serde_json::from_value::<AgentSubagentPolicy>(s).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -330,6 +449,48 @@ impl GraphStore {
             params,
         )?;
         Ok(true)
+    }
+
+    // ─── Per-workspace settings (P1.4 `ws_settings` kv store) ──────────────
+    // A tiny key→value store per brain: `entity_context` (per-userMind LLM
+    // context), and future per-userMind settings (display name, retention).
+
+    /// Upsert a per-workspace setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("key".into(), DataValue::Str(key.into()));
+        params.insert("value".into(), DataValue::Str(value.into()));
+        self.query(
+            r#"?[key, value] <- [[$key, $value]]
+            :put ws_settings {key => value}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Read a per-workspace setting; `None` if unset.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("key".into(), DataValue::Str(key.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[value] := *ws_settings{key, value}, key = $key",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_setting: {e}")))?;
+        Ok(rows.rows.first().map(|r| dv_str(&r[0])))
+    }
+
+    /// List all per-workspace settings as `(key, value)` pairs.
+    pub fn list_settings(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .query_read("?[key, value] := *ws_settings{key, value}")?
+            .rows
+            .iter()
+            .map(|r| (dv_str(&r[0]), dv_str(&r[1])))
+            .collect())
     }
 }
 
@@ -540,5 +701,127 @@ mod provenance_tests {
         // A later update that omits provenance keeps "new".
         let again = s.put_agent("p", "x2", "", "{}").unwrap();
         assert_eq!(again.created_by.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn ws_settings_set_get_list_roundtrip() {
+        let s = store();
+        assert_eq!(s.get_setting("entity_context").unwrap(), None);
+        s.set_setting("entity_context", "Treat this user as a patient.")
+            .unwrap();
+        assert_eq!(
+            s.get_setting("entity_context").unwrap().as_deref(),
+            Some("Treat this user as a patient.")
+        );
+        // upsert overwrites in place
+        s.set_setting("entity_context", "v2").unwrap();
+        assert_eq!(s.get_setting("entity_context").unwrap().as_deref(), Some("v2"));
+        s.set_setting("display_name", "Naveen").unwrap();
+        let mut all = s.list_settings().unwrap();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                ("display_name".to_string(), "Naveen".to_string()),
+                ("entity_context".to_string(), "v2".to_string()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod connected_tests {
+    use super::*;
+
+    fn agent(config_json: &str) -> AgentDef {
+        AgentDef {
+            name: "a".into(),
+            persona: "p".into(),
+            model: "".into(),
+            created_by: None,
+            parent_agent: None,
+            config_json: config_json.into(),
+            created_at: 0.0,
+            updated_at: 0.0,
+        }
+    }
+
+    #[test]
+    fn absent_list_is_inherit_all() {
+        // No list anywhere → None = inherit-all (legacy, zero regression).
+        for cfg in ["", "{}", r#"{"recall_k":5,"guardrails":{}}"#] {
+            assert_eq!(agent(cfg).connected_functions(), None, "cfg={cfg:?}");
+            assert_eq!(agent(cfg).connected_prompts(), None, "cfg={cfg:?}");
+        }
+    }
+
+    #[test]
+    fn empty_list_connects_nothing() {
+        let a = agent(r#"{"connected_functions":[],"connected_prompts":[]}"#);
+        assert_eq!(a.connected_functions(), Some(vec![]));
+        assert_eq!(a.connected_prompts(), Some(vec![]));
+    }
+
+    #[test]
+    fn explicit_list_round_trips() {
+        let a = agent(
+            r#"{"connected_functions":["compile","close_deal"],"connected_prompts":["greeting"]}"#,
+        );
+        assert_eq!(
+            a.connected_functions(),
+            Some(vec!["compile".to_string(), "close_deal".to_string()])
+        );
+        assert_eq!(a.connected_prompts(), Some(vec!["greeting".to_string()]));
+    }
+
+    #[test]
+    fn malformed_or_wrong_type_is_none() {
+        assert_eq!(agent("{not json").connected_functions(), None);
+        assert_eq!(
+            agent(r#"{"connected_functions":"oops"}"#).connected_functions(),
+            None
+        );
+    }
+
+    #[test]
+    fn feature_flags_absent_is_all_on() {
+        for cfg in ["", "{}", r#"{"recall_k":5}"#] {
+            let f = agent(cfg).feature_flags();
+            assert_eq!(f, AgentFeatureFlags::default(), "cfg={cfg:?}");
+            assert!(f.can_remember && f.can_use_tools && f.web_search && f.dream_enabled);
+        }
+    }
+
+    #[test]
+    fn feature_flags_partial_restricts_only_named() {
+        let f = agent(r#"{"feature_flags":{"can_use_tools":false,"dream_enabled":false}}"#)
+            .feature_flags();
+        assert!(!f.can_use_tools);
+        assert!(!f.dream_enabled);
+        // omitted flags stay ON (no regression)
+        assert!(f.can_remember);
+        assert!(f.web_search);
+    }
+
+    #[test]
+    fn subagent_policy_defaults_permissive() {
+        let p = agent("{}").subagent_policy();
+        assert!(p.can_spawn_subagents);
+        assert!(!p.auto_jit);
+        assert!(!p.require_approval);
+        assert_eq!(p.max_depth, 2);
+        assert!(p.inherit_parent_tools);
+    }
+
+    #[test]
+    fn subagent_policy_parses_console_keys() {
+        let p = agent(r#"{"subagents":{"can_spawn_subagents":false,"auto_jit":true,"max_depth":1}}"#)
+            .subagent_policy();
+        assert!(!p.can_spawn_subagents);
+        assert!(p.auto_jit);
+        assert_eq!(p.max_depth, 1);
+        // omitted → defaults
+        assert!(!p.require_approval);
+        assert!(p.inherit_parent_tools);
     }
 }

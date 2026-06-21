@@ -941,6 +941,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/agents/{name}",
                 get(get_agent_handler).delete(delete_agent_handler),
             )
+            // P1.4 — per-workspace settings kv (entity_context, display name, …).
+            .route(
+                "/ws/{ws}/settings",
+                get(list_settings_handler).put(put_setting_handler),
+            )
             // Learned retrieval prior (item 10) — read-only learning window.
             .route(
                 "/ws/{ws}/learning/retrieval-prior",
@@ -2287,6 +2292,50 @@ async fn delete_agent_handler(
     let engine = state.engine.read().await;
     match engine.delete_agent(&ws, &name).await {
         Ok(removed) => ok_response(serde_json::json!({ "deleted": removed })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PutSettingReq {
+    key: String,
+    value: String,
+}
+
+/// `GET /api/v1/ws/{ws}/settings` — this scope's settings as a JSON object.
+async fn list_settings_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.list_ws_settings(&ws).await {
+        Ok(pairs) => {
+            let map: serde_json::Map<String, serde_json::Value> = pairs
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            ok_response(serde_json::Value::Object(map)).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `PUT /api/v1/ws/{ws}/settings` — upsert one `{key, value}` setting
+/// (e.g. `entity_context`) into this scope's own brain.
+async fn put_setting_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(req): Json<PutSettingReq>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.set_ws_setting(&ws, &req.key, &req.value).await {
+        Ok(()) => ok_response(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => match_engine_error(e),
     }
 }
@@ -7635,6 +7684,11 @@ struct AskRequest {
     /// honoured on the `use_agent` streaming path.
     #[serde(default)]
     agent: Option<String>,
+    /// P1.6 — run this turn against a specific branch (its reads, and writes
+    /// when no per-run isolation applies). Set by the SDK or injected by the
+    /// gateway's `X-TR-Branch` (canary traffic-%). `None` = the live trunk.
+    #[serde(default)]
+    branch: Option<String>,
     /// Stable identifier for this conversation. Used by the agent
     /// path as the MCP session id (which scopes
     /// `contribute_claim`'s active branch and provenance). When
@@ -8157,7 +8211,8 @@ async fn ask_handler(
 async fn ask_stream_handler(
     State(state): State<Arc<AppState>>,
     Path(ws): Path<String>,
-    Json(body): Json<AskRequest>,
+    headers: HeaderMap,
+    Json(mut body): Json<AskRequest>,
 ) -> impl IntoResponse {
     use crate::intelligence::identity::build_workspace_identity;
     use crate::intelligence::synthesizer::{
@@ -8165,6 +8220,17 @@ async fn ask_stream_handler(
     };
     use futures::StreamExt;
     use std::collections::{HashMap, HashSet};
+
+    // P1.6 — a gateway-injected `X-TR-Branch` (canary traffic-%) targets a branch
+    // for this run; the header wins over any body `branch`.
+    if let Some(b) = headers
+        .get("x-tr-branch")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body.branch = Some(b.to_string());
+    }
 
     // Agent path branches off as early as possible: it has its own
     // event stream (tool_call_* + token + final + error) and reuses
@@ -8748,6 +8814,9 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // Per-agent guardrails (Console `config_json.guardrails`). Default = all-off
     // (no agent / no guardrails block → byte-identical to legacy behavior).
     let mut agent_guardrails = thinkingroot_graph::agents::AgentGuardrails::default();
+    // P1.2 capability flags (Console `config_json.feature_flags`). Default = all-on
+    // (no agent / no flags block → byte-identical to legacy behavior).
+    let mut agent_feature_flags = thinkingroot_graph::agents::AgentFeatureFlags::default();
     if let Some(agent_name) = body
         .agent
         .as_deref()
@@ -8807,6 +8876,14 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
                     // every read and drops every write — that's `Some(vec![])`,
                     // NOT `None` (None = unrestricted full catalog).
                     agent_allowed_tools = Some(agent_guardrails.allowed_tools.clone());
+                }
+                // P1.2 capability flags (Console `config_json.feature_flags`).
+                agent_feature_flags = def.feature_flags();
+                // `can_use_tools=false` hard-restricts to READ tools regardless of
+                // any allowlist (keeps reads, drops all writes/external incl
+                // web_search). Absent flag = on (no change).
+                if !agent_feature_flags.can_use_tools {
+                    agent_allowed_tools = Some(Vec::new());
                 }
                 tracing::info!(
                     target: "chat_turn",
@@ -9074,7 +9151,9 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         system_refresher: Some(refresher),
         allowed_tools: agent_allowed_tools,
         block_pii_in_remember: agent_guardrails.block_pii_in_remember,
+        can_remember: agent_feature_flags.can_remember,
         run_branch,
+        target_branch: body.branch.clone(),
         merge_policy: topology.merge_policy,
     };
     let deps = StreamAgentDeps {

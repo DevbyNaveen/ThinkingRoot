@@ -77,6 +77,10 @@ pub struct ToolContext {
     /// statement before persisting (reuses the extractor's pattern catalog).
     /// `false` (the default for every legacy / non-agent context) = no change.
     pub block_pii_in_remember: bool,
+    /// P1.2 capability flag (`config_json.feature_flags.can_remember`): when
+    /// false, `contribute_claim` is refused (the agent can read/act but never
+    /// persists memory). `true` (the default everywhere else) = no change.
+    pub can_remember: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -817,6 +821,13 @@ impl ContributeClaimTool {
 #[async_trait]
 impl ToolHandler for ContributeClaimTool {
     async fn handle(&self, input: serde_json::Value) -> ToolHandlerResult {
+        // P1.2: an agent with `can_remember=false` may read/act but must not
+        // persist memory. Fail-closed BEFORE any write.
+        if !self.ctx.can_remember {
+            return ToolHandlerResult::error(
+                "this agent is not permitted to remember (can_remember=false)",
+            );
+        }
         let Some(statement_raw) = input.get("statement").and_then(|v| v.as_str()) else {
             return ToolHandlerResult::error("missing required field: statement");
         };
@@ -1636,6 +1647,7 @@ mod tests {
                 crate::intelligence::engram::EngramConfig::default(),
             ),
             block_pii_in_remember: false,
+            can_remember: true,
         }
     }
 

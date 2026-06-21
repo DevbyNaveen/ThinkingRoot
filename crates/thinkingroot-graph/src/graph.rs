@@ -1148,6 +1148,16 @@ impl GraphStore {
                 created_at: Float default 0.0,
                 updated_at: Float default 0.0
             }",
+            // P1.4 — per-workspace settings (a small kv store): `entity_context`
+            // (a per-userMind context string consumed at LLM points such as
+            // `dream`; NOT the pure-CPU structural extractor), plus future
+            // per-userMind settings (display name, retention). Created on mount,
+            // zero migration. PK is `key`.
+            ":create ws_settings {
+                key: String
+                =>
+                value: String default ''
+            }",
             // A6 — durable verification verdicts. One row per forge/verify
             // test case: did the function's OUTPUT match the expectation?
             // This is the signal the run-log cannot carry (a run that
