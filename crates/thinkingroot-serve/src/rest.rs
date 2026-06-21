@@ -946,6 +946,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/settings",
                 get(list_settings_handler).put(put_setting_handler),
             )
+            // P3.15 — export this brain as a portable Brain Pack (.tr). Pairs
+            // with the provisioner `/import` for project-to-project sharing.
+            .route("/ws/{ws}/export-pack", get(export_pack_handler))
             // Learned retrieval prior (item 10) — read-only learning window.
             .route(
                 "/ws/{ws}/learning/retrieval-prior",
@@ -1114,6 +1117,8 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             // every branch in the registry (active + merged +
             // abandoned).
             .route("/branches/lineage", get(branch_lineage_handler))
+            // P5.25 — god-view: cognition graph merged across mounted userMinds.
+            .route("/userminds/graph", get(aggregate_userminds_graph_handler))
             // T2.5 — tag create + list. Writes are rejected by the
             // immutability gate at `engine::ensure_branch_permission`
             // (lives since T0.6); this surface is what gives the gate
@@ -2336,6 +2341,53 @@ async fn put_setting_handler(
     let engine = state.engine.read().await;
     match engine.set_ws_setting(&ws, &req.key, &req.value).await {
         Ok(()) => ok_response(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/export-pack` — stream this brain back as a sealed
+/// Brain Pack (`.tr`) for project-to-project sharing (P3.15). Auto-mounts
+/// a `u_*`/`agent_*` scope first; `main` is always mounted. The bytes are
+/// served as `application/octet-stream` with a `.tr` attachment name.
+async fn export_pack_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let engine = state.engine.read().await;
+    match engine.export_pack(&ws).await {
+        Ok(bytes) => {
+            let filename = format!("{}.tr", ws.replace(['/', ':'], "-"));
+            (
+                StatusCode::OK,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/userminds/graph` — god-view: the cognition graph merged
+/// across every currently-mounted plain userMind, with per-node/edge
+/// provenance (P5.25). Honest scope: only RAM-resident userMinds.
+async fn aggregate_userminds_graph_handler(State(state): State<Arc<AppState>>) -> Response {
+    let engine = state.engine.read().await;
+    match engine.aggregate_userminds_graph().await {
+        Ok(graph) => ok_response(graph).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

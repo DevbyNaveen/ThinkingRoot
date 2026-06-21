@@ -7559,6 +7559,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "tr-format",
  "tr-sigstore",
  "tracing",
  "trash",

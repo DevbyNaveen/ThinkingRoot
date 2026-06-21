@@ -32,6 +32,7 @@ thinkingroot-core = { workspace = true }
 thinkingroot-graph = { workspace = true }
 thinkingroot-branch = { workspace = true }
 thinkingroot-pr = { workspace = true }
+tr-format = { workspace = true }
 thinkingroot-parse = { workspace = true }
 thinkingroot-extract = { workspace = true }
 thinkingroot-llm = { workspace = true }

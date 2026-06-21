@@ -37,6 +37,38 @@ pub struct EntityInfo {
     pub claim_count: usize,
 }
 
+/// P5.25 — god-view aggregate of the cognition graph merged across all
+/// currently-mounted plain userMinds (`u_*`, excluding composite
+/// `u_*__agent_*`). Each entity/relation carries the `userminds` it was
+/// seen in, so the Console can show "who knows this". HONEST SCOPE: only
+/// userMinds resident in RAM at request time are included — idle/evicted
+/// ones aren't (the engine holds no cross-tenant index); the count makes
+/// that explicit.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateGraph {
+    pub usermind_count: usize,
+    pub entities: Vec<AggregateEntity>,
+    pub relations: Vec<AggregateRelation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateEntity {
+    pub name: String,
+    pub entity_type: String,
+    pub claim_count: usize,
+    /// The userMinds this entity appears in (provenance for the god-view).
+    pub userminds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateRelation {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+    pub strength: f64,
+    pub userminds: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityDetail {
     pub id: String,
@@ -342,6 +374,16 @@ pub(crate) fn is_auto_scoped_ws(ws: &str) -> bool {
     ws.starts_with("u_") || ws.starts_with("agent_")
 }
 
+/// P1.8 — true when `TR_COMPOSITE_AS_BRANCH` opts a project into storing
+/// composite `u_X__agent_Y` scopes as branches inside the parent userMind
+/// (default OFF = the legacy separate-workspace layout). EXPERIMENTAL:
+/// existing composites are not auto-migrated when this flips.
+fn composite_as_branch_enabled() -> bool {
+    std::env::var("TR_COMPOSITE_AS_BRANCH")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Derive the AGENT a run belongs to from its workspace/scope name — the
 /// same `__agent_`/`agent_` convention the topology + connector code uses
 /// (`u_X__agent_Y` and bare `agent_Y` → `Y`). Returns `None` for `main` and
@@ -363,6 +405,32 @@ pub(crate) fn agent_from_ws(ws: &str) -> Option<String> {
 /// through the single prompt pipeline under this name.
 pub(crate) fn agent_persona_prompt_name(agent_name: &str) -> String {
     format!("agent::{agent_name}::persona")
+}
+
+/// P3.15 — Normalize a source URI to the relative pack-entry path used in
+/// an exported `.tr`. Strips a `file://` scheme and any leading workspace
+/// `root_path` prefix so packs are portable across machines, then trims
+/// leading separators and drops parent refs. Deterministic: the SAME URI
+/// always yields the SAME path, which is required so a claim's `file`
+/// field matches its staged source entry. An empty result falls back to a
+/// stable placeholder so the path set never contains "".
+fn uri_to_pack_path(uri: &str, root_path: &std::path::Path) -> String {
+    let mut p = uri.strip_prefix("file://").unwrap_or(uri);
+    if let Some(root_str) = root_path.to_str()
+        && let Some(rest) = p.strip_prefix(root_str)
+    {
+        p = rest;
+    }
+    let cleaned = p
+        .trim_start_matches('/')
+        .trim_start_matches('\\')
+        .replace("../", "")
+        .replace("..\\", "");
+    if cleaned.is_empty() {
+        "source".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2497,6 +2565,58 @@ impl QueryEngine {
         // Belt-and-suspenders path-traversal guard before any filesystem join
         // (the gateway also charset-guards gateway-routed requests).
         Self::validate_workspace_name(ws)?;
+
+        // P1.8 — composite-collapse (TR_COMPOSITE_AS_BRANCH, default OFF).
+        // When enabled, a composite per-(user×agent) scope `u_X__agent_Y` is
+        // stored as an empty, isolated branch `agent/Y` INSIDE the parent
+        // userMind `u_X`'s data tree (`u_X/.thinkingroot/branches/agent-y/`)
+        // instead of a separate top-level workspace dir — halving the on-disk
+        // workspace count for swarm-scale per-user agents. The composite NAME
+        // is unchanged, so the inheritance chain (`[composite, agent_Y, main]`,
+        // which deliberately excludes `u_X`) and every read/write path behave
+        // identically; only the storage location moves. The branch starts
+        // BLANK (not COW from `u_X`) so it never inherits the user's personal
+        // data. EXPERIMENTAL / dark: existing separate-dir composites are NOT
+        // auto-migrated — flip per project after proving + migrating. The
+        // default-OFF path below is byte-identical to the prior behaviour.
+        if composite_as_branch_enabled()
+            && let Some(idx) = ws.find("__agent_")
+        {
+            let parent = ws[..idx].to_string();
+            let agent = ws[idx + "__agent_".len()..].to_string();
+            if parent.starts_with("u_") && !agent.is_empty() {
+                if !self.workspaces.contains_key(&parent) {
+                    Box::pin(self.get_or_mount_user_ws(&parent)).await?;
+                }
+                let parent_root = self
+                    .workspaces
+                    .get(&parent)
+                    .map(|h| h.root_path.clone())
+                    .ok_or_else(|| {
+                        Error::Config(format!("parent userMind '{parent}' not mounted"))
+                    })?;
+                let branch = format!("agent/{agent}");
+                let branch_dir =
+                    thinkingroot_branch::snapshot::resolve_data_dir(&parent_root, Some(&branch));
+                // Create the empty branch data dir on first reference;
+                // `mount_with_data_dir` -> `StorageEngine::init` bootstraps an
+                // empty graph inside it (idempotent on remount).
+                std::fs::create_dir_all(&branch_dir).map_err(|e| {
+                    Error::Config(format!("create composite branch dir for '{ws}': {e}"))
+                })?;
+                self.mount_with_data_dir(ws.to_string(), parent_root, branch_dir)
+                    .await?;
+                // Mount the agent's own brain so the inheritance chain resolves
+                // its functions/prompts (mirrors the separate-dir path below).
+                let agent_brain = format!("agent_{agent}");
+                if !self.workspaces.contains_key(&agent_brain) {
+                    let _ = Box::pin(self.get_or_mount_user_ws(&agent_brain)).await;
+                }
+                self.evict_idle_user_ws(ws);
+                return Ok(());
+            }
+        }
+
         let anchor = self
             .primary_ws_name()
             .and_then(|p| self.workspaces.get(&p))
@@ -2633,6 +2753,192 @@ impl QueryEngine {
         }
 
         Ok(result)
+    }
+
+    /// P3.15 — Export a mounted workspace's full brain as a portable
+    /// Brain Pack (`.tr`, tr/3 wire format): the in-process REST
+    /// counterpart to the CLI `root pack`. Unlike the CLI (which opens a
+    /// fresh `GraphStore` off disk), this reads through the LIVE mounted
+    /// `storage.graph`, because the daemon already holds the workspace's
+    /// RocksDB under an exclusive process lock — a second open would
+    /// fail with a LOCK error. The workspace must already be mounted
+    /// (`main` always is; reference a `u_*`/`agent_*` scope first to
+    /// export it). Returns the sealed pack bytes (unsigned — sign
+    /// client-side if Sigstore provenance is required). Round-trips with
+    /// the provisioner `/import` + engine mount-from-pack path.
+    pub async fn export_pack(&self, ws: &str) -> Result<Vec<u8>> {
+        use std::collections::HashSet;
+        use thinkingroot_core::types::ContentHash;
+        use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
+        use tr_format::{ClaimRecord, ManifestV3, V3PackBuilder, Version};
+
+        let handle = self.get_workspace(ws)?;
+        let root_path = handle.root_path.clone();
+
+        // Pull the joined claim/source rows under the storage lock, then
+        // release the guard before the CPU-bound pack seal.
+        let (sources, claim_rows, entity_names) = {
+            let storage = handle.storage.lock().await;
+            let sources = storage.graph.get_sources_with_hashes()?;
+            let claim_rows = storage.graph.get_v3_claim_export()?;
+            let entity_names = storage.graph.get_claim_entity_names()?;
+            (sources, claim_rows, entity_names)
+        };
+
+        let source_store_dir = root_path.join(".thinkingroot");
+        let source_store = FileSystemSourceStore::new(&source_store_dir)
+            .map_err(|e| Error::Config(format!("open source store: {e}")))?;
+
+        // Minimal manifest — name from the workspace, version 0.1.0. The
+        // v3 writer fills in all hash fields at build() time.
+        let mut manifest = ManifestV3::new(
+            ws,
+            Version::parse("0.1.0").map_err(|e| Error::Config(format!("pack version: {e}")))?,
+        );
+        manifest.extracted_at = Some(chrono::Utc::now());
+        manifest.extractor = Some(format!(
+            "thinkingroot/export-pack@{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+
+        let mut builder = V3PackBuilder::new(manifest);
+
+        // Stage source files, deduped by their normalized pack path. The
+        // SAME normalization is applied to claims below so every emitted
+        // claim's `file` resolves to a staged source.
+        let mut packed_paths: HashSet<String> = HashSet::new();
+        for (uri, content_hash) in &sources {
+            if content_hash.is_empty() {
+                continue;
+            }
+            let hash = ContentHash(content_hash.clone());
+            let Some(bytes) = source_store
+                .get(&hash)
+                .map_err(|e| Error::Config(format!("source store read for {}: {e}", hash.0)))?
+            else {
+                continue;
+            };
+            let pack_path = uri_to_pack_path(uri, &root_path);
+            if packed_paths.insert(pack_path.clone()) {
+                builder
+                    .add_source_file(&pack_path, &bytes.bytes)
+                    .map_err(|e| Error::Config(format!("stage source {pack_path}: {e}")))?;
+            }
+        }
+
+        // Build claim records; skip any whose owning source wasn't packed
+        // (synthetic/agent contributions, GC'd sources) so every claim
+        // resolves to a staged file.
+        let mut claim_count = 0usize;
+        for row in &claim_rows {
+            if row.content_hash.is_empty() {
+                continue;
+            }
+            let pack_path = uri_to_pack_path(&row.source_uri, &root_path);
+            if !packed_paths.contains(&pack_path) {
+                continue;
+            }
+            let ents = entity_names.get(&row.id).cloned().unwrap_or_default();
+            let mut record = ClaimRecord::new(
+                row.id.clone(),
+                row.statement.clone(),
+                ents,
+                pack_path,
+                row.byte_start,
+                row.byte_end,
+            );
+            if !row.claim_type.is_empty() {
+                record = record.with_claim_type(row.claim_type.clone());
+            }
+            record = record.with_confidence(row.confidence);
+            if !row.admission_tier.is_empty() {
+                record = record.with_admission_tier(row.admission_tier.clone());
+            }
+            builder.add_claim(record);
+            claim_count += 1;
+        }
+
+        // Attach the Living Paper if the workspace has one (non-fatal).
+        let paper_path = source_store_dir.join("paper.md");
+        if let Ok(paper_md) = std::fs::read_to_string(&paper_path) {
+            builder = builder.with_paper(paper_md);
+        }
+
+        let bytes = builder
+            .build()
+            .map_err(|e| Error::Config(format!("seal .tr pack: {e}")))?;
+        tracing::info!(
+            ws = %ws,
+            files = packed_paths.len(),
+            claims = claim_count,
+            pack_bytes = bytes.len(),
+            "exported brain pack"
+        );
+        Ok(bytes)
+    }
+
+    /// P5.25 — merge the cognition graph across all currently-mounted plain
+    /// userMinds into one god-view payload, deduping entities by lowercased
+    /// name (summing claim counts, unioning provenance) and relations by
+    /// `(from, type, to)` (max strength, unioned provenance). Composite
+    /// `u_*__agent_*` scopes are excluded — they're agent working brains,
+    /// not user knowledge. HONEST: only RAM-resident userMinds are folded
+    /// in (see [`AggregateGraph`]).
+    pub async fn aggregate_userminds_graph(&self) -> Result<AggregateGraph> {
+        use std::collections::BTreeMap;
+
+        let user_wss: Vec<String> = self
+            .workspaces
+            .keys()
+            .filter(|k| k.starts_with("u_") && !k.contains("__agent_"))
+            .cloned()
+            .collect();
+
+        let mut entities: BTreeMap<String, AggregateEntity> = BTreeMap::new();
+        let mut relations: BTreeMap<(String, String, String), AggregateRelation> = BTreeMap::new();
+
+        for ws in &user_wss {
+            if let Ok(ents) = self.list_entities(ws).await {
+                for e in ents {
+                    let agg = entities.entry(e.name.to_lowercase()).or_insert_with(|| {
+                        AggregateEntity {
+                            name: e.name.clone(),
+                            entity_type: e.entity_type.clone(),
+                            claim_count: 0,
+                            userminds: Vec::new(),
+                        }
+                    });
+                    agg.claim_count += e.claim_count;
+                    if !agg.userminds.contains(ws) {
+                        agg.userminds.push(ws.clone());
+                    }
+                }
+            }
+            if let Ok(rels) = self.get_all_relations(ws).await {
+                for (from, to, rtype, strength) in rels {
+                    let key = (from.to_lowercase(), rtype.to_lowercase(), to.to_lowercase());
+                    let agg = relations.entry(key).or_insert_with(|| AggregateRelation {
+                        source: from.clone(),
+                        target: to.clone(),
+                        relation_type: rtype.clone(),
+                        strength: 0.0,
+                        userminds: Vec::new(),
+                    });
+                    if strength > agg.strength {
+                        agg.strength = strength;
+                    }
+                    if !agg.userminds.contains(ws) {
+                        agg.userminds.push(ws.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(AggregateGraph {
+            usermind_count: user_wss.len(),
+            entities: entities.into_values().collect(),
+            relations: relations.into_values().collect(),
+        })
     }
 
     /// Get detailed information about a single entity by name (case-insensitive).
