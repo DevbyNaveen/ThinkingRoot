@@ -307,8 +307,131 @@ impl GraphStore {
         // can carry I-4 evidence and Phase 7e callee resolution can join
         // function_calls.callee_name → claims.symbol.
         store.migrate_claims_content_blake3()?;
+        // SOTA reconcile: the per-column migrations above can silently
+        // cascade-fail on a legacy brain (a later `:replace` reads a column an
+        // earlier broken step never added → swallowed), leaving an incomplete
+        // `claims` schema that breaks `insert_claim` and aborts every MERGE
+        // (the dream-branch merge → MERGE_BLOCKED). This GUARANTEES the full
+        // current schema, preserving whatever columns exist.
+        store.reconcile_claims_schema()?;
         store.create_indexes()?;
         Ok(store)
+    }
+
+    /// Idempotent guarantee that `claims` has the complete current schema.
+    /// No-ops when the newest column (`symbol`) is already present; otherwise
+    /// does ONE `:replace` that PRESERVES every column that exists (probed
+    /// individually) and DEFAULTS the rest — robust to a legacy brain at ANY
+    /// intermediate migration version.
+    fn reconcile_claims_schema(&self) -> Result<()> {
+        // Legacy / forked brains can be MISSING the claim link relations that
+        // claim writes depend on: `insert_claim` / `insert_claims_batch` do
+        // `:put claim_source_edges` / `:put claim_entity_edges`, so an absent
+        // relation breaks EVERY merge write ("when executing against relation
+        // 'claim_source_edges'") — the exact MERGE_BLOCKED root cause. Idempotent
+        // re-create (no-op when the relation already exists).
+        let _ = self
+            .db
+            .run_default(":create claim_source_edges { claim_id: String, source_id: String }");
+        let _ = self
+            .db
+            .run_default(":create claim_entity_edges { claim_id: String, entity_id: String }");
+
+        // Already current (claims columns)?
+        let current = self.db.run_script(
+            "?[symbol] := *claims{id: 'probe-noop', symbol}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        );
+        if current.is_ok() {
+            return Ok(());
+        }
+        // Relation absent entirely → create_schema owns it; nothing to reconcile.
+        if let Err(e) = &current {
+            let m = e.to_string();
+            if m.contains("not found") || m.contains("does not exist") {
+                return Ok(());
+            }
+        }
+
+        // Optional columns in SCHEMA ORDER: (name, default-literal). The 8 core
+        // columns (id + statement..created_at) are original and always present.
+        let optional: &[(&str, &str)] = &[
+            ("grounding_score", "-1.0"),
+            ("grounding_method", "''"),
+            ("extraction_tier", "'llm'"),
+            ("event_date", "0.0"),
+            ("admission_tier", "'attested'"),
+            ("derivation_parents", "''"),
+            ("predicate_json", "''"),
+            ("last_rooted_at", "0.0"),
+            ("source_path", "''"),
+            ("byte_start", "0"),
+            ("byte_end", "0"),
+            ("content_blake3", "''"),
+            ("symbol", "''"),
+        ];
+
+        let mut head: Vec<String> = vec![
+            "id".into(),
+            "statement".into(),
+            "claim_type".into(),
+            "source_id".into(),
+            "confidence".into(),
+            "sensitivity".into(),
+            "workspace_id".into(),
+            "created_at".into(),
+        ];
+        let mut binds = head.clone(); // columns read from the existing relation
+        let mut defaults: Vec<String> = Vec::new();
+        for (name, def) in optional {
+            head.push((*name).into());
+            let exists = self
+                .db
+                .run_script(
+                    &format!("?[{name}] := *claims{{id: 'probe-noop', {name}}}"),
+                    BTreeMap::new(),
+                    ScriptMutability::Immutable,
+                )
+                .is_ok();
+            if exists {
+                binds.push((*name).into());
+            } else {
+                defaults.push(format!("{name} = {def}"));
+            }
+        }
+
+        // `:replace` fails while an index is attached; create_indexes() (next in
+        // init) recreates them atop the new schema. Best-effort drops.
+        for d in [
+            "::index drop claims:by_type",
+            "::index drop claims:by_tier",
+            "::index drop claim_entity_edges:by_entity",
+            "::index drop claim_source_edges:by_source",
+        ] {
+            let _ = self.db.run_default(d);
+        }
+
+        let full_schema = "id: String => statement: String, claim_type: String, source_id: String, confidence: Float, sensitivity: String, workspace_id: String, created_at: Float, grounding_score: Float, grounding_method: String, extraction_tier: String, event_date: Float, admission_tier: String, derivation_parents: String, predicate_json: String, last_rooted_at: Float, source_path: String, byte_start: Int, byte_end: Int, content_blake3: String, symbol: String";
+        let defaults_clause = if defaults.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", defaults.join(", "))
+        };
+        let migration = format!(
+            "{{ ?[{head}] := *claims{{{binds}}}{defaults_clause} :replace claims {{{full_schema}}} }}",
+            head = head.join(", "),
+            binds = binds.join(", "),
+        );
+
+        // FAIL-SOFT: a reconcile failure must NEVER block mounting the brain.
+        // Worst case it's a no-op and the legacy brain stays as-is (the merge
+        // path is independently fail-soft on reads). Log loudly for diagnosis.
+        match self.db.run_default(&migration) {
+            Ok(_) => tracing::info!("claims schema reconciled to full current shape (legacy brain)"),
+            Err(e) => tracing::warn!("claims schema reconcile skipped (non-fatal): {e}"),
+        }
+        Ok(())
     }
 
     /// Reflect (Phase 9) schema migration.
@@ -655,6 +778,47 @@ impl GraphStore {
                 weight: Float default 0.0,
                 last_used: Float default 0.0,
                 count: Int default 0
+            }",
+            // The Stitcher's woven edges — a provenance + Connection-contract
+            // sidecar for the `entity_relations` rows it creates. Keyed by the
+            // edge (from,to,type). `origin` is always 'stitch'; `evidence_json`
+            // is the JSON array of claim ids that justify the edge (never empty
+            // — the anti-hallucination gate); `confidence` the adjudicated
+            // score; `valid_from`/`valid_until` bitemporal validity
+            // (valid_until < 0 = still valid); `provenance` the stitch:// uri.
+            // Additive: the edge itself still lives in `entity_relations`, so
+            // existing reads are unchanged. Gated TR_STITCHER — no row written
+            // while the flag is off. Decayed by the `stitched_edges_decay` job.
+            ":create stitched_edges {
+                from_id: String,
+                to_id: String,
+                relation_type: String
+                =>
+                origin: String default 'stitch',
+                evidence_json: String default '[]',
+                confidence: Float default 0.0,
+                weight: Float default 1.0,
+                valid_from: Float default 0.0,
+                valid_until: Float default -1.0,
+                provenance: String default ''
+            }",
+            // Destructive Stitcher moves awaiting human/agent approval. Tiered
+            // trust: additive ops (weave/grow) auto-merge through the verify
+            // gate, but entity-merge/delete are NEVER auto-applied — they land
+            // here. `op` = 'resolve' (merge `from_id` into `to_id`) | 'delete';
+            // `evidence_json` the supporting claim ids; `status` =
+            // 'pending' | 'approved' | 'rejected'. Created-on-mount, zero
+            // migration.
+            ":create stitch_proposals {
+                id: String
+                =>
+                op: String default 'resolve',
+                from_id: String default '',
+                to_id: String default '',
+                evidence_json: String default '[]',
+                confidence: Float default 0.0,
+                status: String default 'pending',
+                created_at: Float default 0.0
             }",
             // Rooting — append-only log of every trial run against a claim.
             // One row per probe battery execution (not per probe). A single claim
@@ -1995,14 +2159,35 @@ impl GraphStore {
     ) -> Result<NamedRows> {
         self.db
             .run_script(script, params, ScriptMutability::Mutable)
-            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))
+            .map_err(|e| {
+                // TEMP instrumentation: log the error FIRST (Debug, fuller) so it
+                // isn't truncated; + a short query head; + the live `claims`
+                // columns when a claims write fails, to pinpoint the mismatch.
+                let head: String = script.chars().take(110).collect();
+                tracing::error!("query(write) FAILED cozo_err_dbg={:?} | head={}", e, head);
+                if script.contains("claims") {
+                    if let Ok(cols) = self.db.run_script(
+                        "::columns claims",
+                        BTreeMap::new(),
+                        ScriptMutability::Immutable,
+                    ) {
+                        tracing::error!("LIVE claims columns = {:?}", cols.rows);
+                    }
+                }
+                Error::GraphStorage(format!("query failed: {e}"))
+            })
     }
 
     /// Run a read-only Datalog query.
     pub fn query_read(&self, script: &str) -> Result<NamedRows> {
         self.db
             .run_script(script, BTreeMap::new(), ScriptMutability::Immutable)
-            .map_err(|e| Error::GraphStorage(format!("query failed: {e}")))
+            .map_err(|e| {
+                // TEMP instrumentation: surface the EXACT failing query so the
+                // MERGE_BLOCKED "relation 'claims'" can be pinpointed precisely.
+                tracing::error!(failing_query = %script, cozo_error = %e, "query_read FAILED");
+                Error::GraphStorage(format!("query failed: {e}"))
+            })
     }
 
     /// Insert a source node.
@@ -4658,13 +4843,19 @@ impl GraphStore {
         // Legacy fallback: a workspace with NO witnesses yet (pre-
         // migration / test fixtures) still surfaces its claims rows
         // so the broader cutover can land incrementally without
-        // breaking legacy paths.
-        let claims = self.query_read(
+        // breaking legacy paths. FAIL-SOFT: a brain missing the
+        // `claim_source_edges` relation (witness-mesh-only / variant schema)
+        // must not abort the whole merge — the witness path above is primary;
+        // an empty legacy result is correct for such brains.
+        let claims = match self.query_read(
             r#"?[id, statement, claim_type, confidence, uri, event_date] :=
                 *claims{id, statement, claim_type, confidence, event_date},
                 *claim_source_edges{claim_id: id, source_id: sid},
                 *sources{id: sid, uri}"#,
-        )?;
+        ) {
+            Ok(c) => c,
+            Err(_) => return Ok(Vec::new()),
+        };
         let legacy: Vec<(String, String, String, f64, String, f64)> = claims
             .rows
             .iter()
@@ -4804,7 +4995,16 @@ impl GraphStore {
     /// field in the claims table.  Used by the diff algorithm to carry real SourceIds
     /// into `DiffClaim` objects rather than synthetic placeholder IDs.
     pub fn get_claim_source_id_map(&self) -> Result<std::collections::HashMap<String, String>> {
-        let result = self.query_read("?[id, source_id] := *claims{id, source_id}")?;
+        // FAIL-SOFT: older / witness-mesh-only schemas may not carry a
+        // `source_id` column on `claims` (the cutover dual-writes
+        // incrementally). Cozo then errors "when executing against relation
+        // 'claims'", which previously aborted any MERGE touching such a brain
+        // (e.g. the dream-branch merge → MERGE_BLOCKED). Degrade to an empty map
+        // — callers fall back to synthetic source ids — rather than break merge.
+        let result = match self.query_read("?[id, source_id] := *claims{id, source_id}") {
+            Ok(r) => r,
+            Err(_) => return Ok(std::collections::HashMap::new()),
+        };
         Ok(result
             .rows
             .iter()
@@ -7363,6 +7563,210 @@ impl GraphStore {
         Ok(n)
     }
 
+    // ── The Stitcher (graph-tending creature) ─────────────────────────────
+    // Writes/reads the woven edges + provenance sidecar + the destructive-move
+    // proposals queue. All gated TR_STITCHER at the caller — no row is ever
+    // written while the flag is off, so an untended brain is unchanged.
+
+    /// Write a Stitcher-woven edge: the normal `entity_relations` row (so it
+    /// shows in the graph) PLUS the `stitched_edges` provenance/contract
+    /// sidecar. Edge `weight` starts at `confidence`; `evidence_ids` is the
+    /// non-empty set of claim ids justifying it (the anti-hallucination
+    /// contract — callers pass a non-empty slice). Validity opens at `ts`.
+    pub fn write_stitched_edge(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        relation_type: &str,
+        confidence: f64,
+        evidence_ids: &[String],
+        ts: f64,
+    ) -> Result<()> {
+        let confidence = confidence.clamp(0.0, 1.0);
+        // The visible edge (reuses the proven entity_relations writer).
+        self.link_entities(from_id, to_id, relation_type, confidence)?;
+        let evidence_json =
+            serde_json::to_string(evidence_ids).unwrap_or_else(|_| "[]".to_string());
+        let provenance = format!("stitch://{from_id}/{relation_type}/{to_id}");
+        let mut params = BTreeMap::new();
+        params.insert("fid".into(), DataValue::Str(from_id.into()));
+        params.insert("tid".into(), DataValue::Str(to_id.into()));
+        params.insert("rtype".into(), DataValue::Str(relation_type.into()));
+        params.insert("origin".into(), DataValue::Str("stitch".into()));
+        params.insert("ev".into(), DataValue::Str(evidence_json.as_str().into()));
+        params.insert("conf".into(), DataValue::Num(Num::Float(confidence)));
+        params.insert("vf".into(), DataValue::Num(Num::Float(ts)));
+        params.insert("vu".into(), DataValue::Num(Num::Float(-1.0)));
+        params.insert("prov".into(), DataValue::Str(provenance.as_str().into()));
+        self.query(
+            r#"?[from_id, to_id, relation_type, origin, evidence_json, confidence, weight, valid_from, valid_until, provenance] <- [[$fid, $tid, $rtype, $origin, $ev, $conf, $conf, $vf, $vu, $prov]]
+            :put stitched_edges {from_id, to_id, relation_type => origin, evidence_json, confidence, weight, valid_from, valid_until, provenance}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// All stitched-edge keys → origin, so the graph view can attribute who wove
+    /// each link. Returns `((from_id, to_id, relation_type), origin)`.
+    pub fn get_stitched_edge_origins(&self) -> Result<Vec<((String, String, String), String)>> {
+        let rows = self.query_read(
+            "?[from_id, to_id, relation_type, origin] := *stitched_edges{from_id, to_id, relation_type, origin}",
+        )?;
+        Ok(rows
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    (dv_to_string(&r[0]), dv_to_string(&r[1]), dv_to_string(&r[2])),
+                    dv_to_string(&r[3]),
+                )
+            })
+            .collect())
+    }
+
+    /// Multiplicatively decay stitched-edge `weight` toward `floor` (mirrors
+    /// `decay_assoc_edges`); all other contract fields are preserved. So a woven
+    /// edge that never helps retrieval fades rather than accumulating as noise.
+    pub fn decay_stitched_edges(&self, factor: f64, floor: f64) -> Result<usize> {
+        let factor = factor.clamp(0.0, 1.0);
+        let floor = floor.clamp(0.0, 1.0);
+        let mut rparams = BTreeMap::new();
+        rparams.insert("floor".into(), DataValue::Num(Num::Float(floor)));
+        let all = self
+            .db
+            .run_script(
+                "?[from_id, to_id, relation_type, origin, evidence_json, confidence, weight, valid_from, valid_until, provenance] := \
+                   *stitched_edges{from_id, to_id, relation_type, origin, evidence_json, confidence, weight, valid_from, valid_until, provenance}, weight > $floor",
+                rparams,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("decay_stitched_edges read: {e}")))?;
+        if all.rows.is_empty() {
+            return Ok(0);
+        }
+        let put_rows: Vec<DataValue> = all
+            .rows
+            .iter()
+            .map(|r| {
+                let w = dv_to_float(&r[6]);
+                let w2 = floor + (w - floor) * factor;
+                DataValue::List(vec![
+                    r[0].clone(),
+                    r[1].clone(),
+                    r[2].clone(),
+                    r[3].clone(),
+                    r[4].clone(),
+                    r[5].clone(),
+                    DataValue::Num(Num::Float(w2)),
+                    r[7].clone(),
+                    r[8].clone(),
+                    r[9].clone(),
+                ])
+            })
+            .collect();
+        let n = put_rows.len();
+        let mut wparams = BTreeMap::new();
+        wparams.insert("rows".into(), DataValue::List(put_rows));
+        self.db
+            .run_script(
+                "?[from_id, to_id, relation_type, origin, evidence_json, confidence, weight, valid_from, valid_until, provenance] <- $rows \
+                 :put stitched_edges {from_id, to_id, relation_type => origin, evidence_json, confidence, weight, valid_from, valid_until, provenance}",
+                wparams,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("decay_stitched_edges write: {e}")))?;
+        Ok(n)
+    }
+
+    /// Queue a destructive Stitcher move (entity-merge / delete) for approval —
+    /// it is NEVER auto-applied (tiered trust). `status` starts 'pending'.
+    pub fn add_stitch_proposal(
+        &self,
+        id: &str,
+        op: &str,
+        from_id: &str,
+        to_id: &str,
+        evidence_json: &str,
+        confidence: f64,
+        ts: f64,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        params.insert("op".into(), DataValue::Str(op.into()));
+        params.insert("fid".into(), DataValue::Str(from_id.into()));
+        params.insert("tid".into(), DataValue::Str(to_id.into()));
+        params.insert("ev".into(), DataValue::Str(evidence_json.into()));
+        params.insert("conf".into(), DataValue::Num(Num::Float(confidence.clamp(0.0, 1.0))));
+        params.insert("status".into(), DataValue::Str("pending".into()));
+        params.insert("ts".into(), DataValue::Num(Num::Float(ts)));
+        self.query(
+            r#"?[id, op, from_id, to_id, evidence_json, confidence, status, created_at] <- [[$id, $op, $fid, $tid, $ev, $conf, $status, $ts]]
+            :put stitch_proposals {id => op, from_id, to_id, evidence_json, confidence, status, created_at}"#,
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// List stitch proposals (optionally only `pending`), newest first.
+    pub fn list_stitch_proposals(&self, only_pending: bool) -> Result<Vec<StitchProposal>> {
+        let script = if only_pending {
+            "?[id, op, from_id, to_id, evidence_json, confidence, status, created_at] := *stitch_proposals{id, op, from_id, to_id, evidence_json, confidence, status, created_at}, status == 'pending'"
+        } else {
+            "?[id, op, from_id, to_id, evidence_json, confidence, status, created_at] := *stitch_proposals{id, op, from_id, to_id, evidence_json, confidence, status, created_at}"
+        };
+        let rows = self.query_read(script)?;
+        let mut out: Vec<StitchProposal> = rows
+            .rows
+            .iter()
+            .map(|r| StitchProposal {
+                id: dv_to_string(&r[0]),
+                op: dv_to_string(&r[1]),
+                from_id: dv_to_string(&r[2]),
+                to_id: dv_to_string(&r[3]),
+                evidence_json: dv_to_string(&r[4]),
+                confidence: dv_to_float(&r[5]),
+                status: dv_to_string(&r[6]),
+                created_at: dv_to_float(&r[7]),
+            })
+            .collect();
+        out.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+    }
+
+    /// Approve/reject a proposal. Returns false if the id is unknown. Rewrites
+    /// the row's status (Cozo `:put` replaces the whole value tuple, so the
+    /// existing row is read first to preserve its other fields).
+    pub fn set_stitch_proposal_status(&self, id: &str, status: &str) -> Result<bool> {
+        let mut rparams = BTreeMap::new();
+        rparams.insert("id".into(), DataValue::Str(id.into()));
+        let existing = self
+            .db
+            .run_script(
+                "?[op, from_id, to_id, evidence_json, confidence, created_at] := *stitch_proposals{id: $id, op, from_id, to_id, evidence_json, confidence, created_at}",
+                rparams,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("set_stitch_proposal_status read: {e}")))?;
+        let Some(row) = existing.rows.first() else {
+            return Ok(false);
+        };
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(id.into()));
+        params.insert("op".into(), row[0].clone());
+        params.insert("fid".into(), row[1].clone());
+        params.insert("tid".into(), row[2].clone());
+        params.insert("ev".into(), row[3].clone());
+        params.insert("conf".into(), row[4].clone());
+        params.insert("status".into(), DataValue::Str(status.into()));
+        params.insert("ts".into(), row[5].clone());
+        self.query(
+            r#"?[id, op, from_id, to_id, evidence_json, confidence, status, created_at] <- [[$id, $op, $fid, $tid, $ev, $conf, $status, $ts]]
+            :put stitch_proposals {id => op, from_id, to_id, evidence_json, confidence, status, created_at}"#,
+            params,
+        )?;
+        Ok(true)
+    }
+
     /// Living Engram (Build 2) — associative neighbours of the seed claims via
     /// the learned `assoc_edges` (undirected). Returns `(neighbour_claim_id,
     /// weight)` for edges with weight ≥ `min_weight`, best-weight-first, capped
@@ -8151,6 +8555,23 @@ impl GraphStore {
 }
 
 /// A single connector ingest record returned by
+/// One Stitcher destructive-move proposal (entity-merge / delete) awaiting
+/// approval. Serialized to the Console proposals queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StitchProposal {
+    pub id: String,
+    /// `resolve` (merge `from_id` into `to_id`) | `delete`.
+    pub op: String,
+    pub from_id: String,
+    pub to_id: String,
+    /// JSON array of supporting claim ids.
+    pub evidence_json: String,
+    pub confidence: f64,
+    /// `pending` | `approved` | `rejected`.
+    pub status: String,
+    pub created_at: f64,
+}
+
 /// [`GraphStore::lookup_connector_ingest`].
 #[derive(Debug, Clone)]
 pub struct ConnectorIngestRecord {

@@ -874,6 +874,9 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/route-tools", post(route_tools_handler))
             .route("/ws/{ws}/sleep", post(sleep_handler))
             .route("/ws/{ws}/dream", post(dream_handler))
+            .route("/ws/{ws}/stitch", post(stitch_handler))
+            .route("/ws/{ws}/stitch/proposals", get(stitch_proposals_handler))
+            .route("/ws/{ws}/stitch/proposals/{id}", post(stitch_resolve_handler))
             .route("/ws/{ws}/predict", post(predict_handler))
             .route("/ws/{ws}/merge-across", post(merge_across_handler))
             .route("/ws/{ws}/age", get(age_handler))
@@ -888,6 +891,12 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route(
                 "/ws/{ws}/branches/lineage",
                 get(ws_branch_lineage_handler),
+            )
+            // ws-scoped branch create/delete (per-agent sandbox test branch)
+            .route("/ws/{ws}/branches", post(create_branch_ws_handler))
+            .route(
+                "/ws/{ws}/branches/{branch}",
+                delete(delete_branch_ws_handler),
             )
             .route("/ws/{ws}/agents/spawn", post(agent_spawn_handler))
             .route("/ws/{ws}/agents/finish", post(agent_finish_handler))
@@ -3041,6 +3050,36 @@ async fn forget_source_handler(
     let engine = state.engine.read().await;
     match engine.forget_source(&ws, &body.source_uri).await {
         Ok(removed) => {
+            // forget_source removes the claims/edges + rebuilds the in-memory
+            // cache, but leaves the VECTOR index untouched — recall would keep
+            // returning ghost hits for the deleted claims. Reconcile the index
+            // off the critical path, exactly like the post-compile path does
+            // (forget_source still holds the storage lock here, so an inline
+            // reconcile would deadlock — it must be spawned).
+            if removed > 0 {
+                let engine = state.engine.clone();
+                let ws = ws.clone();
+                let reconcile_cancel = tokio_util::sync::CancellationToken::new();
+                tokio::spawn(async move {
+                    match engine
+                        .read()
+                        .await
+                        .reconcile_vector_index(&ws, reconcile_cancel)
+                        .await
+                    {
+                        Ok(stats) => tracing::info!(
+                            workspace = %ws,
+                            removed = stats.existing.saturating_sub(stats.current),
+                            "post-forget vector reconcile complete"
+                        ),
+                        Err(e) => tracing::warn!(
+                            workspace = %ws,
+                            error = %e,
+                            "post-forget vector reconcile failed — ghost vectors may linger until next compile"
+                        ),
+                    }
+                });
+            }
             ok_response(serde_json::json!({ "removed": removed })).into_response()
         }
         Err(e) => match_engine_error(e),
@@ -4116,11 +4155,17 @@ async fn get_galaxy(State(state): State<Arc<AppState>>, Path(ws): Path<String>) 
 
 async fn get_all_relations(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
     let engine = state.engine.read().await;
+    // Stitched-edge provenance, so the graph view can color woven edges. Best-
+    // effort: an error here just leaves `origin` absent (honest fallback).
+    let stitched = engine.stitched_edge_name_pairs(&ws).await.unwrap_or_default();
     match engine.get_all_relations(&ws).await {
         Ok(rels) => {
             let data: Vec<serde_json::Value> = rels
                 .into_iter()
                 .map(|(from, to, rtype, strength)| {
+                    let (a, b) = (from.to_lowercase(), to.to_lowercase());
+                    let key = if a <= b { (a, b) } else { (b, a) };
+                    let origin = if stitched.contains(&key) { Some("stitch") } else { None };
                     serde_json::json!({
                         "from": from,
                         "to": to,
@@ -4130,6 +4175,7 @@ async fn get_all_relations(State(state): State<Arc<AppState>>, Path(ws): Path<St
                         "relation_type":
                             thinkingroot_core::types::RelationType::normalize_storage(&rtype),
                         "strength": strength,
+                        "origin": origin,
                     })
                 })
                 .collect();
@@ -4329,6 +4375,72 @@ async fn dream_handler(
         .await
     {
         Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct StitchRequest {
+    #[serde(default = "default_stitch_max_candidates")]
+    max_candidates: usize,
+}
+fn default_stitch_max_candidates() -> usize {
+    32
+}
+
+/// `POST /api/v1/ws/{ws}/stitch` — run one Stitcher pass now (manual trigger;
+/// the background `StitcherTask` does this on a schedule). Weaves missing edges
+/// + queues entity-merge proposals.
+async fn stitch_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    body: Option<Json<StitchRequest>>,
+) -> Response {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let engine = state.engine.read().await;
+    match engine.stitch_once(&ws, req.max_candidates).await {
+        Ok(report) => ok_response(serde_json::json!(report)).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/stitch/proposals` — the destructive-move queue (entity
+/// merges the Stitcher proposes but never auto-applies).
+async fn stitch_proposals_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.stitch_proposals(&ws, false).await {
+        Ok(proposals) => ok_response(serde_json::json!({ "proposals": proposals })).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct StitchResolveRequest {
+    /// `approved` | `rejected`.
+    status: String,
+}
+
+/// `POST /api/v1/ws/{ws}/stitch/proposals/{id}` — approve/reject a proposal.
+async fn stitch_resolve_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+    Json(body): Json<StitchResolveRequest>,
+) -> Response {
+    let status = body.status.trim();
+    if status != "approved" && status != "rejected" {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "status must be 'approved' or 'rejected'",
+        );
+    }
+    let engine = state.engine.read().await;
+    match engine.set_stitch_proposal(&ws, &id, status).await {
+        Ok(true) => ok_response(serde_json::json!({ "ok": true, "status": status })).into_response(),
+        Ok(false) => err_response(StatusCode::NOT_FOUND, "NOT_FOUND", "proposal not found"),
         Err(e) => match_engine_error(e),
     }
 }
@@ -4642,6 +4754,16 @@ async fn reflect_across_branches_handler(
 }
 
 async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
+    // Compile targets the PRIMARY project brain only. On an auto-scoped brain
+    // (`u_*` / `agent_*`) it would ingest the whole project source tree into
+    // that personal/agent brain (mis-scope bug) — feed those via remember/store.
+    if crate::engine::is_auto_scoped_ws(&ws) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "COMPILE_NOT_ALLOWED_ON_SCOPED_BRAIN",
+            "compile is only allowed on the primary project brain (main); use remember/store for per-user/agent brains",
+        );
+    }
     // The audit flagged that this read guard is held for the entire
     // compile (multi-minute).  Concurrent *readers* (search,
     // brain_load, etc.) are unaffected — `RwLock::read` is shared.
@@ -5318,6 +5440,16 @@ async fn compile_stream(
     Json(body): Json<CompileStreamRequest>,
 ) -> Response {
     use tokio_util::sync::CancellationToken;
+
+    // Same mis-scope guard as the non-streaming path: never compile a project
+    // source tree into an auto-scoped (`u_*` / `agent_*`) brain.
+    if crate::engine::is_auto_scoped_ws(&ws) {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "COMPILE_NOT_ALLOWED_ON_SCOPED_BRAIN",
+            "compile/stream is only allowed on the primary project brain (main); use remember/store for per-user/agent brains",
+        );
+    }
 
     let root_path = match (body.root_path.as_deref(), state.current_workspace_root().await) {
         (Some(p), _) => PathBuf::from(p),
@@ -7231,6 +7363,98 @@ async fn delete_branch_handler(
             // T1.6 — `delete_branch_as` calls `abandon_branch` which
             // appended an `Abandoned` event; broadcast it before
             // dropping the engine read-lock.
+            drop(engine);
+            publish_latest_branch_event(&state, &branch).await;
+            ok_response(serde_json::json!({ "deleted": branch })).into_response()
+        }
+        Err(e) => err_response(StatusCode::NOT_FOUND, "BRANCH_NOT_FOUND", &e.to_string()),
+    }
+}
+
+// ─── WS-SCOPED branch create/delete ───────────────────────────────────
+// The unscoped `/branches` create/delete operate on the single
+// `current_workspace_root()` (the primary brain). These resolve the root from
+// the `{ws}` path param instead, so a branch can be created/deleted on an
+// auto-scoped brain (`agent_*` / `u_*`) — needed for the Console's per-agent
+// sandbox test branch. Mirrors create_branch_handler / delete_branch_handler.
+async fn create_branch_ws_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(ws): Path<String>,
+    Json(body): Json<CreateBranchRequest>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let root = match state.engine.read().await.workspace_root_path(&ws) {
+        Some(r) => r,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "WORKSPACE_NOT_FOUND",
+                &format!("workspace '{ws}' is not mounted"),
+            );
+        }
+    };
+    let parent = body.parent.as_deref().unwrap_or("main");
+    match thinkingroot_branch::create_branch_full(
+        &root,
+        &body.name,
+        parent,
+        body.description,
+        request_user(&headers),
+        thinkingroot_core::BranchPermissions::default(),
+        body.kind.unwrap_or_default(),
+        body.merge_policy.unwrap_or_default(),
+        body.redaction,
+    )
+    .await
+    {
+        Ok(branch) => {
+            publish_latest_branch_event(&state, &branch.name).await;
+            {
+                let kind_label = format!("{:?}", branch.kind);
+                let kind_label = kind_label
+                    .split(|c: char| c == ' ' || c == '{')
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                let created = chrono::Utc::now().timestamp() as f64;
+                let engine = state.engine.read().await;
+                let _ = engine
+                    .sync_branch_created(&root, &branch.name, Some(parent), Some(&kind_label), created)
+                    .await;
+            }
+            ok_response(serde_json::json!({ "branch": branch })).into_response()
+        }
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, "BRANCH_ERROR", &e.to_string()),
+    }
+}
+
+async fn delete_branch_ws_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((ws, branch)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = ensure_user_ws(&state, &ws).await {
+        return resp;
+    }
+    let root = match state.engine.read().await.workspace_root_path(&ws) {
+        Some(r) => r,
+        None => {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                "WORKSPACE_NOT_FOUND",
+                &format!("workspace '{ws}' is not mounted"),
+            );
+        }
+    };
+    let engine = state.engine.read().await;
+    let actor = request_user(&headers)
+        .map(crate::engine::BranchActor::User)
+        .unwrap_or(crate::engine::BranchActor::System);
+    match engine.delete_branch_as(&root, &branch, actor).await {
+        Ok(_) => {
             drop(engine);
             publish_latest_branch_event(&state, &branch).await;
             ok_response(serde_json::json!({ "deleted": branch })).into_response()

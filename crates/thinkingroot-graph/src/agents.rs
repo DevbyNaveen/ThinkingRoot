@@ -127,6 +127,16 @@ pub struct AgentFeatureFlags {
     /// May the agent invoke `dream` (night-shift synthesis).
     #[serde(default = "flag_on")]
     pub dream_enabled: bool,
+    /// May the agent recall (read memory). Off = the agent runs persona-only,
+    /// no grounded retrieval.
+    #[serde(default = "flag_on")]
+    pub can_recall: bool,
+    /// May the agent fork branches (per-run isolation, sandbox runs).
+    #[serde(default = "flag_on")]
+    pub can_branch: bool,
+    /// May the Stitcher tend this agent's brain (weave edges, resolve, grow).
+    #[serde(default = "flag_on")]
+    pub stitch: bool,
 }
 
 impl Default for AgentFeatureFlags {
@@ -136,6 +146,9 @@ impl Default for AgentFeatureFlags {
             can_use_tools: true,
             web_search: true,
             dream_enabled: true,
+            can_recall: true,
+            can_branch: true,
+            stitch: true,
         }
     }
 }

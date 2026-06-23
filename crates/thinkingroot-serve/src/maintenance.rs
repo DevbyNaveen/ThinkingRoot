@@ -822,6 +822,140 @@ pub fn spawn_living_edges_decay(workspace_root: PathBuf) -> JoinHandle<()> {
     spawn_periodic_task(task)
 }
 
+/// The Stitcher — periodic graph-tending pass over every mounted brain. Each
+/// tick weaves missing relational edges + queues entity-merge proposals
+/// (`QueryEngine::stitch_once`). Mirrors KeepWarm's mounted-workspace walk:
+/// the engine read lock is taken fresh per workspace (released between), so a
+/// slow per-brain LLM adjudication never blocks mounts for the whole fleet.
+/// Best-effort: a per-brain error is logged at WARN and the walk continues.
+struct StitcherTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    max_candidates: usize,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for StitcherTask {
+    fn name(&self) -> &'static str {
+        "stitcher"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let names: Vec<String> = {
+            let eng = self.engine.read().await;
+            eng.mounted_workspace_names()
+        };
+        for ws in names {
+            let res = {
+                let eng = self.engine.read().await;
+                eng.stitch_once(&ws, self.max_candidates).await
+            };
+            match res {
+                Ok(r) if r.woven > 0 || r.proposals > 0 => {
+                    tracing::info!(ws = %ws, woven = r.woven, proposals = r.proposals, "stitcher pass")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(ws = %ws, "stitcher: {e}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the Stitcher. Gated on `TR_STITCHER` — a true no-op until enabled
+/// (the `deep` cognition preset sets it). `TR_STITCHER_SECS` = tick cadence
+/// (default hourly); `TR_STITCHER_MAX_CANDIDATES` = per-brain candidate cap
+/// (default 32, bounds LLM cost).
+pub fn spawn_stitcher(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_STITCHER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let interval_secs = std::env::var("TR_STITCHER_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3_600u64);
+    let max_candidates = std::env::var("TR_STITCHER_MAX_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32usize);
+    let task: Arc<dyn PeriodicTask> = Arc::new(StitcherTask {
+        engine,
+        max_candidates,
+        interval: Duration::from_secs(interval_secs.max(60)),
+    });
+    spawn_periodic_task(task)
+}
+
+/// Idle decay of the Stitcher's woven edges (mirrors the Living-Engram decay):
+/// a woven edge that never helps fades toward a floor, so auto-applied edges
+/// don't accumulate as noise. Gated on `TR_STITCHER`. Daily cadence;
+/// `TR_STITCHED_EDGES_DECAY_FACTOR` (0.97) / `TR_STITCHED_EDGES_FLOOR` (0.05).
+pub fn spawn_stitched_edges_decay(workspace_root: PathBuf) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_STITCHER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let factor = std::env::var("TR_STITCHED_EDGES_DECAY_FACTOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.97f64);
+    let floor = std::env::var("TR_STITCHED_EDGES_FLOOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.05f64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(StitchedEdgeDecayTask {
+        workspace_root,
+        factor,
+        floor,
+        interval: Duration::from_secs(86_400),
+    });
+    spawn_periodic_task(task)
+}
+
+/// Time-driven decay of `stitched_edges` weight (the Stitcher's other half).
+struct StitchedEdgeDecayTask {
+    workspace_root: PathBuf,
+    factor: f64,
+    floor: f64,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for StitchedEdgeDecayTask {
+    fn name(&self) -> &'static str {
+        "stitched_edges_decay"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let graph_dir = self.workspace_root.join(".thinkingroot").join("graph");
+        if !graph_dir.exists() {
+            return Ok(());
+        }
+        let (factor, floor, dir) = (self.factor, self.floor, graph_dir.clone());
+        let decayed = tokio::task::spawn_blocking(move || {
+            let graph = thinkingroot_graph::graph::GraphStore::init(&dir)?;
+            graph.decay_stitched_edges(factor, floor)
+        })
+        .await
+        .map_err(|e| thinkingroot_core::Error::GraphStorage(format!("stitched decay join: {e}")))??;
+        if decayed > 0 {
+            tracing::info!(decayed, "stitched-edges decay pass");
+        }
+        Ok(())
+    }
+}
+
 /// Single cleanup pass. Exposed for tests.
 ///
 /// When `branch_engines` is provided, the cache is invalidated before each

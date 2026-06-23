@@ -443,6 +443,14 @@ pub async fn run_serve(
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_living_edges_decay(root.clone()));
 
+    // The Stitcher: periodic graph-tending creature + idle decay of its woven
+    // edges. No-op handles unless TR_STITCHER=1 (the `deep` cognition preset).
+    let _stitcher_handle =
+        thinkingroot_serve::maintenance::spawn_stitcher(state.engine.clone());
+    let _stitched_decay_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_stitched_edges_decay(root.clone()));
+
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
     // handler updates so a desktop `workspace_set_active` flips the
@@ -844,6 +852,14 @@ async fn run_serve_with_listener(
     let _living_edges_handle = workspace_root
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_living_edges_decay(root.clone()));
+
+    // The Stitcher: periodic graph-tending creature + idle decay of its woven
+    // edges. No-op handles unless TR_STITCHER=1 (the `deep` cognition preset).
+    let _stitcher_handle =
+        thinkingroot_serve::maintenance::spawn_stitcher(state.engine.clone());
+    let _stitched_decay_handle = workspace_root
+        .as_ref()
+        .map(|root| thinkingroot_serve::maintenance::spawn_stitched_edges_decay(root.clone()));
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();

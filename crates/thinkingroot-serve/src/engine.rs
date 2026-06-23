@@ -35,6 +35,35 @@ pub struct EntityInfo {
     pub name: String,
     pub entity_type: String,
     pub claim_count: usize,
+    /// Dominant provenance of this entity's claims — the Console's origin-color
+    /// channel: compiled | chat | ai | dream | web | media.
+    pub origin: String,
+    /// Epoch seconds of the most recent contributing claim (else entity
+    /// creation time) — drives the "freshly written" pulse.
+    pub last_written_at: f64,
+}
+
+/// Map a claim source URI to the Console's origin-color channel. Finer-grained
+/// than `TrustClass` (it distinguishes dream:// and media), so the Neural Graph
+/// can paint where each memory came from.
+fn origin_from_uri(uri: &str) -> &'static str {
+    let u = uri.trim();
+    if u.starts_with("dream://") {
+        "dream"
+    } else if u.starts_with("stitch://") {
+        "stitch"
+    } else if u.starts_with("rootfn://") || u.starts_with("connector://") {
+        "ai"
+    } else if u.starts_with("mcp://agent") {
+        "chat"
+    } else if u.starts_with("image://") || u.starts_with("audio://") || u.starts_with("video://") {
+        "media"
+    } else if u.starts_with("http://") || u.starts_with("https://") {
+        "web"
+    } else {
+        // file://, git://, bare owner-tree paths, unknown → the library default.
+        "compiled"
+    }
 }
 
 /// P5.25 — god-view aggregate of the cognition graph merged across all
@@ -270,6 +299,22 @@ pub struct DreamReport {
     /// Whether the dream was merged into main (else kept on the branch for review).
     pub merged: bool,
     /// Honest note (why nothing dreamed, what was kept/discarded).
+    pub note: String,
+}
+
+/// Outcome of a Stitcher pass — the graph-tending creature's tick. Additive
+/// moves (woven edges, grown concepts) are applied directly (low-risk:
+/// evidence-grounded + decaying); destructive moves (entity-merge) are queued
+/// as proposals, never auto-applied (tiered trust).
+#[derive(Debug, Clone, Serialize)]
+pub struct StitchReport {
+    /// Edges woven into the graph this pass (adjudicated + evidence-grounded).
+    pub woven: usize,
+    /// Destructive moves queued for approval (entity-merge candidates).
+    pub proposals: usize,
+    /// Higher-order concept nodes grown from communities.
+    pub concepts: usize,
+    /// Honest note (why nothing stitched, what was applied/queued).
     pub note: String,
 }
 
@@ -1897,13 +1942,21 @@ impl FnCapabilities {
                 "ctx.dream needs recall + remember + branch capabilities".to_string(),
             ));
         }
+        // Sample from the DURABLE graph, not the compiled read cache:
+        // remember/store/contribute write claims to the graph but do NOT
+        // repopulate the read cache, so cache-sampling makes chat/remember-fed
+        // (uncompiled) brains dream empty. `get_all_claims_with_sources` reads
+        // the witness substrate with a claims-table fallback — it sees those
+        // claims.
         let claims: Vec<String> = {
-            let cache = self.handle.cache.read().await;
-            cache
-                .all_claims()
-                .filter(|c| !c.statement.trim().is_empty())
+            let storage = self.handle.storage.lock().await;
+            storage
+                .graph
+                .get_all_claims_with_sources()?
+                .into_iter()
+                .filter(|(_, statement, ..)| !statement.trim().is_empty())
                 .take(max_claims.clamp(1, 200))
-                .map(|c| c.statement.clone())
+                .map(|(_, statement, ..)| statement)
                 .collect()
         };
         if claims.len() < 3 {
@@ -2737,6 +2790,35 @@ impl QueryEngine {
         let mut result = Vec::with_capacity(cache.entity_count());
         for id in cache.entities_ordered() {
             if let Some(e) = cache.entity_by_id(id) {
+                // Dominant origin (mode over claim provenance) + most-recent write.
+                let claims = cache.claims_for_entity(&e.id);
+                let mut counts: std::collections::HashMap<&'static str, usize> =
+                    std::collections::HashMap::new();
+                let mut last_written: f64 = 0.0;
+                for c in &claims {
+                    *counts.entry(origin_from_uri(&c.source_uri)).or_insert(0) += 1;
+                    if let Some(d) = c.event_date {
+                        if d > last_written {
+                            last_written = d;
+                        }
+                    }
+                }
+                let origin = counts
+                    .into_iter()
+                    .max_by_key(|(_, n)| *n)
+                    .map(|(o, _)| o)
+                    .unwrap_or("compiled")
+                    .to_string();
+                // Fall back to entity creation time (ULID timestamp) when no
+                // claim carries an explicit event date.
+                let created_at = e
+                    .id
+                    .parse::<thinkingroot_core::types::EntityId>()
+                    .map(|eid| eid.timestamp_ms() as f64 / 1000.0)
+                    .unwrap_or(0.0);
+                if last_written <= 0.0 {
+                    last_written = created_at;
+                }
                 result.push(EntityInfo {
                     id: e.id.clone(),
                     name: e.canonical_name.clone(),
@@ -2748,6 +2830,8 @@ impl QueryEngine {
                         &e.entity_type,
                     ),
                     claim_count: cache.entity_claim_count(&e.id),
+                    origin,
+                    last_written_at: last_written,
                 });
             }
         }
@@ -7086,15 +7170,20 @@ side referenced. Strict rules:\n\
         let handle = self.get_workspace(ws)?;
         let root = handle.root_path.clone();
 
-        // Sample claim statements from the read cache (cheap; the dream
-        // abstracts over what's already there).
+        // Sample claim statements from the DURABLE graph, not the compiled
+        // read cache. remember/store/contribute write to the graph but do NOT
+        // repopulate the read cache, so cache-sampling makes chat/remember-fed
+        // (uncompiled) brains dream empty. `get_all_claims_with_sources` reads
+        // the witness substrate with a claims-table fallback — it sees them.
         let claims: Vec<String> = {
-            let cache = handle.cache.read().await;
-            cache
-                .all_claims()
-                .filter(|c| !c.statement.trim().is_empty())
+            let storage = handle.storage.lock().await;
+            storage
+                .graph
+                .get_all_claims_with_sources()?
+                .into_iter()
+                .filter(|(_, statement, ..)| !statement.trim().is_empty())
                 .take(max_claims.clamp(1, 200))
-                .map(|c| c.statement.clone())
+                .map(|(_, statement, ..)| statement)
                 .collect()
         };
         if claims.len() < 3 {
@@ -7177,6 +7266,248 @@ side referenced. Strict rules:\n\
                 "insights kept on the dream branch (review before merge)".to_string()
             },
         })
+    }
+
+    /// The Stitcher — one graph-tending pass over `ws`. Deterministic candidate
+    /// generation (co-occurring entities lacking a direct edge) → LLM
+    /// adjudication (type + confidence, firewalled to the proposed pairs) →
+    /// tiered settlement: ADDITIVE woven edges are applied directly (low-risk —
+    /// evidence-grounded + decaying), DESTRUCTIVE entity-merges are queued as
+    /// proposals (never auto-applied). Honest no-op when there's nothing to do;
+    /// never fabricates an edge. Gated TR_STITCHER at the caller; respects a
+    /// per-agent `stitch=false`.
+    pub async fn stitch_once(
+        &self,
+        ws: &str,
+        max_candidates: usize,
+    ) -> Result<StitchReport> {
+        use std::collections::{HashMap, HashSet};
+        // Per-agent gate (mirror dream's dream_enabled gate).
+        if let Some(agent) = agent_from_ws(ws)
+            && let Ok(Some(def)) = self.get_agent(ws, &agent).await
+            && !def.feature_flags().stitch
+        {
+            return Err(Error::Config(format!(
+                "agent '{agent}' is not permitted to stitch (stitch=false)"
+            )));
+        }
+        let llm = self.workspace_llm(ws).ok_or_else(|| {
+            Error::Config(format!("workspace '{ws}' has no LLM configured — cannot stitch"))
+        })?;
+        let handle = self.get_workspace(ws)?;
+
+        // ── Phase 1: deterministic candidate generation (CPU, no LLM) ──
+        let (entities, claim_entity, claim_text, existing) = {
+            let storage = handle.storage.lock().await;
+            let entities = storage.graph.get_all_entities()?; // (id, name, type)
+            let claim_entity = storage.graph.get_all_claim_entity_edges()?; // (claim_id, entity_id)
+            let claim_text: Vec<(String, String)> = storage
+                .graph
+                .get_all_claims_with_sources()?
+                .into_iter()
+                .map(|(id, statement, ..)| (id, statement))
+                .collect();
+            let existing = storage.graph.get_all_relations()?; // (from_name, to_name, ...)
+            (entities, claim_entity, claim_text, existing)
+        };
+
+        let unordered_lc = |a: &str, b: &str| -> (String, String) {
+            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            if a <= b { (a, b) } else { (b, a) }
+        };
+        let id_name: HashMap<String, String> =
+            entities.iter().map(|(id, name, _)| (id.clone(), name.clone())).collect();
+        let claim_stmt: HashMap<String, String> = claim_text.into_iter().collect();
+        let mut claim_ents: HashMap<String, Vec<String>> = HashMap::new();
+        for (cid, eid) in &claim_entity {
+            claim_ents.entry(cid.clone()).or_default().push(eid.clone());
+        }
+        let connected: HashSet<(String, String)> =
+            existing.iter().map(|(f, t, ..)| unordered_lc(f, t)).collect();
+
+        // Co-occurrence candidates: entity pairs that share a claim but have no
+        // direct edge. Evidence = the shared claim; context = its statement.
+        let mut raw: Vec<crate::intelligence::stitch::Candidate> = Vec::new();
+        for (cid, ents) in &claim_ents {
+            let mut uniq: Vec<&String> = ents.iter().collect();
+            uniq.sort();
+            uniq.dedup();
+            if uniq.len() < 2 {
+                continue;
+            }
+            let ctx = claim_stmt.get(cid).cloned().unwrap_or_default();
+            for i in 0..uniq.len() {
+                for j in (i + 1)..uniq.len() {
+                    let (Some(na), Some(nb)) = (id_name.get(uniq[i]), id_name.get(uniq[j])) else {
+                        continue;
+                    };
+                    if connected.contains(&unordered_lc(na, nb)) {
+                        continue;
+                    }
+                    raw.push(crate::intelligence::stitch::Candidate {
+                        from_id: uniq[i].clone(),
+                        to_id: uniq[j].clone(),
+                        from_name: na.clone(),
+                        to_name: nb.clone(),
+                        signal: 1.0,
+                        context: ctx.clone(),
+                        evidence: vec![cid.clone()],
+                    });
+                }
+            }
+        }
+        let candidates =
+            crate::intelligence::stitch::rank_and_cap(raw, max_candidates.clamp(1, 64));
+
+        // Destructive RESOLVE candidates: exact case-insensitive duplicate names
+        // with different ids → propose a merge (never auto-applied). Cheap +
+        // std-only; richer fuzzy resolution is a follow-up.
+        let mut dup_proposals: Vec<(String, String, String)> = Vec::new(); // (from_id, to_id, name)
+        {
+            let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+            for (id, name, _ty) in &entities {
+                by_name.entry(name.trim().to_lowercase()).or_default().push(id.clone());
+            }
+            for (name, mut ids) in by_name {
+                if ids.len() < 2 {
+                    continue;
+                }
+                ids.sort();
+                let keep = ids[0].clone(); // merge the rest INTO the smallest id
+                for dup in ids.into_iter().skip(1) {
+                    dup_proposals.push((dup, keep.clone(), name.clone()));
+                }
+            }
+        }
+
+        if candidates.is_empty() && dup_proposals.is_empty() {
+            return Ok(StitchReport {
+                woven: 0,
+                proposals: 0,
+                concepts: 0,
+                note: "no candidates to stitch this pass".to_string(),
+            });
+        }
+
+        // ── Phase 2: LLM adjudication (bounded; no lock held) ──
+        let connections = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let prompt = crate::intelligence::stitch::build_stitch_prompt(&candidates);
+            let out = llm.chat(crate::intelligence::stitch::STITCH_SYSTEM, &prompt).await?;
+            crate::intelligence::stitch::parse_stitch_connections(&out, &candidates)
+        };
+
+        // ── Phase 3: tiered settlement ──
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut woven = 0usize;
+        let mut proposals = 0usize;
+        {
+            let storage = handle.storage.lock().await;
+            // Additive: weave edges directly (evidence-grounded + decaying).
+            for c in &connections {
+                if c.evidence.is_empty() {
+                    continue; // contract: never weave an unevidenced edge.
+                }
+                if storage
+                    .graph
+                    .write_stitched_edge(
+                        &c.from_id,
+                        &c.to_id,
+                        &c.relation_type,
+                        c.confidence,
+                        &c.evidence,
+                        ts,
+                    )
+                    .is_ok()
+                {
+                    woven += 1;
+                }
+            }
+            // Destructive: queue merge proposals (idempotent on re-run because a
+            // proposal id is derived from the pair, not random).
+            for (from_id, to_id, name) in &dup_proposals {
+                let id = format!("stitch-merge:{from_id}->{to_id}");
+                let evidence_json = serde_json::to_string(&[format!("duplicate-name:{name}")])
+                    .unwrap_or_else(|_| "[]".to_string());
+                if storage
+                    .graph
+                    .add_stitch_proposal(&id, "resolve", from_id, to_id, &evidence_json, 0.9, ts)
+                    .is_ok()
+                {
+                    proposals += 1;
+                }
+            }
+            // Reload the read cache so woven edges show immediately (mirrors
+            // `remember`; otherwise the graph view lags until remount).
+            if woven > 0 {
+                if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
+                    *handle.cache.write().await = new_cache;
+                }
+            }
+        }
+
+        Ok(StitchReport {
+            woven,
+            proposals,
+            // Concept-grow (community detection → concept nodes) wires next; the
+            // pure `detect_communities` is ready, concept-node creation pending.
+            concepts: 0,
+            note: format!("wove {woven} edge(s), queued {proposals} merge proposal(s)"),
+        })
+    }
+
+    /// List the Stitcher's destructive-move proposals for `ws` (optionally only
+    /// `pending`). Read-only — approval is a separate explicit step.
+    pub async fn stitch_proposals(
+        &self,
+        ws: &str,
+        only_pending: bool,
+    ) -> Result<Vec<thinkingroot_graph::graph::StitchProposal>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_stitch_proposals(only_pending)
+    }
+
+    /// Approve/reject a Stitcher proposal (`status` = approved | rejected).
+    /// Returns false if the id is unknown. v1 records the decision; applying an
+    /// approved entity-merge (claim redirect) is the one destructive op left to
+    /// wire — so an approval never silently mutates the graph yet.
+    pub async fn set_stitch_proposal(&self, ws: &str, id: &str, status: &str) -> Result<bool> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.set_stitch_proposal_status(id, status)
+    }
+
+    /// The set of unordered, lowercased entity-NAME pairs that the Stitcher wove
+    /// (provenance `stitch://`). Lets the `/relations` endpoint stamp `origin` so
+    /// the graph view colors woven edges. Matches on the entity pair (robust to
+    /// relation-type normalization).
+    pub async fn stitched_edge_name_pairs(
+        &self,
+        ws: &str,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        use std::collections::{HashMap, HashSet};
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let origins = storage.graph.get_stitched_edge_origins()?;
+        let id_name: HashMap<String, String> = storage
+            .graph
+            .get_all_entities()?
+            .into_iter()
+            .map(|(id, name, _)| (id, name))
+            .collect();
+        let mut set = HashSet::new();
+        for ((from_id, to_id, _rt), _origin) in origins {
+            if let (Some(f), Some(t)) = (id_name.get(&from_id), id_name.get(&to_id)) {
+                let (a, b) = (f.to_lowercase(), t.to_lowercase());
+                set.insert(if a <= b { (a, b) } else { (b, a) });
+            }
+        }
+        Ok(set)
     }
 
     /// §1 — the `predict` verb ("what happens next"), grounded + falsifier-gated.
