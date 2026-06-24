@@ -7569,6 +7569,14 @@ side referenced. Strict rules:\n\
             if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
                 tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
             }
+            // Promote the facts' subjects/objects into first-class graph ENTITY
+            // NODES + relations so the LLM-extracted knowledge appears in the
+            // Neural Graph and can be clustered into concepts.
+            match storage.graph.promote_fact_entities_and_relations(&sid) {
+                Ok(n) if n > 0 => tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}"),
+            }
             // Per-document summary node (deterministic over the live facts).
             if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
                 tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
@@ -7613,6 +7621,22 @@ side referenced. Strict rules:\n\
                 let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
             } else {
                 let _ = storage.graph.complete_atomic_extract(&sid);
+            }
+        }
+        // Reload the read cache so freshly-promoted entities + relations appear
+        // in the Neural Graph immediately (list_entities reads the cache).
+        if total > 0 {
+            {
+                let storage = handle.storage.lock().await;
+                if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
+                    *handle.cache.write().await = new_cache;
+                }
+            }
+            // Grow concepts promptly from the new entity graph (best-effort;
+            // the periodic Stitcher would otherwise do this on its own tick).
+            // Cheap here: no weave candidates ⇒ no LLM adjudication.
+            if let Err(e) = self.stitch_once(ws, 32).await {
+                tracing::debug!(ws = %ws, "post-extract stitch skipped: {e}");
             }
         }
         Ok(total)
@@ -7746,6 +7770,13 @@ side referenced. Strict rules:\n\
         // each cluster ≥2 becomes a concept node. Anti-hallucination gate 2:
         // a concept is `active` only with ≥1 evidenced co-occurrence (a claim
         // mentioning ≥2 of its members) — else it stays `quarantined`.
+        // Co-occurrence comes from TWO sources: entities sharing a CLAIM, AND
+        // entity↔entity RELATIONS (which now includes fact-promoted edges). A
+        // name→id map lets us fold the name-keyed relations into the id space.
+        let name_to_id: HashMap<String, String> = entities
+            .iter()
+            .map(|(id, name, _)| (name.to_lowercase(), id.clone()))
+            .collect();
         let community_edges: Vec<(String, String)> = {
             let mut e = Vec::new();
             for ents in claim_ents.values() {
@@ -7758,8 +7789,22 @@ side referenced. Strict rules:\n\
                     }
                 }
             }
+            for (fname, tname, ..) in &existing {
+                if let (Some(fid), Some(tid)) = (
+                    name_to_id.get(&fname.to_lowercase()),
+                    name_to_id.get(&tname.to_lowercase()),
+                ) {
+                    if fid != tid {
+                        e.push((fid.clone(), tid.clone()));
+                    }
+                }
+            }
             e
         };
+        let edge_set: HashSet<(String, String)> = community_edges
+            .iter()
+            .map(|(a, b)| if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) })
+            .collect();
         let communities =
             crate::intelligence::stitch::detect_communities(&community_edges, 5, 2);
         let mut concept_records: Vec<(thinkingroot_graph::rows::ConceptNode, Vec<String>, bool)> =
@@ -7771,6 +7816,18 @@ side referenced. Strict rules:\n\
                 if ents.iter().filter(|e| member_set.contains(*e)).count() >= 2 {
                     evidence.push(cid.clone());
                 }
+            }
+            // Edge evidence: a connecting (claim or fact-relation) edge inside
+            // the community. A detected community always has ≥1, so a cluster
+            // built purely from fact relations still passes the gate (active).
+            let connected_internal = comm.iter().enumerate().any(|(i, a)| {
+                comm.iter().skip(i + 1).any(|b| {
+                    let key = if a <= b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+                    edge_set.contains(&key)
+                })
+            });
+            if evidence.is_empty() && connected_internal {
+                evidence.push("entity-relations".to_string());
             }
             let id = thinkingroot_graph::graph::GraphStore::concept_id_for(comm);
             let label = comm
