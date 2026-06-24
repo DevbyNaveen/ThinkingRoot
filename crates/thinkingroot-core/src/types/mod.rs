@@ -1,5 +1,6 @@
 mod agent_topology;
 mod artifact;
+mod atomic_fact;
 mod branch;
 mod claim;
 pub mod claim_migration;
@@ -20,6 +21,7 @@ mod workspace_status;
 
 pub use agent_topology::{AgentMergePolicy, AgentTopology, ReadScope, WriteTarget};
 pub use artifact::*;
+pub use atomic_fact::{parse_atomic_facts, AtomicFact, ChunkContext, RawAtomicFact};
 pub use branch::*;
 pub use claim::*;
 pub use claim_migration::{

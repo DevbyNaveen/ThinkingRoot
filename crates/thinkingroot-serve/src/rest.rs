@@ -859,6 +859,13 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/gaps", get(gaps_handler))
             .route("/ws/{ws}/sources", get(list_sources_handler))
+            // North-star: per-source detail + verbatim chunks + concepts +
+            // entity profile + claim timeline + the original-bytes loop.
+            .route("/ws/{ws}/sources/{id}", get(source_detail_handler))
+            .route("/ws/{ws}/sources/{id}/raw", get(source_raw_handler))
+            .route("/ws/{ws}/sources/{id}/chunks", get(source_chunks_handler))
+            .route("/ws/{ws}/concepts", get(list_concepts_handler))
+            .route("/ws/{ws}/entities/{name}/profile", get(entity_profile_handler))
             // ─── Compiled Prompt substrate ───────────────────────────
             .route(
                 "/ws/{ws}/prompts",
@@ -1983,6 +1990,107 @@ async fn list_sources_handler(
     match engine.list_sources(&ws).await {
         Ok(sources) => ok_response(sources).into_response(),
         Err(e) => match_engine_error(e),
+    }
+}
+
+// ─── North-star Phase 6 — Sources/Cognition drill-down handlers ──────────────
+
+/// `GET /ws/{ws}/sources/{id}` — per-document detail (summary + facts +
+/// chunk count + entities).
+async fn source_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_source_detail(&ws, &id).await {
+        Ok(d) => ok_response(d).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /ws/{ws}/sources/{id}/raw` — the original document bytes ("Open
+/// original ↗"). Auth is upstream (gateway/BFF); only project members reach it.
+async fn source_raw_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_source_raw(&ws, &id).await {
+        Ok((uri, bytes)) => {
+            let ct = content_type_for_uri(&uri);
+            (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(ct).unwrap_or_else(|_| {
+                        HeaderValue::from_static("application/octet-stream")
+                    }),
+                )],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /ws/{ws}/sources/{id}/chunks` — verbatim chunk list.
+async fn source_chunks_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_source_chunks(&ws, &id).await {
+        Ok(c) => ok_response(c).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConceptListParams {
+    status: Option<String>,
+}
+
+/// `GET /ws/{ws}/concepts?status=active` — Stitcher-grown concept nodes.
+async fn list_concepts_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(q): Query<ConceptListParams>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_concepts(&ws, q.status.as_deref()).await {
+        Ok(c) => ok_response(c).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /ws/{ws}/entities/{name}/profile` — cross-document entity profile.
+async fn entity_profile_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_entity_profile(&ws, &name).await {
+        Ok(p) => ok_response(p).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Best-effort content-type from a source URI's extension (for inline preview).
+fn content_type_for_uri(uri: &str) -> &'static str {
+    let lower = uri.to_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "pdf" => "application/pdf",
+        "txt" | "md" | "markdown" => "text/plain; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
     }
 }
 

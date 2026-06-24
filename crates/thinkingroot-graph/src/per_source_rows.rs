@@ -60,8 +60,8 @@ use thinkingroot_core::{Error, Result};
 use crate::graph::GraphStore;
 use crate::rows::{
     CodeImport, CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow,
-    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
-    SourceAnnotation, SourceReference, TestAnnotation,
+    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, RawChunkRow,
+    ResidualChunk, SourceAnnotation, SourceReference, TestAnnotation,
 };
 
 /// New structural rows for one source, grouped per table.  Used by
@@ -92,6 +92,10 @@ pub struct PerSourceRows {
     pub git_blame: Vec<GitBlameRow>,
     pub git_commits: Vec<GitCommit>,
     pub code_metrics: Vec<CodeMetric>,
+    /// Verbatim 1:1 chunk track (north-star spine). NOT a STRUCTURAL_TABLES
+    /// member — rebuilt wholesale per-source via an explicit `:rm` in the
+    /// transactional rebuild (it must not join the Phase-9 byte audit).
+    pub raw_chunks: Vec<RawChunkRow>,
 }
 
 impl PerSourceRows {
@@ -117,6 +121,7 @@ impl PerSourceRows {
             && self.git_blame.is_empty()
             && self.git_commits.is_empty()
             && self.code_metrics.is_empty()
+            && self.raw_chunks.is_empty()
     }
 
     /// Run one `:put <table> {…}` script inside `tx` for every table
@@ -176,6 +181,9 @@ impl PerSourceRows {
         if !self.code_metrics.is_empty() {
             run_put(tx, code_metrics_put_spec(&self.code_metrics))?;
         }
+        if !self.raw_chunks.is_empty() {
+            run_put(tx, raw_chunks_put_spec(&self.raw_chunks))?;
+        }
         Ok(())
     }
 }
@@ -192,6 +200,24 @@ struct PutSpec {
 fn run_put(tx: &MultiTransaction, spec: PutSpec) -> Result<()> {
     tx.run_script(&spec.script, spec.params)
         .map_err(|e| Error::GraphStorage(format!("transactional rebuild :put failed: {e}")))?;
+    Ok(())
+}
+
+/// Cascade `:rm` for `raw_chunks` scoped to one source. Standalone (not in
+/// `STRUCTURAL_TABLES`) so the wholesale per-source rebuild stays atomic with
+/// the structural cascade while keeping `raw_chunks` out of the byte audit.
+fn run_raw_chunks_rm(tx: &MultiTransaction, source_id: &str) -> Result<()> {
+    let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+    params.insert("sid".into(), DataValue::Str(source_id.into()));
+    tx.run_script(
+        "?[id] := *raw_chunks{id, source_id: $sid}\n:rm raw_chunks {id}",
+        params,
+    )
+    .map_err(|e| {
+        Error::GraphStorage(format!(
+            "transactional rebuild for source {source_id}: cascade :rm on raw_chunks failed: {e}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -235,6 +261,11 @@ impl GraphStore {
                     ))
                 })?;
             }
+
+            // raw_chunks lives outside STRUCTURAL_TABLES (it must not join the
+            // Phase-9 byte audit), so cascade it explicitly for wholesale
+            // per-source rebuild.
+            run_raw_chunks_rm(&tx, source_id)?;
 
             // 2. Per-table inserts (only for tables with new rows).
             new_rows.append_put_scripts(&tx).map_err(|e| match e {
@@ -314,6 +345,8 @@ impl GraphStore {
                         ))
                     })?;
                 }
+                // raw_chunks is rebuilt wholesale outside STRUCTURAL_TABLES.
+                run_raw_chunks_rm(&tx, source_id.as_str())?;
             }
 
             // Phase 2: per-source :put for tables with new rows.
@@ -595,6 +628,30 @@ fn chunks_residual_put_spec(rows: &[ResidualChunk]) -> PutSpec {
     )
 }
 
+fn raw_chunks_put_spec(rows: &[RawChunkRow]) -> PutSpec {
+    let payload: Vec<DataValue> = rows
+        .iter()
+        .map(|r| {
+            DataValue::List(vec![
+                s(&r.id),
+                s(&r.source_id),
+                i(r.chunk_index as i64),
+                s(&r.chunk_type),
+                s(&r.content),
+                i(r.byte_start as i64),
+                i(r.byte_end as i64),
+                s(&r.content_blake3),
+                f(r.created_at),
+            ])
+        })
+        .collect();
+    put_spec(
+        "?[id, source_id, chunk_index, chunk_type, content, byte_start, byte_end, content_blake3, created_at] <- $rows \
+         :put raw_chunks {id => source_id, chunk_index, chunk_type, content, byte_start, byte_end, content_blake3, created_at}",
+        payload,
+    )
+}
+
 fn quantities_put_spec(rows: &[QuantityRow]) -> PutSpec {
     let payload: Vec<DataValue> = rows
         .iter()
@@ -810,6 +867,78 @@ mod tests {
     fn empty_per_source_rows_is_empty() {
         let rows = PerSourceRows::default();
         assert!(rows.is_empty());
+    }
+
+    fn raw_chunk(source: &str, idx: u32, start: u64, end: u64) -> RawChunkRow {
+        RawChunkRow {
+            id: format!("rc-{source}-{start}-{end}"),
+            source_id: source.into(),
+            chunk_index: idx,
+            chunk_type: "text".into(),
+            content: format!("chunk {idx}"),
+            byte_start: start,
+            byte_end: end,
+            content_blake3: format!("b-{start}-{end}"),
+            created_at: 0.0,
+        }
+    }
+
+    #[test]
+    fn raw_chunks_persist_and_rebuild_wholesale() {
+        let (_dir, store) = make_store();
+
+        // First compile: 3 verbatim chunks for one source.
+        let mut rows = PerSourceRows::default();
+        for k in 0..3u32 {
+            rows.raw_chunks
+                .push(raw_chunk("src-rc", k, (k * 10) as u64, (k * 10 + 8) as u64));
+        }
+        store
+            .transactional_rebuild_sources(&[("src-rc".to_string(), rows)])
+            .unwrap();
+        let probe = store
+            .query_read("?[id] := *raw_chunks{id, source_id: 'src-rc'}")
+            .unwrap();
+        assert_eq!(probe.rows.len(), 3, "all three chunks persist");
+
+        // Re-compile with only 2 chunks at DIFFERENT byte ranges: the explicit
+        // per-source :rm must clear the old 3 before inserting the new 2
+        // (wholesale rebuild — no accumulation, no orphans).
+        let mut rows2 = PerSourceRows::default();
+        for k in 0..2u32 {
+            rows2
+                .raw_chunks
+                .push(raw_chunk("src-rc", k, (k * 5) as u64, (k * 5 + 4) as u64));
+        }
+        store
+            .transactional_rebuild_sources(&[("src-rc".to_string(), rows2)])
+            .unwrap();
+        let probe2 = store
+            .query_read("?[id] := *raw_chunks{id, source_id: 'src-rc'}")
+            .unwrap();
+        assert_eq!(probe2.rows.len(), 2, "raw_chunks rebuilt wholesale, not accumulated");
+    }
+
+    #[test]
+    fn raw_chunks_rebuild_isolates_sources() {
+        let (_dir, store) = make_store();
+        let mut a = PerSourceRows::default();
+        a.raw_chunks.push(raw_chunk("src-a", 0, 0, 8));
+        store
+            .transactional_rebuild_sources(&[("src-a".to_string(), a)])
+            .unwrap();
+
+        // Rebuilding B must not touch A's raw_chunks.
+        let mut b = PerSourceRows::default();
+        b.raw_chunks.push(raw_chunk("src-b", 0, 0, 8));
+        store
+            .transactional_rebuild_sources(&[("src-b".to_string(), b)])
+            .unwrap();
+
+        let probe_a = store
+            .query_read("?[id] := *raw_chunks{id, source_id: 'src-a'}")
+            .unwrap();
+        assert_eq!(probe_a.rows.len(), 1, "source A's raw_chunks survive B's rebuild");
     }
 
     #[test]

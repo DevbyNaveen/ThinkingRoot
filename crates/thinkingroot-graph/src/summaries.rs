@@ -26,6 +26,10 @@ use crate::graph::GraphStore;
 pub const ALTITUDE_FUNCTION: &str = "function";
 pub const ALTITUDE_FILE: &str = "file";
 pub const ALTITUDE_REPO: &str = "repo";
+/// North-star: one summary node per imported document (`target_id =
+/// source_id`). Powers the Sources page "Summary" tab. Distinct from the
+/// code-oriented function/file/repo ladder above.
+pub const ALTITUDE_DOCUMENT: &str = "document";
 
 /// One hierarchical summary node.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -183,6 +187,72 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Upsert the per-document summary node for one source (wholesale-replace
+    /// the prior `document`-altitude node for that `source_id`). `child_ids` are
+    /// the fact/chunk ids the summary covers.
+    pub fn upsert_document_summary(
+        &self,
+        source_id: &str,
+        source_uri: &str,
+        summary: &str,
+        child_ids: &[String],
+        now: f64,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("sid".to_string(), DataValue::Str(source_id.into()));
+        self.query(
+            "?[id] := *summary_nodes{id, altitude, target_id}, altitude == 'document', \
+             target_id == $sid\n:rm summary_nodes {id}",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("upsert_document_summary :rm: {e}")))?;
+
+        let node = SummaryNode {
+            id: format!("doc-summary:{source_id}"),
+            altitude: ALTITUDE_DOCUMENT.to_string(),
+            target_id: source_id.to_string(),
+            summary: summary.to_string(),
+            child_ids_json: serde_json::to_string(child_ids).unwrap_or_else(|_| "[]".into()),
+            source_uri: source_uri.to_string(),
+            created_at: now,
+        };
+        self.insert_summary_nodes(&[node])
+    }
+
+    /// Build a DETERMINISTIC per-document summary from the source's live atomic
+    /// facts (the always-available fallback; an LLM-authored summary can be
+    /// supplied via [`Self::upsert_document_summary`] instead). Returns `false`
+    /// when the source has no facts yet (nothing to summarize). `now` keeps the
+    /// build pure/replayable.
+    pub fn build_document_summary(
+        &self,
+        source_id: &str,
+        source_uri: &str,
+        now: f64,
+    ) -> Result<bool> {
+        let facts: Vec<_> = self
+            .get_atomic_facts_for_source(source_id)?
+            .into_iter()
+            .filter(|f| f.is_live())
+            .collect();
+        if facts.is_empty() {
+            return Ok(false);
+        }
+        let chunk_count = self.get_raw_chunks_for_source(source_id)?.len();
+        let preview: Vec<&str> = facts.iter().take(5).map(|f| f.statement.as_str()).collect();
+        let summary = format!(
+            "{} fact{} across {} section{}. {}",
+            facts.len(),
+            if facts.len() == 1 { "" } else { "s" },
+            chunk_count,
+            if chunk_count == 1 { "" } else { "s" },
+            preview.join(" · ")
+        );
+        let child_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
+        self.upsert_document_summary(source_id, source_uri, &summary, &child_ids, now)?;
+        Ok(true)
+    }
+
     /// Read summary nodes, optionally filtered to one altitude. Ordered by
     /// (altitude, id) for determinism.
     pub fn get_summary_nodes(&self, altitude: Option<&str>) -> Result<Vec<SummaryNode>> {
@@ -245,6 +315,49 @@ mod tests {
             params,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn document_summary_built_from_facts_and_upserts() {
+        use thinkingroot_core::types::AtomicFact;
+        let s = store();
+        // No facts yet → nothing to summarize.
+        assert!(!s.build_document_summary("srcD", "doc.md", 1.0).unwrap());
+
+        let f = |pred: &str, start: u64, stmt: &str| AtomicFact {
+            id: AtomicFact::derive_id("srcD", start, start + 5, pred),
+            source_id: "srcD".into(),
+            chunk_id: "c".into(),
+            subject: "S".into(),
+            predicate: pred.into(),
+            object: "O".into(),
+            statement: stmt.into(),
+            confidence: 0.9,
+            extraction_model: "m".into(),
+            workspace_id: "ws".into(),
+            sensitivity: "Public".into(),
+            byte_start: start,
+            byte_end: start + 5,
+            content_blake3: "h".into(),
+            valid_from: 1.0,
+            valid_until: -1.0,
+            created_at: 1.0,
+        };
+        s.insert_atomic_facts_batch(&[f("a", 0, "Alpha fact"), f("b", 10, "Beta fact")])
+            .unwrap();
+
+        assert!(s.build_document_summary("srcD", "doc.md", 1.0).unwrap());
+        let docs = s.get_summary_nodes(Some(ALTITUDE_DOCUMENT)).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].target_id, "srcD");
+        assert!(docs[0].summary.contains("2 facts"));
+        assert!(docs[0].summary.contains("Alpha fact"));
+        let children: Vec<String> = serde_json::from_str(&docs[0].child_ids_json).unwrap();
+        assert_eq!(children.len(), 2);
+
+        // Idempotent: a second build replaces (not duplicates) the node.
+        s.build_document_summary("srcD", "doc.md", 2.0).unwrap();
+        assert_eq!(s.get_summary_nodes(Some(ALTITUDE_DOCUMENT)).unwrap().len(), 1);
     }
 
     #[test]

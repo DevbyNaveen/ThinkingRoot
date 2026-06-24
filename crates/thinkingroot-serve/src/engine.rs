@@ -209,6 +209,28 @@ pub struct ReadSourceResult {
     pub bytes: Vec<u8>,
 }
 
+/// North-star Phase 6 — Sources page drill-down payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDetailDto {
+    pub source_id: String,
+    pub uri: String,
+    pub summary: Option<String>,
+    pub fact_count: usize,
+    pub chunk_count: usize,
+    pub facts: Vec<thinkingroot_core::types::AtomicFact>,
+    pub entities: Vec<String>,
+}
+
+/// Cross-document entity profile payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityProfileDto {
+    pub name: String,
+    pub fact_count: usize,
+    pub facts: Vec<thinkingroot_core::types::AtomicFact>,
+    /// `(target_name, relation_type, strength)` triples.
+    pub relations: Vec<(String, String, f64)>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceInfo {
     pub id: String,
@@ -6520,6 +6542,120 @@ side referenced. Strict rules:\n\
         })
     }
 
+    /// North-star Phase 5 — read a source's ORIGINAL bytes in full (the
+    /// "Open original ↗" provenance loop). Returns `(uri, bytes)`. `Err(NotFound)`
+    /// when the source id is unknown; empty bytes when the source has no
+    /// persisted content (synthetic/agent contributions).
+    pub async fn get_source_raw(&self, ws: &str, source_id: &str) -> Result<(String, Vec<u8>)> {
+        use thinkingroot_core::Error;
+        use thinkingroot_graph::{FileSystemSourceStore, SourceByteStore};
+
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let source = storage
+            .graph
+            .get_source_by_id(source_id)?
+            .ok_or_else(|| Error::GraphStorage(format!("source {source_id} not found")))?;
+        if source.content_hash.is_empty() {
+            return Ok((source.uri, Vec::new()));
+        }
+        let store = FileSystemSourceStore::new(&handle.root_path.join(".thinkingroot"))
+            .map_err(|e| Error::GraphStorage(format!("source store init: {e}")))?;
+        let bytes = store
+            .get(&source.content_hash)
+            .map_err(|e| Error::GraphStorage(format!("source read: {e}")))?
+            .map(|b| b.bytes)
+            .unwrap_or_default();
+        Ok((source.uri, bytes))
+    }
+
+    /// North-star Phase 6 — per-document detail (Sources page drill-down):
+    /// summary + live facts + chunk count + mentioned entities.
+    pub async fn get_source_detail(
+        &self,
+        ws: &str,
+        source_id: &str,
+    ) -> Result<SourceDetailDto> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let uri = storage
+            .graph
+            .get_source_by_id(source_id)?
+            .map(|s| s.uri)
+            .unwrap_or_default();
+        let summary = storage
+            .graph
+            .get_summary_nodes(Some(thinkingroot_graph::summaries::ALTITUDE_DOCUMENT))?
+            .into_iter()
+            .find(|n| n.target_id == source_id)
+            .map(|n| n.summary);
+        let facts: Vec<thinkingroot_core::types::AtomicFact> = storage
+            .graph
+            .get_atomic_facts_for_source(source_id)?
+            .into_iter()
+            .filter(|f| f.is_live())
+            .collect();
+        let chunk_count = storage.graph.get_raw_chunks_for_source(source_id)?.len();
+        let mut entities: Vec<String> = Vec::new();
+        for f in &facts {
+            for n in [&f.subject, &f.object] {
+                if !n.is_empty() && !entities.iter().any(|e| e.eq_ignore_ascii_case(n)) {
+                    entities.push(n.clone());
+                }
+            }
+        }
+        Ok(SourceDetailDto {
+            source_id: source_id.to_string(),
+            uri,
+            summary,
+            fact_count: facts.len(),
+            chunk_count,
+            facts,
+            entities,
+        })
+    }
+
+    /// Verbatim chunks for a source (Sources page "Chunks" tab).
+    pub async fn get_source_chunks(
+        &self,
+        ws: &str,
+        source_id: &str,
+    ) -> Result<Vec<thinkingroot_graph::rows::RawChunkRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_raw_chunks_for_source(source_id)
+    }
+
+    /// Concept nodes (Cognition page "Concepts"). `status` filters
+    /// active/quarantined; `None` returns all.
+    pub async fn list_concepts(
+        &self,
+        ws: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<thinkingroot_graph::rows::ConceptNode>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_concept_nodes(status)
+    }
+
+    /// Cross-document entity profile: the entity's facts (from any source) +
+    /// its relations — "everything known about X across all sources."
+    pub async fn get_entity_profile(&self, ws: &str, name: &str) -> Result<EntityProfileDto> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let facts = storage.graph.get_atomic_facts_mentioning(name)?;
+        let relations = storage
+            .graph
+            .get_relations_for_entity(name)
+            .unwrap_or_default();
+        Ok(EntityProfileDto {
+            name: name.to_string(),
+            fact_count: facts.len(),
+            facts,
+            relations,
+        })
+    }
+
     /// Return Rooting admission-tier counts for a workspace.
     /// Bypasses the in-memory cache — queries CozoDB directly so MCP callers
     /// always see the freshest tier distribution (Phase 6.5 writes verdicts
@@ -7276,6 +7412,103 @@ side referenced. Strict rules:\n\
     /// proposals (never auto-applied). Honest no-op when there's nothing to do;
     /// never fabricates an edge. Gated TR_STITCHER at the caller; respects a
     /// per-agent `stitch=false`.
+    /// Phase 1d — drain up to `batch_limit` pending sources from the workspace's
+    /// `atomic_extract_queue`, run LLM atomic-fact extraction over each source's
+    /// verbatim `raw_chunks`, persist the grounded facts, and settle the queue.
+    /// Returns the number of facts written. Best-effort: the storage lock is
+    /// never held across the (slow, async) LLM calls — read chunks under lock,
+    /// extract unlocked, write under lock (mirrors `stitch_once`).
+    pub async fn extract_atomic_facts_once(&self, ws: &str, batch_limit: usize) -> Result<usize> {
+        const MAX_ATTEMPTS: i64 = 3;
+        let Some(llm) = self.workspace_llm(ws) else {
+            return Ok(0);
+        };
+        let handle = self.get_workspace(ws)?;
+
+        // Read the work-list (pending sources + their chunks) under the lock.
+        let work: Vec<(String, i64, Vec<thinkingroot_graph::rows::RawChunkRow>)> = {
+            let storage = handle.storage.lock().await;
+            let pending = storage.graph.pending_atomic_extract(batch_limit)?;
+            let mut w = Vec::with_capacity(pending.len());
+            for (sid, attempts) in pending {
+                let chunks = storage.graph.get_raw_chunks_for_source(&sid)?;
+                w.push((sid, attempts, chunks));
+            }
+            w
+        };
+        if work.is_empty() {
+            return Ok(0);
+        }
+
+        let model = llm.model_name().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut total = 0usize;
+
+        for (sid, attempts, chunks) in work {
+            if attempts >= MAX_ATTEMPTS {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
+                let storage = handle.storage.lock().await;
+                let _ = storage.graph.complete_atomic_extract(&sid);
+                continue;
+            }
+
+            // Extract over every chunk WITHOUT holding the storage lock.
+            let mut facts = Vec::new();
+            let mut transient_error = false;
+            for ch in &chunks {
+                let ctx = thinkingroot_core::types::ChunkContext {
+                    source_id: sid.clone(),
+                    chunk_id: ch.id.clone(),
+                    content: ch.content.clone(),
+                    byte_start: ch.byte_start,
+                    workspace_id: ws.to_string(),
+                    extraction_model: model.clone(),
+                    created_at: now,
+                };
+                match crate::intelligence::atomic_extract::extract_chunk_facts(&llm, &ctx).await {
+                    Ok(f) => facts.extend(f),
+                    Err(e) => {
+                        transient_error = true;
+                        tracing::warn!(ws = %ws, source_id = %sid, chunk_id = %ch.id, "atomic extract LLM error: {e}");
+                    }
+                }
+            }
+
+            // Persist + settle the queue under the lock.
+            let storage = handle.storage.lock().await;
+            // Bi-temporal supersession: tombstone prior live facts this
+            // re-extraction no longer confirms (keeps the version timeline).
+            let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
+            if let Err(e) = storage.graph.supersede_facts_not_in(&sid, &new_ids, now) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: supersession failed: {e}");
+            }
+            if let Err(e) = storage.graph.insert_atomic_facts_batch(&facts) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: insert failed: {e}");
+                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
+                continue;
+            }
+            total += facts.len();
+            // Build the mother-node spine edges for the facts just written.
+            if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
+            }
+            // Per-document summary node (deterministic over the live facts).
+            if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
+            }
+            if transient_error {
+                // Some chunks errored — keep the source queued to retry the rest.
+                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
+            } else {
+                let _ = storage.graph.complete_atomic_extract(&sid);
+            }
+        }
+        Ok(total)
+    }
+
     pub async fn stitch_once(
         &self,
         ws: &str,
@@ -7403,8 +7636,64 @@ side referenced. Strict rules:\n\
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
+        // ── Concept growth (community detection → concept NODES) ──────────
+        // Build the entity-id co-occurrence graph (CPU) and detect communities;
+        // each cluster ≥2 becomes a concept node. Anti-hallucination gate 2:
+        // a concept is `active` only with ≥1 evidenced co-occurrence (a claim
+        // mentioning ≥2 of its members) — else it stays `quarantined`.
+        let community_edges: Vec<(String, String)> = {
+            let mut e = Vec::new();
+            for ents in claim_ents.values() {
+                let mut u: Vec<&String> = ents.iter().collect();
+                u.sort();
+                u.dedup();
+                for i in 0..u.len() {
+                    for j in (i + 1)..u.len() {
+                        e.push((u[i].clone(), u[j].clone()));
+                    }
+                }
+            }
+            e
+        };
+        let communities =
+            crate::intelligence::stitch::detect_communities(&community_edges, 5, 2);
+        let mut concept_records: Vec<(thinkingroot_graph::rows::ConceptNode, Vec<String>, bool)> =
+            Vec::new();
+        for comm in &communities {
+            let member_set: HashSet<&String> = comm.iter().collect();
+            let mut evidence: Vec<String> = Vec::new();
+            for (cid, ents) in &claim_ents {
+                if ents.iter().filter(|e| member_set.contains(*e)).count() >= 2 {
+                    evidence.push(cid.clone());
+                }
+            }
+            let id = thinkingroot_graph::graph::GraphStore::concept_id_for(comm);
+            let label = comm
+                .iter()
+                .filter_map(|eid| id_name.get(eid))
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let active = !evidence.is_empty();
+            let confidence = (evidence.len() as f64 / comm.len().max(1) as f64).min(1.0);
+            let node = thinkingroot_graph::rows::ConceptNode {
+                id: id.clone(),
+                label,
+                member_entity_ids_json: serde_json::to_string(comm).unwrap_or_else(|_| "[]".into()),
+                origin: "stitch".into(),
+                status: if active { "active" } else { "quarantined" }.into(),
+                confidence,
+                evidence_json: serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into()),
+                provenance: format!("stitch://concept/{id}"),
+                created_at: ts,
+            };
+            concept_records.push((node, comm.clone(), active));
+        }
+
         let mut woven = 0usize;
         let mut proposals = 0usize;
+        let mut concepts = 0usize;
         {
             let storage = handle.storage.lock().await;
             // Additive: weave edges directly (evidence-grounded + decaying).
@@ -7441,9 +7730,19 @@ side referenced. Strict rules:\n\
                     proposals += 1;
                 }
             }
+            // Concept growth: wholesale re-grow concept nodes + membership edges.
+            let _ = storage.graph.clear_concepts();
+            for (node, members, active) in &concept_records {
+                if storage.graph.upsert_concept_node(node).is_ok() {
+                    concepts += 1;
+                    if *active {
+                        let _ = storage.graph.write_concept_membership(&node.id, members, ts);
+                    }
+                }
+            }
             // Reload the read cache so woven edges show immediately (mirrors
             // `remember`; otherwise the graph view lags until remount).
-            if woven > 0 {
+            if woven > 0 || concepts > 0 {
                 if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
                     *handle.cache.write().await = new_cache;
                 }
@@ -7453,10 +7752,10 @@ side referenced. Strict rules:\n\
         Ok(StitchReport {
             woven,
             proposals,
-            // Concept-grow (community detection → concept nodes) wires next; the
-            // pure `detect_communities` is ready, concept-node creation pending.
-            concepts: 0,
-            note: format!("wove {woven} edge(s), queued {proposals} merge proposal(s)"),
+            concepts,
+            note: format!(
+                "wove {woven} edge(s), queued {proposals} merge proposal(s), grew {concepts} concept(s)"
+            ),
         })
     }
 

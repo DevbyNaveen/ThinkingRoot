@@ -673,9 +673,11 @@ async fn run_recall(
 /// Query-expansion flag (next-wave NOW) — OFF until the dilution/precision
 /// tradeoff is eval-tuned; flag-off is a literal no-op.
 fn query_expansion_flag_on() -> bool {
+    // North-star: default-ON (time-aware/alias expansion lifts multi-session
+    // recall). `TR_QUERY_EXPANSION=0` reverts for a clean eval A/B.
     std::env::var("TR_QUERY_EXPANSION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Pure alias expansion. For each synonym group, if ANY surface form occurs

@@ -1446,6 +1446,25 @@ async fn run_pipeline_inner(
     );
     mark_phase!("structural_persist");
 
+    // North-star Phase 1d — enqueue truly-changed sources for ASYNC LLM
+    // atomic-fact extraction (kept off the compile critical path). The
+    // AtomicExtractTask maintenance tick drains the queue, reads each source's
+    // verbatim raw_chunks, extracts grounded facts, and builds the spine.
+    // Default-ON; `TR_ATOMIC_EXTRACT=0` disables enqueue + drain together.
+    let atomic_extract_on = std::env::var("TR_ATOMIC_EXTRACT")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if atomic_extract_on && !truly_changed.is_empty() {
+        let sids: Vec<String> = truly_changed.iter().map(|d| d.source_id.to_string()).collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if let Err(e) = storage.graph.enqueue_atomic_extract(&sids, now) {
+            tracing::warn!("atomic-extract enqueue failed (non-fatal): {e}");
+        }
+    }
+
     // Second `Linking` slot — covers Phase 7 (linker), Phase 7e
     // (resolution), and Phase 8 (post-link entity-relation update + SVO
     // event extraction). Phase 7's linker has its own done/total

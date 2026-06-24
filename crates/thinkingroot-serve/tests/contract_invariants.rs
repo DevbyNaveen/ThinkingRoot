@@ -221,6 +221,40 @@ fn test_12_1_byte_coverage_invariant_holds() {
     }
 }
 
+// ─── North-star spine — raw_chunks verbatim track ───────────────────────
+
+#[test]
+fn raw_chunks_track_is_emitted_and_rebuilt_wholesale() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (graph, _bs) = run_structural_pipeline_into(dir.path(), &fixture_path());
+
+    // Every parsed chunk with a real byte range gets a verbatim raw_chunks
+    // node — the "nothing is lost" layer + the spine's chunk node.
+    let raw = count_rows(&graph, "?[id] := *raw_chunks{id}");
+    assert!(raw > 0, "raw_chunks must be populated for the canonical fixture");
+
+    // raw_chunks is the 1:1 superset; chunks_residual (gap-filler) only fires
+    // on uncovered chunks, so it is always a subset.
+    let residual = count_rows(&graph, "?[id] := *chunks_residual{id}");
+    assert!(
+        raw >= residual,
+        "raw_chunks ({raw}) must cover at least as many chunks as residual ({residual})"
+    );
+
+    // Each raw chunk carries a real byte range (the emit guard).
+    let bad_span = count_rows(
+        &graph,
+        "?[id] := *raw_chunks{id, byte_start, byte_end}, byte_end <= byte_start",
+    );
+    assert_eq!(bad_span, 0, "every raw_chunk must have byte_end > byte_start");
+
+    // Wholesale per-source rebuild: re-running the pipeline into the SAME
+    // data dir must NOT accumulate rows (the explicit per-source :rm fires).
+    let (graph2, _bs2) = run_structural_pipeline_into(dir.path(), &fixture_path());
+    let raw2 = count_rows(&graph2, "?[id] := *raw_chunks{id}");
+    assert_eq!(raw, raw2, "raw_chunks must rebuild wholesale, not accumulate");
+}
+
 // ─── Test 12.2 — byte-anchoring per table ───────────────────────────────
 
 #[test]

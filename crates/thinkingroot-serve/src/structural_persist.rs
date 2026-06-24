@@ -38,8 +38,8 @@ use thinkingroot_core::types::{ContentHash, SourceId};
 use thinkingroot_extract::ExtractionOutput;
 use thinkingroot_graph::rows::{
     CodeImport, CodeLink, CodeMarker, CodeMetric, CodeSignature, ConfigTreeNode, DataRowRow,
-    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, ResidualChunk,
-    SourceAnnotation, TestAnnotation,
+    DocTagRow, FunctionCall, GitBlameRow, GitCommit, HeadingRow, QuantityRow, RawChunkRow,
+    ResidualChunk, SourceAnnotation, TestAnnotation,
 };
 use thinkingroot_graph::Blake3Cache;
 use thinkingroot_graph::graph::{GraphStore, PerSourceRows};
@@ -104,6 +104,9 @@ struct PerTableBuckets {
     code_metrics: Vec<CodeMetric>,
     git_blame: Vec<GitBlameRow>,
     git_commits: Vec<GitCommit>,
+    /// Verbatim 1:1 chunk track (north-star spine). Emitted unconditionally
+    /// for every chunk, distinct from the gap-filling `chunks_residual`.
+    raw_chunks: Vec<RawChunkRow>,
 }
 
 /// Phase 6.7 driver — see module docs.
@@ -319,7 +322,31 @@ fn phase_6_7_per_source(
     let mut heading_stack: Vec<(u8, String)> = Vec::new();
 
     // Per-chunk emitter dispatch.
-    for chunk in &doc.chunks {
+    for (chunk_index, chunk) in doc.chunks.iter().enumerate() {
+        // North-star spine: emit a verbatim raw_chunks node for EVERY chunk
+        // (1:1, unconditional), distinct from the gap-filling chunks_residual.
+        // This is the "nothing is lost" layer + the spine's chunk node.
+        if chunk.byte_end > chunk.byte_start {
+            let raw_id = stable_row_id(
+                "raw_chunks",
+                &source_id_str,
+                chunk.byte_start,
+                chunk.byte_end,
+                "",
+            );
+            buckets.raw_chunks.push(RawChunkRow {
+                id: raw_id,
+                source_id: source_id_str.clone(),
+                chunk_index: chunk_index as u32,
+                chunk_type: chunk_type_str(chunk.chunk_type).to_string(),
+                content: chunk.content.clone(),
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                content_blake3: cache.get(chunk.byte_start, chunk.byte_end).to_string(),
+                created_at: 0.0,
+            });
+        }
+
         let pre_count = total_row_count(&buckets);
         dispatch_chunk(
             chunk,
@@ -496,6 +523,7 @@ fn drain_buckets_to_per_source_rows(buckets: &mut PerTableBuckets) -> PerSourceR
         code_metrics: std::mem::take(&mut buckets.code_metrics),
         git_blame: std::mem::take(&mut buckets.git_blame),
         git_commits: std::mem::take(&mut buckets.git_commits),
+        raw_chunks: std::mem::take(&mut buckets.raw_chunks),
         // Phase 7e is the canonical writer — the cascade in
         // `transactional_rebuild_sources` still clears any stale rows
         // for this source so the linker emits cleanly.
@@ -523,6 +551,7 @@ fn record_per_source_counts(stats: &mut Phase67Stats, rows: &PerSourceRows) {
     stats.record("code_metrics", rows.code_metrics.len());
     stats.record("git_blame", rows.git_blame.len());
     stats.record("git_commits", rows.git_commits.len());
+    stats.record("raw_chunks", rows.raw_chunks.len());
 }
 
 /// Compute uncovered byte ranges given a set of `(start, end)` covered

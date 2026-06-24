@@ -277,3 +277,56 @@ pub struct CodeMetric {
     pub byte_end: u64,
     pub content_blake3: String,
 }
+
+// ─── North-star compile rebuild (2026-06-24) — mother-node spine rows ───
+
+/// `raw_chunks` — verbatim 1:1 track of every parsed chunk. The
+/// "nothing is lost" layer and the spine's chunk node. Distinct from
+/// [`ResidualChunk`] (a gap-filler that only fires on uncovered chunks);
+/// `raw_chunks` stores ALL chunks and is rebuilt wholesale per-source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawChunkRow {
+    pub id: String,
+    pub source_id: String,
+    pub chunk_index: u32,
+    pub chunk_type: String,
+    pub content: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub content_blake3: String,
+    pub created_at: f64,
+}
+
+/// `concept_nodes` — community summary the Stitcher grows from
+/// `detect_communities()`. Inserted `quarantined`; promoted to `active`
+/// only after a verify pass confirms evidenced co-occurrence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptNode {
+    pub id: String,
+    pub label: String,
+    /// JSON array of member entity ids.
+    pub member_entity_ids_json: String,
+    pub origin: String,
+    /// `quarantined` | `active` | `rejected`.
+    pub status: String,
+    pub confidence: f64,
+    /// JSON array of the evidencing shared-claim ids (never empty for a
+    /// legitimately-grown concept).
+    pub evidence_json: String,
+    pub provenance: String,
+    pub created_at: f64,
+}
+
+/// `spine_edges` — one denormalised row per mother-node hierarchy edge so
+/// retrieval graph-expansion is a single indexed join per hop. `edge_kind`
+/// ∈ {`doc_has_chunk`, `chunk_has_fact`, `fact_mentions_entity`,
+/// `entity_in_concept`}.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpineEdge {
+    pub from_id: String,
+    pub to_id: String,
+    pub edge_kind: String,
+    pub source_id: String,
+    pub confidence: f64,
+    pub created_at: f64,
+}

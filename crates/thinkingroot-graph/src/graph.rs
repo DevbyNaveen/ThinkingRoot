@@ -1568,6 +1568,95 @@ impl GraphStore {
                 =>
                 object_kind: String default 'claim'
             }",
+            // ─── North-star compile rebuild (2026-06-24) — the mother-node
+            //     spine. Five additive relations; all created here (zero
+            //     migration). See docs/superpowers/specs/2026-06-24-*.
+            //
+            // atomic_facts — LLM-extracted SVO propositions grounded to a
+            // raw_chunk's byte span. Distinct from `witnesses` (mechanical,
+            // never paraphrased) and the legacy `claims`. Ids are prefixed
+            // `af:` so retrieval fusion never confuses them with claim ids.
+            // Bi-temporal: `valid_until < 0` means "still valid"; a
+            // superseding re-extraction tombstones the old row's valid_until.
+            ":create atomic_facts {
+                id: String
+                =>
+                source_id: String,
+                chunk_id: String default '',
+                subject: String default '',
+                predicate: String default '',
+                object: String default '',
+                statement: String,
+                confidence: Float default 0.0,
+                extraction_model: String default '',
+                workspace_id: String default '',
+                sensitivity: String default 'Public',
+                byte_start: Int default 0,
+                byte_end: Int default 0,
+                content_blake3: String default '',
+                valid_from: Float default 0.0,
+                valid_until: Float default -1.0,
+                created_at: Float default 0.0
+            }",
+            // raw_chunks — verbatim 1:1 track of every parsed chunk (the
+            // "nothing is lost" layer + the spine's chunk node). Distinct
+            // from `chunks_residual` (gap-filler that only fires on chunks
+            // with zero coverage). Rebuilt wholesale per-source, so it is
+            // NOT registered in STRUCTURAL_TABLES (byte-audit would
+            // double-count it against chunks_residual).
+            ":create raw_chunks {
+                id: String
+                =>
+                source_id: String,
+                chunk_index: Int default 0,
+                chunk_type: String default '',
+                content: String default '',
+                byte_start: Int default 0,
+                byte_end: Int default 0,
+                content_blake3: String default '',
+                created_at: Float default 0.0
+            }",
+            // concept_nodes — community summaries the Stitcher grows from
+            // detect_communities(). Inserted `quarantined`; promoted to
+            // `active` only after a verify pass confirms evidenced
+            // co-occurrence (anti-hallucination gate 2). Id = concept:<blake3
+            // of sorted member entity ids> (idempotent upsert).
+            ":create concept_nodes {
+                id: String
+                =>
+                label: String default '',
+                member_entity_ids_json: String default '[]',
+                origin: String default 'stitch',
+                status: String default 'quarantined',
+                confidence: Float default 0.0,
+                evidence_json: String default '[]',
+                provenance: String default '',
+                created_at: Float default 0.0
+            }",
+            // spine_edges — denormalised mother-node adjacency, one row per
+            // hierarchy edge, so retrieval graph-expansion is a single
+            // indexed join per hop (no recursive Datalog at query time).
+            // edge_kind ∈ {doc_has_chunk, chunk_has_fact, fact_mentions_entity,
+            // entity_in_concept}.
+            ":create spine_edges {
+                from_id: String,
+                to_id: String,
+                edge_kind: String
+                =>
+                source_id: String default '',
+                confidence: Float default 1.0,
+                created_at: Float default 0.0
+            }",
+            // atomic_extract_queue — durable work list for the async,
+            // post-compile LLM atomic-fact extractor (keeps compile UX fast).
+            // Drained by the AtomicExtractTask maintenance tick.
+            ":create atomic_extract_queue {
+                source_id: String
+                =>
+                status: String default 'pending',
+                enqueued_at: Float default 0.0,
+                attempts: Int default 0
+            }",
         ];
 
         for stmt in &relations {
@@ -1708,6 +1797,16 @@ impl GraphStore {
             // dropping a whole branch's capsules on session teardown.
             "::index create capsule_deps:by_object { object_id }",
             "::index create capsule_cache:by_branch { branch }",
+            // North-star compile-rebuild spine indexes — point-range lookups
+            // for the async extractor, per-source detail endpoints, and the
+            // retrieval graph-expansion hops.
+            "::index create atomic_facts:by_source { source_id }",
+            "::index create atomic_facts:by_chunk { chunk_id }",
+            "::index create raw_chunks:by_source { source_id }",
+            "::index create spine_edges:by_from { from_id }",
+            "::index create spine_edges:by_kind { edge_kind }",
+            "::index create concept_nodes:by_status { status }",
+            "::index create atomic_extract_queue:by_status { status }",
         ];
 
         for stmt in &indexes {
@@ -8723,6 +8822,43 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn create_schema_is_idempotent_with_spine_tables() {
+        // North-star compile-rebuild relations must be created by
+        // create_schema and a second create_schema() call must be a no-op
+        // (the "already exists" branch is taken). All five must be queryable.
+        let store = mem_store();
+        // Re-running schema creation is safe (idempotent).
+        store.create_schema().unwrap();
+        store.create_indexes().unwrap();
+
+        for rel in [
+            "?[id] := *atomic_facts{id}",
+            "?[id] := *raw_chunks{id}",
+            "?[id] := *concept_nodes{id}",
+            "?[from_id] := *spine_edges{from_id}",
+            "?[source_id] := *atomic_extract_queue{source_id}",
+        ] {
+            store
+                .db
+                .run_default(rel)
+                .unwrap_or_else(|e| panic!("relation query `{rel}` failed: {e}"));
+        }
+    }
+
+    #[test]
+    fn raw_chunks_is_not_a_cascade_structural_table() {
+        // raw_chunks is rebuilt wholesale per-source (like summary_nodes), so
+        // it must NOT join the STRUCTURAL_TABLES registry — otherwise the
+        // Phase-9 byte-coverage audit double-counts it against chunks_residual.
+        assert!(
+            !thinkingroot_core::structural_registry::STRUCTURAL_TABLES
+                .iter()
+                .any(|t| t.name == "raw_chunks"),
+            "raw_chunks must stay out of STRUCTURAL_TABLES"
+        );
     }
 
     #[test]

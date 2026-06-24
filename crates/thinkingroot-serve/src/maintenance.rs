@@ -872,8 +872,8 @@ pub fn spawn_stitcher(
     engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
 ) -> JoinHandle<()> {
     let enabled = std::env::var("TR_STITCHER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if !enabled {
         return tokio::spawn(async {});
     }
@@ -893,14 +893,87 @@ pub fn spawn_stitcher(
     spawn_periodic_task(task)
 }
 
+/// North-star Phase 1d — async LLM atomic-fact extraction. Each tick drains a
+/// bounded batch of pending sources from every mounted brain's
+/// `atomic_extract_queue` (`QueryEngine::extract_atomic_facts_once`), extracts
+/// grounded facts over the verbatim `raw_chunks`, persists them, and rebuilds
+/// the mother-node spine. Mirrors the Stitcher's mounted-workspace walk: the
+/// engine read lock is taken fresh per workspace and never held across the LLM
+/// calls. Best-effort — a per-brain error is logged and the walk continues.
+struct AtomicExtractTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    batch_limit: usize,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for AtomicExtractTask {
+    fn name(&self) -> &'static str {
+        "atomic_extract"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let names: Vec<String> = {
+            let eng = self.engine.read().await;
+            eng.mounted_workspace_names()
+        };
+        for ws in names {
+            let res = {
+                let eng = self.engine.read().await;
+                eng.extract_atomic_facts_once(&ws, self.batch_limit).await
+            };
+            match res {
+                Ok(n) if n > 0 => {
+                    tracing::info!(ws = %ws, facts = n, "atomic-extract pass")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(ws = %ws, "atomic-extract: {e}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the async atomic-fact extractor. Default-ON (`TR_ATOMIC_EXTRACT=0`
+/// disables it, in lockstep with the compile-side enqueue). `TR_ATOMIC_EXTRACT_SECS`
+/// = tick cadence (default 30s — facts should land seconds after a compile);
+/// `TR_ATOMIC_EXTRACT_BATCH` = sources drained per brain per tick (default 4,
+/// bounds LLM burst).
+pub fn spawn_atomic_extract(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let enabled = std::env::var("TR_ATOMIC_EXTRACT")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !enabled {
+        return tokio::spawn(async {});
+    }
+    let interval_secs = std::env::var("TR_ATOMIC_EXTRACT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30u64);
+    let batch_limit = std::env::var("TR_ATOMIC_EXTRACT_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4usize);
+    let task: Arc<dyn PeriodicTask> = Arc::new(AtomicExtractTask {
+        engine,
+        batch_limit,
+        interval: Duration::from_secs(interval_secs.max(5)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Idle decay of the Stitcher's woven edges (mirrors the Living-Engram decay):
 /// a woven edge that never helps fades toward a floor, so auto-applied edges
 /// don't accumulate as noise. Gated on `TR_STITCHER`. Daily cadence;
 /// `TR_STITCHED_EDGES_DECAY_FACTOR` (0.97) / `TR_STITCHED_EDGES_FLOOR` (0.05).
 pub fn spawn_stitched_edges_decay(workspace_root: PathBuf) -> JoinHandle<()> {
     let enabled = std::env::var("TR_STITCHER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if !enabled {
         return tokio::spawn(async {});
     }

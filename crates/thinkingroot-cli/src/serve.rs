@@ -450,6 +450,9 @@ pub async fn run_serve(
     let _stitched_decay_handle = workspace_root
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_stitched_edges_decay(root.clone()));
+    // North-star async atomic-fact extractor (default-ON; TR_ATOMIC_EXTRACT=0 disables).
+    let _atomic_extract_handle =
+        thinkingroot_serve::maintenance::spawn_atomic_extract(state.engine.clone());
 
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
@@ -860,6 +863,9 @@ async fn run_serve_with_listener(
     let _stitched_decay_handle = workspace_root
         .as_ref()
         .map(|root| thinkingroot_serve::maintenance::spawn_stitched_edges_decay(root.clone()));
+    // North-star async atomic-fact extractor (default-ON; TR_ATOMIC_EXTRACT=0 disables).
+    let _atomic_extract_handle =
+        thinkingroot_serve::maintenance::spawn_atomic_extract(state.engine.clone());
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();
