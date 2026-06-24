@@ -138,6 +138,27 @@ impl GraphStore {
         Ok(res.rows.iter().filter_map(|r| row_to_fact(r)).collect())
     }
 
+    /// All facts for a source INCLUDING tombstoned ones, newest first — the
+    /// version timeline (live current value + its superseded history).
+    pub fn get_fact_history_for_source(&self, source_id: &str) -> Result<Vec<AtomicFact>> {
+        let mut facts = self.get_atomic_facts_for_source(source_id)?;
+        facts.sort_by(|a, b| {
+            b.is_live()
+                .cmp(&a.is_live())
+                .then(b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        Ok(facts)
+    }
+
+    /// One atomic fact by id (for retrieval hydration + citation byte-anchor).
+    pub fn get_atomic_fact_by_id(&self, id: &str) -> Result<Option<AtomicFact>> {
+        let mut params = BTreeMap::new();
+        params.insert("fid".into(), DataValue::Str(id.into()));
+        let script = format!("?[{COLS}] := *atomic_facts{{{COLS}}}, id == $fid");
+        let res = self.query(&script, params)?;
+        Ok(res.rows.first().and_then(|r| row_to_fact(r)))
+    }
+
     /// Live atomic facts whose subject OR object matches `name`
     /// (case-insensitive) — the cross-document entity profile.
     pub fn get_atomic_facts_mentioning(&self, name: &str) -> Result<Vec<AtomicFact>> {

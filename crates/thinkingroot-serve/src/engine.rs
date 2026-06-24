@@ -5680,6 +5680,18 @@ impl QueryEngine {
         storage.graph.get_witnesses_for_claim(claim_id)
     }
 
+    /// One atomic fact by its (`af:`-prefixed) id — for byte-anchoring a fact
+    /// citation and for the console version timeline.
+    pub async fn get_atomic_fact_by_id(
+        &self,
+        ws: &str,
+        id: &str,
+    ) -> Result<Option<thinkingroot_core::types::AtomicFact>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_atomic_fact_by_id(id)
+    }
+
     // ─── E2: code-graph traversal API ───────────────────────────────
 
     /// Find code entities (FunctionDef/TypeDef) whose symbol contains
@@ -6626,6 +6638,18 @@ side referenced. Strict rules:\n\
         storage.graph.get_raw_chunks_for_source(source_id)
     }
 
+    /// Full fact history for a source (live + tombstoned) — the version
+    /// timeline. Newest/live first.
+    pub async fn get_source_fact_history(
+        &self,
+        ws: &str,
+        source_id: &str,
+    ) -> Result<Vec<thinkingroot_core::types::AtomicFact>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_fact_history_for_source(source_id)
+    }
+
     /// Concept nodes (Cognition page "Concepts"). `status` filters
     /// active/quarantined; `None` returns all.
     pub async fn list_concepts(
@@ -6922,6 +6946,56 @@ side referenced. Strict rules:\n\
     ///
     /// Used for multi-user graphs where each query must be isolated to a specific
     /// user's sessions. Entities are always included (user-agnostic structural nodes).
+    /// North-star fact recall — semantic search over the LLM-extracted atomic
+    /// facts (a `fact|`-namespaced parallel channel in the same vector index, so
+    /// claim retrieval is untouched). Returns `ClaimSearchHit`s (only LIVE facts)
+    /// that merge into the normal grounding set + flow through synthesis +
+    /// citations. Scope-filtered by source uri when `allowed_source_ids` is set.
+    pub async fn search_facts(
+        &self,
+        ws: &str,
+        query: &str,
+        top_k: usize,
+        allowed_source_ids: &HashSet<String>,
+    ) -> Result<Vec<ClaimSearchHit>> {
+        let handle = self.get_workspace(ws)?;
+        let results = {
+            let mut storage = handle.storage.lock().await;
+            run_blocking(|| storage.vector.search_prefix(query, top_k, "fact|"))?
+        };
+        let mut hits: Vec<ClaimSearchHit> = Vec::new();
+        let storage = handle.storage.lock().await;
+        for (key, meta, score) in &results {
+            if !key.starts_with("af:") {
+                continue;
+            }
+            // The vector key IS the stored fact id (already `af:`-prefixed).
+            let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
+                continue;
+            };
+            if !f.is_live() {
+                continue;
+            }
+            // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
+            let uri = meta.rsplit('|').next().unwrap_or("").to_string();
+            if !allowed_source_ids.is_empty()
+                && !allowed_source_ids.iter().any(|sid| uri.contains(sid.as_str()))
+            {
+                continue;
+            }
+            hits.push(ClaimSearchHit {
+                id: key.clone(),
+                statement: f.statement.clone(),
+                claim_type: "atomic-fact".to_string(),
+                confidence: f.confidence as f64,
+                source_uri: uri,
+                relevance: *score,
+                valid_from: f.created_at as i64,
+            });
+        }
+        Ok(hits)
+    }
+
     pub async fn search_scoped(
         &self,
         ws: &str,
@@ -7478,7 +7552,7 @@ side referenced. Strict rules:\n\
             }
 
             // Persist + settle the queue under the lock.
-            let storage = handle.storage.lock().await;
+            let mut storage = handle.storage.lock().await;
             // Bi-temporal supersession: tombstone prior live facts this
             // re-extraction no longer confirms (keeps the version timeline).
             let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
@@ -7498,6 +7572,41 @@ side referenced. Strict rules:\n\
             // Per-document summary node (deterministic over the live facts).
             if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
                 tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
+            }
+            // Make the facts semantically recallable in the ask path: embed each
+            // fact statement under an `af:` vector id with `fact|` metadata (a
+            // separate namespace from `claim|`, so claim retrieval is untouched).
+            if !facts.is_empty() {
+                let uri = storage
+                    .graph
+                    .get_source_by_id(&sid)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.uri)
+                    .unwrap_or_default();
+                // The fact id already carries the `af:` namespace prefix, so it
+                // IS the vector key. Metadata `fact|{id}|{uri}` namespaces the
+                // search channel + carries the source uri for scoping/citation.
+                let items: Vec<(String, String, String)> = facts
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.id.clone(),
+                            f.statement.clone(),
+                            format!("fact|{}|{}", f.id, uri),
+                        )
+                    })
+                    .collect();
+                let upsert = run_blocking(|| storage.vector.upsert_batch(&items));
+                match upsert {
+                    Ok(_) => {
+                        let _ = run_blocking(|| storage.vector.save());
+                    }
+                    Err(e) => tracing::warn!(
+                        ws = %ws, source_id = %sid,
+                        "atomic fact vector upsert failed (facts durable; semantic recall degraded): {e}"
+                    ),
+                }
             }
             if transient_error {
                 // Some chunks errored — keep the source queued to retry the rest.

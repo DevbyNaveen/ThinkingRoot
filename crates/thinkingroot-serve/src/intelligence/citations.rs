@@ -151,6 +151,17 @@ pub async fn verify_citations(
 ) -> CitationOutcome {
     let mut outcome = verify_citations_sync(answer, grounding);
     for cit in &mut outcome.citations {
+        // North-star: an atomic fact (`af:` id) carries its OWN byte anchor
+        // (the verbatim quote) — resolve it directly, no witness row needed.
+        if cit.claim_id.starts_with("af:") {
+            if let Ok(Some(f)) = engine.get_atomic_fact_by_id(ws, &cit.claim_id).await {
+                cit.byte_start = f.byte_start;
+                cit.byte_end = f.byte_end;
+                cit.content_blake3 = f.content_blake3;
+                cit.confidence = 1.0;
+            }
+            continue;
+        }
         // Best-effort byte-span enrichment; absence keeps the
         // source-granular citation (never fabricate a span).
         if let Ok(spans) = engine.get_witnesses_for_claim(ws, &cit.claim_id).await

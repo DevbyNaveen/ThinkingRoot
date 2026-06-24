@@ -864,6 +864,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/sources/{id}", get(source_detail_handler))
             .route("/ws/{ws}/sources/{id}/raw", get(source_raw_handler))
             .route("/ws/{ws}/sources/{id}/chunks", get(source_chunks_handler))
+            .route("/ws/{ws}/sources/{id}/fact-history", get(source_fact_history_handler))
             .route("/ws/{ws}/concepts", get(list_concepts_handler))
             .route("/ws/{ws}/entities/{name}/profile", get(entity_profile_handler))
             // ─── Compiled Prompt substrate ───────────────────────────
@@ -2049,6 +2050,19 @@ async fn source_chunks_handler(
 #[derive(Deserialize)]
 struct ConceptListParams {
     status: Option<String>,
+}
+
+/// `GET /ws/{ws}/sources/{id}/fact-history` — full fact version timeline
+/// (live + tombstoned), newest first.
+async fn source_fact_history_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, id)): Path<(String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_source_fact_history(&ws, &id).await {
+        Ok(h) => ok_response(h).into_response(),
+        Err(e) => match_engine_error(e),
+    }
 }
 
 /// `GET /ws/{ws}/concepts?status=active` — Stitcher-grown concept nodes.

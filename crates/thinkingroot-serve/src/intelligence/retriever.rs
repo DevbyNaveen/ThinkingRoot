@@ -126,6 +126,35 @@ pub async fn retrieve_claims(
         }
     }
 
+    // Phase 4b: atomic-fact recall (north-star, additive, default-ON). The
+    // LLM-extracted facts are a parallel `fact|`-namespaced grounding channel;
+    // they merge into the claim set and flow through synthesis + citations
+    // unchanged. `TR_FACT_RECALL=0` reverts to claims-only for a clean eval A/B.
+    if fact_recall_on() {
+        if let Ok(fact_hits) = engine
+            .search_facts(workspace, question, primary_top_k, allowed_sources)
+            .await
+        {
+            for hit in fact_hits {
+                if seen.insert(hit.id.clone()) {
+                    claims.push(hit);
+                }
+            }
+        }
+        for sub_q in sub_queries.iter().skip(1) {
+            if let Ok(fact_hits) = engine
+                .search_facts(workspace, sub_q, primary_top_k / 2, allowed_sources)
+                .await
+            {
+                for hit in fact_hits {
+                    if seen.insert(hit.id.clone()) {
+                        claims.push(hit);
+                    }
+                }
+            }
+        }
+    }
+
     // Sort: knowledge-update by session recency (prevents stale values),
     // all others by vector relevance score.
     match category {
@@ -184,6 +213,12 @@ fn second_pass_on() -> bool {
     std::env::var("TR_SECOND_PASS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+/// North-star atomic-fact recall — default-ON (`TR_FACT_RECALL=0` reverts).
+fn fact_recall_on() -> bool {
+    std::env::var("TR_FACT_RECALL")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 fn second_pass_min_claims() -> usize {
     std::env::var("TR_SECOND_PASS_MIN_CLAIMS")
