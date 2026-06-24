@@ -7722,14 +7722,10 @@ side referenced. Strict rules:\n\
             }
         }
 
-        if candidates.is_empty() && dup_proposals.is_empty() {
-            return Ok(StitchReport {
-                woven: 0,
-                proposals: 0,
-                concepts: 0,
-                note: "no candidates to stitch this pass".to_string(),
-            });
-        }
+        // NOTE: we do NOT early-return when weave candidates + merge proposals
+        // are both empty — concept growth (below) runs off claim co-occurrence
+        // communities, which exist independently of weave candidates. The
+        // downstream weave/proposal loops are no-ops when empty.
 
         // ── Phase 2: LLM adjudication (bounded; no lock held) ──
         let connections = if candidates.is_empty() {
