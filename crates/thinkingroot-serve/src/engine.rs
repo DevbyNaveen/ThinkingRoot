@@ -214,11 +214,33 @@ pub struct ReadSourceResult {
 pub struct SourceDetailDto {
     pub source_id: String,
     pub uri: String,
+    pub source_type: String,
+    pub mime: String,
+    pub byte_size: u64,
+    pub content_hash: String,
     pub summary: Option<String>,
     pub fact_count: usize,
     pub chunk_count: usize,
     pub facts: Vec<thinkingroot_core::types::AtomicFact>,
     pub entities: Vec<String>,
+    /// Full verbatim text (concatenated chunks) — the "Content" tab.
+    pub content: String,
+}
+
+/// Best-effort MIME type from a uri extension (for the source detail header).
+fn mime_for_uri(uri: &str) -> &'static str {
+    match uri.to_lowercase().rsplit('.').next().unwrap_or("") {
+        "pdf" => "application/pdf",
+        "md" | "markdown" => "text/markdown",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "cpp" => "text/x-code",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Cross-document entity profile payload.
@@ -6571,13 +6593,31 @@ side referenced. Strict rules:\n\
         if source.content_hash.is_empty() {
             return Ok((source.uri, Vec::new()));
         }
-        let store = FileSystemSourceStore::new(&handle.root_path.join(".thinkingroot"))
+        // The content-addressed byte store lives under `.thinkingroot/graph`
+        // (NOT `.thinkingroot` — `new()` appends `rooting/sources`). Using the
+        // wrong base made /raw return 200 with 0 bytes (blank "Open original").
+        let store = FileSystemSourceStore::new(&handle.root_path.join(".thinkingroot").join("graph"))
             .map_err(|e| Error::GraphStorage(format!("source store init: {e}")))?;
-        let bytes = store
+        let mut bytes = store
             .get(&source.content_hash)
             .map_err(|e| Error::GraphStorage(format!("source read: {e}")))?
             .map(|b| b.bytes)
             .unwrap_or_default();
+        // Fallback: read the on-disk file directly (ingested files always live
+        // under the workspace root) if the byte store has nothing.
+        if bytes.is_empty() {
+            let p = std::path::Path::new(&source.uri);
+            let candidate = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                handle.root_path.join(p)
+            };
+            if candidate.starts_with(&handle.root_path) {
+                if let Ok(b) = std::fs::read(&candidate) {
+                    bytes = b;
+                }
+            }
+        }
         Ok((source.uri, bytes))
     }
 
@@ -6590,11 +6630,15 @@ side referenced. Strict rules:\n\
     ) -> Result<SourceDetailDto> {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        let uri = storage
-            .graph
-            .get_source_by_id(source_id)?
-            .map(|s| s.uri)
+        let src = storage.graph.get_source_by_id(source_id)?;
+        let uri = src.as_ref().map(|s| s.uri.clone()).unwrap_or_default();
+        let source_type = src
+            .as_ref()
+            .map(|s| format!("{:?}", s.source_type))
             .unwrap_or_default();
+        let byte_size = src.as_ref().map(|s| s.byte_size.max(0) as u64).unwrap_or(0);
+        let content_hash = src.as_ref().map(|s| s.content_hash.0.clone()).unwrap_or_default();
+        let mime = mime_for_uri(&uri).to_string();
         let summary = storage
             .graph
             .get_summary_nodes(Some(thinkingroot_graph::summaries::ALTITUDE_DOCUMENT))?
@@ -6607,7 +6651,10 @@ side referenced. Strict rules:\n\
             .into_iter()
             .filter(|f| f.is_live())
             .collect();
-        let chunk_count = storage.graph.get_raw_chunks_for_source(source_id)?.len();
+        let chunks = storage.graph.get_raw_chunks_for_source(source_id)?;
+        let chunk_count = chunks.len();
+        // Full verbatim text = ordered chunk content joined (the "Content" tab).
+        let content = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("");
         let mut entities: Vec<String> = Vec::new();
         for f in &facts {
             for n in [&f.subject, &f.object] {
@@ -6619,11 +6666,16 @@ side referenced. Strict rules:\n\
         Ok(SourceDetailDto {
             source_id: source_id.to_string(),
             uri,
+            source_type,
+            mime,
+            byte_size,
+            content_hash,
             summary,
             fact_count: facts.len(),
             chunk_count,
             facts,
             entities,
+            content,
         })
     }
 
