@@ -188,6 +188,41 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Wipe ALL derived knowledge (entities, relations, claims, witnesses,
+    /// atomic facts, chunks, spine, concepts, summaries, extract queue) — keeps
+    /// the `sources` rows so a recompile re-discovers + rebuilds everything
+    /// cleanly. Used by the workspace reset (clears accumulated junk so the new
+    /// clean-extraction code starts from a blank graph). Best-effort per table.
+    pub fn clear_all_knowledge(&self) -> Result<()> {
+        // (table, PK projection) — one `:rm` per table.
+        let specs: &[(&str, &str)] = &[
+            ("entities", "id"),
+            ("entity_relations", "from_id, to_id, relation_type"),
+            ("source_entity_relations", "source_id, from_id, to_id, relation_type"),
+            ("claims", "id"),
+            ("claim_entity_edges", "claim_id, entity_id"),
+            ("atomic_facts", "id"),
+            ("raw_chunks", "id"),
+            ("spine_edges", "from_id, to_id, edge_kind"),
+            ("concept_nodes", "id"),
+            ("atomic_extract_queue", "source_id"),
+            ("summary_nodes", "id"),
+            ("witnesses", "id"),
+            ("chunks_residual", "id"),
+            ("function_calls", "id"),
+            ("headings", "id"),
+            ("doc_tags", "id"),
+            ("code_links", "id"),
+            ("data_rows", "id"),
+        ];
+        for (table, pk) in specs {
+            let script = format!("?[{pk}] := *{table}{{{pk}}}\n:rm {table} {{{pk}}}");
+            // Tolerate missing tables / empty relations — best-effort wipe.
+            let _ = self.query(&script, BTreeMap::new());
+        }
+        Ok(())
+    }
+
     /// Mother→entity edges for the Neural Graph: distinct `(source_id, entity_id)`
     /// pairs derived from the `fact_mentions_entity` spine (a document's facts
     /// mention these entities). Lets the graph draw each DOCUMENT as a mother

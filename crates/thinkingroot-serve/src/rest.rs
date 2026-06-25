@@ -867,6 +867,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/sources/{id}/fact-history", get(source_fact_history_handler))
             .route("/ws/{ws}/concepts", get(list_concepts_handler))
             .route("/ws/{ws}/mother-edges", get(mother_edges_handler))
+            .route("/ws/{ws}/reset", post(reset_workspace_handler))
             .route("/ws/{ws}/entities/{name}/profile", get(entity_profile_handler))
             // ─── Compiled Prompt substrate ───────────────────────────
             .route(
@@ -2075,6 +2076,19 @@ async fn list_concepts_handler(
     let engine = state.engine.read().await;
     match engine.list_concepts(&ws, q.status.as_deref()).await {
         Ok(c) => ok_response(c).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `POST /ws/{ws}/reset` — wipe derived knowledge (keeps sources) for a clean
+/// recompile. Destructive; gateway/BFF auth-gates it to project members.
+async fn reset_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.reset_workspace_knowledge(&ws).await {
+        Ok(()) => ok_response(serde_json::json!({"reset": true})).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

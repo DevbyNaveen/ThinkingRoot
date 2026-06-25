@@ -6689,6 +6689,22 @@ side referenced. Strict rules:\n\
         })
     }
 
+    /// Wipe all derived knowledge for a workspace (keeps `sources`) so a
+    /// recompile rebuilds the graph cleanly with the current extraction code.
+    /// Reloads an empty read cache so the Neural Graph reflects the wipe at once.
+    pub async fn reset_workspace_knowledge(&self, ws: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        {
+            let storage = handle.storage.lock().await;
+            storage.graph.clear_all_knowledge()?;
+        }
+        let storage = handle.storage.lock().await;
+        if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
+            *handle.cache.write().await = new_cache;
+        }
+        Ok(())
+    }
+
     /// Mother-node graph edges: each DOCUMENT linked to the entities its facts
     /// produced (`document → entity`), for the Neural Graph hierarchy. Returns
     /// `(source_id, source_uri, entity_name)` triples.
@@ -7597,18 +7613,14 @@ side referenced. Strict rules:\n\
         };
         let handle = self.get_workspace(ws)?;
 
-        // Read the work-list (pending sources + their chunks) under the lock.
-        let work: Vec<(String, i64, Vec<thinkingroot_graph::rows::RawChunkRow>)> = {
+        // Read ONLY the pending source ids (not their chunks) — chunks are read
+        // lazily per-source below so we never hold every pending PDF's content
+        // in memory at once (that was the OOM under a multi-PDF backlog).
+        let pending: Vec<(String, i64)> = {
             let storage = handle.storage.lock().await;
-            let pending = storage.graph.pending_atomic_extract(batch_limit)?;
-            let mut w = Vec::with_capacity(pending.len());
-            for (sid, attempts) in pending {
-                let chunks = storage.graph.get_raw_chunks_for_source(&sid)?;
-                w.push((sid, attempts, chunks));
-            }
-            w
+            storage.graph.pending_atomic_extract(batch_limit)?
         };
-        if work.is_empty() {
+        if pending.is_empty() {
             return Ok(0);
         }
 
@@ -7619,13 +7631,24 @@ side referenced. Strict rules:\n\
             .unwrap_or(0.0);
         let mut total = 0usize;
 
-        for (sid, attempts, chunks) in work {
+        for (sid, attempts) in pending {
             if attempts >= MAX_ATTEMPTS {
                 tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
                 let storage = handle.storage.lock().await;
                 let _ = storage.graph.complete_atomic_extract(&sid);
                 continue;
             }
+            // Load THIS source's chunks (dropped at end of the iteration).
+            let chunks = {
+                let storage = handle.storage.lock().await;
+                match storage.graph.get_raw_chunks_for_source(&sid) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk read failed: {e}");
+                        continue;
+                    }
+                }
+            };
 
             // Extract over chunks WITHOUT holding the storage lock, with BOUNDED
             // concurrency (the LlmClient scheduler still rate-limits). 6 chunks
@@ -7737,19 +7760,15 @@ side referenced. Strict rules:\n\
             }
         }
         // Reload the read cache so freshly-promoted entities + relations appear
-        // in the Neural Graph immediately (list_entities reads the cache).
+        // in the Neural Graph (list_entities reads the cache). ONE reload at the
+        // end of the tick — NOT after every source, and we no longer trigger a
+        // full stitch_once here (it loaded the entire graph + an LLM pass every
+        // tick → the OOM under a big backlog). The periodic Stitcher grows
+        // concepts on its own cadence instead.
         if total > 0 {
-            {
-                let storage = handle.storage.lock().await;
-                if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
-                    *handle.cache.write().await = new_cache;
-                }
-            }
-            // Grow concepts promptly from the new entity graph (best-effort;
-            // the periodic Stitcher would otherwise do this on its own tick).
-            // Cheap here: no weave candidates ⇒ no LLM adjudication.
-            if let Err(e) = self.stitch_once(ws, 32).await {
-                tracing::debug!(ws = %ws, "post-extract stitch skipped: {e}");
+            let storage = handle.storage.lock().await;
+            if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
+                *handle.cache.write().await = new_cache;
             }
         }
         Ok(total)
