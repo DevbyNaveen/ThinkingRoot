@@ -2105,6 +2105,13 @@ fn now_secs_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// True when an error is SQLite's transient single-writer contention
+/// ("database is locked"), which is safe to retry after a short backoff.
+fn is_db_locked(e: &Error) -> bool {
+    let m = e.to_string().to_lowercase();
+    m.contains("database is locked") || m.contains("locked") && m.contains("code 5")
+}
+
 fn run_blocking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -7802,12 +7809,28 @@ side referenced. Strict rules:\n\
         source_count: i64,
         host_pid: i64,
     ) -> Result<()> {
-        let now = now_secs_f64();
-        let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        storage
-            .graph
-            .insert_compile_job(job_id, ws, root_path, branch, source_count, now, host_pid)
+        // The workspace graph.db is single-writer SQLite. A background writer
+        // (e.g. the atomic-extract drain) may momentarily hold the write lock,
+        // so retry this quick single-row write past transient "database is
+        // locked" contention rather than dropping the durable record.
+        for attempt in 0u32..6 {
+            let res = {
+                let handle = self.get_workspace(ws)?;
+                let storage = handle.storage.lock().await;
+                storage.graph.insert_compile_job(
+                    job_id, ws, root_path, branch, source_count, now_secs_f64(), host_pid,
+                )
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < 5 && is_db_locked(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)))
+                        .await;
+                }
+                other => return other,
+            }
+        }
+        Ok(())
     }
 
     /// Update the live phase of a running compile job (cheap, per transition).
@@ -7818,6 +7841,8 @@ side referenced. Strict rules:\n\
     }
 
     /// Move a compile job to a terminal status (`done` only on real success).
+    /// Retried past transient SQLite write contention — a job left `running`
+    /// because its terminal write was dropped would look stuck forever.
     pub async fn finish_compile_job(
         &self,
         ws: &str,
@@ -7825,9 +7850,22 @@ side referenced. Strict rules:\n\
         status: &str,
         error: &str,
     ) -> Result<()> {
-        let handle = self.get_workspace(ws)?;
-        let storage = handle.storage.lock().await;
-        storage.graph.finish_compile_job(job_id, status, error, now_secs_f64())
+        for attempt in 0u32..6 {
+            let res = {
+                let handle = self.get_workspace(ws)?;
+                let storage = handle.storage.lock().await;
+                storage.graph.finish_compile_job(job_id, status, error, now_secs_f64())
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < 5 && is_db_locked(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)))
+                        .await;
+                }
+                other => return other,
+            }
+        }
+        Ok(())
     }
 
     /// Fetch one compile job (re-attach snapshot + console polling).

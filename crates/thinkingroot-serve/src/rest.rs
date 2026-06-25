@@ -5902,27 +5902,24 @@ fn spawn_detached_compile(
     user_cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
-        // Bridge: pipeline → mpsc → (durable phase update + broadcast fan-out).
+        // Bridge: pipeline → mpsc → broadcast fan-out.
+        //
+        // IMPORTANT: we do NOT write phase transitions to the durable row
+        // mid-compile. The workspace `graph.db` is SQLite (single writer); a
+        // concurrent `compile_jobs` write races the pipeline's own `sources`
+        // persist and one side fails with "database is locked" (cozo-ce's pool
+        // connections don't inherit a busy_timeout). The durable row therefore
+        // carries START + TERMINAL status only — both written when the pipeline
+        // is NOT touching the DB. Live, fine-grained phase still reaches the
+        // console through this broadcast (the SSE observer); a client that
+        // re-attaches after a reload sees the coarse `running` status from the
+        // row until the SSE reconnects (~instant).
         let (mpsc_tx, mut mpsc_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
         let bridge = {
             let bcast = bcast_tx.clone();
-            let engine = state.engine.clone();
-            let ws = ws_key.clone();
-            let jid = job_id.clone();
             tokio::spawn(async move {
-                let mut last_phase: Option<&'static str> = None;
                 while let Some(ev) = mpsc_rx.recv().await {
-                    if let Some(phase) = phase_token_from_event(&ev) {
-                        if last_phase != Some(phase) {
-                            let _ = engine
-                                .read()
-                                .await
-                                .update_compile_job_phase(&ws, &jid, phase)
-                                .await;
-                            last_phase = Some(phase);
-                        }
-                    }
                     // Err only means "no live observers" — fine, drop it.
                     let _ = bcast.send(ev);
                 }
