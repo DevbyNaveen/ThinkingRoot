@@ -93,6 +93,78 @@ pub struct RawAtomicFact {
     pub confidence: Option<f32>,
 }
 
+/// Collapse runs of whitespace to a single space (+ trim) for tolerant matching.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Locate `quote` inside `content`, tolerating whitespace differences (real
+/// documents — PDFs especially — have newlines/runs of spaces the model
+/// collapses). Returns the byte `(start, end)` in the ORIGINAL content so the
+/// anchor stays byte-exact. Tries an exact match first (fast path), then a
+/// whitespace-insensitive scan.
+fn find_quote_span(content: &str, quote: &str) -> Option<(usize, usize)> {
+    if let Some(s) = content.find(quote) {
+        return Some((s, s + quote.len()));
+    }
+    // Whitespace-tolerant: walk `content` byte-by-byte, matching `quote` where
+    // any run of whitespace in either side matches any run in the other.
+    let cb = content.as_bytes();
+    let qb = quote.as_bytes();
+    let is_ws = |b: u8| b == b' ' || b == b'\n' || b == b'\r' || b == b'\t';
+    let qb_trim_end = {
+        let mut e = qb.len();
+        while e > 0 && is_ws(qb[e - 1]) {
+            e -= 1;
+        }
+        e
+    };
+    if qb_trim_end == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    while start < cb.len() {
+        let mut ci = start;
+        let mut qi = 0usize;
+        let mut matched = true;
+        while qi < qb_trim_end {
+            if is_ws(qb[qi]) {
+                // Consume a (possibly empty) whitespace run on the quote side…
+                while qi < qb_trim_end && is_ws(qb[qi]) {
+                    qi += 1;
+                }
+                // …and require ≥1 whitespace on the content side.
+                if ci >= cb.len() || !is_ws(cb[ci]) {
+                    matched = false;
+                    break;
+                }
+                while ci < cb.len() && is_ws(cb[ci]) {
+                    ci += 1;
+                }
+            } else {
+                if ci >= cb.len() || cb[ci] != qb[qi] {
+                    matched = false;
+                    break;
+                }
+                ci += 1;
+                qi += 1;
+            }
+        }
+        if matched && qi >= qb_trim_end {
+            // Ensure the byte offsets land on char boundaries.
+            if content.is_char_boundary(start) && content.is_char_boundary(ci) {
+                return Some((start, ci));
+            }
+        }
+        // Advance to the next char boundary.
+        start += 1;
+        while start < cb.len() && !content.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    None
+}
+
 /// Parse an LLM extraction response into grounded [`AtomicFact`]s.
 ///
 /// **Anti-hallucination gate 1 (extract):** every fact must (a) carry a
@@ -113,7 +185,9 @@ pub fn parse_atomic_facts(response: &str, ctx: &ChunkContext) -> Vec<AtomicFact>
         Err(_) => return Vec::new(),
     };
 
-    let content_lc = ctx.content.to_lowercase();
+    // Whitespace-collapsed, lowercased content for tolerant subject/object
+    // grounding (PDF text is full of stray newlines).
+    let content_norm = normalize_ws(&ctx.content.to_lowercase());
     let mut out = Vec::new();
     for raw in raws {
         let subject = raw.subject.trim().to_string();
@@ -125,15 +199,14 @@ pub fn parse_atomic_facts(response: &str, ctx: &ChunkContext) -> Vec<AtomicFact>
         if subject.is_empty() || object.is_empty() || quote.len() < 3 {
             continue;
         }
-        // (a) the quote must appear VERBATIM in the chunk → its byte span.
-        let Some(bs) = ctx.content.find(&quote) else {
+        // (a) the quote must appear in the chunk (whitespace-tolerant) → span.
+        let Some((bs, be)) = find_quote_span(&ctx.content, &quote) else {
             continue;
         };
-        let be = bs + quote.len();
         let statement = ctx.content[bs..be].to_string();
-        // (c) ground subject + object to the chunk text.
-        if !content_lc.contains(&subject.to_lowercase())
-            || !content_lc.contains(&object.to_lowercase())
+        // (c) ground subject + object to the chunk text (whitespace-tolerant).
+        if !content_norm.contains(&normalize_ws(&subject.to_lowercase()))
+            || !content_norm.contains(&normalize_ws(&object.to_lowercase()))
         {
             continue;
         }
@@ -216,6 +289,25 @@ mod tests {
         let c = ctx();
         let resp = "Here are the facts:\n```json\n[{\"subject\":\"Yuriy\",\"predicate\":\"teaches\",\"object\":\"university\",\"quote\":\"Yuriy teaches the database course at the university\"}]\n```";
         assert_eq!(parse_atomic_facts(resp, &c).len(), 1);
+    }
+
+    #[test]
+    fn quote_match_tolerates_pdf_whitespace() {
+        // PDF text has stray newlines/double-spaces; the model returns a clean
+        // quote. The tolerant matcher must still ground it.
+        let c = ChunkContext {
+            content: "Yuriy  teaches\nthe   database\ncourse at the university.".into(),
+            byte_start: 0,
+            source_id: "s".into(),
+            chunk_id: "c".into(),
+            workspace_id: "w".into(),
+            extraction_model: "m".into(),
+            created_at: 1.0,
+        };
+        let resp = r#"[{"subject":"Yuriy","predicate":"teaches","object":"database course","quote":"Yuriy teaches the database course"}]"#;
+        let facts = parse_atomic_facts(resp, &c);
+        assert_eq!(facts.len(), 1, "whitespace-tolerant match must succeed");
+        assert!(facts[0].byte_end > facts[0].byte_start);
     }
 
     #[test]

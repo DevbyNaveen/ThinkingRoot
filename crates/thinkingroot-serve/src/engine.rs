@@ -6655,6 +6655,8 @@ side referenced. Strict rules:\n\
         let chunk_count = chunks.len();
         // Full verbatim text = ordered chunk content joined (the "Content" tab).
         let content = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("");
+        // Fall back to the content length when the source row's size is unset.
+        let byte_size = if byte_size == 0 { content.len() as u64 } else { byte_size };
         let mut entities: Vec<String> = Vec::new();
         for f in &facts {
             for n in [&f.subject, &f.object] {
