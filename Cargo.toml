@@ -158,8 +158,11 @@ tempfile = "3"
 # clear the in-flight mutex on panic or early return.
 scopeguard = "1"
 
-# Graph DB (Datalog-based, embedded, community edition)
-cozo = { package = "cozo-ce", version = "0.7.13-alpha.3", default-features = false, features = ["minimal", "rayon"] }
+# Graph DB (Datalog-based, embedded, community edition).
+# `minimal` keeps the SQLite backend compiled in (used for the gated legacy
+# path + the one-time SQLite→RocksDB data migration); `storage-new-rocksdb`
+# adds the concurrent-writer RocksDB backend (engine string "newrocksdb").
+cozo = { package = "cozo-ce", version = "0.7.13-alpha.3", default-features = false, features = ["minimal", "rayon", "storage-new-rocksdb"] }
 
 # Parsing
 pulldown-cmark = "0.13"

@@ -2616,9 +2616,15 @@ impl QueryEngine {
 
     /// Unmount a previously mounted workspace.
     pub fn unmount(&mut self, name: &str) -> Result<()> {
-        self.workspaces
+        let handle = self
+            .workspaces
             .remove(name)
             .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))?;
+        // Drop the registry's strong ref so the shared (RocksDB-exclusive)
+        // handle can close once this removed handle's clone is gone.
+        thinkingroot_graph::graph::GraphStore::release(
+            &handle.root_path.join(".thinkingroot").join("graph"),
+        );
         Ok(())
     }
 
@@ -2816,10 +2822,13 @@ impl QueryEngine {
                         && Arc::strong_count(&h.storage) == 1
                 })
                 .min_by_key(|(_, h)| h.last_use.load(std::sync::atomic::Ordering::Relaxed))
-                .map(|(name, _)| name.clone());
+                .map(|(name, h)| (name.clone(), h.root_path.clone()));
             match victim {
-                Some(name) => {
+                Some((name, root_path)) => {
                     self.workspaces.remove(&name);
+                    thinkingroot_graph::graph::GraphStore::release(
+                        &root_path.join(".thinkingroot").join("graph"),
+                    );
                     tracing::info!(
                         target: "engine",
                         ws = %name,

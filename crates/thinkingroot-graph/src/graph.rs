@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono;
 use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
@@ -14,6 +14,23 @@ use thinkingroot_core::{Error, Result};
 pub use crate::per_source_rows::PerSourceRows;
 
 use crate::source_store::{FileSystemSourceStore, SourceByteStore};
+
+/// Process-global registry of OPEN Cozo handles, keyed by the canonical
+/// `graph.db` path. **RocksDB takes an EXCLUSIVE per-directory lock** — a
+/// second open of the same dir fails ("Failed to open RocksDB"). Yet many call
+/// sites open the same workspace dir: the daemon's mounted handle, the compile
+/// pipeline (which opens its own `StorageEngine`), branch lookups, export. On
+/// SQLite a second open was tolerated; on RocksDB they MUST share ONE handle.
+/// `DbInstance` is internally `Arc`, so a clone is the *same* underlying DB —
+/// safe for concurrent reads + writes within the one handle. The registry hands
+/// out a clone when a dir is already open; [`GraphStore::release`] (called on
+/// unmount/evict) drops the registry's strong ref so the DB can close once the
+/// last live clone is gone.
+static OPEN_DBS: OnceLock<Mutex<HashMap<PathBuf, DbInstance>>> = OnceLock::new();
+
+fn open_dbs() -> &'static Mutex<HashMap<PathBuf, DbInstance>> {
+    OPEN_DBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
 /// adjacent shape: every field maps directly onto the v3 spec §3.3
@@ -268,34 +285,63 @@ impl GraphStore {
     pub fn init(path: &Path) -> Result<Self> {
         let db_path = path.join("graph.db");
 
-        // Durably switch graph.db to WAL journal mode BEFORE cozo opens it.
-        // cozo-ce's sqlite backend opens a *pool* of connections with no
-        // pragmas; under a write burst (e.g. a large compile) the default
-        // rollback journal makes pooled reader/writer connections conflict →
-        // `database is locked` (observed compiling 940 LongMemEval sessions).
-        // WAL lets readers and the single writer proceed concurrently and is
-        // PERSISTENT in the file header, so every cozo connection inherits it.
-        // Best-effort: a failure here must not block opening the DB.
-        if let Ok(conn) = sqlite::open(&db_path) {
-            let _ = conn.execute("PRAGMA journal_mode=WAL;");
-            let _ = conn.execute("PRAGMA synchronous=NORMAL;");
-            let _ = conn.execute("PRAGMA busy_timeout=10000;");
+        // Byte store is cheap; build it for either the shared or fresh path.
+        let byte_store: Arc<dyn SourceByteStore> = Arc::new(FileSystemSourceStore::new(path)?);
+
+        // RocksDB is exclusive-per-directory: share ONE handle if this graph dir
+        // is already open (the daemon handle + compile pipeline + branch ops all
+        // open the same path). Hold the registry lock across the open to
+        // serialize + race-proof first opens.
+        let mut reg = open_dbs().lock().expect("OPEN_DBS mutex poisoned");
+        if let Some(existing) = reg.get(&db_path) {
+            // Schema/migrations already run by the first opener (durable on disk).
+            return Ok(Self {
+                db: existing.clone(),
+                byte_store: Some(byte_store),
+            });
         }
 
-        let db = DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
-            .map_err(|e| Error::GraphStorage(format!("failed to open cozo db: {e}")))?;
+        // Storage backend select. Default = RocksDB ("newrocksdb"), a true
+        // concurrent-writer LSM engine that removes SQLite's single-writer
+        // ceiling and the `database is locked` class entirely (the loser of a
+        // write race waits instead of erroring). `TR_STORAGE_BACKEND=sqlite`
+        // reverts to the legacy SQLite backend — also how the one-time
+        // SQLite→RocksDB migration opens old DBs to read them.
+        let backend = std::env::var("TR_STORAGE_BACKEND").unwrap_or_else(|_| "newrocksdb".into());
 
-        // Wire the byte store to the same workspace data dir so the
-        // Witness Mesh bridge can materialise lossless statement text
-        // from `(source_id, byte_start, byte_end)` at read time.
-        // `FileSystemSourceStore::new` is infallible — it just builds
-        // the path; the actual directory is created lazily on first
-        // write by Phase 6 of the pipeline.
-        let byte_store: Arc<dyn SourceByteStore> =
-            Arc::new(FileSystemSourceStore::new(path)?);
+        let db = if backend == "sqlite" {
+            // SQLite needs WAL set durably BEFORE cozo's pooled connections
+            // attach (best-effort; persists in the file header).
+            if let Ok(conn) = sqlite::open(&db_path) {
+                let _ = conn.execute("PRAGMA journal_mode=WAL;");
+                let _ = conn.execute("PRAGMA synchronous=NORMAL;");
+                let _ = conn.execute("PRAGMA busy_timeout=10000;");
+            }
+            DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo sqlite db: {e}")))?
+        } else {
+            // RocksDB: `graph.db` is a DIRECTORY. Per-instance memory is bounded
+            // so many workspace brains coexist in one engine — a small block
+            // cache + write buffer, and `enable_write_buffer_manager` caps TOTAL
+            // memtable RAM across every open DB in the process.
+            let lru = std::env::var("TR_ROCKS_LRU_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            let wbuf = std::env::var("TR_ROCKS_WRITEBUF_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            let opts = format!(
+                "{{\"lru_cache_mb\":{lru},\"write_buffer_mb\":{wbuf},\
+                 \"enable_write_buffer_manager\":true,\"allow_stall\":true}}"
+            );
+            DbInstance::new("newrocksdb", db_path.to_str().unwrap_or("."), &opts)
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo rocksdb db: {e}")))?
+        };
 
         let store = Self {
-            db,
+            db: db.clone(),
             byte_store: Some(byte_store),
         };
         store.create_schema()?;
@@ -315,7 +361,21 @@ impl GraphStore {
         // current schema, preserving whatever columns exist.
         store.reconcile_claims_schema()?;
         store.create_indexes()?;
+
+        // Publish the canonical handle so later opens of this dir share it.
+        reg.insert(db_path, db);
         Ok(store)
+    }
+
+    /// Drop the registry's strong reference to the open handle for this
+    /// workspace graph dir (call on unmount / LRU-evict). The underlying DB
+    /// closes once every live clone is also dropped — this just stops the
+    /// registry from pinning it open forever. No-op if not open.
+    pub fn release(graph_dir: &Path) {
+        if let Some(reg) = OPEN_DBS.get() {
+            let db_path = graph_dir.join("graph.db");
+            reg.lock().expect("OPEN_DBS mutex poisoned").remove(&db_path);
+        }
     }
 
     /// Idempotent guarantee that `claims` has the complete current schema.
