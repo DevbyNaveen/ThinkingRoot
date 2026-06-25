@@ -966,6 +966,53 @@ pub fn spawn_atomic_extract(
     spawn_periodic_task(task)
 }
 
+/// Crash/restart resilience (Phase 5): periodically mark any `running`
+/// compile job owned by a DIFFERENT process id as `interrupted`. Because the
+/// cloud daemon boots with zero workspaces and the provisioner mounts them
+/// over REST *after* boot, a one-shot boot sweep would see nothing — so this
+/// runs periodically and reaps as soon as the workspace is mounted. Idempotent
+/// and safe: a job owned by the CURRENT process (host_pid match) is never
+/// touched, so a live compile is never falsely interrupted.
+struct CompileJobReaperTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    pid: i64,
+    interval: Duration,
+}
+
+#[async_trait]
+impl PeriodicTask for CompileJobReaperTask {
+    fn name(&self) -> &'static str {
+        "compile_job_reaper"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let reaped = self.engine.read().await.sweep_interrupted_compile_jobs(self.pid).await;
+        if reaped > 0 {
+            tracing::warn!(reaped, "compile-job reaper: marked stale running compiles as interrupted");
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the compile-job reaper. Always on (it only ever touches rows from a
+/// *previous* process). `TR_COMPILE_REAP_SECS` = cadence (default 45s).
+pub fn spawn_compile_job_reaper(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let interval_secs = std::env::var("TR_COMPILE_REAP_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(CompileJobReaperTask {
+        engine,
+        pid: std::process::id() as i64,
+        interval: Duration::from_secs(interval_secs.max(15)),
+    });
+    spawn_periodic_task(task)
+}
+
 /// Idle decay of the Stitcher's woven edges (mirrors the Living-Engram decay):
 /// a woven edge that never helps fades toward a floor, so auto-applied edges
 /// don't accumulate as noise. Gated on `TR_STITCHER`. Daily cadence;

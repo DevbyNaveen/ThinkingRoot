@@ -125,6 +125,18 @@ pub struct AppState {
     /// from the map on every exit path (success, failure, cancellation)
     /// by the merge handler so a long-cancelled merge never leaks.
     pub active_merges: Arc<RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Phase 2 reliability (2026-06-25) — in-flight compile jobs keyed by
+    /// canonical workspace name. The streaming compile detaches its work from
+    /// the SSE connection: the entry holds a `broadcast` progress sender (so a
+    /// reconnecting console re-subscribes to the live run) and a `user_cancel`
+    /// token that is fired ONLY by an explicit `POST …/compile/cancel` — never
+    /// by the client disconnecting. This is what makes a compile survive the
+    /// browser closing. One entry per ws = the single-compile-per-ws guard.
+    pub active_compiles: Arc<RwLock<HashMap<String, ActiveCompile>>>,
+    /// Phase 3 reliability — process-wide activity counters feeding `GET /busy`
+    /// (the provisioner polls it before pausing a dormant engine, so a busy
+    /// engine is never idle-GC'd mid-stream).
+    pub busy: Arc<BusyState>,
     /// C3 (2026-05-22) — in-flight MCP `tools/call`
     /// `CancellationToken`s keyed by the JSON-RPC request id (as a
     /// string). `notifications/cancelled` looks up the matching id
@@ -197,6 +209,51 @@ pub struct AppState {
     /// dispatch, persisted to `<config>/thinkingroot/mcp-sessions.jsonl`
     /// on disconnect.
     pub mcp_session_telemetry: crate::mcp::telemetry::SessionTelemetryMap,
+}
+
+/// One in-flight compile run, decoupled from any client connection. Held in
+/// `AppState.active_compiles` for the lifetime of the run.
+pub struct ActiveCompile {
+    /// The durable `compile_jobs` row id this run writes to.
+    pub job_id: String,
+    /// Fan-out of pipeline `ProgressEvent`s. A reconnecting console subscribes
+    /// here; zero subscribers never block the producer (broadcast drops).
+    pub progress: broadcast::Sender<crate::pipeline::ProgressEvent>,
+    /// Fired ONLY by an explicit `POST …/compile/cancel`. The detached compile
+    /// task observes it via the pipeline's cancel token — a client
+    /// disconnecting does NOT touch it (that is the whole point).
+    pub user_cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Process-wide activity counters for the `/busy` signal. Counters use
+/// `AtomicI64` so increment/decrement is lock-free on the request hot path.
+#[derive(Default)]
+pub struct BusyState {
+    /// Open `/ask/stream` responses (agent loops in flight).
+    pub active_ask_streams: std::sync::atomic::AtomicI64,
+    /// Live compile SSE observers (informational only — the authoritative
+    /// compile signal is the durable `compile_jobs` running count, so a
+    /// disconnected observer never makes a running compile look idle).
+    pub active_compile_observers: std::sync::atomic::AtomicI64,
+}
+
+/// RAII guard that counts an open `/ask/stream` toward the busy signal for the
+/// full lifetime of the SSE response (moved INTO the stream so the decrement
+/// fires when the connection drops, not when the handler returns).
+struct AskBusyGuard(Arc<BusyState>);
+impl AskBusyGuard {
+    fn new(busy: Arc<BusyState>) -> Self {
+        busy.active_ask_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(busy)
+    }
+}
+impl Drop for AskBusyGuard {
+    fn drop(&mut self) {
+        self.0
+            .active_ask_streams
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl AppState {
@@ -286,6 +343,8 @@ impl AppState {
                 head_change_tx: broadcast::channel(64).0,
                 activity_tx: broadcast::channel(512).0,
                 active_merges: Arc::new(RwLock::new(HashMap::new())),
+                active_compiles: Arc::new(RwLock::new(HashMap::new())),
+                busy: Arc::new(BusyState::default()),
                 mcp_pending_calls: Arc::new(RwLock::new(HashMap::new())),
                 mcp_pending_sampling: Arc::new(RwLock::new(HashMap::new())),
                 workspace_watcher: Arc::new(RwLock::new(None)),
@@ -1061,6 +1120,11 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             )
             .route("/ws/{ws}/compile", post(compile))
             .route("/ws/{ws}/compile/stream", post(compile_stream))
+            // Phase 2 reliability — durable compile job control + status.
+            .route("/ws/{ws}/compile/cancel", post(cancel_compile_handler))
+            .route("/ws/{ws}/compile/jobs", get(list_running_compile_jobs_handler))
+            .route("/ws/{ws}/compile/jobs/{job_id}", get(get_compile_job_handler))
+            .route("/ws/{ws}/extract-status", get(extract_status_handler))
             // Unified project activity log: live SSE tail + durable history
             // + connected-MCP roster. Powers the Console "Activity" tab.
             .route("/ws/{ws}/activity/stream", get(stream_activity_handler))
@@ -1203,6 +1267,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
     let public_or_self_auth = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/readyz", get(readyz_handler))
+        .route("/busy", get(busy_handler))
         .route("/livez", get(livez_handler))
         .route("/api/v1/version", get(version_handler))
         .route("/.well-known/mcp", get(well_known_mcp_handler))
@@ -5639,82 +5704,152 @@ async fn compile_stream(
         no_rooting: body.no_rooting,
     };
 
-    // Channel that the helper writes to and the SSE stream below
-    // pumps events from.
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
+    // ── Phase 2 reliability (2026-06-25): durable, disconnect-proof compile ──
+    //
+    // The compile WORK is detached from this SSE connection. The pipeline runs
+    // in a background task that observes only an explicit `user_cancel` token —
+    // it is NOT bound to a DropGuard, so closing the browser ends *observation*,
+    // not the compile. A durable `compile_jobs` row tracks the run so a
+    // reconnecting client re-attaches and a crash is detected on boot.
+    //
+    // `TR_DURABLE_COMPILE=0` reverts to the legacy "close = cancel" semantics
+    // (the SSE holds the cancel drop-guard) as a one-release escape hatch.
+    let durable = std::env::var("TR_DURABLE_COMPILE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
-    // The DropGuard fires the cancel token when the SSE stream is
-    // dropped (client disconnect, axum body cancellation, etc.).
-    // The pipeline observes the same token via `PipelineOptions` and
-    // bails at the next phase boundary — the engine-pipeline.md
-    // cancellation contract (every stateful REST handler binds a
-    // CancellationToken + DropGuard inside its response body).
-    let cancel = CancellationToken::new();
-    let cancel_for_helper = cancel.clone();
-    let drop_guard = cancel.drop_guard();
+    // Resolve the canonical workspace name so the registry key + durable job
+    // land on the same workspace the pipeline writes to.
+    let ws_key = resolve_compile_ws_key(&state, &ws, &root_path).await;
 
-    // Spawn the helper as a sibling task so the SSE stream below
-    // pumps `progress_rx` concurrently with the pipeline running.
-    // The helper owns ALL the post-compile reconciliation (remount,
-    // vector-index rebuild, LLM-probe stamp, mount-success dispatch,
-    // terminal CompileFinished, engram cache invalidation); when it
-    // returns we just yield the wire terminator.
-    let helper_state = state.clone();
-    let helper_handle = tokio::spawn(async move {
-        run_unified_compile(helper_state, req, Some(progress_tx), cancel_for_helper).await
-    });
+    // Attach-or-start under the registry lock (the single-compile-per-ws guard).
+    let (mut progress_rx, job_id, started_new, legacy_guard) = {
+        let mut map = state.active_compiles.write().await;
+        if let Some(existing) = map.get(&ws_key) {
+            // ATTACH — a compile is already running for this ws. Subscribe to
+            // its live progress; the run keeps going regardless of observers.
+            let guard = (!durable).then(|| existing.user_cancel.clone().drop_guard());
+            (existing.progress.subscribe(), existing.job_id.clone(), false, guard)
+        } else {
+            // START — create the broadcast + cancel token, register, then spawn
+            // the detached compile task.
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let (bcast_tx, bcast_rx) = broadcast::channel(256);
+            let user_cancel = CancellationToken::new();
+            map.insert(
+                ws_key.clone(),
+                ActiveCompile {
+                    job_id: job_id.clone(),
+                    progress: bcast_tx.clone(),
+                    user_cancel: user_cancel.clone(),
+                },
+            );
+            // Release the registry lock before any IO.
+            drop(map);
+
+            // Durable record — best-effort; a write failure never fails the run.
+            let pid = std::process::id() as i64;
+            if let Err(e) = state
+                .engine
+                .read()
+                .await
+                .insert_compile_job(
+                    &ws_key,
+                    &job_id,
+                    &root_path.to_string_lossy(),
+                    req.branch.as_deref().unwrap_or(""),
+                    0,
+                    pid,
+                )
+                .await
+            {
+                tracing::warn!(ws = %ws_key, "compile job record insert failed (run still proceeds): {e}");
+            }
+
+            let guard = (!durable).then(|| user_cancel.clone().drop_guard());
+            spawn_detached_compile(state.clone(), req, ws_key.clone(), job_id.clone(), bcast_tx, user_cancel);
+            (bcast_rx, job_id, true, guard)
+        }
+    };
+
+    // SSE: OBSERVE the broadcast. Dropping this stream ends observation only.
+    state
+        .busy
+        .active_compile_observers
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let observe_state = state.clone();
+    let observe_ws = ws_key.clone();
+    let observe_job = job_id.clone();
 
     let stream = async_stream::stream! {
-        let _guard = drop_guard;
-
-        while let Some(event) = progress_rx.recv().await {
-            let payload = match serde_json::to_string(&event) {
-                Ok(s) => s,
-                Err(e) => {
-                    // Should not happen — every ProgressEvent variant
-                    // is composed of primitives. If it does, surface
-                    // the error rather than silently swallowing the
-                    // event so the desktop can show a real failure
-                    // instead of an incomplete progress stream.
-                    let payload = serde_json::json!({
-                        "error": format!("progress event encode failed: {e}"),
-                    })
-                    .to_string();
-                    yield Ok::<Event, std::convert::Infallible>(
-                        Event::default().event("failed").data(payload),
-                    );
-                    return;
-                }
-            };
-            yield Ok(Event::default().event("progress").data(payload));
+        // Hold the legacy drop-guard (only Some when TR_DURABLE_COMPILE=0) and
+        // a busy-counter guard for the whole stream lifetime.
+        let _legacy_guard = legacy_guard;
+        struct ObsGuard(std::sync::Arc<AppState>);
+        impl Drop for ObsGuard {
+            fn drop(&mut self) {
+                self.0
+                    .busy
+                    .active_compile_observers
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        let _obs = ObsGuard(observe_state.clone());
 
-        // Channel closed → the helper task has finished. Yield the
-        // single terminator event that matches its outcome. The
-        // helper has already stamped the workspace_status actor +
-        // remounted the workspace + invalidated engrams, so the
-        // terminator is the *only* thing the SSE stream still owes
-        // the client.
-        match helper_handle.await {
-            Ok((_status_name, UnifiedCompileOutcome::Done(result))) => {
-                let payload = serde_json::to_string(&result)
-                    .unwrap_or_else(|_| "{}".to_string());
-                yield Ok(Event::default().event("done").data(payload));
-            }
-            Ok((_, UnifiedCompileOutcome::Cancelled)) => {
-                yield Ok(Event::default().event("cancelled").data("{}"));
-            }
-            Ok((_, UnifiedCompileOutcome::Failed(msg))) => {
-                let payload = serde_json::json!({ "error": msg }).to_string();
-                yield Ok(Event::default().event("failed").data(payload));
-            }
-            Err(e) => {
-                let payload = serde_json::json!({
-                    "error": format!("compile task panicked: {e}"),
+        // Re-attach snapshot so a reconnecting client immediately sees the
+        // current phase even though it joined the broadcast mid-run.
+        if !started_new {
+            if let Ok(Some(job)) =
+                observe_state.engine.read().await.get_compile_job(&observe_ws, &observe_job).await
+            {
+                let snap = serde_json::json!({
+                    "attached": true,
+                    "phase": job.phase,
+                    "status": job.status,
                 })
                 .to_string();
-                yield Ok(Event::default().event("failed").data(payload));
+                yield Ok::<Event, std::convert::Infallible>(
+                    Event::default().event("attached").data(snap),
+                );
+            }
+        }
+
+        loop {
+            match progress_rx.recv().await {
+                Ok(event) => {
+                    let payload = serde_json::to_string(&event)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(Event::default().event("progress").data(payload));
+                }
+                // A slow observer fell behind the broadcast buffer — skip the
+                // gap (progress is best-effort; the durable row is truth).
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // Producer finished + dropped its senders → read the durable
+                // row for the authoritative terminal status.
+                Err(broadcast::error::RecvError::Closed) => {
+                    let (ev, payload) = match observe_state
+                        .engine
+                        .read()
+                        .await
+                        .get_compile_job(&observe_ws, &observe_job)
+                        .await
+                    {
+                        Ok(Some(job)) if job.status == "done" => ("done", "{}".to_string()),
+                        Ok(Some(job)) if job.status == "cancelled" => {
+                            ("cancelled", "{}".to_string())
+                        }
+                        Ok(Some(job)) => (
+                            "failed",
+                            serde_json::json!({ "error": job.error, "status": job.status })
+                                .to_string(),
+                        ),
+                        // No durable row (insert failed earlier) — the compile
+                        // still ran; report a clean done so the client refreshes.
+                        _ => ("done", "{}".to_string()),
+                    };
+                    yield Ok(Event::default().event(ev).data(payload));
+                    return;
+                }
             }
         }
     };
@@ -5726,6 +5861,246 @@ async fn compile_stream(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+/// Resolve the canonical mounted-workspace name for a compile. The CLI POSTs
+/// to `/ws/_/compile/stream` with `_` as the alias; match it by `root_path`
+/// against the engine's mount table so the registry key + durable job land on
+/// the real workspace. Non-`_` aliases pass through unchanged.
+async fn resolve_compile_ws_key(
+    state: &Arc<AppState>,
+    ws_alias: &str,
+    root_path: &std::path::Path,
+) -> String {
+    if ws_alias != "_" {
+        return ws_alias.to_string();
+    }
+    let engine = state.engine.read().await;
+    if let Ok(list) = engine.list_workspaces().await {
+        if let Some(w) = list
+            .into_iter()
+            .find(|w| std::path::PathBuf::from(&w.path) == root_path)
+        {
+            return w.name;
+        }
+    }
+    ws_alias.to_string()
+}
+
+/// Spawn the detached compile task. It runs `run_unified_compile` (which owns
+/// all post-compile reconciliation) bound ONLY to `user_cancel`, bridges the
+/// pipeline's progress onto the broadcast `bcast_tx` while advancing the
+/// durable job's phase, then writes the terminal status and removes itself
+/// from the registry. The task outlives any SSE observer — that is what makes
+/// a compile survive the browser closing.
+fn spawn_detached_compile(
+    state: Arc<AppState>,
+    req: UnifiedCompileRequest,
+    ws_key: String,
+    job_id: String,
+    bcast_tx: broadcast::Sender<crate::pipeline::ProgressEvent>,
+    user_cancel: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        // Bridge: pipeline → mpsc → (durable phase update + broadcast fan-out).
+        let (mpsc_tx, mut mpsc_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
+        let bridge = {
+            let bcast = bcast_tx.clone();
+            let engine = state.engine.clone();
+            let ws = ws_key.clone();
+            let jid = job_id.clone();
+            tokio::spawn(async move {
+                let mut last_phase: Option<&'static str> = None;
+                while let Some(ev) = mpsc_rx.recv().await {
+                    if let Some(phase) = phase_token_from_event(&ev) {
+                        if last_phase != Some(phase) {
+                            let _ = engine
+                                .read()
+                                .await
+                                .update_compile_job_phase(&ws, &jid, phase)
+                                .await;
+                            last_phase = Some(phase);
+                        }
+                    }
+                    // Err only means "no live observers" — fine, drop it.
+                    let _ = bcast.send(ev);
+                }
+            })
+        };
+
+        // Orphan guard: a compile that never finishes (client gone forever,
+        // pathological input) is force-cancelled after the cap so it can't pin
+        // an engine "busy" indefinitely.
+        let max_secs = std::env::var("TR_COMPILE_MAX_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1800);
+
+        let compile_fut =
+            run_unified_compile(state.clone(), req, Some(mpsc_tx), user_cancel.clone());
+        tokio::pin!(compile_fut);
+        let (_name, outcome) = tokio::select! {
+            res = &mut compile_fut => res,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(max_secs)) => {
+                tracing::warn!(ws = %ws_key, "compile exceeded TR_COMPILE_MAX_SECS={max_secs}s — cancelling");
+                user_cancel.cancel();
+                // Let the pipeline wind down cleanly to Cancelled.
+                (&mut compile_fut).await
+            }
+        };
+        let _ = bridge.await;
+
+        let (status, error) = match &outcome {
+            UnifiedCompileOutcome::Done(_) => ("done", String::new()),
+            UnifiedCompileOutcome::Cancelled => ("cancelled", String::new()),
+            UnifiedCompileOutcome::Failed(msg) => ("failed", msg.clone()),
+        };
+        if let Err(e) = state
+            .engine
+            .read()
+            .await
+            .finish_compile_job(&ws_key, &job_id, status, &error)
+            .await
+        {
+            tracing::warn!(ws = %ws_key, "finish_compile_job failed: {e}");
+        }
+
+        // Remove from the registry LAST: dropping the map's broadcast sender
+        // and this task's `bcast_tx` closes observers' receivers, which then
+        // read the now-terminal durable row.
+        state.active_compiles.write().await.remove(&ws_key);
+        drop(bcast_tx);
+    });
+}
+
+/// `POST /api/v1/ws/{ws}/compile/cancel` — deliberate, user-initiated cancel
+/// of a running compile. Distinct from the client disconnecting (which no
+/// longer cancels anything). 404 if no compile is active for the workspace.
+async fn cancel_compile_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    if let Some(ac) = state.active_compiles.read().await.get(&ws) {
+        ac.user_cancel.cancel();
+        ok_response(serde_json::json!({ "cancelled": ws, "job_id": ac.job_id })).into_response()
+    } else {
+        err_response(
+            StatusCode::NOT_FOUND,
+            "COMPILE_NOT_ACTIVE",
+            &format!("no in-flight compile for workspace '{ws}'"),
+        )
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/compile/jobs/{job_id}` — durable compile-job status so
+/// the console can poll a run it isn't actively streaming (survives tab close,
+/// surfaces `interrupted`/`failed` for one-click Retry).
+async fn get_compile_job_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, job_id)): Path<(String, String)>,
+) -> Response {
+    match state.engine.read().await.get_compile_job(&ws, &job_id).await {
+        Ok(Some(job)) => ok_response(serde_json::json!({
+            "job_id": job.job_id,
+            "ws": job.ws,
+            "status": job.status,
+            "phase": job.phase,
+            "source_count": job.source_count,
+            "started_at": job.started_at,
+            "updated_at": job.updated_at,
+            "error": job.error,
+        }))
+        .into_response(),
+        Ok(None) => err_response(StatusCode::NOT_FOUND, "COMPILE_JOB_NOT_FOUND", "no such compile job"),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Query for `GET …/compile/jobs`. `recent=N` switches from "running only"
+/// (the default, used for the live re-attach check) to "the N most recent jobs
+/// in any status, newest-first" (the Import-page queue/history view).
+#[derive(Debug, Default, serde::Deserialize)]
+struct CompileJobsQuery {
+    recent: Option<usize>,
+}
+
+/// `GET /api/v1/ws/{ws}/compile/jobs` — compile jobs for a workspace. Without
+/// `?recent=` it returns only `running` jobs (the console's "is a compile live
+/// right now?" check on mount / tab-reopen). With `?recent=N` it returns the N
+/// newest jobs in ANY status, so the Import page can render a durable queue
+/// (done/interrupted/failed/cancelled history included).
+async fn list_running_compile_jobs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Query(q): Query<CompileJobsQuery>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let jobs = match q.recent {
+        Some(n) => engine.list_recent_compile_jobs(&ws, n.clamp(1, 200)).await,
+        None => engine.list_running_compile_jobs(&ws).await,
+    };
+    match jobs {
+        Ok(jobs) => {
+            let out: Vec<_> = jobs
+                .into_iter()
+                .map(|job| {
+                    serde_json::json!({
+                        "job_id": job.job_id,
+                        "status": job.status,
+                        "phase": job.phase,
+                        "source_count": job.source_count,
+                        "error": job.error,
+                        "started_at": job.started_at,
+                        "updated_at": job.updated_at,
+                    })
+                })
+                .collect();
+            ok_response(serde_json::json!({ "jobs": out })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/extract-status` — source ids still pending LLM
+/// atomic-fact extraction, so the Import page can mark each freshly-compiled
+/// doc "extracting facts" vs "ready" honestly (mechanical chunks land instantly;
+/// facts/entities arrive asynchronously via `atomic_extract_queue`).
+async fn extract_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    match state.engine.read().await.pending_extract_ids(&ws, 256).await {
+        Ok(pending) => ok_response(serde_json::json!({
+            "pending_count": pending.len(),
+            "pending": pending,
+        }))
+        .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /busy` — process activity signal the provisioner polls before pausing
+/// a dormant engine. `busy=true` whenever there is durable in-flight work
+/// (a running compile or pending fact-extraction) or a live ask stream, so a
+/// busy engine is never idle-GC'd mid-stream. Fail-safe by design at the
+/// caller: the provisioner treats an unreachable `/busy` as busy.
+async fn busy_handler(State(state): State<Arc<AppState>>) -> Response {
+    use std::sync::atomic::Ordering::Relaxed;
+    let engine = state.engine.read().await;
+    let compiles = engine.running_compile_count_all().await;
+    let extract_pending = engine.pending_atomic_extract_count_all().await;
+    drop(engine);
+    let ask_streams = state.busy.active_ask_streams.load(Relaxed).max(0);
+    let in_mem_compiles = !state.active_compiles.read().await.is_empty();
+    let busy = compiles > 0 || extract_pending > 0 || ask_streams > 0 || in_mem_compiles;
+    ok_response(serde_json::json!({
+        "busy": busy,
+        "compiles": compiles,
+        "extract_pending": extract_pending,
+        "ask_streams": ask_streams,
+    }))
+    .into_response()
 }
 
 async fn verify_ws(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> Response {
@@ -8762,7 +9137,9 @@ async fn ask_stream_handler(
         0
     };
 
+    let busy_guard = AskBusyGuard::new(state.busy.clone());
     let stream = async_stream::stream! {
+        let _busy = busy_guard;
         match outcome {
             StreamingAnswer::Static { answer, claims_used, category } => {
                 let meta = serde_json::json!({
@@ -9635,6 +10012,7 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
     // is `Copy`.
     let chat_started_at_for_stream = chat_started_at;
     let workspace_for_timeline = ws.clone();
+    let busy_state_for_stream = state.busy.clone();
     let stream = async_stream::stream! {
         use crate::intelligence::retrieval_capture::{HashSetSubstrate, RetrievalCapture};
         use crate::intelligence::verifier::{
@@ -9647,6 +10025,8 @@ async fn agent_stream_response(state: Arc<AppState>, ws: String, body: AskReques
         // token and the spawned agent task observes it at its next
         // safe checkpoint.
         let _agent_drop_guard = drop_guard;
+        // Count this agent stream toward the `/busy` signal for its lifetime.
+        let _busy = AskBusyGuard::new(busy_state_for_stream);
 
         // First-token watermark for the chat-turn timeline. Flips
         // exactly once on the first Text/ToolCallProposed/

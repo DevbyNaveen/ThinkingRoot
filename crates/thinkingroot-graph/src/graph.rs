@@ -1657,6 +1657,30 @@ impl GraphStore {
                 enqueued_at: Float default 0.0,
                 attempts: Int default 0
             }",
+            // compile_jobs — durable record of a compile run so the work is
+            // a persistent queued job, not an ephemeral HTTP side effect:
+            //  • a reconnecting console re-attaches to a live compile (status
+            //    `running` + the current `phase`),
+            //  • a compile keeps running server-side after the browser closes
+            //    (the SSE only OBSERVES — see rest.rs active_compiles),
+            //  • a crash-interrupted run is detected on boot (host_pid mismatch
+            //    → status `interrupted`) and surfaced honestly for Retry.
+            // status ∈ {running, done, failed, interrupted, cancelled};
+            // `done` is written ONLY on a genuine successful finish.
+            ":create compile_jobs {
+                job_id: String
+                =>
+                ws: String default '',
+                root_path: String default '',
+                branch: String default '',
+                status: String default 'running',
+                phase: String default 'starting',
+                source_count: Int default 0,
+                started_at: Float default 0.0,
+                updated_at: Float default 0.0,
+                error: String default '',
+                host_pid: Int default 0
+            }",
         ];
 
         for stmt in &relations {
@@ -1807,6 +1831,7 @@ impl GraphStore {
             "::index create spine_edges:by_kind { edge_kind }",
             "::index create concept_nodes:by_status { status }",
             "::index create atomic_extract_queue:by_status { status }",
+            "::index create compile_jobs:by_status { status }",
         ];
 
         for stmt in &indexes {

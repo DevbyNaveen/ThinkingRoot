@@ -2096,6 +2096,15 @@ pub struct BranchMergeResult {
 /// are no other workers to repark onto, so the closure is just invoked
 /// directly. `block_in_place` cannot be used there — it panics.
 #[inline]
+/// Wall-clock seconds since the Unix epoch as `f64` (the timestamp form the
+/// Cozo relations store). Defaults to `0.0` if the clock is before the epoch.
+fn now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 fn run_blocking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -7772,6 +7781,155 @@ side referenced. Strict rules:\n\
             }
         }
         Ok(total)
+    }
+
+    // ─── Durable compile jobs (Phase 2 reliability) ────────────────────────
+    // Thin pass-throughs to the per-workspace `compile_jobs` Cozo relation so
+    // the streaming compile can persist a run that survives the browser
+    // closing, a reconnecting client can re-attach, and a crash-interrupted
+    // run is detected on boot. All best-effort: a write failure never breaks
+    // the compile itself (the in-memory `active_compiles` registry still
+    // protects the run during its lifetime).
+
+    /// Record a fresh `running` compile job in the workspace's graph.db.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+        root_path: &str,
+        branch: &str,
+        source_count: i64,
+        host_pid: i64,
+    ) -> Result<()> {
+        let now = now_secs_f64();
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage
+            .graph
+            .insert_compile_job(job_id, ws, root_path, branch, source_count, now, host_pid)
+    }
+
+    /// Update the live phase of a running compile job (cheap, per transition).
+    pub async fn update_compile_job_phase(&self, ws: &str, job_id: &str, phase: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.update_compile_job_phase(job_id, phase, now_secs_f64())
+    }
+
+    /// Move a compile job to a terminal status (`done` only on real success).
+    pub async fn finish_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+        status: &str,
+        error: &str,
+    ) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.finish_compile_job(job_id, status, error, now_secs_f64())
+    }
+
+    /// Fetch one compile job (re-attach snapshot + console polling).
+    pub async fn get_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+    ) -> Result<Option<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_compile_job(job_id)
+    }
+
+    /// Running compile jobs for one workspace (console "is a compile live?").
+    pub async fn list_running_compile_jobs(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_running_compile_jobs()
+    }
+
+    /// Recent compile jobs for one workspace, newest-first (any status) — the
+    /// Import-page queue/history view. Auto-mounts the workspace.
+    pub async fn list_recent_compile_jobs(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_recent_compile_jobs(limit)
+    }
+
+    /// Source ids still pending LLM atomic-fact extraction in one workspace —
+    /// lets the console mark each freshly-compiled doc "extracting facts" vs
+    /// "ready" without guessing. Bounded read (the queue is small in practice).
+    pub async fn pending_extract_ids(&self, ws: &str, limit: usize) -> Result<Vec<String>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        Ok(storage
+            .graph
+            .pending_atomic_extract(limit)?
+            .into_iter()
+            .map(|(id, _attempts)| id)
+            .collect())
+    }
+
+    /// Count of running compile jobs across ALL mounted workspaces — the
+    /// authoritative half of the `/busy` signal (survives observer
+    /// disconnect, unlike an in-memory counter).
+    pub async fn running_compile_count_all(&self) -> usize {
+        let mut total = 0usize;
+        for ws in self.mounted_workspace_names() {
+            if let Ok(handle) = self.get_workspace(&ws) {
+                let storage = handle.storage.lock().await;
+                total += storage.graph.running_compile_count().unwrap_or(0);
+            }
+        }
+        total
+    }
+
+    /// Count of sources still pending LLM atomic-fact extraction across ALL
+    /// mounted workspaces — the other durable half of the `/busy` signal, so an
+    /// engine draining its post-compile extraction queue is never idle-paused.
+    pub async fn pending_atomic_extract_count_all(&self) -> usize {
+        let mut total = 0usize;
+        for ws in self.mounted_workspace_names() {
+            if let Ok(handle) = self.get_workspace(&ws) {
+                let storage = handle.storage.lock().await;
+                // A small bounded probe is enough for a boolean-ish signal;
+                // cap the read so a huge backlog stays cheap to poll.
+                total += storage.graph.pending_atomic_extract(64).map(|v| v.len()).unwrap_or(0);
+            }
+        }
+        total
+    }
+
+    /// Boot-sweep: across all mounted workspaces, mark any `running` job owned
+    /// by a DIFFERENT process id (i.e. orphaned by a crash/restart) as
+    /// `interrupted`. Honest recovery — the run is surfaced for a Retry, never
+    /// reported as `done`. Returns the number reaped.
+    pub async fn sweep_interrupted_compile_jobs(&self, current_pid: i64) -> usize {
+        let mut reaped = 0usize;
+        for ws in self.mounted_workspace_names() {
+            let Ok(handle) = self.get_workspace(&ws) else { continue };
+            let storage = handle.storage.lock().await;
+            let running = storage.graph.list_running_compile_jobs().unwrap_or_default();
+            for job in running {
+                if job.host_pid != current_pid {
+                    if storage
+                        .graph
+                        .finish_compile_job(&job.job_id, "interrupted", "engine restarted", now_secs_f64())
+                        .is_ok()
+                    {
+                        reaped += 1;
+                    }
+                }
+            }
+        }
+        reaped
     }
 
     pub async fn stitch_once(
