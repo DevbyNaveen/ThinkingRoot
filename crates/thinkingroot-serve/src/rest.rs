@@ -866,6 +866,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/sources/{id}/chunks", get(source_chunks_handler))
             .route("/ws/{ws}/sources/{id}/fact-history", get(source_fact_history_handler))
             .route("/ws/{ws}/concepts", get(list_concepts_handler))
+            .route("/ws/{ws}/mother-edges", get(mother_edges_handler))
             .route("/ws/{ws}/entities/{name}/profile", get(entity_profile_handler))
             // ─── Compiled Prompt substrate ───────────────────────────
             .route(
@@ -2074,6 +2075,18 @@ async fn list_concepts_handler(
     let engine = state.engine.read().await;
     match engine.list_concepts(&ws, q.status.as_deref()).await {
         Ok(c) => ok_response(c).into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /ws/{ws}/mother-edges` — document→entity edges for the graph hierarchy.
+async fn mother_edges_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.get_mother_edges(&ws).await {
+        Ok(e) => ok_response(e).into_response(),
         Err(e) => match_engine_error(e),
     }
 }

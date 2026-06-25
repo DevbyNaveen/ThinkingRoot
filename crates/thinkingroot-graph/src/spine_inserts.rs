@@ -188,6 +188,34 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Mother→entity edges for the Neural Graph: distinct `(source_id, entity_id)`
+    /// pairs derived from the `fact_mentions_entity` spine (a document's facts
+    /// mention these entities). Lets the graph draw each DOCUMENT as a mother
+    /// node connected to the entities it produced.
+    pub fn get_mother_entity_edges(&self) -> Result<Vec<(String, String)>> {
+        let res = self.query_read(
+            "?[source_id, to_id] := *spine_edges{source_id, to_id, edge_kind}, \
+             edge_kind == 'fact_mentions_entity'",
+        )?;
+        let mut out: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 2 {
+                    return None;
+                }
+                let ds = |v: &cozo::DataValue| match v {
+                    cozo::DataValue::Str(s) => s.to_string(),
+                    other => format!("{other:?}"),
+                };
+                Some((ds(&r[0]), ds(&r[1])))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Spine neighbours of a node by edge kind (one hop). Used by retrieval
     /// graph-expansion to walk the mother-node hierarchy.
     pub fn spine_neighbors(&self, from_id: &str, edge_kind: &str) -> Result<Vec<String>> {
@@ -209,9 +237,18 @@ impl GraphStore {
     }
 }
 
+/// Comparison / constraint / value phrases that are NOT entities (common in
+/// schema/spec docs). A fact subject/object containing one is dropped.
+const NON_ENTITY_MARKERS: &[&str] = &[
+    "more than", "less than", "greater than", "at least", "at most", "must be",
+    "equal to", "not null", "default ", "between ", "ranges from", " per ",
+    "cannot be", "should be", "no more", "up to", "minimum", "maximum",
+];
+
 /// Normalise a fact subject/object into a clean entity name, or `None` to skip
-/// junk. Drops a leading article, trims, and rejects empties / over‑long
-/// phrases / pure stop‑words so the graph stays legible.
+/// non-entity junk (values, numbers, constraint clauses, mangled fragments).
+/// This is the gate that keeps the graph legible — SOTA memory graphs show
+/// named entities, NOT every value or clause.
 fn clean_entity_name(raw: &str) -> Option<String> {
     let mut s = raw.trim();
     for art in ["the ", "a ", "an ", "The ", "A ", "An "] {
@@ -220,9 +257,31 @@ fn clean_entity_name(raw: &str) -> Option<String> {
             break;
         }
     }
-    let s = s.trim_matches(|c: char| c == '.' || c == ',' || c == '"').trim();
-    let words = s.split_whitespace().count();
-    if s.len() < 2 || s.len() > 60 || words == 0 || words > 6 {
+    let s = s
+        .trim_matches(|c: char| c == '.' || c == ',' || c == '"' || c == ':' || c == ';')
+        .trim();
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if s.len() < 2 || s.len() > 48 || words.is_empty() || words.len() > 5 {
+        return None;
+    }
+    // Must contain a letter; must NOT start with a digit (values like "20 …").
+    if !s.chars().any(|c| c.is_alphabetic()) {
+        return None;
+    }
+    if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Reject if any token is a bare number or single char ("Camera Nr N 3 0",
+    // "1,2,…,12") — schema fragments, not entity names.
+    if words
+        .iter()
+        .any(|w| w.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') || w.chars().count() == 1)
+    {
+        return None;
+    }
+    // Reject constraint / comparison / value phrases.
+    let lc = s.to_lowercase();
+    if NON_ENTITY_MARKERS.iter().any(|m| lc.contains(m)) {
         return None;
     }
     Some(s.to_string())
@@ -239,18 +298,42 @@ fn normalize_predicate(pred: &str) -> String {
     }
 }
 
+/// Schema/structural words that a real PERSON name never contains — used to
+/// stop columns like "Camera Nr" / "Teacher Id" being mislabelled Person.
+const SCHEMA_WORDS: &[&str] = &[
+    "nr", "id", "no", "code", "date", "number", "type", "name", "field", "key",
+    "table", "column", "pk", "fk", "view", "class", "group", "groups", "rubric",
+    "department", "departments", "service", "services", "book", "books",
+];
+
 /// Best‑effort entity type from the name (drives the graph SHAPE). Defaults to
-/// Concept (the neutral ring) — honest when we can't tell.
+/// Concept (the neutral ring) — honest when we can't tell. Person is inferred
+/// ONLY for a clean two-word Title-Case alphabetic name that contains no schema
+/// word (so "Lena Park" → Person, but "Camera Nr" / "Class Nr" → Concept).
 fn guess_entity_type(name: &str) -> EntityType {
     let lc = name.to_lowercase();
     let words: Vec<&str> = name.split_whitespace().collect();
-    let looks_proper = words.len() <= 3 && words.iter().all(|w| w.chars().next().is_some_and(|c| c.is_uppercase()));
-    if lc.contains("team") {
-        EntityType::Team
-    } else if lc.ends_with(" inc") || lc.contains("robotics") || lc.contains("consortium") || lc.contains("corp") {
-        EntityType::Organization
-    } else if looks_proper && words.len() == 2 {
-        // Two capitalised words → likely a person name.
+    if lc == "team" || lc.ends_with(" team") || lc.starts_with("team ") {
+        return EntityType::Team;
+    }
+    if lc.ends_with(" inc")
+        || lc.ends_with(" llc")
+        || lc.ends_with(" corp")
+        || lc.contains("robotics")
+        || lc.contains("consortium")
+        || lc.contains("dynamics")
+        || lc.contains(" systems")
+    {
+        return EntityType::Organization;
+    }
+    let two_title_alpha = words.len() == 2
+        && words.iter().all(|w| {
+            w.chars().next().is_some_and(|c| c.is_uppercase()) && w.chars().all(|c| c.is_alphabetic())
+        });
+    let has_schema_word = words
+        .iter()
+        .any(|w| SCHEMA_WORDS.contains(&w.to_lowercase().as_str()));
+    if two_title_alpha && !has_schema_word {
         EntityType::Person
     } else {
         EntityType::Concept
@@ -272,8 +355,23 @@ mod tests {
     fn clean_entity_name_filters_junk() {
         assert_eq!(clean_entity_name("Acme Robotics").as_deref(), Some("Acme Robotics"));
         assert_eq!(clean_entity_name("the database course").as_deref(), Some("database course"));
-        assert_eq!(clean_entity_name("a"), None); // too short after article
-        assert_eq!(clean_entity_name("the engineering team of the central robotics division here"), None); // >6 words
+        assert_eq!(clean_entity_name("a"), None);
+        assert_eq!(clean_entity_name("the engineering team of the central robotics division"), None);
+        // Non-entity junk that polluted the graph:
+        assert_eq!(clean_entity_name("more than 0"), None);
+        assert_eq!(clean_entity_name("20 patients per day"), None); // starts with digit
+        assert_eq!(clean_entity_name("Camera Nr N 3 0"), None); // digit-heavy fragment
+        assert_eq!(clean_entity_name("must be unique"), None);
+    }
+
+    #[test]
+    fn entity_type_does_not_mislabel_columns_as_person() {
+        assert_eq!(guess_entity_type("Lena Park"), EntityType::Person);
+        assert_eq!(guess_entity_type("Mateo Silva"), EntityType::Person);
+        assert_eq!(guess_entity_type("Camera Nr"), EntityType::Concept); // was wrongly Person
+        assert_eq!(guess_entity_type("Class Nr"), EntityType::Concept);
+        assert_eq!(guess_entity_type("Teacher Id"), EntityType::Concept);
+        assert_eq!(guess_entity_type("Nova Dynamics"), EntityType::Organization);
     }
 
     #[test]

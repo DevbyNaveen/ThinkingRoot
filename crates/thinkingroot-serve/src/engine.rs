@@ -243,6 +243,14 @@ fn mime_for_uri(uri: &str) -> &'static str {
     }
 }
 
+/// One mother-node graph edge: a document and an entity it produced.
+#[derive(Debug, Clone, Serialize)]
+pub struct MotherEdgeDto {
+    pub source_id: String,
+    pub source_uri: String,
+    pub entity: String,
+}
+
 /// Cross-document entity profile payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityProfileDto {
@@ -6681,6 +6689,42 @@ side referenced. Strict rules:\n\
         })
     }
 
+    /// Mother-node graph edges: each DOCUMENT linked to the entities its facts
+    /// produced (`document → entity`), for the Neural Graph hierarchy. Returns
+    /// `(source_id, source_uri, entity_name)` triples.
+    pub async fn get_mother_edges(&self, ws: &str) -> Result<Vec<MotherEdgeDto>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let raw = storage.graph.get_mother_entity_edges()?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_name: std::collections::HashMap<String, String> = storage
+            .graph
+            .get_all_entities()?
+            .into_iter()
+            .map(|(id, name, _)| (id, name))
+            .collect();
+        let id_uri: std::collections::HashMap<String, String> = storage
+            .graph
+            .get_all_sources()?
+            .into_iter()
+            .map(|(id, uri, _, _)| (id, uri))
+            .collect();
+        Ok(raw
+            .into_iter()
+            .filter_map(|(sid, eid)| {
+                let entity = id_name.get(&eid)?.clone();
+                let source_uri = id_uri.get(&sid).cloned().unwrap_or_default();
+                Some(MotherEdgeDto {
+                    source_id: sid,
+                    source_uri,
+                    entity,
+                })
+            })
+            .collect())
+    }
+
     /// Verbatim chunks for a source (Sources page "Chunks" tab).
     pub async fn get_source_chunks(
         &self,
@@ -7583,11 +7627,14 @@ side referenced. Strict rules:\n\
                 continue;
             }
 
-            // Extract over every chunk WITHOUT holding the storage lock.
-            let mut facts = Vec::new();
-            let mut transient_error = false;
-            for ch in &chunks {
-                let ctx = thinkingroot_core::types::ChunkContext {
+            // Extract over chunks WITHOUT holding the storage lock, with BOUNDED
+            // concurrency (the LlmClient scheduler still rate-limits). 6 chunks
+            // in flight at once makes a 31-chunk PDF extract in ~seconds instead
+            // of ~minutes, while capping memory so big PDFs don't crash the engine.
+            const CHUNK_CONCURRENCY: usize = 6;
+            let ctxs: Vec<thinkingroot_core::types::ChunkContext> = chunks
+                .iter()
+                .map(|ch| thinkingroot_core::types::ChunkContext {
                     source_id: sid.clone(),
                     chunk_id: ch.id.clone(),
                     content: ch.content.clone(),
@@ -7595,12 +7642,24 @@ side referenced. Strict rules:\n\
                     workspace_id: ws.to_string(),
                     extraction_model: model.clone(),
                     created_at: now,
-                };
-                match crate::intelligence::atomic_extract::extract_chunk_facts(&llm, &ctx).await {
-                    Ok(f) => facts.extend(f),
-                    Err(e) => {
-                        transient_error = true;
-                        tracing::warn!(ws = %ws, source_id = %sid, chunk_id = %ch.id, "atomic extract LLM error: {e}");
+                })
+                .collect();
+            let mut facts = Vec::new();
+            let mut transient_error = false;
+            for batch in ctxs.chunks(CHUNK_CONCURRENCY) {
+                let futs = batch.iter().map(|ctx| {
+                    let llm = llm.clone();
+                    async move {
+                        crate::intelligence::atomic_extract::extract_chunk_facts(&llm, ctx).await
+                    }
+                });
+                for r in futures::future::join_all(futs).await {
+                    match r {
+                        Ok(f) => facts.extend(f),
+                        Err(e) => {
+                            transient_error = true;
+                            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract LLM error: {e}");
+                        }
                     }
                 }
             }
