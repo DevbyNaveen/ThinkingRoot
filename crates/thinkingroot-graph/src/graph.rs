@@ -341,14 +341,32 @@ impl GraphStore {
         }
     }
 
+    /// SQLite is COMPLETELY DISABLED in production — RocksDB is the sole
+    /// engine. The SQLite code below is retained (not deleted) purely as a
+    /// break-glass rollback / re-migration path, and is unreachable unless an
+    /// operator explicitly sets `TR_ALLOW_SQLITE=1`. Returns `false` by default.
+    fn sqlite_enabled() -> bool {
+        matches!(
+            std::env::var("TR_ALLOW_SQLITE").ok().as_deref(),
+            Some("1") | Some("true")
+        )
+    }
+
     /// Open the configured Cozo backend at `db_path` (no schema). Default =
     /// RocksDB ("newrocksdb"), a concurrent-writer LSM engine that removes
     /// SQLite's single-writer ceiling + the `database is locked` class.
-    /// `TR_STORAGE_BACKEND=sqlite` reverts to SQLite (also used by the
-    /// SQLite→RocksDB migration to read old DBs).
+    /// `TR_STORAGE_BACKEND=sqlite` is DISABLED by default — it only takes effect
+    /// when the `TR_ALLOW_SQLITE=1` break-glass override is also set.
     fn open_backend(db_path: &Path) -> Result<DbInstance> {
         let backend = std::env::var("TR_STORAGE_BACKEND").unwrap_or_else(|_| "newrocksdb".into());
         if backend == "sqlite" {
+            if !Self::sqlite_enabled() {
+                return Err(Error::GraphStorage(
+                    "SQLite backend is disabled (RocksDB-only). Set TR_ALLOW_SQLITE=1 to \
+                     override (break-glass rollback only)."
+                        .into(),
+                ));
+            }
             // SQLite needs WAL set durably BEFORE cozo's pooled connections
             // attach (best-effort; persists in the file header).
             if let Ok(conn) = sqlite::open(db_path) {
@@ -440,6 +458,13 @@ impl GraphStore {
         }
         if !db_file.exists() {
             return Ok(format!("skip (no graph.db): {}", graph_dir.display()));
+        }
+        if !Self::sqlite_enabled() {
+            return Err(Error::GraphStorage(
+                "SQLite→RocksDB migration is disabled (RocksDB-only). The one-time migration is \
+                 already complete; set TR_ALLOW_SQLITE=1 only for a break-glass re-run."
+                    .into(),
+            ));
         }
         let staging = graph_dir.join(".migrate-staging.bak");
         let _ = std::fs::remove_file(&staging);
