@@ -149,6 +149,171 @@ impl GraphStore {
         Ok(id)
     }
 
+    /// Like [`Self::ensure_entity`] but with an explicit, authoritative
+    /// [`EntityType`] (from the EDC typing pass) instead of the mechanical
+    /// `guess_entity_type` heuristic.
+    fn ensure_entity_typed(
+        &self,
+        cache: &mut BTreeMap<String, String>,
+        name: &str,
+        entity_type: EntityType,
+        created: &mut usize,
+    ) -> Result<String> {
+        let key = name.to_lowercase();
+        if let Some(id) = cache.get(&key) {
+            return Ok(id.clone());
+        }
+        let entity = Entity::new(name, entity_type);
+        let id = entity.id.to_string();
+        self.insert_entity(&entity)?;
+        cache.insert(key, id.clone());
+        *created += 1;
+        Ok(id)
+    }
+
+    /// EDC-typed promotion (the write-boundary clean-extraction path). Identical
+    /// in shape to [`Self::promote_fact_entities_and_relations`] but driven by an
+    /// authoritative typing map (keyed by the RAW fact subject/object string,
+    /// lowercased) produced off-lock by the LLM typing/verify stage:
+    ///   * `keep == false` ⇒ the candidate is a literal/value/date/count → it is
+    ///     NOT promoted to a node (kills over-extraction).
+    ///   * the supplied [`EntityType`] is used verbatim (kills mis-typing).
+    ///   * a relation is written ONLY when BOTH endpoints survived as real
+    ///     entities → **resolve-before-relate**, so dangling edges become
+    ///     structurally impossible.
+    /// Candidates absent from the map fall back to the mechanical heuristic
+    /// (graceful — e.g. the LLM was unavailable), so no knowledge is lost.
+    pub fn promote_fact_entities_and_relations_typed(
+        &self,
+        source_id: &str,
+        typing: &BTreeMap<String, (String, EntityType, bool)>,
+    ) -> Result<usize> {
+        let facts: Vec<_> = self
+            .get_atomic_facts_for_source(source_id)?
+            .into_iter()
+            .filter(|f| f.is_live())
+            .collect();
+        if facts.is_empty() {
+            return Ok(0);
+        }
+        let mut name_to_id: BTreeMap<String, String> = self
+            .get_all_entities()?
+            .into_iter()
+            .map(|(id, name, _)| (name.to_lowercase(), id))
+            .collect();
+
+        // Resolve one fact endpoint to a (canonical, type) pair, or `None` to
+        // skip it (literal, junk, or LLM-rejected). The map key is the RAW fact
+        // string (lowercased) so it aligns with how `serve` harvested candidates.
+        let resolve = |raw: &str| -> Option<(String, EntityType)> {
+            match typing.get(&raw.trim().to_lowercase()) {
+                Some((_, _, false)) => None, // explicitly rejected (literal/value)
+                Some((canonical, ty, true)) => {
+                    // Still apply the junk-name floor to the canonical form.
+                    clean_entity_name(canonical).map(|c| (c, *ty))
+                }
+                // Unknown to the map → mechanical fallback (no regression).
+                None => clean_entity_name(raw).map(|c| {
+                    let ty = guess_entity_type(&c);
+                    (c, ty)
+                }),
+            }
+        };
+
+        let mut created = 0usize;
+        let mut triples: Vec<(String, String, String)> = Vec::new();
+        // Every entity confirmed by THIS extraction — used to refresh its
+        // attestation (the bi-temporal liveness signal for #3).
+        let mut attested: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for f in &facts {
+            let (Some((subj, s_ty)), Some((obj, o_ty))) = (resolve(&f.subject), resolve(&f.object))
+            else {
+                continue; // resolve-before-relate: at least one endpoint dropped
+            };
+            let sid = self.ensure_entity_typed(&mut name_to_id, &subj, s_ty, &mut created)?;
+            let oid = self.ensure_entity_typed(&mut name_to_id, &obj, o_ty, &mut created)?;
+            attested.insert(sid.clone());
+            attested.insert(oid.clone());
+            if sid == oid {
+                continue;
+            }
+            triples.push((sid, oid, normalize_predicate(&f.predicate)));
+        }
+        for (sid, oid, rel) in &triples {
+            self.link_entities(sid, oid, rel, 0.8)?;
+        }
+        // Refresh attestation for every confirmed entity (additive, zero-risk).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let ids: Vec<String> = attested.into_iter().collect();
+        self.attest_entities(&ids, now)?;
+        Ok(created)
+    }
+
+    /// #3 — refresh the attestation of confirmed entities (sidecar bi-temporal
+    /// record). `retired_at = -1.0` (live), `last_attested_at = now`. Idempotent
+    /// `:put`. Called from typed promotion AFTER the spine rebuild, so a
+    /// re-confirmed entity always carries a fresh `last_attested_at` — that
+    /// recency is the liveness signal the retirement sweep keys on.
+    pub fn attest_entities(&self, entity_ids: &[String], now: f64) -> Result<()> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        let payload: Vec<DataValue> = entity_ids
+            .iter()
+            .map(|id| DataValue::List(vec![s(id), DataValue::Bool(true), f(now), f(-1.0)]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("rows".into(), DataValue::List(payload));
+        self.query(
+            "?[entity_id, attested, last_attested_at, retired_at] <- $rows\n\
+             :put entity_attestation { entity_id => attested, last_attested_at, retired_at }",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("attest_entities: {e}")))?;
+        Ok(())
+    }
+
+    /// #3 — retire attested entities that no longer have ANY live
+    /// `fact_mentions_entity` spine edge (bi-temporal: set `retired_at = now`,
+    /// KEEP the node + its history; NEVER hard-delete).
+    ///
+    /// Why the spine signal is globally sound: `rebuild_spine_for_source`
+    /// replaces only ONE source's edges, so an entity mentioned by any source
+    /// keeps an edge; an untouched source keeps its edges (its entities are
+    /// never wrongly retired). Only a recompile that DROPS an entity removes
+    /// that source's edge to it — and if no other source mentions it, it
+    /// becomes unmentioned and is retired here. Requires the drain to rebuild
+    /// the spine AFTER promotion (so freshly-promoted entities have edges).
+    ///
+    /// Gated by the caller behind `TR_ENTITY_RETIRE` (default OFF) until
+    /// validated on real data. Returns the number of entities newly retired.
+    pub fn retire_unmentioned_entities(&self, now: f64) -> Result<usize> {
+        let pending = self.query_read(
+            "?[entity_id] := *entity_attestation{entity_id, retired_at}, retired_at < 0.0, \
+             not *spine_edges{to_id: entity_id, edge_kind: 'fact_mentions_entity'}",
+        )?;
+        let n = pending.rows.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        let mut params = BTreeMap::new();
+        params.insert("now".into(), f(now));
+        self.query(
+            "?[entity_id, attested, last_attested_at, retired_at] := \
+             *entity_attestation{entity_id, last_attested_at, retired_at: old_r}, \
+             old_r < 0.0, \
+             not *spine_edges{to_id: entity_id, edge_kind: 'fact_mentions_entity'}, \
+             attested = false, retired_at = $now\n\
+             :put entity_attestation { entity_id => attested, last_attested_at, retired_at }",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("retire_unmentioned_entities: {e}")))?;
+        Ok(n)
+    }
+
     /// Wholesale replace one source's spine edges (scoped `:rm` then batch put).
     pub fn write_spine_edges_for_source(&self, source_id: &str, edges: &[SpineEdge]) -> Result<()> {
         // Clear prior edges for this source.
@@ -453,6 +618,112 @@ mod tests {
         // Idempotent: re-run reuses entities, creates none new.
         let again = store.promote_fact_entities_and_relations("src").unwrap();
         assert_eq!(again, 0, "re-promotion must not duplicate entities");
+    }
+
+    #[test]
+    fn typed_promote_uses_types_drops_literals_resolves_before_relate() {
+        let (_d, store) = store();
+        let f = |pred: &str, subj: &str, obj: &str, start: u64| AtomicFact {
+            id: AtomicFact::derive_id("src", start, start + 5, pred),
+            source_id: "src".into(),
+            chunk_id: "c".into(),
+            subject: subj.into(),
+            predicate: pred.into(),
+            object: obj.into(),
+            statement: format!("{subj} {pred} {obj}"),
+            confidence: 0.9,
+            extraction_model: "m".into(),
+            workspace_id: "ws".into(),
+            sensitivity: "Public".into(),
+            byte_start: start,
+            byte_end: start + 5,
+            content_blake3: "h".into(),
+            valid_from: 1.0,
+            valid_until: -1.0,
+            created_at: 1.0,
+        };
+        store
+            .insert_atomic_facts_batch(&[
+                f("leads", "Lena Park", "Orion Labs", 0),
+                f("employs", "Orion Labs", "50 people", 20), // object is a literal
+            ])
+            .unwrap();
+
+        // EDC decisions (keyed by RAW fact string, lowercased).
+        let mut typing: BTreeMap<String, (String, EntityType, bool)> = BTreeMap::new();
+        typing.insert("lena park".into(), ("Lena Park".into(), EntityType::Person, true));
+        typing.insert(
+            "orion labs".into(),
+            ("Orion Labs".into(), EntityType::Organization, true),
+        );
+        // The literal is rejected → must NOT become a node.
+        typing.insert("50 people".into(), ("50 people".into(), EntityType::Concept, false));
+
+        let created = store
+            .promote_fact_entities_and_relations_typed("src", &typing)
+            .unwrap();
+        assert_eq!(created, 2, "literal endpoint dropped → only 2 real entities");
+
+        let ents = store.get_all_entities().unwrap();
+        let orion = ents.iter().find(|(_, n, _)| n == "Orion Labs").unwrap();
+        assert_eq!(
+            EntityType::from_any(&orion.2),
+            Some(EntityType::Organization),
+            "EDC type used verbatim — company is org, not person"
+        );
+        assert!(
+            !ents.iter().any(|(_, n, _)| n == "50 people"),
+            "literal must never be promoted to a node"
+        );
+
+        // resolve-before-relate: employs(Orion Labs → 50 people) is dropped
+        // because one endpoint vanished; only leads(Lena Park → Orion Labs) stays.
+        let rels = store.get_all_relations().unwrap();
+        assert_eq!(rels.len(), 1, "only the both-endpoints-kept relation survives");
+    }
+
+    #[test]
+    fn retire_unmentioned_keeps_mentioned_entities() {
+        let (_d, store) = store();
+        let mentioned = Entity::new("Fresh Co", EntityType::Organization);
+        let gone = Entity::new("Stale Co", EntityType::Organization);
+        store.insert_entity(&mentioned).unwrap();
+        store.insert_entity(&gone).unwrap();
+        store
+            .attest_entities(&[mentioned.id.to_string(), gone.id.to_string()], 1.0)
+            .unwrap();
+
+        // Only `mentioned` has a live fact_mentions_entity spine edge; `gone`
+        // dropped out of its source (no edge) → it should be retired.
+        store
+            .write_spine_edges_for_source(
+                "src",
+                &[SpineEdge {
+                    from_id: "fact1".into(),
+                    to_id: mentioned.id.to_string(),
+                    edge_kind: "fact_mentions_entity".into(),
+                    source_id: "src".into(),
+                    confidence: 0.9,
+                    created_at: 1.0,
+                }],
+            )
+            .unwrap();
+
+        let retired = store.retire_unmentioned_entities(100.0).unwrap();
+        assert_eq!(retired, 1, "only the unmentioned entity is retired");
+
+        // Idempotent: already-retired entity is not retired again.
+        assert_eq!(store.retire_unmentioned_entities(100.0).unwrap(), 0);
+
+        // Both nodes KEPT — retirement never hard-deletes (history preserved).
+        let names: Vec<String> = store
+            .get_all_entities()
+            .unwrap()
+            .into_iter()
+            .map(|(_, n, _)| n)
+            .collect();
+        assert!(names.iter().any(|n| n == "Stale Co"));
+        assert!(names.iter().any(|n| n == "Fresh Co"));
     }
 
     #[test]

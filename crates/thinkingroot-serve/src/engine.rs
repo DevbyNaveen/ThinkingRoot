@@ -1590,6 +1590,36 @@ impl FnCapabilities {
             storage
                 .graph
                 .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())?;
+            // ── #2 live-write enrichment ──────────────────────────────────
+            // Store the statement as ONE chunk on this source and enqueue it
+            // for the async atomic-extract queue, so a remembered fact's
+            // entities get the SAME EDC typing + graph promotion as a compiled
+            // doc (a few seconds later, off the conversation). The queue drains
+            // this source ONCE (one chunk) then settles — no reprocessing.
+            // Best-effort: enrichment must never fail the durable claim write.
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let chunk = thinkingroot_graph::rows::RawChunkRow {
+                id: format!("rc:{}", claim.id),
+                source_id: source.id.to_string(),
+                chunk_index: 0,
+                chunk_type: "text".to_string(),
+                content: statement.to_string(),
+                byte_start: 0,
+                byte_end: statement.len() as u64,
+                content_blake3: format!("blake3:{}", blake3::hash(statement.as_bytes()).to_hex()),
+                created_at: now_ts,
+            };
+            if let Err(e) = storage.graph.insert_raw_chunks(std::slice::from_ref(&chunk)) {
+                tracing::warn!("remember: enrichment chunk write failed (claim durable): {e}");
+            } else if let Err(e) = storage
+                .graph
+                .enqueue_atomic_extract(&[source.id.to_string()], now_ts)
+            {
+                tracing::warn!("remember: enrichment enqueue failed (claim durable): {e}");
+            }
             // Vector-index the claim so semantic recall finds it without a
             // recompile (mirrors the contribute_claims write path). ONNX
             // embedding is sync; on the isolate's current-thread runtime
@@ -7712,6 +7742,42 @@ side referenced. Strict rules:\n\
                 }
             }
 
+            // --- Write-boundary EDC typing/verify pass (OFF the storage lock) ---
+            // Harvest the distinct subject/object names from the facts we just
+            // extracted and run ONE LLM typing/verify call. This gives promotion
+            // authoritative types (kills "company labelled Person") and drops
+            // literals/values/dates/counts (kills `50 people`/`2024` becoming
+            // nodes). Keyed by the RAW fact string (lowercased) so the graph's
+            // typed promotion aligns endpoints exactly. Degrades gracefully: an
+            // LLM error → literal-guard-only fallback, never blocks the drain.
+            let typing_map: std::collections::BTreeMap<
+                String,
+                (String, thinkingroot_core::types::EntityType, bool),
+            > = {
+                use crate::intelligence::entity_typing::{self, Candidate};
+                let mut seen: std::collections::BTreeMap<String, Candidate> =
+                    std::collections::BTreeMap::new();
+                for fa in &facts {
+                    for raw in [&fa.subject, &fa.object] {
+                        let key = raw.trim().to_lowercase();
+                        if key.is_empty() {
+                            continue;
+                        }
+                        seen.entry(key).or_insert_with(|| Candidate {
+                            name: raw.trim().to_string(),
+                            context: fa.statement.clone(),
+                        });
+                    }
+                }
+                let candidates: Vec<Candidate> = seen.into_values().collect();
+                let decisions = entity_typing::type_source_entities(&llm, &candidates).await;
+                let mut map = std::collections::BTreeMap::new();
+                for (c, d) in candidates.iter().zip(decisions.into_iter()) {
+                    map.insert(c.name.to_lowercase(), (d.canonical, d.entity_type, d.keep));
+                }
+                map
+            };
+
             // Persist + settle the queue under the lock.
             let mut storage = handle.storage.lock().await;
             // Bi-temporal supersession: tombstone prior live facts this
@@ -7733,10 +7799,22 @@ side referenced. Strict rules:\n\
             // Promote the facts' subjects/objects into first-class graph ENTITY
             // NODES + relations so the LLM-extracted knowledge appears in the
             // Neural Graph and can be clustered into concepts.
-            match storage.graph.promote_fact_entities_and_relations(&sid) {
-                Ok(n) if n > 0 => tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities"),
+            match storage
+                .graph
+                .promote_fact_entities_and_relations_typed(&sid, &typing_map)
+            {
+                Ok(n) if n > 0 => tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities (EDC-typed)"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}"),
+            }
+            // Re-build the spine AFTER promotion so `fact_mentions_entity` edges
+            // include the entities just created (the first rebuild ran before
+            // promotion, so freshly-promoted entities had no edge). This both
+            // completes the Neural-Graph mother→entity links immediately and is
+            // the soundness precondition for #3 entity-retirement (an entity is
+            // "live" iff it has a fact_mentions_entity edge from some source).
+            if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: post-promote spine rebuild failed: {e}");
             }
             // Per-document summary node (deterministic over the live facts).
             if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
@@ -7792,6 +7870,20 @@ side referenced. Strict rules:\n\
         // concepts on its own cadence instead.
         if total > 0 {
             let storage = handle.storage.lock().await;
+            // #3 — entity retirement sweep (bi-temporal: mark vanished entities
+            // retired, never delete). GATED behind TR_ENTITY_RETIRE (default
+            // OFF) until validated on real data. Sound because the spine was
+            // rebuilt AFTER promotion above, so `fact_mentions_entity` reflects
+            // the current live set across all sources.
+            if std::env::var("TR_ENTITY_RETIRE").as_deref() == Ok("1") {
+                match storage.graph.retire_unmentioned_entities(now) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(ws = %ws, "entity retirement: retired {n} unmentioned entities")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(ws = %ws, "entity retirement sweep failed: {e}"),
+                }
+            }
             if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
                 *handle.cache.write().await = new_cache;
             }

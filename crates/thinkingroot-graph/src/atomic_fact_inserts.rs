@@ -279,6 +279,45 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Insert verbatim chunks (one `:put raw_chunks` batch). Unlike the
+    /// compile-time transactional rebuild (`per_source_rows`), this is an
+    /// additive single-shot write used by the LIVE write path (`remember`):
+    /// a remembered statement is stored as one chunk on its source so the
+    /// async atomic-extract queue can mine + EDC-type its entities, exactly
+    /// like a compiled doc. Idempotent on `id` (`:put` upserts).
+    pub fn insert_raw_chunks(&self, chunks: &[RawChunkRow]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        for batch in chunks.chunks(CHUNK) {
+            let payload: Vec<DataValue> = batch
+                .iter()
+                .map(|r| {
+                    DataValue::List(vec![
+                        s(&r.id),
+                        s(&r.source_id),
+                        i(r.chunk_index as i64),
+                        s(&r.chunk_type),
+                        s(&r.content),
+                        i(r.byte_start as i64),
+                        i(r.byte_end as i64),
+                        s(&r.content_blake3),
+                        f(r.created_at),
+                    ])
+                })
+                .collect();
+            let mut params = BTreeMap::new();
+            params.insert("rows".into(), DataValue::List(payload));
+            self.query(
+                "?[id, source_id, chunk_index, chunk_type, content, byte_start, byte_end, content_blake3, created_at] <- $rows\n\
+                 :put raw_chunks {id => source_id, chunk_index, chunk_type, content, byte_start, byte_end, content_blake3, created_at}",
+                params,
+            )
+            .map_err(|e| Error::GraphStorage(format!("insert_raw_chunks: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// All verbatim chunks for one source, ordered by chunk_index (the spine's
     /// doc→chunk children + the extractor's input).
     pub fn get_raw_chunks_for_source(&self, source_id: &str) -> Result<Vec<RawChunkRow>> {
@@ -435,5 +474,30 @@ mod tests {
         let chunks = store.get_raw_chunks_for_source("src").unwrap();
         let idxs: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
         assert_eq!(idxs, vec![0, 1, 2], "chunks returned in index order");
+    }
+
+    #[test]
+    fn insert_raw_chunks_roundtrips_for_live_writes() {
+        // The #2 live-write path: a single additive chunk insert (not the
+        // transactional rebuild) round-trips through get_raw_chunks_for_source.
+        let (_d, store) = store();
+        let chunk = crate::rows::RawChunkRow {
+            id: "rc:claim1".into(),
+            source_id: "live-src".into(),
+            chunk_index: 0,
+            chunk_type: "text".into(),
+            content: "Lena Park leads Orion Labs.".into(),
+            byte_start: 0,
+            byte_end: 27,
+            content_blake3: "blake3:deadbeef".into(),
+            created_at: 1.0,
+        };
+        store.insert_raw_chunks(std::slice::from_ref(&chunk)).unwrap();
+        let got = store.get_raw_chunks_for_source("live-src").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "Lena Park leads Orion Labs.");
+        // Idempotent on id (`:put` upsert) — a replay does not duplicate.
+        store.insert_raw_chunks(std::slice::from_ref(&chunk)).unwrap();
+        assert_eq!(store.get_raw_chunks_for_source("live-src").unwrap().len(), 1);
     }
 }

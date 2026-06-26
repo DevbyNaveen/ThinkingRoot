@@ -835,6 +835,20 @@ impl GraphStore {
                 entity_type: String,
                 description: String default ''
             }",
+            // ─── Entity attestation (#3, 2026-06-26). Bi-temporal sidecar for
+            //     entity NODES (the `entities` relation has no version columns).
+            //     Created idempotently on open (`create_schema` ignores
+            //     "already exists"), so it lands on existing volumes with no
+            //     migration. `retired_at < 0` ⇒ live; a recompile that drops an
+            //     entity's last live fact mention marks `retired_at = now`
+            //     (the node + its history are KEPT, never hard-deleted).
+            ":create entity_attestation {
+                entity_id: String
+                =>
+                attested: Bool default true,
+                last_attested_at: Float default 0.0,
+                retired_at: Float default -1.0
+            }",
             ":create claim_source_edges {
                 claim_id: String,
                 source_id: String
