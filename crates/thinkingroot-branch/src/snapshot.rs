@@ -260,18 +260,44 @@ pub fn create_branch_layout(parent_data_dir: &Path, branch_data_dir: &Path) -> R
     // this, three-way merge cannot identify the lowest common
     // ancestor and would silently last-writer-win on concurrent
     // edits to the same claim.
-    let src_db = parent_data_dir.join("graph").join("graph.db");
-    let dst_db = branch_graph_dir.join("graph.db");
-    let parent_at_fork_root = branch_graph_dir.join(PARENT_AT_FORK_DIR);
+    // graph.db: with the RocksDB backend it is a DIRECTORY held OPEN by the
+    // daemon (exclusive per-dir lock), so a raw file/dir copy would be torn /
+    // inconsistent. Use cozo's CONSISTENT backup instead: dump the parent via
+    // its SHARED handle (GraphStore::init resolves to the daemon's already-open
+    // DB through the global OPEN_DBS registry — no second open) → restore into
+    // the branch working copy AND the immutable parent-at-fork LCA snapshot.
+    // Backend-agnostic: works identically on SQLite. (The LCA copy is what lets
+    // three-way merge identify the lowest common ancestor — T0.5 §"Snapshot at
+    // fork" — instead of silently last-writer-winning concurrent edits.)
+    let parent_graph_dir = parent_data_dir.join("graph");
+    let src_db = parent_graph_dir.join("graph.db");
     if src_db.exists() {
-        // T2.1 — APFS clonefile / FICLONE on supported filesystems
-        // (O(1), copy-on-write); falls back to fs::copy on every
-        // other host.  graph.db is the largest file in a branch
-        // workspace and the dominant cost of `create_branch` on
-        // pre-T2.1 hosts.
-        clone_file_fast(&src_db, &dst_db)?;
-        fs::create_dir_all(&parent_at_fork_root)?;
-        clone_file_fast(&src_db, &parent_at_fork_root.join("graph.db"))?;
+        use thinkingroot_graph::graph::GraphStore;
+        let staging = branch_graph_dir.join(".fork-staging.bak");
+        let _ = fs::remove_file(&staging);
+        {
+            // Shared handle (registry hit when the daemon owns it) → consistent
+            // point-in-time dump. Do NOT release it: the daemon may still own it.
+            let parent = GraphStore::init(&parent_graph_dir)?;
+            parent.raw_db().backup_db(&staging).map_err(|e| {
+                thinkingroot_core::Error::GraphStorage(format!(
+                    "branch fork: backup of parent graph failed: {e}"
+                ))
+            })?;
+        }
+        for target in [
+            branch_graph_dir.clone(),
+            branch_graph_dir.join(PARENT_AT_FORK_DIR),
+        ] {
+            fs::create_dir_all(&target)?;
+            // Grow a FRESH empty DB from the parent's dump (restore_backup needs
+            // an empty target — init_from_backup deliberately skips create_schema).
+            let store = GraphStore::init_from_backup(&target, &staging)?;
+            drop(store);
+            // We opened these fresh dirs; unpin so a later mount re-opens cleanly.
+            GraphStore::release(&target);
+        }
+        let _ = fs::remove_file(&staging);
     }
 
     // Copy vectors.bin — must be a physical copy, not a symlink.

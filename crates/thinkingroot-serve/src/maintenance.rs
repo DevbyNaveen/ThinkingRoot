@@ -131,7 +131,19 @@ pub fn integrity_snapshot_once(
     let ts = chrono::Utc::now().timestamp_millis();
     let seq = SNAP_SEQ.fetch_add(1, Ordering::Relaxed) % 1000;
     let snap = dir.join(format!("graph.db.integrity-{ts}{seq:03}"));
-    std::fs::copy(&graph_db, &snap).map_err(|e| Error::io_path(&snap, e))?;
+    // graph.db is an open RocksDB directory — a raw fs::copy would be torn.
+    // cozo's `backup_db` writes a CONSISTENT, portable SQLite-format file
+    // (validated below by the same magic/page-size check), via the shared
+    // handle (registry hit when the daemon owns the dir).
+    {
+        let graph_dir = workspace_root.join(".thinkingroot").join("graph");
+        let store = thinkingroot_graph::graph::GraphStore::init(&graph_dir)
+            .map_err(|e| Error::GraphStorage(format!("integrity snapshot: open graph failed: {e}")))?;
+        store
+            .raw_db()
+            .backup_db(&snap)
+            .map_err(|e| Error::GraphStorage(format!("integrity snapshot backup failed: {e}")))?;
+    }
 
     // Validate structurally: a snapshot that cannot be opened is WORSE than
     // none — it would be discovered broken exactly when a rollback is
@@ -237,18 +249,24 @@ pub fn restore_integrity_snapshot(
     // is the one outcome worse than not restoring.
     validate_sqlite_structure(snapshot)?;
 
-    let graph_db = workspace_root.join(".thinkingroot").join("graph").join("graph.db");
-    // Back up the current graph first (reversible rollback).
+    let graph_dir = workspace_root.join(".thinkingroot").join("graph");
+    let graph_db = graph_dir.join("graph.db");
+    // Snapshots are portable SQLite-format backups; graph.db is a RocksDB dir,
+    // so restore via cozo `restore_backup` (replaces relations in place) rather
+    // than a file swap. Back the current graph up first (reversible rollback).
     if graph_db.exists() {
-        let ts = chrono::Utc::now().timestamp_millis();
-        let backup = graph_db.with_file_name(format!("graph.db.pre-restore-{ts}"));
-        std::fs::copy(&graph_db, &backup).map_err(|e| Error::io_path(&backup, e))?;
-        tracing::info!(backup = %backup.display(), "restore: backed up current graph");
+        if let Ok(store) = thinkingroot_graph::graph::GraphStore::init(&graph_dir) {
+            let ts = chrono::Utc::now().timestamp_millis();
+            let backup = graph_dir.join(format!("graph.db.pre-restore-{ts}.bak"));
+            let _ = store.raw_db().backup_db(&backup);
+            tracing::info!(backup = %backup.display(), "restore: backed up current graph");
+        }
     }
-    // Atomic swap via a temp in the same dir + rename.
-    let tmp = graph_db.with_extension("db.restore-tmp");
-    std::fs::copy(snapshot, &tmp).map_err(|e| Error::io_path(&tmp, e))?;
-    std::fs::rename(&tmp, &graph_db).map_err(|e| Error::io_path(&graph_db, e))?;
+    let store = thinkingroot_graph::graph::GraphStore::init(&graph_dir)
+        .map_err(|e| Error::GraphStorage(format!("restore: open graph failed: {e}")))?;
+    // Live graph is non-empty → overwrite relations from the snapshot via
+    // import_from_backup (restore_backup only works on an empty DB).
+    store.import_backup_over(snapshot)?;
     tracing::info!(from = %snapshot.display(), "restore: graph rolled back to snapshot");
     Ok(graph_db)
 }

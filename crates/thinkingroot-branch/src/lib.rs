@@ -114,14 +114,56 @@ pub async fn create_branch_full(
     // back to two-way for those.
     let parent_db = parent_data_dir.join("graph").join("graph.db");
     if parent_db.exists() {
-        let bytes = std::fs::read(&parent_db)
-            .map_err(|e| thinkingroot_core::Error::io_path(&parent_db, e))?;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let hash = graph_identity_hash(&parent_db)?;
         registry.set_parent_commit_hash(name, hash.clone())?;
         branch_ref.parent_commit_hash = Some(hash);
     }
 
     Ok(branch_ref)
+}
+
+/// Fork-point identity token for the parent graph. SQLite `graph.db` is a
+/// single file → BLAKE3 of its bytes. RocksDB `graph.db` is a DIRECTORY →
+/// BLAKE3 of a deterministic digest of its sorted (relative-path, length)
+/// pairs. (The actual three-way-merge LCA uses the immutable parent-at-fork
+/// snapshot, not this token — it just identifies the fork point.)
+fn graph_identity_hash(parent_db: &Path) -> Result<String> {
+    if parent_db.is_dir() {
+        let mut entries: Vec<(String, u64)> = Vec::new();
+        let mut stack = vec![parent_db.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir)
+                .map_err(|err| thinkingroot_core::Error::io_path(&dir, err))?
+            {
+                let e = e.map_err(|err| thinkingroot_core::Error::io_path(&dir, err))?;
+                let p = e.path();
+                let meta = e
+                    .metadata()
+                    .map_err(|err| thinkingroot_core::Error::io_path(&p, err))?;
+                if meta.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p
+                        .strip_prefix(parent_db)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string();
+                    entries.push((rel, meta.len()));
+                }
+            }
+        }
+        entries.sort();
+        let mut hasher = blake3::Hasher::new();
+        for (rel, len) in entries {
+            hasher.update(rel.as_bytes());
+            hasher.update(&len.to_le_bytes());
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    } else {
+        let bytes = std::fs::read(parent_db)
+            .map_err(|e| thinkingroot_core::Error::io_path(parent_db, e))?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
 }
 
 /// Create an immutable tag pointing at a target commit (T2.5).

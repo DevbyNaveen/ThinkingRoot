@@ -301,44 +301,7 @@ impl GraphStore {
             });
         }
 
-        // Storage backend select. Default = RocksDB ("newrocksdb"), a true
-        // concurrent-writer LSM engine that removes SQLite's single-writer
-        // ceiling and the `database is locked` class entirely (the loser of a
-        // write race waits instead of erroring). `TR_STORAGE_BACKEND=sqlite`
-        // reverts to the legacy SQLite backend — also how the one-time
-        // SQLite→RocksDB migration opens old DBs to read them.
-        let backend = std::env::var("TR_STORAGE_BACKEND").unwrap_or_else(|_| "newrocksdb".into());
-
-        let db = if backend == "sqlite" {
-            // SQLite needs WAL set durably BEFORE cozo's pooled connections
-            // attach (best-effort; persists in the file header).
-            if let Ok(conn) = sqlite::open(&db_path) {
-                let _ = conn.execute("PRAGMA journal_mode=WAL;");
-                let _ = conn.execute("PRAGMA synchronous=NORMAL;");
-                let _ = conn.execute("PRAGMA busy_timeout=10000;");
-            }
-            DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
-                .map_err(|e| Error::GraphStorage(format!("failed to open cozo sqlite db: {e}")))?
-        } else {
-            // RocksDB: `graph.db` is a DIRECTORY. Per-instance memory is bounded
-            // so many workspace brains coexist in one engine — a small block
-            // cache + write buffer, and `enable_write_buffer_manager` caps TOTAL
-            // memtable RAM across every open DB in the process.
-            let lru = std::env::var("TR_ROCKS_LRU_MB")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(32);
-            let wbuf = std::env::var("TR_ROCKS_WRITEBUF_MB")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(32);
-            let opts = format!(
-                "{{\"lru_cache_mb\":{lru},\"write_buffer_mb\":{wbuf},\
-                 \"enable_write_buffer_manager\":true,\"allow_stall\":true}}"
-            );
-            DbInstance::new("newrocksdb", db_path.to_str().unwrap_or("."), &opts)
-                .map_err(|e| Error::GraphStorage(format!("failed to open cozo rocksdb db: {e}")))?
-        };
+        let db = Self::open_backend(&db_path)?;
 
         let store = Self {
             db: db.clone(),
@@ -376,6 +339,92 @@ impl GraphStore {
             let db_path = graph_dir.join("graph.db");
             reg.lock().expect("OPEN_DBS mutex poisoned").remove(&db_path);
         }
+    }
+
+    /// Open the configured Cozo backend at `db_path` (no schema). Default =
+    /// RocksDB ("newrocksdb"), a concurrent-writer LSM engine that removes
+    /// SQLite's single-writer ceiling + the `database is locked` class.
+    /// `TR_STORAGE_BACKEND=sqlite` reverts to SQLite (also used by the
+    /// SQLite→RocksDB migration to read old DBs).
+    fn open_backend(db_path: &Path) -> Result<DbInstance> {
+        let backend = std::env::var("TR_STORAGE_BACKEND").unwrap_or_else(|_| "newrocksdb".into());
+        if backend == "sqlite" {
+            // SQLite needs WAL set durably BEFORE cozo's pooled connections
+            // attach (best-effort; persists in the file header).
+            if let Ok(conn) = sqlite::open(db_path) {
+                let _ = conn.execute("PRAGMA journal_mode=WAL;");
+                let _ = conn.execute("PRAGMA synchronous=NORMAL;");
+                let _ = conn.execute("PRAGMA busy_timeout=10000;");
+            }
+            DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo sqlite db: {e}")))
+        } else {
+            // RocksDB: `db_path` is a DIRECTORY. Per-instance memory is bounded so
+            // many workspace brains coexist in one engine — a small block cache +
+            // write buffer, and `enable_write_buffer_manager` caps TOTAL memtable
+            // RAM across every open DB in the process.
+            let lru = std::env::var("TR_ROCKS_LRU_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            let wbuf = std::env::var("TR_ROCKS_WRITEBUF_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            let opts = format!(
+                "{{\"lru_cache_mb\":{lru},\"write_buffer_mb\":{wbuf},\
+                 \"enable_write_buffer_manager\":true,\"allow_stall\":true}}"
+            );
+            DbInstance::new("newrocksdb", db_path.to_str().unwrap_or("."), &opts)
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo rocksdb db: {e}")))
+        }
+    }
+
+    /// Open a FRESH (empty) Cozo DB at `path` and populate it from a portable
+    /// `backup` file via cozo `restore_backup` — which REQUIRES an empty target
+    /// (so we deliberately do NOT run `create_schema`; the backup carries the
+    /// full schema + data). Used by branch fork: the parent is dumped with
+    /// `backup_db`, the new branch dir is grown from that dump. Shares via the
+    /// OPEN_DBS registry like [`init`].
+    pub fn init_from_backup(path: &Path, backup: &Path) -> Result<Self> {
+        let db_path = path.join("graph.db");
+        let byte_store: Arc<dyn SourceByteStore> = Arc::new(FileSystemSourceStore::new(path)?);
+        let mut reg = open_dbs().lock().expect("OPEN_DBS mutex poisoned");
+        if let Some(existing) = reg.get(&db_path) {
+            // Already open (with data) — cannot restore into a non-empty DB. The
+            // caller forks into a FRESH dir, so this is unexpected; share it.
+            return Ok(Self { db: existing.clone(), byte_store: Some(byte_store) });
+        }
+        let db = Self::open_backend(&db_path)?;
+        db.restore_backup(backup)
+            .map_err(|e| Error::GraphStorage(format!("init_from_backup: restore failed: {e}")))?;
+        reg.insert(db_path, db.clone());
+        Ok(Self { db, byte_store: Some(byte_store) })
+    }
+
+    /// Overwrite this (live, non-empty) DB's relations from a portable `backup`
+    /// file via cozo `import_from_backup` (which, unlike `restore_backup`, works
+    /// on a populated DB). Imports every relation present in the backup. Used by
+    /// the rare recovery paths (merge rollback, integrity restore).
+    pub fn import_backup_over(&self, backup: &Path) -> Result<()> {
+        // Enumerate relation names from the running DB (`::relations` yields a
+        // `name` column); import each from the backup.
+        let rels = self.db.run_default("::relations").map_err(|e| {
+            Error::GraphStorage(format!("import_backup_over: list relations failed: {e}"))
+        })?;
+        let name_idx = rels.headers.iter().position(|h| h == "name").unwrap_or(0);
+        let names: Vec<String> = rels
+            .rows
+            .iter()
+            .filter_map(|r| r.get(name_idx))
+            .filter_map(|v| match v {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        self.db.import_from_backup(backup, &names).map_err(|e| {
+            Error::GraphStorage(format!("import_backup_over: import failed: {e}"))
+        })
     }
 
     /// Idempotent guarantee that `claims` has the complete current schema.
