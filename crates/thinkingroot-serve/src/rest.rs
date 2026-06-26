@@ -1125,6 +1125,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/compile/jobs", get(list_running_compile_jobs_handler))
             .route("/ws/{ws}/compile/jobs/{job_id}", get(get_compile_job_handler))
             .route("/ws/{ws}/extract-status", get(extract_status_handler))
+            .route("/ws/{ws}/backup", post(backup_workspace_handler))
             // Unified project activity log: live SSE tail + durable history
             // + connected-MCP roster. Powers the Console "Activity" tab.
             .route("/ws/{ws}/activity/stream", get(stream_activity_handler))
@@ -6055,6 +6056,30 @@ async fn list_running_compile_jobs_handler(
                 .collect();
             ok_response(serde_json::json!({ "jobs": out })).into_response()
         }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// Body for `POST …/backup`.
+#[derive(Debug, serde::Deserialize)]
+struct BackupRequest {
+    /// Absolute path (inside the engine's data volume) to write the portable
+    /// backup file. A host job then ships it to object storage.
+    out_path: String,
+}
+
+/// `POST /api/v1/ws/{ws}/backup` — write a consistent portable backup of the
+/// workspace graph to `out_path` (cozo `backup_db`). The durability primitive
+/// a periodic host job rclones to Azure Blob; must run in-engine because
+/// RocksDB holds the dir under an exclusive lock.
+async fn backup_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+    Json(body): Json<BackupRequest>,
+) -> Response {
+    match state.engine.read().await.backup_workspace(&ws, &body.out_path).await {
+        Ok(()) => ok_response(serde_json::json!({ "backed_up": ws, "out_path": body.out_path }))
+            .into_response(),
         Err(e) => match_engine_error(e),
     }
 }

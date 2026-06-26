@@ -7924,6 +7924,21 @@ side referenced. Strict rules:\n\
             .collect())
     }
 
+    /// Write a CONSISTENT portable backup of a mounted workspace's graph to
+    /// `out_path` via cozo `backup_db` (a single SQLite-format file, even on
+    /// RocksDB). This is the durability primitive a periodic host job rclones
+    /// to object storage — backups MUST come from the running engine because
+    /// RocksDB holds the dir under an exclusive lock (no external open).
+    pub async fn backup_workspace(&self, ws: &str, out_path: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage
+            .graph
+            .raw_db()
+            .backup_db(out_path)
+            .map_err(|e| Error::GraphStorage(format!("backup_workspace: {e}")))
+    }
+
     /// Count of running compile jobs across ALL mounted workspaces — the
     /// authoritative half of the `/busy` signal (survives observer
     /// disconnect, unlike an in-memory counter).

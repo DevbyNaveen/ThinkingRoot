@@ -427,6 +427,57 @@ impl GraphStore {
         })
     }
 
+    /// One-time, LOSSLESS migration of a workspace graph dir from the SQLite
+    /// backend to RocksDB. SQLite `graph.db` is a FILE; this dumps it via cozo
+    /// `backup_db`, moves it aside (`graph.db.sqlite.bak`, reversible), then
+    /// grows a FRESH RocksDB directory at `graph.db` and `restore_backup`s the
+    /// dump into it. Idempotent: a `graph.db` that is already a directory is
+    /// skipped. Returns a human-readable summary line.
+    pub fn migrate_sqlite_to_rocksdb(graph_dir: &Path) -> Result<String> {
+        let db_file = graph_dir.join("graph.db");
+        if db_file.is_dir() {
+            return Ok(format!("skip (already RocksDB): {}", graph_dir.display()));
+        }
+        if !db_file.exists() {
+            return Ok(format!("skip (no graph.db): {}", graph_dir.display()));
+        }
+        let staging = graph_dir.join(".migrate-staging.bak");
+        let _ = std::fs::remove_file(&staging);
+        // 1. Dump the SQLite DB to a portable backup (explicit sqlite backend,
+        //    independent of TR_STORAGE_BACKEND).
+        {
+            let sqlite = DbInstance::new("sqlite", db_file.to_str().unwrap_or("."), "")
+                .map_err(|e| Error::GraphStorage(format!("migrate: open sqlite failed: {e}")))?;
+            sqlite
+                .backup_db(&staging)
+                .map_err(|e| Error::GraphStorage(format!("migrate: backup sqlite failed: {e}")))?;
+        } // sqlite handle dropped (file closed) before we move it
+        // 2. Move the SQLite file aside — reversible until verified.
+        let aside = graph_dir.join("graph.db.sqlite.bak");
+        std::fs::rename(&db_file, &aside)
+            .map_err(|e| Error::GraphStorage(format!("migrate: move sqlite aside failed: {e}")))?;
+        // 3. Grow a fresh RocksDB dir at graph.db and restore into it.
+        let claim_count = {
+            let opts =
+                "{\"lru_cache_mb\":32,\"write_buffer_mb\":32,\"enable_write_buffer_manager\":true,\"allow_stall\":true}";
+            let rocks = DbInstance::new("newrocksdb", db_file.to_str().unwrap_or("."), opts)
+                .map_err(|e| Error::GraphStorage(format!("migrate: open rocksdb failed: {e}")))?;
+            rocks
+                .restore_backup(&staging)
+                .map_err(|e| Error::GraphStorage(format!("migrate: restore into rocksdb failed: {e}")))?;
+            rocks
+                .run_default("?[id] := *claims{id}")
+                .map(|r| r.rows.len())
+                .unwrap_or(0)
+        };
+        let _ = std::fs::remove_file(&staging);
+        Ok(format!(
+            "migrated SQLite→RocksDB: {} ({} claims; old DB kept at graph.db.sqlite.bak)",
+            graph_dir.display(),
+            claim_count
+        ))
+    }
+
     /// Idempotent guarantee that `claims` has the complete current schema.
     /// No-ops when the newest column (`symbol`) is already present; otherwise
     /// does ONE `:replace` that PRESERVES every column that exists (probed
