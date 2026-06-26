@@ -10,19 +10,31 @@
  * the canvas first paint.
  *
  * The worker receives `{entities, claims}` and returns
- * `{bestTypeMap, claimToEntities}` — the two derived structures the
- * canvas needs to colour nodes by semantic type and to map citation
- * activations onto entity nodes.  Sending arrays as plain objects
- * is fine; the payload is ~1–2 MB at the upper bound and only flows
- * once per snapshot refresh.
+ * `{bestFamily, bestConfidence, claimToEntities}` — three derived
+ * structures the canvas needs to:
+ *   - colour nodes by witness super-family (hue),
+ *   - modulate alpha by the entity's strongest claim confidence,
+ *   - map citation activations onto entity nodes.
  *
- * Determinism: same input → same output, byte-for-byte.  Sort the
+ * Determinism: same input → same output, byte-for-byte. Sort the
  * entity names longest-first so multi-word names win over their
  * prefixes (e.g. "User Account" wins over "User").
  */
 
+import {
+  claimTypeToSuperFamily,
+  seedFamilyFromEntityType,
+  superFamilyRank,
+  type SuperFamily,
+} from "../lib/witnessFamily";
+
 interface EntityIn {
   name: string;
+  /**
+   * Engine-provided structural type ("inferred" when the entity only
+   * appears in a relation). The worker reads this so an entity with
+   * no resolved claims still receives a deterministic super-family.
+   */
   entity_type: string;
   claim_count: number;
 }
@@ -32,7 +44,9 @@ interface ClaimIn {
   statement: string;
   /** Optional in the wire shape — engine omits for some structural rows. */
   claim_type?: string;
-  /** "rooted" | "attested" | "unknown" */
+  /** 0–1, from the structural extractor / future rule catalog. */
+  confidence?: number;
+  /** "rooted" | "attested" | "unknown" — legacy admission tier. */
   tier?: string;
 }
 
@@ -44,29 +58,15 @@ export interface EntityResolverRequest {
 
 export interface EntityResolverResponse {
   reqId: number;
-  bestType: Array<[string, string]>;
+  /** Per entity → winning super-family (string for cheap structural-clone). */
+  bestFamily: Array<[string, SuperFamily]>;
+  /** Per entity → max confidence (0–1) seen across its backing claims. */
+  bestConfidence: Array<[string, number]>;
+  /** claim_id → entity names mentioned in its statement. */
   claimToEntities: Array<[string, string[]]>;
   /** Wall-time the worker spent on this request, for telemetry. */
   elapsedMs: number;
 }
-
-// Wire spelling matches `ClaimType` serde snake_case from
-// `crates/thinkingroot-core/src/types/claim.rs` (verified against
-// engine.rs:5031 and extractor.rs:636). The pre-fix `"apisignature"`
-// (no underscore) never matched the backend's `"api_signature"` —
-// every ApiSignature claim silently fell to MAX_SAFE_INTEGER rank
-// and lost every tie-break. Ranking order = bias for which claim
-// type wins when an entity is mentioned by multiple claims.
-const TYPE_PRIORITY: ReadonlyArray<string> = [
-  "definition",
-  "api_signature",
-  "architecture",
-  "requirement",
-  "fact",
-];
-const TYPE_RANK = new Map<string, number>(
-  TYPE_PRIORITY.map((t, i) => [t, i] as const),
-);
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -74,9 +74,22 @@ function escapeRegex(s: string): string {
 
 function resolve(req: EntityResolverRequest): EntityResolverResponse {
   const start = performance.now();
-  const bestType = new Map<string, string>();
+  const bestFamily = new Map<string, SuperFamily>();
   const bestRank = new Map<string, number>();
+  const bestConf = new Map<string, number>();
   const claimToEntities = new Map<string, string[]>();
+
+  // Seed every entity from its engine-provided `entity_type` so the
+  // first paint shows real colors. `entity_type` and `claim_type` are
+  // distinct vocabularies — `entity_type` describes what kind of
+  // thing the entity IS (function/file/library/person/…), while
+  // `claim_type` describes statements about it. The resolver upgrades
+  // the seed once claims are matched in the loop below.
+  for (const e of req.entities) {
+    const seeded = seedFamilyFromEntityType(e.entity_type);
+    bestFamily.set(e.name, seeded);
+    bestRank.set(e.name, superFamilyRank(seeded));
+  }
 
   const sortedNames = req.entities
     .map((e) => e.name)
@@ -90,31 +103,33 @@ function resolve(req: EntityResolverRequest): EntityResolverResponse {
 
   if (matcher) {
     for (const claim of req.claims) {
-      const incoming = claim.claim_type;
-      const incomingRank =
-        incoming === undefined
-          ? Number.MAX_SAFE_INTEGER
-          : (TYPE_RANK.get(incoming.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
-      const isRooted = claim.tier === "rooted";
+      const family =
+        claimTypeToSuperFamily(claim.claim_type) ??
+        // tier == "rooted" → tests-equivalent grounding tier in the
+        // legacy substrate. Keep promoting those entities into "tests"
+        // so existing rooted-grounded knowledge keeps its strong hue.
+        (claim.tier === "rooted" ? "tests" : null);
+      const familyRank =
+        family === null ? Number.MAX_SAFE_INTEGER : superFamilyRank(family);
+      const conf =
+        typeof claim.confidence === "number" && Number.isFinite(claim.confidence)
+          ? Math.max(0, Math.min(1, claim.confidence))
+          : 0;
 
-      // matchAll over the claim text — single DFA traversal, O(N).
       const matches = claim.statement.matchAll(matcher);
       const seen = new Set<string>();
       for (const m of matches) {
         const name = m[0];
-        const currentRank = bestRank.get(name);
-        if (
-          incoming !== undefined &&
-          (currentRank === undefined || incomingRank < currentRank)
-        ) {
-          bestType.set(name, incoming);
-          bestRank.set(name, incomingRank);
-        }
-        if (isRooted) {
-          const cur = bestType.get(name);
-          if (!cur || cur.toLowerCase() !== "definition") {
-            bestType.set(name, "rooted");
+        if (family !== null) {
+          const currentRank = bestRank.get(name);
+          if (currentRank === undefined || familyRank < currentRank) {
+            bestFamily.set(name, family);
+            bestRank.set(name, familyRank);
           }
+        }
+        const prevConf = bestConf.get(name);
+        if (prevConf === undefined || conf > prevConf) {
+          bestConf.set(name, conf);
         }
         seen.add(name);
       }
@@ -126,7 +141,8 @@ function resolve(req: EntityResolverRequest): EntityResolverResponse {
 
   return {
     reqId: req.reqId,
-    bestType: Array.from(bestType.entries()),
+    bestFamily: Array.from(bestFamily.entries()),
+    bestConfidence: Array.from(bestConf.entries()),
     claimToEntities: Array.from(claimToEntities.entries()),
     elapsedMs: Math.round(performance.now() - start),
   };

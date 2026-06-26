@@ -63,6 +63,11 @@ import type {
   EntityResolverRequest,
   EntityResolverResponse,
 } from "@/workers/entityResolver.worker";
+import {
+  familyFill,
+  seedFamilyFromEntityType,
+  type SuperFamily,
+} from "@/lib/witnessFamily";
 
 // ───────────────────────── Component contract ─────────────────────────
 
@@ -82,7 +87,16 @@ interface NodeMeta {
   id: string;
   label: string;
   claim_count: number;
+  /** Engine-provided structural type — used only as a fallback when
+   *  the entity-resolver worker hasn't replied yet. */
   entity_type: string;
+  /** Super-family that drives node hue. Seeded from `entity_type`,
+   *  upgraded by the entity-resolver worker once it resolves the
+   *  entity's backing claims. */
+  family: SuperFamily;
+  /** Max confidence (0–1) seen across this entity's backing claims.
+   *  Drives alpha modulation. 0 when the entity has no claims yet. */
+  confidence: number;
 }
 
 interface WorkerLinkOut {
@@ -99,61 +113,6 @@ interface InternalLink {
 }
 
 // ───────────────────────── Helpers ────────────────────────────────────
-
-// Production palette covering every value `node.entity_type` can take.
-// Two source vocabularies feed this string:
-//   1. `ClaimType` (worker-resolved; entityResolver.worker.ts) — serde
-//      snake_case from `crates/thinkingroot-core/src/types/claim.rs`.
-//   2. `EntityType` (backend fallback) — serde snake_case from
-//      `crates/thinkingroot-core/src/types/entity.rs`.
-// Plus two synthetic strings: `"rooted"` (worker override when any
-// matching claim is tier=rooted) and `"inferred"` (BrainGraph.tsx
-// fallback for entities mentioned in relations but absent from the
-// entity list). Lightness pinned 55–72% for legibility on the dark
-// canvas; hue separation ≥ 25° between same-vocabulary neighbours.
-const SEMANTIC_PALETTE: Readonly<Record<string, string>> = {
-  // ── ClaimType (snake_case wire) ──
-  fact: "hsl(215, 55%, 65%)",
-  decision: "hsl(45, 75%, 60%)",
-  opinion: "hsl(15, 60%, 68%)",
-  plan: "hsl(135, 50%, 58%)",
-  requirement: "hsl(340, 70%, 65%)",
-  metric: "hsl(180, 70%, 55%)",
-  definition: "hsl(280, 70%, 65%)",
-  dependency: "hsl(305, 55%, 62%)",
-  api_signature: "hsl(200, 80%, 65%)",
-  // Legacy compact spelling — kept as a no-cost alias in case any
-  // upstream path emits `apisignature` without the underscore.
-  apisignature: "hsl(200, 80%, 65%)",
-  architecture: "hsl(30, 80%, 65%)",
-  preference: "hsl(60, 55%, 60%)",
-  // ── EntityType (snake_case wire) ──
-  person: "hsl(0, 65%, 68%)",
-  system: "hsl(250, 50%, 65%)",
-  service: "hsl(160, 55%, 55%)",
-  concept: "hsl(265, 55%, 72%)",
-  team: "hsl(325, 50%, 68%)",
-  api: "hsl(195, 70%, 60%)",
-  database: "hsl(85, 50%, 55%)",
-  library: "hsl(290, 55%, 68%)",
-  file: "hsl(45, 70%, 62%)",
-  module: "hsl(225, 60%, 65%)",
-  function: "hsl(170, 60%, 55%)",
-  config: "hsl(220, 22%, 60%)",
-  organization: "hsl(20, 55%, 62%)",
-  // ── Synthetic ──
-  rooted: "hsl(150, 70%, 60%)",
-  inferred: "rgba(140, 140, 140, 0.4)",
-};
-
-// Dim slate — deliberately not pale (`rgba(200,200,200,0.8)` reads as
-// white on the dark canvas). Used only when an unknown type arrives;
-// the palette above is meant to cover every real wire value.
-const SEMANTIC_DEFAULT = "hsl(220, 15%, 58%)";
-
-function getSemanticColor(type: string): string {
-  return SEMANTIC_PALETTE[type.toLowerCase()] ?? SEMANTIC_DEFAULT;
-}
 
 function activationHue(kind: ActivationKind): { r: number; g: number; b: number } {
   switch (kind) {
@@ -202,8 +161,15 @@ export function BrainGraph({
   const claimToEntitiesRef = useRef<Map<string, string[]>>(new Map());
   const decayRafRef = useRef<number | null>(null);
 
-  // Per-node semantic-type upgrade from the entity-resolver worker.
-  const [bestTypeMap, setBestTypeMap] = useState<Map<string, string>>(() => new Map());
+  // Per-node super-family + confidence upgrade from the
+  // entity-resolver worker. Both maps are name-keyed (entity name is
+  // unique within a snapshot) and replace wholesale per reply.
+  const [bestFamilyMap, setBestFamilyMap] = useState<Map<string, SuperFamily>>(
+    () => new Map(),
+  );
+  const [bestConfidenceMap, setBestConfidenceMap] = useState<Map<string, number>>(
+    () => new Map(),
+  );
 
   const [size, setSize] = useState({ w: 800, h: 600 });
 
@@ -234,16 +200,27 @@ export function BrainGraph({
 
     for (const e of entities) {
       nameToIndex.set(e.name, nodeArr.length);
+      // Every entity returned by the engine is evidence-backed by
+      // definition — the structural extractor only writes an entity
+      // row when it was named in a parsed source. The fact that no
+      // claim *statement* literally references it by name (common
+      // when claim_count < entity_count) is not a "no evidence"
+      // signal; the relations table carries that link instead.
+      // Hollow rings are reserved for true substrate orphans:
+      // entities that appear only via the relations pass below.
       nodeArr.push({
         id: e.name,
         label: e.name,
         claim_count: e.claim_count,
-        entity_type: bestTypeMap.get(e.name) ?? e.entity_type,
+        entity_type: e.entity_type,
+        family: bestFamilyMap.get(e.name) ?? seedFamilyFromEntityType(e.entity_type),
+        confidence: bestConfidenceMap.get(e.name) ?? 0,
       });
     }
     // Relations may reference entity names that aren't in `entities`
     // (e.g. structural-only relations from a partial compile).  Add
-    // them as inferred-type nodes so the link draws correctly.
+    // them as unattested nodes so the link draws correctly without
+    // claiming evidence that doesn't exist.
     for (const r of relations) {
       for (const name of [r.source, r.target]) {
         if (!nameToIndex.has(name)) {
@@ -252,7 +229,9 @@ export function BrainGraph({
             id: name,
             label: name,
             claim_count: 0,
-            entity_type: bestTypeMap.get(name) ?? "inferred",
+            entity_type: "inferred",
+            family: bestFamilyMap.get(name) ?? "unattested",
+            confidence: bestConfidenceMap.get(name) ?? 0,
           });
         }
       }
@@ -284,13 +263,13 @@ export function BrainGraph({
       neighborMap: neighbors,
       fingerprint: fingerprintEntities(nodeArr.map((n) => n.id)),
     };
-  }, [entities, relations, bestTypeMap]);
+  }, [entities, relations, bestFamilyMap, bestConfidenceMap]);
 
   // Persisted layout, loaded once per (workspace, fingerprint) pair.
   // Both the layout-init effect and the centering effect read this —
   // doing it via `useMemo` avoids cross-effect timing races AND avoids
-  // parsing the ~250 KB localStorage payload every time `bestTypeMap`
-  // updates (which rebuilds `nodes` but doesn't change the id set).
+  // parsing the ~250 KB localStorage payload every time the worker
+  // reply updates (which rebuilds `nodes` but doesn't change the id set).
   const persistedHint = useMemo(() => {
     return cacheKey ? loadGraphLayout(cacheKey, fingerprint) : null;
   }, [cacheKey, fingerprint]);
@@ -307,10 +286,11 @@ export function BrainGraph({
     resolverWorkerRef.current = worker;
 
     worker.onmessage = (e: MessageEvent<EntityResolverResponse>) => {
-      const { reqId, bestType, claimToEntities } = e.data;
+      const { reqId, bestFamily, bestConfidence, claimToEntities } = e.data;
       // Drop stale replies — only the latest request's result counts.
       if (reqId !== resolverReqIdRef.current) return;
-      setBestTypeMap(new Map(bestType));
+      setBestFamilyMap(new Map(bestFamily));
+      setBestConfidenceMap(new Map(bestConfidence));
       claimToEntitiesRef.current = new Map(claimToEntities);
       drawRef.current?.();
     };
@@ -337,6 +317,7 @@ export function BrainGraph({
         id: c.id,
         statement: c.statement,
         claim_type: c.claim_type,
+        confidence: c.confidence,
         tier: c.tier,
       })),
     };
@@ -587,16 +568,32 @@ export function BrainGraph({
           ctx.arc(x, y, r, 0, 2 * Math.PI);
           if (isFocused) {
             ctx.fillStyle = "rgb(255, 255, 255)";
+            ctx.fill();
           } else if (isNeighbor) {
             ctx.fillStyle = "rgb(100, 200, 255)";
+            ctx.fill();
           } else if (isSearchMatch) {
             ctx.fillStyle = "rgb(255, 200, 100)";
+            ctx.fill();
           } else {
-            const semanticColor = getSemanticColor(n.entity_type);
-            ctx.fillStyle =
-              hasFocus || hasSearch ? "rgba(100, 100, 100, 0.1)" : semanticColor;
+            const paint = familyFill(n.family);
+            if (hasFocus || hasSearch) {
+              // Dim every non-highlighted node to the same neutral so
+              // the focus/search subject stays the only readable hue.
+              ctx.fillStyle = "rgba(100, 100, 100, 0.1)";
+              ctx.fill();
+            } else if (paint.hollow) {
+              // Unattested entities (no anchored evidence) render as a
+              // hollow ring so they're visually distinct from any
+              // colored, evidence-backed node — honest absence.
+              ctx.strokeStyle = paint.fillStyle;
+              ctx.lineWidth = 1.25 / t.k;
+              ctx.stroke();
+            } else {
+              ctx.fillStyle = paint.fillStyle;
+              ctx.fill();
+            }
           }
-          ctx.fill();
 
           // Labels — only when LOD allows or the node is highlighted.
           const showLabel =
