@@ -7662,15 +7662,16 @@ side referenced. Strict rules:\n\
     /// never held across the (slow, async) LLM calls — read chunks under lock,
     /// extract unlocked, write under lock (mirrors `stitch_once`).
     pub async fn extract_atomic_facts_once(&self, ws: &str, batch_limit: usize) -> Result<usize> {
+        use futures::StreamExt;
         const MAX_ATTEMPTS: i64 = 3;
-        let Some(llm) = self.workspace_llm(ws) else {
+        if self.workspace_llm(ws).is_none() {
             return Ok(0);
-        };
+        }
         let handle = self.get_workspace(ws)?;
 
         // Read ONLY the pending source ids (not their chunks) — chunks are read
-        // lazily per-source below so we never hold every pending PDF's content
-        // in memory at once (that was the OOM under a multi-PDF backlog).
+        // lazily per-source so we never hold every pending PDF's content in memory
+        // at once (that was the OOM under a multi-PDF backlog).
         let pending: Vec<(String, i64)> = {
             let storage = handle.storage.lock().await;
             storage.graph.pending_atomic_extract(batch_limit)?
@@ -7679,202 +7680,51 @@ side referenced. Strict rules:\n\
             return Ok(0);
         }
 
-        let model = llm.model_name().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let mut total = 0usize;
 
-        for (sid, attempts) in pending {
-            if attempts >= MAX_ATTEMPTS {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
-                let storage = handle.storage.lock().await;
-                let _ = storage.graph.complete_atomic_extract(&sid);
-                continue;
-            }
-            // Load THIS source's chunks (dropped at end of the iteration).
-            let chunks = {
-                let storage = handle.storage.lock().await;
-                match storage.graph.get_raw_chunks_for_source(&sid) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk read failed: {e}");
-                        continue;
-                    }
-                }
-            };
+        // Bounded DOC-LEVEL parallelism. RocksDB is a concurrent-writer backend
+        // and the slow part (LLM extraction + typing + brief) runs OFF the storage
+        // lock, so many docs enrich at once; only the short writes serialise on the
+        // per-workspace lock. Default 8, override with TR_COMPILE_CONCURRENCY.
+        let concurrency = std::env::var("TR_COMPILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(8);
 
-            // Extract over chunks WITHOUT holding the storage lock, with BOUNDED
-            // concurrency (the LlmClient scheduler still rate-limits). 6 chunks
-            // in flight at once makes a 31-chunk PDF extract in ~seconds instead
-            // of ~minutes, while capping memory so big PDFs don't crash the engine.
-            const CHUNK_CONCURRENCY: usize = 6;
-            let ctxs: Vec<thinkingroot_core::types::ChunkContext> = chunks
-                .iter()
-                .map(|ch| thinkingroot_core::types::ChunkContext {
-                    source_id: sid.clone(),
-                    chunk_id: ch.id.clone(),
-                    content: ch.content.clone(),
-                    byte_start: ch.byte_start,
-                    workspace_id: ws.to_string(),
-                    extraction_model: model.clone(),
-                    created_at: now,
-                })
-                .collect();
-            let mut facts = Vec::new();
-            let mut transient_error = false;
-            for batch in ctxs.chunks(CHUNK_CONCURRENCY) {
-                let futs = batch.iter().map(|ctx| {
-                    let llm = llm.clone();
-                    async move {
-                        crate::intelligence::atomic_extract::extract_chunk_facts(&llm, ctx).await
+        let total: usize = futures::stream::iter(pending.into_iter())
+            .map(|(sid, attempts)| async move {
+                if attempts >= MAX_ATTEMPTS {
+                    tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
+                    if let Ok(h) = self.get_workspace(ws) {
+                        let storage = h.storage.lock().await;
+                        let _ = storage.graph.set_source_progress(&sid, "failed", "max attempts exceeded", now);
+                        let _ = storage.graph.complete_atomic_extract(&sid);
                     }
-                });
-                for r in futures::future::join_all(futs).await {
-                    match r {
-                        Ok(f) => facts.extend(f),
-                        Err(e) => {
-                            transient_error = true;
-                            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract LLM error: {e}");
-                        }
-                    }
+                    return 0usize;
                 }
-            }
+                self.enrich_one_source(ws, &sid, attempts, now)
+                    .await
+                    .unwrap_or(0)
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<usize>>()
+            .await
+            .into_iter()
+            .sum();
 
-            // --- Write-boundary EDC typing/verify pass (OFF the storage lock) ---
-            // Harvest the distinct subject/object names from the facts we just
-            // extracted and run ONE LLM typing/verify call. This gives promotion
-            // authoritative types (kills "company labelled Person") and drops
-            // literals/values/dates/counts (kills `50 people`/`2024` becoming
-            // nodes). Keyed by the RAW fact string (lowercased) so the graph's
-            // typed promotion aligns endpoints exactly. Degrades gracefully: an
-            // LLM error → literal-guard-only fallback, never blocks the drain.
-            let typing_map: std::collections::BTreeMap<
-                String,
-                (String, thinkingroot_core::types::EntityType, bool),
-            > = {
-                use crate::intelligence::entity_typing::{self, Candidate};
-                let mut seen: std::collections::BTreeMap<String, Candidate> =
-                    std::collections::BTreeMap::new();
-                for fa in &facts {
-                    for raw in [&fa.subject, &fa.object] {
-                        let key = raw.trim().to_lowercase();
-                        if key.is_empty() {
-                            continue;
-                        }
-                        seen.entry(key).or_insert_with(|| Candidate {
-                            name: raw.trim().to_string(),
-                            context: fa.statement.clone(),
-                        });
-                    }
-                }
-                let candidates: Vec<Candidate> = seen.into_values().collect();
-                let decisions = entity_typing::type_source_entities(&llm, &candidates).await;
-                let mut map = std::collections::BTreeMap::new();
-                for (c, d) in candidates.iter().zip(decisions.into_iter()) {
-                    map.insert(c.name.to_lowercase(), (d.canonical, d.entity_type, d.keep));
-                }
-                map
-            };
-
-            // Persist + settle the queue under the lock.
-            let mut storage = handle.storage.lock().await;
-            // Bi-temporal supersession: tombstone prior live facts this
-            // re-extraction no longer confirms (keeps the version timeline).
-            let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
-            if let Err(e) = storage.graph.supersede_facts_not_in(&sid, &new_ids, now) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: supersession failed: {e}");
-            }
-            if let Err(e) = storage.graph.insert_atomic_facts_batch(&facts) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: insert failed: {e}");
-                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
-                continue;
-            }
-            total += facts.len();
-            // Build the mother-node spine edges for the facts just written.
-            if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
-            }
-            // Promote the facts' subjects/objects into first-class graph ENTITY
-            // NODES + relations so the LLM-extracted knowledge appears in the
-            // Neural Graph and can be clustered into concepts.
-            match storage
-                .graph
-                .promote_fact_entities_and_relations_typed(&sid, &typing_map)
-            {
-                Ok(n) if n > 0 => tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities (EDC-typed)"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}"),
-            }
-            // Re-build the spine AFTER promotion so `fact_mentions_entity` edges
-            // include the entities just created (the first rebuild ran before
-            // promotion, so freshly-promoted entities had no edge). This both
-            // completes the Neural-Graph mother→entity links immediately and is
-            // the soundness precondition for #3 entity-retirement (an entity is
-            // "live" iff it has a fact_mentions_entity edge from some source).
-            if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: post-promote spine rebuild failed: {e}");
-            }
-            // Per-document summary node (deterministic over the live facts).
-            if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
-            }
-            // Make the facts semantically recallable in the ask path: embed each
-            // fact statement under an `af:` vector id with `fact|` metadata (a
-            // separate namespace from `claim|`, so claim retrieval is untouched).
-            if !facts.is_empty() {
-                let uri = storage
-                    .graph
-                    .get_source_by_id(&sid)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.uri)
-                    .unwrap_or_default();
-                // The fact id already carries the `af:` namespace prefix, so it
-                // IS the vector key. Metadata `fact|{id}|{uri}` namespaces the
-                // search channel + carries the source uri for scoping/citation.
-                let items: Vec<(String, String, String)> = facts
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.id.clone(),
-                            f.statement.clone(),
-                            format!("fact|{}|{}", f.id, uri),
-                        )
-                    })
-                    .collect();
-                let upsert = run_blocking(|| storage.vector.upsert_batch(&items));
-                match upsert {
-                    Ok(_) => {
-                        let _ = run_blocking(|| storage.vector.save());
-                    }
-                    Err(e) => tracing::warn!(
-                        ws = %ws, source_id = %sid,
-                        "atomic fact vector upsert failed (facts durable; semantic recall degraded): {e}"
-                    ),
-                }
-            }
-            if transient_error {
-                // Some chunks errored — keep the source queued to retry the rest.
-                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
-            } else {
-                let _ = storage.graph.complete_atomic_extract(&sid);
-            }
-        }
-        // Reload the read cache so freshly-promoted entities + relations appear
-        // in the Neural Graph (list_entities reads the cache). ONE reload at the
-        // end of the tick — NOT after every source, and we no longer trigger a
-        // full stitch_once here (it loaded the entire graph + an LLM pass every
-        // tick → the OOM under a big backlog). The periodic Stitcher grows
-        // concepts on its own cadence instead.
+        // ONE cache reload + an optional retirement sweep at the end of the tick
+        // (not after every source). Reloads so freshly-promoted entities/relations
+        // appear in the Neural Graph (list_entities reads the cache).
         if total > 0 {
             let storage = handle.storage.lock().await;
             // #3 — entity retirement sweep (bi-temporal: mark vanished entities
-            // retired, never delete). GATED behind TR_ENTITY_RETIRE (default
-            // OFF) until validated on real data. Sound because the spine was
-            // rebuilt AFTER promotion above, so `fact_mentions_entity` reflects
-            // the current live set across all sources.
+            // retired, never delete). GATED behind TR_ENTITY_RETIRE (default OFF)
+            // until validated on real data. Sound because each source rebuilt its
+            // spine AFTER promotion, so `fact_mentions_entity` reflects the live set.
             if std::env::var("TR_ENTITY_RETIRE").as_deref() == Ok("1") {
                 match storage.graph.retire_unmentioned_entities(now) {
                     Ok(n) if n > 0 => {
@@ -7887,6 +7737,213 @@ side referenced. Strict rules:\n\
             if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
                 *handle.cache.write().await = new_cache;
             }
+        }
+        Ok(total)
+    }
+
+    /// Enrich ONE source: LLM atomic-fact extraction → EDC typing → title+summary
+    /// brief → persist (facts, entities, spine, summary, brief, vectors) → settle
+    /// the queue. Writes durable per-doc `source_progress` at each phase so the
+    /// Console shows a real, refresh-proof status. The slow LLM work runs OFF the
+    /// storage lock; only the short writes take it (so this is safe to run for
+    /// many sources concurrently). Best-effort: returns facts written (0 on a
+    /// recoverable error, leaving the source queued for the background retry).
+    async fn enrich_one_source(
+        &self,
+        ws: &str,
+        sid: &str,
+        attempts: i64,
+        now: f64,
+    ) -> Result<usize> {
+        let Some(llm) = self.workspace_llm(ws) else {
+            return Ok(0);
+        };
+        let handle = self.get_workspace(ws)?;
+        let model = llm.model_name().to_string();
+
+        // Phase → "facts"; load this source's chunks + uri (quick lock).
+        let (chunks, uri) = {
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.set_source_progress(sid, "facts", "", now);
+            let chunks = match storage.graph.get_raw_chunks_for_source(sid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk read failed: {e}");
+                    let _ = storage.graph.set_source_progress(sid, "failed", "chunk read failed", now);
+                    return Ok(0);
+                }
+            };
+            let uri = storage
+                .graph
+                .get_source_by_id(sid)
+                .ok()
+                .flatten()
+                .map(|s| s.uri)
+                .unwrap_or_default();
+            (chunks, uri)
+        };
+
+        // Extract over chunks WITHOUT holding the storage lock, BOUNDED to 6
+        // chunks in flight (caps memory; the LlmClient scheduler rate-limits).
+        const CHUNK_CONCURRENCY: usize = 6;
+        let ctxs: Vec<thinkingroot_core::types::ChunkContext> = chunks
+            .iter()
+            .map(|ch| thinkingroot_core::types::ChunkContext {
+                source_id: sid.to_string(),
+                chunk_id: ch.id.clone(),
+                content: ch.content.clone(),
+                byte_start: ch.byte_start,
+                workspace_id: ws.to_string(),
+                extraction_model: model.clone(),
+                created_at: now,
+            })
+            .collect();
+        let mut facts = Vec::new();
+        let mut transient_error = false;
+        for batch in ctxs.chunks(CHUNK_CONCURRENCY) {
+            let futs = batch.iter().map(|ctx| {
+                let llm = llm.clone();
+                async move {
+                    crate::intelligence::atomic_extract::extract_chunk_facts(&llm, ctx).await
+                }
+            });
+            for r in futures::future::join_all(futs).await {
+                match r {
+                    Ok(f) => facts.extend(f),
+                    Err(e) => {
+                        transient_error = true;
+                        tracing::warn!(ws = %ws, source_id = %sid, "atomic extract LLM error: {e}");
+                    }
+                }
+            }
+        }
+
+        // --- Write-boundary EDC typing/verify pass (OFF the storage lock) ---
+        // One LLM call gives promotion authoritative types (kills "company labelled
+        // Person") and drops literals/values/dates/counts (kills `50 people`/`2024`
+        // becoming nodes). Degrades gracefully on LLM error → literal-guard fallback.
+        let typing_map: std::collections::BTreeMap<
+            String,
+            (String, thinkingroot_core::types::EntityType, bool),
+        > = {
+            use crate::intelligence::entity_typing::{self, Candidate};
+            let mut seen: std::collections::BTreeMap<String, Candidate> =
+                std::collections::BTreeMap::new();
+            for fa in &facts {
+                for raw in [&fa.subject, &fa.object] {
+                    let key = raw.trim().to_lowercase();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    seen.entry(key).or_insert_with(|| Candidate {
+                        name: raw.trim().to_string(),
+                        context: fa.statement.clone(),
+                    });
+                }
+            }
+            let candidates: Vec<Candidate> = seen.into_values().collect();
+            let decisions = entity_typing::type_source_entities(&llm, &candidates).await;
+            let mut map = std::collections::BTreeMap::new();
+            for (c, d) in candidates.iter().zip(decisions.into_iter()) {
+                map.insert(c.name.to_lowercase(), (d.canonical, d.entity_type, d.keep));
+            }
+            map
+        };
+
+        // Phase → "summary": title + one-line summary in ONE LLM call (OFF lock).
+        {
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.set_source_progress(sid, "summary", "", now);
+        }
+        let preview = chunks.first().map(|c| c.content.clone()).unwrap_or_default();
+        let brief =
+            crate::intelligence::doc_brief::generate_doc_brief(&llm, &uri, &facts, &preview).await;
+
+        // --- Persist everything under the lock, then settle the queue. ---
+        let mut storage = handle.storage.lock().await;
+        // Bi-temporal supersession: tombstone prior live facts this re-extraction
+        // no longer confirms (keeps the version timeline).
+        let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
+        if let Err(e) = storage.graph.supersede_facts_not_in(sid, &new_ids, now) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: supersession failed: {e}");
+        }
+        if let Err(e) = storage.graph.insert_atomic_facts_batch(&facts) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: insert failed: {e}");
+            let _ = storage.graph.bump_atomic_extract_attempt(sid, now, attempts);
+            let _ = storage
+                .graph
+                .set_source_progress(sid, "facts", "insert failed; retrying", now);
+            return Ok(0);
+        }
+        let total = facts.len();
+        // Build the mother-node spine edges for the facts just written.
+        if let Err(e) = storage.graph.rebuild_spine_for_source(sid) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
+        }
+        // Promote the facts' subjects/objects into first-class graph ENTITY NODES
+        // + relations so the LLM-extracted knowledge appears in the Neural Graph.
+        match storage
+            .graph
+            .promote_fact_entities_and_relations_typed(sid, &typing_map)
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities (EDC-typed)")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}")
+            }
+        }
+        // Re-build the spine AFTER promotion so `fact_mentions_entity` edges include
+        // the entities just created (soundness precondition for #3 retirement).
+        if let Err(e) = storage.graph.rebuild_spine_for_source(sid) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: post-promote spine rebuild failed: {e}");
+        }
+        // Per-document summary node (deterministic over the live facts).
+        if let Err(e) = storage.graph.build_document_summary(sid, "", now) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
+        }
+        // Store the LLM brief — title + one-line summary (the free-title win).
+        if let Err(e) = storage
+            .graph
+            .set_source_brief(sid, &brief.title, &brief.summary, now)
+        {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: brief store failed: {e}");
+        }
+        // Make the facts semantically recallable in the ask path: embed each fact
+        // statement under its `af:` vector id with `fact|` metadata (a separate
+        // namespace from `claim|`, so claim retrieval is untouched).
+        if !facts.is_empty() {
+            let items: Vec<(String, String, String)> = facts
+                .iter()
+                .map(|f| {
+                    (
+                        f.id.clone(),
+                        f.statement.clone(),
+                        format!("fact|{}|{}", f.id, uri),
+                    )
+                })
+                .collect();
+            let upsert = run_blocking(|| storage.vector.upsert_batch(&items));
+            match upsert {
+                Ok(_) => {
+                    let _ = run_blocking(|| storage.vector.save());
+                }
+                Err(e) => tracing::warn!(
+                    ws = %ws, source_id = %sid,
+                    "atomic fact vector upsert failed (facts durable; semantic recall degraded): {e}"
+                ),
+            }
+        }
+        if transient_error {
+            // Some chunks errored — keep the source queued to retry the rest.
+            let _ = storage.graph.bump_atomic_extract_attempt(sid, now, attempts);
+            let _ = storage
+                .graph
+                .set_source_progress(sid, "facts", "partial extraction; retrying", now);
+        } else {
+            let _ = storage.graph.complete_atomic_extract(sid);
+            let _ = storage.graph.set_source_progress(sid, "ready", "", now);
         }
         Ok(total)
     }
@@ -8013,6 +8070,39 @@ side referenced. Strict rules:\n\
             .pending_atomic_extract(limit)?
             .into_iter()
             .map(|(id, _attempts)| id)
+            .collect())
+    }
+
+    /// Durable per-doc enrichment status + LLM title/summary, joined for the
+    /// Console's `/source-progress` endpoint. One row per source that has a
+    /// progress record OR a brief, as
+    /// `(source_id, phase, updated_at, error, title, summary)`.
+    pub async fn source_progress_rows(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String, String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let progress = storage.graph.list_source_progress(limit)?;
+        let briefs = storage.graph.list_source_briefs(limit)?;
+        let mut by_id: std::collections::BTreeMap<String, (String, f64, String, String, String)> =
+            std::collections::BTreeMap::new();
+        for (sid, phase, updated_at, error) in progress {
+            by_id.insert(sid, (phase, updated_at, error, String::new(), String::new()));
+        }
+        for (sid, title, summary) in briefs {
+            let e = by_id
+                .entry(sid)
+                .or_insert_with(|| (String::new(), 0.0, String::new(), String::new(), String::new()));
+            e.3 = title;
+            e.4 = summary;
+        }
+        Ok(by_id
+            .into_iter()
+            .map(|(sid, (phase, updated_at, error, title, summary))| {
+                (sid, phase, updated_at, error, title, summary)
+            })
             .collect())
     }
 

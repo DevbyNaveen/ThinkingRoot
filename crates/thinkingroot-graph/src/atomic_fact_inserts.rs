@@ -279,6 +279,106 @@ impl GraphStore {
         Ok(())
     }
 
+    // ─── source_progress — durable per-doc enrichment lifecycle ────────────
+    // The SINGLE source of truth for the Console's per-doc status. Every write
+    // is best-effort (a progress write must never break the enrichment itself).
+    // phase ∈ {queued, reading, facts, summary, title, ready, failed}.
+
+    /// Upsert a source's enrichment phase (+ optional error detail).
+    pub fn set_source_progress(
+        &self,
+        source_id: &str,
+        phase: &str,
+        error: &str,
+        now: f64,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "rows".into(),
+            DataValue::List(vec![DataValue::List(vec![
+                s(source_id),
+                s(phase),
+                f(now),
+                s(error),
+            ])]),
+        );
+        self.query(
+            "?[source_id, phase, updated_at, error] <- $rows\n\
+             :put source_progress { source_id => phase, updated_at, error }",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("set_source_progress: {e}")))?;
+        Ok(())
+    }
+
+    /// All recorded per-source progress rows `(source_id, phase, updated_at, error)`.
+    /// Read-only; powers the `/source-progress` endpoint.
+    pub fn list_source_progress(&self, limit: usize) -> Result<Vec<(String, String, f64, String)>> {
+        let script = format!(
+            "?[source_id, phase, updated_at, error] := \
+             *source_progress{{source_id, phase, updated_at, error}} :limit {limit}"
+        );
+        let res = self.query_read(&script)?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 4 {
+                    return None;
+                }
+                Some((ds(&r[0]), ds(&r[1]), df(&r[2]), ds(&r[3])))
+            })
+            .collect())
+    }
+
+    // ─── source_brief — LLM title + one-line summary (single call) ──────────
+
+    /// Upsert a source's LLM-generated title + summary (produced in one call).
+    pub fn set_source_brief(
+        &self,
+        source_id: &str,
+        title: &str,
+        summary: &str,
+        now: f64,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "rows".into(),
+            DataValue::List(vec![DataValue::List(vec![
+                s(source_id),
+                s(title),
+                s(summary),
+                f(now),
+            ])]),
+        );
+        self.query(
+            "?[source_id, title, summary, updated_at] <- $rows\n\
+             :put source_brief { source_id => title, summary, updated_at }",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("set_source_brief: {e}")))?;
+        Ok(())
+    }
+
+    /// All recorded briefs `(source_id, title, summary)`. Read-only.
+    pub fn list_source_briefs(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
+        let script = format!(
+            "?[source_id, title, summary] := \
+             *source_brief{{source_id, title, summary}} :limit {limit}"
+        );
+        let res = self.query_read(&script)?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 3 {
+                    return None;
+                }
+                Some((ds(&r[0]), ds(&r[1]), ds(&r[2])))
+            })
+            .collect())
+    }
+
     /// Insert verbatim chunks (one `:put raw_chunks` batch). Unlike the
     /// compile-time transactional rebuild (`per_source_rows`), this is an
     /// additive single-shot write used by the LIVE write path (`remember`):

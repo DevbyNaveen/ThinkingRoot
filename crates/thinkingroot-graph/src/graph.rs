@@ -1880,6 +1880,31 @@ impl GraphStore {
                 error: String default '',
                 host_pid: Int default 0
             }",
+            // ─── source_progress — durable per-doc enrichment lifecycle
+            //     (2026-06-27). One row per source tracking where it is AFTER the
+            //     mechanical compile: phase ∈ {queued, reading, facts, summary,
+            //     title, ready, failed}. This is the SINGLE source of truth for
+            //     the Console's per-doc status — real and refresh-proof
+            //     (RocksDB-durable), not a client-side guess. New relation →
+            //     created on mount via create_schema, zero migration.
+            ":create source_progress {
+                source_id: String
+                =>
+                phase: String default 'queued',
+                updated_at: Float default 0.0,
+                error: String default ''
+            }",
+            // ─── source_brief — the LLM-generated TITLE + one-line SUMMARY for a
+            //     doc, produced in a SINGLE call during enrichment (free title).
+            //     A sidecar (NOT a `sources` column → adding a column is a no-op on
+            //     a live brain, a new relation lands with zero migration).
+            ":create source_brief {
+                source_id: String
+                =>
+                title: String default '',
+                summary: String default '',
+                updated_at: Float default 0.0
+            }",
         ];
 
         for stmt in &relations {

@@ -1125,6 +1125,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/compile/jobs", get(list_running_compile_jobs_handler))
             .route("/ws/{ws}/compile/jobs/{job_id}", get(get_compile_job_handler))
             .route("/ws/{ws}/extract-status", get(extract_status_handler))
+            .route("/ws/{ws}/source-progress", get(source_progress_handler))
             .route("/ws/{ws}/backup", post(backup_workspace_handler))
             // Unified project activity log: live SSE tail + durable history
             // + connected-MCP roster. Powers the Console "Activity" tab.
@@ -5382,6 +5383,44 @@ pub(crate) async fn run_unified_compile(
                 duration_ms,
             )
             .await;
+            // INLINE-FIRST enrichment: kick the LLM stage (facts → typing →
+            // title+summary) for the just-compiled sources IMMEDIATELY, instead of
+            // waiting up to 30s for the background tick. Detached so the compile SSE
+            // returns fast; per-doc `source_progress` updates stream to the Console
+            // via polling and each doc flips Ready as its own enrichment lands
+            // (incremental ready). The durable atomic-extract queue + the periodic
+            // AtomicExtractTask stay underneath as the safety net.
+            {
+                let engine = state.engine.clone();
+                let ws = status_name.clone();
+                tokio::spawn(async move {
+                    // Drain the just-compiled sources NOW in bounded-parallel passes,
+                    // re-acquiring the engine READ lock per pass so a concurrent
+                    // compile/mount (engine WRITE) is never starved. Safety cap; the
+                    // background AtomicExtractTask sweeps anything left.
+                    const MAX_PASSES: usize = 64;
+                    for _ in 0..MAX_PASSES {
+                        let drained = engine
+                            .read()
+                            .await
+                            .extract_atomic_facts_once(&ws, 16)
+                            .await
+                            .unwrap_or(0);
+                        let remaining = engine
+                            .read()
+                            .await
+                            .pending_extract_ids(&ws, 1)
+                            .await
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        // Done, or this pass made no progress (remaining are
+                        // retrying/maxed) → hand off to the background sweeper.
+                        if remaining == 0 || drained == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
             (status_name, UnifiedCompileOutcome::Done(result))
         }
         Err(e) if e.is_cancelled() => {
@@ -6098,6 +6137,35 @@ async fn extract_status_handler(
             "pending": pending,
         }))
         .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/source-progress` — durable, per-document enrichment
+/// status + the LLM-generated title/summary. This is the SINGLE source of truth
+/// for the Console's per-doc lifecycle (queued → facts → summary → ready / failed):
+/// real (engine-side) and refresh-proof (RocksDB), not a client-side guess.
+async fn source_progress_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    match state.engine.read().await.source_progress_rows(&ws, 512).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(source_id, phase, updated_at, error, title, summary)| {
+                    serde_json::json!({
+                        "source_id": source_id,
+                        "phase": phase,
+                        "updated_at": updated_at,
+                        "error": error,
+                        "title": title,
+                        "summary": summary,
+                    })
+                })
+                .collect();
+            ok_response(serde_json::json!({ "items": items })).into_response()
+        }
         Err(e) => match_engine_error(e),
     }
 }
