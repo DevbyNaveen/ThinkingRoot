@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod aggregation;
 pub mod agent;
 pub mod atomic_extract;
+pub mod chunk_brief;
 pub mod doc_brief;
 pub mod entity_typing;
 pub mod agent_streaming;

@@ -360,6 +360,54 @@ impl GraphStore {
         Ok(())
     }
 
+    // ─── chunk_brief — one-line summary per chunk (a "memory") ─────────────
+
+    /// Upsert the one-line brief for a chunk.
+    pub fn set_chunk_brief(
+        &self,
+        chunk_id: &str,
+        source_id: &str,
+        summary: &str,
+        now: f64,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "rows".into(),
+            DataValue::List(vec![DataValue::List(vec![
+                s(chunk_id),
+                s(source_id),
+                s(summary),
+                f(now),
+            ])]),
+        );
+        self.query(
+            "?[chunk_id, source_id, summary, updated_at] <- $rows\n\
+             :put chunk_brief { chunk_id => source_id, summary, updated_at }",
+            params,
+        )
+        .map_err(|e| Error::GraphStorage(format!("set_chunk_brief: {e}")))?;
+        Ok(())
+    }
+
+    /// All chunk briefs `(chunk_id, source_id, summary)`. Read-only.
+    pub fn list_chunk_briefs(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
+        let script = format!(
+            "?[chunk_id, source_id, summary] := \
+             *chunk_brief{{chunk_id, source_id, summary}} :limit {limit}"
+        );
+        let res = self.query_read(&script)?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                if r.len() < 3 {
+                    return None;
+                }
+                Some((ds(&r[0]), ds(&r[1]), ds(&r[2])))
+            })
+            .collect())
+    }
+
     /// All recorded briefs `(source_id, title, summary)`. Read-only.
     pub fn list_source_briefs(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
         let script = format!(

@@ -7859,6 +7859,34 @@ side referenced. Strict rules:\n\
         let brief =
             crate::intelligence::doc_brief::generate_doc_brief(&llm, &uri, &facts, &preview).await;
 
+        // Per-chunk "memory briefs": a one-line summary for each passage (the
+        // Console's Memory Graph headlines a memory = a chunk's facts with this).
+        // Built from the facts we just extracted + the chunk text, ONE batched
+        // LLM call. Only chunks that produced facts become memories.
+        let chunk_briefs: Vec<(String, String)> = {
+            use crate::intelligence::chunk_brief::{generate_chunk_briefs, ChunkBriefInput};
+            let mut by_chunk: std::collections::BTreeMap<String, ChunkBriefInput> =
+                std::collections::BTreeMap::new();
+            for ch in &chunks {
+                by_chunk.insert(
+                    ch.id.clone(),
+                    ChunkBriefInput {
+                        chunk_id: ch.id.clone(),
+                        facts: Vec::new(),
+                        preview: ch.content.clone(),
+                    },
+                );
+            }
+            for fa in &facts {
+                if let Some(e) = by_chunk.get_mut(&fa.chunk_id) {
+                    e.facts.push(fa.statement.clone());
+                }
+            }
+            let inputs: Vec<ChunkBriefInput> =
+                by_chunk.into_values().filter(|c| !c.facts.is_empty()).collect();
+            generate_chunk_briefs(&llm, &inputs).await
+        };
+
         // --- Persist everything under the lock, then settle the queue. ---
         let mut storage = handle.storage.lock().await;
         // Bi-temporal supersession: tombstone prior live facts this re-extraction
@@ -7909,6 +7937,12 @@ side referenced. Strict rules:\n\
             .set_source_brief(sid, &brief.title, &brief.summary, now)
         {
             tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: brief store failed: {e}");
+        }
+        // Store the per-chunk memory briefs (Memory Graph headlines).
+        for (chunk_id, summary) in &chunk_briefs {
+            if let Err(e) = storage.graph.set_chunk_brief(chunk_id, sid, summary, now) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk brief store failed: {e}");
+            }
         }
         // Make the facts semantically recallable in the ask path: embed each fact
         // statement under its `af:` vector id with `fact|` metadata (a separate
@@ -8104,6 +8138,18 @@ side referenced. Strict rules:\n\
                 (sid, phase, updated_at, error, title, summary)
             })
             .collect())
+    }
+
+    /// Per-chunk memory briefs `(chunk_id, source_id, summary)` for the Console's
+    /// Memory Graph (it headlines each memory = a chunk's facts with this).
+    pub async fn chunk_brief_rows(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_chunk_briefs(limit)
     }
 
     /// Write a CONSISTENT portable backup of a mounted workspace's graph to

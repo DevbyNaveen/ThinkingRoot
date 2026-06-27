@@ -1126,6 +1126,7 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
             .route("/ws/{ws}/compile/jobs/{job_id}", get(get_compile_job_handler))
             .route("/ws/{ws}/extract-status", get(extract_status_handler))
             .route("/ws/{ws}/source-progress", get(source_progress_handler))
+            .route("/ws/{ws}/chunk-briefs", get(chunk_briefs_handler))
             .route("/ws/{ws}/backup", post(backup_workspace_handler))
             // Unified project activity log: live SSE tail + durable history
             // + connected-MCP roster. Powers the Console "Activity" tab.
@@ -6141,6 +6142,27 @@ async fn extract_status_handler(
             "pending": pending,
         }))
         .into_response(),
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// `GET /api/v1/ws/{ws}/chunk-briefs` — one-line memory briefs per chunk. The
+/// Console's Memory Graph groups a document's facts into memories by chunk and
+/// headlines each with its brief (a consolidated plain-English sentence).
+async fn chunk_briefs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(ws): Path<String>,
+) -> Response {
+    match state.engine.read().await.chunk_brief_rows(&ws, 4096).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(chunk_id, source_id, summary)| {
+                    serde_json::json!({ "chunk_id": chunk_id, "source_id": source_id, "summary": summary })
+                })
+                .collect();
+            ok_response(serde_json::json!({ "items": items })).into_response()
+        }
         Err(e) => match_engine_error(e),
     }
 }

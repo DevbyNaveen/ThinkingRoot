@@ -1905,6 +1905,18 @@ impl GraphStore {
                 summary: String default '',
                 updated_at: Float default 0.0
             }",
+            // ─── chunk_brief — a one-sentence, plain-English summary per CHUNK
+            //     (a "memory" in the Console's Memory Graph = a chunk's facts).
+            //     Produced by a batched LLM pass during enrichment so each memory
+            //     node reads as a consolidated sentence, not a raw fact. Sidecar,
+            //     zero migration.
+            ":create chunk_brief {
+                chunk_id: String
+                =>
+                source_id: String default '',
+                summary: String default '',
+                updated_at: Float default 0.0
+            }",
         ];
 
         for stmt in &relations {
