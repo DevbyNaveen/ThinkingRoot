@@ -5047,6 +5047,9 @@ async fn compile(State(state): State<Arc<AppState>>, Path(ws): Path<String>) -> 
                     ),
                 }
             });
+            // INLINE-FIRST enrichment (same as the streaming path): kick the LLM
+            // stage immediately so docs flip Ready without waiting for the 30s tick.
+            spawn_inline_enrichment(state.engine.clone(), ws.clone());
             ok_response(result).into_response()
         }
         Err(e) => match_engine_error(e),
@@ -5199,6 +5202,37 @@ fn phase_token_from_event(ev: &crate::pipeline::ProgressEvent) -> Option<&'stati
 /// caller passes its sibling-task channel sender so events stream as
 /// they fire, and the MCP caller passes `None` so events are dropped
 /// (the agent waits for the final result, not the wire stream).
+/// Spawn the INLINE-FIRST enrichment drain for a freshly-compiled workspace: it
+/// drains the atomic-extract queue NOW, in bounded-parallel passes, so docs flip
+/// Ready immediately (incremental ready) instead of waiting up to 30s for the
+/// background tick. Re-acquires the engine READ lock per pass so a concurrent
+/// compile/mount (engine WRITE) is never starved. Detached + best-effort; the
+/// durable queue + the periodic AtomicExtractTask remain the safety net. Used by
+/// BOTH the streaming and non-streaming compile paths so they behave identically.
+fn spawn_inline_enrichment(engine: Arc<RwLock<crate::engine::QueryEngine>>, ws: String) {
+    tokio::spawn(async move {
+        const MAX_PASSES: usize = 64;
+        for _ in 0..MAX_PASSES {
+            let drained = engine
+                .read()
+                .await
+                .extract_atomic_facts_once(&ws, 16)
+                .await
+                .unwrap_or(0);
+            let remaining = engine
+                .read()
+                .await
+                .pending_extract_ids(&ws, 1)
+                .await
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if remaining == 0 || drained == 0 {
+                break;
+            }
+        }
+    });
+}
+
 pub(crate) async fn run_unified_compile(
     state: Arc<AppState>,
     req: UnifiedCompileRequest,
@@ -5390,37 +5424,7 @@ pub(crate) async fn run_unified_compile(
             // via polling and each doc flips Ready as its own enrichment lands
             // (incremental ready). The durable atomic-extract queue + the periodic
             // AtomicExtractTask stay underneath as the safety net.
-            {
-                let engine = state.engine.clone();
-                let ws = status_name.clone();
-                tokio::spawn(async move {
-                    // Drain the just-compiled sources NOW in bounded-parallel passes,
-                    // re-acquiring the engine READ lock per pass so a concurrent
-                    // compile/mount (engine WRITE) is never starved. Safety cap; the
-                    // background AtomicExtractTask sweeps anything left.
-                    const MAX_PASSES: usize = 64;
-                    for _ in 0..MAX_PASSES {
-                        let drained = engine
-                            .read()
-                            .await
-                            .extract_atomic_facts_once(&ws, 16)
-                            .await
-                            .unwrap_or(0);
-                        let remaining = engine
-                            .read()
-                            .await
-                            .pending_extract_ids(&ws, 1)
-                            .await
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        // Done, or this pass made no progress (remaining are
-                        // retrying/maxed) → hand off to the background sweeper.
-                        if remaining == 0 || drained == 0 {
-                            break;
-                        }
-                    }
-                });
-            }
+            spawn_inline_enrichment(state.engine.clone(), status_name.clone());
             (status_name, UnifiedCompileOutcome::Done(result))
         }
         Err(e) if e.is_cancelled() => {
