@@ -5,6 +5,7 @@ pub mod artifact_nodes;
 pub mod atomic_fact_inserts;
 pub mod capsule;
 pub mod codegraph;
+pub mod compile_jobs;
 pub mod concept_inserts;
 pub mod cognition_inserts;
 pub mod cognition_merge;

@@ -78,19 +78,30 @@ impl<'a> Linker<'a> {
         let mut output = LinkOutput::default();
 
         // Phase 1: Entity resolution.
+        //
+        // Uses an O(1)-exact / blocked-fuzzy `EntityResolverIndex` instead of
+        // the old per-entity linear scan (which was O(N²) and pinned a single
+        // core for minutes on large corpora — the observed Phase-7 hang). A
+        // position map keeps merges O(1) too: the old `iter_mut().find()` was
+        // itself an O(N) scan per merge, a second hidden quadratic.
         let mut resolved_entities = self.graph.get_entities_with_aliases()?;
+        let mut resolver = resolution::EntityResolverIndex::from_entities(&resolved_entities);
+        let mut pos_by_id: HashMap<EntityId, usize> = resolved_entities
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id, i))
+            .collect();
         let mut entity_id_map: HashMap<EntityId, EntityId> = HashMap::new();
         let total_entities = extraction.entities.len();
         let mut entity_done: usize = 0;
 
         for new_entity in extraction.entities {
-            match resolution::resolve_entity(&new_entity, &resolved_entities) {
+            match resolver.resolve(&new_entity) {
                 Some(existing_id) => {
-                    if let Some(existing) =
-                        resolved_entities.iter_mut().find(|e| e.id == existing_id)
-                    {
+                    if let Some(&pos) = pos_by_id.get(&existing_id) {
                         entity_id_map.insert(new_entity.id, existing_id);
-                        resolution::merge_entities(existing, &new_entity);
+                        resolution::merge_entities(&mut resolved_entities[pos], &new_entity);
+                        resolver.add_merge_aliases(existing_id, &new_entity);
                         output.entities_merged += 1;
                         output.affected_entity_ids.push(existing_id.to_string());
                     }
@@ -99,6 +110,8 @@ impl<'a> Linker<'a> {
                     let new_id = new_entity.id;
                     entity_id_map.insert(new_id, new_id);
                     output.affected_entity_ids.push(new_id.to_string());
+                    pos_by_id.insert(new_id, resolved_entities.len());
+                    resolver.add_new(&new_entity);
                     resolved_entities.push(new_entity);
                     output.entities_created += 1;
                 }

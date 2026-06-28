@@ -13,15 +13,21 @@ fn snapshot_target_db(
     snapshot_prefix: &str,
     snapshot_subject: &str,
 ) -> Result<()> {
-    let db_path = target_data_dir.join("graph").join("graph.db");
+    let graph_dir = target_data_dir.join("graph");
+    let db_path = graph_dir.join("graph.db");
     if db_path.exists() {
         let ts = chrono::Utc::now().timestamp();
         let slug = slugify(snapshot_subject);
-        let backup_path = target_data_dir
-            .join("graph")
-            .join(format!("graph.db.{snapshot_prefix}-{slug}-{ts}"));
-        std::fs::copy(&db_path, &backup_path)?;
-        tracing::debug!("snapshot written to {}", backup_path.display());
+        let backup_path = graph_dir.join(format!("graph.db.{snapshot_prefix}-{slug}-{ts}.bak"));
+        // graph.db is a RocksDB directory held open by the daemon — a raw
+        // fs::copy would be inconsistent. Take a consistent point-in-time backup
+        // via the shared handle (registry hit when the daemon owns it); restore
+        // with `restore_backup` if a rollback is ever needed. Backend-agnostic.
+        let store = GraphStore::init(&graph_dir)?;
+        store.raw_db().backup_db(&backup_path).map_err(|e| {
+            Error::GraphStorage(format!("merge pre-snapshot backup failed: {e}"))
+        })?;
+        tracing::debug!("merge pre-snapshot written to {}", backup_path.display());
     }
     Ok(())
 }
@@ -627,8 +633,11 @@ pub fn rollback_merge(root_path: &Path, branch_name: &str) -> Result<()> {
     candidates.sort();
     let backup = candidates.last().expect("non-empty after filter");
 
-    let db_path = graph_dir.join("graph.db");
-    std::fs::copy(backup, &db_path)?;
+    // The pre-merge backup is a portable SQLite-format dump; graph.db is a
+    // (non-empty) RocksDB dir, so roll back via cozo `import_from_backup`
+    // (overwrites relations in place on the shared handle) rather than a copy.
+    let store = GraphStore::init(&graph_dir)?;
+    store.import_backup_over(backup)?;
     tracing::info!(
         "rolled back main graph to pre-merge snapshot {}",
         backup.display()

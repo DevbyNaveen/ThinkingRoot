@@ -47,10 +47,19 @@ mod inner {
     /// itself is `&self`-callable, but we need interior mutability
     /// for the Option-replace pattern).
     pub struct CrossEncoder {
+        #[allow(dead_code)]
         model: Mutex<Option<OrtCrossEncoderModel>>,
         paths: OrtModelPaths,
         max_length: usize,
     }
+
+    /// Process-global cached cross-encoder session (2026-06-28). The ONNX
+    /// session costs ~2-3s to create; the hot path builds a fresh `CrossEncoder`
+    /// per query, so caching the loaded model here loads it ONCE for the whole
+    /// process and every workspace (model files are already process-global).
+    static SHARED_RERANK_MODEL: std::sync::OnceLock<
+        std::sync::Mutex<Option<OrtCrossEncoderModel>>,
+    > = std::sync::OnceLock::new();
 
     impl CrossEncoder {
         /// Construct a deferred-init reranker pointing at the canonical
@@ -102,19 +111,22 @@ mod inner {
                 return Ok(Vec::new());
             }
 
-            let mut guard = self
-                .model
+            // Reuse the process-global session (load once) instead of the
+            // per-instance one — the hot path constructs a fresh CrossEncoder
+            // per recall, which previously reloaded the ~2-3s session every query.
+            let cell = SHARED_RERANK_MODEL.get_or_init(|| std::sync::Mutex::new(None));
+            let mut guard = cell
                 .lock()
                 .map_err(|_| Error::GraphStorage("rerank mutex poisoned".into()))?;
 
             if guard.is_none() {
                 tracing::info!(
                     target: "rerank",
-                    "loading cross-encoder model (first use)…"
+                    "loading cross-encoder model (first use, process-global cache)…"
                 );
                 let model = OrtCrossEncoderModel::load(&self.paths, self.max_length)?;
                 *guard = Some(model);
-                tracing::info!(target: "rerank", "cross-encoder loaded");
+                tracing::info!(target: "rerank", "cross-encoder loaded (cached)");
             }
 
             let model = guard.as_mut().expect("just-loaded");
@@ -125,7 +137,10 @@ mod inner {
         /// and for tests that want to verify lazy-load behaviour
         /// without triggering inference.
         pub fn is_loaded(&self) -> bool {
-            self.model.lock().map(|g| g.is_some()).unwrap_or(false)
+            SHARED_RERANK_MODEL
+                .get()
+                .and_then(|c| c.lock().ok().map(|g| g.is_some()))
+                .unwrap_or(false)
         }
     }
 }

@@ -1117,6 +1117,12 @@ struct WorkspaceHandle {
     root_path: PathBuf,
     /// Write operations (pipeline, agent contribute) go through CozoDB.
     storage: Arc<Mutex<StorageEngine>>,
+    /// Pillar 2 (2026-06-28): lock-free RCU read snapshot of the vector index.
+    /// Recall reads this WITHOUT the storage Mutex (read lock held only for a
+    /// nanosecond Arc-clone); the write path rebuilds + publishes it after
+    /// reconcile so background re-embedding never starves live recall.
+    vector_snapshot:
+        std::sync::Arc<std::sync::RwLock<std::sync::Arc<thinkingroot_graph::vector::ReadSnapshot>>>,
     /// All read operations are served from this in-memory cache.
     /// Multiple concurrent requests read simultaneously; compile/contribute
     /// take an exclusive write lock to reload after mutating CozoDB.
@@ -1590,6 +1596,36 @@ impl FnCapabilities {
             storage
                 .graph
                 .link_claim_to_source(&claim.id.to_string(), &source.id.to_string())?;
+            // ── #2 live-write enrichment ──────────────────────────────────
+            // Store the statement as ONE chunk on this source and enqueue it
+            // for the async atomic-extract queue, so a remembered fact's
+            // entities get the SAME EDC typing + graph promotion as a compiled
+            // doc (a few seconds later, off the conversation). The queue drains
+            // this source ONCE (one chunk) then settles — no reprocessing.
+            // Best-effort: enrichment must never fail the durable claim write.
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let chunk = thinkingroot_graph::rows::RawChunkRow {
+                id: format!("rc:{}", claim.id),
+                source_id: source.id.to_string(),
+                chunk_index: 0,
+                chunk_type: "text".to_string(),
+                content: statement.to_string(),
+                byte_start: 0,
+                byte_end: statement.len() as u64,
+                content_blake3: format!("blake3:{}", blake3::hash(statement.as_bytes()).to_hex()),
+                created_at: now_ts,
+            };
+            if let Err(e) = storage.graph.insert_raw_chunks(std::slice::from_ref(&chunk)) {
+                tracing::warn!("remember: enrichment chunk write failed (claim durable): {e}");
+            } else if let Err(e) = storage
+                .graph
+                .enqueue_atomic_extract(&[source.id.to_string()], now_ts)
+            {
+                tracing::warn!("remember: enrichment enqueue failed (claim durable): {e}");
+            }
             // Vector-index the claim so semantic recall finds it without a
             // recompile (mirrors the contribute_claims write path). ONNX
             // embedding is sync; on the isolate's current-thread runtime
@@ -2096,6 +2132,22 @@ pub struct BranchMergeResult {
 /// are no other workers to repark onto, so the closure is just invoked
 /// directly. `block_in_place` cannot be used there — it panics.
 #[inline]
+/// Wall-clock seconds since the Unix epoch as `f64` (the timestamp form the
+/// Cozo relations store). Defaults to `0.0` if the clock is before the epoch.
+fn now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// True when an error is SQLite's transient single-writer contention
+/// ("database is locked"), which is safe to retry after a short backoff.
+fn is_db_locked(e: &Error) -> bool {
+    let m = e.to_string().to_lowercase();
+    m.contains("database is locked") || m.contains("locked") && m.contains("code 5")
+}
+
 fn run_blocking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -2511,6 +2563,12 @@ impl QueryEngine {
             WorkspaceHandle {
                 name,
                 root_path,
+                // Pillar 2: build the initial lock-free snapshot from the loaded
+                // index BEFORE `storage` is moved into the Mutex (struct fields
+                // evaluate top-to-bottom, so this borrow precedes the move).
+                vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
@@ -2585,6 +2643,12 @@ impl QueryEngine {
             WorkspaceHandle {
                 name,
                 root_path,
+                // Pillar 2: build the initial lock-free snapshot from the loaded
+                // index BEFORE `storage` is moved into the Mutex (struct fields
+                // evaluate top-to-bottom, so this borrow precedes the move).
+                vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
@@ -2600,9 +2664,15 @@ impl QueryEngine {
 
     /// Unmount a previously mounted workspace.
     pub fn unmount(&mut self, name: &str) -> Result<()> {
-        self.workspaces
+        let handle = self
+            .workspaces
             .remove(name)
             .ok_or_else(|| Error::EntityNotFound(format!("workspace '{name}' not mounted")))?;
+        // Drop the registry's strong ref so the shared (RocksDB-exclusive)
+        // handle can close once this removed handle's clone is gone.
+        thinkingroot_graph::graph::GraphStore::release(
+            &handle.root_path.join(".thinkingroot").join("graph"),
+        );
         Ok(())
     }
 
@@ -2800,10 +2870,13 @@ impl QueryEngine {
                         && Arc::strong_count(&h.storage) == 1
                 })
                 .min_by_key(|(_, h)| h.last_use.load(std::sync::atomic::Ordering::Relaxed))
-                .map(|(name, _)| name.clone());
+                .map(|(name, h)| (name.clone(), h.root_path.clone()));
             match victim {
-                Some(name) => {
+                Some((name, root_path)) => {
                     self.workspaces.remove(&name);
+                    thinkingroot_graph::graph::GraphStore::release(
+                        &root_path.join(".thinkingroot").join("graph"),
+                    );
                     tracing::info!(
                         target: "engine",
                         ws = %name,
@@ -6936,9 +7009,11 @@ side referenced. Strict rules:\n\
         // 1–100ms). Without this wrap the tokio reactor stalls under concurrent
         // load — regresses the 10K-VU p95 claim.
         let vector_results = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search(query, top_k * 2))?
-            // storage Mutex drops here
+            // Pillar 2: lock-free recall — embed via the dedicated read lane,
+            // search the RCU snapshot; no storage Mutex on the read path.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_scoped(&qv, top_k * 2, None))
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -7073,42 +7148,195 @@ side referenced. Strict rules:\n\
         allowed_source_ids: &HashSet<String>,
     ) -> Result<Vec<ClaimSearchHit>> {
         let handle = self.get_workspace(ws)?;
-        let results = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search_prefix(query, top_k, "fact|"))?
+        // L2 — HYBRID + RERANK fact recall. Two retrieval arms (dense vector +
+        // lexical BM25) fused with RRF, then the cross-encoder reranks the fused
+        // head so the most relevant fact ranks first. Each stage is flag-gated;
+        // with both off this is byte-identical to the prior dense-only path.
+        let hybrid = std::env::var("TR_HYBRID_FACTS")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let rerank_on = std::env::var("TR_FACT_RERANK")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        // Over-fetch candidates when we will fuse/rerank — RRF and the
+        // cross-encoder need a wider pool than the final `top_k`.
+        let widen = hybrid || rerank_on;
+        let fetch = if widen { top_k.saturating_mul(4).max(24) } else { top_k };
+
+        // ── Arm 1: dense vector search over the contextual fact embeddings. ──
+        let dense_raw = {
+            // Pillar 2: lock-free fact recall.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_prefix(&qv, fetch, "fact|"))
         };
-        let mut hits: Vec<ClaimSearchHit> = Vec::new();
-        let storage = handle.storage.lock().await;
-        for (key, meta, score) in &results {
-            if !key.starts_with("af:") {
-                continue;
+        let scope_ok = |uri: &str, src_id: &str| {
+            allowed_source_ids.is_empty()
+                || allowed_source_ids
+                    .iter()
+                    .any(|sid| uri.contains(sid.as_str()) || src_id == sid)
+        };
+
+        // Materialise candidates (live + scoped) under one graph lock; collect
+        // the dense ranked-id list and, when hybrid, the lexical one.
+        let mut cand: std::collections::HashMap<String, ClaimSearchHit> =
+            std::collections::HashMap::new();
+        let mut dense_ids: Vec<String> = Vec::new();
+        let mut lex_ids: Vec<String> = Vec::new();
+        {
+            let storage = handle.storage.lock().await;
+            for (key, meta, score) in &dense_raw {
+                if !key.starts_with("af:") {
+                    continue;
+                }
+                // The vector key IS the stored fact id (already `af:`-prefixed).
+                let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
+                    continue;
+                };
+                if !f.is_live() {
+                    continue;
+                }
+                // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
+                let uri = meta.rsplit('|').next().unwrap_or("").to_string();
+                if !scope_ok(&uri, &f.source_id) {
+                    continue;
+                }
+                dense_ids.push(key.clone());
+                cand.entry(key.clone()).or_insert(ClaimSearchHit {
+                    id: key.clone(),
+                    statement: f.statement.clone(),
+                    claim_type: "atomic-fact".to_string(),
+                    confidence: f.confidence as f64,
+                    source_uri: uri,
+                    relevance: *score,
+                    valid_from: f.created_at as i64,
+                });
             }
-            // The vector key IS the stored fact id (already `af:`-prefixed).
-            let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
-                continue;
-            };
-            if !f.is_live() {
-                continue;
+
+            // ── Arm 2: lexical BM25 over the live fact corpus (rare-term recall). ──
+            if hybrid {
+                const SCAN_MAX: usize = 50_000;
+                let all = storage.graph.get_all_atomic_facts().unwrap_or_default();
+                if all.len() > SCAN_MAX {
+                    tracing::warn!(
+                        ws = %ws, facts = all.len(),
+                        "hybrid fact recall: corpus > {SCAN_MAX}; lexical arm scans first {SCAN_MAX} \
+                         (dense arm still covers the rest) — a persistent fact FTS index is the scale fix"
+                    );
+                }
+                let docs: Vec<(String, String)> = all
+                    .into_iter()
+                    .take(SCAN_MAX)
+                    .filter(|f| f.is_live())
+                    .map(|f| (f.id.clone(), f.statement.clone()))
+                    .collect();
+                let ranked = crate::intelligence::reranker::bm25_rank(query, &docs);
+                for (id, _bm25) in ranked.into_iter().take(fetch) {
+                    if cand.contains_key(&id) {
+                        lex_ids.push(id); // already a (scope-checked) dense candidate
+                        continue;
+                    }
+                    let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(&id) else {
+                        continue;
+                    };
+                    if !f.is_live() {
+                        continue;
+                    }
+                    let uri = storage
+                        .graph
+                        .find_source_uri_by_id(&f.source_id)
+                        .unwrap_or_default();
+                    if !scope_ok(&uri, &f.source_id) {
+                        continue;
+                    }
+                    lex_ids.push(id.clone());
+                    cand.insert(
+                        id.clone(),
+                        ClaimSearchHit {
+                            id,
+                            statement: f.statement.clone(),
+                            claim_type: "atomic-fact".to_string(),
+                            confidence: f.confidence as f64,
+                            source_uri: uri,
+                            // dense-comparable placeholder; the final ramp below
+                            // overwrites this once the order is settled.
+                            relevance: 0.5,
+                            valid_from: f.created_at as i64,
+                        },
+                    );
+                }
             }
-            // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
-            let uri = meta.rsplit('|').next().unwrap_or("").to_string();
-            if !allowed_source_ids.is_empty()
-                && !allowed_source_ids.iter().any(|sid| uri.contains(sid.as_str()))
-            {
-                continue;
-            }
-            hits.push(ClaimSearchHit {
-                id: key.clone(),
-                statement: f.statement.clone(),
-                claim_type: "atomic-fact".to_string(),
-                confidence: f.confidence as f64,
-                source_uri: uri,
-                relevance: *score,
-                valid_from: f.created_at as i64,
-            });
         }
-        Ok(hits)
+
+        // Fast path: nothing to fuse/rerank → original dense-only behaviour.
+        if !widen {
+            let mut hits: Vec<ClaimSearchHit> =
+                dense_ids.into_iter().filter_map(|id| cand.remove(&id)).collect();
+            hits.truncate(top_k);
+            return Ok(hits);
+        }
+
+        // ── Fuse: RRF over (dense, lexical); dense-only when hybrid is off. ──
+        let fused_ids: Vec<String> = if hybrid {
+            crate::intelligence::reranker::rrf_fuse(&[&dense_ids, &lex_ids], 60.0)
+        } else {
+            dense_ids.clone()
+        };
+        let mut ordered: Vec<ClaimSearchHit> =
+            fused_ids.into_iter().filter_map(|id| cand.remove(&id)).collect();
+
+        // ── Cross-encoder rerank the fused head (the "ranks first" lever). ──
+        // Reuses the gte-reranker; a missing model / load failure falls back to
+        // the RRF order (retrieval never goes dark, only the rerank lift is lost).
+        if rerank_on && ordered.len() > 1 {
+            // Multiplier B (2026-06-28): cap the cross-encoder candidate window.
+            // Rerank cost is ~linear in candidates; K=25-50 covers ~90-97% of the
+            // accuracy at roughly half the latency (research-grounded). RRF still
+            // fuses the FULL fetch pool above; only the expensive rerank is capped.
+            // Env override TR_RERANK_MAX (default 50).
+            let rerank_max = std::env::var("TR_RERANK_MAX")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+            let window = ordered.len().min(fetch).min(rerank_max);
+            let docs: Vec<&str> =
+                ordered.iter().take(window).map(|h| h.statement.as_str()).collect();
+            let reranked = thinkingroot_graph::rerank::CrossEncoder::new(std::path::Path::new("."))
+                .and_then(|ce| ce.rerank(query, &docs));
+            if let Ok(scores) = reranked {
+                if scores.len() == window {
+                    let mut head: Vec<(ClaimSearchHit, f32)> =
+                        ordered.drain(..window).zip(scores).collect();
+                    head.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut new_order: Vec<ClaimSearchHit> =
+                        head.into_iter().map(|(h, _)| h).collect();
+                    new_order.append(&mut ordered);
+                    ordered = new_order;
+                }
+            }
+        }
+
+        // Bake the final order into `relevance` as a monotonic ramp inside the
+        // observed cosine band, so it survives the retriever's global re-sort by
+        // relevance (which would otherwise discard the rerank order). Facts stay
+        // on a claim-comparable scale so the two channels interleave sensibly.
+        ordered.truncate(top_k);
+        let n = ordered.len();
+        if n > 0 {
+            let hi = dense_raw
+                .iter()
+                .map(|(_, _, s)| *s)
+                .fold(0.0_f32, f32::max)
+                .clamp(0.05, 1.0);
+            let lo = (hi * 0.6).max(0.05);
+            for (i, h) in ordered.iter_mut().enumerate() {
+                let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+                h.relevance = hi - t * (hi - lo);
+            }
+        }
+        Ok(ordered)
     }
+
 
     pub async fn search_scoped(
         &self,
@@ -7242,8 +7470,10 @@ side referenced. Strict rules:\n\
         };
         // block_in_place: see rationale on `search` above.
         let vector_results = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search_scoped(query, top_k * 3, scope))?
+            // Pillar 2: lock-free scoped recall.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_scoped(&qv, top_k * 3, scope))
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -7607,15 +7837,16 @@ side referenced. Strict rules:\n\
     /// never held across the (slow, async) LLM calls — read chunks under lock,
     /// extract unlocked, write under lock (mirrors `stitch_once`).
     pub async fn extract_atomic_facts_once(&self, ws: &str, batch_limit: usize) -> Result<usize> {
+        use futures::StreamExt;
         const MAX_ATTEMPTS: i64 = 3;
-        let Some(llm) = self.workspace_llm(ws) else {
+        if self.workspace_llm(ws).is_none() {
             return Ok(0);
-        };
+        }
         let handle = self.get_workspace(ws)?;
 
         // Read ONLY the pending source ids (not their chunks) — chunks are read
-        // lazily per-source below so we never hold every pending PDF's content
-        // in memory at once (that was the OOM under a multi-PDF backlog).
+        // lazily per-source so we never hold every pending PDF's content in memory
+        // at once (that was the OOM under a multi-PDF backlog).
         let pending: Vec<(String, i64)> = {
             let storage = handle.storage.lock().await;
             storage.graph.pending_atomic_extract(batch_limit)?
@@ -7624,154 +7855,561 @@ side referenced. Strict rules:\n\
             return Ok(0);
         }
 
-        let model = llm.model_name().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let mut total = 0usize;
 
-        for (sid, attempts) in pending {
-            if attempts >= MAX_ATTEMPTS {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
-                let storage = handle.storage.lock().await;
-                let _ = storage.graph.complete_atomic_extract(&sid);
-                continue;
-            }
-            // Load THIS source's chunks (dropped at end of the iteration).
-            let chunks = {
-                let storage = handle.storage.lock().await;
-                match storage.graph.get_raw_chunks_for_source(&sid) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk read failed: {e}");
-                        continue;
-                    }
-                }
-            };
+        // Bounded DOC-LEVEL parallelism. RocksDB is a concurrent-writer backend
+        // and the slow part (LLM extraction + typing + brief) runs OFF the storage
+        // lock, so many docs enrich at once; only the short writes serialise on the
+        // per-workspace lock. Default 8, override with TR_COMPILE_CONCURRENCY.
+        let concurrency = std::env::var("TR_COMPILE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(8);
 
-            // Extract over chunks WITHOUT holding the storage lock, with BOUNDED
-            // concurrency (the LlmClient scheduler still rate-limits). 6 chunks
-            // in flight at once makes a 31-chunk PDF extract in ~seconds instead
-            // of ~minutes, while capping memory so big PDFs don't crash the engine.
-            const CHUNK_CONCURRENCY: usize = 6;
-            let ctxs: Vec<thinkingroot_core::types::ChunkContext> = chunks
-                .iter()
-                .map(|ch| thinkingroot_core::types::ChunkContext {
-                    source_id: sid.clone(),
-                    chunk_id: ch.id.clone(),
-                    content: ch.content.clone(),
-                    byte_start: ch.byte_start,
-                    workspace_id: ws.to_string(),
-                    extraction_model: model.clone(),
-                    created_at: now,
-                })
-                .collect();
-            let mut facts = Vec::new();
-            let mut transient_error = false;
-            for batch in ctxs.chunks(CHUNK_CONCURRENCY) {
-                let futs = batch.iter().map(|ctx| {
-                    let llm = llm.clone();
-                    async move {
-                        crate::intelligence::atomic_extract::extract_chunk_facts(&llm, ctx).await
+        let total: usize = futures::stream::iter(pending.into_iter())
+            .map(|(sid, attempts)| async move {
+                if attempts >= MAX_ATTEMPTS {
+                    tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: giving up after {MAX_ATTEMPTS} attempts");
+                    if let Ok(h) = self.get_workspace(ws) {
+                        let storage = h.storage.lock().await;
+                        let _ = storage.graph.set_source_progress(&sid, "failed", "max attempts exceeded", now);
+                        let _ = storage.graph.complete_atomic_extract(&sid);
                     }
-                });
-                for r in futures::future::join_all(futs).await {
-                    match r {
-                        Ok(f) => facts.extend(f),
-                        Err(e) => {
-                            transient_error = true;
-                            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract LLM error: {e}");
-                        }
-                    }
+                    return 0usize;
                 }
-            }
+                self.enrich_one_source(ws, &sid, attempts, now)
+                    .await
+                    .unwrap_or(0)
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<usize>>()
+            .await
+            .into_iter()
+            .sum();
 
-            // Persist + settle the queue under the lock.
-            let mut storage = handle.storage.lock().await;
-            // Bi-temporal supersession: tombstone prior live facts this
-            // re-extraction no longer confirms (keeps the version timeline).
-            let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
-            if let Err(e) = storage.graph.supersede_facts_not_in(&sid, &new_ids, now) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: supersession failed: {e}");
-            }
-            if let Err(e) = storage.graph.insert_atomic_facts_batch(&facts) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: insert failed: {e}");
-                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
-                continue;
-            }
-            total += facts.len();
-            // Build the mother-node spine edges for the facts just written.
-            if let Err(e) = storage.graph.rebuild_spine_for_source(&sid) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
-            }
-            // Promote the facts' subjects/objects into first-class graph ENTITY
-            // NODES + relations so the LLM-extracted knowledge appears in the
-            // Neural Graph and can be clustered into concepts.
-            match storage.graph.promote_fact_entities_and_relations(&sid) {
-                Ok(n) if n > 0 => tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}"),
-            }
-            // Per-document summary node (deterministic over the live facts).
-            if let Err(e) = storage.graph.build_document_summary(&sid, "", now) {
-                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
-            }
-            // Make the facts semantically recallable in the ask path: embed each
-            // fact statement under an `af:` vector id with `fact|` metadata (a
-            // separate namespace from `claim|`, so claim retrieval is untouched).
-            if !facts.is_empty() {
-                let uri = storage
-                    .graph
-                    .get_source_by_id(&sid)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.uri)
-                    .unwrap_or_default();
-                // The fact id already carries the `af:` namespace prefix, so it
-                // IS the vector key. Metadata `fact|{id}|{uri}` namespaces the
-                // search channel + carries the source uri for scoping/citation.
-                let items: Vec<(String, String, String)> = facts
-                    .iter()
-                    .map(|f| {
-                        (
-                            f.id.clone(),
-                            f.statement.clone(),
-                            format!("fact|{}|{}", f.id, uri),
-                        )
-                    })
-                    .collect();
-                let upsert = run_blocking(|| storage.vector.upsert_batch(&items));
-                match upsert {
-                    Ok(_) => {
-                        let _ = run_blocking(|| storage.vector.save());
-                    }
-                    Err(e) => tracing::warn!(
-                        ws = %ws, source_id = %sid,
-                        "atomic fact vector upsert failed (facts durable; semantic recall degraded): {e}"
-                    ),
-                }
-            }
-            if transient_error {
-                // Some chunks errored — keep the source queued to retry the rest.
-                let _ = storage.graph.bump_atomic_extract_attempt(&sid, now, attempts);
-            } else {
-                let _ = storage.graph.complete_atomic_extract(&sid);
-            }
-        }
-        // Reload the read cache so freshly-promoted entities + relations appear
-        // in the Neural Graph (list_entities reads the cache). ONE reload at the
-        // end of the tick — NOT after every source, and we no longer trigger a
-        // full stitch_once here (it loaded the entire graph + an LLM pass every
-        // tick → the OOM under a big backlog). The periodic Stitcher grows
-        // concepts on its own cadence instead.
+        // ONE cache reload + an optional retirement sweep at the end of the tick
+        // (not after every source). Reloads so freshly-promoted entities/relations
+        // appear in the Neural Graph (list_entities reads the cache).
         if total > 0 {
             let storage = handle.storage.lock().await;
+            // #3 — entity retirement sweep (bi-temporal: mark vanished entities
+            // retired, never delete). GATED behind TR_ENTITY_RETIRE (default OFF)
+            // until validated on real data. Sound because each source rebuilt its
+            // spine AFTER promotion, so `fact_mentions_entity` reflects the live set.
+            if std::env::var("TR_ENTITY_RETIRE").as_deref() == Ok("1") {
+                match storage.graph.retire_unmentioned_entities(now) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(ws = %ws, "entity retirement: retired {n} unmentioned entities")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(ws = %ws, "entity retirement sweep failed: {e}"),
+                }
+            }
             if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
                 *handle.cache.write().await = new_cache;
             }
         }
         Ok(total)
+    }
+
+    /// Enrich ONE source: LLM atomic-fact extraction → EDC typing → title+summary
+    /// brief → persist (facts, entities, spine, summary, brief, vectors) → settle
+    /// the queue. Writes durable per-doc `source_progress` at each phase so the
+    /// Console shows a real, refresh-proof status. The slow LLM work runs OFF the
+    /// storage lock; only the short writes take it (so this is safe to run for
+    /// many sources concurrently). Best-effort: returns facts written (0 on a
+    /// recoverable error, leaving the source queued for the background retry).
+    async fn enrich_one_source(
+        &self,
+        ws: &str,
+        sid: &str,
+        attempts: i64,
+        now: f64,
+    ) -> Result<usize> {
+        let Some(llm) = self.workspace_llm(ws) else {
+            return Ok(0);
+        };
+        let handle = self.get_workspace(ws)?;
+        let model = llm.model_name().to_string();
+
+        // Phase → "facts"; load this source's chunks + uri (quick lock).
+        let (chunks, uri) = {
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.set_source_progress(sid, "facts", "", now);
+            let chunks = match storage.graph.get_raw_chunks_for_source(sid) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk read failed: {e}");
+                    let _ = storage.graph.set_source_progress(sid, "failed", "chunk read failed", now);
+                    return Ok(0);
+                }
+            };
+            let uri = storage
+                .graph
+                .get_source_by_id(sid)
+                .ok()
+                .flatten()
+                .map(|s| s.uri)
+                .unwrap_or_default();
+            (chunks, uri)
+        };
+
+        // Extract over chunks WITHOUT holding the storage lock, BOUNDED to 6
+        // chunks in flight (caps memory; the LlmClient scheduler rate-limits).
+        const CHUNK_CONCURRENCY: usize = 6;
+        let ctxs: Vec<thinkingroot_core::types::ChunkContext> = chunks
+            .iter()
+            .map(|ch| thinkingroot_core::types::ChunkContext {
+                source_id: sid.to_string(),
+                chunk_id: ch.id.clone(),
+                content: ch.content.clone(),
+                byte_start: ch.byte_start,
+                workspace_id: ws.to_string(),
+                extraction_model: model.clone(),
+                created_at: now,
+            })
+            .collect();
+        let mut facts = Vec::new();
+        let mut transient_error = false;
+        for batch in ctxs.chunks(CHUNK_CONCURRENCY) {
+            let futs = batch.iter().map(|ctx| {
+                let llm = llm.clone();
+                async move {
+                    crate::intelligence::atomic_extract::extract_chunk_facts(&llm, ctx).await
+                }
+            });
+            for r in futures::future::join_all(futs).await {
+                match r {
+                    Ok(f) => facts.extend(f),
+                    Err(e) => {
+                        transient_error = true;
+                        tracing::warn!(ws = %ws, source_id = %sid, "atomic extract LLM error: {e}");
+                    }
+                }
+            }
+        }
+
+        // --- Write-boundary EDC typing/verify pass (OFF the storage lock) ---
+        // One LLM call gives promotion authoritative types (kills "company labelled
+        // Person") and drops literals/values/dates/counts (kills `50 people`/`2024`
+        // becoming nodes). Degrades gracefully on LLM error → literal-guard fallback.
+        let typing_map: std::collections::BTreeMap<
+            String,
+            (String, thinkingroot_core::types::EntityType, bool),
+        > = {
+            use crate::intelligence::entity_typing::{self, Candidate};
+            let mut seen: std::collections::BTreeMap<String, Candidate> =
+                std::collections::BTreeMap::new();
+            for fa in &facts {
+                for raw in [&fa.subject, &fa.object] {
+                    let key = raw.trim().to_lowercase();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    seen.entry(key).or_insert_with(|| Candidate {
+                        name: raw.trim().to_string(),
+                        context: fa.statement.clone(),
+                    });
+                }
+            }
+            let candidates: Vec<Candidate> = seen.into_values().collect();
+            let decisions = entity_typing::type_source_entities(&llm, &candidates).await;
+            let mut map = std::collections::BTreeMap::new();
+            for (c, d) in candidates.iter().zip(decisions.into_iter()) {
+                map.insert(c.name.to_lowercase(), (d.canonical, d.entity_type, d.keep));
+            }
+            map
+        };
+
+        // Phase → "summary": title + one-line summary in ONE LLM call (OFF lock).
+        {
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.set_source_progress(sid, "summary", "", now);
+        }
+        let preview = chunks.first().map(|c| c.content.clone()).unwrap_or_default();
+        let brief =
+            crate::intelligence::doc_brief::generate_doc_brief(&llm, &uri, &facts, &preview).await;
+
+        // Per-chunk "memory briefs": a one-line summary for each passage (the
+        // Console's Memory Graph headlines a memory = a chunk's facts with this).
+        // Built from the facts we just extracted + the chunk text, ONE batched
+        // LLM call. Only chunks that produced facts become memories.
+        let chunk_briefs: Vec<(String, String)> = {
+            use crate::intelligence::chunk_brief::{generate_chunk_briefs, ChunkBriefInput};
+            let mut by_chunk: std::collections::BTreeMap<String, ChunkBriefInput> =
+                std::collections::BTreeMap::new();
+            for ch in &chunks {
+                by_chunk.insert(
+                    ch.id.clone(),
+                    ChunkBriefInput {
+                        chunk_id: ch.id.clone(),
+                        facts: Vec::new(),
+                        preview: ch.content.clone(),
+                    },
+                );
+            }
+            for fa in &facts {
+                if let Some(e) = by_chunk.get_mut(&fa.chunk_id) {
+                    e.facts.push(fa.statement.clone());
+                }
+            }
+            let inputs: Vec<ChunkBriefInput> =
+                by_chunk.into_values().filter(|c| !c.facts.is_empty()).collect();
+            generate_chunk_briefs(&llm, &inputs).await
+        };
+
+        // --- Persist everything under the lock, then settle the queue. ---
+        let mut storage = handle.storage.lock().await;
+        // Bi-temporal supersession: tombstone prior live facts this re-extraction
+        // no longer confirms (keeps the version timeline).
+        let new_ids: Vec<String> = facts.iter().map(|f| f.id.clone()).collect();
+        if let Err(e) = storage.graph.supersede_facts_not_in(sid, &new_ids, now) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: supersession failed: {e}");
+        }
+        if let Err(e) = storage.graph.insert_atomic_facts_batch(&facts) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: insert failed: {e}");
+            let _ = storage.graph.bump_atomic_extract_attempt(sid, now, attempts);
+            let _ = storage
+                .graph
+                .set_source_progress(sid, "facts", "insert failed; retrying", now);
+            return Ok(0);
+        }
+        let total = facts.len();
+        // Build the mother-node spine edges for the facts just written.
+        if let Err(e) = storage.graph.rebuild_spine_for_source(sid) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
+        }
+        // Promote the facts' subjects/objects into first-class graph ENTITY NODES
+        // + relations so the LLM-extracted knowledge appears in the Neural Graph.
+        match storage
+            .graph
+            .promote_fact_entities_and_relations_typed(sid, &typing_map)
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities (EDC-typed)")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}")
+            }
+        }
+        // Re-build the spine AFTER promotion so `fact_mentions_entity` edges include
+        // the entities just created (soundness precondition for #3 retirement).
+        if let Err(e) = storage.graph.rebuild_spine_for_source(sid) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: post-promote spine rebuild failed: {e}");
+        }
+        // Per-document summary node (deterministic over the live facts).
+        if let Err(e) = storage.graph.build_document_summary(sid, "", now) {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: summary build failed: {e}");
+        }
+        // Store the LLM brief — title + one-line summary (the free-title win).
+        if let Err(e) = storage
+            .graph
+            .set_source_brief(sid, &brief.title, &brief.summary, now)
+        {
+            tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: brief store failed: {e}");
+        }
+        // Store the per-chunk memory briefs (Memory Graph headlines).
+        for (chunk_id, summary) in &chunk_briefs {
+            if let Err(e) = storage.graph.set_chunk_brief(chunk_id, sid, summary, now) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: chunk brief store failed: {e}");
+            }
+        }
+        // Make the facts semantically recallable in the ask path. Layer 1 —
+        // CONTEXTUAL RETRIEVAL: embed each fact under a short situating prefix
+        // (document title + the chunk's memory brief, both computed above) so a
+        // bare statement matches a query naming neither subject nor doc. Only the
+        // embedded text is enriched; key/meta/stored-statement are unchanged and
+        // the query side stays bare. `TR_CONTEXTUAL_EMBED=0` reverts to bare text.
+        if !facts.is_empty() {
+            let contextual = std::env::var("TR_CONTEXTUAL_EMBED")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let brief_by_chunk: std::collections::HashMap<&str, &str> = chunk_briefs
+                .iter()
+                .map(|(c, s)| (c.as_str(), s.as_str()))
+                .collect();
+            let items: Vec<(String, String, String)> = facts
+                .iter()
+                .map(|f| {
+                    let text = if contextual {
+                        crate::intelligence::chunk_brief::contextualize_fact_text(
+                            &brief.title,
+                            brief_by_chunk.get(f.chunk_id.as_str()).copied(),
+                            &f.statement,
+                        )
+                    } else {
+                        f.statement.clone()
+                    };
+                    (f.id.clone(), text, format!("fact|{}|{}", f.id, uri))
+                })
+                .collect();
+            let upsert = run_blocking(|| storage.vector.upsert_batch(&items));
+            match upsert {
+                Ok(_) => {
+                    let _ = run_blocking(|| storage.vector.save());
+                }
+                Err(e) => tracing::warn!(
+                    ws = %ws, source_id = %sid,
+                    "atomic fact vector upsert failed (facts durable; semantic recall degraded): {e}"
+                ),
+            }
+        }
+        if transient_error {
+            // Some chunks errored — keep the source queued to retry the rest.
+            let _ = storage.graph.bump_atomic_extract_attempt(sid, now, attempts);
+            let _ = storage
+                .graph
+                .set_source_progress(sid, "facts", "partial extraction; retrying", now);
+        } else {
+            let _ = storage.graph.complete_atomic_extract(sid);
+            let _ = storage.graph.set_source_progress(sid, "ready", "", now);
+        }
+        Ok(total)
+    }
+
+    // ─── Durable compile jobs (Phase 2 reliability) ────────────────────────
+    // Thin pass-throughs to the per-workspace `compile_jobs` Cozo relation so
+    // the streaming compile can persist a run that survives the browser
+    // closing, a reconnecting client can re-attach, and a crash-interrupted
+    // run is detected on boot. All best-effort: a write failure never breaks
+    // the compile itself (the in-memory `active_compiles` registry still
+    // protects the run during its lifetime).
+
+    /// Record a fresh `running` compile job in the workspace's graph.db.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+        root_path: &str,
+        branch: &str,
+        source_count: i64,
+        host_pid: i64,
+    ) -> Result<()> {
+        // The workspace graph.db is single-writer SQLite. A background writer
+        // (e.g. the atomic-extract drain) may momentarily hold the write lock,
+        // so retry this quick single-row write past transient "database is
+        // locked" contention rather than dropping the durable record.
+        for attempt in 0u32..6 {
+            let res = {
+                let handle = self.get_workspace(ws)?;
+                let storage = handle.storage.lock().await;
+                storage.graph.insert_compile_job(
+                    job_id, ws, root_path, branch, source_count, now_secs_f64(), host_pid,
+                )
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < 5 && is_db_locked(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)))
+                        .await;
+                }
+                other => return other,
+            }
+        }
+        Ok(())
+    }
+
+    /// Update the live phase of a running compile job (cheap, per transition).
+    pub async fn update_compile_job_phase(&self, ws: &str, job_id: &str, phase: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.update_compile_job_phase(job_id, phase, now_secs_f64())
+    }
+
+    /// Move a compile job to a terminal status (`done` only on real success).
+    /// Retried past transient SQLite write contention — a job left `running`
+    /// because its terminal write was dropped would look stuck forever.
+    pub async fn finish_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+        status: &str,
+        error: &str,
+    ) -> Result<()> {
+        for attempt in 0u32..6 {
+            let res = {
+                let handle = self.get_workspace(ws)?;
+                let storage = handle.storage.lock().await;
+                storage.graph.finish_compile_job(job_id, status, error, now_secs_f64())
+            };
+            match res {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < 5 && is_db_locked(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(40 * (attempt as u64 + 1)))
+                        .await;
+                }
+                other => return other,
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch one compile job (re-attach snapshot + console polling).
+    pub async fn get_compile_job(
+        &self,
+        ws: &str,
+        job_id: &str,
+    ) -> Result<Option<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.get_compile_job(job_id)
+    }
+
+    /// Running compile jobs for one workspace (console "is a compile live?").
+    pub async fn list_running_compile_jobs(
+        &self,
+        ws: &str,
+    ) -> Result<Vec<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_running_compile_jobs()
+    }
+
+    /// Recent compile jobs for one workspace, newest-first (any status) — the
+    /// Import-page queue/history view. Auto-mounts the workspace.
+    pub async fn list_recent_compile_jobs(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<thinkingroot_graph::compile_jobs::CompileJobRow>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_recent_compile_jobs(limit)
+    }
+
+    /// Source ids still pending LLM atomic-fact extraction in one workspace —
+    /// lets the console mark each freshly-compiled doc "extracting facts" vs
+    /// "ready" without guessing. Bounded read (the queue is small in practice).
+    pub async fn pending_extract_ids(&self, ws: &str, limit: usize) -> Result<Vec<String>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        Ok(storage
+            .graph
+            .pending_atomic_extract(limit)?
+            .into_iter()
+            .map(|(id, _attempts)| id)
+            .collect())
+    }
+
+    /// Durable per-doc enrichment status + LLM title/summary, joined for the
+    /// Console's `/source-progress` endpoint. One row per source that has a
+    /// progress record OR a brief, as
+    /// `(source_id, phase, updated_at, error, title, summary)`.
+    pub async fn source_progress_rows(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, f64, String, String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let progress = storage.graph.list_source_progress(limit)?;
+        let briefs = storage.graph.list_source_briefs(limit)?;
+        let mut by_id: std::collections::BTreeMap<String, (String, f64, String, String, String)> =
+            std::collections::BTreeMap::new();
+        for (sid, phase, updated_at, error) in progress {
+            by_id.insert(sid, (phase, updated_at, error, String::new(), String::new()));
+        }
+        for (sid, title, summary) in briefs {
+            let e = by_id
+                .entry(sid)
+                .or_insert_with(|| (String::new(), 0.0, String::new(), String::new(), String::new()));
+            e.3 = title;
+            e.4 = summary;
+        }
+        Ok(by_id
+            .into_iter()
+            .map(|(sid, (phase, updated_at, error, title, summary))| {
+                (sid, phase, updated_at, error, title, summary)
+            })
+            .collect())
+    }
+
+    /// Per-chunk memory briefs `(chunk_id, source_id, summary)` for the Console's
+    /// Memory Graph (it headlines each memory = a chunk's facts with this).
+    pub async fn chunk_brief_rows(
+        &self,
+        ws: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_chunk_briefs(limit)
+    }
+
+    /// Write a CONSISTENT portable backup of a mounted workspace's graph to
+    /// `out_path` via cozo `backup_db` (a single SQLite-format file, even on
+    /// RocksDB). This is the durability primitive a periodic host job rclones
+    /// to object storage — backups MUST come from the running engine because
+    /// RocksDB holds the dir under an exclusive lock (no external open).
+    pub async fn backup_workspace(&self, ws: &str, out_path: &str) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        storage
+            .graph
+            .raw_db()
+            .backup_db(out_path)
+            .map_err(|e| Error::GraphStorage(format!("backup_workspace: {e}")))
+    }
+
+    /// Count of running compile jobs across ALL mounted workspaces — the
+    /// authoritative half of the `/busy` signal (survives observer
+    /// disconnect, unlike an in-memory counter).
+    pub async fn running_compile_count_all(&self) -> usize {
+        let mut total = 0usize;
+        for ws in self.mounted_workspace_names() {
+            if let Ok(handle) = self.get_workspace(&ws) {
+                let storage = handle.storage.lock().await;
+                total += storage.graph.running_compile_count().unwrap_or(0);
+            }
+        }
+        total
+    }
+
+    /// Count of sources still pending LLM atomic-fact extraction across ALL
+    /// mounted workspaces — the other durable half of the `/busy` signal, so an
+    /// engine draining its post-compile extraction queue is never idle-paused.
+    pub async fn pending_atomic_extract_count_all(&self) -> usize {
+        let mut total = 0usize;
+        for ws in self.mounted_workspace_names() {
+            if let Ok(handle) = self.get_workspace(&ws) {
+                let storage = handle.storage.lock().await;
+                // A small bounded probe is enough for a boolean-ish signal;
+                // cap the read so a huge backlog stays cheap to poll.
+                total += storage.graph.pending_atomic_extract(64).map(|v| v.len()).unwrap_or(0);
+            }
+        }
+        total
+    }
+
+    /// Boot-sweep: across all mounted workspaces, mark any `running` job owned
+    /// by a DIFFERENT process id (i.e. orphaned by a crash/restart) as
+    /// `interrupted`. Honest recovery — the run is surfaced for a Retry, never
+    /// reported as `done`. Returns the number reaped.
+    pub async fn sweep_interrupted_compile_jobs(&self, current_pid: i64) -> usize {
+        let mut reaped = 0usize;
+        for ws in self.mounted_workspace_names() {
+            let Ok(handle) = self.get_workspace(&ws) else { continue };
+            let storage = handle.storage.lock().await;
+            let running = storage.graph.list_running_compile_jobs().unwrap_or_default();
+            for job in running {
+                if job.host_pid != current_pid {
+                    if storage
+                        .graph
+                        .finish_compile_job(&job.job_id, "interrupted", "engine restarted", now_secs_f64())
+                        .is_ok()
+                    {
+                        reaped += 1;
+                    }
+                }
+            }
+        }
+        reaped
     }
 
     pub async fn stitch_once(
@@ -12108,11 +12746,21 @@ Rules: \
         let handle = self.get_workspace(ws)?;
         let storage_arc = Arc::clone(&handle.storage);
         let stats = tokio::task::spawn_blocking(move || {
-            let mut storage = storage_arc.blocking_lock();
-            crate::pipeline::reconcile_vector_index(&mut storage, &cancel)
+            crate::pipeline::reconcile_vector_index(storage_arc, &cancel)
         })
         .await
         .map_err(|e| Error::Config(format!("vector-index reconcile task panicked: {e}")))??;
+        // Pillar 2: publish the freshly-reindexed vectors as a new lock-free
+        // snapshot so recall sees the new data. build_snapshot clones the index
+        // + builds the HNSW; the brief lock here is bounded (TODO: build the
+        // HNSW off-lock from a cloned dataset to remove even this window).
+        {
+            let snap = {
+                let storage = handle.storage.lock().await;
+                run_blocking(|| storage.vector.build_snapshot())
+            };
+            *handle.vector_snapshot.write().expect("snapshot lock") = std::sync::Arc::new(snap);
+        }
         Ok(stats)
     }
 

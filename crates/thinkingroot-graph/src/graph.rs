@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono;
 use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
@@ -14,6 +14,23 @@ use thinkingroot_core::{Error, Result};
 pub use crate::per_source_rows::PerSourceRows;
 
 use crate::source_store::{FileSystemSourceStore, SourceByteStore};
+
+/// Process-global registry of OPEN Cozo handles, keyed by the canonical
+/// `graph.db` path. **RocksDB takes an EXCLUSIVE per-directory lock** — a
+/// second open of the same dir fails ("Failed to open RocksDB"). Yet many call
+/// sites open the same workspace dir: the daemon's mounted handle, the compile
+/// pipeline (which opens its own `StorageEngine`), branch lookups, export. On
+/// SQLite a second open was tolerated; on RocksDB they MUST share ONE handle.
+/// `DbInstance` is internally `Arc`, so a clone is the *same* underlying DB —
+/// safe for concurrent reads + writes within the one handle. The registry hands
+/// out a clone when a dir is already open; [`GraphStore::release`] (called on
+/// unmount/evict) drops the registry's strong ref so the DB can close once the
+/// last live clone is gone.
+static OPEN_DBS: OnceLock<Mutex<HashMap<PathBuf, DbInstance>>> = OnceLock::new();
+
+fn open_dbs() -> &'static Mutex<HashMap<PathBuf, DbInstance>> {
+    OPEN_DBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Row returned by [`GraphStore::get_v3_claim_export`]. Pack-writer-
 /// adjacent shape: every field maps directly onto the v3 spec §3.3
@@ -268,34 +285,26 @@ impl GraphStore {
     pub fn init(path: &Path) -> Result<Self> {
         let db_path = path.join("graph.db");
 
-        // Durably switch graph.db to WAL journal mode BEFORE cozo opens it.
-        // cozo-ce's sqlite backend opens a *pool* of connections with no
-        // pragmas; under a write burst (e.g. a large compile) the default
-        // rollback journal makes pooled reader/writer connections conflict →
-        // `database is locked` (observed compiling 940 LongMemEval sessions).
-        // WAL lets readers and the single writer proceed concurrently and is
-        // PERSISTENT in the file header, so every cozo connection inherits it.
-        // Best-effort: a failure here must not block opening the DB.
-        if let Ok(conn) = sqlite::open(&db_path) {
-            let _ = conn.execute("PRAGMA journal_mode=WAL;");
-            let _ = conn.execute("PRAGMA synchronous=NORMAL;");
-            let _ = conn.execute("PRAGMA busy_timeout=10000;");
+        // Byte store is cheap; build it for either the shared or fresh path.
+        let byte_store: Arc<dyn SourceByteStore> = Arc::new(FileSystemSourceStore::new(path)?);
+
+        // RocksDB is exclusive-per-directory: share ONE handle if this graph dir
+        // is already open (the daemon handle + compile pipeline + branch ops all
+        // open the same path). Hold the registry lock across the open to
+        // serialize + race-proof first opens.
+        let mut reg = open_dbs().lock().expect("OPEN_DBS mutex poisoned");
+        if let Some(existing) = reg.get(&db_path) {
+            // Schema/migrations already run by the first opener (durable on disk).
+            return Ok(Self {
+                db: existing.clone(),
+                byte_store: Some(byte_store),
+            });
         }
 
-        let db = DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
-            .map_err(|e| Error::GraphStorage(format!("failed to open cozo db: {e}")))?;
-
-        // Wire the byte store to the same workspace data dir so the
-        // Witness Mesh bridge can materialise lossless statement text
-        // from `(source_id, byte_start, byte_end)` at read time.
-        // `FileSystemSourceStore::new` is infallible — it just builds
-        // the path; the actual directory is created lazily on first
-        // write by Phase 6 of the pipeline.
-        let byte_store: Arc<dyn SourceByteStore> =
-            Arc::new(FileSystemSourceStore::new(path)?);
+        let db = Self::open_backend(&db_path)?;
 
         let store = Self {
-            db,
+            db: db.clone(),
             byte_store: Some(byte_store),
         };
         store.create_schema()?;
@@ -315,7 +324,176 @@ impl GraphStore {
         // current schema, preserving whatever columns exist.
         store.reconcile_claims_schema()?;
         store.create_indexes()?;
+
+        // Publish the canonical handle so later opens of this dir share it.
+        reg.insert(db_path, db);
         Ok(store)
+    }
+
+    /// Drop the registry's strong reference to the open handle for this
+    /// workspace graph dir (call on unmount / LRU-evict). The underlying DB
+    /// closes once every live clone is also dropped — this just stops the
+    /// registry from pinning it open forever. No-op if not open.
+    pub fn release(graph_dir: &Path) {
+        if let Some(reg) = OPEN_DBS.get() {
+            let db_path = graph_dir.join("graph.db");
+            reg.lock().expect("OPEN_DBS mutex poisoned").remove(&db_path);
+        }
+    }
+
+    /// Open the configured Cozo backend at `db_path` (no schema). Default =
+    /// RocksDB ("newrocksdb"), a concurrent-writer LSM engine that removes
+    /// SQLite's single-writer ceiling + the `database is locked` class.
+    /// `TR_STORAGE_BACKEND=sqlite` reverts to SQLite (also used by the
+    /// SQLite→RocksDB migration to read old DBs).
+    fn open_backend(db_path: &Path) -> Result<DbInstance> {
+        let backend = std::env::var("TR_STORAGE_BACKEND").unwrap_or_else(|_| "newrocksdb".into());
+        if backend == "sqlite" {
+            // SQLite needs WAL set durably BEFORE cozo's pooled connections
+            // attach (best-effort; persists in the file header).
+            if let Ok(conn) = sqlite::open(db_path) {
+                let _ = conn.execute("PRAGMA journal_mode=WAL;");
+                let _ = conn.execute("PRAGMA synchronous=NORMAL;");
+                let _ = conn.execute("PRAGMA busy_timeout=10000;");
+            }
+            DbInstance::new("sqlite", db_path.to_str().unwrap_or("."), "")
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo sqlite db: {e}")))
+        } else {
+            // RocksDB: `db_path` is a DIRECTORY. Per-instance memory is bounded so
+            // many workspace brains coexist in one engine — a small block cache +
+            // write buffer, and `enable_write_buffer_manager` caps TOTAL memtable
+            // RAM across every open DB in the process.
+            let lru = std::env::var("TR_ROCKS_LRU_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            // 128MB default write buffer (was 32MB). The old 32MB ceiling
+            // DEADLOCKED large compiles: a single witness-mesh batch (~16k rows
+            // ≈ 30MB+) overran the buffer and RocksDB's WriteBufferManager
+            // stalled the next transaction commit FOREVER — `allow_stall` plus a
+            // single-DB stall has no path to recover (the flush that would free
+            // the buffer is gated behind the same stall). Proven via gdb: the
+            // main thread parked in WBMStallInterface::Block inside
+            // enqueue_atomic_extract's commit on a 217-doc compile.
+            let wbuf = std::env::var("TR_ROCKS_WRITEBUF_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(128);
+            // allow_stall=false by default: stall-based backpressure deadlocks in
+            // the single-DB case. With it off, the WriteBufferManager still caps
+            // TOTAL memtable RAM by TRIGGERING FLUSHES, but never BLOCKS a write
+            // waiting on one — memory is bounded by flush throughput instead of a
+            // deadlock-prone stall. Break-glass re-enable: TR_ROCKS_ALLOW_STALL=1.
+            let allow_stall = std::env::var("TR_ROCKS_ALLOW_STALL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let opts = format!(
+                "{{\"lru_cache_mb\":{lru},\"write_buffer_mb\":{wbuf},\
+                 \"enable_write_buffer_manager\":true,\"allow_stall\":{allow_stall}}}"
+            );
+            DbInstance::new("newrocksdb", db_path.to_str().unwrap_or("."), &opts)
+                .map_err(|e| Error::GraphStorage(format!("failed to open cozo rocksdb db: {e}")))
+        }
+    }
+
+    /// Open a FRESH (empty) Cozo DB at `path` and populate it from a portable
+    /// `backup` file via cozo `restore_backup` — which REQUIRES an empty target
+    /// (so we deliberately do NOT run `create_schema`; the backup carries the
+    /// full schema + data). Used by branch fork: the parent is dumped with
+    /// `backup_db`, the new branch dir is grown from that dump. Shares via the
+    /// OPEN_DBS registry like [`init`].
+    pub fn init_from_backup(path: &Path, backup: &Path) -> Result<Self> {
+        let db_path = path.join("graph.db");
+        let byte_store: Arc<dyn SourceByteStore> = Arc::new(FileSystemSourceStore::new(path)?);
+        let mut reg = open_dbs().lock().expect("OPEN_DBS mutex poisoned");
+        if let Some(existing) = reg.get(&db_path) {
+            // Already open (with data) — cannot restore into a non-empty DB. The
+            // caller forks into a FRESH dir, so this is unexpected; share it.
+            return Ok(Self { db: existing.clone(), byte_store: Some(byte_store) });
+        }
+        let db = Self::open_backend(&db_path)?;
+        db.restore_backup(backup)
+            .map_err(|e| Error::GraphStorage(format!("init_from_backup: restore failed: {e}")))?;
+        reg.insert(db_path, db.clone());
+        Ok(Self { db, byte_store: Some(byte_store) })
+    }
+
+    /// Overwrite this (live, non-empty) DB's relations from a portable `backup`
+    /// file via cozo `import_from_backup` (which, unlike `restore_backup`, works
+    /// on a populated DB). Imports every relation present in the backup. Used by
+    /// the rare recovery paths (merge rollback, integrity restore).
+    pub fn import_backup_over(&self, backup: &Path) -> Result<()> {
+        // Enumerate relation names from the running DB (`::relations` yields a
+        // `name` column); import each from the backup.
+        let rels = self.db.run_default("::relations").map_err(|e| {
+            Error::GraphStorage(format!("import_backup_over: list relations failed: {e}"))
+        })?;
+        let name_idx = rels.headers.iter().position(|h| h == "name").unwrap_or(0);
+        let names: Vec<String> = rels
+            .rows
+            .iter()
+            .filter_map(|r| r.get(name_idx))
+            .filter_map(|v| match v {
+                DataValue::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect();
+        self.db.import_from_backup(backup, &names).map_err(|e| {
+            Error::GraphStorage(format!("import_backup_over: import failed: {e}"))
+        })
+    }
+
+    /// One-time, LOSSLESS migration of a workspace graph dir from the SQLite
+    /// backend to RocksDB. SQLite `graph.db` is a FILE; this dumps it via cozo
+    /// `backup_db`, moves it aside (`graph.db.sqlite.bak`, reversible), then
+    /// grows a FRESH RocksDB directory at `graph.db` and `restore_backup`s the
+    /// dump into it. Idempotent: a `graph.db` that is already a directory is
+    /// skipped. Returns a human-readable summary line.
+    pub fn migrate_sqlite_to_rocksdb(graph_dir: &Path) -> Result<String> {
+        let db_file = graph_dir.join("graph.db");
+        if db_file.is_dir() {
+            return Ok(format!("skip (already RocksDB): {}", graph_dir.display()));
+        }
+        if !db_file.exists() {
+            return Ok(format!("skip (no graph.db): {}", graph_dir.display()));
+        }
+        let staging = graph_dir.join(".migrate-staging.bak");
+        let _ = std::fs::remove_file(&staging);
+        // 1. Dump the SQLite DB to a portable backup (explicit sqlite backend,
+        //    independent of TR_STORAGE_BACKEND).
+        {
+            let sqlite = DbInstance::new("sqlite", db_file.to_str().unwrap_or("."), "")
+                .map_err(|e| Error::GraphStorage(format!("migrate: open sqlite failed: {e}")))?;
+            sqlite
+                .backup_db(&staging)
+                .map_err(|e| Error::GraphStorage(format!("migrate: backup sqlite failed: {e}")))?;
+        } // sqlite handle dropped (file closed) before we move it
+        // 2. Move the SQLite file aside — reversible until verified.
+        let aside = graph_dir.join("graph.db.sqlite.bak");
+        std::fs::rename(&db_file, &aside)
+            .map_err(|e| Error::GraphStorage(format!("migrate: move sqlite aside failed: {e}")))?;
+        // 3. Grow a fresh RocksDB dir at graph.db and restore into it.
+        let claim_count = {
+            // Match open_backend's deadlock-safe defaults (128MB buffer,
+            // no stall) so a large SQLite→RocksDB restore can't wedge either.
+            let opts =
+                "{\"lru_cache_mb\":32,\"write_buffer_mb\":128,\"enable_write_buffer_manager\":true,\"allow_stall\":false}";
+            let rocks = DbInstance::new("newrocksdb", db_file.to_str().unwrap_or("."), opts)
+                .map_err(|e| Error::GraphStorage(format!("migrate: open rocksdb failed: {e}")))?;
+            rocks
+                .restore_backup(&staging)
+                .map_err(|e| Error::GraphStorage(format!("migrate: restore into rocksdb failed: {e}")))?;
+            rocks
+                .run_default("?[id] := *claims{id}")
+                .map(|r| r.rows.len())
+                .unwrap_or(0)
+        };
+        let _ = std::fs::remove_file(&staging);
+        Ok(format!(
+            "migrated SQLite→RocksDB: {} ({} claims; old DB kept at graph.db.sqlite.bak)",
+            graph_dir.display(),
+            claim_count
+        ))
     }
 
     /// Idempotent guarantee that `claims` has the complete current schema.
@@ -649,6 +827,20 @@ impl GraphStore {
                 canonical_name: String,
                 entity_type: String,
                 description: String default ''
+            }",
+            // ─── Entity attestation (#3, 2026-06-26). Bi-temporal sidecar for
+            //     entity NODES (the `entities` relation has no version columns).
+            //     Created idempotently on open (`create_schema` ignores
+            //     "already exists"), so it lands on existing volumes with no
+            //     migration. `retired_at < 0` ⇒ live; a recompile that drops an
+            //     entity's last live fact mention marks `retired_at = now`
+            //     (the node + its history are KEPT, never hard-deleted).
+            ":create entity_attestation {
+                entity_id: String
+                =>
+                attested: Bool default true,
+                last_attested_at: Float default 0.0,
+                retired_at: Float default -1.0
             }",
             ":create claim_source_edges {
                 claim_id: String,
@@ -1657,6 +1849,67 @@ impl GraphStore {
                 enqueued_at: Float default 0.0,
                 attempts: Int default 0
             }",
+            // compile_jobs — durable record of a compile run so the work is
+            // a persistent queued job, not an ephemeral HTTP side effect:
+            //  • a reconnecting console re-attaches to a live compile (status
+            //    `running` + the current `phase`),
+            //  • a compile keeps running server-side after the browser closes
+            //    (the SSE only OBSERVES — see rest.rs active_compiles),
+            //  • a crash-interrupted run is detected on boot (host_pid mismatch
+            //    → status `interrupted`) and surfaced honestly for Retry.
+            // status ∈ {running, done, failed, interrupted, cancelled};
+            // `done` is written ONLY on a genuine successful finish.
+            ":create compile_jobs {
+                job_id: String
+                =>
+                ws: String default '',
+                root_path: String default '',
+                branch: String default '',
+                status: String default 'running',
+                phase: String default 'starting',
+                source_count: Int default 0,
+                started_at: Float default 0.0,
+                updated_at: Float default 0.0,
+                error: String default '',
+                host_pid: Int default 0
+            }",
+            // ─── source_progress — durable per-doc enrichment lifecycle
+            //     (2026-06-27). One row per source tracking where it is AFTER the
+            //     mechanical compile: phase ∈ {queued, reading, facts, summary,
+            //     title, ready, failed}. This is the SINGLE source of truth for
+            //     the Console's per-doc status — real and refresh-proof
+            //     (RocksDB-durable), not a client-side guess. New relation →
+            //     created on mount via create_schema, zero migration.
+            ":create source_progress {
+                source_id: String
+                =>
+                phase: String default 'queued',
+                updated_at: Float default 0.0,
+                error: String default ''
+            }",
+            // ─── source_brief — the LLM-generated TITLE + one-line SUMMARY for a
+            //     doc, produced in a SINGLE call during enrichment (free title).
+            //     A sidecar (NOT a `sources` column → adding a column is a no-op on
+            //     a live brain, a new relation lands with zero migration).
+            ":create source_brief {
+                source_id: String
+                =>
+                title: String default '',
+                summary: String default '',
+                updated_at: Float default 0.0
+            }",
+            // ─── chunk_brief — a one-sentence, plain-English summary per CHUNK
+            //     (a "memory" in the Console's Memory Graph = a chunk's facts).
+            //     Produced by a batched LLM pass during enrichment so each memory
+            //     node reads as a consolidated sentence, not a raw fact. Sidecar,
+            //     zero migration.
+            ":create chunk_brief {
+                chunk_id: String
+                =>
+                source_id: String default '',
+                summary: String default '',
+                updated_at: Float default 0.0
+            }",
         ];
 
         for stmt in &relations {
@@ -1807,6 +2060,7 @@ impl GraphStore {
             "::index create spine_edges:by_kind { edge_kind }",
             "::index create concept_nodes:by_status { status }",
             "::index create atomic_extract_queue:by_status { status }",
+            "::index create compile_jobs:by_status { status }",
         ];
 
         for stmt in &indexes {

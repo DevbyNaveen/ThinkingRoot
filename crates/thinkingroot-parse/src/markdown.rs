@@ -59,7 +59,12 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     // the ENABLE_TABLES extension is on.  Without this flag pipe tables fall
     // through as prose, which is exactly the behaviour the wedge replaces.
     opts.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(content, opts);
+    // AUTHORITATIVE byte offsets: the offset iterator yields `(Event, Range)` so
+    // every chunk's byte range is the SOURCE span — never reconstructed by a
+    // substring search. This stops prose/table chunks (whose rendered text is not
+    // a verbatim substring) from failing the search and being silently dropped,
+    // which was losing the body of every structured doc (e.g. a big CLAUDE.md).
+    let parser = Parser::new_ext(content, opts).into_offset_iter();
 
     let mut current_heading: Option<String> = None;
     let mut current_text = String::new();
@@ -85,19 +90,32 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     let mut table_headers: Vec<String> = Vec::new();
     let mut table_body_row_idx: u32 = 0;
 
-    for event in parser {
+    // Authoritative byte spans (from the offset iterator). A prose run spans from
+    // its first paragraph's start to its last paragraph's end; block elements
+    // carry their own range. The chunk content becomes the verbatim source slice.
+    let mut prose_start: Option<usize> = None;
+    let mut prose_end: usize = 0;
+    let mut heading_start: usize = 0;
+    let mut code_start: usize = 0;
+    let mut list_start: usize = 0;
+
+    for (event, range) in parser {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 // Flush any accumulated prose.
                 flush_prose(
                     &mut doc,
                     &mut current_text,
+                    content,
+                    &mut prose_start,
+                    prose_end,
                     current_start_line,
                     line_counter,
                     &current_heading,
                     &mut current_links,
                 );
                 in_heading = true;
+                heading_start = range.start;
                 heading_text.clear();
                 current_heading_level = match level {
                     pulldown_cmark::HeadingLevel::H1 => 1,
@@ -123,7 +141,8 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
 
                     let mut heading_chunk =
                         Chunk::new(&heading, ChunkType::Heading, line_counter, line_counter)
-                            .with_heading(heading.clone());
+                            .with_heading(heading.clone())
+                            .with_byte_range(heading_start as u64, range.end as u64);
                     heading_chunk.metadata.heading_level = Some(current_heading_level);
                     heading_chunk.metadata.parent = parent;
                     doc.add_chunk(heading_chunk);
@@ -137,12 +156,16 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 flush_prose(
                     &mut doc,
                     &mut current_text,
+                    content,
+                    &mut prose_start,
+                    prose_end,
                     current_start_line,
                     line_counter,
                     &current_heading,
                     &mut current_links,
                 );
                 in_code_block = true;
+                code_start = range.start;
                 code_content.clear();
                 code_lang = match kind {
                     pulldown_cmark::CodeBlockKind::Fenced(lang) => {
@@ -160,7 +183,8 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                         ChunkType::Code,
                         line_counter.saturating_sub(lines),
                         line_counter,
-                    );
+                    )
+                    .with_byte_range(code_start as u64, range.end as u64);
                     if let Some(lang) = &code_lang {
                         chunk = chunk.with_language(lang.clone());
                     }
@@ -177,12 +201,16 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 flush_prose(
                     &mut doc,
                     &mut current_text,
+                    content,
+                    &mut prose_start,
+                    prose_end,
                     current_start_line,
                     line_counter,
                     &current_heading,
                     &mut current_links,
                 );
                 in_list = true;
+                list_start = range.start;
                 list_content.clear();
             }
             Event::End(TagEnd::List(_)) => {
@@ -193,7 +221,8 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                         ChunkType::List,
                         line_counter.saturating_sub(lines),
                         line_counter,
-                    );
+                    )
+                    .with_byte_range(list_start as u64, range.end as u64);
                     if let Some(h) = &current_heading {
                         chunk = chunk.with_heading(h.clone());
                     }
@@ -214,6 +243,9 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                 flush_prose(
                     &mut doc,
                     &mut current_text,
+                    content,
+                    &mut prose_start,
+                    prose_end,
                     current_start_line,
                     line_counter,
                     &current_heading,
@@ -255,7 +287,8 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
                         .collect::<Vec<_>>()
                         .join(" | ");
                     let mut chunk =
-                        Chunk::new(display, ChunkType::DataRow, line_counter, line_counter);
+                        Chunk::new(display, ChunkType::DataRow, line_counter, line_counter)
+                            .with_byte_range(range.start as u64, range.end as u64);
                     if let Some(h) = &current_heading {
                         chunk = chunk.with_heading(h.clone());
                     }
@@ -287,9 +320,16 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
             // its sentinel `[0,0]` range, which the sentence-witness extractor
             // treats as an empty span and drops. Mirror the source's blank line
             // so the chunk stays source-faithful and byte-anchorable.
+            Event::Start(Tag::Paragraph) => {
+                // Mark the start of a prose run (first paragraph since last flush).
+                if !in_heading && !in_code_block && !in_table && !in_list && prose_start.is_none() {
+                    prose_start = Some(range.start);
+                }
+            }
             Event::End(TagEnd::Paragraph) => {
                 if !in_heading && !in_code_block && !in_table && !in_list {
                     current_text.push_str("\n\n");
+                    prose_end = range.end; // extend the prose run to this paragraph's end
                 }
             }
             Event::Text(text) => {
@@ -340,17 +380,19 @@ fn parse_markdown_content(path: &Path, content: &str) -> Result<DocumentIR> {
     flush_prose(
         &mut doc,
         &mut current_text,
+        content,
+        &mut prose_start,
+        prose_end,
         current_start_line,
         line_counter,
         &current_heading,
         &mut current_links,
     );
 
-    // Backfill byte ranges on every chunk pulldown-cmark emitted (we don't
-    // use OffsetIter here because the existing event-loop accumulates state
-    // across events; the substring-search backfill is correct for typical
-    // markdown where chunks contain unique-enough text). Tree-sitter chunks
-    // would already carry ranges and are skipped.
+    // Defensive backstop only: every chunk above already carries an
+    // authoritative byte range from the offset iterator, so this is a no-op in
+    // practice. It still backfills any chunk that somehow lacks a range (kept so
+    // a future chunk type can't silently regress to the [0,0]-dropped path).
     doc.fill_byte_ranges(content);
 
     // Wedge 3: coalesce tiny adjacent prose chunks under the same heading.
@@ -427,25 +469,45 @@ pub fn coalesce_adjacent_prose(
     *chunks = out;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_prose(
     doc: &mut DocumentIR,
     text: &mut String,
+    source: &str,
+    prose_start: &mut Option<usize>,
+    prose_end: usize,
     start_line: u32,
     end_line: u32,
     heading: &Option<String>,
     links: &mut Vec<String>,
 ) {
-    let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        let mut chunk = Chunk::new(trimmed, ChunkType::Prose, start_line, end_line);
-        if let Some(h) = heading {
-            chunk = chunk.with_heading(h.clone());
-        }
-        chunk.metadata.links = std::mem::take(links);
-        doc.add_chunk(chunk);
-    }
+    // Prefer the AUTHORITATIVE byte span (first paragraph start → last paragraph
+    // end). The chunk content is then the VERBATIM source slice, so it is
+    // anchorable by construction (slice == content) and never dropped for a
+    // failed substring search. Falls back to the trimmed accumulated text only if
+    // no span was captured (defensive — shouldn't happen for real prose).
+    let span = prose_start.take();
+    let (content_str, range): (String, Option<(u64, u64)>) = match span {
+        Some(s) if prose_end > s && prose_end <= source.len() => (
+            source[s..prose_end].to_string(),
+            Some((s as u64, prose_end as u64)),
+        ),
+        _ => (text.trim().to_string(), None),
+    };
     text.clear();
-    links.clear(); // ensure cleared even if text was empty
+    if content_str.trim().is_empty() {
+        links.clear();
+        return;
+    }
+    let mut chunk = Chunk::new(&content_str, ChunkType::Prose, start_line, end_line);
+    if let Some((s, e)) = range {
+        chunk = chunk.with_byte_range(s, e);
+    }
+    if let Some(h) = heading {
+        chunk = chunk.with_heading(h.clone());
+    }
+    chunk.metadata.links = std::mem::take(links);
+    doc.add_chunk(chunk);
 }
 
 #[cfg(test)]
@@ -485,6 +547,53 @@ mod tests {
                 "paragraphs concatenated without separator: {:?}",
                 c.content
             );
+        }
+    }
+
+    #[test]
+    fn large_structured_doc_keeps_every_body_not_just_headings() {
+        // Regression (2026-06-27): a big CLAUDE.md kept its headings (verbatim →
+        // matched the substring search) but DROPPED every body paragraph (the
+        // parser re-rendered prose so it was no longer a source substring →
+        // fill_byte_ranges failed → [0,0] → structural_persist dropped it). With
+        // authoritative offsets, EVERY chunk has a real range and no body is lost.
+        let content = "\
+# Section One
+
+The first body paragraph mentions RocksDB as the storage backend.
+
+# Section Two
+
+The second body paragraph mentions the gte-modernbert embedder.
+
+# Section Three
+
+The third body paragraph mentions per-project engine isolation.
+";
+        let doc = parse_markdown_content(Path::new("CLAUDE.md"), content).unwrap();
+        // No chunk may carry the [0,0] sentinel — nothing is dropped downstream.
+        for c in &doc.chunks {
+            assert!(
+                c.byte_end > c.byte_start,
+                "chunk has empty byte range (would be dropped): {:?}",
+                c.content
+            );
+        }
+        // Every body must survive (not just the headings).
+        let bodies: String = doc
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_type == ChunkType::Prose)
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(bodies.contains("RocksDB"), "body 1 lost: {bodies}");
+        assert!(bodies.contains("gte-modernbert"), "body 2 lost: {bodies}");
+        assert!(bodies.contains("per-project engine isolation"), "body 3 lost: {bodies}");
+        // Prose content is the verbatim source slice (anchorable by construction).
+        for c in doc.chunks.iter().filter(|c| c.chunk_type == ChunkType::Prose) {
+            let slice = &content[c.byte_start as usize..c.byte_end as usize];
+            assert_eq!(slice, c.content, "prose chunk range does not map to content");
         }
     }
 

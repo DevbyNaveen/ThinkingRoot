@@ -2030,81 +2030,97 @@ pub struct VectorReconcileStats {
 /// and the operator `rebuild_vector_index` tool — call
 /// `rebuild_vector_index` instead.
 pub fn reconcile_vector_index(
-    storage: &mut StorageEngine,
+    storage_arc: std::sync::Arc<tokio::sync::Mutex<StorageEngine>>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<VectorReconcileStats> {
-    /// Per-chunk size used by the embed loop. Calibrated for honest
-    /// cancel cadence: ~50 ms/embed × 64 ≈ ~3.2 s worst case per
-    /// chunk before observing the cancel token.
+    // LOCK-FAIRNESS: the storage Mutex is RE-ACQUIRED per chunk and released
+    // between chunks, so a foreground /ask waiting on storage.lock() interleaves
+    // after at most one chunk (~1-3s) instead of blocking for the whole
+    // multi-minute embed. The pre-fix code held storage.blocking_lock() across
+    // the ENTIRE reconcile — at 16873 claims that starved every ask for ~13 min
+    // (root-caused 2026-06-28). Mirrors the lock-release pattern compile() uses.
     const RECONCILE_EMBED_CHUNK: usize = 64;
 
     let started = std::time::Instant::now();
 
-    let existing_keys = storage.vector.index_ids();
-    let existing_set: std::collections::HashSet<String> = existing_keys.into_iter().collect();
-    let existing_count = existing_set.len();
+    // Phase 1 — BRIEF LOCK: snapshot graph, compute the index delta, apply removals.
+    let (to_add, removed, existing_count, current_count) = {
+        let mut storage = storage_arc.blocking_lock();
 
-    let entities = storage.graph.get_all_entities()?;
-    let claims = storage.graph.get_all_claims_with_sources()?;
+        let existing_keys = storage.vector.index_ids();
+        let existing_set: std::collections::HashSet<String> = existing_keys.into_iter().collect();
+        let existing_count = existing_set.len();
 
-    let mut current_set: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(entities.len() + claims.len());
-    let mut items_by_id: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::with_capacity(entities.len() + claims.len());
+        let entities = storage.graph.get_all_entities()?;
+        let claims = storage.graph.get_all_claims_with_sources()?;
 
-    for (id, name, etype) in &entities {
-        let key = format!("entity:{id}");
-        current_set.insert(key.clone());
-        items_by_id.insert(
-            key,
-            (
-                format!("{name} ({etype})"),
-                format!("entity|{id}|{name}|{etype}"),
-            ),
-        );
-    }
-    for (id, statement, ctype, conf, uri, _) in &claims {
-        let key = format!("claim:{id}");
-        current_set.insert(key.clone());
-        items_by_id.insert(
-            key,
-            (
-                statement.clone(),
-                format!("claim|{id}|{ctype}|{conf}|{uri}"),
-            ),
-        );
-    }
-    let current_count = current_set.len();
+        let mut current_set: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(entities.len() + claims.len());
+        let mut items_by_id: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::with_capacity(entities.len() + claims.len());
 
-    let to_remove_owned: Vec<String> = existing_set.difference(&current_set).cloned().collect();
-    let to_remove_refs: Vec<&str> = to_remove_owned.iter().map(|s| s.as_str()).collect();
+        for (id, name, etype) in &entities {
+            let key = format!("entity:{id}");
+            current_set.insert(key.clone());
+            items_by_id.insert(
+                key,
+                (
+                    format!("{name} ({etype})"),
+                    format!("entity|{id}|{name}|{etype}"),
+                ),
+            );
+        }
+        for (id, statement, ctype, conf, uri, _) in &claims {
+            let key = format!("claim:{id}");
+            current_set.insert(key.clone());
+            items_by_id.insert(
+                key,
+                (
+                    statement.clone(),
+                    format!("claim|{id}|{ctype}|{conf}|{uri}"),
+                ),
+            );
+        }
+        let current_count = current_set.len();
 
-    let to_add: Vec<(String, String, String)> = current_set
-        .difference(&existing_set)
-        .filter_map(|id| {
-            items_by_id
-                .get(id)
-                .map(|(text, meta)| (id.clone(), text.clone(), meta.clone()))
-        })
-        .collect();
+        let to_remove_owned: Vec<String> = existing_set.difference(&current_set).cloned().collect();
+        let to_remove_refs: Vec<&str> = to_remove_owned.iter().map(|s| s.as_str()).collect();
 
-    let removed = to_remove_refs.len();
-    storage.vector.remove_by_ids(&to_remove_refs);
+        let to_add: Vec<(String, String, String)> = current_set
+            .difference(&existing_set)
+            .filter_map(|id| {
+                items_by_id
+                    .get(id)
+                    .map(|(text, meta)| (id.clone(), text.clone(), meta.clone()))
+            })
+            .collect();
 
-    // Embed in cancel-aware chunks. `upsert_batch` calls ONNX
-    // inference once per chunk — coarser chunks would be faster but
-    // would burn longer before observing cancel. 64 strikes the
-    // honest cadence balance.
+        let removed = to_remove_refs.len();
+        storage.vector.remove_by_ids(&to_remove_refs);
+
+        (to_add, removed, existing_count, current_count)
+    };
+    tracing::warn!(target: "tr_timing", "RECONCILE phase1_ms={} to_add={}", started.elapsed().as_millis(), to_add.len());
+
+    // Phase 2 — embed in chunks, RE-LOCKING per chunk. upsert_batch (ONNX embed +
+    // index insert) needs the lock, but we drop it between every chunk so queued
+    // foreground reads (search/ask) interleave instead of waiting out the embed.
     let mut added = 0usize;
     for chunk in to_add.chunks(RECONCILE_EMBED_CHUNK) {
         if cancel.is_cancelled() {
             return Err(thinkingroot_core::Error::Cancelled);
         }
-        storage.vector.upsert_batch(chunk)?;
+        {
+            let mut storage = storage_arc.blocking_lock();
+            storage.vector.upsert_batch(chunk)?;
+        } // lock released here
         added += chunk.len();
     }
 
+    tracing::warn!(target: "tr_timing", "RECONCILE embed_done total_ms={} added={}", started.elapsed().as_millis(), added);
+    // Phase 3 — BRIEF LOCK: persist if the index changed.
     if removed > 0 || added > 0 {
+        let mut storage = storage_arc.blocking_lock();
         storage.vector.save()?;
     }
 

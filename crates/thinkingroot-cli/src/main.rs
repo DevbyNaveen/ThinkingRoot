@@ -329,6 +329,26 @@ enum Commands {
         /// Path to the file to hash.
         path: std::path::PathBuf,
     },
+    /// One-time, LOSSLESS SQLite→RocksDB storage migration: walk a data dir
+    /// (e.g. the per-project `/workspace` volume) and convert every workspace /
+    /// branch / user-brain `graph.db` from a SQLite FILE to a RocksDB directory
+    /// via cozo backup→restore. Idempotent (already-RocksDB dirs are skipped);
+    /// the old SQLite file is kept beside it as `graph.db.sqlite.bak`.
+    #[command(hide = true)]
+    StorageMigrate {
+        /// Data dir to walk recursively for `graph.db` files.
+        dir: std::path::PathBuf,
+    },
+    /// Restore a workspace graph from a portable backup file (cozo
+    /// `restore_backup`) into a FRESH RocksDB dir — disaster recovery from an
+    /// object-storage backup. Any existing `graph.db` is moved aside first.
+    #[command(hide = true)]
+    StorageRestore {
+        /// The workspace graph dir (e.g. …/.thinkingroot/graph).
+        graph_dir: std::path::PathBuf,
+        /// The portable `.bak` file (a cozo backup) to restore from.
+        backup: std::path::PathBuf,
+    },
     /// Multi-agent flow orchestration (C19, 2026-05-22).
     ///
     /// Declare YAML/TOML flow definitions and run them locally
@@ -1920,6 +1940,83 @@ async fn async_main() -> anyhow::Result<()> {
             let mut hasher = blake3::Hasher::new();
             std::io::copy(&mut file, &mut hasher)?;
             println!("{}", hasher.finalize().to_hex());
+            return Ok(());
+        }
+        Some(Commands::StorageMigrate { dir }) => {
+            // Walk for every `graph.db` (a FILE = SQLite) under the data dir and
+            // migrate each workspace/branch/user brain to RocksDB. A `graph.db`
+            // that is a DIRECTORY is already RocksDB — skip it and don't descend.
+            let mut stack = vec![dir.clone()];
+            let (mut migrated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&d) else { continue };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let is_graph_db = p.file_name().and_then(|n| n.to_str()) == Some("graph.db");
+                    let Ok(ft) = e.file_type() else { continue };
+                    if ft.is_dir() {
+                        if !is_graph_db {
+                            stack.push(p);
+                        }
+                    } else if is_graph_db {
+                        if let Some(parent) = p.parent() {
+                            match thinkingroot_graph::graph::GraphStore::migrate_sqlite_to_rocksdb(
+                                parent,
+                            ) {
+                                Ok(msg) => {
+                                    println!("{msg}");
+                                    if msg.starts_with("migrated") {
+                                        migrated += 1;
+                                    } else {
+                                        skipped += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("FAILED {}: {e}", parent.display());
+                                    failed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "storage migrate done: {migrated} migrated, {skipped} skipped, {failed} failed"
+            );
+            if failed > 0 {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Commands::StorageRestore { graph_dir, backup }) => {
+            let db = graph_dir.join("graph.db");
+            if db.exists() {
+                let ts = chrono::Utc::now().timestamp();
+                let aside = graph_dir.join(format!("graph.db.pre-restore-{ts}"));
+                std::fs::rename(&db, &aside)
+                    .with_context(|| format!("moving existing graph.db aside to {}", aside.display()))?;
+                println!("moved existing graph.db -> {}", aside.display());
+            }
+            let store =
+                thinkingroot_graph::graph::GraphStore::init_from_backup(&graph_dir, &backup)
+                    .with_context(|| {
+                        format!(
+                            "restoring {} from {}",
+                            graph_dir.display(),
+                            backup.display()
+                        )
+                    })?;
+            let n = store
+                .raw_db()
+                .run_default("?[id] := *claims{id}")
+                .map(|r| r.rows.len())
+                .unwrap_or(0);
+            println!(
+                "restored {} ({} claims) from {}",
+                graph_dir.display(),
+                n,
+                backup.display()
+            );
             return Ok(());
         }
         Some(Commands::Flow { action }) => {

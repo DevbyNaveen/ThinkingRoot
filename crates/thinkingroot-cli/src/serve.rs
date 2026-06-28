@@ -453,6 +453,9 @@ pub async fn run_serve(
     // North-star async atomic-fact extractor (default-ON; TR_ATOMIC_EXTRACT=0 disables).
     let _atomic_extract_handle =
         thinkingroot_serve::maintenance::spawn_atomic_extract(state.engine.clone());
+    // Phase 5 reliability — reap compile jobs orphaned by a previous crash.
+    let _compile_reaper_handle =
+        thinkingroot_serve::maintenance::spawn_compile_job_reaper(state.engine.clone());
 
     // Slice 3 — file-system watcher for workspace lifecycle events.
     // Read the active workspace_root via the same RwLock the mount
@@ -866,6 +869,9 @@ async fn run_serve_with_listener(
     // North-star async atomic-fact extractor (default-ON; TR_ATOMIC_EXTRACT=0 disables).
     let _atomic_extract_handle =
         thinkingroot_serve::maintenance::spawn_atomic_extract(state.engine.clone());
+    // Phase 5 reliability — reap compile jobs orphaned by a previous crash.
+    let _compile_reaper_handle =
+        thinkingroot_serve::maintenance::spawn_compile_job_reaper(state.engine.clone());
 
     // Slice 3 — file-system watcher (parity with the bound-port path).
     let watcher_active = state.clone();

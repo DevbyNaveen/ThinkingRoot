@@ -3688,18 +3688,22 @@ impl LlmClient {
                 break;
             }
 
+            let _t_slot = std::time::Instant::now(); // TR_TIMING_CWU
             let opt_ticket = if let Some(ref sched) = self.scheduler {
                 Some(sched.wait_for_slot().await)
             } else {
                 None
             };
+            let slot_ms = _t_slot.elapsed().as_millis();
 
             let outer = outer_timeout_secs(self.timeout_secs);
+            let _t_http = std::time::Instant::now();
             let chat_result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(outer),
                 self.provider.chat(system, user),
             )
             .await;
+            tracing::warn!(target: "tr_timing", "CWU wait_for_slot={}ms provider.chat={}ms", slot_ms, _t_http.elapsed().as_millis());
 
             let provider_result = match chat_result {
                 Ok(r) => r,

@@ -261,8 +261,10 @@ fn restore_one(root_path: &Path, intent: &MergeIntent) -> Result<Option<PathBuf>
         .expect("non-empty after filter")
         .clone();
 
-    let live = graph_dir.join("graph.db");
-    std::fs::copy(&snapshot, &live).map_err(|e| Error::io_path(&live, e))?;
+    // Snapshot is a portable backup; graph.db is a (non-empty) RocksDB dir, so
+    // restore via import_from_backup rather than a file copy.
+    let store = thinkingroot_graph::graph::GraphStore::init(&graph_dir)?;
+    store.import_backup_over(&snapshot)?;
     tracing::info!(
         source_branch = %intent.source_branch,
         target_branch = ?intent.target_branch,

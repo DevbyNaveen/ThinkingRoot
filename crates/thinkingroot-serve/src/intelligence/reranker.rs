@@ -89,6 +89,47 @@ impl Reranker {
     }
 }
 
+/// Lexical RETRIEVAL arm (L2 hybrid): BM25-rank a corpus of `(id, text)` docs
+/// against `query`, returning `(id, raw_bm25)` for docs with non-zero term
+/// overlap, highest first. Ranks the WHOLE corpus (not just an existing
+/// candidate set) so a rare-term fact the dense embedding missed still enters.
+pub fn bm25_rank(query: &str, docs: &[(String, String)]) -> Vec<(String, f32)> {
+    let r = Reranker::new(query);
+    if r.query_terms.is_empty() || docs.is_empty() {
+        return Vec::new();
+    }
+    let toks: Vec<Vec<String>> = docs.iter().map(|(_, t)| tokenise(t)).collect();
+    let stats = CorpusStats::from(&toks);
+    let mut scored: Vec<(String, f32)> = docs
+        .iter()
+        .zip(toks.iter())
+        .map(|((id, _), d)| (id.clone(), r.bm25_raw(d, &stats)))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+/// Reciprocal Rank Fusion of several ranked id-lists. `rrf(id) = sum 1/(k+rank)`
+/// (rank 0-based). Parameter-free, robust across incomparable score scales
+/// (cosine vs BM25); k=60 canonical (Cormack et al. 2009). Ties break first-seen.
+pub fn rrf_fuse(lists: &[&[String]], k: f64) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut score: HashMap<&str, f64> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            let e = score.entry(id.as_str()).or_insert_with(|| {
+                order.push(id.as_str());
+                0.0
+            });
+            *e += 1.0 / (k + rank as f64 + 1.0);
+        }
+    }
+    order.sort_by(|a, b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.into_iter().map(String::from).collect()
+}
+
 /// Min-max normalisation across a candidate set: maps the highest
 /// raw BM25 score to 1.0 and the lowest (≥0) to 0.0.  When every
 /// candidate scores zero (no term overlap anywhere) the function

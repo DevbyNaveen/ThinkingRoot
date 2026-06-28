@@ -83,6 +83,12 @@ pub enum EntityType {
     Function,
     Config,
     Organization,
+    /// A named product / brand / offering (e.g. "iPhone", "Stripe Billing").
+    Product,
+    /// A named happening with a time-anchor (e.g. "WWDC 2025", "the Q3 launch").
+    Event,
+    /// A named place (e.g. "San Francisco", "Building 4").
+    Location,
 }
 
 impl EntityType {
@@ -104,6 +110,9 @@ impl EntityType {
             Self::Function => "function",
             Self::Config => "config",
             Self::Organization => "organization",
+            Self::Product => "product",
+            Self::Event => "event",
+            Self::Location => "location",
         }
     }
 
@@ -127,6 +136,9 @@ impl EntityType {
             "function" | "Function" => Some(Self::Function),
             "config" | "Config" => Some(Self::Config),
             "organization" | "Organization" => Some(Self::Organization),
+            "product" | "Product" => Some(Self::Product),
+            "event" | "Event" => Some(Self::Event),
+            "location" | "Location" => Some(Self::Location),
             _ => None,
         }
     }
