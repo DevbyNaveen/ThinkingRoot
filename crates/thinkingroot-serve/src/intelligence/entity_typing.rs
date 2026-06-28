@@ -238,14 +238,38 @@ fn extract_json_array(resp: &str) -> Option<String> {
     }
 }
 
-/// Run the typing/verify pass over a source's candidate entities. One LLM call
-/// for the whole batch (cheap, off the storage lock). On any LLM error, returns
+/// Max candidates per typing LLM call. A large source can surface hundreds of
+/// distinct entities; typing them all in ONE call overruns the model's output
+/// token budget (finish_reason=length → truncated → parse fails → the whole
+/// source falls back to neutral literal-guard typing AND burns a full ~32k-token
+/// generation per attempt). That was the dominant cost stalling large-doc atomic
+/// extraction. Bounding each call keeps the response small, so typing succeeds
+/// and stays cheap; only a genuinely-failing batch degrades, not the whole source.
+const TYPING_BATCH: usize = 40;
+
+/// Run the typing/verify pass over a source's candidate entities, in bounded
+/// batches (see [`TYPING_BATCH`]). On any per-batch LLM error, that batch returns
 /// the graceful fallback (keep-all, literal-guarded, neutral type) so the caller
-/// can still promote — correctness degrades, the pipeline does not stall.
+/// can still promote — correctness degrades for that batch only, never a stall.
 pub async fn type_source_entities(
     llm: &LlmClient,
     candidates: &[Candidate],
 ) -> Vec<TypingDecision> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    if candidates.len() <= TYPING_BATCH {
+        return type_one_batch(llm, candidates).await;
+    }
+    let mut out = Vec::with_capacity(candidates.len());
+    for batch in candidates.chunks(TYPING_BATCH) {
+        out.extend(type_one_batch(llm, batch).await);
+    }
+    out
+}
+
+/// Type a single bounded batch of candidates in one LLM call.
+async fn type_one_batch(llm: &LlmClient, candidates: &[Candidate]) -> Vec<TypingDecision> {
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -254,7 +278,7 @@ pub async fn type_source_entities(
     match llm.chat(&system, &prompt).await {
         Ok(resp) => parse_typing(&resp, candidates),
         Err(e) => {
-            tracing::warn!("entity typing LLM failed ({e}); using literal-guard fallback");
+            tracing::warn!("entity typing batch failed ({e}); using literal-guard fallback");
             // Fallback: literal guard still applies; everything else kept neutral.
             candidates
                 .iter()

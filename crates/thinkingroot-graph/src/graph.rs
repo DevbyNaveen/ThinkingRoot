@@ -385,13 +385,29 @@ impl GraphStore {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(32);
+            // 128MB default write buffer (was 32MB). The old 32MB ceiling
+            // DEADLOCKED large compiles: a single witness-mesh batch (~16k rows
+            // ≈ 30MB+) overran the buffer and RocksDB's WriteBufferManager
+            // stalled the next transaction commit FOREVER — `allow_stall` plus a
+            // single-DB stall has no path to recover (the flush that would free
+            // the buffer is gated behind the same stall). Proven via gdb: the
+            // main thread parked in WBMStallInterface::Block inside
+            // enqueue_atomic_extract's commit on a 217-doc compile.
             let wbuf = std::env::var("TR_ROCKS_WRITEBUF_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(32);
+                .unwrap_or(128);
+            // allow_stall=false by default: stall-based backpressure deadlocks in
+            // the single-DB case. With it off, the WriteBufferManager still caps
+            // TOTAL memtable RAM by TRIGGERING FLUSHES, but never BLOCKS a write
+            // waiting on one — memory is bounded by flush throughput instead of a
+            // deadlock-prone stall. Break-glass re-enable: TR_ROCKS_ALLOW_STALL=1.
+            let allow_stall = std::env::var("TR_ROCKS_ALLOW_STALL")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let opts = format!(
                 "{{\"lru_cache_mb\":{lru},\"write_buffer_mb\":{wbuf},\
-                 \"enable_write_buffer_manager\":true,\"allow_stall\":true}}"
+                 \"enable_write_buffer_manager\":true,\"allow_stall\":{allow_stall}}}"
             );
             DbInstance::new("newrocksdb", db_path.to_str().unwrap_or("."), &opts)
                 .map_err(|e| Error::GraphStorage(format!("failed to open cozo rocksdb db: {e}")))
@@ -483,8 +499,10 @@ impl GraphStore {
             .map_err(|e| Error::GraphStorage(format!("migrate: move sqlite aside failed: {e}")))?;
         // 3. Grow a fresh RocksDB dir at graph.db and restore into it.
         let claim_count = {
+            // Match open_backend's deadlock-safe defaults (128MB buffer,
+            // no stall) so a large SQLite→RocksDB restore can't wedge either.
             let opts =
-                "{\"lru_cache_mb\":32,\"write_buffer_mb\":32,\"enable_write_buffer_manager\":true,\"allow_stall\":true}";
+                "{\"lru_cache_mb\":32,\"write_buffer_mb\":128,\"enable_write_buffer_manager\":true,\"allow_stall\":false}";
             let rocks = DbInstance::new("newrocksdb", db_file.to_str().unwrap_or("."), opts)
                 .map_err(|e| Error::GraphStorage(format!("migrate: open rocksdb failed: {e}")))?;
             rocks

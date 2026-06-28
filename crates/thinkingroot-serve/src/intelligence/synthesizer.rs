@@ -833,6 +833,7 @@ pub async fn ask(
 
     use crate::intelligence::retriever::retrieve_claims;
 
+    let _t_retrieve = std::time::Instant::now(); // TR_TIMING_ASK
     let mut claims = retrieve_claims(
         engine,
         req.workspace,
@@ -852,6 +853,7 @@ pub async fn ask(
         claims.retain(|c| !req.excluded_claim_ids.contains(&c.id));
     }
 
+    tracing::warn!(target: "tr_timing", "ASK retrieve_claims={}ms claims={}", _t_retrieve.elapsed().as_millis(), claims.len());
     let claims_used = claims.len();
 
     if claims.is_empty() {
@@ -880,7 +882,9 @@ pub async fn ask(
         };
     };
 
+    let _t_syn = std::time::Instant::now();
     let (answer, usage) = synthesize(&claims, &llm_client, req).await;
+    tracing::warn!(target: "tr_timing", "ASK synthesize={}ms", _t_syn.elapsed().as_millis());
     AskResponse {
         answer,
         claims_used,

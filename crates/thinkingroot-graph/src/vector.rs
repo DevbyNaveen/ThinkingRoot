@@ -905,6 +905,162 @@ mod inner {
         }
         dot / (norm_a * norm_b)
     }
+
+    // ========================================================================
+    // Pillar 2 (2026-06-28) — lock-free read snapshot (RCU). An immutable copy
+    // of the searchable state with the HNSW PRE-BUILT, so a recall needs NO
+    // storage Mutex and NO &mut. Published by the write path after each
+    // reconcile/upsert and read via RwLock<Arc<ReadSnapshot>> where the read
+    // lock is held only for a nanosecond Arc-clone. Mirrors VectorStore's own
+    // search logic but &self over the frozen snapshot.
+    // ========================================================================
+    pub struct ReadSnapshot {
+        index: HashMap<String, (QuantizedVec, String)>,
+        #[allow(dead_code)]
+        tokens: HashMap<String, Vec<QuantizedVec>>,
+        ann: Option<HnswMap<EmbPoint, String>>,
+    }
+
+    impl ReadSnapshot {
+        pub fn empty() -> Self {
+            Self { index: HashMap::new(), tokens: HashMap::new(), ann: None }
+        }
+        pub fn len(&self) -> usize { self.index.len() }
+        pub fn is_empty(&self) -> bool { self.index.is_empty() }
+
+        /// Lock-free scoped search (mirror of VectorStore::search_scoped).
+        pub fn search_scoped(
+            &self,
+            query_vec: &[f32],
+            top_k: usize,
+            allowed_source_uris: Option<&std::collections::HashSet<String>>,
+        ) -> Vec<(String, String, f32)> {
+            if self.index.is_empty() { return Vec::new(); }
+            if allowed_source_uris.is_none() && self.index.len() >= ANN_THRESHOLD {
+                return self.search_vec_ann(query_vec, top_k);
+            }
+            let mut scores: Vec<(String, String, f32)> = self
+                .index
+                .iter()
+                .filter(|(_, (_, meta))| {
+                    if let Some(allowed) = allowed_source_uris {
+                        if meta.starts_with("claim|") {
+                            let uri = meta.rsplit('|').next().unwrap_or("");
+                            return allowed.iter().any(|sid| uri.contains(sid.as_str()));
+                        }
+                    }
+                    true
+                })
+                .map(|(id, (vec, meta))| {
+                    (id.clone(), meta.clone(), cosine_query_to_i8(query_vec, vec))
+                })
+                .collect();
+            scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(top_k);
+            scores
+        }
+
+        /// Lock-free prefix search (mirror of VectorStore::search_prefix).
+        pub fn search_prefix(
+            &self,
+            query_vec: &[f32],
+            top_k: usize,
+            meta_prefix: &str,
+        ) -> Vec<(String, String, f32)> {
+            if self.index.is_empty() { return Vec::new(); }
+            let mut scores: Vec<(String, String, f32)> = self
+                .index
+                .iter()
+                .filter(|(_, (_, meta))| meta.starts_with(meta_prefix))
+                .map(|(id, (vec, meta))| {
+                    (id.clone(), meta.clone(), cosine_query_to_i8(query_vec, vec))
+                })
+                .collect();
+            scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(top_k);
+            scores
+        }
+
+        fn search_vec_ann(&self, query_vec: &[f32], top_k: usize) -> Vec<(String, String, f32)> {
+            if top_k == 0 || self.index.is_empty() { return Vec::new(); }
+            let map = match self.ann.as_ref() {
+                Some(m) => m,
+                None => return self.brute(query_vec, top_k),
+            };
+            let overfetch = (top_k * 4).max(64);
+            let q = EmbPoint(quantize_i8(query_vec));
+            let mut search = Search::default();
+            let candidate_ids: Vec<String> = map
+                .search(&q, &mut search)
+                .take(overfetch)
+                .map(|item| item.value.clone())
+                .collect();
+            let mut scored: Vec<(String, String, f32)> = candidate_ids
+                .iter()
+                .filter_map(|id| {
+                    self.index
+                        .get(id)
+                        .map(|(vec, meta)| (id.clone(), meta.clone(), cosine_query_to_i8(query_vec, vec)))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(top_k);
+            scored
+        }
+
+        fn brute(&self, query_vec: &[f32], top_k: usize) -> Vec<(String, String, f32)> {
+            let mut scores: Vec<(String, String, f32)> = self
+                .index
+                .iter()
+                .map(|(id, (vec, meta))| (id.clone(), meta.clone(), cosine_query_to_i8(query_vec, vec)))
+                .collect();
+            scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(top_k);
+            scores
+        }
+    }
+
+    impl VectorStore {
+        /// Build an immutable lock-free read snapshot (Pillar 2). Clones the
+        /// index/tokens and pre-builds the HNSW so readers never mutate.
+        pub fn build_snapshot(&self) -> ReadSnapshot {
+            let ann = if self.index.len() >= ANN_THRESHOLD {
+                let mut points = Vec::with_capacity(self.index.len());
+                let mut values = Vec::with_capacity(self.index.len());
+                for (id, (qvec, _meta)) in &self.index {
+                    points.push(EmbPoint(qvec.clone()));
+                    values.push(id.clone());
+                }
+                Some(Builder::default().build(points, values))
+            } else {
+                None
+            };
+            ReadSnapshot { index: self.index.clone(), tokens: self.tokens.clone(), ann }
+        }
+    }
+
+    /// Process-global READ embedder (Pillar 1). A dedicated ONNX session for
+    /// query embedding so a live recall's embed never serializes behind the
+    /// bulk/ingest embed (VectorStore::model). Thread-safe ORT session; loaded
+    /// once. Used by the lock-free read path (no storage Mutex).
+    static SHARED_READ_EMBEDDER: std::sync::OnceLock<std::sync::Mutex<Option<OrtEmbeddingModel>>> =
+        std::sync::OnceLock::new();
+
+    /// Embed a single query string via the dedicated read embedder.
+    pub fn embed_query(text: &str) -> Result<Vec<f32>> {
+        let cell = SHARED_READ_EMBEDDER.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cell
+            .lock()
+            .map_err(|_| Error::GraphStorage("read-embedder mutex poisoned".into()))?;
+        if guard.is_none() {
+            tracing::info!("loading READ embedding model (first use, dedicated lane)…");
+            *guard = Some(OrtEmbeddingModel::load(&default_embed_paths(), EMBED_DIM, EMBED_MAX_LEN)?);
+        }
+        let model = guard.as_mut().expect("just-loaded");
+        let mut out = model.embed(&[text])?;
+        Ok(out.drain(..).next().unwrap_or_default())
+    }
+
 }
 
 // ─── No-op Stub ──────────────────────────────────────────────────────────────
@@ -1032,10 +1188,34 @@ mod inner {
             std::collections::HashMap::new()
         }
     }
+
+    pub struct ReadSnapshot;
+    impl ReadSnapshot {
+        pub fn empty() -> Self { Self }
+        pub fn len(&self) -> usize { 0 }
+        pub fn is_empty(&self) -> bool { true }
+        pub fn search_scoped(
+            &self,
+            _query_vec: &[f32],
+            _top_k: usize,
+            _allowed: Option<&std::collections::HashSet<String>>,
+        ) -> Vec<(String, String, f32)> { Vec::new() }
+        pub fn search_prefix(
+            &self,
+            _query_vec: &[f32],
+            _top_k: usize,
+            _meta_prefix: &str,
+        ) -> Vec<(String, String, f32)> { Vec::new() }
+    }
+    impl VectorStore {
+        pub fn build_snapshot(&self) -> ReadSnapshot { ReadSnapshot }
+    }
+    pub fn embed_query(_text: &str) -> Result<Vec<f32>> { Ok(Vec::new()) }
+
 }
 
 // Re-export whichever impl was compiled.
-pub use inner::VectorStore;
+pub use inner::{embed_query, ReadSnapshot, VectorStore};
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 

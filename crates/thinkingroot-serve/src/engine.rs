@@ -1117,6 +1117,12 @@ struct WorkspaceHandle {
     root_path: PathBuf,
     /// Write operations (pipeline, agent contribute) go through CozoDB.
     storage: Arc<Mutex<StorageEngine>>,
+    /// Pillar 2 (2026-06-28): lock-free RCU read snapshot of the vector index.
+    /// Recall reads this WITHOUT the storage Mutex (read lock held only for a
+    /// nanosecond Arc-clone); the write path rebuilds + publishes it after
+    /// reconcile so background re-embedding never starves live recall.
+    vector_snapshot:
+        std::sync::Arc<std::sync::RwLock<std::sync::Arc<thinkingroot_graph::vector::ReadSnapshot>>>,
     /// All read operations are served from this in-memory cache.
     /// Multiple concurrent requests read simultaneously; compile/contribute
     /// take an exclusive write lock to reload after mutating CozoDB.
@@ -2557,6 +2563,12 @@ impl QueryEngine {
             WorkspaceHandle {
                 name,
                 root_path,
+                // Pillar 2: build the initial lock-free snapshot from the loaded
+                // index BEFORE `storage` is moved into the Mutex (struct fields
+                // evaluate top-to-bottom, so this borrow precedes the move).
+                vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
@@ -2631,6 +2643,12 @@ impl QueryEngine {
             WorkspaceHandle {
                 name,
                 root_path,
+                // Pillar 2: build the initial lock-free snapshot from the loaded
+                // index BEFORE `storage` is moved into the Mutex (struct fields
+                // evaluate top-to-bottom, so this borrow precedes the move).
+                vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
                 config,
@@ -6991,9 +7009,11 @@ side referenced. Strict rules:\n\
         // 1–100ms). Without this wrap the tokio reactor stalls under concurrent
         // load — regresses the 10K-VU p95 claim.
         let vector_results = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search(query, top_k * 2))?
-            // storage Mutex drops here
+            // Pillar 2: lock-free recall — embed via the dedicated read lane,
+            // search the RCU snapshot; no storage Mutex on the read path.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_scoped(&qv, top_k * 2, None))
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -7145,8 +7165,10 @@ side referenced. Strict rules:\n\
 
         // ── Arm 1: dense vector search over the contextual fact embeddings. ──
         let dense_raw = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search_prefix(query, fetch, "fact|"))?
+            // Pillar 2: lock-free fact recall.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_prefix(&qv, fetch, "fact|"))
         };
         let scope_ok = |uri: &str, src_id: &str| {
             allowed_source_ids.is_empty()
@@ -7267,7 +7289,14 @@ side referenced. Strict rules:\n\
         // Reuses the gte-reranker; a missing model / load failure falls back to
         // the RRF order (retrieval never goes dark, only the rerank lift is lost).
         if rerank_on && ordered.len() > 1 {
-            let window = ordered.len().min(fetch);
+            // Multiplier B (2026-06-28): cap the cross-encoder candidate window.
+            // Rerank cost is ~linear in candidates; K=25-50 covers ~90-97% of the
+            // accuracy at roughly half the latency (research-grounded). RRF still
+            // fuses the FULL fetch pool above; only the expensive rerank is capped.
+            // Env override TR_RERANK_MAX (default 50).
+            let rerank_max = std::env::var("TR_RERANK_MAX")
+                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(50);
+            let window = ordered.len().min(fetch).min(rerank_max);
             let docs: Vec<&str> =
                 ordered.iter().take(window).map(|h| h.statement.as_str()).collect();
             let reranked = thinkingroot_graph::rerank::CrossEncoder::new(std::path::Path::new("."))
@@ -7307,6 +7336,7 @@ side referenced. Strict rules:\n\
         }
         Ok(ordered)
     }
+
 
     pub async fn search_scoped(
         &self,
@@ -7440,8 +7470,10 @@ side referenced. Strict rules:\n\
         };
         // block_in_place: see rationale on `search` above.
         let vector_results = {
-            let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search_scoped(query, top_k * 3, scope))?
+            // Pillar 2: lock-free scoped recall.
+            let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
+            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            run_blocking(move || snap.search_scoped(&qv, top_k * 3, scope))
         };
 
         let mut entity_hits: Vec<EntitySearchHit> = Vec::new();
@@ -12720,11 +12752,21 @@ Rules: \
         let handle = self.get_workspace(ws)?;
         let storage_arc = Arc::clone(&handle.storage);
         let stats = tokio::task::spawn_blocking(move || {
-            let mut storage = storage_arc.blocking_lock();
-            crate::pipeline::reconcile_vector_index(&mut storage, &cancel)
+            crate::pipeline::reconcile_vector_index(storage_arc, &cancel)
         })
         .await
         .map_err(|e| Error::Config(format!("vector-index reconcile task panicked: {e}")))??;
+        // Pillar 2: publish the freshly-reindexed vectors as a new lock-free
+        // snapshot so recall sees the new data. build_snapshot clones the index
+        // + builds the HNSW; the brief lock here is bounded (TODO: build the
+        // HNSW off-lock from a cloned dataset to remove even this window).
+        {
+            let snap = {
+                let storage = handle.storage.lock().await;
+                run_blocking(|| storage.vector.build_snapshot())
+            };
+            *handle.vector_snapshot.write().expect("snapshot lock") = std::sync::Arc::new(snap);
+        }
         Ok(stats)
     }
 
