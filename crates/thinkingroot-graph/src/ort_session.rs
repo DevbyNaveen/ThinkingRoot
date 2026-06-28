@@ -712,7 +712,23 @@ pub fn default_model_bundle_dir() -> PathBuf {
 /// `github.com/DevbyNaveen/releases/releases/download/models-v1/`.
 pub fn default_embed_paths() -> OrtModelPaths {
     let dir = default_model_bundle_dir();
-    OrtModelPaths::new(dir.join("embed.onnx"), dir.join("embed.tokenizer.json"))
+    // Multiplier A: prefer the int8-quantized embedder (`embed.int8.onnx`) when
+    // present (≈2-4× faster on AVX-512 VNNI). BOTH the bulk/ingest embedder and
+    // the read/query embedder resolve through here, so the corpus and the query
+    // are embedded by the SAME model — no train/test space mismatch (a re-compile
+    // is needed to upgrade vectors built by the fp32 model). Falls back to fp32
+    // `embed.onnx` when absent; `TR_EMBED_FP32=1` forces fp32 (escape hatch / A·B).
+    let force_fp32 = std::env::var("TR_EMBED_FP32")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let int8 = dir.join("embed.int8.onnx");
+    let onnx = if !force_fp32 && int8.exists() {
+        tracing::info!(target: "ort_session", "embedder: using int8 model (Multiplier A)");
+        int8
+    } else {
+        dir.join("embed.onnx")
+    };
+    OrtModelPaths::new(onnx, dir.join("embed.tokenizer.json"))
 }
 
 /// Canonical paths for the cross-encoder reranker bundle entry.
