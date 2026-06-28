@@ -7128,41 +7128,184 @@ side referenced. Strict rules:\n\
         allowed_source_ids: &HashSet<String>,
     ) -> Result<Vec<ClaimSearchHit>> {
         let handle = self.get_workspace(ws)?;
-        let results = {
+        // L2 — HYBRID + RERANK fact recall. Two retrieval arms (dense vector +
+        // lexical BM25) fused with RRF, then the cross-encoder reranks the fused
+        // head so the most relevant fact ranks first. Each stage is flag-gated;
+        // with both off this is byte-identical to the prior dense-only path.
+        let hybrid = std::env::var("TR_HYBRID_FACTS")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let rerank_on = std::env::var("TR_FACT_RERANK")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        // Over-fetch candidates when we will fuse/rerank — RRF and the
+        // cross-encoder need a wider pool than the final `top_k`.
+        let widen = hybrid || rerank_on;
+        let fetch = if widen { top_k.saturating_mul(4).max(24) } else { top_k };
+
+        // ── Arm 1: dense vector search over the contextual fact embeddings. ──
+        let dense_raw = {
             let mut storage = handle.storage.lock().await;
-            run_blocking(|| storage.vector.search_prefix(query, top_k, "fact|"))?
+            run_blocking(|| storage.vector.search_prefix(query, fetch, "fact|"))?
         };
-        let mut hits: Vec<ClaimSearchHit> = Vec::new();
-        let storage = handle.storage.lock().await;
-        for (key, meta, score) in &results {
-            if !key.starts_with("af:") {
-                continue;
+        let scope_ok = |uri: &str, src_id: &str| {
+            allowed_source_ids.is_empty()
+                || allowed_source_ids
+                    .iter()
+                    .any(|sid| uri.contains(sid.as_str()) || src_id == sid)
+        };
+
+        // Materialise candidates (live + scoped) under one graph lock; collect
+        // the dense ranked-id list and, when hybrid, the lexical one.
+        let mut cand: std::collections::HashMap<String, ClaimSearchHit> =
+            std::collections::HashMap::new();
+        let mut dense_ids: Vec<String> = Vec::new();
+        let mut lex_ids: Vec<String> = Vec::new();
+        {
+            let storage = handle.storage.lock().await;
+            for (key, meta, score) in &dense_raw {
+                if !key.starts_with("af:") {
+                    continue;
+                }
+                // The vector key IS the stored fact id (already `af:`-prefixed).
+                let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
+                    continue;
+                };
+                if !f.is_live() {
+                    continue;
+                }
+                // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
+                let uri = meta.rsplit('|').next().unwrap_or("").to_string();
+                if !scope_ok(&uri, &f.source_id) {
+                    continue;
+                }
+                dense_ids.push(key.clone());
+                cand.entry(key.clone()).or_insert(ClaimSearchHit {
+                    id: key.clone(),
+                    statement: f.statement.clone(),
+                    claim_type: "atomic-fact".to_string(),
+                    confidence: f.confidence as f64,
+                    source_uri: uri,
+                    relevance: *score,
+                    valid_from: f.created_at as i64,
+                });
             }
-            // The vector key IS the stored fact id (already `af:`-prefixed).
-            let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
-                continue;
-            };
-            if !f.is_live() {
-                continue;
+
+            // ── Arm 2: lexical BM25 over the live fact corpus (rare-term recall). ──
+            if hybrid {
+                const SCAN_MAX: usize = 50_000;
+                let all = storage.graph.get_all_atomic_facts().unwrap_or_default();
+                if all.len() > SCAN_MAX {
+                    tracing::warn!(
+                        ws = %ws, facts = all.len(),
+                        "hybrid fact recall: corpus > {SCAN_MAX}; lexical arm scans first {SCAN_MAX} \
+                         (dense arm still covers the rest) — a persistent fact FTS index is the scale fix"
+                    );
+                }
+                let docs: Vec<(String, String)> = all
+                    .into_iter()
+                    .take(SCAN_MAX)
+                    .filter(|f| f.is_live())
+                    .map(|f| (f.id.clone(), f.statement.clone()))
+                    .collect();
+                let ranked = crate::intelligence::reranker::bm25_rank(query, &docs);
+                for (id, _bm25) in ranked.into_iter().take(fetch) {
+                    if cand.contains_key(&id) {
+                        lex_ids.push(id); // already a (scope-checked) dense candidate
+                        continue;
+                    }
+                    let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(&id) else {
+                        continue;
+                    };
+                    if !f.is_live() {
+                        continue;
+                    }
+                    let uri = storage
+                        .graph
+                        .find_source_uri_by_id(&f.source_id)
+                        .unwrap_or_default();
+                    if !scope_ok(&uri, &f.source_id) {
+                        continue;
+                    }
+                    lex_ids.push(id.clone());
+                    cand.insert(
+                        id.clone(),
+                        ClaimSearchHit {
+                            id,
+                            statement: f.statement.clone(),
+                            claim_type: "atomic-fact".to_string(),
+                            confidence: f.confidence as f64,
+                            source_uri: uri,
+                            // dense-comparable placeholder; the final ramp below
+                            // overwrites this once the order is settled.
+                            relevance: 0.5,
+                            valid_from: f.created_at as i64,
+                        },
+                    );
+                }
             }
-            // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
-            let uri = meta.rsplit('|').next().unwrap_or("").to_string();
-            if !allowed_source_ids.is_empty()
-                && !allowed_source_ids.iter().any(|sid| uri.contains(sid.as_str()))
-            {
-                continue;
-            }
-            hits.push(ClaimSearchHit {
-                id: key.clone(),
-                statement: f.statement.clone(),
-                claim_type: "atomic-fact".to_string(),
-                confidence: f.confidence as f64,
-                source_uri: uri,
-                relevance: *score,
-                valid_from: f.created_at as i64,
-            });
         }
-        Ok(hits)
+
+        // Fast path: nothing to fuse/rerank → original dense-only behaviour.
+        if !widen {
+            let mut hits: Vec<ClaimSearchHit> =
+                dense_ids.into_iter().filter_map(|id| cand.remove(&id)).collect();
+            hits.truncate(top_k);
+            return Ok(hits);
+        }
+
+        // ── Fuse: RRF over (dense, lexical); dense-only when hybrid is off. ──
+        let fused_ids: Vec<String> = if hybrid {
+            crate::intelligence::reranker::rrf_fuse(&[&dense_ids, &lex_ids], 60.0)
+        } else {
+            dense_ids.clone()
+        };
+        let mut ordered: Vec<ClaimSearchHit> =
+            fused_ids.into_iter().filter_map(|id| cand.remove(&id)).collect();
+
+        // ── Cross-encoder rerank the fused head (the "ranks first" lever). ──
+        // Reuses the gte-reranker; a missing model / load failure falls back to
+        // the RRF order (retrieval never goes dark, only the rerank lift is lost).
+        if rerank_on && ordered.len() > 1 {
+            let window = ordered.len().min(fetch);
+            let docs: Vec<&str> =
+                ordered.iter().take(window).map(|h| h.statement.as_str()).collect();
+            let reranked = thinkingroot_graph::rerank::CrossEncoder::new(std::path::Path::new("."))
+                .and_then(|ce| ce.rerank(query, &docs));
+            if let Ok(scores) = reranked {
+                if scores.len() == window {
+                    let mut head: Vec<(ClaimSearchHit, f32)> =
+                        ordered.drain(..window).zip(scores).collect();
+                    head.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut new_order: Vec<ClaimSearchHit> =
+                        head.into_iter().map(|(h, _)| h).collect();
+                    new_order.append(&mut ordered);
+                    ordered = new_order;
+                }
+            }
+        }
+
+        // Bake the final order into `relevance` as a monotonic ramp inside the
+        // observed cosine band, so it survives the retriever's global re-sort by
+        // relevance (which would otherwise discard the rerank order). Facts stay
+        // on a claim-comparable scale so the two channels interleave sensibly.
+        ordered.truncate(top_k);
+        let n = ordered.len();
+        if n > 0 {
+            let hi = dense_raw
+                .iter()
+                .map(|(_, _, s)| *s)
+                .fold(0.0_f32, f32::max)
+                .clamp(0.05, 1.0);
+            let lo = (hi * 0.6).max(0.05);
+            for (i, h) in ordered.iter_mut().enumerate() {
+                let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+                h.relevance = hi - t * (hi - lo);
+            }
+        }
+        Ok(ordered)
     }
 
     pub async fn search_scoped(
@@ -7945,17 +8088,38 @@ side referenced. Strict rules:\n\
             }
         }
         // Make the facts semantically recallable in the ask path: embed each fact
-        // statement under its `af:` vector id with `fact|` metadata (a separate
-        // namespace from `claim|`, so claim retrieval is untouched).
+        // under its `af:` vector id with `fact|` metadata (a separate namespace
+        // from `claim|`, so claim retrieval is untouched).
+        //
+        // Layer 1 — CONTEXTUAL RETRIEVAL (Anthropic-style): we embed each fact
+        // under a short situating prefix (the document title + the chunk's memory
+        // brief, both already computed above) so a bare statement like "it is
+        // 768-dimensional" still matches a query naming neither subject nor doc.
+        // ONLY the embedded text is enriched — the vector key, the `fact|` meta,
+        // and the stored statement are unchanged, so a retrieved fact is still the
+        // verbatim quote, and the query side stays bare (we contextualise the
+        // corpus, not the question). `TR_CONTEXTUAL_EMBED=0` reverts to bare text.
         if !facts.is_empty() {
+            let contextual = std::env::var("TR_CONTEXTUAL_EMBED")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let brief_by_chunk: std::collections::HashMap<&str, &str> = chunk_briefs
+                .iter()
+                .map(|(c, s)| (c.as_str(), s.as_str()))
+                .collect();
             let items: Vec<(String, String, String)> = facts
                 .iter()
                 .map(|f| {
-                    (
-                        f.id.clone(),
-                        f.statement.clone(),
-                        format!("fact|{}|{}", f.id, uri),
-                    )
+                    let text = if contextual {
+                        crate::intelligence::chunk_brief::contextualize_fact_text(
+                            &brief.title,
+                            brief_by_chunk.get(f.chunk_id.as_str()).copied(),
+                            &f.statement,
+                        )
+                    } else {
+                        f.statement.clone()
+                    };
+                    (f.id.clone(), text, format!("fact|{}|{}", f.id, uri))
                 })
                 .collect();
             let upsert = run_blocking(|| storage.vector.upsert_batch(&items));

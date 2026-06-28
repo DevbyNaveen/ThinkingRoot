@@ -125,9 +125,84 @@ pub async fn generate_chunk_briefs(
     out
 }
 
+/// Layer 1 — CONTEXTUAL RETRIEVAL (Anthropic-style). Build the *embedding* text
+/// for an atomic fact: a short situating prefix — the document title plus the
+/// chunk's one-line memory brief — followed by the verbatim statement.
+///
+/// This lets a fact like "it is 768-dimensional" match a query about "the
+/// ThinkingRoot embedder" even though the bare statement names neither, because
+/// the chunk brief ("ThinkingRoot's embedder is gte-modernbert at 768 dims")
+/// carries the missing referents. Only the embedded TEXT changes — the caller
+/// keeps the stored statement, the vector key, and the `fact|` meta verbatim, so
+/// a *retrieved* fact is still the exact quote.
+///
+/// Empty pieces are skipped so a missing brief/title never injects noise; with
+/// neither, it degrades to the bare statement (no regression vs. the old path).
+pub fn contextualize_fact_text(title: &str, brief: Option<&str>, statement: &str) -> String {
+    let title = title.trim();
+    let brief = brief.map(str::trim).filter(|s| !s.is_empty());
+    let mut ctx = String::new();
+    if !title.is_empty() {
+        ctx.push_str(title);
+    }
+    if let Some(b) = brief {
+        // Skip a brief that just restates this exact fact (the lead-fact fallback
+        // can equal the statement) — it would add no situating context.
+        if !b.eq_ignore_ascii_case(statement.trim()) {
+            if !ctx.is_empty() {
+                ctx.push_str(" — ");
+            }
+            ctx.push_str(b);
+        }
+    }
+    if ctx.is_empty() {
+        statement.to_string()
+    } else {
+        format!("{ctx}\n{statement}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextualize_prepends_title_and_brief() {
+        let t = contextualize_fact_text(
+            "ThinkingRoot Architecture",
+            Some("The embedder is gte-modernbert at 768 dimensions."),
+            "It is 768-dimensional.",
+        );
+        assert_eq!(
+            t,
+            "ThinkingRoot Architecture — The embedder is gte-modernbert at 768 dimensions.\nIt is 768-dimensional."
+        );
+        // The verbatim statement is always the last line (retrieval returns it intact).
+        assert!(t.ends_with("It is 768-dimensional."));
+    }
+
+    #[test]
+    fn contextualize_handles_missing_pieces_without_noise() {
+        // No title → brief only.
+        assert_eq!(
+            contextualize_fact_text("", Some("A passage about X."), "X happened."),
+            "A passage about X.\nX happened."
+        );
+        // No brief → title only.
+        assert_eq!(
+            contextualize_fact_text("Doc Title", None, "X happened."),
+            "Doc Title\nX happened."
+        );
+        // Neither → bare statement (no regression, no stray separators).
+        assert_eq!(contextualize_fact_text("  ", Some("  "), "X happened."), "X happened.");
+    }
+
+    #[test]
+    fn contextualize_skips_brief_that_equals_statement() {
+        // The lead-fact fallback can make the brief == the statement; don't duplicate it.
+        let t = contextualize_fact_text("Doc", Some("X happened."), "X happened.");
+        assert_eq!(t, "Doc\nX happened.");
+    }
 
     fn inp(id: &str, facts: &[&str], preview: &str) -> ChunkBriefInput {
         ChunkBriefInput {

@@ -89,6 +89,52 @@ impl Reranker {
     }
 }
 
+/// Lexical RETRIEVAL arm (L2 hybrid): BM25-rank a corpus of `(id, text)` docs
+/// against `query`, returning `(id, raw_bm25)` for docs with non-zero term
+/// overlap, highest first. Unlike `rerank_claims` (which rescleores an existing
+/// candidate set), this ranks the WHOLE corpus, so a rare-term / exact-token
+/// fact the dense embedding missed still enters the candidate set. IDF is
+/// computed over the supplied corpus (the standard BM25 helpers below).
+pub fn bm25_rank(query: &str, docs: &[(String, String)]) -> Vec<(String, f32)> {
+    let r = Reranker::new(query);
+    if r.query_terms.is_empty() || docs.is_empty() {
+        return Vec::new();
+    }
+    let toks: Vec<Vec<String>> = docs.iter().map(|(_, t)| tokenise(t)).collect();
+    let stats = CorpusStats::from(&toks);
+    let mut scored: Vec<(String, f32)> = docs
+        .iter()
+        .zip(toks.iter())
+        .map(|((id, _), d)| (id.clone(), r.bm25_raw(d, &stats)))
+        .filter(|(_, s)| *s > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+/// Reciprocal Rank Fusion of several ranked id-lists into one ranking.
+/// `rrf(id) = Σ_lists 1/(k + rank)` (rank 0-based). Parameter-free and robust
+/// across incomparable score scales (cosine vs BM25) — the standard way to fuse
+/// a dense and a lexical retriever (Cormack et al. 2009; k=60 canonical). An id
+/// absent from a list contributes 0 from that list. Ties break by first-seen
+/// order (which preserves the stronger list's ordering when scores match).
+pub fn rrf_fuse(lists: &[&[String]], k: f64) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut score: HashMap<&str, f64> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            let e = score.entry(id.as_str()).or_insert_with(|| {
+                order.push(id.as_str());
+                0.0
+            });
+            *e += 1.0 / (k + rank as f64 + 1.0);
+        }
+    }
+    order.sort_by(|a, b| score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.into_iter().map(String::from).collect()
+}
+
 /// Min-max normalisation across a candidate set: maps the highest
 /// raw BM25 score to 1.0 and the lowest (≥0) to 0.0.  When every
 /// candidate scores zero (no term overlap anywhere) the function
@@ -327,6 +373,37 @@ mod tests {
             "rare-term match must score higher than common-term match \
              (alice={alice_score}, paris={paris_score})"
         );
+    }
+
+    #[test]
+    fn bm25_rank_surfaces_rare_term_match_over_corpus() {
+        // Lexical arm: a rare-term query must rank the one doc that contains it,
+        // and skip docs with no overlap entirely.
+        let docs = vec![
+            ("a".to_string(), "the cat sat on the mat".to_string()),
+            ("b".to_string(), "quarterly revenue grew in Reykjavik".to_string()),
+            ("c".to_string(), "a dog barked loudly".to_string()),
+        ];
+        let ranked = bm25_rank("Reykjavik revenue", &docs);
+        assert_eq!(ranked.first().map(|(id, _)| id.as_str()), Some("b"));
+        // Docs with zero overlap are dropped (no false candidates).
+        assert!(ranked.iter().all(|(id, _)| id != "a"));
+    }
+
+    #[test]
+    fn rrf_fuse_combines_two_rankings() {
+        // dense likes [x, y, z]; lexical likes [z, w]. z appears in both so it
+        // should rise; x (rank-0 in dense) and z (rank-0 in lexical) lead.
+        let dense = vec!["x".to_string(), "y".to_string(), "z".to_string()];
+        let lex = vec!["z".to_string(), "w".to_string()];
+        let fused = rrf_fuse(&[&dense, &lex], 60.0);
+        // z is the only id in BOTH lists → highest fused score → first.
+        assert_eq!(fused.first().map(String::as_str), Some("z"));
+        // every id from both lists is present exactly once.
+        assert_eq!(fused.len(), 4);
+        for id in ["x", "y", "z", "w"] {
+            assert_eq!(fused.iter().filter(|i| i.as_str() == id).count(), 1);
+        }
     }
 
     #[test]
