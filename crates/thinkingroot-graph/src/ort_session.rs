@@ -716,9 +716,26 @@ pub fn default_embed_paths() -> OrtModelPaths {
 }
 
 /// Canonical paths for the cross-encoder reranker bundle entry.
+///
+/// **Multiplier A (2026-06-28):** prefer the int8-quantized reranker
+/// (`rerank.int8.onnx`) when it is present in the bundle — its MatMuls run
+/// ~2-4× faster on AVX-512 VNNI CPUs with near-identical scores (dynamic
+/// weight quantization). Falls back to the fp32 `rerank.onnx` when the int8
+/// file is absent, so an un-quantized bundle behaves exactly as before.
+/// `TR_RERANK_FP32=1` forces the fp32 model (escape hatch / A·B).
 pub fn default_rerank_paths() -> OrtModelPaths {
     let dir = default_model_bundle_dir();
-    OrtModelPaths::new(dir.join("rerank.onnx"), dir.join("rerank.tokenizer.json"))
+    let force_fp32 = std::env::var("TR_RERANK_FP32")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let int8 = dir.join("rerank.int8.onnx");
+    let onnx = if !force_fp32 && int8.exists() {
+        tracing::info!(target: "ort_session", "reranker: using int8 model (Multiplier A)");
+        int8
+    } else {
+        dir.join("rerank.onnx")
+    };
+    OrtModelPaths::new(onnx, dir.join("rerank.tokenizer.json"))
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
