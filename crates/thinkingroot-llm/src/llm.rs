@@ -1120,6 +1120,15 @@ impl AzureProvider {
         // rather than ship a half-built client.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            // #31 — keep the upstream LLM connection warm so an idle engine does
+            // NOT pay a cold TCP+TLS+edge-routing handshake on the next request
+            // (the ~30s "first call after idle" stall that made /ask 14-19s).
+            // Connections are HTTP/1.1 here (reqwest http2 feature off), so a long
+            // pool idle timeout keeps the established connection in the pool past
+            // reqwest's default 90s eviction, and TCP keepalive stops NAT/firewall
+            // idle-eviction. Output-identical — only connection reuse changes.
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::LlmProvider {
                 provider: "azure".into(),
@@ -1513,6 +1522,15 @@ impl OpenAiProvider {
         // configured timeout — see the AzureProvider note above).
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            // #31 — keep the upstream LLM connection warm so an idle engine does
+            // NOT pay a cold TCP+TLS+edge-routing handshake on the next request
+            // (the ~30s "first call after idle" stall that made /ask 14-19s).
+            // Connections are HTTP/1.1 here (reqwest http2 feature off), so a long
+            // pool idle timeout keeps the established connection in the pool past
+            // reqwest's default 90s eviction, and TCP keepalive stops NAT/firewall
+            // idle-eviction. Output-identical — only connection reuse changes.
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::LlmProvider {
                 provider: provider_name.to_string(),
@@ -1885,6 +1903,15 @@ impl CloudManagedProvider {
         let server = server.trim_end_matches('/').to_string();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            // #31 — keep the upstream LLM connection warm so an idle engine does
+            // NOT pay a cold TCP+TLS+edge-routing handshake on the next request
+            // (the ~30s "first call after idle" stall that made /ask 14-19s).
+            // Connections are HTTP/1.1 here (reqwest http2 feature off), so a long
+            // pool idle timeout keeps the established connection in the pool past
+            // reqwest's default 90s eviction, and TCP keepalive stops NAT/firewall
+            // idle-eviction. Output-identical — only connection reuse changes.
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::LlmProvider {
                 provider: "thinkingroot-cloud".into(),
@@ -2184,6 +2211,15 @@ impl AnthropicProvider {
         // configured timeout — see the AzureProvider note above).
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            // #31 — keep the upstream LLM connection warm so an idle engine does
+            // NOT pay a cold TCP+TLS+edge-routing handshake on the next request
+            // (the ~30s "first call after idle" stall that made /ask 14-19s).
+            // Connections are HTTP/1.1 here (reqwest http2 feature off), so a long
+            // pool idle timeout keeps the established connection in the pool past
+            // reqwest's default 90s eviction, and TCP keepalive stops NAT/firewall
+            // idle-eviction. Output-identical — only connection reuse changes.
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::LlmProvider {
                 provider: "anthropic".into(),
@@ -2543,6 +2579,15 @@ impl OllamaProvider {
         // configured timeout — see the AzureProvider note above).
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            // #31 — keep the upstream LLM connection warm so an idle engine does
+            // NOT pay a cold TCP+TLS+edge-routing handshake on the next request
+            // (the ~30s "first call after idle" stall that made /ask 14-19s).
+            // Connections are HTTP/1.1 here (reqwest http2 feature off), so a long
+            // pool idle timeout keeps the established connection in the pool past
+            // reqwest's default 90s eviction, and TCP keepalive stops NAT/firewall
+            // idle-eviction. Output-identical — only connection reuse changes.
+            .pool_idle_timeout(std::time::Duration::from_secs(600))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::LlmProvider {
                 provider: "ollama".into(),
