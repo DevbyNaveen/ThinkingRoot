@@ -2167,6 +2167,53 @@ where
     }
 }
 
+/// Pillar 2 Phase 3 (2026-06-28) — collect the LIVE atomic-fact set into the
+/// lock-free fact map carried by a `ReadSnapshot`. Resolves each source URI
+/// once (cached), so the `search_facts` recall path hydrates dense hits AND
+/// runs its BM25 arm entirely from the snapshot — no `storage` Mutex, so a
+/// live recall never blocks behind a background reconcile/drain. Superseded
+/// facts are excluded here (the snapshot is the live set by construction).
+fn collect_live_facts(
+    graph: &thinkingroot_graph::graph::GraphStore,
+) -> std::collections::HashMap<String, thinkingroot_graph::vector::FactRecord> {
+    use std::collections::HashMap;
+    let mut uri_cache: HashMap<String, String> = HashMap::new();
+    let mut out: HashMap<String, thinkingroot_graph::vector::FactRecord> = HashMap::new();
+    for f in graph.get_all_atomic_facts().unwrap_or_default() {
+        if !f.is_live() {
+            continue;
+        }
+        let uri = uri_cache
+            .entry(f.source_id.clone())
+            .or_insert_with(|| graph.find_source_uri_by_id(&f.source_id).unwrap_or_default())
+            .clone();
+        out.insert(
+            f.id.clone(),
+            thinkingroot_graph::vector::FactRecord {
+                id: f.id,
+                statement: f.statement,
+                confidence: f.confidence,
+                source_id: f.source_id,
+                uri,
+                created_at: f.created_at,
+            },
+        );
+    }
+    out
+}
+
+/// Build a complete lock-free `ReadSnapshot`: the vector index + pre-built
+/// HNSW (`VectorStore::build_snapshot`) AND the live fact set
+/// (`collect_live_facts`). Published by the write path after each
+/// reconcile/drain. The caller decides whether to wrap the graph/vector
+/// access in `run_blocking`.
+fn build_read_snapshot(storage: &StorageEngine) -> thinkingroot_graph::vector::ReadSnapshot {
+    storage
+        .vector
+        .build_snapshot()
+        .with_facts(collect_live_facts(&storage.graph))
+}
+
 fn artifact_filename(artifact_type: &str) -> Option<&'static str> {
     match artifact_type {
         "architecture-map" => Some("architecture-map.md"),
@@ -2566,8 +2613,10 @@ impl QueryEngine {
                 // Pillar 2: build the initial lock-free snapshot from the loaded
                 // index BEFORE `storage` is moved into the Mutex (struct fields
                 // evaluate top-to-bottom, so this borrow precedes the move).
+                // Phase 3: the snapshot also carries the live fact set so the
+                // `search_facts` recall path is lock-free too.
                 vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
-                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                    std::sync::Arc::new(build_read_snapshot(&storage)),
                 )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
@@ -2646,8 +2695,10 @@ impl QueryEngine {
                 // Pillar 2: build the initial lock-free snapshot from the loaded
                 // index BEFORE `storage` is moved into the Mutex (struct fields
                 // evaluate top-to-bottom, so this borrow precedes the move).
+                // Phase 3: the snapshot also carries the live fact set so the
+                // `search_facts` recall path is lock-free too.
                 vector_snapshot: std::sync::Arc::new(std::sync::RwLock::new(
-                    std::sync::Arc::new(storage.vector.build_snapshot()),
+                    std::sync::Arc::new(build_read_snapshot(&storage)),
                 )),
                 storage: Arc::new(Mutex::new(storage)),
                 cache: Arc::new(RwLock::new(cache)),
@@ -7163,11 +7214,18 @@ side referenced. Strict rules:\n\
         let widen = hybrid || rerank_on;
         let fetch = if widen { top_k.saturating_mul(4).max(24) } else { top_k };
 
+        // Pillar 2 Phase 3: one lock-free snapshot clone serves BOTH the dense
+        // vector arm AND fact hydration + the BM25 arm — NO `storage` Mutex, so
+        // a live recall never blocks behind a background reconcile/drain (the
+        // ~20s during-indexing tail this fixes). The snapshot carries the live
+        // fact set (statement/confidence/source_id/uri/created_at), refreshed
+        // after each reconcile and drain tick.
+        let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+
         // ── Arm 1: dense vector search over the contextual fact embeddings. ──
         let dense_raw = {
-            // Pillar 2: lock-free fact recall.
             let qv = run_blocking(|| thinkingroot_graph::vector::embed_query(query))?;
-            let snap = handle.vector_snapshot.read().expect("snapshot lock").clone();
+            let snap = snap.clone();
             run_blocking(move || snap.search_prefix(&qv, fetch, "fact|"))
         };
         let scope_ok = |uri: &str, src_id: &str| {
@@ -7177,28 +7235,24 @@ side referenced. Strict rules:\n\
                     .any(|sid| uri.contains(sid.as_str()) || src_id == sid)
         };
 
-        // Materialise candidates (live + scoped) under one graph lock; collect
-        // the dense ranked-id list and, when hybrid, the lexical one.
+        // Materialise candidates (live + scoped) FROM THE SNAPSHOT (lock-free);
+        // collect the dense ranked-id list and, when hybrid, the lexical one.
         let mut cand: std::collections::HashMap<String, ClaimSearchHit> =
             std::collections::HashMap::new();
         let mut dense_ids: Vec<String> = Vec::new();
         let mut lex_ids: Vec<String> = Vec::new();
         {
-            let storage = handle.storage.lock().await;
-            for (key, meta, score) in &dense_raw {
+            for (key, _meta, score) in &dense_raw {
                 if !key.starts_with("af:") {
                     continue;
                 }
-                // The vector key IS the stored fact id (already `af:`-prefixed).
-                let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(key) else {
+                // The vector key IS the stored fact id; hydrate from the snapshot
+                // (superseded facts are absent → naturally skipped, same as the
+                // old `is_live()` guard).
+                let Some(f) = snap.fact(key) else {
                     continue;
                 };
-                if !f.is_live() {
-                    continue;
-                }
-                // `fact|{id}|{uri}` — recover the source uri for scoping + citation.
-                let uri = meta.rsplit('|').next().unwrap_or("").to_string();
-                if !scope_ok(&uri, &f.source_id) {
+                if !scope_ok(&f.uri, &f.source_id) {
                     continue;
                 }
                 dense_ids.push(key.clone());
@@ -7207,7 +7261,7 @@ side referenced. Strict rules:\n\
                     statement: f.statement.clone(),
                     claim_type: "atomic-fact".to_string(),
                     confidence: f.confidence as f64,
-                    source_uri: uri,
+                    source_uri: f.uri.clone(),
                     relevance: *score,
                     valid_from: f.created_at as i64,
                 });
@@ -7216,18 +7270,17 @@ side referenced. Strict rules:\n\
             // ── Arm 2: lexical BM25 over the live fact corpus (rare-term recall). ──
             if hybrid {
                 const SCAN_MAX: usize = 50_000;
-                let all = storage.graph.get_all_atomic_facts().unwrap_or_default();
-                if all.len() > SCAN_MAX {
+                let fact_count = snap.fact_count();
+                if fact_count > SCAN_MAX {
                     tracing::warn!(
-                        ws = %ws, facts = all.len(),
+                        ws = %ws, facts = fact_count,
                         "hybrid fact recall: corpus > {SCAN_MAX}; lexical arm scans first {SCAN_MAX} \
                          (dense arm still covers the rest) — a persistent fact FTS index is the scale fix"
                     );
                 }
-                let docs: Vec<(String, String)> = all
-                    .into_iter()
+                let docs: Vec<(String, String)> = snap
+                    .facts_iter()
                     .take(SCAN_MAX)
-                    .filter(|f| f.is_live())
                     .map(|f| (f.id.clone(), f.statement.clone()))
                     .collect();
                 let ranked = crate::intelligence::reranker::bm25_rank(query, &docs);
@@ -7236,17 +7289,10 @@ side referenced. Strict rules:\n\
                         lex_ids.push(id); // already a (scope-checked) dense candidate
                         continue;
                     }
-                    let Ok(Some(f)) = storage.graph.get_atomic_fact_by_id(&id) else {
+                    let Some(f) = snap.fact(&id) else {
                         continue;
                     };
-                    if !f.is_live() {
-                        continue;
-                    }
-                    let uri = storage
-                        .graph
-                        .find_source_uri_by_id(&f.source_id)
-                        .unwrap_or_default();
-                    if !scope_ok(&uri, &f.source_id) {
+                    if !scope_ok(&f.uri, &f.source_id) {
                         continue;
                     }
                     lex_ids.push(id.clone());
@@ -7257,7 +7303,7 @@ side referenced. Strict rules:\n\
                             statement: f.statement.clone(),
                             claim_type: "atomic-fact".to_string(),
                             confidence: f.confidence as f64,
-                            source_uri: uri,
+                            source_uri: f.uri.clone(),
                             // dense-comparable placeholder; the final ramp below
                             // overwrites this once the order is settled.
                             relevance: 0.5,
@@ -7895,23 +7941,31 @@ side referenced. Strict rules:\n\
         // (not after every source). Reloads so freshly-promoted entities/relations
         // appear in the Neural Graph (list_entities reads the cache).
         if total > 0 {
-            let storage = handle.storage.lock().await;
-            // #3 — entity retirement sweep (bi-temporal: mark vanished entities
-            // retired, never delete). GATED behind TR_ENTITY_RETIRE (default OFF)
-            // until validated on real data. Sound because each source rebuilt its
-            // spine AFTER promotion, so `fact_mentions_entity` reflects the live set.
-            if std::env::var("TR_ENTITY_RETIRE").as_deref() == Ok("1") {
-                match storage.graph.retire_unmentioned_entities(now) {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(ws = %ws, "entity retirement: retired {n} unmentioned entities")
+            let snap = {
+                let storage = handle.storage.lock().await;
+                // #3 — entity retirement sweep (bi-temporal: mark vanished entities
+                // retired, never delete). GATED behind TR_ENTITY_RETIRE (default OFF)
+                // until validated on real data. Sound because each source rebuilt its
+                // spine AFTER promotion, so `fact_mentions_entity` reflects the live set.
+                if std::env::var("TR_ENTITY_RETIRE").as_deref() == Ok("1") {
+                    match storage.graph.retire_unmentioned_entities(now) {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(ws = %ws, "entity retirement: retired {n} unmentioned entities")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(ws = %ws, "entity retirement sweep failed: {e}"),
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(ws = %ws, "entity retirement sweep failed: {e}"),
                 }
-            }
-            if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
-                *handle.cache.write().await = new_cache;
-            }
+                if let Ok(new_cache) = KnowledgeGraph::load_from_graph(&storage.graph) {
+                    *handle.cache.write().await = new_cache;
+                }
+                // Pillar 2 Phase 3: rebuild the lock-free snapshot under the same
+                // lock so the facts just drained (and their vectors) are reflected.
+                run_blocking(|| build_read_snapshot(&storage))
+            };
+            // Publish OUTSIDE the storage lock — freshly-drained facts are now
+            // immediately recallable via the lock-free `search_facts` path.
+            *handle.vector_snapshot.write().expect("snapshot lock") = std::sync::Arc::new(snap);
         }
         Ok(total)
     }
@@ -12757,13 +12811,14 @@ Rules: \
         .await
         .map_err(|e| Error::Config(format!("vector-index reconcile task panicked: {e}")))??;
         // Pillar 2: publish the freshly-reindexed vectors as a new lock-free
-        // snapshot so recall sees the new data. build_snapshot clones the index
-        // + builds the HNSW; the brief lock here is bounded (TODO: build the
-        // HNSW off-lock from a cloned dataset to remove even this window).
+        // snapshot so recall sees the new data. build_read_snapshot clones the
+        // index + builds the HNSW + collects the live facts (Phase 3); the
+        // brief lock here is bounded (TODO: build the HNSW off-lock from a
+        // cloned dataset to remove even this window).
         {
             let snap = {
                 let storage = handle.storage.lock().await;
-                run_blocking(|| storage.vector.build_snapshot())
+                run_blocking(|| build_read_snapshot(&storage))
             };
             *handle.vector_snapshot.write().expect("snapshot lock") = std::sync::Arc::new(snap);
         }

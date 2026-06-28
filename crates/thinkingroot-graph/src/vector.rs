@@ -10,6 +10,24 @@
 // and loaded via `ort_session::EmbeddingModel`. Loading is still
 // lazy (first call) so workspace open stays instant.
 
+/// A hydrated atomic-fact row carried inside a [`ReadSnapshot`] (Pillar 2
+/// Phase 3, 2026-06-28). Lets the `search_facts` recall path hydrate dense
+/// hits AND run the lexical BM25 arm entirely from the lock-free snapshot —
+/// no `storage` Mutex, so a live recall never blocks behind a background
+/// reconcile/drain. Only the **live** fact set is snapshotted (superseded
+/// facts are excluded at build time), so there is no `is_live` flag to check.
+#[derive(Clone, Debug)]
+pub struct FactRecord {
+    /// The `af:`-prefixed fact id (== its vector key).
+    pub id: String,
+    pub statement: String,
+    pub confidence: f32,
+    pub source_id: String,
+    /// Resolved source URI (for scope-check + citation), captured at build time.
+    pub uri: String,
+    pub created_at: f64,
+}
+
 #[cfg(feature = "vector")]
 mod inner {
     use std::collections::HashMap;
@@ -919,14 +937,41 @@ mod inner {
         #[allow(dead_code)]
         tokens: HashMap<String, Vec<QuantizedVec>>,
         ann: Option<HnswMap<EmbPoint, String>>,
+        /// Pillar 2 Phase 3 — live atomic facts keyed by `af:` id, so the
+        /// `search_facts` recall path hydrates + BM25-scans lock-free.
+        facts: HashMap<String, super::FactRecord>,
     }
 
     impl ReadSnapshot {
         pub fn empty() -> Self {
-            Self { index: HashMap::new(), tokens: HashMap::new(), ann: None }
+            Self {
+                index: HashMap::new(),
+                tokens: HashMap::new(),
+                ann: None,
+                facts: HashMap::new(),
+            }
         }
         pub fn len(&self) -> usize { self.index.len() }
         pub fn is_empty(&self) -> bool { self.index.is_empty() }
+
+        /// Attach the live fact set to a vector-only snapshot (consuming
+        /// builder). Called by the write path after each reconcile/drain so
+        /// recall sees freshly-written facts without a storage lock.
+        pub fn with_facts(mut self, facts: HashMap<String, super::FactRecord>) -> Self {
+            self.facts = facts;
+            self
+        }
+
+        /// Number of live facts carried in the snapshot.
+        pub fn fact_count(&self) -> usize { self.facts.len() }
+
+        /// Lock-free hydration of a single fact by its `af:` id.
+        pub fn fact(&self, id: &str) -> Option<&super::FactRecord> { self.facts.get(id) }
+
+        /// Lock-free iterator over all live facts (the BM25 corpus).
+        pub fn facts_iter(&self) -> impl Iterator<Item = &super::FactRecord> {
+            self.facts.values()
+        }
 
         /// Lock-free scoped search (mirror of VectorStore::search_scoped).
         pub fn search_scoped(
@@ -1035,7 +1080,15 @@ mod inner {
             } else {
                 None
             };
-            ReadSnapshot { index: self.index.clone(), tokens: self.tokens.clone(), ann }
+            // Facts are attached by the caller via `with_facts` (they live in
+            // the graph, not the VectorStore). A vector-only snapshot starts
+            // with an empty fact map.
+            ReadSnapshot {
+                index: self.index.clone(),
+                tokens: self.tokens.clone(),
+                ann,
+                facts: HashMap::new(),
+            }
         }
     }
 
@@ -1194,6 +1247,15 @@ mod inner {
         pub fn empty() -> Self { Self }
         pub fn len(&self) -> usize { 0 }
         pub fn is_empty(&self) -> bool { true }
+        pub fn with_facts(
+            self,
+            _facts: std::collections::HashMap<String, super::FactRecord>,
+        ) -> Self { self }
+        pub fn fact_count(&self) -> usize { 0 }
+        pub fn fact(&self, _id: &str) -> Option<&super::FactRecord> { None }
+        pub fn facts_iter(&self) -> impl Iterator<Item = &super::FactRecord> {
+            std::iter::empty()
+        }
         pub fn search_scoped(
             &self,
             _query_vec: &[f32],
@@ -1216,6 +1278,8 @@ mod inner {
 
 // Re-export whichever impl was compiled.
 pub use inner::{embed_query, ReadSnapshot, VectorStore};
+// `FactRecord` is feature-independent and already `pub` at module scope, so it
+// is reachable as `vector::FactRecord` without re-export.
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -1246,6 +1310,38 @@ mod tests {
     #[test]
     fn index_ids_method_exists_on_real_store() {
         let _: fn(&VectorStore) -> Vec<String> = VectorStore::index_ids;
+    }
+
+    /// Pillar 2 Phase 3 — the lock-free fact set carried by a ReadSnapshot.
+    /// Model-free: pure data, so it runs everywhere. Locks in `with_facts`,
+    /// `fact` (hydration), `facts_iter` (BM25 corpus), and `fact_count`.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn snapshot_carries_live_facts() {
+        let mk = |id: &str, stmt: &str| FactRecord {
+            id: id.to_string(),
+            statement: stmt.to_string(),
+            confidence: 0.9,
+            source_id: "src1".to_string(),
+            uri: "file://doc.md".to_string(),
+            created_at: 1.0,
+        };
+        let mut facts = std::collections::HashMap::new();
+        facts.insert("af:a".to_string(), mk("af:a", "Yuriy teaches the course"));
+        facts.insert("af:b".to_string(), mk("af:b", "the embedder is 768-dim"));
+
+        let snap = ReadSnapshot::empty().with_facts(facts);
+
+        // Hydration by id (the dense-arm path).
+        assert_eq!(snap.fact_count(), 2);
+        assert_eq!(snap.fact("af:a").unwrap().statement, "Yuriy teaches the course");
+        assert_eq!(snap.fact("af:b").unwrap().uri, "file://doc.md");
+        assert!(snap.fact("af:missing").is_none());
+
+        // Iteration (the BM25 corpus path) — order-independent.
+        let mut ids: Vec<String> = snap.facts_iter().map(|f| f.id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["af:a".to_string(), "af:b".to_string()]);
     }
 
     /// TRVEC2 persistence round-trip + TRVEC1 migration, model-free (raw
