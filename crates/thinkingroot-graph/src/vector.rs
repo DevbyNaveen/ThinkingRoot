@@ -1099,19 +1099,46 @@ mod inner {
     static SHARED_READ_EMBEDDER: std::sync::OnceLock<std::sync::Mutex<Option<OrtEmbeddingModel>>> =
         std::sync::OnceLock::new();
 
-    /// Embed a single query string via the dedicated read embedder.
+    /// Request-burst cache of query embeddings. `retrieve_claims` embeds the
+    /// SAME question + each static sub-query multiple times across its
+    /// scoped+facts fan-out (≈2× per unique string); memoising means each
+    /// unique string is embedded once. Deterministic — the read model is fixed
+    /// per process, so a cache hit returns a byte-identical vector. Bounded:
+    /// cleared past CAP so it never grows unbounded across many distinct
+    /// queries (the fan-out repeats land in a tight window, well under CAP).
+    static QUERY_EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<f32>>>> =
+        std::sync::OnceLock::new();
+    const QUERY_EMBED_CACHE_CAP: usize = 1024;
+
+    /// Embed a single query string via the dedicated read embedder (memoised).
     pub fn embed_query(text: &str) -> Result<Vec<f32>> {
-        let cell = SHARED_READ_EMBEDDER.get_or_init(|| std::sync::Mutex::new(None));
-        let mut guard = cell
-            .lock()
-            .map_err(|_| Error::GraphStorage("read-embedder mutex poisoned".into()))?;
-        if guard.is_none() {
-            tracing::info!("loading READ embedding model (first use, dedicated lane)…");
-            *guard = Some(OrtEmbeddingModel::load(&default_embed_paths(), EMBED_DIM, EMBED_MAX_LEN)?);
+        let cache = QUERY_EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        if let Ok(g) = cache.lock() {
+            if let Some(v) = g.get(text) {
+                return Ok(v.clone());
+            }
         }
-        let model = guard.as_mut().expect("just-loaded");
-        let mut out = model.embed(&[text])?;
-        Ok(out.drain(..).next().unwrap_or_default())
+        let vec = {
+            let cell = SHARED_READ_EMBEDDER.get_or_init(|| std::sync::Mutex::new(None));
+            let mut guard = cell
+                .lock()
+                .map_err(|_| Error::GraphStorage("read-embedder mutex poisoned".into()))?;
+            if guard.is_none() {
+                tracing::info!("loading READ embedding model (first use, dedicated lane)…");
+                *guard =
+                    Some(OrtEmbeddingModel::load(&default_embed_paths(), EMBED_DIM, EMBED_MAX_LEN)?);
+            }
+            let model = guard.as_mut().expect("just-loaded");
+            let mut out = model.embed(&[text])?;
+            out.drain(..).next().unwrap_or_default()
+        };
+        if let Ok(mut g) = cache.lock() {
+            if g.len() >= QUERY_EMBED_CACHE_CAP {
+                g.clear();
+            }
+            g.insert(text.to_string(), vec.clone());
+        }
+        Ok(vec)
     }
 
 }
