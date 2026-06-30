@@ -8011,6 +8011,38 @@ side referenced. Strict rules:\n\
             }
         }
 
+        // ARTMIP §4.2 — sleep also refreshes the STRUCTURAL spine priors from the
+        // graph's entity relations, so the plastic substrate carries structure
+        // (shared-entity / co-citation), not just learned synapses. Preserves
+        // learned `h`. Gated `TR_HEBBIAN` (the MIND master).
+        if std::env::var("TR_HEBBIAN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let storage = handle.storage.lock().await;
+            if let Ok(n) = storage.graph.populate_spine_from_relations(now, 20_000) {
+                if n > 0 {
+                    tracing::info!(ws = %ws, "dream: refreshed {n} structural spine priors");
+                }
+            }
+            // ARTMIP §4.5 tethered plasticity — re-ground concepts against their
+            // facts; mark stale any generalization whose ground truth has been
+            // retracted (the truth leash). `TR_TETHER_QUORUM` (default 0.5).
+            let quorum: f64 = std::env::var("TR_TETHER_QUORUM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5);
+            if let Ok((checked, stale)) = storage.graph.recompute_concept_tethers(quorum, now) {
+                if stale > 0 {
+                    tracing::info!(ws = %ws, "dream: {stale}/{checked} concepts marked stale (tether broken)");
+                }
+            }
+        }
+
         // Sample claim statements from the DURABLE graph, not the compiled
         // read cache. remember/store/contribute write to the graph but do NOT
         // repopulate the read cache, so cache-sampling makes chat/remember-fed

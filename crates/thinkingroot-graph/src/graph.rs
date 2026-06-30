@@ -895,6 +895,19 @@ impl GraphStore {
                 last_access: Float default 0.0,
                 stability: Float default 1.0
             }",
+            // ARTMIP §4.5 tethered plasticity — the "truth leash". A concept/
+            // generalization is only as alive as the index entries (its member
+            // facts/entities) that ground it. When a quorum of its tether dies
+            // (tombstoned/retired), the concept is marked `stale` (re-derived next
+            // dream, or dropped from recall) — so the Mind generalizes freely but
+            // can never drift from revocable ground truth. Sidecar, reversible.
+            ":create concept_stale {
+                concept_id: String
+                =>
+                stale: Bool default false,
+                live_fraction: Float default 1.0,
+                checked_at: Float default 0.0
+            }",
             ":create claim_source_edges {
                 claim_id: String,
                 source_id: String

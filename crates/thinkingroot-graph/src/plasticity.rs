@@ -267,6 +267,116 @@ impl GraphStore {
         }
         Ok(out.into_iter().collect())
     }
+
+    /// Build/refresh the **structural** spine priors (`w_struct`, §4.2) from
+    /// `entity_relations` — the shared-entity / co-citation structure set at
+    /// compile. Aggregated by MAX strength per `(from,to)` pair, capped. Preserves
+    /// learned plastic `h` (delegates to `upsert_spine_structural`), so a fresh
+    /// brain carries structural priors *and* keeps everything it has learned.
+    /// Called from `dream` (sleep consolidation). Returns edges written.
+    pub fn populate_spine_from_relations(&self, now: f64, cap: usize) -> Result<usize> {
+        let res = self.query_read(
+            "?[from_id, to_id, strength] := *entity_relations{from_id, to_id, strength}",
+        )?;
+        let mut best: HashMap<(String, String), f64> = HashMap::new();
+        for r in &res.rows {
+            let (Some(from), Some(to)) = (
+                r.first().and_then(|v| v.get_str()).map(|s| s.to_string()),
+                r.get(1).and_then(|v| v.get_str()).map(|s| s.to_string()),
+            ) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            let s = match r.get(2) {
+                Some(DataValue::Num(Num::Float(x))) => *x,
+                Some(DataValue::Num(Num::Int(x))) => *x as f64,
+                _ => 1.0,
+            };
+            let e = best.entry((from, to)).or_insert(0.0);
+            if s > *e {
+                *e = s;
+            }
+        }
+        let mut edges: Vec<(String, String, f64)> =
+            best.into_iter().map(|((f, t), s)| (f, t, s)).collect();
+        edges.truncate(cap);
+        self.upsert_spine_structural(&edges, now)
+    }
+
+    fn list_concept_ids(&self) -> Result<Vec<String>> {
+        let res = self.query_read("?[id] := *concept_nodes{id}")?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.get_str()).map(|s| s.to_string()))
+            .collect())
+    }
+
+    /// A member is LIVE unless its `entity_attestation` says `retired_at >= 0`.
+    /// No attestation row → live (default).
+    fn member_is_live(&self, entity_id: &str) -> Result<bool> {
+        let mut p = BTreeMap::new();
+        p.insert("e".to_string(), DataValue::Str(entity_id.into()));
+        let res = self.query("?[retired_at] := *entity_attestation{entity_id: $e, retired_at}", p)?;
+        Ok(match res.rows.first().and_then(|r| r.first()) {
+            Some(DataValue::Num(Num::Float(x))) => *x < 0.0,
+            Some(DataValue::Num(Num::Int(x))) => *x < 0,
+            _ => true,
+        })
+    }
+
+    fn set_concept_stale(&self, concept_id: &str, stale: bool, live_fraction: f64, now: f64) -> Result<()> {
+        let mut p = BTreeMap::new();
+        p.insert("c".to_string(), DataValue::Str(concept_id.into()));
+        p.insert("s".to_string(), DataValue::Bool(stale));
+        p.insert("lf".to_string(), DataValue::Num(Num::Float(live_fraction)));
+        p.insert("ca".to_string(), DataValue::Num(Num::Float(now)));
+        self.query(
+            "?[concept_id, stale, live_fraction, checked_at] <- [[$c, $s, $lf, $ca]] \
+             :put concept_stale {concept_id => stale, live_fraction, checked_at}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// **Tethered plasticity (§4.5) — the truth leash.** Re-ground every concept
+    /// against its tether: a concept is STALE when the live fraction of its member
+    /// facts/entities falls below `quorum` (its ground truth has been retracted).
+    /// Marks (never deletes — re-derived next dream). Returns `(checked, stale)`.
+    pub fn recompute_concept_tethers(&self, quorum: f64, now: f64) -> Result<(usize, usize)> {
+        let concept_ids = self.list_concept_ids()?;
+        let mut stale_count = 0;
+        for cid in &concept_ids {
+            let members = self.get_concept_members(cid)?;
+            if members.is_empty() {
+                continue;
+            }
+            let live = members.iter().filter(|m| self.member_is_live(m).unwrap_or(true)).count();
+            let frac = live as f64 / members.len() as f64;
+            let is_stale = frac < quorum;
+            self.set_concept_stale(cid, is_stale, frac, now)?;
+            if is_stale {
+                stale_count += 1;
+            }
+        }
+        Ok((concept_ids.len(), stale_count))
+    }
+
+    /// Whether a concept is currently flagged stale (read-side gate — a stale
+    /// generalization should be down-ranked/withheld until re-derived).
+    pub fn is_concept_stale(&self, concept_id: &str) -> Result<bool> {
+        let mut p = BTreeMap::new();
+        p.insert("c".to_string(), DataValue::Str(concept_id.into()));
+        let res = self.query("?[stale] := *concept_stale{concept_id: $c, stale}", p)?;
+        Ok(res
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(|v| matches!(v, DataValue::Bool(true)))
+            .unwrap_or(false))
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +474,88 @@ mod tests {
         assert!(
             store.plastic_weight("C", "D", now, 0.001).unwrap() >= 0.5,
             "structural edge survives forgetting"
+        );
+    }
+
+    #[test]
+    fn structural_population_preserves_learned_plasticity() {
+        use cozo::{DbInstance, ScriptMutability};
+        let db = DbInstance::new("mem", "", "").unwrap();
+        let store = GraphStore::from_db_for_testing(db);
+        store.init_for_testing().unwrap();
+        let now = 100.0;
+
+        // Learn a plastic synapse A-B first (h > 0, no structural prior yet).
+        store.bump_hebbian(&[("A".into(), "B".into(), 1.0)], 0.5, now).unwrap();
+        let h_only = store.plastic_weight("A", "B", now, 0.0).unwrap();
+
+        // A structural entity relation A-B exists in the graph.
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("f".to_string(), DataValue::from("A"));
+        p.insert("t".to_string(), DataValue::from("B"));
+        store
+            .raw_db()
+            .run_script(
+                r#"?[from_id, to_id, relation_type, strength] <- [[$f, $t, "rel", 0.4]]
+                   :put entity_relations {from_id, to_id, relation_type => strength}"#,
+                p,
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+
+        // Sleep populates the structural prior → w_struct added, learned h kept.
+        assert_eq!(store.populate_spine_from_relations(now, 1000).unwrap(), 1);
+        let w_full = store.plastic_weight("A", "B", now, 0.0).unwrap();
+        assert!(w_full >= 0.4, "structural prior present");
+        assert!(w_full > h_only, "structural prior added ON TOP of preserved h");
+    }
+
+    #[test]
+    fn tethered_plasticity_marks_stale_when_ground_truth_dies() {
+        use cozo::{DbInstance, ScriptMutability};
+        let db = DbInstance::new("mem", "", "").unwrap();
+        let store = GraphStore::from_db_for_testing(db);
+        store.init_for_testing().unwrap();
+        let now = 100.0;
+
+        // A concept g1 grown from 3 members (the tether is `member_entity_ids_json`,
+        // which is what `get_concept_members` reads).
+        let mut cp = BTreeMap::new();
+        cp.insert("id".to_string(), DataValue::from("g1"));
+        cp.insert("mj".to_string(), DataValue::from(r#"["e1","e2","e3"]"#));
+        store
+            .raw_db()
+            .run_script(
+                r#"?[id, member_entity_ids_json] <- [[$id, $mj]]
+                   :put concept_nodes {id => member_entity_ids_json}"#,
+                cp,
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+
+        // e1 stays live; e2 and e3 are RETIRED (their ground truth was retracted).
+        store.attest_entities(&["e1".into()], now).unwrap();
+        for e in ["e2", "e3"] {
+            let mut p = BTreeMap::new();
+            p.insert("e".to_string(), DataValue::from(e));
+            store
+                .raw_db()
+                .run_script(
+                    r#"?[entity_id, attested, last_attested_at, retired_at] <- [[$e, true, 100.0, 200.0]]
+                       :put entity_attestation {entity_id => attested, last_attested_at, retired_at}"#,
+                    p,
+                    ScriptMutability::Mutable,
+                )
+                .unwrap();
+        }
+
+        // Only 1/3 members live < 0.5 quorum → the concept has drifted → stale.
+        let (checked, stale) = store.recompute_concept_tethers(0.5, now).unwrap();
+        assert_eq!(checked, 1);
+        assert_eq!(stale, 1);
+        assert!(
+            store.is_concept_stale("g1").unwrap(),
+            "concept is stale once a quorum of its ground truth is retracted"
         );
     }
 }
