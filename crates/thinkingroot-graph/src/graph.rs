@@ -919,6 +919,19 @@ impl GraphStore {
                 stability: Float default 1.0,
                 last_access: Float default 0.0
             }",
+            // ARTMIP §4.10 — episodic trajectory chaining: directed `temporal_flow`
+            // edges record which node tends to be activated AFTER which (the tempo
+            // of cognitive paths). A later recall is primed toward the nodes that
+            // historically followed its seeds — the spotlight flows along paths
+            // that resolved similar tasks before. Sidecar, reversible.
+            ":create temporal_flow {
+                from_id: String,
+                to_id: String
+                =>
+                weight: Float default 0.0,
+                count: Int default 0,
+                last_at: Float default 0.0
+            }",
             ":create claim_source_edges {
                 claim_id: String,
                 source_id: String

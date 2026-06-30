@@ -226,6 +226,14 @@ pub fn expand_claims_from_seeds(
             let e = activation.entry(nbr).or_insert(0.0);
             *e = e.max(w as f32);
         }
+        // §4.10 trajectory priming: boost nodes that historically FOLLOWED the
+        // seeds in past recalls (the spotlight flows along used paths). Bounded.
+        const BETA: f64 = 0.25;
+        for (follower, w) in store.trajectory_followers(&seed_entities, 0.5)? {
+            let prime = (BETA * w).min(1.0) as f32;
+            let e = activation.entry(follower).or_insert(0.0);
+            *e = e.max(prime);
+        }
         // §4.4b forgetting affects RECALL: scale each activated node by its
         // retrievability ρ = exp(−Δt/S), so a faded (long-unused) memory
         // contributes less. Unseen nodes are ρ=1 (neutral). Closes the read loop:

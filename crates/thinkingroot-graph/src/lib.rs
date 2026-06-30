@@ -14,6 +14,7 @@ pub mod hybrid_queries;
 pub mod ort_session;
 pub mod plasticity;
 pub mod spreading_activation;
+pub mod trajectory;
 pub mod per_source_rows;
 pub mod prompt;
 pub mod root_function;

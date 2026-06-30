@@ -7733,6 +7733,17 @@ side referenced. Strict rules:\n\
         if !node_bumps.is_empty() {
             let _ = storage.graph.bump_node_recall(&node_bumps, kappa, now);
         }
+        // §4.10 trajectory chaining: record this recall's activation SEQUENCE
+        // (distinct entities in relevance order) as `temporal_flow` path edges,
+        // so a future recall is primed along the paths used before.
+        let mut seen_seq: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let seq: Vec<String> = ents
+            .iter()
+            .filter_map(|(e, _)| seen_seq.insert(e.clone()).then(|| e.clone()))
+            .collect();
+        if seq.len() >= 2 {
+            let _ = storage.graph.record_trajectory(&seq, 1.0, now);
+        }
     }
 
     pub(crate) async fn search_scoped_on(
