@@ -226,6 +226,14 @@ pub fn expand_claims_from_seeds(
             let e = activation.entry(nbr).or_insert(0.0);
             *e = e.max(w as f32);
         }
+        // §4.4b forgetting affects RECALL: scale each activated node by its
+        // retrievability ρ = exp(−Δt/S), so a faded (long-unused) memory
+        // contributes less. Unseen nodes are ρ=1 (neutral). Closes the read loop:
+        // decay → low ρ → lower rank.
+        for (eid, a) in activation.iter_mut() {
+            let rho = store.node_retrievability(eid, now).unwrap_or(1.0) as f32;
+            *a *= rho;
+        }
     }
 
     // 3. Materialize claims for activated entities (strongest first), weighting
