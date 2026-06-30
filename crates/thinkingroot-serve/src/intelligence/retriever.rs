@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::engine::{ClaimSearchHit, QueryEngine};
+use crate::intelligence::query_router;
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -155,6 +156,43 @@ pub async fn retrieve_claims(
         }
     }
 
+    // Multi-session expansion (HippoRAG): flow spreading activation from the top
+    // vector-seed claims out through the entity graph and pull the connected
+    // claims a pure vector search misses (cross-session, no shared surface terms).
+    // The engine re-scopes the results to `allowed_sources` (cross-session safety).
+    // Flag-gated (`TR_GRAPH_EXPAND`, default off); ships dark until eval tunes the
+    // boost weight. ADAPTIVE-ROUTED: only fires for MultiHop/Global queries — the
+    // literature is clear that graph expansion HURTS simple single-fact lookups,
+    // so the router keeps the fast path noise-free.
+    if graph_expand_on() && query_router::wants_graph_expansion(category, question) {
+        let seed_ids: Vec<String> = claims
+            .iter()
+            .take(GRAPH_EXPAND_SEED_CLAIMS)
+            .map(|c| c.id.clone())
+            .collect();
+        for hit in engine
+            .expand_via_spreading(workspace, &seed_ids, allowed_sources)
+            .await
+        {
+            if seen.insert(hit.id.clone()) {
+                claims.push(hit);
+            }
+        }
+    }
+
+    // RAPTOR (roadmap #6): a GLOBAL "what's this whole thing about" question gets
+    // the corpus theme summaries — no single fact answers it. Query-type-gated
+    // (summaries hurt single-fact precision) + flag-gated (`TR_RAPTOR`, default off).
+    if raptor_on()
+        && matches!(query_router::route(category, question), query_router::QueryClass::Global)
+    {
+        for hit in engine.community_summary_hits(workspace).await {
+            if seen.insert(hit.id.clone()) {
+                claims.push(hit);
+            }
+        }
+    }
+
     // Sort: knowledge-update by session recency (prevents stale values),
     // all others by vector relevance score.
     match category {
@@ -219,6 +257,24 @@ fn fact_recall_on() -> bool {
     std::env::var("TR_FACT_RECALL")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true)
+}
+
+/// Multi-session graph expansion (HippoRAG) — OFF by default (adds a graph
+/// read-lock + an eval-tunable boost weight, so it ships dark until measured).
+fn graph_expand_on() -> bool {
+    std::env::var("TR_GRAPH_EXPAND")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// How many top vector-seed claims feed the spreading-activation expansion.
+const GRAPH_EXPAND_SEED_CLAIMS: usize = 20;
+
+/// RAPTOR community summaries for global questions — OFF by default.
+fn raptor_on() -> bool {
+    std::env::var("TR_RAPTOR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 fn second_pass_min_claims() -> usize {
     std::env::var("TR_SECOND_PASS_MIN_CLAIMS")

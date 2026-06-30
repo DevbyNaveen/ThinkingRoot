@@ -180,6 +180,39 @@ impl GraphStore {
         Ok(res.rows.iter().filter_map(|r| row_to_fact(r)).collect())
     }
 
+    /// Temporal anchoring (ingest side): record the absolute event date a fact's
+    /// statement refers to (Unix epoch sec, UTC midnight) in the `fact_event_date`
+    /// sidecar. Idempotent `:put` upsert. Facts with no extractable date are
+    /// simply absent (no row), so this never penalizes undated facts.
+    pub fn set_fact_event_dates(&self, dates: &[(String, f64)]) -> Result<usize> {
+        if dates.is_empty() {
+            return Ok(0);
+        }
+        let rows: Vec<DataValue> = dates
+            .iter()
+            .map(|(id, d)| DataValue::List(vec![s(id), f(*d)]))
+            .collect();
+        let mut params = BTreeMap::new();
+        params.insert("rows".into(), DataValue::List(rows));
+        self.query(
+            "?[fact_id, event_date] <- $rows\n:put fact_event_date {fact_id => event_date}",
+            params,
+        )?;
+        Ok(dates.len())
+    }
+
+    /// All fact→event-date sidecar rows: `(fact_id, event_date)`. Loaded into the
+    /// read snapshot so recall can temporally re-rank without a per-query DB hit.
+    pub fn get_all_fact_event_dates(&self) -> Result<Vec<(String, f64)>> {
+        let res =
+            self.query_read("?[fact_id, event_date] := *fact_event_date{fact_id, event_date}")?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| Some((r.first()?.get_str()?.to_string(), df(r.get(1)?))))
+            .collect())
+    }
+
     /// Bi-temporal supersession: tombstone (set `valid_until = now`) every
     /// LIVE fact of `source_id` whose id is NOT in `keep_ids` — i.e. facts a
     /// re-extraction no longer confirms. Tombstoned facts are kept (never
@@ -197,6 +230,36 @@ impl GraphStore {
             .get_atomic_facts_for_source(source_id)?
             .into_iter()
             .filter(|f| f.is_live() && !keep.contains(f.id.as_str()))
+            .map(|mut f| {
+                f.valid_until = now;
+                f
+            })
+            .collect();
+        let n = updated.len();
+        if n > 0 {
+            self.insert_atomic_facts_batch(&updated)?;
+        }
+        Ok(n)
+    }
+
+    /// Bi-temporal supersession by explicit fact id — tombstone (set
+    /// `valid_until = now`) each LIVE fact in `ids`. Unlike
+    /// [`Self::supersede_facts_not_in`] this is NOT scoped to a source: it is the
+    /// CROSS-SOURCE knowledge-update path (a newer fact in document B closes an
+    /// older, contradicted fact from document A). Tombstoned facts are kept (never
+    /// deleted) for the version timeline. Already-tombstoned ids are skipped.
+    /// Returns the number newly tombstoned.
+    pub fn supersede_fact_ids(&self, ids: &[String], now: f64) -> Result<usize> {
+        use std::collections::HashSet;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let want: HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        // Resolve ids → live facts, set their valid_until, upsert.
+        let updated: Vec<AtomicFact> = ids
+            .iter()
+            .filter_map(|id| self.get_atomic_fact_by_id(id).ok().flatten())
+            .filter(|f| f.is_live() && want.contains(f.id.as_str()))
             .map(|mut f| {
                 f.valid_until = now;
                 f
@@ -576,6 +639,47 @@ mod tests {
         assert_eq!(live[0].id, f1.id);
         let dead: Vec<_> = all.iter().filter(|f| !f.is_live()).collect();
         assert_eq!(dead[0].valid_until, 99.0);
+    }
+
+    #[test]
+    fn supersede_fact_ids_tombstones_cross_source() {
+        let (_d, store) = store();
+        // Old fact in srcA, newer contradicting fact in srcB (knowledge update).
+        let old = fact("srcA", "works_at", 0);
+        let new = fact("srcB", "works_at", 0);
+        store.insert_atomic_facts_batch(&[old.clone(), new.clone()]).unwrap();
+
+        // The KU judge decided `new` supersedes `old` → close `old` by id.
+        let n = store.supersede_fact_ids(&[old.id.clone()], 99.0).unwrap();
+        assert_eq!(n, 1);
+
+        let after_old = store.get_atomic_fact_by_id(&old.id).unwrap().unwrap();
+        assert!(!after_old.is_live(), "old fact tombstoned");
+        assert_eq!(after_old.valid_until, 99.0);
+        let after_new = store.get_atomic_fact_by_id(&new.id).unwrap().unwrap();
+        assert!(after_new.is_live(), "the current fact stays live");
+
+        // Idempotent: re-superseding an already-dead fact tombstones nothing.
+        assert_eq!(store.supersede_fact_ids(&[old.id.clone()], 123.0).unwrap(), 0);
+    }
+
+    #[test]
+    fn fact_event_date_sidecar_roundtrips() {
+        let (_d, store) = store();
+        let f1 = fact("srcA", "happened_on", 0);
+        store.insert_atomic_facts_batch(&[f1.clone()]).unwrap();
+
+        assert_eq!(store.set_fact_event_dates(&[(f1.id.clone(), 1_700_000_000.0)]).unwrap(), 1);
+        let dates = store.get_all_fact_event_dates().unwrap();
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0].0, f1.id);
+        assert_eq!(dates[0].1, 1_700_000_000.0);
+
+        // Idempotent upsert: same id overwrites, not duplicates.
+        store.set_fact_event_dates(&[(f1.id.clone(), 1_800_000_000.0)]).unwrap();
+        let dates = store.get_all_fact_event_dates().unwrap();
+        assert_eq!(dates.len(), 1);
+        assert_eq!(dates[0].1, 1_800_000_000.0);
     }
 
     #[test]

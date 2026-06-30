@@ -138,9 +138,15 @@ pub async fn generate_chunk_briefs(
 ///
 /// Empty pieces are skipped so a missing brief/title never injects noise; with
 /// neither, it degrades to the bare statement (no regression vs. the old path).
-pub fn contextualize_fact_text(title: &str, brief: Option<&str>, statement: &str) -> String {
+pub fn contextualize_fact_text(
+    title: &str,
+    brief: Option<&str>,
+    neighborhood: Option<&str>,
+    statement: &str,
+) -> String {
     let title = title.trim();
     let brief = brief.map(str::trim).filter(|s| !s.is_empty());
+    let neighborhood = neighborhood.map(str::trim).filter(|s| !s.is_empty());
     let mut ctx = String::new();
     if !title.is_empty() {
         ctx.push_str(title);
@@ -154,6 +160,16 @@ pub fn contextualize_fact_text(title: &str, brief: Option<&str>, statement: &str
             }
             ctx.push_str(b);
         }
+    }
+    // L1+ Spine-Contextual: the fact's resolved entity neighborhood (clean typed
+    // canonical names from EDC, e.g. "Lena Park (person), Orion Labs (organization)").
+    // Free (no LLM), always fresh (re-derived on resolve/supersede). Lets a
+    // referent-light statement match a query that names the entity but not the doc.
+    if let Some(n) = neighborhood {
+        if !ctx.is_empty() {
+            ctx.push_str(" — ");
+        }
+        ctx.push_str(n);
     }
     if ctx.is_empty() {
         statement.to_string()
@@ -171,6 +187,7 @@ mod tests {
         let t = contextualize_fact_text(
             "ThinkingRoot Architecture",
             Some("The embedder is gte-modernbert at 768 dimensions."),
+            None,
             "It is 768-dimensional.",
         );
         assert_eq!(
@@ -185,23 +202,44 @@ mod tests {
     fn contextualize_handles_missing_pieces_without_noise() {
         // No title → brief only.
         assert_eq!(
-            contextualize_fact_text("", Some("A passage about X."), "X happened."),
+            contextualize_fact_text("", Some("A passage about X."), None, "X happened."),
             "A passage about X.\nX happened."
         );
         // No brief → title only.
         assert_eq!(
-            contextualize_fact_text("Doc Title", None, "X happened."),
+            contextualize_fact_text("Doc Title", None, None, "X happened."),
             "Doc Title\nX happened."
         );
         // Neither → bare statement (no regression, no stray separators).
-        assert_eq!(contextualize_fact_text("  ", Some("  "), "X happened."), "X happened.");
+        assert_eq!(contextualize_fact_text("  ", Some("  "), None, "X happened."), "X happened.");
     }
 
     #[test]
     fn contextualize_skips_brief_that_equals_statement() {
         // The lead-fact fallback can make the brief == the statement; don't duplicate it.
-        let t = contextualize_fact_text("Doc", Some("X happened."), "X happened.");
+        let t = contextualize_fact_text("Doc", Some("X happened."), None, "X happened.");
         assert_eq!(t, "Doc\nX happened.");
+    }
+
+    #[test]
+    fn contextualize_appends_entity_neighborhood() {
+        // L1+ Spine-Contextual: the resolved entity neighborhood is appended so a
+        // referent-light statement matches a query naming the entity.
+        let t = contextualize_fact_text(
+            "Q3 Plan",
+            None,
+            Some("Lena Park (person), Orion Labs (organization)"),
+            "She leads the team.",
+        );
+        assert_eq!(
+            t,
+            "Q3 Plan — Lena Park (person), Orion Labs (organization)\nShe leads the team."
+        );
+        // Neighborhood alone (no title/brief) still situates the bare statement.
+        assert_eq!(
+            contextualize_fact_text("", None, Some("Orion Labs (organization)"), "It shipped."),
+            "Orion Labs (organization)\nIt shipped."
+        );
     }
 
     fn inp(id: &str, facts: &[&str], preview: &str) -> ChunkBriefInput {

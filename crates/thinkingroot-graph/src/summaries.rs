@@ -158,6 +158,56 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Replace the RAPTOR **community** summaries — corpus-level theme summaries
+    /// spanning documents, for global "what's this whole thing about" questions.
+    /// Clears ONLY the `community` altitude (code function/file/repo summaries are
+    /// untouched), then inserts the new ones. Each input is `(summary_text,
+    /// child_source_ids)`. Returns the number written.
+    pub fn replace_community_summaries(
+        &self,
+        summaries: &[(String, Vec<String>)],
+        now: f64,
+    ) -> Result<usize> {
+        self.query(
+            "?[id] := *summary_nodes{id, altitude}, altitude == 'community' \
+             :rm summary_nodes {id}",
+            Default::default(),
+        )
+        .map_err(|e| Error::GraphStorage(format!("clear community summaries: {e}")))?;
+        if summaries.is_empty() {
+            return Ok(0);
+        }
+        let nodes: Vec<SummaryNode> = summaries
+            .iter()
+            .enumerate()
+            .map(|(i, (text, children))| SummaryNode {
+                id: format!("sum:community:{i}"),
+                altitude: "community".to_string(),
+                target_id: String::new(),
+                summary: text.clone(),
+                child_ids_json: serde_json::to_string(children).unwrap_or_else(|_| "[]".into()),
+                source_uri: String::new(),
+                created_at: now,
+            })
+            .collect();
+        let n = nodes.len();
+        self.insert_summary_nodes(&nodes)?;
+        Ok(n)
+    }
+
+    /// The RAPTOR community theme summaries (corpus-level), newest-irrelevant
+    /// order — used to answer global questions.
+    pub fn get_community_summaries(&self) -> Result<Vec<String>> {
+        let res = self.query_read(
+            "?[summary] := *summary_nodes{altitude, summary}, altitude == 'community'",
+        )?;
+        Ok(res
+            .rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.get_str()).map(|s| s.to_string()))
+            .collect())
+    }
+
     /// Batch-insert summary nodes.
     fn insert_summary_nodes(&self, nodes: &[SummaryNode]) -> Result<()> {
         for chunk in nodes.chunks(500) {

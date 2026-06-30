@@ -867,6 +867,34 @@ impl GraphStore {
                 last_attested_at: Float default 0.0,
                 retired_at: Float default -1.0
             }",
+            // Temporal anchoring sidecar: the absolute date a fact's statement
+            // REFERS TO (an event/content date), distinct from the fact's
+            // bi-temporal validity (`valid_from`/`valid_until`) and ingest time
+            // (`created_at`). Sidecar (not an atomic_facts column) so the fact
+            // read/write path is untouched; absent ⇒ no event date extracted.
+            // `event_date` = Unix epoch seconds (UTC midnight of the date).
+            ":create fact_event_date {
+                fact_id: String
+                =>
+                event_date: Float default -1.0
+            }",
+            // ARTMIP / "Recall is Rewrite" (L3, the MIND) — the plastic synapse
+            // sidecar (spec §5). `w_struct` = structural prior (compile-set);
+            // `h` = plastic Hebbian component, written on recall, decaying lazily;
+            // `last_access` = when h was last touched (for lazy Ebbinghaus decay);
+            // `stability` = forgetting resistance, grows with recall (spacing
+            // effect). Sidecar so the core graph is untouched and the whole MIND
+            // is reversible (drop the relation = back to the static index). ALL
+            // consumers are flag-default-OFF + eval-gated.
+            ":create spine_edge {
+                from_id: String,
+                to_id: String
+                =>
+                w_struct: Float default 0.0,
+                h: Float default 0.0,
+                last_access: Float default 0.0,
+                stability: Float default 1.0
+            }",
             ":create claim_source_edges {
                 claim_id: String,
                 source_id: String
@@ -3809,6 +3837,49 @@ impl GraphStore {
             .collect())
     }
 
+    /// Returns `(id, canonical_name, entity_type, description)` for every entity.
+    /// Like [`Self::get_all_entities`] but also carries the EDC DEFINE-stage
+    /// description — used by the canonicalizer's LLM-judge to compare *definitions*
+    /// (not bare names) when deciding whether a new entity duplicates an existing one.
+    pub fn get_entities_brief(&self) -> Result<Vec<(String, String, String, String)>> {
+        let result = self.query_read(
+            "?[id, canonical_name, entity_type, description] := \
+             *entities{id, canonical_name, entity_type, description}",
+        )?;
+        Ok(result
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_to_string(&row[0]),
+                    dv_to_string(&row[1]),
+                    dv_to_string(&row[2]),
+                    dv_to_string(&row[3]),
+                )
+            })
+            .collect())
+    }
+
+    /// Register `alias` as an alternate surface form of the entity `entity_id`
+    /// (idempotent `:put` upsert). Used by EDC canonicalization when a new
+    /// extracted name is judged the same entity as an existing node: the merged
+    /// name becomes an alias so future exact lookups resolve to the survivor.
+    pub fn add_entity_alias(&self, entity_id: &str, alias: &str) -> Result<()> {
+        let alias = alias.trim();
+        if entity_id.is_empty() || alias.is_empty() {
+            return Ok(());
+        }
+        let mut p = BTreeMap::new();
+        p.insert("eid".into(), DataValue::Str(entity_id.into()));
+        p.insert("alias".into(), DataValue::Str(alias.into()));
+        self.query(
+            r#"?[entity_id, alias] <- [[$eid, $alias]]
+            :put entity_aliases {entity_id, alias}"#,
+            p,
+        )?;
+        Ok(())
+    }
+
     /// Returns (canonical_name, entity_type) pairs for all entities.
     /// Used by graph-primed extraction to inject KNOWN_ENTITIES into LLM prompts.
     pub fn get_known_entities(&self) -> Result<Vec<(String, String)>> {
@@ -6734,6 +6805,30 @@ impl GraphStore {
             .iter()
             .map(|row| dv_to_string(&row[0]))
             .collect())
+    }
+
+    /// `(claim_id, source_uri)` for each given claim (via `claim_source_edges` →
+    /// `sources`). Used to RE-SCOPE graph-expanded claims: spreading activation
+    /// crosses sources, so expanded claims must be re-filtered with the SAME
+    /// substring scope rule as scoped vector search. Claims with no source edge
+    /// are simply absent (the caller drops them under a non-empty scope).
+    pub fn get_claim_source_uris(&self, claim_ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(claim_ids.len());
+        for cid in claim_ids {
+            let mut params = BTreeMap::new();
+            params.insert("cid".into(), DataValue::Str(cid.clone().into()));
+            if let Ok(res) = self.db.run_script(
+                "?[uri] := *claim_source_edges{claim_id: $cid, source_id}, \
+                 *sources{id: source_id, uri}",
+                params,
+                ScriptMutability::Immutable,
+            ) {
+                if let Some(uri) = res.rows.first().and_then(|r| r.first()).map(dv_to_string) {
+                    out.push((cid.clone(), uri));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn remove_claim_source_edges_for_claim(&self, claim_id: &str) -> Result<()> {

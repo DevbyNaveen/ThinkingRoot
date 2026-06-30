@@ -157,13 +157,20 @@ impl GraphStore {
         cache: &mut BTreeMap<String, String>,
         name: &str,
         entity_type: EntityType,
+        description: Option<&str>,
         created: &mut usize,
     ) -> Result<String> {
         let key = name.to_lowercase();
         if let Some(id) = cache.get(&key) {
             return Ok(id.clone());
         }
-        let entity = Entity::new(name, entity_type);
+        let mut entity = Entity::new(name, entity_type);
+        // EDC DEFINE stage: attach the one-sentence definition (if any) so the
+        // node is self-describing and the canonicalizer's LLM-judge can compare
+        // definitions, not bare names. A blank definition leaves it undescribed.
+        if let Some(d) = description.map(str::trim).filter(|s| !s.is_empty()) {
+            entity = entity.with_description(d);
+        }
         let id = entity.id.to_string();
         self.insert_entity(&entity)?;
         cache.insert(key, id.clone());
@@ -183,10 +190,15 @@ impl GraphStore {
     ///     structurally impossible.
     /// Candidates absent from the map fall back to the mechanical heuristic
     /// (graceful — e.g. the LLM was unavailable), so no knowledge is lost.
+    /// `definitions` (EDC stage 2) maps a lowercased typing-canonical name to its
+    /// one-sentence definition; threaded through [`Self::resolve`] so the
+    /// definition travels with the SAME canonical the type came from (no key
+    /// mismatch). Absent/empty ⇒ the node is created undescribed (graceful).
     pub fn promote_fact_entities_and_relations_typed(
         &self,
         source_id: &str,
         typing: &BTreeMap<String, (String, EntityType, bool)>,
+        definitions: &BTreeMap<String, String>,
     ) -> Result<usize> {
         let facts: Vec<_> = self
             .get_atomic_facts_for_source(source_id)?
@@ -202,20 +214,25 @@ impl GraphStore {
             .map(|(id, name, _)| (name.to_lowercase(), id))
             .collect();
 
-        // Resolve one fact endpoint to a (canonical, type) pair, or `None` to
-        // skip it (literal, junk, or LLM-rejected). The map key is the RAW fact
-        // string (lowercased) so it aligns with how `serve` harvested candidates.
-        let resolve = |raw: &str| -> Option<(String, EntityType)> {
+        // Resolve one fact endpoint to a (canonical, type, definition) triple, or
+        // `None` to skip it (literal, junk, or LLM-rejected). The map key is the
+        // RAW fact string (lowercased) so it aligns with how `serve` harvested
+        // candidates; the definition is looked up by the typing CANONICAL (the
+        // same key `serve` used when building the definition map) — no mismatch.
+        let resolve = |raw: &str| -> Option<(String, EntityType, Option<String>)> {
             match typing.get(&raw.trim().to_lowercase()) {
                 Some((_, _, false)) => None, // explicitly rejected (literal/value)
                 Some((canonical, ty, true)) => {
                     // Still apply the junk-name floor to the canonical form.
-                    clean_entity_name(canonical).map(|c| (c, *ty))
+                    clean_entity_name(canonical).map(|c| {
+                        let def = definitions.get(&canonical.trim().to_lowercase()).cloned();
+                        (c, *ty, def)
+                    })
                 }
                 // Unknown to the map → mechanical fallback (no regression).
                 None => clean_entity_name(raw).map(|c| {
                     let ty = guess_entity_type(&c);
-                    (c, ty)
+                    (c, ty, None)
                 }),
             }
         };
@@ -226,12 +243,15 @@ impl GraphStore {
         // attestation (the bi-temporal liveness signal for #3).
         let mut attested: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for f in &facts {
-            let (Some((subj, s_ty)), Some((obj, o_ty))) = (resolve(&f.subject), resolve(&f.object))
+            let (Some((subj, s_ty, s_def)), Some((obj, o_ty, o_def))) =
+                (resolve(&f.subject), resolve(&f.object))
             else {
                 continue; // resolve-before-relate: at least one endpoint dropped
             };
-            let sid = self.ensure_entity_typed(&mut name_to_id, &subj, s_ty, &mut created)?;
-            let oid = self.ensure_entity_typed(&mut name_to_id, &obj, o_ty, &mut created)?;
+            let sid =
+                self.ensure_entity_typed(&mut name_to_id, &subj, s_ty, s_def.as_deref(), &mut created)?;
+            let oid =
+                self.ensure_entity_typed(&mut name_to_id, &obj, o_ty, o_def.as_deref(), &mut created)?;
             attested.insert(sid.clone());
             attested.insert(oid.clone());
             if sid == oid {
@@ -659,10 +679,18 @@ mod tests {
         // The literal is rejected → must NOT become a node.
         typing.insert("50 people".into(), ("50 people".into(), EntityType::Concept, false));
 
+        // EDC DEFINE stage: definitions keyed by lowercased typing-canonical.
+        let mut definitions: BTreeMap<String, String> = BTreeMap::new();
+        definitions.insert("orion labs".into(), "A neural-storage company.".into());
+
         let created = store
-            .promote_fact_entities_and_relations_typed("src", &typing)
+            .promote_fact_entities_and_relations_typed("src", &typing, &definitions)
             .unwrap();
         assert_eq!(created, 2, "literal endpoint dropped → only 2 real entities");
+
+        // The DEFINE-stage definition is persisted onto the entity node.
+        let orion_ctx = store.get_entity_context("Orion Labs").unwrap().unwrap();
+        assert_eq!(orion_ctx.description, "A neural-storage company.");
 
         let ents = store.get_all_entities().unwrap();
         let orion = ents.iter().find(|(_, n, _)| n == "Orion Labs").unwrap();

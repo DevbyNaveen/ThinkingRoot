@@ -155,6 +155,105 @@ fn neighbours_of(store: &GraphStore, entity: &str) -> Result<Vec<String>> {
     Ok(out.into_iter().collect())
 }
 
+/// Multi-session / HippoRAG-style recall expansion (the multi-hop step the
+/// default `/ask` retriever lacks). From a set of vector-retrieved SEED claims,
+/// flow activation out through the entity graph and pull back the claims of the
+/// activated entities — the connected memories a pure vector search misses
+/// because they share no surface terms with the query.
+///
+/// Pipeline: seed claims → their entities (`get_entity_ids_for_claim`) →
+/// [`spread`] over `entity_relations` (decaying with hop distance) → the claims
+/// of each activated entity (`get_claims_for_entity`). Returns
+/// `(claim_id, statement, claim_type, activation_weight)` for NEW claims only
+/// (seeds excluded), strongest-activation first. Everything is bounded
+/// (`seed_entity_cap`, `out_claim_cap`, [`spread`]'s own `MAX_FRONTIER`) so cost
+/// stays predictable on hub-heavy graphs. Read-only.
+#[allow(clippy::too_many_arguments)]
+/// `plastic = Some((now, lambda))` turns on the **recall-is-rewrite READ** (L3):
+/// in addition to structural `entity_relations` spread, the seeds' *plastic*
+/// neighbours (`spine_edge`, Hebbian-strengthened by past co-recall) are
+/// activated — so paths you've used before surface. `None` = pure structural
+/// spread (the default).
+#[allow(clippy::too_many_arguments)]
+pub fn expand_claims_from_seeds(
+    store: &GraphStore,
+    seed_claim_ids: &[String],
+    max_hops: u8,
+    decay: f64,
+    seed_entity_cap: usize,
+    out_claim_cap: usize,
+    plastic: Option<(f64, f64)>,
+) -> Result<Vec<(String, String, String, f32)>> {
+    let seed_set: HashSet<&str> = seed_claim_ids.iter().map(|s| s.as_str()).collect();
+
+    // 1. Seed entities = the distinct entities mentioned by the seed claims.
+    let mut seed_entities: Vec<String> = Vec::new();
+    let mut seen_ent: HashSet<String> = HashSet::new();
+    for cid in seed_claim_ids {
+        if seed_entities.len() >= seed_entity_cap {
+            break;
+        }
+        for eid in store.get_entity_ids_for_claim(cid).unwrap_or_default() {
+            if seen_ent.insert(eid.clone()) {
+                seed_entities.push(eid);
+                if seed_entities.len() >= seed_entity_cap {
+                    break;
+                }
+            }
+        }
+    }
+    if seed_entities.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Spread from each seed; keep the MAX intensity that reached each entity.
+    let mut activation: HashMap<String, f32> = HashMap::new();
+    for seed in &seed_entities {
+        for ripple in spread(store, seed, max_hops, decay)? {
+            if ripple.hop_distance == 0 {
+                continue; // the seed entity itself — its claims are already seeds
+            }
+            let e = activation.entry(ripple.entity_id).or_insert(0.0);
+            *e = e.max(ripple.intensity as f32);
+        }
+    }
+
+    // 2b. Recall-is-rewrite READ: also activate the seeds' PLASTIC neighbours
+    // (Hebbian synapses from past co-recall), so used paths surface even with no
+    // structural relation. This is the read side of the L3 loop.
+    if let Some((now, lambda)) = plastic {
+        for (nbr, w) in store.plastic_neighbors(&seed_entities, now, lambda, 0.05)? {
+            let e = activation.entry(nbr).or_insert(0.0);
+            *e = e.max(w as f32);
+        }
+    }
+
+    // 3. Materialize claims for activated entities (strongest first), weighting
+    //    each claim by the activation that reached its entity; exclude seeds.
+    let mut entities: Vec<(String, f32)> = activation.into_iter().collect();
+    entities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: HashMap<String, (String, String, f32)> = HashMap::new();
+    'outer: for (eid, intensity) in entities {
+        for (cid, statement, ctype) in store.get_claims_for_entity(&eid).unwrap_or_default() {
+            if seed_set.contains(cid.as_str()) {
+                continue;
+            }
+            let entry = out.entry(cid).or_insert((statement, ctype, 0.0));
+            entry.2 = entry.2.max(intensity);
+            if out.len() >= out_claim_cap {
+                break 'outer;
+            }
+        }
+    }
+
+    let mut result: Vec<(String, String, String, f32)> = out
+        .into_iter()
+        .map(|(cid, (st, ct, w))| (cid, st, ct, w))
+        .collect();
+    result.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +346,99 @@ mod tests {
         let b = ripples.iter().find(|r| r.entity_id == "B").unwrap();
         // Default decay is 0.5; hop 1 → intensity 0.5.
         assert!((b.intensity - 0.5).abs() < 1e-9);
+    }
+
+    fn insert_claim(store: &GraphStore, id: &str, source: &str) {
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("id".to_string(), DataValue::from(id));
+        p.insert("st".to_string(), DataValue::from("a statement"));
+        p.insert("ct".to_string(), DataValue::from("fact"));
+        p.insert("src".to_string(), DataValue::from(source));
+        store
+            .raw_db()
+            .run_script(
+                r#"?[id, statement, claim_type, source_id] <- [[$id, $st, $ct, $src]]
+                   :put claims {id => statement, claim_type, source_id}"#,
+                p,
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+    }
+
+    fn link_claim_entity(store: &GraphStore, claim: &str, entity: &str) {
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("cid".to_string(), DataValue::from(claim));
+        p.insert("eid".to_string(), DataValue::from(entity));
+        store
+            .raw_db()
+            .run_script(
+                r#"?[claim_id, entity_id] <- [[$cid, $eid]]
+                   :put claim_entity_edges {claim_id, entity_id}"#,
+                p,
+                ScriptMutability::Mutable,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn expand_pulls_connected_claims_via_multi_hop() {
+        let store = fixture(); // entity edges: A→B, B→C, A→D
+        insert_claim(&store, "cA", "srcX");
+        insert_claim(&store, "cC", "srcX");
+        link_claim_entity(&store, "cA", "A");
+        link_claim_entity(&store, "cC", "C");
+
+        // Seed = cA (mentions A). Activation flows A→B→C and pulls C's claim —
+        // a memory pure vector search on cA's text would never reach.
+        let out =
+            expand_claims_from_seeds(&store, &["cA".to_string()], 3, 0.5, 16, 16, None).unwrap();
+        let ids: Vec<&str> = out.iter().map(|(c, ..)| c.as_str()).collect();
+        assert!(ids.contains(&"cC"), "multi-hop reaches C's claim");
+        assert!(!ids.contains(&"cA"), "seed claim is excluded from expansion");
+    }
+
+    #[test]
+    fn expand_empty_when_no_seed_entities() {
+        let store = fixture();
+        // cZ has no entity links → nothing to spread from.
+        insert_claim(&store, "cZ", "srcX");
+        let out =
+            expand_claims_from_seeds(&store, &["cZ".to_string()], 3, 0.5, 16, 16, None).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn plastic_edge_surfaces_claim_closing_the_loop() {
+        // The recall-is-rewrite loop: a Hebbian synapse (no structural relation)
+        // pulls a connected claim on the NEXT recall.
+        let store = fixture(); // structural edges: A→B, B→C, A→D (no Z)
+        insert_claim(&store, "cA", "srcX");
+        insert_claim(&store, "cZ", "srcX");
+        link_claim_entity(&store, "cA", "A");
+        link_claim_entity(&store, "cZ", "Z"); // Z is NOT in entity_relations
+
+        // Without plasticity, a seed on A can never reach Z's claim.
+        let cold =
+            expand_claims_from_seeds(&store, &["cA".to_string()], 3, 0.5, 16, 16, None).unwrap();
+        assert!(!cold.iter().any(|(c, ..)| c == "cZ"), "no structural path A→Z");
+
+        // A past recall co-activated A and Z → Hebbian synapse written.
+        store.bump_hebbian(&[("A".into(), "Z".into(), 1.0)], 0.5, 100.0).unwrap();
+
+        // Now the SAME seed reaches Z's claim via the plastic edge (loop closed).
+        let warm = expand_claims_from_seeds(
+            &store,
+            &["cA".to_string()],
+            3,
+            0.5,
+            16,
+            16,
+            Some((100.0, 1e-6)),
+        )
+        .unwrap();
+        assert!(
+            warm.iter().any(|(c, ..)| c == "cZ"),
+            "plastic synapse from past co-recall surfaces cZ"
+        );
     }
 }

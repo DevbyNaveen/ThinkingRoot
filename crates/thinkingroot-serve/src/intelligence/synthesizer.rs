@@ -734,6 +734,14 @@ fn aggregation_route_on() -> bool {
         .unwrap_or(false)
 }
 
+/// ARTMIP Hebbian write-back (the MIND, "recall is rewrite") — OFF by default
+/// (research, eval-gated, mutates the graph on recall).
+fn hebbian_on() -> bool {
+    std::env::var("TR_HEBBIAN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Try to answer a count/list question with an EXACT graph aggregate. Returns
 /// `None` (caller falls through to the reader) when the question is not an
 /// aggregate, has no extractable subject, the graph is unavailable, or the
@@ -854,7 +862,16 @@ pub async fn ask(
     }
 
     tracing::warn!(target: "tr_timing", "ASK retrieve_claims={}ms claims={}", _t_retrieve.elapsed().as_millis(), claims.len());
+
+    // ARTMIP — "Recall is Rewrite" (§4.4): this recall reconsolidates the Mind —
+    // the co-recalled entities strengthen their synapses, so paths you use get
+    // sharper. The line no static index crosses (recall mutates the store). Gated
+    // `TR_HEBBIAN` (default off — research, eval-gated). Bounded; reads stay
+    // lock-free.
     let claims_used = claims.len();
+    if hebbian_on() {
+        engine.apply_hebbian_writeback(req.workspace, &claims).await;
+    }
 
     if claims.is_empty() {
         return AskResponse {
@@ -1013,7 +1030,15 @@ async fn synthesize(
 ) -> (String, TokenUsage) {
     let system_prompt_owned = resolve_system_prompt(req);
     let system_prompt: &str = system_prompt_owned.as_ref();
-    let user_msg = build_user_message(claims, req);
+    let mut user_msg = build_user_message(claims, req);
+    // Reader upgrade — Chain-of-Note: note each evidence's relevance, then answer
+    // from the relevant notes. Additive + reversible (does NOT touch the pinned
+    // MEMORY_SYSTEM_PROMPT); the directive is appended here and the notes are
+    // stripped from the answer below. Gated `TR_CHAIN_OF_NOTE` (default off).
+    let chain_of_note = crate::intelligence::chain_of_note::enabled();
+    if chain_of_note {
+        user_msg.push_str(crate::intelligence::chain_of_note::directive());
+    }
     // The FIRST Azure request after idle pays a ~30s cold-connection/routing
     // stall; the next hits the warm connection and returns in ~1s (measured).
     // So we make TWO attempts at 40s each: a cold first attempt fails fast and
@@ -1028,7 +1053,15 @@ async fn synthesize(
         )
         .await
         {
-            Ok(Ok((answer, usage))) => return (answer, usage),
+            Ok(Ok((answer, usage))) => {
+                // Strip the Chain-of-Note relevance notes, keep only the answer.
+                let answer = if chain_of_note {
+                    crate::intelligence::chain_of_note::extract_answer(&answer)
+                } else {
+                    answer
+                };
+                return (answer, usage);
+            }
             Ok(Err(e)) => tracing::warn!("synthesizer: LLM error (attempt {attempt}): {e}"),
             Err(_) => tracing::warn!("synthesizer: LLM timeout (attempt {attempt})"),
         }

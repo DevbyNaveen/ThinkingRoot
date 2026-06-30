@@ -7501,6 +7501,223 @@ side referenced. Strict rules:\n\
     /// [`FnCapabilities`]) can recall over the cognition graph without
     /// re-acquiring the engine `RwLock` mid-run (which would risk the
     /// writer-queue deadlock when a workspace mounts during a function run).
+    /// Multi-session graph expansion for the `/ask` retriever (HippoRAG-style):
+    /// from the vector-retrieved SEED claims, spread activation through the entity
+    /// graph and return the CONNECTED claims a pure vector search misses (no shared
+    /// surface terms). Re-scoped to `allowed_sources` with the SAME substring rule
+    /// as scoped vector search — activation crosses sources, so expanded claims
+    /// MUST be re-filtered, never leaking outside the haystack/user scope. Brief
+    /// storage read-lock (graph adjacency isn't in the lock-free snapshot); bounded.
+    /// The caller gates this behind `TR_GRAPH_EXPAND` (default off); the boost
+    /// weight + hops are env-tunable (`TR_GRAPH_EXPAND_WEIGHT` / `_HOPS`).
+    pub(crate) async fn expand_via_spreading(
+        &self,
+        workspace: &str,
+        seed_claim_ids: &[String],
+        allowed_sources: &HashSet<String>,
+    ) -> Vec<ClaimSearchHit> {
+        if seed_claim_ids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(handle) = self.get_workspace(workspace) else {
+            return Vec::new();
+        };
+        let max_hops: u8 = std::env::var("TR_GRAPH_EXPAND_HOPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let boost: f32 = std::env::var("TR_GRAPH_EXPAND_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.25);
+
+        // Recall-is-rewrite READ (L3): when the MIND is on (`TR_HEBBIAN`), the
+        // expansion also follows the plastic synapses strengthened by past
+        // co-recall — closing the loop (writes from `apply_hebbian_writeback` now
+        // affect retrieval). Off → pure structural spread (unchanged behavior).
+        let plastic = if std::env::var("TR_HEBBIAN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let lambda: f64 = std::env::var("TR_DECAY_LAMBDA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1e-6);
+            Some((now, lambda))
+        } else {
+            None
+        };
+        let storage = handle.storage.lock().await;
+        let expanded = match thinkingroot_graph::spreading_activation::expand_claims_from_seeds(
+            &storage.graph,
+            seed_claim_ids,
+            max_hops,
+            0.5,
+            32, // seed-entity cap
+            80, // out-claim cap
+            plastic,
+        ) {
+            Ok(e) if !e.is_empty() => e,
+            Ok(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!("graph expansion failed: {e}");
+                return Vec::new();
+            }
+        };
+        let ids: Vec<String> = expanded.iter().map(|(c, ..)| c.clone()).collect();
+        let uris: std::collections::HashMap<String, String> = storage
+            .graph
+            .get_claim_source_uris(&ids)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        drop(storage);
+
+        expanded
+            .into_iter()
+            .filter_map(|(id, statement, claim_type, w)| {
+                let uri = uris.get(&id).cloned().unwrap_or_default();
+                // EXACT same scope rule as scoped vector search (engine.rs claim
+                // defense-in-depth): substring match; empty allowed = unscoped.
+                let in_scope = allowed_sources.is_empty()
+                    || allowed_sources.iter().any(|sid| uri.contains(sid.as_str()));
+                if !in_scope {
+                    return None; // out of scope → drop (cross-session safety)
+                }
+                Some(ClaimSearchHit {
+                    id,
+                    statement,
+                    claim_type,
+                    confidence: 0.6,
+                    source_uri: uri,
+                    relevance: w * boost,
+                    valid_from: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// RAPTOR (roadmap #6): (re)build the workspace's corpus-level COMMUNITY theme
+    /// summaries from its per-document summaries — cluster the doc summaries, write
+    /// one theme summary per cluster. For global "what's this whole thing about"
+    /// questions that no single fact answers. LLM runs OFF the storage lock; the
+    /// caller gates via `TR_RAPTOR` (default off). Returns the number written.
+    pub(crate) async fn build_community_summaries(&self, workspace: &str, now: f64) -> usize {
+        let Some(llm) = self.workspace_llm(workspace) else {
+            return 0;
+        };
+        let Ok(handle) = self.get_workspace(workspace) else {
+            return 0;
+        };
+        let briefs: Vec<(String, String, String)> = {
+            let storage = handle.storage.lock().await;
+            storage.graph.list_source_briefs(10_000).unwrap_or_default()
+        };
+        if briefs.len() < 2 {
+            return 0; // need a corpus of ≥2 docs to have a "theme"
+        }
+        let summaries_text: Vec<String> = briefs
+            .iter()
+            .map(|(_, t, s)| if t.is_empty() { s.clone() } else { format!("{t}: {s}") })
+            .collect();
+        let clusters = crate::intelligence::raptor::cluster_indices(summaries_text.len());
+        let mut community: Vec<(String, Vec<String>)> = Vec::new();
+        for cluster in &clusters {
+            let docs: Vec<&str> = cluster.iter().map(|&i| summaries_text[i].as_str()).collect();
+            let summary = crate::intelligence::raptor::summarize_cluster(&llm, &docs).await;
+            if !summary.is_empty() {
+                let children: Vec<String> = cluster.iter().map(|&i| briefs[i].0.clone()).collect();
+                community.push((summary, children));
+            }
+        }
+        let storage = handle.storage.lock().await;
+        storage.graph.replace_community_summaries(&community, now).unwrap_or(0)
+    }
+
+    /// RAPTOR retrieval: the workspace's community theme summaries as hits, for a
+    /// GLOBAL query. Empty when none are built (so it's a safe no-op until RAPTOR
+    /// has run). They span the workspace (= the haystack / the user's data), so
+    /// they're inherently in-scope. High relevance — a global question wants them.
+    pub(crate) async fn community_summary_hits(&self, workspace: &str) -> Vec<ClaimSearchHit> {
+        let Ok(handle) = self.get_workspace(workspace) else {
+            return Vec::new();
+        };
+        let summaries = {
+            let storage = handle.storage.lock().await;
+            storage.graph.get_community_summaries().unwrap_or_default()
+        };
+        summaries
+            .into_iter()
+            .enumerate()
+            .map(|(i, summary)| ClaimSearchHit {
+                id: format!("sum:community:{i}"),
+                statement: summary,
+                claim_type: "summary".to_string(),
+                confidence: 0.7,
+                source_uri: String::new(),
+                relevance: 0.9,
+                valid_from: 0,
+            })
+            .collect()
+    }
+
+    /// ARTMIP "Recall is Rewrite" (§4.4) — the **Hebbian write-back**: a recall
+    /// co-activates the entities of its top results, so we strengthen the synapses
+    /// between them ("fire together, wire together"). This is the line no other
+    /// memory crosses — recall mutates the store. Bounded (top claims × capped
+    /// pairs); the caller gates it (`TR_HEBBIAN`, default off). Brief storage
+    /// write-lock — concurrent READS are unaffected (lock-free snapshot, Pillar 2).
+    ///
+    /// NOTE (production): the spec wants this fully OFF the response path via a
+    /// durable async queue. Bounded-sync here is acceptable for flag-off + eval
+    /// (the LLM synth dominates `/ask` latency, and writes are a few ms); moving
+    /// to a `recall_writeback_queue` drained by maintenance is the SOTA upgrade.
+    pub(crate) async fn apply_hebbian_writeback(&self, workspace: &str, claims: &[ClaimSearchHit]) {
+        const TOP_N: usize = 8; // co-activation set size
+        const MAX_PAIRS: usize = 24; // bound the synapse writes per recall
+        let eta: f64 = std::env::var("TR_HEBBIAN_ETA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.1);
+        let Ok(handle) = self.get_workspace(workspace) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let storage = handle.storage.lock().await;
+        // Co-activation set: the entities of the top retrieved claims, each
+        // weighted by its claim's relevance (the activation `a_i`).
+        let mut ents: Vec<(String, f64)> = Vec::new();
+        for c in claims.iter().take(TOP_N) {
+            for eid in storage.graph.get_entity_ids_for_claim(&c.id).unwrap_or_default() {
+                ents.push((eid, c.relevance.max(0.0) as f64));
+            }
+        }
+        // Pairs among co-recalled entities (bounded); product = a_i·a_j.
+        let mut pairs: Vec<(String, String, f64)> = Vec::new();
+        'outer: for i in 0..ents.len() {
+            for j in (i + 1)..ents.len() {
+                if ents[i].0 != ents[j].0 {
+                    pairs.push((ents[i].0.clone(), ents[j].0.clone(), ents[i].1 * ents[j].1));
+                    if pairs.len() >= MAX_PAIRS {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if !pairs.is_empty() {
+            if let Err(e) = storage.graph.bump_hebbian(&pairs, eta, now) {
+                tracing::warn!(ws = %workspace, "hebbian write-back failed: {e}");
+            }
+        }
+    }
+
     pub(crate) async fn search_scoped_on(
         handle: &WorkspaceHandle,
         query: &str,
@@ -7770,6 +7987,30 @@ side referenced. Strict rules:\n\
         let handle = self.get_workspace(ws)?;
         let root = handle.root_path.clone();
 
+        // ARTMIP §4.7 — sleep consolidation prunes the FADED synapses (honest
+        // forgetting: only the `spine_edge` plastic association is dropped; the
+        // facts, provenance, and bi-temporal rows are kept → recoverable). Gated
+        // `TR_DECAY` (default off, eval-gated like all the MIND laws).
+        if std::env::var("TR_DECAY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let lambda: f64 = std::env::var("TR_DECAY_LAMBDA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1e-6);
+            let storage = handle.storage.lock().await;
+            if let Ok(n) = storage.graph.prune_spine_edges(now, lambda, 0.05) {
+                if n > 0 {
+                    tracing::info!(ws = %ws, "dream: pruned {n} faded synapses (honest forgetting)");
+                }
+            }
+        }
+
         // Sample claim statements from the DURABLE graph, not the compiled
         // read cache. remember/store/contribute write to the graph but do NOT
         // repopulate the read cache, so cache-sampling makes chat/remember-fed
@@ -7967,6 +8208,20 @@ side referenced. Strict rules:\n\
             // immediately recallable via the lock-free `search_facts` path.
             *handle.vector_snapshot.write().expect("snapshot lock") = std::sync::Arc::new(snap);
         }
+        // RAPTOR (roadmap #6): refresh the corpus theme summaries after a drain
+        // that produced facts. Gated `TR_RAPTOR` (default off — it adds LLM cost;
+        // the rebuild is idempotent, so re-running across drain ticks is safe if
+        // wasteful, and it settles once the corpus is fully compiled).
+        if total > 0
+            && std::env::var("TR_RAPTOR")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        {
+            let n = self.build_community_summaries(ws, now).await;
+            if n > 0 {
+                tracing::info!(ws = %ws, "raptor: rebuilt {n} community theme summaries");
+            }
+        }
         Ok(total)
     }
 
@@ -8051,7 +8306,7 @@ side referenced. Strict rules:\n\
         // One LLM call gives promotion authoritative types (kills "company labelled
         // Person") and drops literals/values/dates/counts (kills `50 people`/`2024`
         // becoming nodes). Degrades gracefully on LLM error → literal-guard fallback.
-        let typing_map: std::collections::BTreeMap<
+        let mut typing_map: std::collections::BTreeMap<
             String,
             (String, thinkingroot_core::types::EntityType, bool),
         > = {
@@ -8077,6 +8332,188 @@ side referenced. Strict rules:\n\
                 map.insert(c.name.to_lowercase(), (d.canonical, d.entity_type, d.keep));
             }
             map
+        };
+
+        // --- Write-boundary EDC DEFINE pass (EDC stage 2, OFF the storage lock) ---
+        // One LLM call per ~40 KEPT entities → a grounded one-sentence definition,
+        // stored on the node (`entities.description`) so the graph is self-describing
+        // and the canonicalizer can compare definitions (not bare names). Keyed by
+        // the lowercased typing canonical so it aligns with promotion's `resolve`.
+        // Gated by `TR_ENTITY_DEFINE` (default on); a blank/errored definition just
+        // leaves the node undescribed — never blocks the pipeline.
+        let def_map: std::collections::BTreeMap<String, String> = {
+            let define_on = std::env::var("TR_ENTITY_DEFINE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            if !define_on || facts.is_empty() {
+                std::collections::BTreeMap::new()
+            } else {
+                use crate::intelligence::entity_definitions::{self, DefineCandidate};
+                // One candidate per KEPT canonical entity, grounded by a
+                // representative fact statement (deduped by canonical).
+                let mut seen: std::collections::BTreeMap<String, DefineCandidate> =
+                    std::collections::BTreeMap::new();
+                for fa in &facts {
+                    for raw in [&fa.subject, &fa.object] {
+                        let key = raw.trim().to_lowercase();
+                        if let Some((canonical, _ty, keep)) = typing_map.get(&key) {
+                            if *keep {
+                                seen.entry(canonical.trim().to_lowercase()).or_insert_with(|| {
+                                    DefineCandidate {
+                                        name: canonical.clone(),
+                                        context: fa.statement.clone(),
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                let candidates: Vec<DefineCandidate> = seen.into_values().collect();
+                let defs =
+                    entity_definitions::generate_entity_definitions(&llm, &candidates).await;
+                let mut map = std::collections::BTreeMap::new();
+                for (c, d) in candidates.iter().zip(defs.into_iter()) {
+                    if !d.trim().is_empty() {
+                        map.insert(c.name.trim().to_lowercase(), d);
+                    }
+                }
+                map
+            }
+        };
+
+        // --- Write-boundary EDC CANONICALIZATION (EDC stage 4, OFF the storage lock) ---
+        // Resolve this source's kept entities against the EXISTING graph: block
+        // gray-zone same-type candidates, then an LLM judge (over DEFINITIONS)
+        // decides same-or-different — link-don't-merge on doubt. A confirmed merge
+        // rewrites the canonical to the survivor (so promotion reuses its node, no
+        // duplicate created) and records an alias to write post-promotion. The LLM
+        // judge runs here, OFF the lock — never inside promotion (which holds it).
+        // Gated by `TR_ENTITY_CANON` (default on).
+        let canon_aliases: Vec<(String, String)> = {
+            use crate::intelligence::entity_canonicalize::{self, EntityRef};
+            let canon_on = std::env::var("TR_ENTITY_CANON")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            // Kept entities from this source are the "new" side to resolve.
+            let new_refs: Vec<EntityRef> = typing_map
+                .values()
+                .filter(|(_, _, keep)| *keep)
+                .map(|(canonical, ty, _)| EntityRef {
+                    name: canonical.clone(),
+                    entity_type: format!("{ty:?}"),
+                    definition: def_map
+                        .get(&canonical.trim().to_lowercase())
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect();
+            if !canon_on || new_refs.is_empty() {
+                Vec::new()
+            } else {
+                // Existing entities (id, canonical, type, description) — a quick read.
+                let existing: Vec<(String, String, String, String)> = {
+                    let storage = handle.storage.lock().await;
+                    storage.graph.get_entities_brief().unwrap_or_default()
+                };
+                let id_by_name: std::collections::BTreeMap<String, String> = existing
+                    .iter()
+                    .map(|(id, name, _, _)| (name.trim().to_lowercase(), id.clone()))
+                    .collect();
+                let existing_refs: Vec<EntityRef> = existing
+                    .iter()
+                    .map(|(_, name, ty, desc)| EntityRef {
+                        name: name.clone(),
+                        entity_type: ty.clone(),
+                        definition: desc.clone(),
+                    })
+                    .collect();
+                let merge_map: std::collections::BTreeMap<String, String> =
+                    entity_canonicalize::canonicalize(&llm, &new_refs, &existing_refs)
+                        .await
+                        .into_iter()
+                        .map(|m| (m.new_name_lc, m.survivor))
+                        .collect();
+                // Apply: rewrite typing_map canonicals to survivors; collect aliases.
+                let mut aliases = Vec::new();
+                if !merge_map.is_empty() {
+                    for (_, (canonical, _ty, keep)) in typing_map.iter_mut() {
+                        if !*keep {
+                            continue;
+                        }
+                        if let Some(survivor) = merge_map.get(&canonical.trim().to_lowercase()) {
+                            if let Some(id) = id_by_name.get(&survivor.trim().to_lowercase()) {
+                                aliases.push((id.clone(), canonical.clone()));
+                            }
+                            *canonical = survivor.clone();
+                        }
+                    }
+                    tracing::info!(
+                        ws = %ws, source_id = %sid,
+                        "EDC canonicalize merged {} entity name(s) into existing nodes",
+                        aliases.len()
+                    );
+                }
+                aliases
+            }
+        };
+
+        // --- Cross-source KNOWLEDGE-UPDATE supersession (Phase 3, OFF the lock) ---
+        // A newer fact in THIS source can update an older contradicting fact from
+        // ANOTHER source (e.g. "works at Orion" → "works at Acme"): the per-source
+        // path can't see across documents. Find same-`(subject,predicate)`-slot
+        // collisions, LLM-judge update-vs-both-true (keep-both on doubt), and
+        // collect the stale OLD fact ids to tombstone under the persist lock below.
+        // Gated `TR_FACT_SUPERSEDE`, **default OFF** (tombstoning drops a fact from
+        // recall → eval-gated before it ships).
+        let supersede_ids: Vec<String> = {
+            let on = std::env::var("TR_FACT_SUPERSEDE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !on || facts.is_empty() {
+                Vec::new()
+            } else {
+                use crate::intelligence::fact_supersession::{self, FactRef};
+                let new_refs: Vec<FactRef> = facts
+                    .iter()
+                    .map(|f| FactRef {
+                        id: f.id.clone(),
+                        subject: f.subject.clone(),
+                        predicate: f.predicate.clone(),
+                        object: f.object.clone(),
+                        statement: f.statement.clone(),
+                        valid_from: now, // newly extracted ⇒ the newest assertion
+                    })
+                    .collect();
+                // Existing LIVE facts from OTHER sources only (cross-source — the
+                // per-source `supersede_facts_not_in` handles same-source re-extract).
+                let existing: Vec<FactRef> = {
+                    let storage = handle.storage.lock().await;
+                    storage
+                        .graph
+                        .get_all_atomic_facts()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|f| f.is_live() && f.source_id != sid)
+                        .map(|f| FactRef {
+                            id: f.id,
+                            subject: f.subject,
+                            predicate: f.predicate,
+                            object: f.object,
+                            statement: f.statement,
+                            valid_from: f.valid_from,
+                        })
+                        .collect()
+                };
+                let ids = fact_supersession::superseded_old_ids(&llm, &new_refs, &existing).await;
+                if !ids.is_empty() {
+                    tracing::info!(
+                        ws = %ws, source_id = %sid,
+                        "knowledge-update: {} cross-source fact(s) judged superseded",
+                        ids.len()
+                    );
+                }
+                ids
+            }
         };
 
         // Phase → "summary": title + one-line summary in ONE LLM call (OFF lock).
@@ -8133,6 +8570,43 @@ side referenced. Strict rules:\n\
             return Ok(0);
         }
         let total = facts.len();
+        // Cross-source knowledge-update: tombstone the older facts these new ones
+        // were judged to supersede (computed off-lock above). Now that the new
+        // facts are persisted, closing the stale ones makes the snapshot rebuild
+        // (below) surface only the current value in recall.
+        if !supersede_ids.is_empty() {
+            match storage.graph.supersede_fact_ids(&supersede_ids, now) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(ws = %ws, source_id = %sid, "knowledge-update: tombstoned {n} superseded fact(s)")
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(ws = %ws, source_id = %sid, "knowledge-update supersede failed: {e}")
+                }
+            }
+        }
+        // Temporal anchoring (ingest side): extract the absolute event date each
+        // fact's statement refers to (pure mechanical regex, no LLM) and store it
+        // in the `fact_event_date` sidecar for temporal recall. Facts with no
+        // absolute date get no row (neutral — never penalized). Gated
+        // `TR_EVENT_DATE` (default on); cheap and additive.
+        let event_dates_on = std::env::var("TR_EVENT_DATE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if event_dates_on {
+            let event_dates: Vec<(String, f64)> = facts
+                .iter()
+                .filter_map(|fa| {
+                    thinkingroot_extract::temporal::extract_event_date(&fa.statement)
+                        .map(|dt| (fa.id.clone(), dt.timestamp() as f64))
+                })
+                .collect();
+            if !event_dates.is_empty() {
+                if let Err(e) = storage.graph.set_fact_event_dates(&event_dates) {
+                    tracing::warn!(ws = %ws, source_id = %sid, "temporal: event-date sidecar write failed: {e}");
+                }
+            }
+        }
         // Build the mother-node spine edges for the facts just written.
         if let Err(e) = storage.graph.rebuild_spine_for_source(sid) {
             tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: spine rebuild failed: {e}");
@@ -8141,7 +8615,7 @@ side referenced. Strict rules:\n\
         // + relations so the LLM-extracted knowledge appears in the Neural Graph.
         match storage
             .graph
-            .promote_fact_entities_and_relations_typed(sid, &typing_map)
+            .promote_fact_entities_and_relations_typed(sid, &typing_map, &def_map)
         {
             Ok(n) if n > 0 => {
                 tracing::info!(ws = %ws, source_id = %sid, "promoted {n} fact entities (EDC-typed)")
@@ -8149,6 +8623,14 @@ side referenced. Strict rules:\n\
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: entity promotion failed: {e}")
+            }
+        }
+        // EDC canonicalization: register each merged name as an alias of its
+        // surviving node, so a future exact lookup of the merged name resolves to
+        // the survivor (cheap upserts, under the same lock — no LLM here).
+        for (survivor_id, alias) in &canon_aliases {
+            if let Err(e) = storage.graph.add_entity_alias(survivor_id, alias) {
+                tracing::warn!(ws = %ws, source_id = %sid, "atomic extract: alias write failed: {e}");
             }
         }
         // Re-build the spine AFTER promotion so `fact_mentions_entity` edges include
@@ -8189,6 +8671,12 @@ side referenced. Strict rules:\n\
             let contextual = std::env::var("TR_CONTEXTUAL_EMBED")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
+            // L1+ Spine-Contextual: also fold the fact's resolved typed entities
+            // (from EDC's `typing_map`, post-canonicalize) into the embed prefix —
+            // free, always-fresh graph neighborhood. `TR_SPINE_CONTEXT` (default on).
+            let spine_context = std::env::var("TR_SPINE_CONTEXT")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
             let brief_by_chunk: std::collections::HashMap<&str, &str> = chunk_briefs
                 .iter()
                 .map(|(c, s)| (c.as_str(), s.as_str()))
@@ -8197,9 +8685,33 @@ side referenced. Strict rules:\n\
                 .iter()
                 .map(|f| {
                     let text = if contextual {
+                        // The fact's entity neighborhood: "Canonical (type), …" for
+                        // its KEPT subject/object (literals excluded), deduped.
+                        let neighborhood: Option<String> = if spine_context {
+                            let mut parts: Vec<String> = Vec::new();
+                            for raw in [&f.subject, &f.object] {
+                                if let Some((canonical, ty, keep)) =
+                                    typing_map.get(&raw.trim().to_lowercase())
+                                {
+                                    if *keep {
+                                        let label = format!(
+                                            "{canonical} ({})",
+                                            format!("{ty:?}").to_lowercase()
+                                        );
+                                        if !parts.contains(&label) {
+                                            parts.push(label);
+                                        }
+                                    }
+                                }
+                            }
+                            if parts.is_empty() { None } else { Some(parts.join(", ")) }
+                        } else {
+                            None
+                        };
                         crate::intelligence::chunk_brief::contextualize_fact_text(
                             &brief.title,
                             brief_by_chunk.get(f.chunk_id.as_str()).copied(),
+                            neighborhood.as_deref(),
                             &f.statement,
                         )
                     } else {
