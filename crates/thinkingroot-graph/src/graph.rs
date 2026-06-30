@@ -908,6 +908,17 @@ impl GraphStore {
                 live_fraction: Float default 1.0,
                 checked_at: Float default 0.0
             }",
+            // ARTMIP §4.4/§4.4b — per-NODE plastic state: `stability` (forgetting
+            // resistance, grows with each recall = the spacing effect) and
+            // `last_access` (for lazy Ebbinghaus retrievability ρ = exp(−Δt/S)).
+            // Sidecar, reversible; default stability 1.0. A node absent here is
+            // treated as fresh (retrievability 1.0).
+            ":create node_state {
+                node_id: String
+                =>
+                stability: Float default 1.0,
+                last_access: Float default 0.0
+            }",
             ":create claim_source_edges {
                 claim_id: String,
                 source_id: String

@@ -7716,6 +7716,23 @@ side referenced. Strict rules:\n\
                 tracing::warn!(ws = %workspace, "hebbian write-back failed: {e}");
             }
         }
+        // §4.4 stability bump — the recalled NODES become more durable (spacing
+        // effect: used memories get harder to forget). Deduped to max activation.
+        let kappa: f64 = std::env::var("TR_STABILITY_KAPPA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.2);
+        let mut node_max: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (e, a) in &ents {
+            let v = node_max.entry(e.clone()).or_insert(0.0);
+            if *a > *v {
+                *v = *a;
+            }
+        }
+        let node_bumps: Vec<(String, f64)> = node_max.into_iter().collect();
+        if !node_bumps.is_empty() {
+            let _ = storage.graph.bump_node_recall(&node_bumps, kappa, now);
+        }
     }
 
     pub(crate) async fn search_scoped_on(

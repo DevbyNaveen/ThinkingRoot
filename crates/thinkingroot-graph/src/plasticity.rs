@@ -377,6 +377,57 @@ impl GraphStore {
             .map(|v| matches!(v, DataValue::Bool(true)))
             .unwrap_or(false))
     }
+
+    /// `(stability, last_access)` for a node, or `None` if it's never been recalled.
+    fn read_node_state(&self, node_id: &str) -> Result<Option<(f64, f64)>> {
+        let mut p = BTreeMap::new();
+        p.insert("n".to_string(), DataValue::Str(node_id.into()));
+        let res =
+            self.query("?[stability, last_access] := *node_state{node_id: $n, stability, last_access}", p)?;
+        let getf = |r: &[DataValue], i: usize| match r.get(i) {
+            Some(DataValue::Num(Num::Float(x))) => *x,
+            Some(DataValue::Num(Num::Int(x))) => *x as f64,
+            _ => 0.0,
+        };
+        Ok(res.rows.first().map(|r| (getf(r, 0).max(1e-6), getf(r, 1))))
+    }
+
+    /// **Stability bump on recall (§4.4 — the spacing effect).** Each recalled
+    /// node `(id, activation)` becomes more durable: `S ← S·(1+κ·a)` (floored at
+    /// 1), and `last_access ← now`. Used memories become HARDER to forget.
+    pub fn bump_node_recall(&self, nodes: &[(String, f64)], kappa: f64, now: f64) -> Result<usize> {
+        let mut n = 0;
+        for (node, a) in nodes {
+            if node.is_empty() {
+                continue;
+            }
+            let s = self.read_node_state(node)?.map(|(s, _)| s).unwrap_or(1.0);
+            let s_new = bump_stability(s, *a, kappa);
+            let mut p = BTreeMap::new();
+            p.insert("n".to_string(), DataValue::Str(node.clone().into()));
+            p.insert("s".to_string(), DataValue::Num(Num::Float(s_new)));
+            p.insert("la".to_string(), DataValue::Num(Num::Float(now)));
+            self.query(
+                "?[node_id, stability, last_access] <- [[$n, $s, $la]] \
+                 :put node_state {node_id => stability, last_access}",
+                p,
+            )?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// **Node retrievability (§4.4b).** `ρ = exp(−(now − last_access)/stability)`
+    /// in `(0,1]`. A node never recalled returns `1.0` (neutral — not penalized;
+    /// it just hasn't been *used* yet). The forgetting signal for ranking.
+    pub fn node_retrievability(&self, node_id: &str, now: f64) -> Result<f64> {
+        match self.read_node_state(node_id)? {
+            Some((stability, last_access)) => {
+                Ok(retrievability((now - last_access).max(0.0), stability))
+            }
+            None => Ok(1.0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,5 +608,28 @@ mod tests {
             store.is_concept_stale("g1").unwrap(),
             "concept is stale once a quorum of its ground truth is retracted"
         );
+    }
+
+    #[test]
+    fn node_stability_grows_with_recall_retrievability_decays() {
+        use cozo::DbInstance;
+        let db = DbInstance::new("mem", "", "").unwrap();
+        let store = GraphStore::from_db_for_testing(db);
+        store.init_for_testing().unwrap();
+        let now = 100.0;
+
+        // An unseen node is neutral (not penalized): ρ = 1.0.
+        assert!((store.node_retrievability("N", now).unwrap() - 1.0).abs() < 1e-9);
+
+        // Recall it once → stability bumps, last_access = now.
+        store.bump_node_recall(&[("N".into(), 1.0)], 0.5, now).unwrap();
+        assert!(store.node_retrievability("N", now).unwrap() > 0.99, "fresh recall stays retrievable");
+        let after_1 = store.node_retrievability("N", now + 1.0).unwrap();
+        assert!(after_1 < 1.0 && after_1 > 0.0, "retrievability decays with time");
+
+        // Recall it AGAIN → stability grows → more retrievable at the same age.
+        store.bump_node_recall(&[("N".into(), 1.0)], 0.5, now).unwrap();
+        let after_2 = store.node_retrievability("N", now + 1.0).unwrap();
+        assert!(after_2 > after_1, "more recalls ⇒ harder to forget (spacing effect)");
     }
 }
