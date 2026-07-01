@@ -2389,13 +2389,19 @@ pub async fn handle_call(
                 .map(|s| build_workspace_identity(s, &s.config.chat));
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
+            // Harvest per-session dates from transcript `Date:` headers so the
+            // temporal anchor timeline + KU recency sort render (was starved
+            // by an empty map).
+            let session_dates =
+                crate::intelligence::augmenter::harvest_session_dates(&sessions_dir);
+
             let req = AskRequest {
                 workspace: ws,
                 question: &question,
                 category: &category,
                 allowed_sources: &allowed_sources,
                 question_date: &question_date,
-                session_dates: &std::collections::HashMap::new(),
+                session_dates: &session_dates,
                 answer_sids: &session_scope,
                 sessions_dir: &sessions_dir,
                 excluded_claim_ids: &std::collections::HashSet::new(),

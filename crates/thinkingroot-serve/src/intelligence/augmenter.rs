@@ -176,6 +176,58 @@ pub fn load_raw_sources(sessions_dir: &Path, answer_sids: &[String], char_budget
 }
 
 // ---------------------------------------------------------------------------
+// Session-date harvester
+// ---------------------------------------------------------------------------
+
+/// Harvest per-session dates from the `Date: YYYY/MM/DD ...` header each
+/// session transcript carries (the same header the synthesis prompt tells the
+/// LLM to read). Returns a map of file-stem → raw date string — the shape
+/// `compute_temporal_anchors` / `render_claim_notes` / `retrieve_claims`
+/// match by substring against `source_uri` / answer session ids.
+///
+/// Honest degradation: a file without a parseable `Date:` header simply gets
+/// no entry — consumers then behave exactly as they do today (no date hint).
+/// Never fabricates a date.
+pub fn harvest_session_dates(sessions_dir: &Path) -> std::collections::HashMap<String, String> {
+    use std::io::Read;
+
+    let mut out = std::collections::HashMap::new();
+    if !sessions_dir.is_dir() {
+        return out;
+    }
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+        return out;
+    };
+    // ponytail: whole-dir head-scan per ask; move dates into the graph if session dirs grow huge
+    for entry in entries.filter_map(|e| e.ok()).take(5000) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        // Read only the head — the Date: header sits in the first lines.
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut head = String::new();
+        if file.take(2048).read_to_string(&mut head).is_err() {
+            continue;
+        }
+        if let Some(date) = head.lines().find_map(|l| {
+            l.trim().strip_prefix("Date:").map(|d| d.trim().to_string())
+        }) {
+            // Sanity: must start with a parseable YYYY/MM/DD token.
+            if super::temporal::parse_question_date(&date).is_some() {
+                out.insert(stem, date);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Keyword-snippet extractor
 // ---------------------------------------------------------------------------
 
@@ -310,5 +362,38 @@ mod tests {
             10000,
         );
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn harvest_session_dates_reads_date_headers() {
+        let dir = std::env::temp_dir().join(format!(
+            "tr_harvest_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session_abc123.txt"),
+            "Date: 2023/05/30 (Tue) 22:10\nUSER: hi\nASSISTANT: hello\n",
+        )
+        .unwrap();
+        // No Date header → no entry (honest degradation, never fabricated).
+        std::fs::write(dir.join("session_nodate.txt"), "USER: hi\n").unwrap();
+        // Unparseable date → no entry.
+        std::fs::write(dir.join("session_bad.txt"), "Date: not-a-date\nUSER: x\n").unwrap();
+
+        let map = harvest_session_dates(&dir);
+        assert_eq!(
+            map.get("session_abc123").map(String::as_str),
+            Some("2023/05/30 (Tue) 22:10")
+        );
+        assert!(!map.contains_key("session_nodate"));
+        assert!(!map.contains_key("session_bad"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn harvest_session_dates_empty_on_missing_dir() {
+        assert!(harvest_session_dates(Path::new("/nonexistent/dir")).is_empty());
     }
 }

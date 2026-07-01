@@ -8920,13 +8920,18 @@ async fn ask_handler(
         .flatten()
         .map(|p| p.template_text);
 
+    // Harvest per-session dates from the transcripts' `Date:` headers so the
+    // SESSION DATE TIMELINE anchor block + KU recency sort actually render
+    // (previously starved by an empty map).
+    let session_dates = crate::intelligence::augmenter::harvest_session_dates(&sessions_dir);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
         category: &category,
         allowed_sources: &allowed_sources,
         question_date: &body.question_date,
-        session_dates: &HashMap::new(),
+        session_dates: &session_dates,
         answer_sids: &body.session_scope,
         sessions_dir: &sessions_dir,
         excluded_claim_ids: &HashSet::new(),
@@ -9294,13 +9299,17 @@ async fn ask_stream_handler(
         .flatten()
         .map(|p| p.template_text);
 
+    // Same `Date:`-header harvest as the non-streaming ask path — feeds the
+    // SESSION DATE TIMELINE + KU recency sort (previously an empty map).
+    let session_dates = crate::intelligence::augmenter::harvest_session_dates(&sessions_dir);
+
     let req = SynthAskRequest {
         workspace: &ws,
         question: &body.question,
         category: &category,
         allowed_sources: &allowed_sources,
         question_date: &body.question_date,
-        session_dates: &HashMap::new(),
+        session_dates: &session_dates,
         answer_sids: &answer_sids,
         sessions_dir: &sessions_dir,
         excluded_claim_ids: &HashSet::new(),

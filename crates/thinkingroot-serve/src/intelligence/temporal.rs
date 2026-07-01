@@ -123,10 +123,12 @@ pub fn compute_temporal_anchors(
                 out.push_str(&format!("{} week(s) ago = {}\n", n, d.format("%Y-%m-%d")));
                 found = true;
             } else if unit.starts_with("month") && is_ago {
-                // Approximate: 30 days per month
-                let d = today - Duration::days(n * 30);
-                out.push_str(&format!("{} month(s) ago ≈ {}\n", n, d.format("%Y-%m-%d")));
-                found = true;
+                // Exact calendar-month arithmetic (was a 30-day approximation,
+                // which drifted by days over multi-month spans).
+                if let Some(d) = today.checked_sub_months(chrono::Months::new(n.max(0) as u32)) {
+                    out.push_str(&format!("{} month(s) ago = {}\n", n, d.format("%Y-%m-%d")));
+                    found = true;
+                }
             }
         }
     }
