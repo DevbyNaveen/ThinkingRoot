@@ -9103,6 +9103,47 @@ impl GraphStore {
         }
         Ok(out)
     }
+
+    /// Batched `claim id → event_date` lookup for the temporal event-calendar
+    /// block. Same point-query-per-id idiom as
+    /// [`Self::get_sensitivities_for_claims`] (CozoDB has no list-parameter
+    /// membership binding; per-call top-K rows only). Claims with no real
+    /// event date (`event_date <= 0.0`, the schema default) are omitted —
+    /// the calendar never fabricates a date.
+    pub fn get_event_dates_for_claims(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        for id in ids {
+            let mut params = BTreeMap::new();
+            params.insert("id".into(), DataValue::Str(id.as_str().into()));
+            let result = self
+                .db
+                .run_script(
+                    "?[d] := *claims{id: $id, event_date: d}",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| {
+                    Error::GraphStorage(format!("get_event_dates_for_claims({id}) failed: {e}"))
+                })?;
+            if let Some(row) = result.rows.first() {
+                let d = match &row[0] {
+                    DataValue::Num(Num::Float(f)) => *f,
+                    DataValue::Num(Num::Int(i)) => *i as f64,
+                    _ => 0.0,
+                };
+                if d > 0.0 {
+                    out.insert(id.clone(), d);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A single connector ingest record returned by
@@ -9274,6 +9315,33 @@ mod tests {
         let store = mem_store();
         let (s, c, e) = store.get_counts().unwrap();
         assert_eq!((s, c, e), (0, 0, 0));
+    }
+
+    #[test]
+    fn event_dates_for_claims_returns_dated_and_omits_undated() {
+        let store = mem_store();
+        // One dated claim + one with the schema default (0.0) — the default
+        // must be OMITTED, never surfaced as a fabricated epoch-zero date.
+        store
+            .db
+            .run_default(
+                "?[id, statement, claim_type, source_id, confidence, event_date] <- \
+                 [['c-dated', 'went hiking', 'event', 's1', 0.9, 1685145600.0], \
+                  ['c-undated', 'likes tea', 'preference', 's1', 0.9, 0.0]] \
+                 :put claims {id => statement, claim_type, source_id, confidence, event_date}",
+            )
+            .unwrap();
+        let out = store
+            .get_event_dates_for_claims(&[
+                "c-dated".to_string(),
+                "c-undated".to_string(),
+                "c-missing".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(out.get("c-dated"), Some(&1685145600.0));
+        assert!(!out.contains_key("c-undated"));
+        assert!(!out.contains_key("c-missing"));
+        assert!(store.get_event_dates_for_claims(&[]).unwrap().is_empty());
     }
 
     #[test]

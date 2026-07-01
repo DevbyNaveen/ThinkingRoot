@@ -165,6 +165,56 @@ pub fn compute_temporal_anchors(
     if found { out } else { String::new() }
 }
 
+/// Cap on rendered calendar rows — a dozen-plus dated events is signal, a
+/// hundred is noise the reader has to wade through.
+pub const EVENT_CALENDAR_MAX: usize = 15;
+
+/// Build the `## EVENT CALENDAR (datetime-verified)` block for temporal
+/// questions — the datetime substrate doing the two things the LLM is worst
+/// at (calendar deltas + event-by-date ordering) in Rust chrono instead of
+/// prose.
+///
+/// `events` = `(statement, event_date_epoch_secs)` pairs from claims that
+/// carry a real compile-extracted `event_date`. Rows render sorted by
+/// proximity to the question date with an exact pre-computed delta
+/// ("3 day(s) before TODAY"). Returns `""` when the question date is
+/// unparseable or no event carries a date — the prompt is then byte-identical
+/// to the calendar-off path (honest degradation, never a fabricated date).
+pub fn build_event_calendar(question_date: &str, events: &[(String, f64)], max: usize) -> String {
+    let Some(today) = parse_question_date(question_date) else {
+        return String::new();
+    };
+    let mut rows: Vec<(NaiveDate, i64, &str)> = events
+        .iter()
+        .filter_map(|(statement, epoch)| {
+            if *epoch <= 0.0 {
+                return None;
+            }
+            let d = chrono::DateTime::from_timestamp(*epoch as i64, 0)?.date_naive();
+            let delta = (today - d).num_days();
+            Some((d, delta, statement.as_str()))
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    // Nearest-to-TODAY first; ties break older-first for a stable render.
+    rows.sort_by_key(|(d, delta, _)| (delta.abs(), *d));
+    rows.truncate(max);
+
+    let mut out = String::from("## EVENT CALENDAR (datetime-verified)\n");
+    for (d, delta, statement) in &rows {
+        let rel = match delta {
+            0 => "TODAY".to_string(),
+            n if *n > 0 => format!("{n} day(s) before TODAY"),
+            n => format!("{} day(s) after TODAY", -n),
+        };
+        out.push_str(&format!("- {} ({rel}): {statement}\n", d.format("%Y-%m-%d")));
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +271,75 @@ mod tests {
     fn compute_anchors_empty_on_bad_date() {
         let anchors = compute_temporal_anchors("What happened?", "", &HashMap::new(), &[]);
         assert!(anchors.is_empty());
+    }
+
+    #[test]
+    fn compute_anchors_months_ago_is_calendar_exact() {
+        // 2023-05-30 minus 3 calendar months = 2023-02-28 (Feb has no 30th).
+        // The old 30-day approximation produced 2023-03-01 — off by a day and
+        // into the wrong month.
+        let anchors = compute_temporal_anchors(
+            "What did I do 3 months ago?",
+            "2023/05/30",
+            &HashMap::new(),
+            &[],
+        );
+        assert!(
+            anchors.contains("2023-02-28"),
+            "Expected exact calendar-month date in: {anchors}"
+        );
+    }
+
+    #[test]
+    fn event_calendar_sorts_by_proximity_and_computes_deltas() {
+        // TODAY = 2023-05-30. Epochs: 2023-05-27 (3 before), 2023-04-10
+        // (50 before), 2023-06-02 (3 after).
+        let d = |y: i32, m: u32, day: u32| -> f64 {
+            NaiveDate::from_ymd_opt(y, m, day)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp() as f64
+        };
+        let events = vec![
+            ("bought hiking boots".to_string(), d(2023, 4, 10)),
+            ("attended sister's wedding".to_string(), d(2023, 5, 27)),
+            ("dentist appointment".to_string(), d(2023, 6, 2)),
+        ];
+        let cal = build_event_calendar("2023/05/30", &events, EVENT_CALENDAR_MAX);
+        assert!(cal.starts_with("## EVENT CALENDAR (datetime-verified)"));
+        assert!(cal.contains("2023-05-27 (3 day(s) before TODAY): attended sister's wedding"));
+        assert!(cal.contains("2023-06-02 (3 day(s) after TODAY): dentist appointment"));
+        assert!(cal.contains("2023-04-10 (50 day(s) before TODAY): bought hiking boots"));
+        // Proximity order: the wedding (|3|, older tie-break) before boots (|50|).
+        let wedding = cal.find("wedding").unwrap();
+        let boots = cal.find("boots").unwrap();
+        assert!(wedding < boots, "nearest event must render first:\n{cal}");
+    }
+
+    #[test]
+    fn event_calendar_empty_on_no_dated_events_or_bad_today() {
+        assert!(build_event_calendar("", &[("x".into(), 1.0)], 15).is_empty());
+        assert!(build_event_calendar("2023/05/30", &[], 15).is_empty());
+        // Zero/default epochs are omitted → empty, never fabricated.
+        assert!(build_event_calendar("2023/05/30", &[("x".into(), 0.0)], 15).is_empty());
+    }
+
+    #[test]
+    fn event_calendar_caps_rows() {
+        let events: Vec<(String, f64)> = (1..=30)
+            .map(|i| {
+                let epoch = NaiveDate::from_ymd_opt(2023, 4, i.min(30) as u32)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp() as f64;
+                (format!("event {i}"), epoch)
+            })
+            .collect();
+        let cal = build_event_calendar("2023/05/30", &events, EVENT_CALENDAR_MAX);
+        assert_eq!(cal.matches("- 2023-").count(), EVENT_CALENDAR_MAX);
     }
 }

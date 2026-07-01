@@ -742,6 +742,50 @@ fn hebbian_on() -> bool {
         .unwrap_or(false)
 }
 
+/// Event-calendar block on the temporal answer path (memory-SOTA Phase 2) —
+/// OFF by default until the eval gate measures it; flag-off keeps the wire
+/// prompt byte-identical to the pinned baseline.
+fn temporal_calendar_on() -> bool {
+    std::env::var("TR_TEMPORAL_CALENDAR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Fetch compile-extracted `event_date`s for the retrieved claims and render
+/// the `## EVENT CALENDAR (datetime-verified)` block. Returns `""` (prompt
+/// unchanged) unless the flag is on, the category is temporal, and at least
+/// one retrieved claim carries a real event date — the block is finished
+/// goods from the graph, never an LLM-computed date.
+async fn temporal_event_calendar(
+    engine: &crate::engine::QueryEngine,
+    req: &AskRequest<'_>,
+    claims: &[ClaimSearchHit],
+) -> String {
+    if !temporal_calendar_on() || req.category != "temporal-reasoning" || claims.is_empty() {
+        return String::new();
+    }
+    let Some(graph) = engine.graph_store(req.workspace).await else {
+        return String::new();
+    };
+    let ids: Vec<String> = claims.iter().map(|c| c.id.clone()).collect();
+    let dates = match graph.get_event_dates_for_claims(&ids) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("event calendar: event_date lookup failed: {e}");
+            return String::new();
+        }
+    };
+    let events: Vec<(String, f64)> = claims
+        .iter()
+        .filter_map(|c| dates.get(&c.id).map(|d| (c.statement.clone(), *d)))
+        .collect();
+    crate::intelligence::temporal::build_event_calendar(
+        req.question_date,
+        &events,
+        crate::intelligence::temporal::EVENT_CALENDAR_MAX,
+    )
+}
+
 /// Try to answer a count/list question with an EXACT graph aggregate. Returns
 /// `None` (caller falls through to the reader) when the question is not an
 /// aggregate, has no extractable subject, the graph is unavailable, or the
@@ -899,8 +943,12 @@ pub async fn ask(
         };
     };
 
+    // Memory-SOTA Phase 2: datetime-verified event calendar (flag-gated,
+    // "" when off → wire prompt unchanged).
+    let event_calendar = temporal_event_calendar(engine, req, &claims).await;
+
     let _t_syn = std::time::Instant::now();
-    let (answer, usage) = synthesize(&claims, &llm_client, req).await;
+    let (answer, usage) = synthesize(&claims, &llm_client, req, &event_calendar).await;
     tracing::warn!(target: "tr_timing", "ASK synthesize={}ms", _t_syn.elapsed().as_millis());
     AskResponse {
         answer,
@@ -992,7 +1040,10 @@ pub async fn ask_streaming(
         };
     };
 
-    let user_msg = build_user_message(&claims, req);
+    // Memory-SOTA Phase 2: datetime-verified event calendar (flag-gated,
+    // "" when off → wire prompt unchanged).
+    let event_calendar = temporal_event_calendar(engine, req, &claims).await;
+    let user_msg = build_user_message_with_calendar(&claims, req, &event_calendar);
     let system_prompt_owned = resolve_system_prompt(req);
     let system_prompt: &str = system_prompt_owned.as_ref();
 
@@ -1027,10 +1078,11 @@ async fn synthesize(
     claims: &[ClaimSearchHit],
     llm: &LlmClient,
     req: &AskRequest<'_>,
+    event_calendar: &str,
 ) -> (String, TokenUsage) {
     let system_prompt_owned = resolve_system_prompt(req);
     let system_prompt: &str = system_prompt_owned.as_ref();
-    let mut user_msg = build_user_message(claims, req);
+    let mut user_msg = build_user_message_with_calendar(claims, req, event_calendar);
     // Reader upgrade — Chain-of-Note: note each evidence's relevance, then answer
     // from the relevant notes. Additive + reversible (does NOT touch the pinned
     // MEMORY_SYSTEM_PROMPT); the directive is appended here and the notes are
@@ -1094,7 +1146,18 @@ async fn synthesize(
 ///    anchors, question) — byte-identical to v0.9.0 when no identity
 ///    and no history are passed.
 fn build_user_message(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String {
-    let body = build_user_message_body(claims, req);
+    build_user_message_with_calendar(claims, req, "")
+}
+
+/// [`build_user_message`] plus the optional `## EVENT CALENDAR` block
+/// (memory-SOTA Phase 2). `event_calendar = ""` renders byte-identical to
+/// [`build_user_message`] — the pinned-prompt tests exercise that path.
+fn build_user_message_with_calendar(
+    claims: &[ClaimSearchHit],
+    req: &AskRequest<'_>,
+    event_calendar: &str,
+) -> String {
+    let body = build_user_message_body(claims, req, event_calendar);
 
     let with_history = if include_history(req) {
         format!("{}{body}", render_history_block(req.history))
@@ -1113,7 +1176,13 @@ fn build_user_message(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String
 
 /// The legacy v0.9.0 user-message body. Stable formatting, used by
 /// LongMemEval and by the new `Conversational` persona alike.
-fn build_user_message_body(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> String {
+/// `event_calendar` renders between the temporal anchors and the TODAY
+/// section; `""` (flag off / non-temporal) keeps the body byte-identical.
+fn build_user_message_body(
+    claims: &[ClaimSearchHit],
+    req: &AskRequest<'_>,
+    event_calendar: &str,
+) -> String {
     let claim_limit = claim_limit(req.category);
 
     // Build claim notes (knowledge-update gets a MOST RECENT / OLDER split).
@@ -1143,7 +1212,7 @@ fn build_user_message_body(claims: &[ClaimSearchHit], req: &AskRequest<'_>) -> S
     let category_label = category_label(req.category);
 
     format!(
-        "{category_label}\n{temporal_section}{date_section}## EXTRACTED CLAIMS ({} most relevant)\n{claim_notes}\n{source_section}## QUESTION\n{}",
+        "{category_label}\n{temporal_section}{event_calendar}{date_section}## EXTRACTED CLAIMS ({} most relevant)\n{claim_notes}\n{source_section}## QUESTION\n{}",
         claims.len().min(claim_limit),
         req.question,
     )
@@ -2318,12 +2387,24 @@ DO NOT use abstention as a cop-out. 95% of the time the answer IS in the data.
             persona_override: None,
         };
         let with_id = build_user_message(&claims, &req);
-        let body = build_user_message_body(&claims, &req);
+        let body = build_user_message_body(&claims, &req, "");
         assert_eq!(with_id, body);
         assert!(!with_id.contains("<system-reminder>"));
         assert!(!with_id.contains("CONVERSATION HISTORY"));
         assert!(with_id.contains("[CATEGORY: single-session-user]"));
         assert!(with_id.ends_with("## QUESTION\nwhat?"));
+
+        // Memory-SOTA Phase 2 pin: empty calendar keeps the wire prompt
+        // byte-identical to the calendar-free path; a non-empty calendar
+        // renders as an additive block BEFORE the extracted claims.
+        let with_empty_calendar = build_user_message_with_calendar(&claims, &req, "");
+        assert_eq!(with_empty_calendar, with_id);
+        let cal = "## EVENT CALENDAR (datetime-verified)\n- 2023-05-27 (3 day(s) before TODAY): x\n\n";
+        let with_calendar = build_user_message_with_calendar(&claims, &req, cal);
+        assert!(with_calendar.contains(cal));
+        assert!(
+            with_calendar.find(cal).unwrap() < with_calendar.find("## EXTRACTED CLAIMS").unwrap()
+        );
     }
 
     #[test]
